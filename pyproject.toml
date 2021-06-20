@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "pyjobby"
+version = "1.2.3"
+description = "PostgreSQL Job Consumer Platform"
+authors = ["Matt Stancliff <matt@genges.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+orjson = "^3.5.0"
+click = "^8.0.0"
+asyncpg = "^0.23.0"
+loguru = "^0.5.3"
+aiohttp = "^3.7.3"
+
+[tool.poetry.scripts]
+pj = "pyjobby.pj:workit"
+
+[tool.poetry.dev-dependencies]
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
