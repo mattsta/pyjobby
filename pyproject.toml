@@ -47,6 +47,7 @@ markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
     "concurrency: marks tests as concurrency tests",
+    "stress: marks tests as stress tests (high load scenarios)",
 ]
 timeout = 300
 filterwarnings = [

@@ -134,6 +134,21 @@ def worker_params() -> dict:
     }
 
 
+@pytest_asyncio.fixture(autouse=True, scope="function")
+async def cleanup_after_concurrency_tests(request, db_params: dict[str, str]):
+    """Clean up database after concurrency tests that don't use transactions."""
+    yield
+
+    # Only clean up after concurrency tests (which create their own connections)
+    if "test_concurrency" in str(request.fspath):
+        conn = await asyncpg.connect(**db_params)
+        try:
+            # Delete all jobs created during concurrency tests
+            await conn.execute("DELETE FROM jorb")
+        finally:
+            await conn.close()
+
+
 @pytest_asyncio.fixture
 async def job_system(db_params: dict[str, str], db_connection, worker_params: dict):
     """
