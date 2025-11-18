@@ -645,13 +645,14 @@ psql -c "INSERT INTO jorb (job_class, kwargs)
 
 ## Error Handling and Retry
 
-### Automatic Retry with Exponential Backoff
+### Automatic Retry with Exponential Backoff (Phase 1 Improvements)
 
-When a job raises an exception:
+When a job raises an exception, Phase 1 implements a robust retry mechanism:
 
-1. **Crash Recorded**:
+1. **Crash Recorded** (Original job marked for audit trail):
    ```python
    await conn.execute("crash", job_id, str(exception), full_traceback)
+   # Sets: state='crashed', error_message='...', error_backtrace='...'
    ```
 
 2. **Backoff Calculated**:
@@ -663,17 +664,43 @@ When a job raises an exception:
        return timedelta(seconds=seconds)
    ```
 
-3. **Job Rescheduled**:
+3. **Check Retry Limit**:
    ```python
-   delay = await job.rescheduleBackoff(job_data['attempt'])
-   await conn.execute("reschedule", job_id, delay)
+   current_error_count = job["error_count"] + 1
+   if current_error_count < max_retries:
+       # Create retry job
+   else:
+       # Log permanent failure
+       logger.error(f"PERMANENTLY FAILED after {current_error_count} attempts")
    ```
 
-4. **New Row Created**:
-   - Original job: `state='crashed'`, `backtrace='...'`
-   - New job: `state='queued'`, `run_after=NOW() + delay`
+4. **New Retry Job Created** (Separate database row):
+   ```python
+   retry_job_id = await conn.fetchval("""
+       INSERT INTO jorb (job_class, kwargs, queue, prio, uid, capability,
+                        run_after, run_group, admin_data, state, error_count)
+       SELECT job_class, kwargs, queue, prio, uid, capability,
+              NOW() + $2::interval,  -- Future run_after
+              run_group,
+              jsonb_set(COALESCE(admin_data, '{}'), '{parent_job_id}', to_jsonb($1::bigint)),
+              'queued',              -- New job is queued!
+              $3                     -- error_count incremented
+       FROM jorb WHERE id = $1
+       RETURNING id
+   """, job_id, delay, current_error_count)
+   ```
 
-**Maximum Retries**: Currently unlimited, but `attempt` counter increments each time
+**Result**:
+- Original job: `state='crashed'`, complete audit trail preserved
+- Retry job: `state='queued'`, `run_after=NOW() + delay`, `admin_data={parent_job_id: original_id}`
+
+**Maximum Retries**: Configurable via `JobSystem.max_retries` (default: 10)
+
+**Benefits**:
+- ✅ Complete audit trail of all failures
+- ✅ Clear parent-child relationship via `admin_data`
+- ✅ Retries actually work (critical bug fix from v1.0.0)
+- ✅ Configurable max retries prevents infinite loops
 
 ### Manual Retry Control
 
@@ -987,10 +1014,11 @@ class MetricsJob(Job):
 ### Known Limitations
 
 1. **No Job Cancellation**: Once claimed, jobs must complete or crash
-2. **No Dead Letter Queue**: Crashed jobs retry forever (or until manual intervention)
+2. ~~**No Dead Letter Queue**~~: **✅ FIXED in Phase 1** - Max retry limits prevent infinite retries, permanently failed jobs are clearly logged
 3. **No Job TTL**: Jobs remain in database forever (manual cleanup required)
 4. **No Worker Affinity**: Can't guarantee same worker processes related jobs
 5. **No Batch Operations**: Each job is independent (no built-in map/reduce)
+6. ~~**Jobs Lost on Worker Crash**~~: **✅ FIXED in Phase 1** - Automatic recovery on worker startup
 
 ## Summary
 

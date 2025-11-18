@@ -35,6 +35,11 @@ class JobSystem:
     pid: int                      # Process ID
     node: str                     # Hostname
     cache: dict[str, Any]         # Worker-local cache
+
+    # Phase 1 Improvements: Self-Healing and Fault Tolerance
+    max_retries: int = 10         # Maximum retry attempts before permanent failure
+    default_timeout: int = 3600   # Default job timeout in seconds (1 hour)
+    enable_recovery: bool = True  # Enable abandoned job recovery on startup
 ```
 
 ## Initialization
@@ -50,6 +55,9 @@ runner = JobSystem(
     workerId=0,               # Worker index
     checkInterval=5,          # Poll every 5 seconds
     webPort=web_config,       # Optional web server config
+    max_retries=10,           # Maximum retry attempts (default: 10)
+    default_timeout=3600,     # Default job timeout in seconds (default: 1 hour)
+    enable_recovery=True,     # Enable crash recovery (default: True)
 )
 
 signal.signal(signal.SIGTERM, runner.shutdown)

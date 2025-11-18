@@ -2,6 +2,20 @@
 
 Comprehensive documentation for the pyjobby PostgreSQL-backed job queue system.
 
+## What's New
+
+🎉 **Phase 1 Improvements** - Self-Healing and Fault Tolerance
+
+Pyjobby now includes critical production-ready improvements:
+
+- ✅ **Fixed Retry Mechanism** - Jobs now retry correctly (critical bug fix)
+- ✅ **Worker Crash Recovery** - Automatic recovery of abandoned jobs on startup
+- ✅ **Job Timeout Protection** - Configurable per-job and system-wide timeouts
+- ✅ **Max Retry Limits** - Prevent infinite retry loops with permanent failure detection
+- ✅ **Enhanced Error Handling** - Detailed logging and monitoring support
+
+See [PHASE1_IMPROVEMENTS.md](../PHASE1_IMPROVEMENTS.md) for complete details.
+
 ## Table of Contents
 
 ### Getting Started
@@ -168,6 +182,9 @@ Trigger Dependent Jobs
 - ✅ **Flexible**: Sync/async jobs, web integration
 - ✅ **Observable**: Complete audit trail in database
 - ✅ **Scalable**: Horizontal scaling via database
+- ✅ **Self-Healing**: Automatic crash recovery and retry management
+- ✅ **Fault-Tolerant**: Timeout protection and max retry limits
+- ✅ **Production-Ready**: Enhanced error handling and monitoring
 
 ## Database Schema Summary
 
@@ -313,6 +330,16 @@ Inspired by:
 - Good Queue (Go) - PostgreSQL queue implementation
 
 ## Version History
+
+- **v1.1.0** (2025-01-XX): Phase 1 - Self-Healing and Fault Tolerance
+  - **CRITICAL FIX**: Retry mechanism now works correctly (jobs were stuck in 'crashed')
+  - Worker crash recovery - automatic requeue of abandoned jobs on startup
+  - Job timeout protection with configurable per-job and system-wide timeouts
+  - Max retry limits to prevent infinite retry loops
+  - Enhanced error handling with detailed logging
+  - Complete audit trail via separate retry jobs
+  - New configuration options: `max_retries`, `default_timeout`, `enable_recovery`
+  - 100% backward compatible - existing jobs work without modification
 
 - **v1.0.0** (2025-01-XX): Initial release
   - Core job system (<1000 lines)

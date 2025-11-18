@@ -34,6 +34,20 @@ class Job:
   - `job["error_count"]`: Number of previous failures
   - See full schema in `priv/schema.py`
 
+**Configurable Class Attributes** (Phase 1 Improvements):
+- `timeout`: Maximum execution time in seconds (default: uses `JobSystem.default_timeout`)
+
+```python
+class LongRunningJob(Job):
+    timeout = 7200  # 2 hours for this specific job type
+
+    async def task(self, data_size: int):
+        # This job can run for up to 2 hours
+        # If it exceeds 7200 seconds, TimeoutError is raised
+        # and the job is marked as crashed and retried
+        pass
+```
+
 ## Core Methods
 
 ### `task(**kwargs) -> Any`
