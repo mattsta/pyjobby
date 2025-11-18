@@ -81,13 +81,41 @@ worker_hosts = st.sampled_from([f"worker-{i}" for i in range(5)])
 pytestmark = pytest.mark.asyncio
 
 
+# ============================================================================
+# Hypothesis Profiles for Different Testing Intensities
+# ============================================================================
+
+# Default profile: Quick validation (already registered by Hypothesis)
+# hypothesis.settings.register_profile("default", max_examples=100)
+
+# Stress profile: Exhaustive testing with thousands of examples
+from hypothesis import settings, Phase
+settings.register_profile(
+    "stress",
+    max_examples=1000,  # 1000 examples per test!
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
+    phases=[Phase.explicit, Phase.reuse, Phase.generate, Phase.shrink],
+)
+
+# CI profile: Balance between coverage and speed
+settings.register_profile(
+    "ci",
+    max_examples=200,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+
+# To use: pytest --hypothesis-profile=stress tests/test_hypothesis_properties.py
+
+
 @pytest.mark.hypothesis
 class TestProducerConsumerInvariants:
     """Property-based tests for producer-consumer invariants."""
 
-    @settings(max_examples=50, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(max_examples=500, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(
-        job_count=st.integers(min_value=1, max_value=20),
+        job_count=st.integers(min_value=1, max_value=50),  # Increased range
         queue=queue_names,
         prio=priorities,
     )
@@ -125,9 +153,9 @@ class TestProducerConsumerInvariants:
         assert len(claimed) == job_count
         assert set(claimed) == set(job_ids)
 
-    @settings(max_examples=30, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(max_examples=500, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(
-        job_count=st.integers(min_value=2, max_value=10),
+        job_count=st.integers(min_value=2, max_value=30),  # Increased range
         queue=queue_names,
     )
     async def test_no_duplicate_claims(
@@ -161,10 +189,10 @@ class TestProducerConsumerInvariants:
         assert len(claimed_jobs) == len(set(claimed_jobs)), "Duplicate claims detected!"
         assert len(claimed_jobs) == job_count
 
-    @settings(max_examples=30, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(max_examples=500, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(
-        finish_count=st.integers(min_value=1, max_value=10),
-        crash_count=st.integers(min_value=1, max_value=10),
+        finish_count=st.integers(min_value=1, max_value=20),  # Increased range
+        crash_count=st.integers(min_value=1, max_value=20),   # Increased range
     )
     async def test_jobs_reach_terminal_states(
         self, db_connection, finish_count: int, crash_count: int
@@ -210,10 +238,10 @@ class TestProducerConsumerInvariants:
 class TestConcurrentProducers:
     """Property tests for concurrent job producers."""
 
-    @settings(max_examples=20, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(
-        producer_count=st.integers(min_value=2, max_value=5),
-        jobs_per_producer=st.integers(min_value=1, max_value=5),
+        producer_count=st.integers(min_value=2, max_value=8),  # More producers
+        jobs_per_producer=st.integers(min_value=1, max_value=10),  # More jobs
     )
     async def test_concurrent_producers_create_all_jobs(
         self, db_params, producer_count: int, jobs_per_producer: int
@@ -284,10 +312,10 @@ class TestConcurrentProducers:
 class TestRecoveryInvariants:
     """Property tests for job recovery after worker crashes."""
 
-    @settings(max_examples=30, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(max_examples=500, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(
-        crashed_job_count=st.integers(min_value=1, max_value=10),
-        recovery_timeout_minutes=st.integers(min_value=1, max_value=30),
+        crashed_job_count=st.integers(min_value=1, max_value=25),  # More jobs
+        recovery_timeout_minutes=st.integers(min_value=1, max_value=60),  # Wider range
     )
     async def test_recovery_returns_abandoned_jobs(
         self, db_connection, crashed_job_count: int, recovery_timeout_minutes: int
@@ -324,10 +352,10 @@ class TestRecoveryInvariants:
             job = await get_job(db_connection, job_id)
             assert job["state"] == "queued"
 
-    @settings(max_examples=20, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(max_examples=500, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(
-        old_job_count=st.integers(min_value=1, max_value=5),
-        recent_job_count=st.integers(min_value=1, max_value=5),
+        old_job_count=st.integers(min_value=1, max_value=15),  # More jobs
+        recent_job_count=st.integers(min_value=1, max_value=15),  # More jobs
     )
     async def test_recovery_respects_timeout(
         self, db_connection, old_job_count: int, recent_job_count: int
@@ -384,12 +412,12 @@ class TestRecoveryInvariants:
 class TestPriorityOrdering:
     """Property tests for job priority ordering."""
 
-    @settings(max_examples=30, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(max_examples=500, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(
         priorities=st.lists(
-            st.integers(min_value=1, max_value=1000),
+            st.integers(min_value=1, max_value=10000),  # Wider range
             min_size=2,
-            max_size=10,
+            max_size=25,  # More priorities to test
             unique=True
         )
     )
@@ -493,10 +521,10 @@ class TestCapabilityMatching:
 class TestDependencyResolution:
     """Property tests for job dependency resolution."""
 
-    @settings(max_examples=20, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(max_examples=400, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(
-        parent_count=st.integers(min_value=1, max_value=5),
-        children_per_parent=st.integers(min_value=1, max_value=3),
+        parent_count=st.integers(min_value=1, max_value=10),  # More parents
+        children_per_parent=st.integers(min_value=1, max_value=5),  # More children
     )
     async def test_waitfor_job_resolution(
         self, db_connection, parent_count: int, children_per_parent: int
