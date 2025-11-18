@@ -146,7 +146,8 @@ STMTS[
 ] = """UPDATE jorb
               SET state = 'running',
                   updated = TIMEZONE('utc', clock_timestamp())
-              WHERE id = $1"""
+              WHERE id = $1
+          RETURNING *"""
 
 # TODO: are we going to re-enqueue crashed jobs? By setting state to
 # 'crashed' here, it'll never be picked up again (also problem if worker
@@ -255,6 +256,17 @@ STMTS[
             WHERE id = $1
             RETURNING id"""
 
+# Cancel a queued or waiting job
+# Only jobs not yet claimed can be cancelled
+STMTS[
+    "cancel"
+] = """UPDATE jorb
+              SET state = 'cancelled',
+                  updated = TIMEZONE('utc', clock_timestamp())
+              WHERE id = $1
+                AND state IN ('queued', 'waiting')
+              RETURNING *"""
+
 
 @dataclass
 class JobSystem:
@@ -300,8 +312,10 @@ class JobSystem:
                 continue
 
     def shutdown(self, signum: int, frame: Any) -> None:
+        """Request graceful shutdown - stop processing new jobs but finish current job."""
         logger.info(f"Shutdown request received by signal {signum}")
         self.stop = True
+        # Note: The main loop will finish the current job before exiting
 
     async def recover_abandoned_jobs(self) -> list[asyncpg.Record]:
         """Recover jobs that were left in claimed/running state when this worker crashed.
@@ -418,8 +432,12 @@ class JobSystem:
         self.cxn = await asyncpg.connect(**self.dsn)
 
         # tell asyncpg we want to use orjson for json types
+        # orjson.dumps returns bytes, but asyncpg expects str for text types
+        def orjson_encoder(obj: Any) -> str:
+            return orjson.dumps(obj).decode('utf-8')
+
         await self.cxn.set_type_codec(
-            "json", encoder=orjson.dumps, decoder=orjson.loads, schema="pg_catalog"
+            "json", encoder=orjson_encoder, decoder=orjson.loads, schema="pg_catalog"
         )
 
         # even though the asyncpg adapter will cache statements as they are run,
@@ -439,6 +457,7 @@ class JobSystem:
         error: int = 0
         start_counter: float = time.perf_counter()
         prev_status: float = time.perf_counter()
+        prev_processed: int = 0  # Initialize BEFORE loop for correct rate calculation
         skipSleep: bool = True  # process without sleeping until job retrieval is empty
         jobs: list[asyncpg.Record] = []
         klass: Optional[Job] = None
@@ -457,14 +476,15 @@ class JobSystem:
                 )
 
             # record time of the current job check
-            prev_processed = 0
             prev = time.perf_counter()
+
+            # Log status every 5 minutes with correct rate calculation
             if now - prev_status >= 300:
-                pdiff_total = (processed - prev_processed) / (prev - prev_status)
+                pdiff_total = (processed - prev_processed) / (now - prev_status)
                 logger.info(
                     f"[processed {processed} ({pdiff_total:0.2f}/s)] [errors {error}]"
                 )
-                prev_status = prev
+                prev_status = now
                 prev_processed = processed
 
             jobs = await self.ex(
@@ -732,6 +752,10 @@ def runAndDone(
     n: int,
     db_params: dict[str, str],
     web_listen: Optional[dict[str, Any]],
+    max_retries: int = 10,
+    default_timeout: int = 3600,
+    recovery_timeout: int = 300,
+    enable_recovery: bool = True,
 ) -> None:
     """ Run the JobSystem for this worker process """
     runner = JobSystem(
@@ -741,6 +765,10 @@ def runAndDone(
         workerId=n,
         checkInterval=5,
         webPort=web_listen,
+        max_retries=max_retries,
+        default_timeout=default_timeout,
+        recovery_timeout=recovery_timeout,
+        enable_recovery=enable_recovery,
     )
 
     signal.signal(signal.SIGTERM, runner.shutdown)
@@ -781,6 +809,29 @@ def runAndDone(
     show_default=True,
 )
 @click.option(
+    "--max-retries",
+    default=10,
+    help="Maximum retry attempts before job is marked as permanently failed",
+    show_default=True,
+)
+@click.option(
+    "--default-timeout",
+    default=3600,
+    help="Default job timeout in seconds (1 hour)",
+    show_default=True,
+)
+@click.option(
+    "--recovery-timeout",
+    default=300,
+    help="Time in seconds before abandoned jobs are recovered (5 minutes)",
+    show_default=True,
+)
+@click.option(
+    "--no-recovery",
+    is_flag=True,
+    help="Disable abandoned job recovery on startup",
+)
+@click.option(
     "-v",
     is_flag=True,
     help="show version then exit",
@@ -797,6 +848,10 @@ def workit(
     cap: tuple[str],
     workers: int,
     path: str,
+    max_retries: int,
+    default_timeout: int,
+    recovery_timeout: int,
+    no_recovery: bool,
     v: bool,
     config: str,
 ) -> None:
@@ -844,6 +899,10 @@ def workit(
                 idx,
                 loadedConfig["db_params"],
                 loadedConfig["web_listen"],
+                max_retries,
+                default_timeout,
+                recovery_timeout,
+                not no_recovery,  # enable_recovery is opposite of no_recovery flag
             ),
         )
         p.start()

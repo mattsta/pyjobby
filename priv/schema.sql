@@ -31,7 +31,8 @@ CREATE TYPE public.jorbstate AS ENUM (
     'heartbeat',
     'crashed',
     'finished',
-    'waiting'
+    'waiting',
+    'cancelled'
 );
 
 
@@ -272,6 +273,13 @@ CREATE INDEX jorb_waitfor_group_idx ON public.jorb USING btree (waitfor_group) W
 --
 
 CREATE INDEX jorb_waitfor_job_idx ON public.jorb USING btree (waitfor_job) WHERE ((waitfor_job IS NOT NULL) AND (state = 'waiting'::public.jorbstate));
+
+
+--
+-- Name: jorb_recovery_idx; Type: INDEX; Schema: public; Owner: kudzu
+--
+
+CREATE INDEX jorb_recovery_idx ON public.jorb USING btree (worker_host, state, updated) WHERE (state IN ('claimed'::public.jorbstate, 'running'::public.jorbstate));
 
 
 --
