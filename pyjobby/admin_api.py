@@ -934,7 +934,8 @@ class AdminAPI:
             'name', 'description', 'job_class', 'kwargs', 'queue', 'prio',
             'capability', 'cron_expr', 'timezone', 'enabled',
             'max_concurrent_jobs', 'jitter_seconds',
-            'backpressure_threshold', 'circuit_breaker_threshold'
+            'backpressure_threshold', 'circuit_breaker_threshold',
+            'consecutive_failures'  # Allow resetting failure counter
         }
 
         # Filter to only allowed fields
