@@ -224,6 +224,7 @@ STMTS[
             RETURNING *"""
 
 # Recover jobs that were stuck when this worker crashed previously
+# Updated to include time-based check to prevent recovering jobs from slow-but-alive workers
 STMTS[
     "recover-abandoned"
 ] = """UPDATE jorb
@@ -232,6 +233,7 @@ STMTS[
                   updated = TIMEZONE('utc', clock_timestamp())
               WHERE worker_host = $1
                 AND state IN ('claimed', 'running')
+                AND updated < TIMEZONE('utc', clock_timestamp()) - $2::interval
               RETURNING id, job_class, state as old_state"""
 
 # Create a retry job (new row) instead of modifying the crashed job
@@ -279,6 +281,7 @@ class JobSystem:
     max_retries: int = 10  # Maximum retry attempts before dead letter
     default_timeout: int = 3600  # Default job timeout in seconds (1 hour)
     enable_recovery: bool = True  # Enable abandoned job recovery on startup
+    recovery_timeout: int = 300  # Time in seconds before job is considered abandoned (5 minutes)
 
     async def ex(self, op: str, *args: Any) -> list[asyncpg.Record]:
         """Execute 'op' from prepared statement dict with *args.
@@ -312,11 +315,16 @@ class JobSystem:
             return []
 
         try:
-            recovered = await self.ex("recover-abandoned", self.node)
+            # Convert recovery_timeout seconds to timedelta for PostgreSQL interval
+            from datetime import timedelta
+            recovery_interval = timedelta(seconds=self.recovery_timeout)
+
+            recovered = await self.ex("recover-abandoned", self.node, recovery_interval)
 
             if recovered:
                 logger.warning(
-                    f"Recovered {len(recovered)} abandoned jobs from previous crash: "
+                    f"Recovered {len(recovered)} abandoned jobs from previous crash "
+                    f"(older than {self.recovery_timeout}s): "
                     f"{[r['id'] for r in recovered]}"
                 )
 

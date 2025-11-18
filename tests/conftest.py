@@ -131,6 +131,7 @@ def worker_params() -> dict:
         "max_retries": 10,
         "default_timeout": 3600,
         "enable_recovery": True,
+        "recovery_timeout": 300,  # 5 minutes
     }
 
 

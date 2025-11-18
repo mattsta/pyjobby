@@ -397,10 +397,20 @@ class TestWorkerRecovery:
             12345, "worker-1", "test_queue", ["test"], 1000
         )
 
-        # Worker crashes - recover jobs from this worker
+        # Simulate time passing (worker has been dead for 10 minutes)
+        old_time = datetime.utcnow() - timedelta(minutes=10)
+        await db_connection.execute(
+            "UPDATE jorb SET updated = $1 WHERE id = $2",
+            old_time,
+            job_id
+        )
+
+        # Worker crashes - recover jobs from this worker (older than 5 minutes)
+        recovery_timeout = timedelta(minutes=5)
         results = await db_connection.fetch(
             STMTS["recover-abandoned"],
-            "worker-1"
+            "worker-1",
+            recovery_timeout
         )
 
         assert len(results) == 1
@@ -422,10 +432,20 @@ class TestWorkerRecovery:
         )
         await db_connection.execute(STMTS["run"], job_id)
 
-        # Worker crashes - recover jobs
+        # Simulate time passing (worker has been dead for 10 minutes)
+        old_time = datetime.utcnow() - timedelta(minutes=10)
+        await db_connection.execute(
+            "UPDATE jorb SET updated = $1 WHERE id = $2",
+            old_time,
+            job_id
+        )
+
+        # Worker crashes - recover jobs (older than 5 minutes)
+        recovery_timeout = timedelta(minutes=5)
         results = await db_connection.fetch(
             STMTS["recover-abandoned"],
-            "worker-1"
+            "worker-1",
+            recovery_timeout
         )
 
         assert len(results) == 1

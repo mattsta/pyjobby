@@ -468,15 +468,18 @@ class TestConcurrentRecovery:
             for i in range(3):
                 job_id = await create_job(conn, state="queued")
 
-                # Manually set as claimed by this worker
+                # Manually set as claimed by this worker with old timestamp
+                old_time = datetime.utcnow() - timedelta(minutes=10)
                 await conn.execute(
                     """UPDATE jorb
                        SET state = 'claimed',
                            worker_pid = $1,
-                           worker_host = $2
-                       WHERE id = $3""",
+                           worker_host = $2,
+                           updated = $3
+                       WHERE id = $4""",
                     10000 + worker_num,
                     worker_host,
+                    old_time,
                     job_id
                 )
                 worker_jobs[worker_host].append(job_id)
@@ -489,9 +492,11 @@ class TestConcurrentRecovery:
             """Recover jobs from a dead worker."""
             conn = await connect_with_codec(db_params)
             try:
+                recovery_timeout = timedelta(minutes=5)
                 results = await conn.fetch(
                     STMTS["recover-abandoned"],
-                    worker_host
+                    worker_host,
+                    recovery_timeout
                 )
                 return [r["id"] for r in results]
             finally:

@@ -351,11 +351,13 @@ class TestRecoverAbandonedStatement:
     """Test the 'recover-abandoned' SQL statement."""
 
     async def test_recover_abandoned_jobs(self, db_connection):
-        """Test recovering jobs from a specific worker host."""
-        # Create job and claim it with a specific worker host
-        job_id = await create_job(db_connection, state="queued")
+        """Test recovering jobs from a specific worker host with time-based check."""
+        # Create two jobs claimed by dead worker
+        old_job_id = await create_job(db_connection, state="queued")
+        recent_job_id = await create_job(db_connection, state="queued")
 
-        # Manually set to claimed by a dead worker
+        # Old job: updated 10 minutes ago (should be recovered with 5 min timeout)
+        old_time = datetime.utcnow() - timedelta(minutes=10)
         await db_connection.execute(
             """UPDATE jorb
                SET state = 'claimed',
@@ -363,26 +365,45 @@ class TestRecoverAbandonedStatement:
                    worker_host = 'dead-host',
                    updated = $1
                WHERE id = $2""",
-            datetime.utcnow(),
-            job_id
+            old_time,
+            old_job_id
+        )
+
+        # Recent job: updated 1 minute ago (should NOT be recovered with 5 min timeout)
+        recent_time = datetime.utcnow() - timedelta(minutes=1)
+        await db_connection.execute(
+            """UPDATE jorb
+               SET state = 'claimed',
+                   worker_pid = 99998,
+                   worker_host = 'dead-host',
+                   updated = $1
+               WHERE id = $2""",
+            recent_time,
+            recent_job_id
         )
 
         from pyjobby.pj import STMTS
 
-        # Recover jobs from dead-host
+        # Recover jobs from dead-host older than 5 minutes
+        recovery_timeout = timedelta(minutes=5)
         results = await db_connection.fetch(
             STMTS["recover-abandoned"],
-            "dead-host"
+            "dead-host",
+            recovery_timeout
         )
 
+        # Should only recover the old job, not the recent one
         assert len(results) == 1
-        assert results[0]["id"] == job_id
-        # Note: "old_state" is misleadingly named - it's actually the NEW state after update
+        assert results[0]["id"] == old_job_id
         assert results[0]["old_state"] == "queued"
 
-        # Verify job is now queued
-        job = await get_job(db_connection, job_id)
-        assert job["state"] == "queued"
+        # Verify old job is now queued
+        old_job = await get_job(db_connection, old_job_id)
+        assert old_job["state"] == "queued"
+
+        # Verify recent job is still claimed (not recovered)
+        recent_job = await get_job(db_connection, recent_job_id)
+        assert recent_job["state"] == "claimed"
 
 
 class TestEnqueueStatements:
