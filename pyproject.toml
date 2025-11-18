@@ -15,6 +15,7 @@ aiohttp = "^3.7.3"
 [tool.poetry.scripts]
 pj = "pyjobby.pj:workit"
 pj-admin = "pyjobby.cli:cli"
+pj-web = "pyjobby.web_admin:main"
 
 [tool.poetry.group.test.dependencies]
 pytest = "^8.0"
