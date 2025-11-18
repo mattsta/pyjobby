@@ -246,7 +246,7 @@ STMTS[
                 job_class, kwargs, queue, prio, uid, capability,
                 TIMEZONE('utc', clock_timestamp()) + $2::interval as run_after,
                 run_group,
-                jsonb_set(COALESCE(admin_data, '{}'::jsonb), '{parent_job_id}', to_jsonb($1::bigint)),
+                jsonb_set(COALESCE(admin_data::jsonb, '{}'::jsonb), '{parent_job_id}', to_jsonb($1::bigint))::json,
                 'queued' as state,
                 $3 as error_count
             FROM jorb

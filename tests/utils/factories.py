@@ -8,8 +8,6 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
-import orjson
-
 
 def make_job_kwargs(
     job_class: str = "test.TestJob",
@@ -55,7 +53,7 @@ def make_job_kwargs(
 
     return {
         "job_class": job_class,
-        "kwargs": orjson.dumps(kwargs),
+        "kwargs": kwargs,  # Pass raw dict - asyncpg will serialize with orjson
         "queue": queue,
         "prio": prio,
         "state": state,
@@ -66,7 +64,7 @@ def make_job_kwargs(
         "waitfor_group": waitfor_group,
         "capability": capability,
         "deadline_key": deadline_key,
-        "admin_data": orjson.dumps(admin_data) if admin_data else None,
+        "admin_data": admin_data,  # Pass raw dict - asyncpg will serialize with orjson
     }
 
 

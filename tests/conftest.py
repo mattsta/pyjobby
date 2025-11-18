@@ -50,38 +50,8 @@ def db_params() -> dict[str, str]:
     }
 
 
-@pytest_asyncio.fixture(scope="session")
-async def db_session_connection(db_params: dict[str, str]) -> AsyncIterator[asyncpg.Connection]:
-    """
-    Create a session-level database connection for schema setup.
-
-    This connection is used once to initialize the schema and stays
-    open for the entire test session.
-
-    Yields:
-        asyncpg.Connection: Session database connection
-    """
-    conn = await asyncpg.connect(**db_params)
-
-    # Load schema (once per session)
-    if SCHEMA_PATH.exists():
-        # Drop existing schema to start fresh
-        await conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
-        await conn.execute("CREATE SCHEMA public")
-
-        # Load schema
-        schema_sql = SCHEMA_PATH.read_text()
-        await conn.execute(schema_sql)
-
-    yield conn
-
-    await conn.close()
-
-
 @pytest_asyncio.fixture
-async def db_connection(
-    db_params: dict[str, str], db_session_connection
-) -> AsyncIterator[asyncpg.Connection]:
+async def db_connection(db_params: dict[str, str]) -> AsyncIterator[asyncpg.Connection]:
     """
     Create an asyncpg connection to the test database for each test.
 
@@ -97,16 +67,20 @@ async def db_connection(
     try:
         import orjson
 
+        # orjson.dumps returns bytes, so decode to str for asyncpg
+        def orjson_encoder(obj):
+            return orjson.dumps(obj).decode('utf-8')
+
         await conn.set_type_codec(
             "json",
-            encoder=orjson.dumps,
+            encoder=orjson_encoder,
             decoder=orjson.loads,
             schema="pg_catalog",
         )
         # Also configure jsonb
         await conn.set_type_codec(
             "jsonb",
-            encoder=orjson.dumps,
+            encoder=orjson_encoder,
             decoder=orjson.loads,
             schema="pg_catalog",
         )
@@ -157,7 +131,6 @@ def worker_params() -> dict:
         "max_retries": 10,
         "default_timeout": 3600,
         "enable_recovery": True,
-        "recovery_timeout": 300,
     }
 
 
