@@ -11,6 +11,8 @@ click = "^8.0.0"
 asyncpg = "^0.29.0"
 loguru = "^0.5.3"
 aiohttp = "^3.7.3"
+croniter = "^2.0.0"
+pytz = "^2024.1"
 
 [tool.poetry.scripts]
 pj = "pyjobby.pj:workit"

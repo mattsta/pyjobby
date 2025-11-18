@@ -684,5 +684,420 @@ def metrics(ctx, queue, since_hours, output_json):
     asyncio.run(_metrics())
 
 
+# =========================================================================
+# Schedule Management Commands
+# =========================================================================
+
+@cli.group()
+def schedule():
+    """Manage recurring schedules"""
+    pass
+
+
+@schedule.command('list')
+@click.option('--enabled', type=bool, help='Filter by enabled status (true/false)')
+@click.option('--queue', '-q', help='Filter by queue')
+@click.option('--limit', '-l', default=100, help='Max results (default: 100)')
+@click.option('--json', 'output_json', is_flag=True, help='Output as JSON')
+@click.pass_context
+def schedule_list(ctx, enabled, queue, limit, output_json):
+    """List recurring schedules"""
+    async def _list():
+        conn = await get_connection(ctx.obj['config'])
+        try:
+            api = AdminAPI(conn)
+            schedules = await api.list_schedules(
+                enabled=enabled,
+                queue=queue,
+                limit=limit
+            )
+
+            if output_json:
+                click.echo(json.dumps(schedules, indent=2, default=str))
+            else:
+                if not schedules:
+                    print_warning("No schedules found")
+                    return
+
+                headers = ['ID', 'Name', 'Enabled', 'Cron', 'Queue', 'Next Run', 'Last Success']
+                rows = []
+                for s in schedules:
+                    rows.append([
+                        str(s['id']),
+                        s['name'][:30],
+                        '✓' if s['enabled'] else '✗',
+                        s['cron_expr'],
+                        s['queue'],
+                        s['next_run'].strftime('%Y-%m-%d %H:%M') if s.get('next_run') else '-',
+                        s['last_success'].strftime('%Y-%m-%d %H:%M') if s.get('last_success') else 'Never',
+                    ])
+
+                print_table(headers, rows)
+                click.echo(f"\nTotal: {len(schedules)} schedule(s)")
+
+        finally:
+            await conn.close()
+
+    asyncio.run(_list())
+
+
+@schedule.command('show')
+@click.argument('name_or_id')
+@click.option('--json', 'output_json', is_flag=True, help='Output as JSON')
+@click.pass_context
+def schedule_show(ctx, name_or_id, output_json):
+    """Show schedule details"""
+    async def _show():
+        conn = await get_connection(ctx.obj['config'])
+        try:
+            api = AdminAPI(conn)
+
+            # Try as ID first, then as name
+            try:
+                schedule_id = int(name_or_id)
+                sched = await api.get_schedule(schedule_id=schedule_id)
+            except ValueError:
+                sched = await api.get_schedule(name=name_or_id)
+
+            if not sched:
+                print_error(f"Schedule not found: {name_or_id}")
+                return
+
+            if output_json:
+                click.echo(json.dumps(sched, indent=2, default=str))
+            else:
+                click.echo(f"\n{Colors.BOLD}Schedule: {sched['name']}{Colors.ENDC}")
+                click.echo("-" * 60)
+                click.echo(f"ID:                    {sched['id']}")
+                click.echo(f"Enabled:               {'✓ Yes' if sched['enabled'] else '✗ No'}")
+                click.echo(f"Description:           {sched.get('description') or '-'}")
+                click.echo(f"\n{Colors.BOLD}Schedule:{Colors.ENDC}")
+                click.echo(f"Cron Expression:       {sched['cron_expr']}")
+                click.echo(f"Timezone:              {sched['timezone']}")
+                click.echo(f"Next Run:              {sched.get('next_run')}")
+                click.echo(f"\n{Colors.BOLD}Job Configuration:{Colors.ENDC}")
+                click.echo(f"Job Class:             {sched['job_class']}")
+                click.echo(f"Queue:                 {sched['queue']}")
+                click.echo(f"Priority:              {sched['prio']}")
+                click.echo(f"Capability:            {sched.get('capability') or '-'}")
+                click.echo(f"Arguments:             {json.dumps(sched['kwargs'])}")
+                click.echo(f"\n{Colors.BOLD}Safety Features:{Colors.ENDC}")
+                click.echo(f"Max Concurrent Jobs:   {sched['max_concurrent_jobs']}")
+                click.echo(f"Jitter (seconds):      {sched['jitter_seconds']}")
+                click.echo(f"Backpressure Threshold:{sched.get('backpressure_threshold') or 'None'}")
+                click.echo(f"Circuit Breaker:       {sched['circuit_breaker_threshold']} failures")
+                click.echo(f"\n{Colors.BOLD}Statistics:{Colors.ENDC}")
+                click.echo(f"Total Runs:            {sched['run_count']}")
+                click.echo(f"Successes:             {sched['success_count']}")
+                click.echo(f"Failures:              {sched['failure_count']}")
+                click.echo(f"Skips:                 {sched['skip_count']}")
+                click.echo(f"Consecutive Failures:  {sched['consecutive_failures']}")
+                click.echo(f"Last Run:              {sched.get('last_run') or 'Never'}")
+                click.echo(f"Last Success:          {sched.get('last_success') or 'Never'}")
+                click.echo(f"Last Failure:          {sched.get('last_failure') or 'Never'}")
+
+        finally:
+            await conn.close()
+
+    asyncio.run(_show())
+
+
+@schedule.command('add')
+@click.argument('name')
+@click.argument('job_class')
+@click.argument('cron_expr')
+@click.option('--queue', '-q', default='default', help='Target queue')
+@click.option('--kwargs', help='Job kwargs as JSON')
+@click.option('--prio', '-p', type=int, default=100, help='Priority (default: 100)')
+@click.option('--capability', help='Required worker capability')
+@click.option('--timezone', default='UTC', help='Timezone (default: UTC)')
+@click.option('--max-concurrent', type=int, default=1, help='Max concurrent jobs (default: 1)')
+@click.option('--jitter', type=int, default=0, help='Random jitter in seconds (default: 0)')
+@click.option('--backpressure', type=int, default=1000, help='Backpressure threshold (default: 1000)')
+@click.option('--circuit-breaker', type=int, default=5, help='Circuit breaker threshold (default: 5)')
+@click.option('--description', help='Schedule description')
+@click.option('--disabled', is_flag=True, help='Create schedule in disabled state')
+@click.pass_context
+def schedule_add(ctx, name, job_class, cron_expr, queue, kwargs, prio, capability,
+                 timezone, max_concurrent, jitter, backpressure, circuit_breaker,
+                 description, disabled):
+    """Create new recurring schedule
+
+    Examples:
+        pj-admin schedule add daily-cleanup CleanupJob "0 2 * * *"
+        pj-admin schedule add hourly-report ReportJob "0 * * * *" --queue reports
+        pj-admin schedule add sync SyncJob "*/5 * * * *" --jitter 60 --max-concurrent 3
+    """
+    async def _add():
+        conn = await get_connection(ctx.obj['config'])
+        try:
+            api = AdminAPI(conn)
+
+            # Parse kwargs if provided
+            job_kwargs = {}
+            if kwargs:
+                try:
+                    job_kwargs = json.loads(kwargs)
+                except json.JSONDecodeError as e:
+                    print_error(f"Invalid JSON for kwargs: {e}")
+                    return
+
+            sched = await api.create_schedule(
+                name=name,
+                job_class=job_class,
+                cron_expr=cron_expr,
+                queue=queue,
+                kwargs=job_kwargs,
+                prio=prio,
+                capability=capability,
+                timezone=timezone,
+                enabled=not disabled,
+                max_concurrent_jobs=max_concurrent,
+                jitter_seconds=jitter,
+                backpressure_threshold=backpressure,
+                circuit_breaker_threshold=circuit_breaker,
+                description=description,
+            )
+
+            print_success(f"✓ Schedule created: {sched['name']} (ID: {sched['id']})")
+            click.echo(f"  Next run: {sched['next_run']}")
+            click.echo(f"  Cron:     {sched['cron_expr']}")
+            click.echo(f"  Queue:    {sched['queue']}")
+
+        except ValueError as e:
+            print_error(str(e))
+        except Exception as e:
+            print_error(f"Failed to create schedule: {e}")
+        finally:
+            await conn.close()
+
+    asyncio.run(_add())
+
+
+@schedule.command('enable')
+@click.argument('name_or_id')
+@click.pass_context
+def schedule_enable(ctx, name_or_id):
+    """Enable a disabled schedule"""
+    async def _enable():
+        conn = await get_connection(ctx.obj['config'])
+        try:
+            api = AdminAPI(conn)
+
+            # Try as ID first, then as name
+            try:
+                schedule_id = int(name_or_id)
+                sched = await api.get_schedule(schedule_id=schedule_id)
+            except ValueError:
+                sched = await api.get_schedule(name=name_or_id)
+                schedule_id = sched['id'] if sched else None
+
+            if not sched:
+                print_error(f"Schedule not found: {name_or_id}")
+                return
+
+            await api.enable_schedule(schedule_id)
+            print_success(f"✓ Schedule enabled: {sched['name']}")
+
+        except Exception as e:
+            print_error(f"Failed to enable schedule: {e}")
+        finally:
+            await conn.close()
+
+    asyncio.run(_enable())
+
+
+@schedule.command('disable')
+@click.argument('name_or_id')
+@click.pass_context
+def schedule_disable(ctx, name_or_id):
+    """Disable an enabled schedule"""
+    async def _disable():
+        conn = await get_connection(ctx.obj['config'])
+        try:
+            api = AdminAPI(conn)
+
+            # Try as ID first, then as name
+            try:
+                schedule_id = int(name_or_id)
+                sched = await api.get_schedule(schedule_id=schedule_id)
+            except ValueError:
+                sched = await api.get_schedule(name=name_or_id)
+                schedule_id = sched['id'] if sched else None
+
+            if not sched:
+                print_error(f"Schedule not found: {name_or_id}")
+                return
+
+            await api.disable_schedule(schedule_id)
+            print_success(f"✓ Schedule disabled: {sched['name']}")
+
+        except Exception as e:
+            print_error(f"Failed to disable schedule: {e}")
+        finally:
+            await conn.close()
+
+    asyncio.run(_disable())
+
+
+@schedule.command('delete')
+@click.argument('name_or_id')
+@click.confirmation_option(prompt='Are you sure you want to delete this schedule?')
+@click.pass_context
+def schedule_delete(ctx, name_or_id):
+    """Delete a recurring schedule"""
+    async def _delete():
+        conn = await get_connection(ctx.obj['config'])
+        try:
+            api = AdminAPI(conn)
+
+            # Try as ID first, then as name
+            try:
+                schedule_id = int(name_or_id)
+                sched = await api.get_schedule(schedule_id=schedule_id)
+            except ValueError:
+                sched = await api.get_schedule(name=name_or_id)
+                schedule_id = sched['id'] if sched else None
+
+            if not sched:
+                print_error(f"Schedule not found: {name_or_id}")
+                return
+
+            await api.delete_schedule(schedule_id)
+            print_success(f"✓ Schedule deleted: {sched['name']}")
+
+        except Exception as e:
+            print_error(f"Failed to delete schedule: {e}")
+        finally:
+            await conn.close()
+
+    asyncio.run(_delete())
+
+
+@schedule.command('history')
+@click.argument('name_or_id')
+@click.option('--result', help='Filter by result (success, failure, skipped)')
+@click.option('--limit', '-l', default=50, help='Max results (default: 50)')
+@click.option('--json', 'output_json', is_flag=True, help='Output as JSON')
+@click.pass_context
+def schedule_history(ctx, name_or_id, result, limit, output_json):
+    """Show schedule execution history"""
+    async def _history():
+        conn = await get_connection(ctx.obj['config'])
+        try:
+            api = AdminAPI(conn)
+
+            # Try as ID first, then as name
+            try:
+                schedule_id = int(name_or_id)
+                sched = await api.get_schedule(schedule_id=schedule_id)
+            except ValueError:
+                sched = await api.get_schedule(name=name_or_id)
+                schedule_id = sched['id'] if sched else None
+
+            if not sched:
+                print_error(f"Schedule not found: {name_or_id}")
+                return
+
+            history = await api.get_schedule_history(
+                schedule_id=schedule_id,
+                result_filter=result,
+                limit=limit
+            )
+
+            if output_json:
+                click.echo(json.dumps(history, indent=2, default=str))
+            else:
+                if not history:
+                    print_warning(f"No execution history for {sched['name']}")
+                    return
+
+                click.echo(f"\n{Colors.BOLD}Execution History: {sched['name']}{Colors.ENDC}")
+                headers = ['Time', 'Result', 'Job ID', 'Duration', 'Details']
+                rows = []
+                for h in history:
+                    result_icon = {
+                        'success': f"{Colors.OKGREEN}✓{Colors.ENDC}",
+                        'failure': f"{Colors.FAIL}✗{Colors.ENDC}",
+                        'skipped': f"{Colors.WARNING}-{Colors.ENDC}",
+                    }.get(h['result'], h['result'])
+
+                    details = ''
+                    if h['result'] == 'skipped' and h.get('skip_reason'):
+                        details = h['skip_reason']
+                    elif h['result'] == 'failure' and h.get('error_message'):
+                        details = h['error_message'][:40]
+
+                    rows.append([
+                        h['actual_time'].strftime('%Y-%m-%d %H:%M:%S') if h.get('actual_time') else '-',
+                        result_icon,
+                        str(h.get('job_id') or '-'),
+                        f"{h['duration_ms']}ms" if h.get('duration_ms') else '-',
+                        details,
+                    ])
+
+                print_table(headers, rows)
+                click.echo(f"\nTotal: {len(history)} execution(s)")
+
+        finally:
+            await conn.close()
+
+    asyncio.run(_history())
+
+
+@schedule.command('stats')
+@click.option('--json', 'output_json', is_flag=True, help='Output as JSON')
+@click.pass_context
+def schedule_stats(ctx, output_json):
+    """Show execution statistics for all schedules"""
+    async def _stats():
+        conn = await get_connection(ctx.obj['config'])
+        try:
+            api = AdminAPI(conn)
+            stats = await api.get_schedule_stats()
+
+            if output_json:
+                click.echo(json.dumps(stats, indent=2, default=str))
+            else:
+                if not stats:
+                    print_warning("No schedules found")
+                    return
+
+                click.echo(f"\n{Colors.BOLD}Schedule Statistics{Colors.ENDC}")
+                headers = ['Name', 'Enabled', 'Runs', 'Success', 'Fails', 'Skips', 'Rate', 'Next']
+                rows = []
+                for s in stats:
+                    success_rate = s.get('success_rate_pct')
+                    rate_str = f"{success_rate:.1f}%" if success_rate is not None else '-'
+
+                    # Color code success rate
+                    if success_rate is not None:
+                        if success_rate >= 95:
+                            rate_str = f"{Colors.OKGREEN}{rate_str}{Colors.ENDC}"
+                        elif success_rate >= 80:
+                            rate_str = f"{Colors.WARNING}{rate_str}{Colors.ENDC}"
+                        else:
+                            rate_str = f"{Colors.FAIL}{rate_str}{Colors.ENDC}"
+
+                    rows.append([
+                        s['name'][:25],
+                        '✓' if s['enabled'] else '✗',
+                        str(s['run_count']),
+                        str(s['success_count']),
+                        str(s['failure_count']),
+                        str(s['skip_count']),
+                        rate_str,
+                        s['next_run'].strftime('%m-%d %H:%M') if s.get('next_run') else '-',
+                    ])
+
+                print_table(headers, rows)
+                click.echo(f"\nTotal: {len(stats)} schedule(s)")
+
+        finally:
+            await conn.close()
+
+    asyncio.run(_stats())
+
+
 if __name__ == '__main__':
     cli(obj={})

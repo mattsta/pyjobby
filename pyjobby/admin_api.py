@@ -12,6 +12,7 @@ import asyncpg
 from typing import Optional, Any
 from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
+import json
 
 
 @dataclass
@@ -757,3 +758,361 @@ class AdminAPI:
             "new_job_id": new_job_id,
             "status": "retry_queued_from_dlq"
         }
+
+    # =========================================================================
+    # Schedule Management
+    # =========================================================================
+
+    async def list_schedules(
+        self,
+        enabled: Optional[bool] = None,
+        queue: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """
+        List recurring schedules with optional filtering.
+
+        Args:
+            enabled: Filter by enabled status (True/False/None for all)
+            queue: Filter by queue name
+            limit: Maximum number of results (default: 100)
+            offset: Offset for pagination (default: 0)
+
+        Returns:
+            List of schedule dictionaries
+        """
+        where_clauses = []
+        params = []
+        param_idx = 1
+
+        if enabled is not None:
+            where_clauses.append(f"enabled = ${param_idx}")
+            params.append(enabled)
+            param_idx += 1
+
+        if queue:
+            where_clauses.append(f"queue = ${param_idx}")
+            params.append(queue)
+            param_idx += 1
+
+        where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
+        query = f"""
+            SELECT * FROM jorb_schedule
+            {where_sql}
+            ORDER BY name ASC
+            LIMIT ${param_idx} OFFSET ${param_idx + 1}
+        """
+        params.extend([limit, offset])
+
+        records = await self.conn.fetch(query, *params)
+        return [dict(r) for r in records]
+
+    async def get_schedule(
+        self, schedule_id: Optional[int] = None, name: Optional[str] = None
+    ) -> Optional[dict[str, Any]]:
+        """
+        Get single schedule by ID or name.
+
+        Args:
+            schedule_id: Schedule ID (optional)
+            name: Schedule name (optional)
+
+        Returns:
+            Schedule dictionary or None if not found
+        """
+        if schedule_id:
+            record = await self.conn.fetchrow(
+                "SELECT * FROM jorb_schedule WHERE id = $1", schedule_id
+            )
+        elif name:
+            record = await self.conn.fetchrow(
+                "SELECT * FROM jorb_schedule WHERE name = $1", name
+            )
+        else:
+            raise ValueError("Must provide either schedule_id or name")
+
+        return dict(record) if record else None
+
+    async def create_schedule(
+        self,
+        name: str,
+        job_class: str,
+        cron_expr: str,
+        queue: str = "default",
+        kwargs: Optional[dict] = None,
+        prio: int = 100,
+        capability: Optional[str] = None,
+        timezone: str = "UTC",
+        enabled: bool = True,
+        max_concurrent_jobs: int = 1,
+        jitter_seconds: int = 0,
+        backpressure_threshold: Optional[int] = 1000,
+        circuit_breaker_threshold: int = 5,
+        description: Optional[str] = None,
+        created_by: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Create new recurring schedule.
+
+        Args:
+            name: Unique schedule name
+            job_class: Python class to execute
+            cron_expr: Cron expression (e.g., "0 2 * * *" for 2am daily)
+            queue: Target queue (default: 'default')
+            kwargs: Job arguments (default: {})
+            prio: Job priority (default: 100)
+            capability: Required worker capability (optional)
+            timezone: Schedule timezone (default: 'UTC')
+            enabled: Is schedule active? (default: True)
+            max_concurrent_jobs: Max jobs running at once (default: 1)
+            jitter_seconds: Random delay 0-N seconds (default: 0)
+            backpressure_threshold: Skip if queue depth > N (default: 1000)
+            circuit_breaker_threshold: Consecutive failures to disable (default: 5)
+            description: Human-readable description (optional)
+            created_by: Who created this (optional)
+
+        Returns:
+            Created schedule dictionary
+        """
+        from croniter import croniter
+        import pytz
+
+        # Validate cron expression
+        try:
+            tz = pytz.timezone(timezone)
+            now = datetime.now(tz)
+            cron = croniter(cron_expr, now)
+            next_run = cron.get_next(datetime)
+        except Exception as e:
+            raise ValueError(f"Invalid cron expression or timezone: {e}")
+
+        # Create schedule
+        record = await self.conn.fetchrow("""
+            INSERT INTO jorb_schedule (
+                name, description, job_class, kwargs, queue, prio, capability,
+                cron_expr, timezone, enabled,
+                max_concurrent_jobs, jitter_seconds,
+                backpressure_threshold, circuit_breaker_threshold,
+                next_run, created_by
+            ) VALUES (
+                $1, $2, $3, $4::jsonb, $5, $6, $7,
+                $8, $9, $10,
+                $11, $12, $13, $14,
+                $15, $16
+            )
+            RETURNING *
+        """,
+            name, description, job_class,
+            json.dumps(kwargs or {}), queue, prio, capability,
+            cron_expr, timezone, enabled,
+            max_concurrent_jobs, jitter_seconds,
+            backpressure_threshold, circuit_breaker_threshold,
+            next_run, created_by
+        )
+
+        return dict(record)
+
+    async def update_schedule(
+        self,
+        schedule_id: int,
+        **updates: Any
+    ) -> dict[str, Any]:
+        """
+        Update existing schedule.
+
+        Args:
+            schedule_id: Schedule ID
+            **updates: Fields to update (name, description, cron_expr, etc.)
+
+        Returns:
+            Updated schedule dictionary
+        """
+        # Allowed fields for update
+        allowed_fields = {
+            'name', 'description', 'job_class', 'kwargs', 'queue', 'prio',
+            'capability', 'cron_expr', 'timezone', 'enabled',
+            'max_concurrent_jobs', 'jitter_seconds',
+            'backpressure_threshold', 'circuit_breaker_threshold'
+        }
+
+        # Filter to only allowed fields
+        updates = {k: v for k, v in updates.items() if k in allowed_fields}
+
+        if not updates:
+            raise ValueError("No valid fields to update")
+
+        # If cron_expr or timezone changed, recalculate next_run
+        if 'cron_expr' in updates or 'timezone' in updates:
+            schedule = await self.get_schedule(schedule_id=schedule_id)
+            if not schedule:
+                raise ValueError(f"Schedule {schedule_id} not found")
+
+            from croniter import croniter
+            import pytz
+
+            cron_expr = updates.get('cron_expr', schedule['cron_expr'])
+            timezone = updates.get('timezone', schedule['timezone'])
+
+            try:
+                tz = pytz.timezone(timezone)
+                now = datetime.now(tz)
+                cron = croniter(cron_expr, now)
+                next_run = cron.get_next(datetime)
+                updates['next_run'] = next_run
+            except Exception as e:
+                raise ValueError(f"Invalid cron expression or timezone: {e}")
+
+        # Build UPDATE query dynamically
+        set_clauses = []
+        params = []
+        param_idx = 1
+
+        for field, value in updates.items():
+            set_clauses.append(f"{field} = ${param_idx}")
+            params.append(value)
+            param_idx += 1
+
+        # Always update 'updated' timestamp
+        set_clauses.append(f"updated = NOW()")
+
+        params.append(schedule_id)
+
+        query = f"""
+            UPDATE jorb_schedule
+            SET {', '.join(set_clauses)}
+            WHERE id = ${param_idx}
+            RETURNING *
+        """
+
+        record = await self.conn.fetchrow(query, *params)
+
+        if not record:
+            raise ValueError(f"Schedule {schedule_id} not found")
+
+        return dict(record)
+
+    async def delete_schedule(self, schedule_id: int) -> dict[str, str]:
+        """
+        Delete recurring schedule.
+
+        Args:
+            schedule_id: Schedule ID
+
+        Returns:
+            Status dictionary
+        """
+        result = await self.conn.execute(
+            "DELETE FROM jorb_schedule WHERE id = $1", schedule_id
+        )
+
+        if result == "DELETE 0":
+            raise ValueError(f"Schedule {schedule_id} not found")
+
+        return {"status": "deleted", "schedule_id": str(schedule_id)}
+
+    async def enable_schedule(self, schedule_id: int) -> dict[str, Any]:
+        """
+        Enable a disabled schedule.
+
+        Args:
+            schedule_id: Schedule ID
+
+        Returns:
+            Updated schedule dictionary
+        """
+        return await self.update_schedule(
+            schedule_id,
+            enabled=True,
+            consecutive_failures=0  # Reset failure counter
+        )
+
+    async def disable_schedule(self, schedule_id: int) -> dict[str, Any]:
+        """
+        Disable an enabled schedule.
+
+        Args:
+            schedule_id: Schedule ID
+
+        Returns:
+            Updated schedule dictionary
+        """
+        return await self.update_schedule(schedule_id, enabled=False)
+
+    async def get_schedule_history(
+        self,
+        schedule_id: int,
+        limit: int = 100,
+        offset: int = 0,
+        result_filter: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Get execution history for a schedule.
+
+        Args:
+            schedule_id: Schedule ID
+            limit: Maximum number of results (default: 100)
+            offset: Offset for pagination (default: 0)
+            result_filter: Filter by result ('success', 'failure', 'skipped')
+
+        Returns:
+            List of execution log dictionaries
+        """
+        where_clauses = ["schedule_id = $1"]
+        params = [schedule_id]
+        param_idx = 2
+
+        if result_filter:
+            where_clauses.append(f"result = ${param_idx}")
+            params.append(result_filter)
+            param_idx += 1
+
+        where_sql = "WHERE " + " AND ".join(where_clauses)
+
+        query = f"""
+            SELECT * FROM jorb_schedule_log
+            {where_sql}
+            ORDER BY created DESC
+            LIMIT ${param_idx} OFFSET ${param_idx + 1}
+        """
+        params.extend([limit, offset])
+
+        records = await self.conn.fetch(query, *params)
+        return [dict(r) for r in records]
+
+    async def get_schedule_stats(self) -> list[dict[str, Any]]:
+        """
+        Get execution statistics for all schedules.
+
+        Returns:
+            List of schedule statistics
+        """
+        records = await self.conn.fetch("""
+            SELECT
+                id,
+                name,
+                enabled,
+                cron_expr,
+                queue,
+                next_run,
+                last_run,
+                last_success,
+                last_failure,
+                run_count,
+                success_count,
+                failure_count,
+                skip_count,
+                consecutive_failures,
+                CASE
+                    WHEN success_count + failure_count = 0 THEN NULL
+                    ELSE ROUND(
+                        (success_count::numeric / (success_count + failure_count)) * 100,
+                        2
+                    )
+                END as success_rate_pct
+            FROM jorb_schedule
+            ORDER BY name ASC
+        """)
+
+        return [dict(r) for r in records]

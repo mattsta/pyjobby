@@ -48,6 +48,7 @@ class WebAdminServer:
         self.app.router.add_get('/workers', self.workers_page)
         self.app.router.add_get('/dlq', self.dlq_page)
         self.app.router.add_get('/metrics', self.metrics_page)
+        self.app.router.add_get('/schedules', self.schedules_page)
 
         # API endpoints for htmx
         self.app.router.add_get('/api/jobs', self.api_jobs_list)
@@ -66,6 +67,15 @@ class WebAdminServer:
         self.app.router.add_post('/api/dlq/{job_id}/retry', self.api_dlq_retry)
 
         self.app.router.add_get('/api/metrics', self.api_metrics)
+
+        # Schedule management endpoints
+        self.app.router.add_get('/api/schedules', self.api_schedules_list)
+        self.app.router.add_get('/api/schedules/{schedule_id}', self.api_schedule_get)
+        self.app.router.add_post('/api/schedules', self.api_schedule_create)
+        self.app.router.add_post('/api/schedules/{schedule_id}/enable', self.api_schedule_enable)
+        self.app.router.add_post('/api/schedules/{schedule_id}/disable', self.api_schedule_disable)
+        self.app.router.add_delete('/api/schedules/{schedule_id}', self.api_schedule_delete)
+        self.app.router.add_get('/api/schedules/{schedule_id}/history', self.api_schedule_history)
 
     async def get_api(self) -> AdminAPI:
         """Get AdminAPI instance with fresh database connection"""
@@ -515,6 +525,485 @@ class WebAdminServer:
                 return web.Response(text=html, content_type='text/html')
             else:
                 return web.json_response(metrics)
+        finally:
+            await api.conn.close()
+
+    # =========================================================================
+    # Schedule Management Pages & API
+    # =========================================================================
+
+    async def schedules_page(self, request: web.Request) -> web.Response:
+        """Schedules management page"""
+        html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Schedules - Pyjobby Admin</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f5f5;
+        }
+
+        .header {
+            background: #2c3e50;
+            color: white;
+            padding: 1rem 2rem;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        .actions {
+            margin-bottom: 2rem;
+            display: flex;
+            gap: 1rem;
+            align-items: center;
+        }
+
+        .btn {
+            background: #3498db;
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .btn:hover {
+            background: #2980b9;
+        }
+
+        .btn-danger {
+            background: #e74c3c;
+        }
+
+        .btn-danger:hover {
+            background: #c0392b;
+        }
+
+        .btn-success {
+            background: #27ae60;
+        }
+
+        .btn-success:hover {
+            background: #229954;
+        }
+
+        table {
+            width: 100%;
+            background: white;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        th {
+            background: #34495e;
+            color: white;
+            padding: 1rem;
+            text-align: left;
+            font-weight: 500;
+        }
+
+        td {
+            padding: 1rem;
+            border-bottom: 1px solid #ecf0f1;
+        }
+
+        tr:hover {
+            background: #f8f9fa;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .badge-enabled {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .badge-disabled {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        .badge-success {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .badge-warning {
+            background: #fff3cd;
+            color: #856404;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            z-index: 1000;
+        }
+
+        .modal.active {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal-content {
+            background: white;
+            padding: 2rem;
+            border-radius: 8px;
+            width: 90%;
+            max-width: 600px;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+
+        .form-group {
+            margin-bottom: 1rem;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: 500;
+        }
+
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+            width: 100%;
+            padding: 0.5rem;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Pyjobby Admin - Recurring Schedules</h1>
+        <nav>
+            <a href="/" style="color: white; margin-right: 1rem;">Dashboard</a>
+            <a href="/jobs" style="color: white; margin-right: 1rem;">Jobs</a>
+            <a href="/queues" style="color: white; margin-right: 1rem;">Queues</a>
+            <a href="/schedules" style="color: #3498db; margin-right: 1rem;">Schedules</a>
+        </nav>
+    </div>
+
+    <div class="container">
+        <div class="actions">
+            <button class="btn btn-success" onclick="showAddScheduleModal()">+ Add Schedule</button>
+            <button class="btn" hx-get="/api/schedules?format=html" hx-target="#schedules-table" hx-swap="innerHTML">
+                🔄 Refresh
+            </button>
+        </div>
+
+        <div id="schedules-table" hx-get="/api/schedules?format=html" hx-trigger="load, every 10s" hx-swap="innerHTML">
+            Loading schedules...
+        </div>
+    </div>
+
+    <!-- Add Schedule Modal -->
+    <div id="addScheduleModal" class="modal">
+        <div class="modal-content">
+            <h2>Create New Schedule</h2>
+            <form hx-post="/api/schedules" hx-target="#schedules-table" hx-swap="innerHTML" onsubmit="closeAddScheduleModal()">
+                <div class="form-group">
+                    <label>Schedule Name *</label>
+                    <input type="text" name="name" required placeholder="daily-cleanup">
+                </div>
+
+                <div class="form-group">
+                    <label>Job Class *</label>
+                    <input type="text" name="job_class" required placeholder="myapp.jobs.CleanupJob">
+                </div>
+
+                <div class="form-group">
+                    <label>Cron Expression *</label>
+                    <input type="text" name="cron_expr" required placeholder="0 2 * * *">
+                    <small>Examples: "0 2 * * *" (2am daily), "0 * * * *" (hourly), "*/5 * * * *" (every 5 min)</small>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Queue</label>
+                        <input type="text" name="queue" value="default">
+                    </div>
+                    <div class="form-group">
+                        <label>Priority</label>
+                        <input type="number" name="prio" value="100">
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>Description</label>
+                    <textarea name="description" rows="2" placeholder="What does this schedule do?"></textarea>
+                </div>
+
+                <h3 style="margin-top: 1.5rem; margin-bottom: 1rem;">Safety Features</h3>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Max Concurrent Jobs</label>
+                        <input type="number" name="max_concurrent_jobs" value="1" min="1">
+                    </div>
+                    <div class="form-group">
+                        <label>Jitter (seconds)</label>
+                        <input type="number" name="jitter_seconds" value="0" min="0">
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Backpressure Threshold</label>
+                        <input type="number" name="backpressure_threshold" value="1000" min="0">
+                    </div>
+                    <div class="form-group">
+                        <label>Circuit Breaker Threshold</label>
+                        <input type="number" name="circuit_breaker_threshold" value="5" min="1">
+                    </div>
+                </div>
+
+                <div style="margin-top: 2rem; display: flex; gap: 1rem;">
+                    <button type="submit" class="btn btn-success">Create Schedule</button>
+                    <button type="button" class="btn" onclick="closeAddScheduleModal()">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        function showAddScheduleModal() {
+            document.getElementById('addScheduleModal').classList.add('active');
+        }
+
+        function closeAddScheduleModal() {
+            document.getElementById('addScheduleModal').classList.remove('active');
+        }
+
+        window.onclick = function(event) {
+            const modal = document.getElementById('addScheduleModal');
+            if (event.target === modal) {
+                closeAddScheduleModal();
+            }
+        }
+    </script>
+</body>
+</html>"""
+        return web.Response(text=html, content_type='text/html')
+
+    async def api_schedules_list(self, request: web.Request) -> web.Response:
+        """List schedules (JSON or HTML)"""
+        api = await self.get_api()
+        try:
+            format_type = request.query.get('format', 'json')
+            enabled = request.query.get('enabled')
+            queue = request.query.get('queue')
+
+            # Convert enabled to bool if provided
+            enabled_bool = None
+            if enabled:
+                enabled_bool = enabled.lower() in ('true', '1', 'yes')
+
+            schedules = await api.list_schedules(
+                enabled=enabled_bool,
+                queue=queue if queue else None
+            )
+
+            if format_type == 'html':
+                html = '<table><thead><tr>'
+                html += '<th>Name</th><th>Status</th><th>Cron</th><th>Queue</th>'
+                html += '<th>Next Run</th><th>Stats</th><th>Actions</th>'
+                html += '</tr></thead><tbody>'
+
+                for s in schedules:
+                    status_badge = 'badge-enabled' if s['enabled'] else 'badge-disabled'
+                    status_text = 'Enabled' if s['enabled'] else 'Disabled'
+
+                    success_rate = None
+                    if s['success_count'] + s['failure_count'] > 0:
+                        success_rate = (s['success_count'] / (s['success_count'] + s['failure_count'])) * 100
+
+                    html += '<tr>'
+                    html += f'<td><strong>{s["name"]}</strong><br><small>{s.get("description") or ""}</small></td>'
+                    html += f'<td><span class="badge {status_badge}">{status_text}</span></td>'
+                    html += f'<td><code>{s["cron_expr"]}</code></td>'
+                    html += f'<td>{s["queue"]}</td>'
+                    html += f'<td>{s["next_run"].strftime("%Y-%m-%d %H:%M") if s.get("next_run") else "-"}</td>'
+                    html += f'<td>{s["run_count"]} runs<br>'
+                    if success_rate is not None:
+                        rate_class = 'badge-success' if success_rate >= 95 else 'badge-warning'
+                        html += f'<span class="badge {rate_class}">{success_rate:.1f}% success</span>'
+                    html += '</td>'
+                    html += f'<td>'
+
+                    schedule_id = s['id']
+                    if s['enabled']:
+                        html += f'<button class="btn btn-danger" hx-post="/api/schedules/{schedule_id}/disable" hx-target="#schedules-table" hx-swap="innerHTML">Disable</button>'
+                    else:
+                        html += f'<button class="btn btn-success" hx-post="/api/schedules/{schedule_id}/enable" hx-target="#schedules-table" hx-swap="innerHTML">Enable</button>'
+
+                    html += f' <button class="btn btn-danger" hx-delete="/api/schedules/{schedule_id}" hx-confirm="Delete schedule {s["name"]}?" hx-target="#schedules-table" hx-swap="innerHTML">Delete</button>'
+                    html += '</td>'
+                    html += '</tr>'
+
+                html += '</tbody></table>'
+                return web.Response(text=html, content_type='text/html')
+            else:
+                # JSON response
+                return web.json_response(schedules, dumps=lambda x: json.dumps(x, default=str))
+        finally:
+            await api.conn.close()
+
+    async def api_schedule_get(self, request: web.Request) -> web.Response:
+        """Get single schedule"""
+        api = await self.get_api()
+        try:
+            schedule_id = int(request.match_info['schedule_id'])
+            schedule = await api.get_schedule(schedule_id=schedule_id)
+
+            if not schedule:
+                return web.json_response({'error': 'Schedule not found'}, status=404)
+
+            return web.json_response(schedule, dumps=lambda x: json.dumps(x, default=str))
+        finally:
+            await api.conn.close()
+
+    async def api_schedule_create(self, request: web.Request) -> web.Response:
+        """Create new schedule"""
+        api = await self.get_api()
+        try:
+            data = await request.post()
+
+            schedule = await api.create_schedule(
+                name=data['name'],
+                job_class=data['job_class'],
+                cron_expr=data['cron_expr'],
+                queue=data.get('queue', 'default'),
+                prio=int(data.get('prio', 100)),
+                description=data.get('description'),
+                max_concurrent_jobs=int(data.get('max_concurrent_jobs', 1)),
+                jitter_seconds=int(data.get('jitter_seconds', 0)),
+                backpressure_threshold=int(data.get('backpressure_threshold', 1000)),
+                circuit_breaker_threshold=int(data.get('circuit_breaker_threshold', 5)),
+            )
+
+            # Return refreshed schedules list as HTML
+            schedules = await api.list_schedules()
+            html = '<table><thead><tr>'
+            html += '<th>Name</th><th>Status</th><th>Cron</th><th>Queue</th>'
+            html += '<th>Next Run</th><th>Stats</th><th>Actions</th>'
+            html += '</tr></thead><tbody>'
+
+            for s in schedules:
+                status_badge = 'badge-enabled' if s['enabled'] else 'badge-disabled'
+                status_text = 'Enabled' if s['enabled'] else 'Disabled'
+
+                success_rate = None
+                if s['success_count'] + s['failure_count'] > 0:
+                    success_rate = (s['success_count'] / (s['success_count'] + s['failure_count'])) * 100
+
+                html += '<tr>'
+                html += f'<td><strong>{s["name"]}</strong><br><small>{s.get("description") or ""}</small></td>'
+                html += f'<td><span class="badge {status_badge}">{status_text}</span></td>'
+                html += f'<td><code>{s["cron_expr"]}</code></td>'
+                html += f'<td>{s["queue"]}</td>'
+                html += f'<td>{s["next_run"].strftime("%Y-%m-%d %H:%M") if s.get("next_run") else "-"}</td>'
+                html += f'<td>{s["run_count"]} runs<br>'
+                if success_rate is not None:
+                    rate_class = 'badge-success' if success_rate >= 95 else 'badge-warning'
+                    html += f'<span class="badge {rate_class}">{success_rate:.1f}% success</span>'
+                html += '</td>'
+                html += f'<td>'
+
+                schedule_id = s['id']
+                if s['enabled']:
+                    html += f'<button class="btn btn-danger" hx-post="/api/schedules/{schedule_id}/disable" hx-target="#schedules-table" hx-swap="innerHTML">Disable</button>'
+                else:
+                    html += f'<button class="btn btn-success" hx-post="/api/schedules/{schedule_id}/enable" hx-target="#schedules-table" hx-swap="innerHTML">Enable</button>'
+
+                html += f' <button class="btn btn-danger" hx-delete="/api/schedules/{schedule_id}" hx-confirm="Delete schedule {s["name"]}?" hx-target="#schedules-table" hx-swap="innerHTML">Delete</button>'
+                html += '</td>'
+                html += '</tr>'
+
+            html += '</tbody></table>'
+            return web.Response(text=html, content_type='text/html')
+        except ValueError as e:
+            return web.json_response({'error': str(e)}, status=400)
+        finally:
+            await api.conn.close()
+
+    async def api_schedule_enable(self, request: web.Request) -> web.Response:
+        """Enable schedule"""
+        api = await self.get_api()
+        try:
+            schedule_id = int(request.match_info['schedule_id'])
+            await api.enable_schedule(schedule_id)
+
+            # Return refreshed list
+            return await self.api_schedules_list(request)
+        finally:
+            await api.conn.close()
+
+    async def api_schedule_disable(self, request: web.Request) -> web.Response:
+        """Disable schedule"""
+        api = await self.get_api()
+        try:
+            schedule_id = int(request.match_info['schedule_id'])
+            await api.disable_schedule(schedule_id)
+
+            # Return refreshed list
+            return await self.api_schedules_list(request)
+        finally:
+            await api.conn.close()
+
+    async def api_schedule_delete(self, request: web.Request) -> web.Response:
+        """Delete schedule"""
+        api = await self.get_api()
+        try:
+            schedule_id = int(request.match_info['schedule_id'])
+            await api.delete_schedule(schedule_id)
+
+            # Return refreshed list
+            return await self.api_schedules_list(request)
+        finally:
+            await api.conn.close()
+
+    async def api_schedule_history(self, request: web.Request) -> web.Response:
+        """Get schedule execution history"""
+        api = await self.get_api()
+        try:
+            schedule_id = int(request.match_info['schedule_id'])
+            limit = int(request.query.get('limit', 50))
+
+            history = await api.get_schedule_history(schedule_id=schedule_id, limit=limit)
+            return web.json_response(history, dumps=lambda x: json.dumps(x, default=str))
         finally:
             await api.conn.close()
 
