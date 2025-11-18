@@ -1,0 +1,3 @@
+"""
+Pyjobby test suite.
+"""
