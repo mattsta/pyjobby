@@ -68,7 +68,7 @@ CREATE TABLE public.jorb (
 );
 
 
-ALTER TABLE public.jorb OWNER TO kudzu;
+-- ALTER TABLE public.jorb OWNER TO kudzu;
 
 --
 -- Name: COLUMN jorb.queue; Type: COMMENT; Schema: public; Owner: kudzu

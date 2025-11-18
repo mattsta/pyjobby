@@ -8,7 +8,7 @@ authors = ["Matt Stancliff <matt@genges.com>"]
 python = "^3.9"
 orjson = "^3.5.0"
 click = "^8.0.0"
-asyncpg = "^0.23.0"
+asyncpg = "^0.29.0"
 loguru = "^0.5.3"
 aiohttp = "^3.7.3"
 
@@ -18,13 +18,9 @@ pj = "pyjobby.pj:workit"
 [tool.poetry.group.test.dependencies]
 pytest = "^8.0"
 pytest-asyncio = "^0.23"
-pytest-postgresql = "^5.0"
 pytest-cov = "^4.1"
 pytest-timeout = "^2.2"
 pytest-xdist = "^3.5"
-factory-boy = "^3.3"
-faker = "^22.0"
-psycopg2-binary = "^2.9"
 
 [tool.poetry.group.dev.dependencies]
 mypy = "^1.8"
