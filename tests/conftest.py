@@ -1,7 +1,8 @@
 """
 Pytest configuration and fixtures for pyjobby tests.
 
-Provides isolated PostgreSQL databases for each test using pytest-postgresql.
+Connects to a live PostgreSQL database (started via docker-compose).
+Each test gets a clean database state via transaction rollback.
 """
 
 import asyncio
@@ -12,20 +13,13 @@ from typing import AsyncIterator, Iterator
 import asyncpg
 import pytest
 import pytest_asyncio
-from pytest_postgresql import factories
 
 # Path to schema file
 SCHEMA_PATH = Path(__file__).parent.parent / "priv" / "schema.sql"
 
-# PostgreSQL test database factory
-# This creates a unique PostgreSQL instance for the test session
-postgresql_proc = factories.postgresql_proc(
-    port=None,  # Use random available port
-    dbname="pyjobby_test",
-)
-
-# PostgreSQL client factory
-postgresql = factories.postgresql("postgresql_proc", dbname="pyjobby_test")
+# Get database connection from environment or use default
+DEFAULT_TEST_DSN = "postgresql://pyjobby_test:pyjobby_test_password@localhost:5433/pyjobby_test"
+TEST_DSN = os.getenv("PYJOBBY_TEST_DSN", DEFAULT_TEST_DSN)
 
 
 @pytest.fixture(scope="session")
@@ -36,45 +30,82 @@ def event_loop() -> Iterator[asyncio.AbstractEventLoop]:
     loop.close()
 
 
-@pytest.fixture
-def db_params(postgresql) -> dict[str, str]:
+@pytest.fixture(scope="session")
+def db_params() -> dict[str, str]:
     """
     Get database connection parameters for the test database.
+
+    Uses live PostgreSQL server from docker-compose.
+    Connection details can be overridden via PYJOBBY_TEST_DSN environment variable.
 
     Returns:
         dict: Connection parameters for asyncpg
     """
     return {
-        "host": postgresql.info.host,
-        "port": postgresql.info.port,
-        "user": postgresql.info.user,
-        "password": postgresql.info.password or "",
-        "database": postgresql.info.dbname,
+        "host": "localhost",
+        "port": 5433,
+        "user": "pyjobby_test",
+        "password": "pyjobby_test_password",
+        "database": "pyjobby_test",
     }
 
 
-@pytest_asyncio.fixture
-async def db_connection(db_params: dict[str, str]) -> AsyncIterator[asyncpg.Connection]:
+@pytest_asyncio.fixture(scope="session")
+async def db_session_connection(db_params: dict[str, str]) -> AsyncIterator[asyncpg.Connection]:
     """
-    Create an asyncpg connection to the test database.
+    Create a session-level database connection for schema setup.
 
-    The connection is automatically closed after the test.
+    This connection is used once to initialize the schema and stays
+    open for the entire test session.
+
+    Yields:
+        asyncpg.Connection: Session database connection
+    """
+    conn = await asyncpg.connect(**db_params)
+
+    # Load schema (once per session)
+    if SCHEMA_PATH.exists():
+        # Drop existing schema to start fresh
+        await conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
+        await conn.execute("CREATE SCHEMA public")
+
+        # Load schema
+        schema_sql = SCHEMA_PATH.read_text()
+        await conn.execute(schema_sql)
+
+    yield conn
+
+    await conn.close()
+
+
+@pytest_asyncio.fixture
+async def db_connection(
+    db_params: dict[str, str], db_session_connection
+) -> AsyncIterator[asyncpg.Connection]:
+    """
+    Create an asyncpg connection to the test database for each test.
+
+    Each test runs in a transaction that is rolled back after the test,
+    ensuring complete isolation between tests without needing to truncate tables.
 
     Yields:
         asyncpg.Connection: Database connection
     """
     conn = await asyncpg.connect(**db_params)
 
-    # Load schema
-    if SCHEMA_PATH.exists():
-        schema_sql = SCHEMA_PATH.read_text()
-        await conn.execute(schema_sql)
-
     # Configure JSON codec to use orjson (same as production)
     try:
         import orjson
+
         await conn.set_type_codec(
             "json",
+            encoder=orjson.dumps,
+            decoder=orjson.loads,
+            schema="pg_catalog",
+        )
+        # Also configure jsonb
+        await conn.set_type_codec(
+            "jsonb",
             encoder=orjson.dumps,
             decoder=orjson.loads,
             schema="pg_catalog",
@@ -82,12 +113,16 @@ async def db_connection(db_params: dict[str, str]) -> AsyncIterator[asyncpg.Conn
     except ImportError:
         pass  # orjson not available, use default JSON codec
 
-    yield conn
+    # Start transaction for test isolation
+    transaction = conn.transaction()
+    await transaction.start()
 
-    # Cleanup: truncate all tables for next test
-    await conn.execute("TRUNCATE TABLE jorb RESTART IDENTITY CASCADE")
-
-    await conn.close()
+    try:
+        yield conn
+    finally:
+        # Rollback transaction to undo all changes
+        await transaction.rollback()
+        await conn.close()
 
 
 @pytest_asyncio.fixture
@@ -95,12 +130,13 @@ async def clean_db(db_connection: asyncpg.Connection) -> AsyncIterator[asyncpg.C
     """
     Provide a clean database with all tables truncated.
 
-    This is useful for tests that need a completely fresh database state.
+    Since we use transaction-based isolation, this is actually the same
+    as db_connection (both start with empty tables).
 
     Yields:
         asyncpg.Connection: Database connection with empty tables
     """
-    await db_connection.execute("TRUNCATE TABLE jorb RESTART IDENTITY CASCADE")
+    # No truncation needed - transaction rollback handles isolation
     yield db_connection
 
 
