@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 #
-# Setup test database for pyjobby using native PostgreSQL
+# Setup test database without sudo (assumes PostgreSQL is running and you have postgres user access)
 #
 # This script:
-# 1. Checks PostgreSQL is installed and running
-# 2. Creates test user and database
-# 3. Loads schema
+# 1. Creates test user and database as current user or postgres
+# 2. Loads schema
 #
 
 set -euo pipefail
@@ -27,37 +26,37 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Check if PostgreSQL is installed
-if ! command -v psql &> /dev/null; then
-    log_error "PostgreSQL is not installed!"
-    log_info "Run: ./scripts/install-postgres.sh"
-    exit 1
-fi
-
-# Check if PostgreSQL is running
-if ! sudo systemctl is-active --quiet postgresql; then
-    log_warn "PostgreSQL is not running. Starting it..."
-    sudo systemctl start postgresql
-    sleep 2
-fi
-
-log_info "PostgreSQL is running"
-
 # Test database configuration
 DB_NAME="pyjobby_test"
 DB_USER="pyjobby_test"
 DB_PASS="pyjobby_test_password"
 SCHEMA_FILE="priv/schema.sql"
 
+# Check if we can connect as postgres user
+if psql -U postgres -c "SELECT 1" > /dev/null 2>&1; then
+    PG_USER="postgres"
+    log_info "Connected as postgres user"
+elif [ "$USER" = "postgres" ]; then
+    PG_USER="postgres"
+    log_info "Running as postgres user"
+else
+    log_error "Cannot connect to PostgreSQL"
+    log_info "Either:"
+    log_info "  1. Run as postgres user: sudo -u postgres $0"
+    log_info "  2. Configure pg_hba.conf to allow local connections"
+    log_info "  3. Set PGPASSWORD environment variable"
+    exit 1
+fi
+
 # Check if database already exists
-if sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$DB_NAME"; then
+if psql -U "$PG_USER" -lqt | cut -d \| -f 1 | grep -qw "$DB_NAME"; then
     log_warn "Database '$DB_NAME' already exists"
     read -p "Do you want to drop and recreate it? (y/N) " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         log_info "Dropping existing database..."
-        sudo -u postgres psql -c "DROP DATABASE IF EXISTS $DB_NAME;"
-        sudo -u postgres psql -c "DROP USER IF EXISTS $DB_USER;"
+        psql -U "$PG_USER" -c "DROP DATABASE IF EXISTS $DB_NAME;"
+        psql -U "$PG_USER" -c "DROP USER IF EXISTS $DB_USER;"
     else
         log_info "Using existing database"
         exit 0
@@ -66,25 +65,25 @@ fi
 
 # Create test user
 log_info "Creating test user '$DB_USER'..."
-sudo -u postgres psql -c "CREATE USER $DB_USER WITH PASSWORD '$DB_PASS';" 2>/dev/null || {
+psql -U "$PG_USER" -c "CREATE USER $DB_USER WITH PASSWORD '$DB_PASS';" 2>/dev/null || {
     log_warn "User already exists, resetting password..."
-    sudo -u postgres psql -c "ALTER USER $DB_USER WITH PASSWORD '$DB_PASS';"
+    psql -U "$PG_USER" -c "ALTER USER $DB_USER WITH PASSWORD '$DB_PASS';"
 }
 
 # Create test database
 log_info "Creating test database '$DB_NAME'..."
-sudo -u postgres psql -c "CREATE DATABASE $DB_NAME OWNER $DB_USER;" 2>/dev/null || {
+psql -U "$PG_USER" -c "CREATE DATABASE $DB_NAME OWNER $DB_USER;" 2>/dev/null || {
     log_warn "Database already exists"
 }
 
 # Grant privileges
 log_info "Granting privileges..."
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;"
+psql -U "$PG_USER" -c "GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;"
 
 # Load schema
 if [ -f "$SCHEMA_FILE" ]; then
     log_info "Loading schema from $SCHEMA_FILE..."
-    sudo -u postgres psql -d "$DB_NAME" -f "$SCHEMA_FILE" > /dev/null
+    psql -U "$PG_USER" -d "$DB_NAME" -f "$SCHEMA_FILE" > /dev/null
     log_info "Schema loaded successfully"
 else
     log_warn "Schema file not found: $SCHEMA_FILE"
@@ -107,5 +106,4 @@ log_info ""
 log_info "Connection string:"
 log_info "  postgresql://$DB_USER:$DB_PASS@localhost:5432/$DB_NAME"
 log_info ""
-log_info "To reset the database: ./scripts/reset-test-db.sh"
 log_info "To run tests: make test"

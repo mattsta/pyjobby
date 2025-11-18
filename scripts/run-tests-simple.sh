@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 #
-# Run pyjobby test suite against native PostgreSQL
+# Run pyjobby test suite (simple version without sudo checks)
 #
 # Usage:
-#   ./scripts/run-tests.sh              # Run all tests
-#   ./scripts/run-tests.sh -k test_claim  # Run specific test
-#   ./scripts/run-tests.sh --cov        # Run with coverage
-#   ./scripts/run-tests.sh --fast       # Run fast tests only (skip slow/concurrency)
-#   ./scripts/run-tests.sh --parallel   # Run tests in parallel
+#   ./scripts/run-tests-simple.sh              # Run all tests
+#   ./scripts/run-tests-simple.sh -k test_claim  # Run specific test
+#   ./scripts/run-tests-simple.sh --fast       # Run fast tests only
+#   ./scripts/run-tests-simple.sh --parallel   # Run tests in parallel
 #
 
 set -euo pipefail
@@ -24,24 +23,6 @@ log_info() {
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
-
-# Check if PostgreSQL is running
-if ! sudo systemctl is-active --quiet postgresql 2>/dev/null; then
-    log_error "PostgreSQL is not running!"
-    log_info "Start it with: sudo systemctl start postgresql"
-    log_info "Or run: ./scripts/setup-test-db.sh"
-    exit 1
-fi
-
-# Check if test database exists
-DB_NAME="pyjobby_test"
-if ! sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$DB_NAME"; then
-    log_error "Test database '$DB_NAME' does not exist!"
-    log_info "Create it with: ./scripts/setup-test-db.sh"
-    exit 1
-fi
-
-log_info "PostgreSQL is running and test database exists"
 
 # Parse arguments
 PYTEST_ARGS=()

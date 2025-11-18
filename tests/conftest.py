@@ -1,7 +1,7 @@
 """
 Pytest configuration and fixtures for pyjobby tests.
 
-Connects to a live PostgreSQL database (started via docker-compose).
+Connects to native PostgreSQL database on localhost.
 Each test gets a clean database state via transaction rollback.
 """
 
@@ -18,7 +18,7 @@ import pytest_asyncio
 SCHEMA_PATH = Path(__file__).parent.parent / "priv" / "schema.sql"
 
 # Get database connection from environment or use default
-DEFAULT_TEST_DSN = "postgresql://pyjobby_test:pyjobby_test_password@localhost:5433/pyjobby_test"
+DEFAULT_TEST_DSN = "postgresql://pyjobby_test:pyjobby_test_password@localhost:5432/pyjobby_test"
 TEST_DSN = os.getenv("PYJOBBY_TEST_DSN", DEFAULT_TEST_DSN)
 
 
@@ -35,7 +35,7 @@ def db_params() -> dict[str, str]:
     """
     Get database connection parameters for the test database.
 
-    Uses live PostgreSQL server from docker-compose.
+    Uses native PostgreSQL server on localhost:5432.
     Connection details can be overridden via PYJOBBY_TEST_DSN environment variable.
 
     Returns:
@@ -43,7 +43,7 @@ def db_params() -> dict[str, str]:
     """
     return {
         "host": "localhost",
-        "port": 5433,
+        "port": 5432,
         "user": "pyjobby_test",
         "password": "pyjobby_test_password",
         "database": "pyjobby_test",

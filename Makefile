@@ -1,20 +1,24 @@
-.PHONY: help install test test-fast test-parallel coverage lint format type-check clean setup-db stop-db reset-db
+.PHONY: help install install-postgres test test-fast test-parallel coverage lint format type-check clean setup-db stop-db reset-db
 
 help:  ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
-install:  ## Install dependencies
+install:  ## Install Python dependencies
 	@echo "Installing dependencies..."
 	poetry install --with test,dev
-	@echo "Done! Run 'make setup-db' to start test database."
+	@echo "Done! Run 'make install-postgres' if PostgreSQL is not installed."
+	@echo "Then run 'make setup-db' to create test database."
 
-setup-db:  ## Start PostgreSQL test database
+install-postgres:  ## Install PostgreSQL natively
+	@./scripts/install-postgres.sh
+
+setup-db:  ## Create test database
 	@./scripts/setup-test-db.sh
 
-stop-db:  ## Stop PostgreSQL test database
-	@./scripts/stop-test-db.sh
+stop-db:  ## Stop PostgreSQL service (caution: affects all databases)
+	@./scripts/stop-db.sh
 
-reset-db:  ## Reset PostgreSQL test database (wipe all data)
+reset-db:  ## Reset test database (wipe all data)
 	@./scripts/reset-test-db.sh
 
 test:  ## Run all tests
@@ -61,13 +65,3 @@ ci:  ## Run all CI checks (format, lint, type-check, test)
 	@make test
 	@echo ""
 	@echo "All CI checks passed! ✓"
-
-dev:  ## Start development environment (database + pgAdmin)
-	@echo "Starting development environment..."
-	docker-compose --profile dev up -d
-	@echo ""
-	@echo "Development environment started!"
-	@echo "  PostgreSQL: localhost:5433"
-	@echo "  pgAdmin: http://localhost:5050"
-	@echo "    Email: admin@pyjobby.test"
-	@echo "    Password: admin"
