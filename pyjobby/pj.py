@@ -223,6 +223,36 @@ STMTS[
             )
             RETURNING *"""
 
+# Recover jobs that were stuck when this worker crashed previously
+STMTS[
+    "recover-abandoned"
+] = """UPDATE jorb
+              SET state = 'queued',
+                  run_after = TIMEZONE('utc', clock_timestamp()),
+                  updated = TIMEZONE('utc', clock_timestamp())
+              WHERE worker_host = $1
+                AND state IN ('claimed', 'running')
+              RETURNING id, job_class, state as old_state"""
+
+# Create a retry job (new row) instead of modifying the crashed job
+# This preserves the crashed job as audit trail and creates clean retry
+STMTS[
+    "create-retry"
+] = """INSERT INTO jorb (
+                job_class, kwargs, queue, prio, uid, capability,
+                run_after, run_group, admin_data, state, error_count
+            )
+            SELECT
+                job_class, kwargs, queue, prio, uid, capability,
+                TIMEZONE('utc', clock_timestamp()) + $2::interval as run_after,
+                run_group,
+                jsonb_set(COALESCE(admin_data, '{}'::jsonb), '{parent_job_id}', to_jsonb($1::bigint)),
+                'queued' as state,
+                $3 as error_count
+            FROM jorb
+            WHERE id = $1
+            RETURNING id"""
+
 
 @dataclass
 class JobSystem:
@@ -245,6 +275,10 @@ class JobSystem:
     pid: int = field(default_factory=lambda: os.getpid())
     node: str = field(default_factory=lambda: platform.node())
     cache: dict[str, Any] = field(default_factory=dict)
+    # Improvement: Configurable retry and timeout settings
+    max_retries: int = 10  # Maximum retry attempts before dead letter
+    default_timeout: int = 3600  # Default job timeout in seconds (1 hour)
+    enable_recovery: bool = True  # Enable abandoned job recovery on startup
 
     async def ex(self, op: str, *args: Any) -> list[asyncpg.Record]:
         """Execute 'op' from prepared statement dict with *args.
@@ -265,6 +299,37 @@ class JobSystem:
     def shutdown(self, signum: int, frame: Any) -> None:
         logger.info(f"Shutdown request received by signal {signum}")
         self.stop = True
+
+    async def recover_abandoned_jobs(self) -> list[asyncpg.Record]:
+        """Recover jobs that were left in claimed/running state when this worker crashed.
+
+        This is called on startup to reclaim jobs that this worker was processing
+        when it previously crashed or was killed. Jobs are moved back to 'queued'
+        state so they can be claimed and processed again.
+
+        Returns list of recovered job records."""
+        if not self.enable_recovery:
+            return []
+
+        try:
+            recovered = await self.ex("recover-abandoned", self.node)
+
+            if recovered:
+                logger.warning(
+                    f"Recovered {len(recovered)} abandoned jobs from previous crash: "
+                    f"{[r['id'] for r in recovered]}"
+                )
+
+                for job in recovered:
+                    logger.info(
+                        f"  Job {job['id']} ({job['job_class']}) "
+                        f"recovered from state '{job['old_state']}'"
+                    )
+
+            return recovered
+        except Exception as e:
+            logger.error(f"Failed to recover abandoned jobs: {e}")
+            return []
 
     async def webHandler(self, request: web.Request) -> web.Response:
         assert self.webPort
@@ -356,10 +421,10 @@ class JobSystem:
         for name, stmt in STMTS.items():
             self.stmts[name] = await self.cxn.prepare(stmt)
 
-        # TODO: we should query for 'running' tasks with this worker hostname on startup
-        #       because if they are running with this hostname, and we are STARTING,
-        #       then they were previously abandoned and need to be re-queued so they
-        #       can be picked up again.
+        # IMPROVEMENT: Recover jobs that were running when this worker crashed
+        # This resolves the TODO above - we now recover abandoned jobs on startup
+        await self.recover_abandoned_jobs()
+
         logger.info(f"[{self.qname}:{self.prio}] Connected and waiting for jobs!")
         prev: float = 0.0
         processed: int = 0
@@ -424,6 +489,10 @@ class JobSystem:
 
                 klass = self.classForKlassFromName(job["job_class"], job=job)
 
+                # IMPROVEMENT: Add timeout protection for job execution
+                # Jobs can specify custom timeout via class attribute
+                job_timeout = getattr(klass, 'timeout', self.default_timeout)
+
                 # if job is async, .run() returns a coroutine we need to await.
                 # else, if task is not async, .run() runs the job itself.
                 # ignore type check because the exception will catch if bad
@@ -431,9 +500,13 @@ class JobSystem:
                 resultStageA = klass.run()  # type: ignore
 
                 if asyncio.iscoroutine(resultStageA):
-                    result = await resultStageA
+                    # Apply timeout to async jobs
+                    result = await asyncio.wait_for(resultStageA, timeout=job_timeout)
                 elif inspect.isasyncgen(resultStageA):
-                    result = [x async for x in resultStageA]
+                    # Apply timeout to async generator jobs
+                    async def collect_with_timeout():
+                        return [x async for x in resultStageA]
+                    result = await asyncio.wait_for(collect_with_timeout(), timeout=job_timeout)
                 else:
                     result = resultStageA
 
@@ -463,37 +536,106 @@ class JobSystem:
                         logger.info(
                             f"[job {jid}:{jname}; group {hex(gid)[2:]}] Triggered scheduling of {nextJobIds}"
                         )
+            except asyncio.TimeoutError as e:
+                # IMPROVEMENT: Handle timeouts specifically
+                exc_traceback = traceback.extract_stack()
+                error_msg = f"Job timed out after {job_timeout}s"
+
+                logger.error(
+                    "[job {}:{}] TIMEOUT in {} after {}s",
+                    job["id"], jname, job["job_class"], job_timeout
+                )
+
+                # Mark original job as crashed (audit trail)
+                await self.ex(
+                    "crash",
+                    job["id"],
+                    error_msg,
+                    "Timeout error - job exceeded maximum execution time",
+                )
+
+                # Create retry job if under max retries
+                current_error_count = job.get("error_count", 0) + 1
+                if klass and current_error_count < self.max_retries:
+                    rescheduleFor = await klass.rescheduleBackoff(current_error_count)
+                    retry_job_id = await self.cxn.fetchval(
+                        self.stmts["create-retry"],
+                        job["id"],
+                        rescheduleFor,
+                        current_error_count
+                    )
+                    logger.info(
+                        "[job {}] Created retry job {} (attempt {}/{}) "
+                        "scheduled for {:.1f} minutes",
+                        job["id"],
+                        retry_job_id,
+                        current_error_count + 1,
+                        self.max_retries,
+                        rescheduleFor.total_seconds() / 60,
+                    )
+                else:
+                    logger.error(
+                        "[job {}] PERMANENTLY FAILED after {} attempts - "
+                        "max retries ({}) exceeded",
+                        job["id"],
+                        current_error_count,
+                        self.max_retries
+                    )
+
+                error += 1
+
             except Exception as e:
-                # oops you excepted something
+                # IMPROVEMENT: Fixed retry mechanism - create separate retry jobs
                 exc_type, exc_value, exc_traceback = sys.exc_info()
 
                 logger.exception(
                     "[job {}:{}] Error in {}: {}", job["id"], jname, job["job_class"], e
                 )
 
-                # since we failed, re-schedule...
-                # TODO: implement max-retries logic before a hard failure?
-                if klass:
-                    rescheduleFor = await klass.rescheduleBackoff()
-                    logger.exception(
-                        "[job {}] Rescheduling to run in {:.3f} minutes",
-                        job["id"],
-                        rescheduleFor.total_seconds() / 60,
-                    )
-
-                error += 1
-
+                # Mark original job as crashed (for audit trail)
                 # Note: we aren't recording the stack because with
                 # our multiprocessing forks, each stack is just the
                 # multiprocessing pre-fork setup frames.
-                #    "\nStack:\n"
-                #    + "".join(traceback.format_stack())
                 await self.ex(
                     "crash",
                     job["id"],
                     str(e),
                     "Traceback:\n" + "".join(traceback.format_tb(exc_traceback)),
                 )
+
+                # IMPROVEMENT: Create NEW retry job instead of overwriting crashed job
+                # This resolves the bug where reschedule() was overwritten by crash()
+                current_error_count = job.get("error_count", 0) + 1
+                if klass and current_error_count < self.max_retries:
+                    rescheduleFor = await klass.rescheduleBackoff(current_error_count)
+
+                    # Create a NEW job for retry (separate row)
+                    retry_job_id = await self.cxn.fetchval(
+                        self.stmts["create-retry"],
+                        job["id"],
+                        rescheduleFor,
+                        current_error_count
+                    )
+
+                    logger.info(
+                        "[job {}] Created retry job {} (attempt {}/{}) "
+                        "scheduled for {:.1f} minutes",
+                        job["id"],
+                        retry_job_id,
+                        current_error_count + 1,
+                        self.max_retries,
+                        rescheduleFor.total_seconds() / 60,
+                    )
+                else:
+                    logger.error(
+                        "[job {}] PERMANENTLY FAILED after {} attempts - "
+                        "max retries ({}) exceeded",
+                        job["id"],
+                        current_error_count,
+                        self.max_retries
+                    )
+
+                error += 1
 
         # if we ever exit the loop...
         await self.cxn.close()
