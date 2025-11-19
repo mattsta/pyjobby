@@ -174,7 +174,8 @@ class TestAdminAPIJobManagement:
         jobs = await api.list_jobs()
 
         assert len(jobs) >= 5  # At least our 5 jobs
-        assert all(isinstance(job, JobInfo) for job in jobs)
+        assert all(isinstance(job, dict) for job in jobs)
+        assert all('id' in job and 'job_class' in job for job in jobs)
 
     @pytest.mark.asyncio
     async def test_list_jobs_filter_by_queue(self, db_pool):
@@ -195,7 +196,7 @@ class TestAdminAPIJobManagement:
 
         jobs = await api.list_jobs(queue='queue_a')
 
-        assert all(job.queue == 'queue_a' for job in jobs)
+        assert all(job['queue'] == 'queue_a' for job in jobs)
 
     @pytest.mark.asyncio
     async def test_list_jobs_filter_by_state(self, db_pool):
@@ -216,7 +217,7 @@ class TestAdminAPIJobManagement:
 
         jobs = await api.list_jobs(state='queued')
 
-        assert all(job.state == 'queued' for job in jobs)
+        assert all(job['state'] == 'queued' for job in jobs)
 
     @pytest.mark.asyncio
     async def test_list_jobs_pagination(self, db_pool):
@@ -240,8 +241,8 @@ class TestAdminAPIJobManagement:
         assert len(page2) == 5
 
         # Pages should not overlap
-        page1_ids = {job.id for job in page1}
-        page2_ids = {job.id for job in page2}
+        page1_ids = {job['id'] for job in page1}
+        page2_ids = {job['id'] for job in page2}
         assert page1_ids.isdisjoint(page2_ids)
 
     @pytest.mark.asyncio
@@ -259,9 +260,9 @@ class TestAdminAPIJobManagement:
         job = await api.get_job(job_id)
 
         assert job is not None
-        assert job.id == job_id
-        assert job.job_class == 'test.Job'
-        assert job.kwargs == {'key': 'value'}
+        assert job['id'] == job_id
+        assert job['job_class'] == 'test.Job'
+        assert job['kwargs'] == {'key': 'value'}
 
     @pytest.mark.asyncio
     async def test_get_job_not_exists(self, db_pool):
@@ -285,9 +286,12 @@ class TestAdminAPIJobManagement:
                 RETURNING id
             """, 'test.Job', {'arg': 'value'}, 'default', 'crashed', 100, 'Test error')
 
-        new_job_id = await api.retry_job(job_id)
+        result = await api.retry_job(job_id)
 
-        assert new_job_id is not None
+        assert result is not None
+        assert 'new_job_id' in result
+        assert result['original_job_id'] == job_id
+        new_job_id = result['new_job_id']
         assert new_job_id != job_id
 
         # Verify new job
@@ -314,7 +318,7 @@ class TestAdminAPIJobManagement:
                 RETURNING id
             """, 'test.Job', {}, 'default', 'queued', 100)
 
-        with pytest.raises(ValueError, match="Job .* is not in a retryable state"):
+        with pytest.raises(ValueError, match="can only retry crashed or cancelled jobs"):
             await api.retry_job(job_id)
 
     @pytest.mark.asyncio
@@ -329,9 +333,11 @@ class TestAdminAPIJobManagement:
                 RETURNING id
             """, 'test.Job', {}, 'default', 'queued', 100)
 
-        success = await api.cancel_job(job_id)
+        result = await api.cancel_job(job_id)
 
-        assert success is True
+        assert result is not None
+        assert result['job_id'] == job_id
+        assert result['status'] == 'cancelled'
 
         # Verify state changed
         async with db_pool.acquire() as conn:
@@ -350,7 +356,7 @@ class TestAdminAPIJobManagement:
                 RETURNING id
             """, 'test.Job', {}, 'default', 'running', 100)
 
-        with pytest.raises(ValueError, match="Job .* is not cancellable"):
+        with pytest.raises(ValueError, match="can only cancel queued or waiting jobs"):
             await api.cancel_job(job_id)
 
     @pytest.mark.asyncio
@@ -430,11 +436,11 @@ class TestAdminAPIQueueManagement:
         stats = await api.queue_stats(queue='test_queue')
 
         assert len(stats) == 1
-        assert stats[0].queue == 'test_queue'
-        assert stats[0].queued >= 1
-        assert stats[0].running >= 1
-        assert stats[0].finished >= 1
-        assert stats[0].total >= 3
+        assert stats[0]['queue'] == 'test_queue'
+        assert stats[0]['queued'] >= 1
+        assert stats[0]['running'] >= 1
+        assert stats[0]['finished'] >= 1
+        assert stats[0]['total'] >= 3
 
     @pytest.mark.asyncio
     async def test_queue_stats_all_queues(self, db_pool):
@@ -455,7 +461,7 @@ class TestAdminAPIQueueManagement:
         stats = await api.queue_stats()
 
         # Should have stats for both queues
-        queue_names = {s.queue for s in stats}
+        queue_names = {s['queue'] for s in stats}
         assert 'queue_a' in queue_names
         assert 'queue_b' in queue_names
 
@@ -494,9 +500,9 @@ class TestAdminAPIWorkerManagement:
         workers = await api.list_workers()
 
         assert len(workers) >= 2
-        assert all(isinstance(w, WorkerInfo) for w in workers)
+        assert all(isinstance(w, dict) for w in workers)
 
-        worker_hosts = {w.worker_host for w in workers}
+        worker_hosts = {w['worker_host'] for w in workers}
         assert 'worker-01' in worker_hosts
         assert 'worker-02' in worker_hosts
 
@@ -518,7 +524,7 @@ class TestAdminAPIWorkerManagement:
         workers = await api.list_workers()
 
         # Finished worker should not appear
-        worker_hosts = {w.worker_host for w in workers}
+        worker_hosts = {w['worker_host'] for w in workers}
         assert 'worker-finished' not in worker_hosts
 
     @pytest.mark.asyncio
@@ -547,12 +553,13 @@ class TestAdminAPIWorkerManagement:
         stats = await api.worker_stats()
 
         assert stats['active_workers'] >= 1
-        assert stats['jobs_by_worker'] is not None
+        assert 'workers' in stats
+        assert len(stats['workers']) >= 1
 
         # Should have at least one worker with 2 jobs
         found_worker = False
-        for worker_key, job_count in stats['jobs_by_worker'].items():
-            if 'worker-01' in worker_key and job_count >= 2:
+        for worker in stats['workers']:
+            if worker['host'] == 'worker-01' and worker['pid'] == 12345 and worker['job_count'] >= 2:
                 found_worker = True
                 break
 
@@ -587,14 +594,13 @@ class TestAdminAPIMetrics:
         metrics = await api.get_metrics()
 
         # Should have metrics structure
-        assert 'state_counts' in metrics
-        assert 'completion_rate' in metrics
+        assert 'finished_count' in metrics
+        assert 'crashed_count' in metrics
         assert 'avg_duration_seconds' in metrics
-        assert 'top_errors' in metrics
 
-        # State counts should be non-negative
-        assert metrics['state_counts']['finished'] >= 1
-        assert metrics['state_counts']['crashed'] >= 1
+        # Counts should be non-negative
+        assert metrics['finished_count'] >= 1
+        assert metrics['crashed_count'] >= 1
 
     @pytest.mark.asyncio
     async def test_get_metrics_custom_time_range(self, db_pool):
@@ -673,11 +679,11 @@ class TestAdminAPIDLQ:
         dlq_jobs = await api.list_dlq(limit=100)
 
         # Should include DLQ job
-        dlq_classes = {job.job_class for job in dlq_jobs}
+        dlq_classes = {job['job_class'] for job in dlq_jobs}
         assert 'test.DLQJob' in dlq_classes
 
         # All jobs should have error_count >= 10
-        assert all(job.error_count >= 10 for job in dlq_jobs)
+        assert all(job['error_count'] >= 10 for job in dlq_jobs)
 
     @pytest.mark.asyncio
     async def test_retry_from_dlq(self, db_pool):
@@ -695,9 +701,11 @@ class TestAdminAPIDLQ:
                 RETURNING id
             """, 'test.DLQJob', {'arg': 'value'}, 'default', 'crashed', 100, 12, 'DLQ error')
 
-        new_job_id = await api.retry_from_dlq(job_id)
+        result = await api.retry_from_dlq(job_id)
 
-        assert new_job_id is not None
+        assert result is not None
+        assert 'new_job_id' in result
+        new_job_id = result['new_job_id']
         assert new_job_id != job_id
 
         # Verify new job has dlq_retry_from in admin_data
@@ -721,7 +729,7 @@ class TestAdminAPIDLQ:
                 RETURNING id
             """, 'test.Job', {}, 'default', 'queued', 100, 15)
 
-        with pytest.raises(ValueError, match="Job .* is not in crashed state"):
+        with pytest.raises(ValueError, match="is not in DLQ"):
             await api.retry_from_dlq(job_id)
 
 
@@ -738,7 +746,7 @@ class TestAdminAPIScheduleManagement:
         """Test creating a basic schedule."""
         api = AdminAPI(db_pool)
 
-        schedule_id = await api.create_schedule(
+        result = await api.create_schedule(
             name='test-schedule',
             job_class='test.Job',
             cron_expr='* * * * *',
@@ -746,19 +754,16 @@ class TestAdminAPIScheduleManagement:
             kwargs={'arg': 'value'}
         )
 
-        assert schedule_id is not None
+        assert result is not None
+        assert 'id' in result
+        schedule_id = result['id']
 
         # Verify schedule created
-        async with db_pool.acquire() as conn:
-            schedule = await conn.fetchrow("""
-                SELECT * FROM jorb_schedule WHERE id = $1
-            """, schedule_id)
-
-            assert schedule['name'] == 'test-schedule'
-            assert schedule['job_class'] == 'test.Job'
-            assert schedule['cron_expr'] == '* * * * *'
-            assert schedule['enabled'] is True
-            assert schedule['kwargs'] == {'arg': 'value'}
+        assert result['name'] == 'test-schedule'
+        assert result['job_class'] == 'test.Job'
+        assert result['cron_expr'] == '* * * * *'
+        assert result['enabled'] is True
+        assert result['kwargs'] == {'arg': 'value'}
 
     @pytest.mark.asyncio
     async def test_create_schedule_invalid_cron(self, db_pool):
@@ -792,7 +797,7 @@ class TestAdminAPIScheduleManagement:
         """Test creating schedule with custom timezone."""
         api = AdminAPI(db_pool)
 
-        schedule_id = await api.create_schedule(
+        result = await api.create_schedule(
             name='tz-schedule',
             job_class='test.Job',
             cron_expr='0 12 * * *',  # Daily at noon
@@ -801,12 +806,7 @@ class TestAdminAPIScheduleManagement:
         )
 
         # Verify timezone saved
-        async with db_pool.acquire() as conn:
-            tz = await conn.fetchval("""
-                SELECT timezone FROM jorb_schedule WHERE id = $1
-            """, schedule_id)
-
-            assert tz == 'America/New_York'
+        assert result['timezone'] == 'America/New_York'
 
     @pytest.mark.asyncio
     async def test_get_schedule_by_id(self, db_pool):
@@ -975,7 +975,9 @@ class TestAdminAPIScheduleManagement:
 
         result = await api.delete_schedule(schedule_id)
 
-        assert result is True
+        assert result is not None
+        assert result['status'] == 'deleted'
+        assert result['schedule_id'] == str(schedule_id)
 
         # Verify deleted
         async with db_pool.acquire() as conn:
