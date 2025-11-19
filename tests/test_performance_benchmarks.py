@@ -192,7 +192,7 @@ class TestLatencyBenchmarks:
                 UPDATE jorb
                 SET state = $2, updated = $3
                 WHERE id = $1
-            """, job_id, state, datetime.now(timezone.utc))
+            """, job_id, state, datetime.now())
 
             latency = (time.time() - start) * 1000
             latencies.append(latency)
@@ -304,8 +304,8 @@ class TestLargeDAGBenchmarks:
         """Benchmark: Create large linear DAG (100 jobs)."""
         # Create DAG
         dag_id = await db_pool.fetchval("""
-            INSERT INTO jorb_dag (name, created, updated)
-            VALUES ($1, $2, $2)
+            INSERT INTO jorb_dag (name, created)
+            VALUES ($1, $2)
             RETURNING id
         """, "Large Linear DAG", datetime.now(timezone.utc))
 
@@ -347,8 +347,8 @@ class TestLargeDAGBenchmarks:
         """Benchmark: Create large parallel DAG (10 branches x 10 jobs)."""
         # Create DAG
         dag_id = await db_pool.fetchval("""
-            INSERT INTO jorb_dag (name, created, updated)
-            VALUES ($1, $2, $2)
+            INSERT INTO jorb_dag (name, created)
+            VALUES ($1, $2)
             RETURNING id
         """, "Large Parallel DAG", datetime.now(timezone.utc))
 
@@ -394,8 +394,8 @@ class TestLargeDAGBenchmarks:
         """Benchmark: DAG cycle validation on large DAG."""
         # Create DAG with 50 jobs
         dag_id = await db_pool.fetchval("""
-            INSERT INTO jorb_dag (name, created, updated)
-            VALUES ($1, $2, $2)
+            INSERT INTO jorb_dag (name, created)
+            VALUES ($1, $2)
             RETURNING id
         """, "Validation Test DAG", datetime.now(timezone.utc))
 

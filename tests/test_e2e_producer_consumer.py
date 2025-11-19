@@ -188,7 +188,7 @@ class TestJobStateTransitions:
 
         # Simulate worker claiming job (state transition to 'claimed')
         # This would happen automatically with live worker
-        now = datetime.now(timezone.utc)
+        now_naive = datetime.now()  # For updated (timestamp WITHOUT time zone)
         await db_pool.execute("""
             UPDATE jorb
             SET state = 'claimed',
@@ -196,21 +196,23 @@ class TestJobStateTransitions:
                 worker_pid = 12345,
                 updated = $2
             WHERE id = $1
-        """, job_id, now)
+        """, job_id, now_naive)
 
         job = await get_job(db_pool, job_id)
         assert job['state'] == 'claimed'
         assert job['worker_host'] == 'test-worker-1'
 
         # Simulate worker starting job (state transition to 'running')
+        now_aware = datetime.now(timezone.utc)  # For started (timestamp WITH time zone)
+        now_naive = datetime.now()  # For updated (timestamp WITHOUT time zone)
         await db_pool.execute("""
             UPDATE jorb
             SET state = 'running',
                 run_count = run_count + 1,
                 started = $2,
-                updated = $2
+                updated = $3
             WHERE id = $1
-        """, job_id, now)
+        """, job_id, now_aware, now_naive)
 
         job = await get_job(db_pool, job_id)
         assert job['state'] == 'running'
@@ -218,15 +220,17 @@ class TestJobStateTransitions:
         assert job['started'] is not None
 
         # Simulate worker finishing job (state transition to 'finished')
-        result = {"status": "success", "completed_at": now.isoformat()}
+        now_aware = datetime.now(timezone.utc)  # For finished (timestamp WITH time zone)
+        now_naive = datetime.now()  # For updated (timestamp WITHOUT time zone)
+        result = {"status": "success", "completed_at": now_aware.isoformat()}
         await db_pool.execute("""
             UPDATE jorb
             SET state = 'finished',
                 result = $2,
                 finished = $3,
-                updated = $3
+                updated = $4
             WHERE id = $1
-        """, job_id, result, now)
+        """, job_id, result, now_aware, now_naive)
 
         job = await get_job(db_pool, job_id)
         assert job['state'] == 'finished'
@@ -260,9 +264,10 @@ class TestErrorHandlingAndRetry:
         )
 
         # Simulate job failure (worker would do this)
-        now = datetime.now(timezone.utc)
+        now_naive = datetime.now()  # For run_after and updated (timestamp WITHOUT time zone)
         error_message = "ValueError: Intentional failure for testing"
 
+        retry_time = now_naive + timedelta(seconds=1)
         await db_pool.execute("""
             UPDATE jorb
             SET state = 'queued',
@@ -271,13 +276,13 @@ class TestErrorHandlingAndRetry:
                 run_after = $3,
                 updated = $3
             WHERE id = $1
-        """, job_id, error_message, now + timedelta(seconds=1))
+        """, job_id, error_message, retry_time)
 
         job = await get_job(db_pool, job_id)
         assert job['state'] == 'queued'  # Retrying
         assert job['error_count'] == 1
         assert 'Intentional failure' in job['error_message']
-        assert job['run_after'] > now  # Scheduled for retry
+        assert job['run_after'] > now_naive  # Scheduled for retry
 
         # Cleanup
         await db_pool.execute("DELETE FROM jorb WHERE id = $1", job_id)
@@ -304,7 +309,7 @@ class TestErrorHandlingAndRetry:
             """, job_id, i)
 
         # Simulate final failure (exceeds max_retries)
-        now = datetime.now(timezone.utc)
+        now_naive = datetime.now()  # For updated (timestamp WITHOUT time zone)
         await db_pool.execute("""
             UPDATE jorb
             SET state = 'crashed',
@@ -312,7 +317,7 @@ class TestErrorHandlingAndRetry:
                 error_message = 'Max retries exceeded',
                 updated = $2
             WHERE id = $1
-        """, job_id, now)
+        """, job_id, now_naive)
 
         job = await get_job(db_pool, job_id)
         assert job['state'] == 'crashed'
@@ -332,8 +337,8 @@ class TestDAGExecution:
         """Test linear DAG: Job1 → Job2 → Job3."""
         # Create DAG
         dag_id = await db_pool.fetchval("""
-            INSERT INTO jorb_dag (name, created, updated)
-            VALUES ($1, $2, $2)
+            INSERT INTO jorb_dag (name, created)
+            VALUES ($1, $2)
             RETURNING id
         """, "E2E Linear Pipeline", datetime.now(timezone.utc))
 
@@ -406,8 +411,8 @@ class TestDAGExecution:
         """Test parallel DAG: Job1, Job2 (parallel) → Job3 (waits for both)."""
         # Create DAG
         dag_id = await db_pool.fetchval("""
-            INSERT INTO jorb_dag (name, created, updated)
-            VALUES ($1, $2, $2)
+            INSERT INTO jorb_dag (name, created)
+            VALUES ($1, $2)
             RETURNING id
         """, "E2E Parallel Pipeline", datetime.now(timezone.utc))
 

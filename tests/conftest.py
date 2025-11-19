@@ -143,7 +143,10 @@ async def cleanup_after_pool_tests(request, db_params: dict[str, str]):
     # Clean up after tests that use db_pool directly (non-transactional)
     # These tests don't automatically rollback like db_connection tests
     test_file = str(request.fspath)
-    if "test_concurrency" in test_file or "TestTimeoutMonitorHandler" in str(request.node.nodeid):
+    if ("test_concurrency" in test_file or
+        "TestTimeoutMonitorHandler" in str(request.node.nodeid) or
+        "test_e2e_producer_consumer" in test_file or
+        "test_performance_benchmarks" in test_file):
         conn = await asyncpg.connect(**db_params)
         try:
             # Delete all jobs created during pool-based tests
