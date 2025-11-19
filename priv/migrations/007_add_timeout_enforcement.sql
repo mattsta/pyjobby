@@ -11,6 +11,10 @@
 
 BEGIN;
 
+-- Add timestamp columns for job lifecycle tracking (if they don't exist)
+ALTER TABLE jorb ADD COLUMN IF NOT EXISTS started TIMESTAMPTZ DEFAULT NULL;
+ALTER TABLE jorb ADD COLUMN IF NOT EXISTS finished TIMESTAMPTZ DEFAULT NULL;
+
 -- Add timeout tracking column
 ALTER TABLE jorb ADD COLUMN IF NOT EXISTS timeout_at TIMESTAMPTZ DEFAULT NULL;
 

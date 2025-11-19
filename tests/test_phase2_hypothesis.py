@@ -27,66 +27,58 @@ class TestRetryDelayProperties:
     """Property-based tests for retry delay calculations."""
 
     @given(
-        attempt=attempt_numbers,
+        error_count=attempt_numbers,
         strategy=retry_strategies,
         initial_delay=small_positive_ints,
         max_delay=delay_seconds
     )
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-    def test_delay_is_never_negative(self, attempt, strategy, initial_delay, max_delay):
+    def test_delay_is_never_negative(self, error_count, strategy, initial_delay, max_delay):
         """Property: Retry delay is always >= 0."""
         delay = calculate_retry_delay(
-            attempt=attempt,
-            strategy=strategy,
-            initial_delay=initial_delay,
-            max_delay=max_delay
+            error_count, strategy, initial_delay, max_delay
         )
         assert delay.total_seconds() >= 0
 
     @given(
-        attempt=attempt_numbers,
+        error_count=attempt_numbers,
         strategy=retry_strategies,
         initial_delay=small_positive_ints,
         max_delay=delay_seconds
     )
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-    def test_delay_never_exceeds_max(self, attempt, strategy, initial_delay, max_delay):
+    def test_delay_never_exceeds_max(self, error_count, strategy, initial_delay, max_delay):
         """Property: Retry delay never exceeds max_delay."""
         delay = calculate_retry_delay(
-            attempt=attempt,
-            strategy=strategy,
-            initial_delay=initial_delay,
-            max_delay=max_delay
+            error_count, strategy, initial_delay, max_delay
         )
         # Account for jitter (up to 25% over base)
         assert delay.total_seconds() <= max_delay * 1.3
 
     @given(
-        attempt=small_positive_ints,
+        error_count=small_positive_ints,
         strategy=retry_strategies,
         initial_delay=small_positive_ints
     )
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-    def test_delay_returns_timedelta(self, attempt, strategy, initial_delay):
+    def test_delay_returns_timedelta(self, error_count, strategy, initial_delay):
         """Property: Always returns timedelta object."""
         delay = calculate_retry_delay(
-            attempt=attempt,
-            strategy=strategy,
-            initial_delay=initial_delay
+            error_count, strategy, initial_delay
         )
         assert isinstance(delay, timedelta)
 
     @given(
-        attempt=st.integers(min_value=1, max_value=20),
+        error_count=st.integers(min_value=1, max_value=20),
         initial_delay=small_positive_ints
     )
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-    def test_exponential_grows_exponentially(self, attempt, initial_delay):
-        """Property: Exponential delay roughly doubles each attempt."""
-        assume(attempt >= 2)  # Need at least 2 attempts to compare
+    def test_exponential_grows_exponentially(self, error_count, initial_delay):
+        """Property: Exponential delay roughly doubles each error_count."""
+        assume(error_count >= 2)  # Need at least 2 attempts to compare
 
-        delay1 = calculate_retry_delay(attempt - 1, 'exponential', initial_delay, max_delay=100000)
-        delay2 = calculate_retry_delay(attempt, 'exponential', initial_delay, max_delay=100000)
+        delay1 = calculate_retry_delay(error_count - 1, 'exponential', initial_delay, max_delay=100000)
+        delay2 = calculate_retry_delay(error_count, 'exponential', initial_delay, max_delay=100000)
 
         # With jitter, delay2 should be roughly 1.5x to 2.5x delay1
         # (accounting for 25% jitter on both sides)
@@ -95,14 +87,14 @@ class TestRetryDelayProperties:
             assert 1.2 <= ratio <= 3.0, f"Ratio {ratio} not exponential"
 
     @given(
-        attempt=st.integers(min_value=2, max_value=20),
+        error_count=st.integers(min_value=2, max_value=20),
         initial_delay=small_positive_ints
     )
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-    def test_linear_grows_linearly(self, attempt, initial_delay):
+    def test_linear_grows_linearly(self, error_count, initial_delay):
         """Property: Linear delay increases by roughly initial_delay each time."""
-        delay1 = calculate_retry_delay(attempt - 1, 'linear', initial_delay, max_delay=100000)
-        delay2 = calculate_retry_delay(attempt, 'linear', initial_delay, max_delay=100000)
+        delay1 = calculate_retry_delay(error_count - 1, 'linear', initial_delay, max_delay=100000)
+        delay2 = calculate_retry_delay(error_count, 'linear', initial_delay, max_delay=100000)
 
         # Difference should be roughly initial_delay (with jitter)
         if delay1.total_seconds() < 10000:
@@ -142,23 +134,23 @@ class TestRetryDelayProperties:
         assert config['max_retry_delay'] > 0
 
     @given(
-        attempt=attempt_numbers,
+        error_count=attempt_numbers,
         initial_delay=small_positive_ints,
         max_delay=delay_seconds,
         multiplier=st.floats(min_value=1.1, max_value=5.0)
     )
-    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-    def test_larger_multiplier_gives_larger_delays(self, attempt, initial_delay, max_delay, multiplier):
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.filter_too_much])
+    def test_larger_multiplier_gives_larger_delays(self, error_count, initial_delay, max_delay, multiplier):
         """Property: Larger multiplier should generally give larger delays."""
-        assume(attempt > 0)
-        assume(initial_delay * (multiplier ** attempt) < max_delay)  # Don't hit cap
+        assume(error_count > 0)
+        assume(initial_delay * (multiplier ** error_count) < max_delay)  # Don't hit cap
 
-        delay_2x = calculate_retry_delay(attempt, 'exponential', initial_delay, max_delay, multiplier=2.0)
-        delay_3x = calculate_retry_delay(attempt, 'exponential', initial_delay, max_delay, multiplier=3.0)
+        delay_2x = calculate_retry_delay(error_count, 'exponential', initial_delay, max_delay, multiplier=2.0)
+        delay_3x = calculate_retry_delay(error_count, 'exponential', initial_delay, max_delay, multiplier=3.0)
 
         # With larger multiplier, delay should generally be larger (accounting for jitter)
         # This is a probabilistic property, so we use a loose bound
-        if attempt >= 3:  # Effect is more pronounced after a few attempts
+        if error_count >= 3:  # Effect is more pronounced after a few attempts
             assert delay_3x.total_seconds() >= delay_2x.total_seconds() * 0.8
 
 
@@ -374,13 +366,13 @@ class TestEdgeCases:
     """Property-based tests for edge cases and boundary conditions."""
 
     @given(
-        attempt=st.integers(min_value=-100, max_value=0)
+        error_count=st.integers(min_value=-100, max_value=0)
     )
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-    def test_negative_or_zero_attempt_handled(self, attempt):
+    def test_negative_or_zero_attempt_handled(self, error_count):
         """Property: Negative/zero attempts should not crash."""
         # Should not crash, should return some reasonable delay
-        delay = calculate_retry_delay(attempt, 'exponential', 1, 3600)
+        delay = calculate_retry_delay(error_count, 'exponential', 1, 3600)
         assert isinstance(delay, timedelta)
         assert delay.total_seconds() >= 0
 

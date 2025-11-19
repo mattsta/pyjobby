@@ -21,8 +21,15 @@ CREATE INDEX IF NOT EXISTS jorb_result_exists_idx
 
 -- Add result size limit check (prevent abuse)
 -- 10MB limit is generous but prevents runaway storage
-ALTER TABLE jorb ADD CONSTRAINT IF NOT EXISTS result_size_check
-    CHECK (pg_column_size(result) < 10485760);
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'result_size_check'
+    ) THEN
+        ALTER TABLE jorb ADD CONSTRAINT result_size_check
+            CHECK (pg_column_size(result) < 10485760);
+    END IF;
+END $$;
 
 -- Add helpful comment
 COMMENT ON COLUMN jorb.result IS
