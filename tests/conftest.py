@@ -66,23 +66,30 @@ async def db_connection(db_params: dict[str, str]) -> AsyncIterator[asyncpg.Conn
     # Configure JSON codec to use orjson (same as production)
     try:
         import orjson
+        import json
 
-        # orjson.dumps returns bytes, so decode to str for asyncpg
+        # Encoder: Python object → JSON string
         def orjson_encoder(obj):
             return orjson.dumps(obj).decode('utf-8')
+
+        # Decoder: JSON string → Python object
+        def orjson_decoder(s):
+            return orjson.loads(s)
 
         await conn.set_type_codec(
             "json",
             encoder=orjson_encoder,
-            decoder=orjson.loads,
+            decoder=orjson_decoder,
             schema="pg_catalog",
+            format="text"
         )
         # Also configure jsonb
         await conn.set_type_codec(
             "jsonb",
             encoder=orjson_encoder,
-            decoder=orjson.loads,
+            decoder=orjson_decoder,
             schema="pg_catalog",
+            format="text"
         )
     except ImportError:
         pass  # orjson not available, use default JSON codec
@@ -180,22 +187,28 @@ async def db_pool(db_params: dict[str, str]) -> AsyncIterator[asyncpg.Pool]:
         try:
             import orjson
 
-            # orjson.dumps returns bytes, so decode to str for asyncpg
+            # Encoder: Python object → JSON string
             def orjson_encoder(obj):
                 return orjson.dumps(obj).decode('utf-8')
+
+            # Decoder: JSON string → Python object
+            def orjson_decoder(s):
+                return orjson.loads(s)
 
             await conn.set_type_codec(
                 "json",
                 encoder=orjson_encoder,
-                decoder=orjson.loads,
+                decoder=orjson_decoder,
                 schema="pg_catalog",
+                format="text"
             )
             # Also configure jsonb
             await conn.set_type_codec(
                 "jsonb",
                 encoder=orjson_encoder,
-                decoder=orjson.loads,
+                decoder=orjson_decoder,
                 schema="pg_catalog",
+                format="text"
             )
         except ImportError:
             pass  # orjson not available, use default JSON codec

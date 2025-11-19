@@ -500,17 +500,17 @@ class SchedulerWorker:
                 INSERT INTO jorb (
                     job_class, kwargs, queue, prio, capability,
                     deadline_key, run_after, admin_data, state
-                ) VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7, $8::jsonb, 'queued')
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued')
                 RETURNING id
             """,
                 schedule['job_class'],
-                schedule['kwargs'],  # Pass dict directly, asyncpg handles encoding
+                schedule['kwargs'],  # Dict - custom codec handles conversion
                 schedule['queue'],
                 schedule['prio'],
                 schedule['capability'],
                 deadline_key,
                 run_after_time,
-                admin_data  # Pass dict directly, NO json.dumps for ::jsonb
+                admin_data  # Dict - custom codec handles conversion
             )
 
             logger.info(

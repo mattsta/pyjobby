@@ -33,15 +33,7 @@ async def handle_timed_out_job(
         admin_data: Job's admin_data (can be dict or JSON string)
         error_count: Current error count
     """
-    # Parse admin_data if it's a JSON string
-    # Use while loop to handle legacy double-encoded data defensively
-    import json as json_module
-    while isinstance(admin_data, str):
-        try:
-            admin_data = json_module.loads(admin_data)
-        except Exception:
-            admin_data = {}
-            break
+    # admin_data is automatically decoded by asyncpg custom codec
     on_timeout = (admin_data or {}).get("on_timeout", "retry")
     max_retries = (admin_data or {}).get("max_retries", 10)
 
@@ -117,7 +109,35 @@ async def timeout_monitor(
         check_interval: How often to check for timeouts (seconds)
         batch_size: Maximum jobs to process per check
     """
-    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+    # Custom codec init function
+    async def init_connection(conn):
+        try:
+            import orjson
+
+            def orjson_encoder(obj):
+                return orjson.dumps(obj).decode('utf-8')
+
+            def orjson_decoder(s):
+                return orjson.loads(s)
+
+            await conn.set_type_codec(
+                "json",
+                encoder=orjson_encoder,
+                decoder=orjson_decoder,
+                schema="pg_catalog",
+                format="text"
+            )
+            await conn.set_type_codec(
+                "jsonb",
+                encoder=orjson_encoder,
+                decoder=orjson_decoder,
+                schema="pg_catalog",
+                format="text"
+            )
+        except ImportError:
+            pass
+
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2, init=init_connection)
 
     logger.info(
         f"Timeout monitor started (check every {check_interval}s, "

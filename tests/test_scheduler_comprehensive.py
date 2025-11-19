@@ -635,11 +635,11 @@ class TestSchedulerWorker:
                 INSERT INTO jorb_schedule (
                     name, job_class, cron_expr, next_run, enabled,
                     queue, prio, kwargs
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 RETURNING *
             """, "test-schedule", "test.TestJob", "* * * * *",
                 datetime.utcnow(), True, "test_queue", 500,
-                json.dumps({"key": "value"}))
+                {"key": "value"})
 
             schedule_dict = dict(schedule)
 

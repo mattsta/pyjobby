@@ -901,7 +901,7 @@ class AdminAPI:
                 backpressure_threshold, circuit_breaker_threshold,
                 next_run, created_by
             ) VALUES (
-                $1, $2, $3, $4::jsonb, $5, $6, $7,
+                $1, $2, $3, $4, $5, $6, $7,
                 $8, $9, $10,
                 $11, $12, $13, $14,
                 $15, $16
@@ -909,7 +909,7 @@ class AdminAPI:
             RETURNING *
         """,
             name, description, job_class,
-            json.dumps(kwargs or {}), queue, prio, capability,
+            kwargs or {}, queue, prio, capability,
             cron_expr, timezone, enabled,
             max_concurrent_jobs, jitter_seconds,
             backpressure_threshold, circuit_breaker_threshold,

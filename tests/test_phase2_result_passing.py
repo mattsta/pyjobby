@@ -185,7 +185,7 @@ class TestResultPassing:
         job1 = await get_job(db_connection, job1_id)
         await db_connection.execute("""
             UPDATE jorb
-            SET kwargs = jsonb_set(kwargs::jsonb, '{upstream_result}', $1::jsonb)
+            SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1))
             WHERE id = $2
         """, job1['result'], job2_id)
 
@@ -205,7 +205,7 @@ class TestResultPassing:
         job2 = await get_job(db_connection, job2_id)
         await db_connection.execute("""
             UPDATE jorb
-            SET kwargs = jsonb_set(kwargs::jsonb, '{upstream_result}', $1::jsonb)
+            SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1))
             WHERE id = $2
         """, job2['result'], job3_id)
 
@@ -298,7 +298,7 @@ class TestPipelinePatterns:
         fetch_job = await get_job(db_connection, fetch_id)
         await db_connection.execute("""
             UPDATE jorb
-            SET kwargs = jsonb_set(kwargs::jsonb, '{upstream_result}', $1::jsonb),
+            SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1)),
                 admin_data = $2
             WHERE id = $3
         """, fetch_job['result'],
@@ -323,7 +323,7 @@ class TestPipelinePatterns:
         process_job = await get_job(db_connection, process_id)
         await db_connection.execute("""
             UPDATE jorb
-            SET kwargs = jsonb_set(kwargs::jsonb, '{upstream_result}', $1::jsonb)
+            SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1))
             WHERE id = $2
         """, process_job['result'], store_id)
 
@@ -357,7 +357,7 @@ class TestPipelinePatterns:
             upstream = await get_job(db_connection, upstream_id)
             await db_connection.execute("""
                 UPDATE jorb
-                SET kwargs = jsonb_set(kwargs::jsonb, '{upstream_result}', $1::jsonb)
+                SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1))
                 WHERE id = $2
             """, upstream['result'], job_id)
 

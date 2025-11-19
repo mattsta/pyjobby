@@ -367,11 +367,11 @@ class JobClient:
                     waitfor_job, waitfor_group,
                     deadline_key, admin_data, state
                 )
-                VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 RETURNING id
             """,
                 job_class,
-                kwargs,  # Pass dict directly - asyncpg handles jsonb encoding
+                kwargs,  # Dict - custom codec handles conversion
                 queue,
                 priority,
                 run_after,
@@ -381,7 +381,7 @@ class JobClient:
                 waitfor_job,
                 waitfor_group,
                 deadline_key,
-                admin_data,  # Pass dict directly - NO json.dumps for ::jsonb
+                admin_data,  # Dict - custom codec handles conversion
                 state
             )
 

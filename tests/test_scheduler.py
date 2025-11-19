@@ -71,7 +71,7 @@ async def create_test_schedule(conn, **kwargs):
             max_concurrent_jobs, jitter_seconds, backpressure_threshold,
             circuit_breaker_threshold, kwargs, next_run,
             run_count, success_count, failure_count, skip_count, consecutive_failures
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13,
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                   $14, $15, $16, $17, $18)
         RETURNING id
     """, defaults['name'], defaults['job_class'], defaults['cron_expr'],
@@ -89,9 +89,9 @@ async def create_test_job_for_schedule(conn, schedule_id, state='queued'):
         INSERT INTO jorb (
             job_class, kwargs, queue, state, prio,
             admin_data
-        ) VALUES ($1, $2::jsonb, $3, $4, $5, $6::jsonb)
+        ) VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING id
-    """, 'test.TestJob', '{}', 'default', state, 100,
+    """, 'test.TestJob', {}, 'default', state, 100,
         {'schedule_id': str(schedule_id), 'schedule_name': 'test'})
 
 
@@ -374,18 +374,18 @@ class TestScheduleExecution:
             INSERT INTO jorb_schedule (
                 name, job_class, cron_expr, queue, prio, enabled,
                 next_run, kwargs
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         """, 'test-due-schedule', 'test.Job', '0 * * * *', 'default', 100,
-            True, now - timedelta(minutes=1), '{}')
+            True, now - timedelta(minutes=1), {})
 
         # Create schedule that's not due yet
         await db_connection.execute("""
             INSERT INTO jorb_schedule (
                 name, job_class, cron_expr, queue, prio, enabled,
                 next_run, kwargs
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         """, 'test-future-schedule', 'test.Job', '0 * * * *', 'default', 100,
-            True, now + timedelta(hours=1), '{}')
+            True, now + timedelta(hours=1), {})
 
         due_schedules = await worker.find_due_schedules()
 

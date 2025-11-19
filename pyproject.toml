@@ -5,14 +5,14 @@ description = "PostgreSQL Job Consumer Platform"
 authors = ["Matt Stancliff <matt@genges.com>"]
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = "^3.10.2"
 orjson = "^3.5.0"
 click = "^8.0.0"
-asyncpg = "^0.29.0"
-loguru = "^0.5.3"
+asyncpg = "^0.30.0"
+loguru = "^0.7.3"
 aiohttp = "^3.7.3"
-croniter = "^2.0.0"
-pytz = "^2024.1"
+croniter = "^6.0.0"
+pytz = "^2025.2"
 
 [tool.poetry.scripts]
 pj = "pyjobby.pj:workit"
@@ -21,17 +21,17 @@ pj-web = "pyjobby.web_admin:main"
 pj-timeout-monitor = "pyjobby.timeout_monitor:cli"
 
 [tool.poetry.group.test.dependencies]
-pytest = "^8.0"
-pytest-asyncio = "^0.23"
-pytest-cov = "^4.1"
+pytest = "^9.0.1"
+pytest-asyncio = "^1.3.0"
+pytest-cov = "^7.0.0"
 pytest-timeout = "^2.2"
 pytest-xdist = "^3.5"
-hypothesis = "^6.148.1"
+hypothesis = "^6.148.2"
 
 [tool.poetry.group.dev.dependencies]
 mypy = "^1.8"
-ruff = "^0.1"
-black = "^24.0"
+ruff = "^0.14.5"
+black = "^25.11.0"
 types-orjson = "^3.6"
 
 [tool.pytest.ini_options]
