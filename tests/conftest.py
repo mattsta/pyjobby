@@ -136,16 +136,20 @@ def worker_params() -> dict:
 
 
 @pytest_asyncio.fixture(autouse=True, scope="function")
-async def cleanup_after_concurrency_tests(request, db_params: dict[str, str]):
-    """Clean up database after concurrency tests that don't use transactions."""
+async def cleanup_after_pool_tests(request, db_params: dict[str, str]):
+    """Clean up database after tests that use db_pool (non-transactional)."""
     yield
 
-    # Only clean up after concurrency tests (which create their own connections)
-    if "test_concurrency" in str(request.fspath):
+    # Clean up after tests that use db_pool directly (non-transactional)
+    # These tests don't automatically rollback like db_connection tests
+    test_file = str(request.fspath)
+    if "test_concurrency" in test_file or "TestTimeoutMonitorHandler" in str(request.node.nodeid):
         conn = await asyncpg.connect(**db_params)
         try:
-            # Delete all jobs created during concurrency tests
+            # Delete all jobs created during pool-based tests
             await conn.execute("DELETE FROM jorb")
+            await conn.execute("DELETE FROM jorb_dag")
+            await conn.execute("DELETE FROM jorb_dependencies")
         finally:
             await conn.close()
 
