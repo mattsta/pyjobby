@@ -146,7 +146,9 @@ async def cleanup_after_pool_tests(request, db_params: dict[str, str]):
     if ("test_concurrency" in test_file or
         "TestTimeoutMonitorHandler" in str(request.node.nodeid) or
         "test_e2e_producer_consumer" in test_file or
-        "test_performance_benchmarks" in test_file):
+        "test_performance_benchmarks" in test_file or
+        "test_client_worker_integration" in test_file or
+        "test_client_hypothesis" in test_file):
         conn = await asyncpg.connect(**db_params)
         try:
             # Delete all jobs created during pool-based tests
