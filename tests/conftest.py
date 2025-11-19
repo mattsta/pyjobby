@@ -151,6 +151,71 @@ async def cleanup_after_concurrency_tests(request, db_params: dict[str, str]):
 
 
 @pytest_asyncio.fixture
+async def db_pool(db_params: dict[str, str]) -> AsyncIterator[asyncpg.Pool]:
+    """
+    Create an asyncpg connection pool for tests that need pooling.
+
+    Each test gets a fresh pool that is automatically closed.
+    Configures JSON codec to use orjson (same as production).
+
+    Yields:
+        asyncpg.Pool: Connection pool
+    """
+    # Pool initialization function to configure JSON codec
+    async def init_connection(conn):
+        try:
+            import orjson
+
+            # orjson.dumps returns bytes, so decode to str for asyncpg
+            def orjson_encoder(obj):
+                return orjson.dumps(obj).decode('utf-8')
+
+            await conn.set_type_codec(
+                "json",
+                encoder=orjson_encoder,
+                decoder=orjson.loads,
+                schema="pg_catalog",
+            )
+            # Also configure jsonb
+            await conn.set_type_codec(
+                "jsonb",
+                encoder=orjson_encoder,
+                decoder=orjson.loads,
+                schema="pg_catalog",
+            )
+        except ImportError:
+            pass  # orjson not available, use default JSON codec
+
+    pool = await asyncpg.create_pool(
+        **db_params,
+        min_size=2,
+        max_size=10,
+        init=init_connection
+    )
+
+    try:
+        yield pool
+    finally:
+        await pool.close()
+
+
+@pytest_asyncio.fixture
+async def client(db_pool: asyncpg.Pool):
+    """
+    Create a JobClient instance for testing.
+
+    Uses the connection pool for database operations.
+
+    Yields:
+        JobClient: Client instance
+    """
+    from pyjobby.client import JobClient
+
+    client = JobClient(pool=db_pool)
+    yield client
+
+
+@pytest_asyncio.fixture
 async def job_system(db_params: dict[str, str], db_connection, worker_params: dict):
     """
     Create a JobSystem instance for testing.
