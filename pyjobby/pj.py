@@ -137,6 +137,8 @@ STMTS[
 ] = """UPDATE jorb
               SET state = 'finished',
                   result = $2,
+                  finished = TIMEZONE('utc', clock_timestamp()),
+                  timeout_at = NULL,
                   updated = TIMEZONE('utc', clock_timestamp())
               WHERE id = $1
           RETURNING *"""
@@ -145,14 +147,19 @@ STMTS[
     "run"
 ] = """UPDATE jorb
               SET state = 'running',
+                  started = TIMEZONE('utc', clock_timestamp()),
                   updated = TIMEZONE('utc', clock_timestamp())
               WHERE id = $1
           RETURNING *"""
 
-# TODO: are we going to re-enqueue crashed jobs? By setting state to
-# 'crashed' here, it'll never be picked up again (also problem if worker
-# claims a job and then crashes without any other updates too, need to
-# check last updated timestamps for heartbeat/visibility timeouts).
+STMTS[
+    "set-timeout"
+] = """UPDATE jorb
+              SET timeout_at = TIMEZONE('utc', clock_timestamp()) + $2::interval
+              WHERE id = $1"""
+
+# Phase 2 improvement: Crashed jobs create retry jobs (see create-retry below)
+# instead of being requeued directly, preserving crash audit trail
 STMTS[
     "crash"
 ] = """UPDATE jorb
@@ -160,6 +167,8 @@ STMTS[
                 error_message = $2,
                 error_backtrace = $3,
                 error_count = error_count + 1,
+                timeout_at = NULL,
+                finished = TIMEZONE('utc', clock_timestamp()),
                 updated = TIMEZONE('utc', clock_timestamp())
               WHERE id = $1"""
 
@@ -517,9 +526,19 @@ class JobSystem:
 
                 klass = self.classForKlassFromName(job["job_class"], job=job)
 
-                # IMPROVEMENT: Add timeout protection for job execution
-                # Jobs can specify custom timeout via class attribute
-                job_timeout = getattr(klass, 'timeout', self.default_timeout)
+                # Phase 2: Extract timeout from admin_data or use class attribute or default
+                admin_data = job.get("admin_data") or {}
+                job_timeout = admin_data.get("timeout_seconds")
+                if job_timeout is None:
+                    job_timeout = getattr(klass, 'timeout', self.default_timeout)
+
+                # Phase 2: Set timeout_at in database if timeout is configured
+                if job_timeout:
+                    await self.ex(
+                        "set-timeout",
+                        job["id"],
+                        datetime.timedelta(seconds=job_timeout)
+                    )
 
                 # if job is async, .run() returns a coroutine we need to await.
                 # else, if task is not async, .run() runs the job itself.
@@ -529,12 +548,18 @@ class JobSystem:
 
                 if asyncio.iscoroutine(resultStageA):
                     # Apply timeout to async jobs
-                    result = await asyncio.wait_for(resultStageA, timeout=job_timeout)
+                    if job_timeout:
+                        result = await asyncio.wait_for(resultStageA, timeout=job_timeout)
+                    else:
+                        result = await resultStageA
                 elif inspect.isasyncgen(resultStageA):
                     # Apply timeout to async generator jobs
                     async def collect_with_timeout():
                         return [x async for x in resultStageA]
-                    result = await asyncio.wait_for(collect_with_timeout(), timeout=job_timeout)
+                    if job_timeout:
+                        result = await asyncio.wait_for(collect_with_timeout(), timeout=job_timeout)
+                    else:
+                        result = await collect_with_timeout()
                 else:
                     result = resultStageA
 
@@ -565,13 +590,15 @@ class JobSystem:
                             f"[job {jid}:{jname}; group {hex(gid)[2:]}] Triggered scheduling of {nextJobIds}"
                         )
             except asyncio.TimeoutError as e:
-                # IMPROVEMENT: Handle timeouts specifically
-                exc_traceback = traceback.extract_stack()
+                # Phase 2: Handle timeouts based on on_timeout configuration
+                admin_data = job.get("admin_data") or {}
+                on_timeout = admin_data.get("on_timeout", "retry")
+                max_retries = admin_data.get("max_retries", self.max_retries)
                 error_msg = f"Job timed out after {job_timeout}s"
 
                 logger.error(
-                    "[job {}:{}] TIMEOUT in {} after {}s",
-                    job["id"], jname, job["job_class"], job_timeout
+                    "[job {}:{}] TIMEOUT in {} after {}s (on_timeout={})",
+                    job["id"], jname, job["job_class"], job_timeout, on_timeout
                 )
 
                 # Mark original job as crashed (audit trail)
@@ -582,9 +609,9 @@ class JobSystem:
                     "Timeout error - job exceeded maximum execution time",
                 )
 
-                # Create retry job if under max retries
+                # Retry or fail based on on_timeout configuration
                 current_error_count = job.get("error_count", 0) + 1
-                if klass and current_error_count < self.max_retries:
+                if on_timeout == "retry" and klass and current_error_count < max_retries:
                     rescheduleFor = await klass.rescheduleBackoff(current_error_count)
                     retry_job_id = await self.cxn.fetchval(
                         self.stmts["create-retry"],
@@ -598,23 +625,25 @@ class JobSystem:
                         job["id"],
                         retry_job_id,
                         current_error_count + 1,
-                        self.max_retries,
+                        max_retries,
                         rescheduleFor.total_seconds() / 60,
                     )
                 else:
+                    reason = "max retries exceeded" if current_error_count >= max_retries else "on_timeout=fail"
                     logger.error(
-                        "[job {}] PERMANENTLY FAILED after {} attempts - "
-                        "max retries ({}) exceeded",
+                        "[job {}] PERMANENTLY FAILED after {} attempts - {}",
                         job["id"],
                         current_error_count,
-                        self.max_retries
+                        reason
                     )
 
                 error += 1
 
             except Exception as e:
-                # IMPROVEMENT: Fixed retry mechanism - create separate retry jobs
+                # Phase 2: Use configurable max_retries from admin_data
                 exc_type, exc_value, exc_traceback = sys.exc_info()
+                admin_data = job.get("admin_data") or {}
+                max_retries = admin_data.get("max_retries", self.max_retries)
 
                 logger.exception(
                     "[job {}:{}] Error in {}: {}", job["id"], jname, job["job_class"], e
@@ -631,10 +660,10 @@ class JobSystem:
                     "Traceback:\n" + "".join(traceback.format_tb(exc_traceback)),
                 )
 
-                # IMPROVEMENT: Create NEW retry job instead of overwriting crashed job
-                # This resolves the bug where reschedule() was overwritten by crash()
+                # Phase 2: Create NEW retry job using configurable retry strategy
+                # This preserves the crashed job as audit trail
                 current_error_count = job.get("error_count", 0) + 1
-                if klass and current_error_count < self.max_retries:
+                if klass and current_error_count < max_retries:
                     rescheduleFor = await klass.rescheduleBackoff(current_error_count)
 
                     # Create a NEW job for retry (separate row)
@@ -647,12 +676,13 @@ class JobSystem:
 
                     logger.info(
                         "[job {}] Created retry job {} (attempt {}/{}) "
-                        "scheduled for {:.1f} minutes",
+                        "scheduled for {:.1f} minutes using {} strategy",
                         job["id"],
                         retry_job_id,
                         current_error_count + 1,
-                        self.max_retries,
+                        max_retries,
                         rescheduleFor.total_seconds() / 60,
+                        admin_data.get("retry_strategy", "exponential")
                     )
                 else:
                     logger.error(
@@ -660,7 +690,7 @@ class JobSystem:
                         "max retries ({}) exceeded",
                         job["id"],
                         current_error_count,
-                        self.max_retries
+                        max_retries
                     )
 
                 error += 1
@@ -697,22 +727,29 @@ class Job:
     def rescheduleBackoff(
         self, attempt: Optional[int] = None
     ) -> Awaitable[datetime.timedelta]:
-        """Reschedule using min/max exponential backoff with jitter.
+        """Reschedule using configurable retry strategy from admin_data.
 
         Returns a coroutine which returns amount of time before job runs
         again as a timedelta.
 
         If no 'attempt' count is given, use the current job's error_count.
 
-        Job will sleep between 16 seconds and 17.2 minutes."""
+        Supports Phase 2 retry strategies:
+        - exponential (default): 1s, 2s, 4s, 8s, 16s...
+        - linear: 1s, 2s, 3s, 4s, 5s...
+        - fibonacci: 1s, 1s, 2s, 3s, 5s, 8s...
+        - fixed (legacy): quadratic backoff
+        """
+        from .retry_strategies import calculate_retry_from_job
 
         if attempt is None:
             attempt = self.job["error_count"]
 
-        # Use a min of 4 (16 seconds) and a max of 10 (~17 minutes)
-        # (plus a random jitter buffer between 0 and 10 seconds)
-        delayFor = 2 ** min(max(4, attempt), 10) + (random.randint(0, 1000) / 100)
-        return self.reschedule(delayFor, "seconds")
+        # Use Phase 2 retry strategies if configured
+        retry_delay = calculate_retry_from_job(self.job, attempt)
+
+        # Return the interval as timedelta
+        return self.reschedule(retry_delay.total_seconds(), "seconds")
 
     async def reschedule(
         self,

@@ -225,6 +225,17 @@ class JobClient:
         waitfor_group: Optional[int] = None,
         deadline_key: Optional[str] = None,
         admin_data: Optional[Dict[str, Any]] = None,
+        # Phase 2: Result Storage & Passing
+        save_result: bool = False,
+        use_result_from: Optional[int] = None,
+        # Phase 2: Retry Strategies
+        retry_strategy: str = "exponential",
+        max_retries: int = 10,
+        initial_retry_delay: int = 1,
+        max_retry_delay: int = 3600,
+        # Phase 2: Timeout Enforcement
+        timeout_seconds: Optional[int] = None,
+        on_timeout: str = "retry",
         **kwargs: Any
     ) -> int:
         """
@@ -242,6 +253,14 @@ class JobClient:
             waitfor_group: Wait for all jobs in this group (default: None)
             deadline_key: Idempotency key (default: None)
             admin_data: Metadata dict (default: None)
+            save_result: Store job result in database (Phase 2, default: False)
+            use_result_from: Inject result from this job ID into kwargs (Phase 2)
+            retry_strategy: 'exponential', 'linear', 'fibonacci', 'fixed' (Phase 2)
+            max_retries: Maximum retry attempts (Phase 2, default: 10)
+            initial_retry_delay: Starting retry delay in seconds (Phase 2, default: 1)
+            max_retry_delay: Maximum retry delay cap (Phase 2, default: 3600)
+            timeout_seconds: Job execution timeout in seconds (Phase 2, default: None)
+            on_timeout: 'retry' or 'fail' (Phase 2, default: 'retry')
             **kwargs: Job arguments (passed to job class)
 
         Returns:
@@ -283,13 +302,32 @@ class JobClient:
                 payment_id=payment_id
             )
 
-            # Pipeline (step 2 waits for step 1)
-            job1 = await client.enqueue('Step1', data=x)
-            job2 = await client.enqueue('Step2', waitfor_job=job1, result_from=job1)
+            # Pipeline with result passing (Phase 2)
+            job1 = await client.enqueue('FetchData', url='...', save_result=True)
+            job2 = await client.enqueue('ProcessData', waitfor_job=job1, use_result_from=job1)
+
+            # Job with timeout and exponential backoff (Phase 2)
+            job_id = await client.enqueue(
+                'ApiCall',
+                timeout_seconds=30,
+                retry_strategy='exponential',
+                max_retries=15,
+                on_timeout='retry'
+            )
         """
         # Validate parameters
         if waitfor_job and waitfor_group:
             raise ValueError("Cannot specify both waitfor_job and waitfor_group")
+
+        # Phase 2: Fetch upstream result if requested
+        if use_result_from:
+            async with self.pool.acquire() as conn:
+                upstream = await conn.fetchrow(
+                    "SELECT result FROM jorb WHERE id = $1",
+                    use_result_from
+                )
+                if upstream and upstream['result']:
+                    kwargs['upstream_result'] = upstream['result']
 
         # Default run_after to now if not specified
         if run_after is None:
@@ -300,6 +338,25 @@ class JobClient:
             state = 'waiting'
         else:
             state = 'queued'
+
+        # Phase 2: Build admin_data with Phase 2 features
+        if admin_data is None:
+            admin_data = {}
+
+        # Add save_result flag if requested
+        if save_result:
+            admin_data['save_result'] = True
+
+        # Add retry strategy configuration
+        admin_data['retry_strategy'] = retry_strategy
+        admin_data['max_retries'] = max_retries
+        admin_data['initial_retry_delay'] = initial_retry_delay
+        admin_data['max_retry_delay'] = max_retry_delay
+
+        # Add timeout configuration if specified
+        if timeout_seconds:
+            admin_data['timeout_seconds'] = timeout_seconds
+            admin_data['on_timeout'] = on_timeout
 
         # Execute INSERT
         async with self.pool.acquire() as conn:
@@ -324,7 +381,7 @@ class JobClient:
                 waitfor_job,
                 waitfor_group,
                 deadline_key,
-                json.dumps(admin_data) if admin_data else None,
+                json.dumps(admin_data),
                 state
             )
 
@@ -688,3 +745,168 @@ class JobClient:
             return True
         except Exception:
             return False
+
+    # =========================================================================
+    # Phase 2: DAG Support
+    # =========================================================================
+
+    def dag(self, name: Optional[str] = None, **common_options) -> 'DAGBuilder':
+        """
+        Create a DAG (Directed Acyclic Graph) builder.
+
+        Args:
+            name: Optional DAG name for debugging/monitoring
+            **common_options: Options applied to all jobs (queue, priority, etc.)
+
+        Returns:
+            DAGBuilder instance
+
+        Example:
+            # Simple DAG
+            dag = client.dag(name='ETL Pipeline', queue='data')
+            fetch = dag.add('FetchData', {'source': 'api'})
+            process = dag.add('ProcessData', depends_on=[fetch])
+            load = dag.add('LoadData', depends_on=[process])
+
+            # Execute DAG
+            node_to_job = await dag.execute(client)
+
+            # Complex DAG with parallelism
+            dag = client.dag(name='ML Training')
+            fetch_train = dag.add('FetchTrainData')
+            fetch_test = dag.add('FetchTestData')
+            preprocess = dag.add('Preprocess', depends_on=[fetch_train, fetch_test])
+            train = dag.add('TrainModel', depends_on=[preprocess])
+            evaluate = dag.add('Evaluate', depends_on=[train])
+            deploy = dag.add('Deploy', depends_on=[evaluate])
+
+            node_to_job = await dag.execute(client)
+        """
+        from .dag import DAGBuilder
+        return DAGBuilder(name=name, **common_options)
+
+    async def execute_dag(self, dag: 'DAGBuilder') -> Dict:
+        """
+        Execute a DAG and return node->job_id mapping.
+
+        Args:
+            dag: DAGBuilder instance
+
+        Returns:
+            Dict mapping DAGNode to job_id
+
+        Example:
+            from pyjobby.dag import DAGBuilder
+
+            dag = DAGBuilder(name='Pipeline')
+            step1 = dag.add('Step1')
+            step2 = dag.add('Step2', depends_on=[step1])
+
+            node_to_job = await client.execute_dag(dag)
+            print(f"Step1 job ID: {node_to_job[step1]}")
+        """
+        return await dag.execute(self)
+
+    async def get_dag_status(self, dag_id: int) -> Dict[str, Any]:
+        """
+        Get DAG execution status.
+
+        Args:
+            dag_id: DAG ID
+
+        Returns:
+            Dict with DAG status information
+
+        Example:
+            status = await client.get_dag_status(123)
+            print(f"DAG state: {status['dag_state']}")
+            print(f"Completed: {status['finished_jobs']}/{status['total_jobs']}")
+        """
+        from .dag import get_dag_status
+        return await get_dag_status(self.pool, dag_id)
+
+    async def wait_for_dag(self, dag_id: int, timeout: int = 3600) -> bool:
+        """
+        Wait for DAG to complete.
+
+        Args:
+            dag_id: DAG ID
+            timeout: Maximum wait time in seconds (default: 3600)
+
+        Returns:
+            True if DAG completed successfully, False if failed or timeout
+
+        Example:
+            # Execute DAG
+            dag = client.dag(name='Pipeline')
+            # ... build DAG ...
+            node_to_job = await dag.execute(client)
+
+            # Get DAG ID from any job
+            dag_id = await client.pool.fetchval(
+                "SELECT dag_id FROM jorb WHERE id = $1",
+                list(node_to_job.values())[0]
+            )
+
+            # Wait for completion
+            if await client.wait_for_dag(dag_id, timeout=1800):
+                print("DAG completed successfully!")
+            else:
+                print("DAG failed or timed out")
+        """
+        from .dag import wait_for_dag
+        return await wait_for_dag(self.pool, dag_id, timeout)
+
+    # =========================================================================
+    # Phase 2: Pipeline with Result Passing
+    # =========================================================================
+
+    async def create_pipeline_with_results(
+        self,
+        stages: List[Tuple[str, dict, bool]],
+        queue: str = 'default',
+        priority: int = 100,
+        **common_options
+    ) -> List[int]:
+        """
+        Create a linear pipeline where each stage can receive the previous stage's result.
+
+        Args:
+            stages: List of (job_class, kwargs, save_result) tuples
+            queue: Queue name (default: 'default')
+            priority: Priority for all jobs (default: 100)
+            **common_options: Additional options for all jobs
+
+        Returns:
+            List of job IDs
+
+        Example:
+            # Pipeline with result passing
+            job_ids = await client.create_pipeline_with_results([
+                ('FetchData', {'url': 'https://...'}, True),     # Save result
+                ('ProcessData', {}, True),                        # Save result
+                ('StoreResults', {}, False),                      # Don't save
+            ])
+
+            # Each job receives previous job's result in kwargs['upstream_result']
+        """
+        job_ids = []
+        previous_job = None
+        previous_saved_result = False
+
+        for job_class, kwargs, save_result in stages:
+            job_id = await self.enqueue(
+                job_class,
+                **kwargs,
+                queue=queue,
+                priority=priority,
+                save_result=save_result,
+                use_result_from=previous_job if previous_saved_result else None,
+                waitfor_job=previous_job,
+                **common_options
+            )
+            job_ids.append(job_id)
+            previous_job = job_id
+            previous_saved_result = save_result
+
+        return job_ids
