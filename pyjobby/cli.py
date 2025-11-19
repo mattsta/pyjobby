@@ -1099,5 +1099,490 @@ def schedule_stats(ctx, output_json):
     asyncio.run(_stats())
 
 
+# =========================================================================
+# Phase 2: DAG Management Commands
+# =========================================================================
+
+@cli.group()
+def dag():
+    """Manage DAGs (Directed Acyclic Graphs)"""
+    pass
+
+
+@dag.command('list')
+@click.option('--limit', '-l', default=50, help='Max results (default: 50)')
+@click.option('--json', 'output_json', is_flag=True, help='Output as JSON')
+@click.pass_context
+def dag_list(ctx, limit, output_json):
+    """List DAGs"""
+    async def _list():
+        conn = await get_connection(ctx.obj['config'])
+        try:
+            # Get DAGs with their status
+            dags = await conn.fetch("""
+                SELECT
+                    d.id,
+                    d.name,
+                    d.created,
+                    d.completed,
+                    s.total_jobs,
+                    s.finished_jobs,
+                    s.running_jobs,
+                    s.queued_jobs,
+                    s.crashed_jobs,
+                    s.dag_state,
+                    s.completion_percentage
+                FROM jorb_dag d
+                LEFT JOIN jorb_dag_status s ON s.dag_id = d.id
+                ORDER BY d.created DESC
+                LIMIT $1
+            """, limit)
+
+            if output_json:
+                # Convert to dict for JSON serialization
+                dag_list = [dict(d) for d in dags]
+                click.echo(json.dumps(dag_list, indent=2, default=str))
+            else:
+                if not dags:
+                    print_warning("No DAGs found")
+                    return
+
+                headers = ['ID', 'Name', 'State', 'Progress', 'Jobs', 'Created']
+                rows = []
+                for d in dags:
+                    name = d['name'][:30] if d['name'] else f"DAG-{d['id']}"
+
+                    # State with color
+                    state = d['dag_state'] or 'unknown'
+                    if state == 'complete':
+                        state_colored = f"{Colors.OKGREEN}{state}{Colors.ENDC}"
+                    elif state == 'failed':
+                        state_colored = f"{Colors.FAIL}{state}{Colors.ENDC}"
+                    elif state == 'running':
+                        state_colored = f"{Colors.OKCYAN}{state}{Colors.ENDC}"
+                    else:
+                        state_colored = state
+
+                    # Progress
+                    pct = d['completion_percentage'] or 0
+                    progress = f"{pct:.0f}%"
+
+                    # Job counts
+                    total = d['total_jobs'] or 0
+                    finished = d['finished_jobs'] or 0
+                    jobs_str = f"{finished}/{total}"
+
+                    # Created time
+                    created = d['created'].strftime('%Y-%m-%d %H:%M') if d['created'] else '-'
+
+                    rows.append([
+                        str(d['id']),
+                        name,
+                        state_colored,
+                        progress,
+                        jobs_str,
+                        created
+                    ])
+
+                print_table(headers, rows)
+                click.echo(f"\nShowing {len(dags)} DAG(s). Use --limit for more.")
+
+        finally:
+            await conn.close()
+
+    asyncio.run(_list())
+
+
+@dag.command('show')
+@click.argument('dag_id', type=int)
+@click.option('--json', 'output_json', is_flag=True, help='Output as JSON')
+@click.pass_context
+def dag_show(ctx, dag_id, output_json):
+    """Show DAG details and job status"""
+    async def _show():
+        conn = await get_connection(ctx.obj['config'])
+        try:
+            # Get DAG info
+            dag = await conn.fetchrow("""
+                SELECT * FROM jorb_dag_status WHERE dag_id = $1
+            """, dag_id)
+
+            if not dag:
+                print_error(f"DAG {dag_id} not found")
+                sys.exit(1)
+
+            # Get jobs in DAG
+            jobs = await conn.fetch("""
+                SELECT
+                    id, job_class, state,
+                    created, started, finished,
+                    waitfor_job, waitfor_group,
+                    error_message
+                FROM jorb
+                WHERE dag_id = $1
+                ORDER BY created
+            """, dag_id)
+
+            if output_json:
+                result = {
+                    'dag': dict(dag),
+                    'jobs': [dict(j) for j in jobs]
+                }
+                click.echo(json.dumps(result, indent=2, default=str))
+            else:
+                name = dag['dag_name'] or f"DAG-{dag_id}"
+                click.echo(f"\n{Colors.BOLD}DAG: {name} (ID: {dag_id}){Colors.ENDC}")
+                click.echo("-" * 60)
+
+                # Overall status
+                state = dag['dag_state']
+                if state == 'complete':
+                    state_str = f"{Colors.OKGREEN}Complete{Colors.ENDC}"
+                elif state == 'failed':
+                    state_str = f"{Colors.FAIL}Failed{Colors.ENDC}"
+                elif state == 'running':
+                    state_str = f"{Colors.OKCYAN}Running{Colors.ENDC}"
+                else:
+                    state_str = state
+
+                click.echo(f"State:       {state_str}")
+                click.echo(f"Created:     {dag['created']}")
+                click.echo(f"Completed:   {dag['completed'] or 'Not yet'}")
+                click.echo(f"Progress:    {dag['completion_percentage']:.1f}%")
+
+                click.echo(f"\n{Colors.BOLD}Job Counts:{Colors.ENDC}")
+                click.echo(f"Total:       {dag['total_jobs']}")
+                click.echo(f"Finished:    {dag['finished_jobs']}")
+                click.echo(f"Running:     {dag['running_jobs']}")
+                click.echo(f"Queued:      {dag['queued_jobs']}")
+                click.echo(f"Crashed:     {dag['crashed_jobs']}")
+                click.echo(f"Cancelled:   {dag['cancelled_jobs']}")
+
+                # Job list
+                if jobs:
+                    click.echo(f"\n{Colors.BOLD}Jobs in DAG:{Colors.ENDC}")
+                    headers = ['Job ID', 'State', 'Job Class', 'Dependencies']
+                    rows = []
+                    for job in jobs:
+                        # State with color
+                        state_icon = {
+                            'finished': f"{Colors.OKGREEN}✓{Colors.ENDC}",
+                            'running': f"{Colors.OKCYAN}▶{Colors.ENDC}",
+                            'queued': f"{Colors.WARNING}⏳{Colors.ENDC}",
+                            'crashed': f"{Colors.FAIL}✗{Colors.ENDC}",
+                            'cancelled': f"{Colors.WARNING}⊘{Colors.ENDC}",
+                        }.get(job['state'], job['state'])
+
+                        # Dependencies
+                        deps = []
+                        if job['waitfor_job']:
+                            deps.append(f"job:{job['waitfor_job']}")
+                        if job['waitfor_group']:
+                            deps.append(f"group:{job['waitfor_group']}")
+                        deps_str = ', '.join(deps) if deps else '-'
+
+                        rows.append([
+                            str(job['id']),
+                            state_icon,
+                            job['job_class'][:30],
+                            deps_str[:20]
+                        ])
+
+                    print_table(headers, rows)
+
+        finally:
+            await conn.close()
+
+    asyncio.run(_show())
+
+
+@dag.command('visualize')
+@click.argument('dag_id', type=int)
+@click.pass_context
+def dag_visualize(ctx, dag_id):
+    """Visualize DAG structure (ASCII art)"""
+    async def _visualize():
+        conn = await get_connection(ctx.obj['config'])
+        try:
+            # Get DAG dependencies
+            deps = await conn.fetch("""
+                SELECT * FROM get_dag_dependencies($1)
+            """, dag_id)
+
+            if not deps:
+                print_error(f"DAG {dag_id} not found or has no jobs")
+                sys.exit(1)
+
+            # Get DAG name
+            dag_name = await conn.fetchval("""
+                SELECT name FROM jorb_dag WHERE id = $1
+            """, dag_id)
+
+            click.echo(f"\n{Colors.BOLD}DAG: {dag_name or f'DAG-{dag_id}'}{Colors.ENDC}")
+            click.echo("=" * 60)
+            click.echo()
+
+            # Build dependency map
+            dep_map = {}
+            for row in deps:
+                dep_map[row['job_id']] = {
+                    'job_class': row['job_class'],
+                    'depends_on': row['depends_on'] or []
+                }
+
+            # Calculate levels (topological sort)
+            levels = []
+            remaining = set(dep_map.keys())
+            in_degree = {job_id: len(deps) for job_id, deps in
+                        [(jid, d['depends_on']) for jid, d in dep_map.items()]}
+
+            while remaining:
+                # Find jobs with no remaining dependencies
+                level = [job_id for job_id in remaining if in_degree[job_id] == 0]
+
+                if not level:
+                    click.echo(f"{Colors.FAIL}ERROR: Cycle detected in DAG!{Colors.ENDC}")
+                    break
+
+                levels.append(level)
+
+                # Remove from remaining and update in-degrees
+                for job_id in level:
+                    remaining.remove(job_id)
+                    # Update dependents
+                    for other_id in remaining:
+                        if job_id in dep_map[other_id]['depends_on']:
+                            in_degree[other_id] -= 1
+
+            # Display levels
+            for level_num, level in enumerate(levels):
+                click.echo(f"{Colors.BOLD}Level {level_num}:{Colors.ENDC}")
+                for job_id in level:
+                    job_info = dep_map[job_id]
+                    deps_str = ', '.join(str(d) for d in job_info['depends_on']) or 'none'
+                    click.echo(f"  • Job {job_id}: {job_info['job_class']}")
+                    click.echo(f"    Depends on: {deps_str}")
+                click.echo()
+
+            click.echo(f"Total: {len(levels)} level(s), {len(dep_map)} job(s)")
+
+        finally:
+            await conn.close()
+
+    asyncio.run(_visualize())
+
+
+# =========================================================================
+# Phase 2: Job Statistics Commands
+# =========================================================================
+
+@jobs.command('retry-stats')
+@click.option('--queue', '-q', help='Filter by queue')
+@click.option('--since-hours', type=int, default=24, help='Hours to look back (default: 24)')
+@click.option('--json', 'output_json', is_flag=True, help='Output as JSON')
+@click.pass_context
+def jobs_retry_stats(ctx, queue, since_hours, output_json):
+    """Show retry statistics (Phase 2)"""
+    async def _retry_stats():
+        conn = await get_connection(ctx.obj['config'])
+        try:
+            # Build WHERE clause
+            where_clauses = ["error_count > 0"]
+            params = []
+
+            if since_hours:
+                where_clauses.append("created > NOW() - $1::interval")
+                params.append(f"{since_hours} hours")
+
+            if queue:
+                where_clauses.append("queue = $2" if since_hours else "queue = $1")
+                params.append(queue)
+
+            where_str = " AND ".join(where_clauses)
+
+            # Get retry statistics
+            stats = await conn.fetch(f"""
+                SELECT
+                    admin_data->>'retry_strategy' as strategy,
+                    COUNT(*) as job_count,
+                    AVG(error_count) as avg_retries,
+                    MAX(error_count) as max_retries,
+                    COUNT(*) FILTER (WHERE state = 'finished') as eventually_succeeded,
+                    COUNT(*) FILTER (WHERE state = 'crashed') as permanently_failed
+                FROM jorb
+                WHERE {where_str}
+                GROUP BY admin_data->>'retry_strategy'
+                ORDER BY job_count DESC
+            """, *params)
+
+            # Get most retried jobs
+            top_retries = await conn.fetch(f"""
+                SELECT
+                    id, job_class, queue, state, error_count,
+                    admin_data->>'retry_strategy' as strategy,
+                    SUBSTRING(error_message, 1, 60) as error_preview
+                FROM jorb
+                WHERE {where_str}
+                ORDER BY error_count DESC
+                LIMIT 10
+            """, *params)
+
+            if output_json:
+                result = {
+                    'stats_by_strategy': [dict(s) for s in stats],
+                    'top_retries': [dict(j) for j in top_retries]
+                }
+                click.echo(json.dumps(result, indent=2, default=str))
+            else:
+                click.echo(f"\n{Colors.BOLD}Retry Statistics (last {since_hours}h){Colors.ENDC}")
+                if queue:
+                    click.echo(f"Queue: {queue}")
+                click.echo("-" * 60)
+
+                if stats:
+                    click.echo(f"\n{Colors.BOLD}By Retry Strategy:{Colors.ENDC}")
+                    headers = ['Strategy', 'Jobs', 'Avg Retries', 'Max', 'Succeeded', 'Failed']
+                    rows = []
+                    for s in stats:
+                        strategy = s['strategy'] or 'default'
+                        rows.append([
+                            strategy,
+                            str(s['job_count']),
+                            f"{s['avg_retries']:.1f}",
+                            str(s['max_retries']),
+                            str(s['eventually_succeeded']),
+                            str(s['permanently_failed'])
+                        ])
+                    print_table(headers, rows)
+                else:
+                    print_warning("No retry data found")
+
+                if top_retries:
+                    click.echo(f"\n{Colors.BOLD}Top Retried Jobs:{Colors.ENDC}")
+                    for job in top_retries:
+                        state_icon = {
+                            'finished': f"{Colors.OKGREEN}✓{Colors.ENDC}",
+                            'crashed': f"{Colors.FAIL}✗{Colors.ENDC}",
+                        }.get(job['state'], job['state'])
+
+                        click.echo(f"\nJob {job['id']} {state_icon} - {job['job_class']}")
+                        click.echo(f"  Retries: {job['error_count']}")
+                        click.echo(f"  Strategy: {job['strategy'] or 'default'}")
+                        if job['error_preview']:
+                            click.echo(f"  Error: {job['error_preview']}...")
+
+        finally:
+            await conn.close()
+
+    asyncio.run(_retry_stats())
+
+
+@jobs.command('timeout-stats')
+@click.option('--queue', '-q', help='Filter by queue')
+@click.option('--since-hours', type=int, default=24, help='Hours to look back (default: 24)')
+@click.option('--json', 'output_json', is_flag=True, help='Output as JSON')
+@click.pass_context
+def jobs_timeout_stats(ctx, queue, since_hours, output_json):
+    """Show timeout statistics (Phase 2)"""
+    async def _timeout_stats():
+        conn = await get_connection(ctx.obj['config'])
+        try:
+            # Build WHERE clause
+            where_clauses = ["admin_data ? 'timeout_seconds'"]
+            params = []
+
+            if since_hours:
+                where_clauses.append("created > NOW() - $1::interval")
+                params.append(f"{since_hours} hours")
+
+            if queue:
+                where_clauses.append("queue = $2" if since_hours else "queue = $1")
+                params.append(queue)
+
+            where_str = " AND ".join(where_clauses)
+
+            # Get timeout statistics
+            stats = await conn.fetchrow(f"""
+                SELECT
+                    COUNT(*) as total_with_timeout,
+                    COUNT(*) FILTER (WHERE state = 'finished') as completed,
+                    COUNT(*) FILTER (WHERE state = 'crashed' AND
+                                     error_message LIKE '%imeout%') as timed_out,
+                    COUNT(*) FILTER (WHERE state = 'running' AND
+                                     timeout_at < NOW()) as currently_timed_out,
+                    AVG((admin_data->>'timeout_seconds')::int) as avg_timeout_seconds
+                FROM jorb
+                WHERE {where_str}
+            """, *params)
+
+            # Get current timeout violations
+            violations = await conn.fetch("""
+                SELECT * FROM jorb_timeout_violations
+                ORDER BY timeout_at
+                LIMIT 20
+            """)
+
+            # Get jobs that timed out
+            timed_out_jobs = await conn.fetch(f"""
+                SELECT
+                    id, job_class, queue, error_count,
+                    admin_data->>'timeout_seconds' as timeout_config,
+                    admin_data->>'on_timeout' as on_timeout,
+                    SUBSTRING(error_message, 1, 60) as error_preview
+                FROM jorb
+                WHERE {where_str}
+                  AND state = 'crashed'
+                  AND error_message LIKE '%imeout%'
+                ORDER BY created DESC
+                LIMIT 10
+            """, *params)
+
+            if output_json:
+                result = {
+                    'summary': dict(stats) if stats else {},
+                    'current_violations': [dict(v) for v in violations],
+                    'recent_timeouts': [dict(j) for j in timed_out_jobs]
+                }
+                click.echo(json.dumps(result, indent=2, default=str))
+            else:
+                click.echo(f"\n{Colors.BOLD}Timeout Statistics (last {since_hours}h){Colors.ENDC}")
+                if queue:
+                    click.echo(f"Queue: {queue}")
+                click.echo("-" * 60)
+
+                if stats:
+                    click.echo(f"\nJobs with timeout config: {stats['total_with_timeout']}")
+                    click.echo(f"Completed successfully:   {stats['completed']}")
+                    click.echo(f"Timed out (crashed):      {stats['timed_out']}")
+                    click.echo(f"Avg timeout setting:      {stats['avg_timeout_seconds']:.0f}s")
+
+                    if stats['currently_timed_out'] and stats['currently_timed_out'] > 0:
+                        print_warning(f"\n⚠️  Currently timed out:    {stats['currently_timed_out']}")
+                else:
+                    print_warning("No timeout data found")
+
+                if violations:
+                    print_warning(f"\n{Colors.BOLD}Current Timeout Violations:{Colors.ENDC}")
+                    for v in violations:
+                        click.echo(f"\nJob {v['id']} - {v['job_class']}")
+                        click.echo(f"  Timeout at: {v['timeout_at']}")
+                        click.echo(f"  Config: {v['timeout_seconds']}s, Action: {v['on_timeout']}")
+
+                if timed_out_jobs:
+                    click.echo(f"\n{Colors.BOLD}Recently Timed Out Jobs:{Colors.ENDC}")
+                    for job in timed_out_jobs:
+                        click.echo(f"\nJob {job['id']} - {job['job_class']}")
+                        click.echo(f"  Timeout: {job['timeout_config']}s")
+                        click.echo(f"  Action: {job['on_timeout']}")
+                        click.echo(f"  Retries: {job['error_count']}")
+                        if job['error_preview']:
+                            click.echo(f"  Error: {job['error_preview']}...")
+
+        finally:
+            await conn.close()
+
+    asyncio.run(_timeout_stats())
+
+
 if __name__ == '__main__':
     cli(obj={})
