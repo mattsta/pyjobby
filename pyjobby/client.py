@@ -626,6 +626,530 @@ class JobClient:
 
         return stats
 
+    async def list_queues(self) -> List[Dict[str, Any]]:
+        """
+        List all queues with statistics.
+
+        Returns:
+            List of dicts with queue name and stats
+
+        Example:
+            queues = await client.list_queues()
+            for q in queues:
+                print(f"{q['queue']}: {q['queued']} queued, {q['running']} running")
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT
+                    queue,
+                    COUNT(*) FILTER (WHERE state = 'queued') as queued,
+                    COUNT(*) FILTER (WHERE state = 'claimed') as claimed,
+                    COUNT(*) FILTER (WHERE state = 'running') as running,
+                    COUNT(*) FILTER (WHERE state = 'waiting') as waiting,
+                    COUNT(*) FILTER (WHERE state = 'finished') as finished,
+                    COUNT(*) FILTER (WHERE state = 'crashed') as crashed,
+                    COUNT(*) FILTER (WHERE state = 'cancelled') as cancelled,
+                    COUNT(*) as total
+                FROM jorb
+                GROUP BY queue
+                ORDER BY queue
+            """)
+
+        return [dict(row) for row in rows]
+
+    async def purge_queue(self, queue: str, states: Optional[List[str]] = None) -> int:
+        """
+        Delete jobs from a queue.
+
+        Args:
+            queue: Queue name
+            states: List of states to delete (default: ['queued', 'waiting'])
+
+        Returns:
+            Number of jobs deleted
+
+        Example:
+            # Delete all queued/waiting jobs
+            deleted = await client.purge_queue('emails')
+
+            # Delete only finished jobs
+            deleted = await client.purge_queue('emails', states=['finished'])
+        """
+        if states is None:
+            states = ['queued', 'waiting']
+
+        async with self.pool.acquire() as conn:
+            result = await conn.execute("""
+                DELETE FROM jorb
+                WHERE queue = $1
+                  AND state = ANY($2::jorbstate[])
+            """, queue, states)
+
+        # Extract row count from result like "DELETE 42"
+        return int(result.split()[-1]) if result.split()[-1].isdigit() else 0
+
+    # =========================================================================
+    # Extended Job Management
+    # =========================================================================
+
+    async def get_job_full(self, job_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get complete job details including kwargs, result, etc.
+
+        Args:
+            job_id: Job ID
+
+        Returns:
+            Dict with all job fields, or None if not found
+
+        Example:
+            job = await client.get_job_full(12345)
+            if job:
+                print(f"Job kwargs: {job['kwargs']}")
+                print(f"Result: {job['result']}")
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT *
+                FROM jorb
+                WHERE id = $1
+            """, job_id)
+
+        if not row:
+            return None
+
+        return dict(row)
+
+    async def get_job_result(self, job_id: int) -> Optional[Any]:
+        """
+        Get job result.
+
+        Args:
+            job_id: Job ID
+
+        Returns:
+            Job result (parsed from JSON), or None if not finished or no result
+
+        Example:
+            result = await client.get_job_result(12345)
+            if result:
+                print(f"Job returned: {result}")
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT result, state
+                FROM jorb
+                WHERE id = $1
+            """, job_id)
+
+        if not row or row['state'] != 'finished' or not row['result']:
+            return None
+
+        # Result is stored as JSON
+        result = row['result']
+        if isinstance(result, str):
+            return json.loads(result)
+        return result
+
+    async def delete_job(self, job_id: int) -> bool:
+        """
+        Delete a job from the database.
+
+        Args:
+            job_id: Job ID
+
+        Returns:
+            True if deleted, False if not found
+
+        Example:
+            if await client.delete_job(12345):
+                print("Job deleted")
+        """
+        async with self.pool.acquire() as conn:
+            result = await conn.execute("""
+                DELETE FROM jorb
+                WHERE id = $1
+            """, job_id)
+
+        return result != "DELETE 0"
+
+    async def update_job_priority(self, job_id: int, new_priority: int) -> bool:
+        """
+        Update job priority (only for queued/waiting jobs).
+
+        Args:
+            job_id: Job ID
+            new_priority: New priority value
+
+        Returns:
+            True if updated, False if not found or already running
+
+        Example:
+            # Make job higher priority
+            if await client.update_job_priority(12345, 500):
+                print("Priority updated")
+        """
+        async with self.pool.acquire() as conn:
+            result = await conn.execute("""
+                UPDATE jorb
+                SET prio = $2
+                WHERE id = $1
+                  AND state IN ('queued', 'waiting')
+            """, job_id, new_priority)
+
+        return result != "UPDATE 0"
+
+    async def get_jobs(
+        self,
+        queue: Optional[str] = None,
+        state: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+        order_by: str = 'created',
+        ascending: bool = False
+    ) -> List[Dict[str, Any]]:
+        """
+        List jobs with filtering and pagination.
+
+        Args:
+            queue: Filter by queue (default: all queues)
+            state: Filter by state (default: all states)
+            limit: Maximum number of jobs to return (default: 100)
+            offset: Number of jobs to skip (default: 0)
+            order_by: Field to sort by (default: 'created')
+            ascending: Sort ascending if True, descending if False (default: False)
+
+        Returns:
+            List of job dicts
+
+        Example:
+            # Get latest 50 queued jobs
+            jobs = await client.get_jobs(state='queued', limit=50)
+
+            # Get jobs from specific queue
+            jobs = await client.get_jobs(queue='emails', limit=20)
+        """
+        # Build WHERE clause
+        where_clauses = []
+        params = []
+        param_num = 1
+
+        if queue:
+            where_clauses.append(f"queue = ${param_num}")
+            params.append(queue)
+            param_num += 1
+
+        if state:
+            where_clauses.append(f"state = ${param_num}::jorbstate")
+            params.append(state)
+            param_num += 1
+
+        where_sql = " AND ".join(where_clauses) if where_clauses else "TRUE"
+
+        # Validate order_by to prevent SQL injection
+        valid_fields = ['id', 'created', 'prio', 'run_after', 'started', 'finished', 'queue', 'state']
+        if order_by not in valid_fields:
+            order_by = 'created'
+
+        direction = 'ASC' if ascending else 'DESC'
+
+        params.extend([limit, offset])
+
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(f"""
+                SELECT *
+                FROM jorb
+                WHERE {where_sql}
+                ORDER BY {order_by} {direction}
+                LIMIT ${param_num}
+                OFFSET ${param_num + 1}
+            """, *params)
+
+        return [dict(row) for row in rows]
+
+    async def search_jobs(
+        self,
+        job_class: Optional[str] = None,
+        min_priority: Optional[int] = None,
+        max_priority: Optional[int] = None,
+        created_after: Optional[datetime] = None,
+        created_before: Optional[datetime] = None,
+        uid: Optional[int] = None,
+        run_group: Optional[int] = None,
+        capability: Optional[str] = None,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """
+        Search jobs by various criteria.
+
+        Args:
+            job_class: Filter by job class (supports wildcards with %)
+            min_priority: Minimum priority (inclusive)
+            max_priority: Maximum priority (inclusive)
+            created_after: Jobs created after this datetime
+            created_before: Jobs created before this datetime
+            uid: Filter by user/tenant ID
+            run_group: Filter by run group
+            capability: Filter by required capability
+            limit: Maximum number of results (default: 100)
+
+        Returns:
+            List of matching job dicts
+
+        Example:
+            # Find high-priority email jobs created today
+            jobs = await client.search_jobs(
+                job_class='%Email%',
+                min_priority=200,
+                created_after=datetime.now() - timedelta(days=1)
+            )
+        """
+        where_clauses = []
+        params = []
+        param_num = 1
+
+        if job_class:
+            where_clauses.append(f"job_class LIKE ${param_num}")
+            params.append(job_class)
+            param_num += 1
+
+        if min_priority is not None:
+            where_clauses.append(f"prio >= ${param_num}")
+            params.append(min_priority)
+            param_num += 1
+
+        if max_priority is not None:
+            where_clauses.append(f"prio <= ${param_num}")
+            params.append(max_priority)
+            param_num += 1
+
+        if created_after:
+            where_clauses.append(f"created >= ${param_num}")
+            params.append(created_after)
+            param_num += 1
+
+        if created_before:
+            where_clauses.append(f"created <= ${param_num}")
+            params.append(created_before)
+            param_num += 1
+
+        if uid is not None:
+            where_clauses.append(f"uid = ${param_num}")
+            params.append(uid)
+            param_num += 1
+
+        if run_group is not None:
+            where_clauses.append(f"run_group = ${param_num}")
+            params.append(run_group)
+            param_num += 1
+
+        if capability:
+            where_clauses.append(f"capability = ${param_num}")
+            params.append(capability)
+            param_num += 1
+
+        where_sql = " AND ".join(where_clauses) if where_clauses else "TRUE"
+        params.append(limit)
+
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(f"""
+                SELECT *
+                FROM jorb
+                WHERE {where_sql}
+                ORDER BY created DESC
+                LIMIT ${param_num}
+            """, *params)
+
+        return [dict(row) for row in rows]
+
+    async def get_failed_jobs(self, queue: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Get crashed/failed jobs.
+
+        Args:
+            queue: Filter by queue (default: all queues)
+            limit: Maximum number of jobs (default: 100)
+
+        Returns:
+            List of failed job dicts
+
+        Example:
+            failed = await client.get_failed_jobs(queue='processing', limit=50)
+            for job in failed:
+                print(f"Job {job['id']} failed: {job['error']}")
+        """
+        where = "state = 'crashed'"
+        params = []
+
+        if queue:
+            where += " AND queue = $1"
+            params.append(queue)
+            params.append(limit)
+        else:
+            params.append(limit)
+
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(f"""
+                SELECT *
+                FROM jorb
+                WHERE {where}
+                ORDER BY finished DESC
+                LIMIT ${len(params)}
+            """, *params)
+
+        return [dict(row) for row in rows]
+
+    async def get_waiting_jobs(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Get jobs waiting on dependencies.
+
+        Args:
+            limit: Maximum number of jobs (default: 100)
+
+        Returns:
+            List of waiting job dicts
+
+        Example:
+            waiting = await client.get_waiting_jobs()
+            for job in waiting:
+                print(f"Job {job['id']} waiting for {job['waitfor_job'] or job['waitfor_group']}")
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT *
+                FROM jorb
+                WHERE state = 'waiting'
+                ORDER BY created DESC
+                LIMIT $1
+            """, limit)
+
+        return [dict(row) for row in rows]
+
+    # =========================================================================
+    # Bulk Operations
+    # =========================================================================
+
+    async def bulk_cancel(self, job_ids: List[int]) -> int:
+        """
+        Cancel multiple jobs.
+
+        Args:
+            job_ids: List of job IDs to cancel
+
+        Returns:
+            Number of jobs cancelled
+
+        Example:
+            cancelled = await client.bulk_cancel([123, 456, 789])
+            print(f"Cancelled {cancelled} jobs")
+        """
+        if not job_ids:
+            return 0
+
+        async with self.pool.acquire() as conn:
+            result = await conn.execute("""
+                UPDATE jorb
+                SET state = 'cancelled'
+                WHERE id = ANY($1::bigint[])
+                  AND state IN ('queued', 'waiting')
+            """, job_ids)
+
+        return int(result.split()[-1]) if result.split()[-1].isdigit() else 0
+
+    async def bulk_retry(self, job_ids: List[int]) -> List[int]:
+        """
+        Retry multiple failed jobs.
+
+        Args:
+            job_ids: List of job IDs to retry
+
+        Returns:
+            List of new job IDs
+
+        Example:
+            new_job_ids = await client.bulk_retry([123, 456, 789])
+            print(f"Created {len(new_job_ids)} retry jobs")
+        """
+        if not job_ids:
+            return []
+
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                INSERT INTO jorb (
+                    job_class, kwargs, queue, prio, uid, capability,
+                    run_after, run_group, admin_data, state
+                )
+                SELECT
+                    job_class, kwargs, queue, prio, uid, capability,
+                    TIMEZONE('utc', clock_timestamp()) as run_after,
+                    run_group,
+                    jsonb_set(
+                        COALESCE(admin_data::jsonb, '{}'::jsonb),
+                        '{retry_of}',
+                        to_jsonb(id::bigint)
+                    )::json,
+                    'queued' as state
+                FROM jorb
+                WHERE id = ANY($1::bigint[])
+                  AND state IN ('crashed', 'finished')
+                RETURNING id
+            """, job_ids)
+
+        return [row['id'] for row in rows]
+
+    async def bulk_delete(self, job_ids: List[int]) -> int:
+        """
+        Delete multiple jobs.
+
+        Args:
+            job_ids: List of job IDs to delete
+
+        Returns:
+            Number of jobs deleted
+
+        Example:
+            deleted = await client.bulk_delete([123, 456, 789])
+            print(f"Deleted {deleted} jobs")
+        """
+        if not job_ids:
+            return 0
+
+        async with self.pool.acquire() as conn:
+            result = await conn.execute("""
+                DELETE FROM jorb
+                WHERE id = ANY($1::bigint[])
+            """, job_ids)
+
+        return int(result.split()[-1]) if result.split()[-1].isdigit() else 0
+
+    async def bulk_update_priority(self, job_ids: List[int], new_priority: int) -> int:
+        """
+        Update priority for multiple jobs.
+
+        Args:
+            job_ids: List of job IDs
+            new_priority: New priority value
+
+        Returns:
+            Number of jobs updated
+
+        Example:
+            updated = await client.bulk_update_priority([123, 456], 500)
+            print(f"Updated {updated} jobs to priority 500")
+        """
+        if not job_ids:
+            return 0
+
+        async with self.pool.acquire() as conn:
+            result = await conn.execute("""
+                UPDATE jorb
+                SET prio = $2
+                WHERE id = ANY($1::bigint[])
+                  AND state IN ('queued', 'waiting')
+            """, job_ids, new_priority)
+
+        return int(result.split()[-1]) if result.split()[-1].isdigit() else 0
+
     # =========================================================================
     # Advanced Features
     # =========================================================================
