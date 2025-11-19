@@ -6,7 +6,6 @@ Tests both database storage and automatic result injection.
 """
 
 import asyncio
-import json
 from datetime import datetime
 
 import pytest
@@ -49,7 +48,7 @@ class TestResultStorage:
             UPDATE jorb
             SET result = $1, state = 'finished'
             WHERE id = $2
-        """, json.dumps(test_result), job_id)
+        """, test_result, job_id)
 
         # Retrieve and verify
         job = await get_job(db_connection, job_id)
@@ -88,7 +87,7 @@ class TestResultStorage:
             UPDATE jorb
             SET result = $1, state = 'finished'
             WHERE id = $2
-        """, json.dumps(complex_result), job_id)
+        """, complex_result, job_id)
 
         job = await get_job(db_connection, job_id)
         assert job['result']['data']['items'] == [1, 2, 3, 4, 5]
@@ -107,7 +106,7 @@ class TestResultStorage:
                 UPDATE jorb
                 SET result = $1, state = 'finished'
                 WHERE id = $2
-            """, json.dumps(large_result), job_id)
+            """, large_result, job_id)
 
     @pytest.mark.asyncio
     async def test_result_with_finished_statement(self, db_connection):
@@ -119,8 +118,7 @@ class TestResultStorage:
         result = {"status": "completed", "value": 123}
         await db_connection.execute(
             STMTS["finished"],
-            job_id,
-            json.dumps(result)
+            job_id, result
         )
 
         job = await get_job(db_connection, job_id)
@@ -142,15 +140,15 @@ class TestResultPassing:
             UPDATE jorb
             SET result = $1, state = 'finished'
             WHERE id = $2
-        """, json.dumps(upstream_result), upstream_id)
+        """, upstream_result, upstream_id)
 
         # Create downstream job referencing upstream
         downstream_kwargs = {"param": "value"}
-        downstream_id = await db_connection.execute("""
+        downstream_id = await db_connection.fetchval("""
             INSERT INTO jorb (job_class, kwargs, queue, state, waitfor_job)
             VALUES ($1, $2, $3, $4, $5)
             RETURNING id
-        """, "test.Downstream", json.dumps(downstream_kwargs), "default", "waiting", upstream_id)
+        """, "test.Downstream", downstream_kwargs, "default", "waiting", upstream_id)
 
         # Simulate client.enqueue with use_result_from
         # In real usage, client would inject upstream_result into kwargs
@@ -159,7 +157,7 @@ class TestResultPassing:
             downstream_kwargs['upstream_result'] = upstream_job['result']
             await db_connection.execute("""
                 UPDATE jorb SET kwargs = $1 WHERE id = $2
-            """, json.dumps(downstream_kwargs), downstream_id)
+            """, downstream_kwargs, downstream_id)
 
         # Verify downstream has upstream result
         downstream_job = await get_job(db_connection, downstream_id)
@@ -175,7 +173,7 @@ class TestResultPassing:
         job1_result = {"step": 1, "data": "initial"}
         await db_connection.execute("""
             UPDATE jorb SET result = $1, state = 'finished' WHERE id = $2
-        """, json.dumps(job1_result), job1_id)
+        """, job1_result, job1_id)
 
         # Job 2: Waits for job1, processes its result
         job2_id = await create_job(
@@ -187,15 +185,15 @@ class TestResultPassing:
         job1 = await get_job(db_connection, job1_id)
         await db_connection.execute("""
             UPDATE jorb
-            SET kwargs = jsonb_set(kwargs, '{upstream_result}', $1::jsonb)
+            SET kwargs = jsonb_set(kwargs::jsonb, '{upstream_result}', $1::jsonb)
             WHERE id = $2
-        """, json.dumps(job1['result']), job2_id)
+        """, job1['result'], job2_id)
 
         # Job 2 produces its own result
         job2_result = {"step": 2, "data": "processed", "from_step1": job1_result['data']}
         await db_connection.execute("""
             UPDATE jorb SET result = $1, state = 'finished' WHERE id = $2
-        """, json.dumps(job2_result), job2_id)
+        """, job2_result, job2_id)
 
         # Job 3: Waits for job2
         job3_id = await create_job(
@@ -207,9 +205,9 @@ class TestResultPassing:
         job2 = await get_job(db_connection, job2_id)
         await db_connection.execute("""
             UPDATE jorb
-            SET kwargs = jsonb_set(kwargs, '{upstream_result}', $1::jsonb)
+            SET kwargs = jsonb_set(kwargs::jsonb, '{upstream_result}', $1::jsonb)
             WHERE id = $2
-        """, json.dumps(job2['result']), job3_id)
+        """, job2['result'], job3_id)
 
         # Verify job3 has result from job2
         job3 = await get_job(db_connection, job3_id)
@@ -249,7 +247,7 @@ class TestAdminDataSaveResult:
             INSERT INTO jorb (job_class, kwargs, queue, admin_data)
             VALUES ($1, $2, $3, $4)
             RETURNING id
-        """, "test.Job", '{}', "default", json.dumps(admin_data))
+        """, "test.Job", '{}', "default", admin_data)
 
         job = await get_job(db_connection, job_id)
         assert job['admin_data'] is not None
@@ -285,8 +283,8 @@ class TestPipelinePatterns:
             UPDATE jorb
             SET admin_data = $1, result = $2, state = 'finished'
             WHERE id = $3
-        """, json.dumps({"save_result": True}),
-            json.dumps({"fetched_data": [1, 2, 3]}),
+        """, {"save_result": True},
+            {"fetched_data": [1, 2, 3]},
             fetch_id)
 
         # Process job (saves result, uses fetch result)
@@ -300,11 +298,11 @@ class TestPipelinePatterns:
         fetch_job = await get_job(db_connection, fetch_id)
         await db_connection.execute("""
             UPDATE jorb
-            SET kwargs = jsonb_set(kwargs, '{upstream_result}', $1::jsonb),
+            SET kwargs = jsonb_set(kwargs::jsonb, '{upstream_result}', $1::jsonb),
                 admin_data = $2
             WHERE id = $3
-        """, json.dumps(fetch_job['result']),
-            json.dumps({"save_result": True}),
+        """, fetch_job['result'],
+            {"save_result": True},
             process_id)
 
         # Process produces result
@@ -312,7 +310,7 @@ class TestPipelinePatterns:
             UPDATE jorb
             SET result = $1, state = 'finished'
             WHERE id = $2
-        """, json.dumps({"processed_data": [2, 4, 6]}), process_id)
+        """, {"processed_data": [2, 4, 6]}, process_id)
 
         # Store job (doesn't save result, uses process result)
         store_id = await create_job(
@@ -325,9 +323,9 @@ class TestPipelinePatterns:
         process_job = await get_job(db_connection, process_id)
         await db_connection.execute("""
             UPDATE jorb
-            SET kwargs = jsonb_set(kwargs, '{upstream_result}', $1::jsonb)
+            SET kwargs = jsonb_set(kwargs::jsonb, '{upstream_result}', $1::jsonb)
             WHERE id = $2
-        """, json.dumps(process_job['result']), store_id)
+        """, process_job['result'], store_id)
 
         # Verify store job has processed data
         store_job = await get_job(db_connection, store_id)
@@ -343,7 +341,7 @@ class TestPipelinePatterns:
             UPDATE jorb
             SET result = $1, state = 'finished'
             WHERE id = $2
-        """, json.dumps(upstream_result), upstream_id)
+        """, upstream_result, upstream_id)
 
         # Create 3 downstream jobs, all using the same upstream result
         downstream_ids = []
@@ -359,9 +357,9 @@ class TestPipelinePatterns:
             upstream = await get_job(db_connection, upstream_id)
             await db_connection.execute("""
                 UPDATE jorb
-                SET kwargs = jsonb_set(kwargs, '{upstream_result}', $1::jsonb)
+                SET kwargs = jsonb_set(kwargs::jsonb, '{upstream_result}', $1::jsonb)
                 WHERE id = $2
-            """, json.dumps(upstream['result']), job_id)
+            """, upstream['result'], job_id)
 
         # Verify all downstream jobs have the shared data
         for job_id in downstream_ids:
@@ -380,7 +378,7 @@ class TestResultCleanup:
             UPDATE jorb
             SET result = $1, state = 'finished'
             WHERE id = $2
-        """, json.dumps({"data": "test"}), job_id)
+        """, {"data": "test"}, job_id)
 
         # Verify result exists
         job = await get_job(db_connection, job_id)
@@ -403,7 +401,7 @@ class TestResultCleanup:
             UPDATE jorb
             SET result = $1, state = 'finished'
             WHERE id = $2
-        """, json.dumps(test_result), job_id)
+        """, test_result, job_id)
 
         # Change state (simulating inspection or retry)
         await db_connection.execute("""

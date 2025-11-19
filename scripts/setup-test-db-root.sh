@@ -99,6 +99,13 @@ else
     exit 1
 fi
 
+# Apply scheduler migration (needed for test_client.py)
+log_info "Applying scheduler migration..."
+if [ -f "priv/migrations/003_add_recurring_scheduler.sql" ]; then
+    log_info "Applying 003_add_recurring_scheduler.sql..."
+    su - postgres -c "cd '$PROJECT_ROOT' && psql -d \"$DB_NAME\" -f 'priv/migrations/003_add_recurring_scheduler.sql'" > /dev/null
+fi
+
 # Apply Phase 2 migrations
 log_info "Applying Phase 2 migrations..."
 for migration in priv/migrations/005_*.sql priv/migrations/006_*.sql priv/migrations/007_*.sql priv/migrations/008_*.sql; do

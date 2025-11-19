@@ -35,7 +35,7 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.hypothesis, pytest.mark.slow]
 # Test Job Implementations
 # ============================================================================
 
-class TestSuccessJob:
+class SuccessJob:
     """Simple job that always succeeds for testing."""
 
     def __init__(self, s, job):
@@ -47,7 +47,7 @@ class TestSuccessJob:
         return {"status": "success", "job_id": self.job["id"], "timestamp": time.time()}
 
 
-class TestCountingJob:
+class CountingJob:
     """Job that increments a counter in worker cache."""
 
     def __init__(self, s, job):
@@ -61,7 +61,7 @@ class TestCountingJob:
         return {"count": count + 1, "job_id": self.job["id"]}
 
 
-class TestSlowJob:
+class SlowJob:
     """Job that takes time to complete."""
 
     def __init__(self, s, job):

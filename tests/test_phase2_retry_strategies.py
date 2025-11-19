@@ -9,7 +9,6 @@ Comprehensive tests for configurable retry strategies:
 """
 
 import asyncio
-import json
 from datetime import datetime, timedelta
 
 import pytest
@@ -34,12 +33,12 @@ class TestRetryDelayCalculation:
         ]
 
         # Should be roughly: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512
-        # (with jitter, so check ranges)
-        assert 0.9 <= delays[0].total_seconds() <= 1.5  # ~1s
-        assert 1.9 <= delays[1].total_seconds() <= 2.5  # ~2s
-        assert 3.9 <= delays[2].total_seconds() <= 4.5  # ~4s
-        assert 7.9 <= delays[3].total_seconds() <= 8.5  # ~8s
-        assert 15.9 <= delays[4].total_seconds() <= 16.5  # ~16s
+        # (with jitter up to 10% or 5 seconds, whichever is less)
+        assert 0.9 <= delays[0].total_seconds() <= 1.5  # ~1s + 10% = 1.1
+        assert 1.9 <= delays[1].total_seconds() <= 2.6  # ~2s + 10% = 2.2
+        assert 3.9 <= delays[2].total_seconds() <= 4.9  # ~4s + 10% = 4.4
+        assert 7.9 <= delays[3].total_seconds() <= 9.3  # ~8s + 10% = 8.8
+        assert 15.9 <= delays[4].total_seconds() <= 18.1  # ~16s + 10% = 17.6
 
     def test_linear_backoff(self):
         """Test linear backoff: 1s, 2s, 3s, 4s, 5s..."""
@@ -62,14 +61,14 @@ class TestRetryDelayCalculation:
             for attempt in range(1, 8)
         ]
 
-        # Fibonacci: 1, 1, 2, 3, 5, 8, 13
+        # Fibonacci: 1, 1, 2, 3, 5, 8, 13 (with jitter up to 10% or 5 seconds)
         assert 0.9 <= delays[0].total_seconds() <= 1.5  # ~1
         assert 0.9 <= delays[1].total_seconds() <= 1.5  # ~1
         assert 1.9 <= delays[2].total_seconds() <= 2.5  # ~2
         assert 2.9 <= delays[3].total_seconds() <= 3.5  # ~3
-        assert 4.9 <= delays[4].total_seconds() <= 5.5  # ~5
-        assert 7.9 <= delays[5].total_seconds() <= 8.5  # ~8
-        assert 12.9 <= delays[6].total_seconds() <= 13.5  # ~13
+        assert 4.9 <= delays[4].total_seconds() <= 5.6  # ~5
+        assert 7.9 <= delays[5].total_seconds() <= 8.9  # ~8
+        assert 12.9 <= delays[6].total_seconds() <= 14.3  # ~13 (13 + 10% jitter = 14.3)
 
     def test_fixed_backoff_legacy(self):
         """Test fixed (legacy) backoff: quadratic."""
@@ -91,7 +90,7 @@ class TestRetryDelayCalculation:
         """Test that delays are capped at max_delay."""
         # With exponential and high attempts, delay should cap at max
         delay = calculate_retry_delay(
-            attempt=20,  # Would be huge without cap
+            20,  # Would be huge without cap
             strategy="exponential",
             initial_delay=1,
             max_delay=60  # Cap at 60 seconds
@@ -103,7 +102,7 @@ class TestRetryDelayCalculation:
         """Test that initial_delay parameter works."""
         # Start with 10 seconds
         delay = calculate_retry_delay(
-            attempt=1,
+            1,
             strategy="exponential",
             initial_delay=10
         )
@@ -205,7 +204,7 @@ class TestAdminDataRetryConfig:
             INSERT INTO jorb (job_class, kwargs, queue, admin_data)
             VALUES ($1, $2, $3, $4)
             RETURNING id
-        """, "test.Job", '{}', "default", json.dumps(admin_data))
+        """, "test.Job", '{}', "default", admin_data)
 
         job = await get_job(db_connection, job_id)
         assert job['admin_data']['retry_strategy'] == 'exponential'
@@ -243,7 +242,7 @@ class TestRetryStrategiesIntegration:
             INSERT INTO jorb (job_class, kwargs, queue, admin_data, state)
             VALUES ($1, $2, $3, $4, $5)
             RETURNING id
-        """, "test.FailingJob", '{}', "default", json.dumps(admin_data), "queued")
+        """, "test.FailingJob", '{}', "default", admin_data, "queued")
 
         # Simulate first failure
         await db_connection.execute("""
@@ -289,7 +288,7 @@ class TestRetryStrategiesIntegration:
             INSERT INTO jorb (job_class, kwargs, queue, admin_data, state, error_count)
             VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING id
-        """, "test.Job", '{}', "default", json.dumps(admin_data), "crashed", 3)
+        """, "test.Job", '{}', "default", admin_data, "crashed", 3)
 
         job = await get_job(db_connection, job_id)
         config = get_retry_config(job['admin_data'])
@@ -313,13 +312,13 @@ class TestRetryStrategiesIntegration:
                 INSERT INTO jorb (job_class, kwargs, queue, admin_data)
                 VALUES ($1, $2, $3, $4)
                 RETURNING id
-            """, "test.Job", '{}', "default", json.dumps(admin_data))
+            """, "test.Job", '{}', "default", admin_data)
 
             job = await get_job(db_connection, job_id)
-            delay = calculate_retry_from_job(job, error_count=5)
+            delay = calculate_retry_from_job(job, error_count=6)
             delays[strategy] = delay.total_seconds()
 
-        # All should be different for attempt 5
+        # All should be different for attempt 6 (linear=6, fib=8, exp=32)
         assert delays["exponential"] != delays["linear"]
         assert delays["exponential"] != delays["fibonacci"]
         assert delays["linear"] != delays["fibonacci"]
