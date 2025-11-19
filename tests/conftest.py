@@ -158,7 +158,8 @@ async def cleanup_after_pool_tests(request, db_params: dict[str, str]):
         "test_client_hypothesis" in test_file or
         "test_client_management" in test_file or
         "test_dag_comprehensive" in test_file or
-        "test_scheduler_comprehensive" in test_file):
+        "test_scheduler_comprehensive" in test_file or
+        "test_admin_api_comprehensive" in test_file):
         conn = await asyncpg.connect(**db_params)
         try:
             # Delete all jobs and schedules created during pool-based tests
@@ -184,34 +185,31 @@ async def db_pool(db_params: dict[str, str]) -> AsyncIterator[asyncpg.Pool]:
     """
     # Pool initialization function to configure JSON codec
     async def init_connection(conn):
-        try:
-            import orjson
+        import orjson
 
-            # Encoder: Python object → JSON string
-            def orjson_encoder(obj):
-                return orjson.dumps(obj).decode('utf-8')
+        # Encoder: Python object → JSON string
+        def orjson_encoder(obj):
+            return orjson.dumps(obj).decode('utf-8')
 
-            # Decoder: JSON string → Python object
-            def orjson_decoder(s):
-                return orjson.loads(s)
+        # Decoder: JSON string → Python object
+        def orjson_decoder(s):
+            return orjson.loads(s)
 
-            await conn.set_type_codec(
-                "json",
-                encoder=orjson_encoder,
-                decoder=orjson_decoder,
-                schema="pg_catalog",
-                format="text"
-            )
-            # Also configure jsonb
-            await conn.set_type_codec(
-                "jsonb",
-                encoder=orjson_encoder,
-                decoder=orjson_decoder,
-                schema="pg_catalog",
-                format="text"
-            )
-        except ImportError:
-            pass  # orjson not available, use default JSON codec
+        await conn.set_type_codec(
+            "json",
+            encoder=orjson_encoder,
+            decoder=orjson_decoder,
+            schema="pg_catalog",
+            format="text"
+        )
+        # Also configure jsonb
+        await conn.set_type_codec(
+            "jsonb",
+            encoder=orjson_encoder,
+            decoder=orjson_decoder,
+            schema="pg_catalog",
+            format="text"
+        )
 
     pool = await asyncpg.create_pool(
         **db_params,
