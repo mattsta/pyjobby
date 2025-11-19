@@ -41,6 +41,10 @@ class JobInfo:
     error_message: Optional[str] = None
     error_backtrace: Optional[str] = None
     admin_data: Optional[dict] = None
+    started: Optional[datetime] = None
+    finished: Optional[datetime] = None
+    timeout_at: Optional[datetime] = None
+    dag_id: Optional[int] = None
 
     @classmethod
     def from_record(cls, record: asyncpg.Record) -> "JobInfo":
@@ -51,8 +55,8 @@ class JobInfo:
         """Convert to dictionary with datetime serialization"""
         data = asdict(self)
         # Convert datetimes to ISO strings for JSON serialization
-        for key in ['run_after', 'created', 'updated']:
-            if data[key]:
+        for key in ['run_after', 'created', 'updated', 'started', 'finished', 'timeout_at']:
+            if data.get(key):
                 data[key] = data[key].isoformat()
         return data
 
