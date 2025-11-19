@@ -371,7 +371,7 @@ class JobClient:
                 RETURNING id
             """,
                 job_class,
-                json.dumps(kwargs),
+                kwargs,  # Pass dict directly - asyncpg handles jsonb encoding
                 queue,
                 priority,
                 run_after,
@@ -381,7 +381,7 @@ class JobClient:
                 waitfor_job,
                 waitfor_group,
                 deadline_key,
-                json.dumps(admin_data),  # Must json.dumps for ::jsonb cast
+                admin_data,  # Pass dict directly - NO json.dumps for ::jsonb
                 state
             )
 

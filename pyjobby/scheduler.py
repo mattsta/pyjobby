@@ -484,7 +484,7 @@ class SchedulerWorker:
 
         # Prepare admin_data with schedule metadata
         admin_data = {
-            'schedule_id': schedule['id'],
+            'schedule_id': str(schedule['id']),  # Store as string for consistency
             'schedule_name': schedule['name'],
             'scheduled_time': scheduled_time.isoformat()
         }
@@ -504,13 +504,13 @@ class SchedulerWorker:
                 RETURNING id
             """,
                 schedule['job_class'],
-                json.dumps(schedule['kwargs']) if isinstance(schedule['kwargs'], dict) else schedule['kwargs'],
+                schedule['kwargs'],  # Pass dict directly, asyncpg handles encoding
                 schedule['queue'],
                 schedule['prio'],
                 schedule['capability'],
                 deadline_key,
                 run_after_time,
-                json.dumps(admin_data)
+                admin_data  # Pass dict directly, NO json.dumps for ::jsonb
             )
 
             logger.info(
