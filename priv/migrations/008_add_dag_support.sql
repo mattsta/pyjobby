@@ -162,31 +162,39 @@ RETURNS BOOLEAN AS $$
 DECLARE
     has_cycle BOOLEAN;
 BEGIN
-    -- Use recursive CTE to detect cycles
-    WITH RECURSIVE dag_traverse AS (
-        -- Start with all jobs in the DAG
-        SELECT
-            j.id as job_id,
-            ARRAY[j.id] as path,
-            j.waitfor_job as next_job
-        FROM jorb j
-        WHERE j.dag_id = dag_id_param
+    -- Build all edges (from both sources)
+    WITH all_edges AS (
+        -- Edges from jorb_dependencies
+        SELECT job_id as from_job, depends_on_job_id as to_job
+        FROM jorb_dependencies jd
+        WHERE EXISTS (SELECT 1 FROM jorb j WHERE j.id = jd.job_id AND j.dag_id = dag_id_param)
 
         UNION ALL
 
-        -- Follow dependencies
-        SELECT
-            dt.job_id,
-            dt.path || j.id,
-            j.waitfor_job
+        -- Edges from waitfor_job
+        SELECT id as from_job, waitfor_job as to_job
+        FROM jorb
+        WHERE dag_id = dag_id_param AND waitfor_job IS NOT NULL
+    ),
+    -- Use recursive CTE to traverse the graph
+    dag_traverse AS (
+        -- Start from each job
+        SELECT from_job as start_job, to_job as current_job, ARRAY[from_job, to_job] as path, 1 as depth
+        FROM all_edges
+
+        UNION ALL
+
+        -- Follow edges
+        SELECT dt.start_job, e.to_job, dt.path || e.to_job, dt.depth + 1
         FROM dag_traverse dt
-        JOIN jorb j ON j.id = dt.next_job
-        WHERE j.dag_id = dag_id_param
-          AND NOT (j.id = ANY(dt.path))  -- Stop if we've seen this job (cycle)
+        JOIN all_edges e ON e.from_job = dt.current_job
+        WHERE NOT (e.to_job = ANY(dt.path))  -- Stop if we've visited this node
+          AND dt.depth < 100  -- Prevent infinite recursion
     )
+    -- Check if any path loops back to its start
     SELECT EXISTS(
         SELECT 1 FROM dag_traverse
-        WHERE next_job = ANY(path)  -- Cycle detected
+        WHERE current_job = start_job
     ) INTO has_cycle;
 
     RETURN NOT has_cycle;

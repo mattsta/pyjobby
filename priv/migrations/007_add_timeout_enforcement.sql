@@ -52,12 +52,14 @@ COMMENT ON VIEW jorb_timeout_violations IS
     'The timeout monitor process uses this to identify jobs to terminate.';
 
 -- Create function to check for timed-out jobs
-CREATE OR REPLACE FUNCTION check_timed_out_jobs()
+CREATE OR REPLACE FUNCTION check_timed_out_jobs(batch_limit INT DEFAULT 100)
 RETURNS TABLE(
     job_id BIGINT,
     job_class TEXT,
     overdue_seconds INT,
-    action TEXT
+    action TEXT,
+    error_count INT,
+    admin_data JSON
 ) AS $$
 BEGIN
     RETURN QUERY
@@ -65,13 +67,15 @@ BEGIN
         id,
         jorb.job_class,
         EXTRACT(EPOCH FROM (NOW() - timeout_at))::INT,
-        COALESCE(admin_data->>'on_timeout', 'retry')
+        COALESCE(jorb.admin_data->>'on_timeout', 'retry'),
+        jorb.error_count,
+        jorb.admin_data
     FROM jorb
     WHERE state = 'running'
       AND timeout_at IS NOT NULL
       AND timeout_at < NOW()
     ORDER BY timeout_at
-    LIMIT 100;
+    LIMIT batch_limit;
 END;
 $$ LANGUAGE plpgsql;
 
