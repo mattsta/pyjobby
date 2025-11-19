@@ -18,12 +18,10 @@ from pyjobby.timeout_monitor import handle_timed_out_job, timeout_monitor
 from tests.utils.factories import create_job, get_job
 
 
-pytestmark = pytest.mark.asyncio
-
-
 class TestTimeoutDatabaseSchema:
     """Test timeout-related database schema."""
 
+    @pytest.mark.asyncio
     async def test_timeout_at_column_exists(self, db_connection):
         """Verify timeout_at column exists in jorb table."""
         result = await db_connection.fetchval("""
@@ -33,6 +31,7 @@ class TestTimeoutDatabaseSchema:
         """)
         assert result == 'timeout_at'
 
+    @pytest.mark.asyncio
     async def test_timeout_index_exists(self, db_connection):
         """Verify sparse index on timeout_at exists."""
         result = await db_connection.fetchval("""
@@ -42,12 +41,14 @@ class TestTimeoutDatabaseSchema:
         """)
         assert result == 'jorb_timeout_idx'
 
+    @pytest.mark.asyncio
     async def test_timeout_at_nullable(self, db_connection):
         """Test that timeout_at is NULL by default."""
         job_id = await create_job(db_connection, job_class="test.Job")
         job = await get_job(db_connection, job_id)
         assert job['timeout_at'] is None
 
+    @pytest.mark.asyncio
     async def test_set_timeout_at(self, db_connection):
         """Test setting timeout_at column."""
         job_id = await create_job(db_connection, job_class="test.Job")
@@ -67,6 +68,7 @@ class TestTimeoutDatabaseSchema:
 class TestTimeoutConfiguration:
     """Test timeout configuration in admin_data."""
 
+    @pytest.mark.asyncio
     async def test_timeout_config_in_admin_data(self, db_connection):
         """Test storing timeout configuration in admin_data."""
         admin_data = {
@@ -84,6 +86,7 @@ class TestTimeoutConfiguration:
         assert job['admin_data']['timeout_seconds'] == 300
         assert job['admin_data']['on_timeout'] == 'retry'
 
+    @pytest.mark.asyncio
     async def test_on_timeout_fail(self, db_connection):
         """Test on_timeout='fail' configuration."""
         admin_data = {
@@ -100,6 +103,7 @@ class TestTimeoutConfiguration:
         job = await get_job(db_connection, job_id)
         assert job['admin_data']['on_timeout'] == 'fail'
 
+    @pytest.mark.asyncio
     async def test_default_on_timeout_is_retry(self, db_connection):
         """Test that default on_timeout is 'retry'."""
         admin_data = {"timeout_seconds": 60}  # No on_timeout specified
@@ -119,6 +123,7 @@ class TestTimeoutConfiguration:
 class TestTimeoutTracking:
     """Test timeout tracking during job execution."""
 
+    @pytest.mark.asyncio
     async def test_timeout_at_set_when_job_starts(self, db_connection):
         """Test that timeout_at is set when job starts running."""
         from pyjobby.pj import STMTS
@@ -142,6 +147,7 @@ class TestTimeoutTracking:
         assert job['timeout_at'] is not None
         assert job['state'] == 'running'
 
+    @pytest.mark.asyncio
     async def test_timeout_at_cleared_on_completion(self, db_connection):
         """Test that timeout_at is cleared when job finishes."""
         from pyjobby.pj import STMTS
@@ -165,6 +171,7 @@ class TestTimeoutTracking:
         assert job['state'] == 'finished'
         assert job['timeout_at'] is None  # Should be cleared
 
+    @pytest.mark.asyncio
     async def test_timeout_at_cleared_on_crash(self, db_connection):
         """Test that timeout_at is cleared when job crashes."""
         from pyjobby.pj import STMTS
@@ -193,6 +200,7 @@ class TestTimeoutTracking:
 class TestTimeoutDetection:
     """Test detection of timed-out jobs."""
 
+    @pytest.mark.asyncio
     async def test_find_timed_out_jobs(self, db_connection):
         """Test SQL query to find timed-out jobs."""
         # Create a job with timeout in the past
@@ -221,6 +229,7 @@ class TestTimeoutDetection:
         assert len(timed_out) == 1
         assert timed_out[0]['id'] == job_id
 
+    @pytest.mark.asyncio
     async def test_check_timed_out_jobs_function(self, db_connection):
         """Test SQL function for checking timed-out jobs."""
         # Create timed-out job
@@ -247,6 +256,7 @@ class TestTimeoutDetection:
 class TestTimeoutMonitorHandler:
     """Test timeout monitor handler function."""
 
+    @pytest.mark.asyncio
     async def test_handle_timeout_with_retry(self, db_connection, db_pool):
         """Test handling timeout with retry action."""
         # Create timed-out job
@@ -283,6 +293,7 @@ class TestTimeoutMonitorHandler:
         assert job['timeout_at'] is None
         assert 'Timeout exceeded' in job['error_message']
 
+    @pytest.mark.asyncio
     async def test_handle_timeout_with_fail(self, db_connection, db_pool):
         """Test handling timeout with fail action."""
         admin_data = {
@@ -310,6 +321,7 @@ class TestTimeoutMonitorHandler:
         assert job['error_count'] == 1
         assert 'Timeout exceeded' in job['error_message']
 
+    @pytest.mark.asyncio
     async def test_handle_timeout_max_retries_exceeded(self, db_connection, db_pool):
         """Test timeout handling when max retries exceeded."""
         admin_data = {
@@ -341,6 +353,7 @@ class TestTimeoutMonitorHandler:
 class TestTimeoutView:
     """Test timeout violations view."""
 
+    @pytest.mark.asyncio
     async def test_timeout_violations_view(self, db_connection):
         """Test jorb_timeout_violations view."""
         # Create timed-out job
@@ -375,6 +388,7 @@ class TestTimeoutView:
 class TestTimeoutIntegration:
     """Integration tests for timeout enforcement."""
 
+    @pytest.mark.asyncio
     async def test_job_with_timeout_config_lifecycle(self, db_connection):
         """Test complete lifecycle of job with timeout configuration."""
         # Create job with timeout
@@ -411,6 +425,7 @@ class TestTimeoutIntegration:
         assert job['state'] == 'finished'
         assert job['timeout_at'] is None
 
+    @pytest.mark.asyncio
     async def test_multiple_jobs_different_timeouts(self, db_connection):
         """Test multiple jobs with different timeout configurations."""
         jobs = []
@@ -463,6 +478,7 @@ class TestTimeoutIntegration:
 class TestTimeoutEdgeCases:
     """Test edge cases and error handling."""
 
+    @pytest.mark.asyncio
     async def test_timeout_at_without_admin_data(self, db_connection):
         """Test job with timeout_at but no admin_data."""
         job_id = await create_job(db_connection, job_class="test.Job", state="running")
@@ -478,6 +494,7 @@ class TestTimeoutEdgeCases:
         # admin_data might be None or empty
         assert job.get('admin_data') is None or job['admin_data'] == {}
 
+    @pytest.mark.asyncio
     async def test_very_short_timeout(self, db_connection):
         """Test with very short timeout (1 second)."""
         admin_data = {"timeout_seconds": 1, "on_timeout": "fail"}
@@ -504,6 +521,7 @@ class TestTimeoutEdgeCases:
 
         assert len(timed_out) == 1
 
+    @pytest.mark.asyncio
     async def test_timeout_at_in_far_future(self, db_connection):
         """Test with timeout far in the future."""
         admin_data = {"timeout_seconds": 86400}  # 24 hours

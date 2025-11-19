@@ -15,12 +15,10 @@ import asyncpg
 from tests.utils.factories import create_job, get_job
 
 
-pytestmark = pytest.mark.asyncio
-
-
 class TestResultStorage:
     """Test result storage in database."""
 
+    @pytest.mark.asyncio
     async def test_result_column_exists(self, db_connection):
         """Verify result column exists in jorb table."""
         result = await db_connection.fetchval("""
@@ -30,6 +28,7 @@ class TestResultStorage:
         """)
         assert result == 'result'
 
+    @pytest.mark.asyncio
     async def test_result_index_exists(self, db_connection):
         """Verify sparse index on result column exists."""
         result = await db_connection.fetchval("""
@@ -39,6 +38,7 @@ class TestResultStorage:
         """)
         assert result == 'jorb_result_exists_idx'
 
+    @pytest.mark.asyncio
     async def test_store_simple_result(self, db_connection):
         """Test storing a simple result."""
         job_id = await create_job(db_connection, job_class="test.Job")
@@ -57,12 +57,14 @@ class TestResultStorage:
         assert job['result']['status'] == 'success'
         assert job['result']['count'] == 42
 
+    @pytest.mark.asyncio
     async def test_result_null_by_default(self, db_connection):
         """Test that result is NULL by default."""
         job_id = await create_job(db_connection, job_class="test.Job")
         job = await get_job(db_connection, job_id)
         assert job['result'] is None
 
+    @pytest.mark.asyncio
     async def test_store_complex_result(self, db_connection):
         """Test storing complex nested data."""
         job_id = await create_job(db_connection, job_class="test.Job")
@@ -92,6 +94,7 @@ class TestResultStorage:
         assert job['result']['data']['items'] == [1, 2, 3, 4, 5]
         assert job['result']['stats']['processed'] == 100
 
+    @pytest.mark.asyncio
     async def test_result_size_limit(self, db_connection):
         """Test that oversized results are rejected (10MB limit)."""
         job_id = await create_job(db_connection, job_class="test.Job")
@@ -106,6 +109,7 @@ class TestResultStorage:
                 WHERE id = $2
             """, json.dumps(large_result), job_id)
 
+    @pytest.mark.asyncio
     async def test_result_with_finished_statement(self, db_connection):
         """Test result storage using the finished statement."""
         from pyjobby.pj import STMTS
@@ -128,6 +132,7 @@ class TestResultStorage:
 class TestResultPassing:
     """Test automatic result passing between jobs."""
 
+    @pytest.mark.asyncio
     async def test_upstream_result_injection(self, db_connection):
         """Test that upstream result is injected into downstream kwargs."""
         # Create upstream job with result
@@ -162,6 +167,7 @@ class TestResultPassing:
         assert downstream_job['kwargs']['upstream_result']['data'] == 'from_upstream'
         assert downstream_job['kwargs']['upstream_result']['count'] == 42
 
+    @pytest.mark.asyncio
     async def test_result_passing_in_chain(self, db_connection):
         """Test result passing through a chain of jobs."""
         # Job 1: Initial data
@@ -210,6 +216,7 @@ class TestResultPassing:
         assert job3['kwargs']['upstream_result']['step'] == 2
         assert job3['kwargs']['upstream_result']['from_step1'] == 'initial'
 
+    @pytest.mark.asyncio
     async def test_result_passing_with_null_result(self, db_connection):
         """Test that NULL result doesn't break downstream jobs."""
         # Upstream job with no result
@@ -234,6 +241,7 @@ class TestResultPassing:
 class TestAdminDataSaveResult:
     """Test save_result flag in admin_data."""
 
+    @pytest.mark.asyncio
     async def test_save_result_flag_in_admin_data(self, db_connection):
         """Test that save_result flag can be stored in admin_data."""
         admin_data = {"save_result": True, "other_meta": "value"}
@@ -247,6 +255,7 @@ class TestAdminDataSaveResult:
         assert job['admin_data'] is not None
         assert job['admin_data']['save_result'] is True
 
+    @pytest.mark.asyncio
     async def test_save_result_defaults_to_false(self, db_connection):
         """Test that save_result defaults to false (no flag in admin_data)."""
         job_id = await create_job(db_connection, job_class="test.Job")
@@ -263,6 +272,7 @@ class TestAdminDataSaveResult:
 class TestPipelinePatterns:
     """Test common pipeline patterns with result passing."""
 
+    @pytest.mark.asyncio
     async def test_linear_pipeline(self, db_connection):
         """Test a simple linear pipeline with result passing."""
         # Create a pipeline: Fetch -> Process -> Store
@@ -323,6 +333,7 @@ class TestPipelinePatterns:
         store_job = await get_job(db_connection, store_id)
         assert store_job['kwargs']['upstream_result']['processed_data'] == [2, 4, 6]
 
+    @pytest.mark.asyncio
     async def test_fan_out_with_results(self, db_connection):
         """Test fan-out pattern where multiple jobs use same upstream result."""
         # Upstream job produces result
@@ -361,6 +372,7 @@ class TestPipelinePatterns:
 class TestResultCleanup:
     """Test result cleanup and lifecycle."""
 
+    @pytest.mark.asyncio
     async def test_result_deleted_with_job(self, db_connection):
         """Test that result is deleted when job row is deleted."""
         job_id = await create_job(db_connection, job_class="test.Job")
@@ -381,6 +393,7 @@ class TestResultCleanup:
         job = await get_job(db_connection, job_id)
         assert job is None
 
+    @pytest.mark.asyncio
     async def test_result_persists_across_states(self, db_connection):
         """Test that result persists even when job state changes."""
         job_id = await create_job(db_connection, job_class="test.Job")

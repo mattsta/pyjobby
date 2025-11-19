@@ -27,9 +27,6 @@ from pyjobby.dag import (
 from tests.utils.factories import create_job, get_job
 
 
-pytestmark = pytest.mark.asyncio
-
-
 class TestDAGNode:
     """Test DAGNode dataclass."""
 
@@ -289,6 +286,7 @@ class TestTopologicalSort:
 class TestDAGDatabaseSchema:
     """Test DAG database schema."""
 
+    @pytest.mark.asyncio
     async def test_jorb_dag_table_exists(self, db_connection):
         """Verify jorb_dag table exists."""
         exists = await db_connection.fetchval("""
@@ -299,6 +297,7 @@ class TestDAGDatabaseSchema:
         """)
         assert exists is True
 
+    @pytest.mark.asyncio
     async def test_jorb_dependencies_table_exists(self, db_connection):
         """Verify jorb_dependencies table exists."""
         exists = await db_connection.fetchval("""
@@ -309,6 +308,7 @@ class TestDAGDatabaseSchema:
         """)
         assert exists is True
 
+    @pytest.mark.asyncio
     async def test_dag_id_column_exists(self, db_connection):
         """Verify dag_id column exists in jorb table."""
         result = await db_connection.fetchval("""
@@ -318,6 +318,7 @@ class TestDAGDatabaseSchema:
         """)
         assert result == 'dag_id'
 
+    @pytest.mark.asyncio
     async def test_dag_id_index_exists(self, db_connection):
         """Verify index on dag_id column exists."""
         result = await db_connection.fetchval("""
@@ -327,6 +328,7 @@ class TestDAGDatabaseSchema:
         """)
         assert result == 'jorb_dag_id_idx'
 
+    @pytest.mark.asyncio
     async def test_create_dag_record(self, db_connection):
         """Test creating a DAG record."""
         dag_id = await db_connection.fetchval("""
@@ -349,6 +351,7 @@ class TestDAGDatabaseSchema:
 class TestDAGViews:
     """Test DAG monitoring views."""
 
+    @pytest.mark.asyncio
     async def test_jorb_dag_status_view_exists(self, db_connection):
         """Verify jorb_dag_status view exists."""
         exists = await db_connection.fetchval("""
@@ -359,6 +362,7 @@ class TestDAGViews:
         """)
         assert exists is True
 
+    @pytest.mark.asyncio
     async def test_jorb_dag_timeline_view_exists(self, db_connection):
         """Verify jorb_dag_timeline view exists."""
         exists = await db_connection.fetchval("""
@@ -369,6 +373,7 @@ class TestDAGViews:
         """)
         assert exists is True
 
+    @pytest.mark.asyncio
     async def test_dag_status_view_simple(self, db_connection):
         """Test jorb_dag_status view with simple DAG."""
         # Create DAG
@@ -395,6 +400,7 @@ class TestDAGViews:
         assert status['finished_jobs'] == 0
         assert status['dag_state'] == 'queued'
 
+    @pytest.mark.asyncio
     async def test_dag_status_view_mixed_states(self, db_connection):
         """Test jorb_dag_status with mixed job states."""
         dag_id = await db_connection.fetchval("""
@@ -419,6 +425,7 @@ class TestDAGViews:
         assert status['crashed_jobs'] == 1
         assert status['dag_state'] == 'failed'  # Has crashed jobs
 
+    @pytest.mark.asyncio
     async def test_dag_status_completion_percentage(self, db_connection):
         """Test completion_percentage calculation."""
         dag_id = await db_connection.fetchval("""
@@ -450,6 +457,7 @@ class TestDAGViews:
 class TestDAGSQLFunctions:
     """Test DAG SQL functions."""
 
+    @pytest.mark.asyncio
     async def test_get_dag_dependencies_function_exists(self, db_connection):
         """Verify get_dag_dependencies function exists."""
         exists = await db_connection.fetchval("""
@@ -461,6 +469,7 @@ class TestDAGSQLFunctions:
         """)
         assert exists is True
 
+    @pytest.mark.asyncio
     async def test_validate_dag_acyclic_function_exists(self, db_connection):
         """Verify validate_dag_acyclic function exists."""
         exists = await db_connection.fetchval("""
@@ -472,6 +481,7 @@ class TestDAGSQLFunctions:
         """)
         assert exists is True
 
+    @pytest.mark.asyncio
     async def test_validate_dag_acyclic_valid_dag(self, db_connection):
         """Test validate_dag_acyclic with valid DAG."""
         # Create DAG with linear dependencies
@@ -491,6 +501,7 @@ class TestDAGSQLFunctions:
         )
         assert is_valid is True
 
+    @pytest.mark.asyncio
     async def test_auto_complete_dag_trigger(self, db_connection):
         """Test that DAG auto-completes when all jobs finish."""
         # Create DAG
@@ -527,6 +538,7 @@ class TestDAGSQLFunctions:
 class TestDAGExecution:
     """Test DAG execution with JobClient."""
 
+    @pytest.mark.asyncio
     async def test_execute_simple_linear_dag(self, db_pool):
         """Test executing a simple linear DAG."""
         from pyjobby.client import JobClient
@@ -560,6 +572,7 @@ class TestDAGExecution:
             job = await get_job(db_pool, node.job_id)
             assert job['dag_id'] is not None
 
+    @pytest.mark.asyncio
     async def test_execute_parallel_dag(self, db_pool):
         """Test executing DAG with parallel jobs."""
         from pyjobby.client import JobClient
@@ -585,6 +598,7 @@ class TestDAGExecution:
         agg_job = await get_job(db_pool, agg.job_id)
         assert agg_job['waitfor_group'] is not None
 
+    @pytest.mark.asyncio
     async def test_execute_diamond_dag(self, db_pool):
         """Test executing diamond pattern DAG."""
         from pyjobby.client import JobClient
@@ -610,6 +624,7 @@ class TestDAGExecution:
         assert c_job['waitfor_job'] == a.job_id
         assert d_job['waitfor_group'] is not None  # Waits for both b and c
 
+    @pytest.mark.asyncio
     async def test_dag_with_common_options(self, db_pool):
         """Test DAG with common options applied to all jobs."""
         from pyjobby.client import JobClient
@@ -630,6 +645,7 @@ class TestDAGExecution:
         assert job1_record['queue'] == 'special_queue'
         assert job2_record['queue'] == 'special_queue'
 
+    @pytest.mark.asyncio
     async def test_execute_dag_validates_first(self, db_pool):
         """Test that execute() validates DAG before running."""
         from pyjobby.client import JobClient
@@ -650,6 +666,7 @@ class TestDAGExecution:
 class TestDAGHelperFunctions:
     """Test DAG helper functions."""
 
+    @pytest.mark.asyncio
     async def test_execute_dag_helper(self, db_pool):
         """Test execute_dag() convenience function."""
         from pyjobby.client import JobClient
@@ -663,6 +680,7 @@ class TestDAGHelperFunctions:
 
         assert len(node_to_job) == 1
 
+    @pytest.mark.asyncio
     async def test_get_dag_status_helper(self, db_pool):
         """Test get_dag_status() helper function."""
         # Create a DAG with jobs
@@ -683,6 +701,7 @@ class TestDAGHelperFunctions:
         assert status['total_jobs'] == 1
         assert status['finished_jobs'] == 1
 
+    @pytest.mark.asyncio
     async def test_get_dag_status_not_found(self, db_pool):
         """Test get_dag_status() with non-existent DAG."""
         status = await get_dag_status(db_pool, 999999)
@@ -690,6 +709,7 @@ class TestDAGHelperFunctions:
         assert 'error' in status
         assert status['error'] == 'DAG not found'
 
+    @pytest.mark.asyncio
     async def test_wait_for_dag_success(self, db_pool):
         """Test wait_for_dag() completes when DAG finishes."""
         # Create completed DAG
@@ -706,6 +726,7 @@ class TestDAGHelperFunctions:
         result = await wait_for_dag(db_pool, dag_id, timeout=5)
         assert result is True
 
+    @pytest.mark.asyncio
     async def test_wait_for_dag_failure(self, db_pool):
         """Test wait_for_dag() fails when jobs crash."""
         # Create DAG with crashed job
@@ -722,6 +743,7 @@ class TestDAGHelperFunctions:
         result = await wait_for_dag(db_pool, dag_id, timeout=5)
         assert result is False
 
+    @pytest.mark.asyncio
     async def test_wait_for_dag_timeout(self, db_pool):
         """Test wait_for_dag() times out for incomplete DAG."""
         # Create incomplete DAG
@@ -791,6 +813,7 @@ class TestDAGVisualization:
 class TestComplexDAGPatterns:
     """Test complex real-world DAG patterns."""
 
+    @pytest.mark.asyncio
     async def test_etl_pipeline_pattern(self, db_pool):
         """Test ETL pipeline: Extract (parallel) -> Transform -> Load."""
         from pyjobby.client import JobClient
@@ -820,6 +843,7 @@ class TestComplexDAGPatterns:
         assert len(levels[1]) == 1  # Transform
         assert len(levels[2]) == 1  # Load
 
+    @pytest.mark.asyncio
     async def test_map_reduce_pattern(self, db_pool):
         """Test map-reduce: Split -> Map (parallel) -> Reduce."""
         from pyjobby.client import JobClient
@@ -848,6 +872,7 @@ class TestComplexDAGPatterns:
         assert len(levels[1]) == 5   # Mappers (parallel)
         assert len(levels[2]) == 1   # Reduce
 
+    @pytest.mark.asyncio
     async def test_multi_stage_pipeline(self, db_pool):
         """Test multi-stage pipeline with complex dependencies."""
         from pyjobby.client import JobClient
@@ -879,6 +904,7 @@ class TestComplexDAGPatterns:
 class TestDAGEdgeCases:
     """Test edge cases and error conditions."""
 
+    @pytest.mark.asyncio
     async def test_empty_dag_execution(self, db_pool):
         """Test executing empty DAG."""
         from pyjobby.client import JobClient
@@ -890,6 +916,7 @@ class TestDAGEdgeCases:
         node_to_job = await dag.execute(client)
         assert len(node_to_job) == 0
 
+    @pytest.mark.asyncio
     async def test_single_job_dag(self, db_pool):
         """Test DAG with single job."""
         from pyjobby.client import JobClient
@@ -904,6 +931,7 @@ class TestDAGEdgeCases:
         assert len(levels) == 1
         assert levels[0] == [job]
 
+    @pytest.mark.asyncio
     async def test_dag_with_kwargs_none(self, db_pool):
         """Test DAG job with kwargs=None."""
         from pyjobby.client import JobClient

@@ -23,9 +23,6 @@ from pyjobby.retry_strategies import (
 from tests.utils.factories import create_job, get_job
 
 
-pytestmark = pytest.mark.asyncio
-
-
 class TestRetryDelayCalculation:
     """Test retry delay calculation algorithms."""
 
@@ -194,6 +191,7 @@ class TestRetryConfigExtraction:
 class TestAdminDataRetryConfig:
     """Test storing retry configuration in admin_data."""
 
+    @pytest.mark.asyncio
     async def test_store_retry_config_in_admin_data(self, db_connection):
         """Test storing retry configuration in job's admin_data."""
         admin_data = {
@@ -215,6 +213,7 @@ class TestAdminDataRetryConfig:
         assert job['admin_data']['initial_retry_delay'] == 1
         assert job['admin_data']['max_retry_delay'] == 300
 
+    @pytest.mark.asyncio
     async def test_default_retry_config(self, db_connection):
         """Test job with no retry config uses defaults."""
         job_id = await create_job(db_connection, job_class="test.Job")
@@ -229,6 +228,7 @@ class TestAdminDataRetryConfig:
 class TestRetryStrategiesIntegration:
     """Integration tests for retry strategies with actual retries."""
 
+    @pytest.mark.asyncio
     async def test_job_retry_with_exponential_strategy(self, db_connection):
         """Test job retry with exponential backoff."""
         admin_data = {
@@ -277,6 +277,7 @@ class TestRetryStrategiesIntegration:
         # run_after should be ~1 second from now
         assert retry_job['run_after'] > datetime.utcnow()
 
+    @pytest.mark.asyncio
     async def test_max_retries_enforcement(self, db_connection):
         """Test that max_retries limit is enforced."""
         admin_data = {
@@ -296,6 +297,7 @@ class TestRetryStrategiesIntegration:
         # Should not retry - at max
         assert job['error_count'] >= config['max_retries']
 
+    @pytest.mark.asyncio
     async def test_different_strategies_produce_different_delays(self, db_connection):
         """Test that different strategies produce different retry delays."""
         strategies = ["exponential", "linear", "fibonacci"]

@@ -108,6 +108,11 @@ for migration in priv/migrations/005_*.sql priv/migrations/006_*.sql priv/migrat
     fi
 done
 
+# Grant all table and sequence permissions to test user
+log_info "Granting table and sequence permissions..."
+su - postgres -c "psql -d \"$DB_NAME\" -c 'GRANT ALL ON ALL TABLES IN SCHEMA public TO $DB_USER;'" > /dev/null
+su - postgres -c "psql -d \"$DB_NAME\" -c 'GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO $DB_USER;'" > /dev/null
+
 # Test connection
 log_info "Testing connection..."
 PGPASSWORD="$DB_PASS" psql -h localhost -U "$DB_USER" -d "$DB_NAME" -c "SELECT version();" > /dev/null
