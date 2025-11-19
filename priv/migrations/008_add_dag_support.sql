@@ -163,7 +163,7 @@ DECLARE
     has_cycle BOOLEAN;
 BEGIN
     -- Build all edges (from both sources)
-    WITH all_edges AS (
+    WITH RECURSIVE all_edges AS (
         -- Edges from jorb_dependencies
         SELECT job_id as from_job, depends_on_job_id as to_job
         FROM jorb_dependencies jd
@@ -176,25 +176,27 @@ BEGIN
         FROM jorb
         WHERE dag_id = dag_id_param AND waitfor_job IS NOT NULL
     ),
-    -- Use recursive CTE to traverse the graph
+    -- Traverse from each node to build paths (without following cycles)
     dag_traverse AS (
-        -- Start from each job
-        SELECT from_job as start_job, to_job as current_job, ARRAY[from_job, to_job] as path, 1 as depth
-        FROM all_edges
+        -- Start from each node in the DAG
+        SELECT id as start_node, id as current_node, ARRAY[]::BIGINT[] as path, 0 as depth
+        FROM jorb
+        WHERE dag_id = dag_id_param
 
         UNION ALL
 
-        -- Follow edges
-        SELECT dt.start_job, e.to_job, dt.path || e.to_job, dt.depth + 1
+        -- Follow outgoing edges (don't revisit current node)
+        SELECT dt.start_node, e.to_job, dt.path || dt.current_node, dt.depth + 1
         FROM dag_traverse dt
-        JOIN all_edges e ON e.from_job = dt.current_job
-        WHERE NOT (e.to_job = ANY(dt.path))  -- Stop if we've visited this node
-          AND dt.depth < 100  -- Prevent infinite recursion
+        JOIN all_edges e ON e.from_job = dt.current_node
+        WHERE dt.depth < 100  -- Prevent infinite recursion
+          AND NOT (dt.current_node = ANY(dt.path))  -- Don't revisit current node
     )
-    -- Check if any path loops back to its start
+    -- A cycle exists if any edge points to a node already in the path
     SELECT EXISTS(
-        SELECT 1 FROM dag_traverse
-        WHERE current_job = start_job
+        SELECT 1 FROM dag_traverse dt
+        JOIN all_edges e ON e.from_job = dt.current_node
+        WHERE e.to_job = ANY(dt.path || dt.current_node)
     ) INTO has_cycle;
 
     RETURN NOT has_cycle;
