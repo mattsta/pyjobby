@@ -47,19 +47,27 @@ BEGIN
             delay := initial_delay * error_count;
 
         WHEN 'fibonacci' THEN
-            -- Fibonacci sequence
+            -- Fibonacci sequence: F(1)=1, F(2)=1, F(3)=2, F(4)=3, F(5)=5...
             DECLARE
-                a INT := 0;
-                b INT := 1;
+                a INT;
+                b INT;
                 temp INT;
                 i INT;
             BEGIN
-                FOR i IN 1..error_count LOOP
-                    temp := a + b;
-                    a := b;
-                    b := temp;
-                END LOOP;
-                delay := initial_delay * b;
+                IF error_count <= 0 THEN
+                    delay := 0;
+                ELSIF error_count = 1 OR error_count = 2 THEN
+                    delay := initial_delay * 1;
+                ELSE
+                    a := 1;
+                    b := 1;
+                    FOR i IN 3..error_count LOOP
+                        temp := a + b;
+                        a := b;
+                        b := temp;
+                    END LOOP;
+                    delay := initial_delay * b;
+                END IF;
             END;
 
         ELSE

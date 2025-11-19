@@ -62,10 +62,14 @@ def calculate_retry_delay(
         delay = initial_delay * error_count
 
     elif strategy == "fibonacci":
-        # Fibonacci backoff
+        # Fibonacci backoff: F(1)=1, F(2)=1, F(3)=2, F(4)=3, F(5)=5...
         def fib(n: int) -> int:
-            a, b = 0, 1
-            for _ in range(n):
+            if n <= 0:
+                return 0
+            if n == 1 or n == 2:
+                return 1
+            a, b = 1, 1
+            for _ in range(n - 2):
                 a, b = b, a + b
             return b
 
