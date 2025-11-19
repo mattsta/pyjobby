@@ -140,20 +140,106 @@ pj scheduler ./pyjobby.conf.py
 
 See [docs/RECURRING_SCHEDULER.md](docs/RECURRING_SCHEDULER.md) for complete documentation.
 
+### ✅ Phase 2: Advanced Job Patterns (NEW!)
+
+Production-grade features for complex workflows:
+
+**Job Result Storage & Passing**
+```python
+# Store results from jobs
+job_id = await client.enqueue(
+    'myapp.jobs.FetchData',
+    save_result=True  # Store result in database
+)
+
+# Pass results between jobs
+pipeline_job = await client.enqueue(
+    'myapp.jobs.ProcessData',
+    use_result_from=job_id  # Inject upstream result
+)
+```
+
+**Configurable Retry Strategies**
+```python
+# Exponential backoff: 1s, 2s, 4s, 8s, 16s...
+await client.enqueue(
+    'myapp.jobs.ApiCall',
+    retry_strategy='exponential',
+    max_retries=10,
+    initial_retry_delay=1
+)
+
+# Also supports: 'linear', 'fibonacci', 'fixed'
+```
+
+**Job Timeout Enforcement**
+```python
+# Worker-side timeout with automatic retry
+await client.enqueue(
+    'myapp.jobs.LongTask',
+    timeout_seconds=300,
+    on_timeout='retry'  # or 'fail'
+)
+
+# Background monitor for safety
+pj-timeout-monitor --dsn postgresql://... --check-interval 10
+```
+
+**DAG Support (Directed Acyclic Graphs)**
+```python
+from pyjobby.dag import DAGBuilder
+
+# Build complex dependency graphs
+dag = DAGBuilder(name='ETL Pipeline')
+
+# Parallel extraction
+extract1 = dag.add('ExtractAPI1', {'url': '...'})
+extract2 = dag.add('ExtractAPI2', {'url': '...'})
+
+# Sequential transformation (waits for both)
+transform = dag.add('Transform', depends_on=[extract1, extract2])
+
+# Final load
+load = dag.add('Load', depends_on=[transform])
+
+# Execute with automatic topological sort
+await dag.execute(client)
+
+# Monitor progress
+pj-admin dag list
+pj-admin dag show 123
+pj-admin dag visualize 123  # ASCII art visualization
+```
+
+**Advanced Statistics**
+```bash
+# Retry statistics by strategy
+pj-admin jobs retry-stats --queue default --since-hours 48
+
+# Timeout monitoring
+pj-admin jobs timeout-stats --json
+```
+
+See [docs/PHASE2_USER_GUIDE.md](docs/PHASE2_USER_GUIDE.md) for complete Phase 2 documentation.
+
 ### ✅ Complete Documentation
 
 - [CLIENT_LIBRARY.md](docs/CLIENT_LIBRARY.md) - Client API reference with examples
 - [EXAMPLES.md](docs/EXAMPLES.md) - Real-world usage patterns
 - [ADMIN_TOOLS.md](docs/ADMIN_TOOLS.md) - CLI, Web UI, and Admin API
 - [RECURRING_SCHEDULER.md](docs/RECURRING_SCHEDULER.md) - Cron scheduling guide
+- **[PHASE2_USER_GUIDE.md](docs/PHASE2_USER_GUIDE.md) - Advanced job patterns (NEW!)**
 - [ARCHITECTURE_CAPABILITIES.md](docs/ARCHITECTURE_CAPABILITIES.md) - System design
 - [PROJECT_STATUS.md](docs/PROJECT_STATUS.md) - Feature completion status
 
 ### ✅ Comprehensive Testing
 
-- 3,500+ test scenarios via Hypothesis property-based testing
-- 100+ unit and integration tests
+- **3,500+ test scenarios** via Hypothesis property-based testing
+- **149 Phase 2 tests** for advanced patterns (result storage, retries, timeouts, DAGs)
+- **100+ unit and integration tests** for core functionality
 - All passing, extensive coverage
+- Direct SQL function testing
+- Property-based fuzzing for retry strategies, timeout enforcement, and DAG algorithms
 
 ---
 
