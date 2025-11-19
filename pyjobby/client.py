@@ -556,11 +556,7 @@ class JobClient:
                     job_class, kwargs, queue, prio, uid, capability,
                     TIMEZONE('utc', clock_timestamp()) as run_after,
                     run_group,
-                    jsonb_set(
-                        COALESCE(admin_data::jsonb, '{}'::jsonb),
-                        '{retry_of}',
-                        to_jsonb($1::bigint)
-                    )::json,
+                    (COALESCE(admin_data::text::jsonb, '{}'::jsonb) || jsonb_build_object('retry_of', $1))::json as admin_data,
                     'queued' as state
                 FROM jorb
                 WHERE id = $1
@@ -1083,11 +1079,7 @@ class JobClient:
                     job_class, kwargs, queue, prio, uid, capability,
                     TIMEZONE('utc', clock_timestamp()) as run_after,
                     run_group,
-                    jsonb_set(
-                        COALESCE(admin_data::jsonb, '{}'::jsonb),
-                        '{retry_of}',
-                        to_jsonb(id::bigint)
-                    )::json,
+                    (COALESCE(admin_data::text::jsonb, '{}'::jsonb) || jsonb_build_object('retry_of', id))::json as admin_data,
                     'queued' as state
                 FROM jorb
                 WHERE id = ANY($1::bigint[])
