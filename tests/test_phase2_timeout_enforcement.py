@@ -9,8 +9,7 @@ Comprehensive tests for job timeout enforcement:
 """
 
 import asyncio
-import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -52,7 +51,7 @@ class TestTimeoutDatabaseSchema:
     async def test_set_timeout_at(self, db_connection):
         """Test setting timeout_at column."""
         job_id = await create_job(db_connection, job_class="test.Job")
-        timeout_at = datetime.utcnow() + timedelta(seconds=60)
+        timeout_at = datetime.now(timezone.utc) + timedelta(seconds=60)
 
         await db_connection.execute("""
             UPDATE jorb
@@ -62,7 +61,7 @@ class TestTimeoutDatabaseSchema:
 
         job = await get_job(db_connection, job_id)
         assert job['timeout_at'] is not None
-        assert job['timeout_at'] > datetime.utcnow()
+        assert job['timeout_at'] > datetime.now(timezone.utc)
 
 
 class TestTimeoutConfiguration:
@@ -80,7 +79,7 @@ class TestTimeoutConfiguration:
             INSERT INTO jorb (job_class, kwargs, queue, admin_data)
             VALUES ($1, $2, $3, $4)
             RETURNING id
-        """, "test.Job", '{}', "default", json.dumps(admin_data))
+        """, "test.Job", '{}', "default", admin_data)
 
         job = await get_job(db_connection, job_id)
         assert job['admin_data']['timeout_seconds'] == 300
@@ -98,7 +97,7 @@ class TestTimeoutConfiguration:
             INSERT INTO jorb (job_class, kwargs, queue, admin_data)
             VALUES ($1, $2, $3, $4)
             RETURNING id
-        """, "test.Job", '{}', "default", json.dumps(admin_data))
+        """, "test.Job", '{}', "default", admin_data)
 
         job = await get_job(db_connection, job_id)
         assert job['admin_data']['on_timeout'] == 'fail'
@@ -112,7 +111,7 @@ class TestTimeoutConfiguration:
             INSERT INTO jorb (job_class, kwargs, queue, admin_data)
             VALUES ($1, $2, $3, $4)
             RETURNING id
-        """, "test.Job", '{}', "default", json.dumps(admin_data))
+        """, "test.Job", '{}', "default", admin_data)
 
         job = await get_job(db_connection, job_id)
         # Default should be 'retry'
@@ -136,7 +135,7 @@ class TestTimeoutTracking:
         )
 
         # Set timeout_at (simulating what worker does)
-        timeout_at = datetime.utcnow() + timedelta(seconds=300)
+        timeout_at = datetime.now(timezone.utc) + timedelta(seconds=300)
         await db_connection.execute("""
             UPDATE jorb
             SET timeout_at = $1, state = 'running'
@@ -155,7 +154,7 @@ class TestTimeoutTracking:
         job_id = await create_job(db_connection, job_class="test.Job", state="running")
 
         # Set timeout_at
-        timeout_at = datetime.utcnow() + timedelta(seconds=60)
+        timeout_at = datetime.now(timezone.utc) + timedelta(seconds=60)
         await db_connection.execute("""
             UPDATE jorb SET timeout_at = $1 WHERE id = $2
         """, timeout_at, job_id)
@@ -164,7 +163,7 @@ class TestTimeoutTracking:
         await db_connection.execute(
             STMTS["finished"],
             job_id,
-            json.dumps({"status": "success"})
+            {"status": "success"}
         )
 
         job = await get_job(db_connection, job_id)
@@ -179,7 +178,7 @@ class TestTimeoutTracking:
         job_id = await create_job(db_connection, job_class="test.Job", state="running")
 
         # Set timeout_at
-        timeout_at = datetime.utcnow() + timedelta(seconds=60)
+        timeout_at = datetime.now(timezone.utc) + timedelta(seconds=60)
         await db_connection.execute("""
             UPDATE jorb SET timeout_at = $1 WHERE id = $2
         """, timeout_at, job_id)
@@ -212,7 +211,7 @@ class TestTimeoutDetection:
         )
 
         # Set timeout_at to 1 minute ago (timed out)
-        timeout_at = datetime.utcnow() - timedelta(minutes=1)
+        timeout_at = datetime.now(timezone.utc) - timedelta(minutes=1)
         await db_connection.execute("""
             UPDATE jorb SET timeout_at = $1 WHERE id = $2
         """, timeout_at, job_id)
@@ -240,7 +239,7 @@ class TestTimeoutDetection:
             admin_data={"timeout_seconds": 30}
         )
 
-        timeout_at = datetime.utcnow() - timedelta(seconds=10)
+        timeout_at = datetime.now(timezone.utc) - timedelta(seconds=10)
         await db_connection.execute("""
             UPDATE jorb SET timeout_at = $1 WHERE id = $2
         """, timeout_at, job_id)
@@ -257,25 +256,26 @@ class TestTimeoutMonitorHandler:
     """Test timeout monitor handler function."""
 
     @pytest.mark.asyncio
-    async def test_handle_timeout_with_retry(self, db_connection, db_pool):
+    async def test_handle_timeout_with_retry(self, db_pool):
         """Test handling timeout with retry action."""
-        # Create timed-out job
+        # Create timed-out job using pool (not transactional connection)
         admin_data = {
             "timeout_seconds": 30,
             "on_timeout": "retry",
             "max_retries": 5
         }
-        job_id = await db_connection.fetchval("""
-            INSERT INTO jorb (job_class, kwargs, queue, admin_data, state, error_count)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id
-        """, "test.Job", '{}', "default", json.dumps(admin_data), "running", 0)
+        async with db_pool.acquire() as conn:
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, admin_data, state, error_count)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id
+            """, "test.Job", '{}', "default", admin_data, "running", 0)
 
-        # Set timeout in past
-        timeout_at = datetime.utcnow() - timedelta(seconds=10)
-        await db_connection.execute("""
-            UPDATE jorb SET timeout_at = $1 WHERE id = $2
-        """, timeout_at, job_id)
+            # Set timeout in past
+            timeout_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+            await conn.execute("""
+                UPDATE jorb SET timeout_at = $1 WHERE id = $2
+            """, timeout_at, job_id)
 
         # Handle timeout
         await handle_timed_out_job(
@@ -286,25 +286,29 @@ class TestTimeoutMonitorHandler:
             0  # error_count
         )
 
-        # Should be requeued
-        job = await get_job(db_connection, job_id)
+        # Should be requeued - read from pool
+        job = await get_job(db_pool, job_id)
         assert job['state'] == 'queued'
         assert job['error_count'] == 1
         assert job['timeout_at'] is None
         assert 'Timeout exceeded' in job['error_message']
 
+        # Cleanup
+        await db_pool.execute("DELETE FROM jorb WHERE id = $1", job_id)
+
     @pytest.mark.asyncio
-    async def test_handle_timeout_with_fail(self, db_connection, db_pool):
+    async def test_handle_timeout_with_fail(self, db_pool):
         """Test handling timeout with fail action."""
         admin_data = {
             "timeout_seconds": 30,
             "on_timeout": "fail"
         }
-        job_id = await db_connection.fetchval("""
-            INSERT INTO jorb (job_class, kwargs, queue, admin_data, state, error_count)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id
-        """, "test.Job", '{}', "default", json.dumps(admin_data), "running", 0)
+        async with db_pool.acquire() as conn:
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, admin_data, state, error_count)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id
+            """, "test.Job", '{}', "default", admin_data, "running", 0)
 
         # Handle timeout
         await handle_timed_out_job(
@@ -315,25 +319,29 @@ class TestTimeoutMonitorHandler:
             0
         )
 
-        # Should be crashed
-        job = await get_job(db_connection, job_id)
+        # Should be crashed - read from pool
+        job = await get_job(db_pool, job_id)
         assert job['state'] == 'crashed'
         assert job['error_count'] == 1
         assert 'Timeout exceeded' in job['error_message']
 
+        # Cleanup
+        await db_pool.execute("DELETE FROM jorb WHERE id = $1", job_id)
+
     @pytest.mark.asyncio
-    async def test_handle_timeout_max_retries_exceeded(self, db_connection, db_pool):
+    async def test_handle_timeout_max_retries_exceeded(self, db_pool):
         """Test timeout handling when max retries exceeded."""
         admin_data = {
             "timeout_seconds": 30,
             "on_timeout": "retry",
             "max_retries": 3
         }
-        job_id = await db_connection.fetchval("""
-            INSERT INTO jorb (job_class, kwargs, queue, admin_data, state, error_count)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id
-        """, "test.Job", '{}', "default", json.dumps(admin_data), "running", 3)  # At max
+        async with db_pool.acquire() as conn:
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, admin_data, state, error_count)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id
+            """, "test.Job", '{}', "default", admin_data, "running", 3)  # At max
 
         # Handle timeout
         await handle_timed_out_job(
@@ -344,10 +352,13 @@ class TestTimeoutMonitorHandler:
             3  # At max retries
         )
 
-        # Should be crashed (max retries exceeded)
-        job = await get_job(db_connection, job_id)
+        # Should be crashed (max retries exceeded) - read from pool
+        job = await get_job(db_pool, job_id)
         assert job['state'] == 'crashed'
         assert 'max retries exceeded' in job['error_message'].lower()
+
+        # Cleanup
+        await db_pool.execute("DELETE FROM jorb WHERE id = $1", job_id)
 
 
 class TestTimeoutView:
@@ -364,7 +375,7 @@ class TestTimeoutView:
             admin_data={"timeout_seconds": 60, "on_timeout": "retry"}
         )
 
-        timeout_at = datetime.utcnow() - timedelta(minutes=2)
+        timeout_at = datetime.now(timezone.utc) - timedelta(minutes=2)
         await db_connection.execute("""
             UPDATE jorb SET timeout_at = $1, started = NOW() - INTERVAL '5 minutes'
             WHERE id = $2
@@ -402,10 +413,10 @@ class TestTimeoutIntegration:
             INSERT INTO jorb (job_class, kwargs, queue, admin_data, state)
             VALUES ($1, $2, $3, $4, $5)
             RETURNING id
-        """, "test.Job", '{}', "default", json.dumps(admin_data), "queued")
+        """, "test.Job", '{}', "default", admin_data, "queued")
 
         # 1. Job starts - set timeout_at
-        timeout_at = datetime.utcnow() + timedelta(seconds=300)
+        timeout_at = datetime.now(timezone.utc) + timedelta(seconds=300)
         await db_connection.execute("""
             UPDATE jorb SET state = 'running', timeout_at = $1 WHERE id = $2
         """, timeout_at, job_id)
@@ -418,7 +429,7 @@ class TestTimeoutIntegration:
         await db_connection.execute(
             STMTS["finished"],
             job_id,
-            json.dumps({"status": "success"})
+            {"status": "success"}
         )
 
         job = await get_job(db_connection, job_id)
@@ -436,7 +447,7 @@ class TestTimeoutIntegration:
             VALUES ($1, $2, $3, $4, $5)
             RETURNING id
         """, "test.FastJob", '{}', "default",
-            json.dumps({"timeout_seconds": 10, "on_timeout": "retry"}), "running")
+            {"timeout_seconds": 10, "on_timeout": "retry"}, "running")
         await db_connection.execute("""
             UPDATE jorb SET timeout_at = NOW() + INTERVAL '10 seconds' WHERE id = $1
         """, job1)
@@ -448,7 +459,7 @@ class TestTimeoutIntegration:
             VALUES ($1, $2, $3, $4, $5)
             RETURNING id
         """, "test.SlowJob", '{}', "default",
-            json.dumps({"timeout_seconds": 600, "on_timeout": "fail"}), "running")
+            {"timeout_seconds": 600, "on_timeout": "fail"}, "running")
         await db_connection.execute("""
             UPDATE jorb SET timeout_at = NOW() + INTERVAL '600 seconds' WHERE id = $1
         """, job2)
@@ -484,7 +495,7 @@ class TestTimeoutEdgeCases:
         job_id = await create_job(db_connection, job_class="test.Job", state="running")
 
         # Set timeout_at without admin_data
-        timeout_at = datetime.utcnow() + timedelta(seconds=60)
+        timeout_at = datetime.now(timezone.utc) + timedelta(seconds=60)
         await db_connection.execute("""
             UPDATE jorb SET timeout_at = $1 WHERE id = $2
         """, timeout_at, job_id)
@@ -502,10 +513,10 @@ class TestTimeoutEdgeCases:
             INSERT INTO jorb (job_class, kwargs, queue, admin_data, state)
             VALUES ($1, $2, $3, $4, $5)
             RETURNING id
-        """, "test.Job", '{}', "default", json.dumps(admin_data), "running")
+        """, "test.Job", '{}', "default", admin_data, "running")
 
         # Set timeout_at to 1 second from now
-        timeout_at = datetime.utcnow() + timedelta(seconds=1)
+        timeout_at = datetime.now(timezone.utc) + timedelta(seconds=1)
         await db_connection.execute("""
             UPDATE jorb SET timeout_at = $1 WHERE id = $2
         """, timeout_at, job_id)
@@ -513,10 +524,10 @@ class TestTimeoutEdgeCases:
         # Wait 2 seconds
         await asyncio.sleep(2)
 
-        # Should be timed out
+        # Should be timed out (use clock_timestamp() not NOW() because NOW() returns transaction start time)
         timed_out = await db_connection.fetch("""
             SELECT id FROM jorb
-            WHERE id = $1 AND timeout_at < NOW()
+            WHERE id = $1 AND timeout_at < clock_timestamp()
         """, job_id)
 
         assert len(timed_out) == 1
@@ -529,9 +540,9 @@ class TestTimeoutEdgeCases:
             INSERT INTO jorb (job_class, kwargs, queue, admin_data, state)
             VALUES ($1, $2, $3, $4, $5)
             RETURNING id
-        """, "test.Job", '{}', "default", json.dumps(admin_data), "running")
+        """, "test.Job", '{}', "default", admin_data, "running")
 
-        timeout_at = datetime.utcnow() + timedelta(days=1)
+        timeout_at = datetime.now(timezone.utc) + timedelta(days=1)
         await db_connection.execute("""
             UPDATE jorb SET timeout_at = $1 WHERE id = $2
         """, timeout_at, job_id)
