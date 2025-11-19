@@ -85,11 +85,12 @@ class TestHandleTimedOutJob:
     @pytest.mark.asyncio
     async def test_timeout_fail_max_retries_exceeded(self, db_pool, client):
         """Test job is marked crashed when max retries exceeded."""
-        # Create job with timeout
+        # Create job with timeout (max_retries=3 as parameter, not in admin_data)
         job_id = await client.enqueue(
             "test.TimeoutJob",
             timeout_seconds=5,
-            admin_data={'on_timeout': 'retry', 'max_retries': 3}
+            on_timeout='retry',
+            max_retries=3
         )
 
         # Simulate job at max retries
@@ -125,11 +126,12 @@ class TestHandleTimedOutJob:
     @pytest.mark.asyncio
     async def test_timeout_fail_on_timeout_fail(self, db_pool, client):
         """Test job is marked crashed when on_timeout='fail'."""
-        # Create job with on_timeout='fail'
+        # Create job with on_timeout='fail' (as parameter, not in admin_data)
         job_id = await client.enqueue(
             "test.TimeoutJob",
             timeout_seconds=5,
-            admin_data={'on_timeout': 'fail', 'max_retries': 10}
+            on_timeout='fail',
+            max_retries=10
         )
 
         # Simulate job timing out
@@ -561,7 +563,8 @@ class TestTimeoutMonitorIntegration:
         job_id = await client.enqueue(
             "test.Job",
             timeout_seconds=5,
-            admin_data={'on_timeout': 'retry', 'max_retries': 1}
+            max_retries=1,
+            on_timeout='retry'
         )
 
         # Simulate timeout at max retries

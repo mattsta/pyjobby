@@ -381,7 +381,7 @@ class JobClient:
                 waitfor_job,
                 waitfor_group,
                 deadline_key,
-                json.dumps(admin_data),
+                json.dumps(admin_data),  # Must json.dumps for ::jsonb cast
                 state
             )
 

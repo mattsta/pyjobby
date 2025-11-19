@@ -94,7 +94,7 @@ def get_retry_config(admin_data: Optional[dict]) -> dict:
     Extract retry configuration from admin_data.
 
     Args:
-        admin_data: Job's admin_data dict (may be None)
+        admin_data: Job's admin_data dict (may be None or JSON string)
 
     Returns:
         Dict with retry configuration:
@@ -103,6 +103,16 @@ def get_retry_config(admin_data: Optional[dict]) -> dict:
         - initial_retry_delay: int
         - max_retry_delay: int
     """
+    # Parse admin_data if it's a JSON string
+    # Use while loop to handle legacy double-encoded data defensively
+    import json as json_module
+    while isinstance(admin_data, str):
+        try:
+            admin_data = json_module.loads(admin_data)
+        except Exception:
+            admin_data = {}
+            break
+
     if not admin_data:
         admin_data = {}
 

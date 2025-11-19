@@ -30,9 +30,18 @@ async def handle_timed_out_job(
         pool: Database connection pool
         job_id: ID of timed-out job
         job_class: Job class name
-        admin_data: Job's admin_data
+        admin_data: Job's admin_data (can be dict or JSON string)
         error_count: Current error count
     """
+    # Parse admin_data if it's a JSON string
+    # Use while loop to handle legacy double-encoded data defensively
+    import json as json_module
+    while isinstance(admin_data, str):
+        try:
+            admin_data = json_module.loads(admin_data)
+        except Exception:
+            admin_data = {}
+            break
     on_timeout = (admin_data or {}).get("on_timeout", "retry")
     max_retries = (admin_data or {}).get("max_retries", 10)
 
@@ -147,7 +156,11 @@ async def timeout_monitor(
                     )
 
             except Exception as e:
-                logger.error(f"Timeout monitor error: {e}", exc_info=True)
+                import traceback
+                logger.error(
+                    f"Timeout monitor error: {e}\n"
+                    f"Full traceback: {traceback.format_exc()}"
+                )
 
             await asyncio.sleep(check_interval)
 
