@@ -69,10 +69,10 @@ SELECT
     COUNT(*) FILTER (WHERE j.state = 'crashed') as crashed_jobs,
     COUNT(*) FILTER (WHERE j.state = 'cancelled') as cancelled_jobs,
     CASE
-        WHEN COUNT(*) FILTER (WHERE j.state NOT IN ('finished', 'crashed', 'cancelled')) = 0
-            THEN 'complete'
         WHEN COUNT(*) FILTER (WHERE j.state = 'crashed') > 0
             THEN 'failed'
+        WHEN COUNT(*) FILTER (WHERE j.state NOT IN ('finished', 'crashed', 'cancelled')) = 0
+            THEN 'complete'
         WHEN COUNT(*) FILTER (WHERE j.state = 'running') > 0
             THEN 'running'
         ELSE 'queued'

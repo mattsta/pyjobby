@@ -19,6 +19,7 @@ Example:
 """
 
 import asyncpg
+import uuid
 from typing import List, Dict, Optional, Any, Set
 from dataclasses import dataclass, field
 from loguru import logger
@@ -66,7 +67,6 @@ class DAGBuilder:
         self.name = name
         self.common_options = common_options
         self.nodes: List[DAGNode] = []
-        self.node_counter = 0
 
     def add(
         self,
@@ -95,9 +95,8 @@ class DAGBuilder:
             job_class=job_class,
             kwargs=kwargs or {},
             depends_on=depends_on or [],
-            node_id=f"node_{self.node_counter}"
+            node_id=str(uuid.uuid4())
         )
-        self.node_counter += 1
 
         # Merge common and job-specific options
         node._job_options = {**self.common_options, **options}

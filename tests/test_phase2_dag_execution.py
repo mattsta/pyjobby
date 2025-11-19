@@ -10,7 +10,6 @@ Comprehensive tests for Dynamic Job Graphs (DAGs):
 """
 
 import asyncio
-import json
 from datetime import datetime
 from typing import List
 
@@ -335,7 +334,7 @@ class TestDAGDatabaseSchema:
             INSERT INTO jorb_dag (name, metadata)
             VALUES ($1, $2)
             RETURNING id
-        """, "Test DAG", json.dumps({"total_nodes": 5}))
+        """, "Test DAG", {"total_nodes": 5})
 
         assert dag_id is not None
 
