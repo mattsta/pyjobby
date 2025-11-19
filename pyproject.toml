@@ -18,6 +18,7 @@ pytz = "^2024.1"
 pj = "pyjobby.pj:workit"
 pj-admin = "pyjobby.cli:cli"
 pj-web = "pyjobby.web_admin:main"
+pj-timeout-monitor = "pyjobby.timeout_monitor:cli"
 
 [tool.poetry.group.test.dependencies]
 pytest = "^8.0"

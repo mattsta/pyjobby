@@ -168,11 +168,50 @@ def run_timeout_monitor(dsn: str) -> None:
     asyncio.run(timeout_monitor(dsn))
 
 
-if __name__ == '__main__':
+def cli() -> None:
+    """CLI entry point for timeout monitor."""
     import sys
-    if len(sys.argv) < 2:
-        print("Usage: python -m pyjobby.timeout_monitor <dsn>")
-        sys.exit(1)
+    import click
 
-    dsn = sys.argv[1]
-    run_timeout_monitor(dsn)
+    @click.command()
+    @click.option(
+        '--dsn',
+        envvar='PYJOBBY_DSN',
+        required=False,
+        help='PostgreSQL DSN (or use PYJOBBY_DSN env var)'
+    )
+    @click.option(
+        '--config',
+        type=click.Path(exists=True),
+        help='Path to pyjobby.conf.py'
+    )
+    @click.option(
+        '--check-interval',
+        default=10,
+        help='Check interval in seconds (default: 10)'
+    )
+    def main(dsn: str, config: str, check_interval: int) -> None:
+        """Start pyjobby timeout monitor process."""
+        import asyncio
+
+        if not dsn:
+            if config:
+                from .configloader import load_config_from_file
+                cfg = load_config_from_file(config, keys=["db_params"])
+                db_params = cfg.get("db_params", {})
+                # Build DSN from params
+                dsn = f"postgresql://{db_params.get('user')}:{db_params.get('password')}@{db_params.get('host')}:{db_params.get('port', 5432)}/{db_params.get('database')}"
+            else:
+                click.echo("Error: Must provide --dsn or --config", err=True)
+                sys.exit(1)
+
+        click.echo(f"Starting timeout monitor (check every {check_interval}s)...")
+        click.echo(f"DSN: {dsn.split('@')[1] if '@' in dsn else dsn}")  # Don't show password
+
+        asyncio.run(timeout_monitor(dsn, check_interval=check_interval))
+
+    main()
+
+
+if __name__ == '__main__':
+    cli()
