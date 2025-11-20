@@ -465,6 +465,37 @@ class TestAdminAPIQueueManagement:
         assert 'queue_a' in queue_names
         assert 'queue_b' in queue_names
 
+    @pytest.mark.asyncio
+    async def test_queue_stats_all_job_states(self, db_pool):
+        """Test queue_stats with all possible job states including claimed, waiting, cancelled."""
+        api = AdminAPI(db_pool)
+
+        async with db_pool.acquire() as conn:
+            # Create jobs in all states to cover lines 499, 503, 508-509
+            states_to_test = ['queued', 'claimed', 'running', 'waiting', 'finished', 'crashed', 'cancelled']
+
+            for state in states_to_test:
+                await conn.execute("""
+                    INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                    VALUES ($1, $2, $3, $4, $5)
+                """, 'test.Job', {}, 'comprehensive_queue', state, 100)
+
+        stats = await api.queue_stats(queue='comprehensive_queue')
+
+        assert len(stats) == 1
+        queue_stat = stats[0]
+
+        # Verify all states are counted
+        assert queue_stat['queue'] == 'comprehensive_queue'
+        assert queue_stat['queued'] == 1  # Line 496
+        assert queue_stat['claimed'] == 1  # Line 499 - UNCOVERED
+        assert queue_stat['running'] == 1  # Line 501
+        assert queue_stat['waiting'] == 1  # Line 503 - UNCOVERED
+        assert queue_stat['finished'] == 1  # Line 505
+        assert queue_stat['crashed'] == 1  # Line 507
+        assert queue_stat['cancelled'] == 1  # Line 509 - UNCOVERED
+        assert queue_stat['total'] == 7
+
 
 # =============================================================================
 # WORKER MANAGEMENT TESTS
@@ -731,6 +762,16 @@ class TestAdminAPIDLQ:
 
         with pytest.raises(ValueError, match="is not in DLQ"):
             await api.retry_from_dlq(job_id)
+
+    @pytest.mark.asyncio
+    async def test_retry_from_dlq_job_not_found(self, db_pool):
+        """Test retry_from_dlq raises error when job doesn't exist."""
+        async with db_pool.acquire() as conn:
+            api = AdminAPI(conn)
+
+            # Try to retry non-existent job - covers line 731
+            with pytest.raises(ValueError, match="Job 999999 not found"):
+                await api.retry_from_dlq(999999)
 
 
 # =============================================================================
@@ -1034,6 +1075,124 @@ class TestAdminAPIScheduleManagement:
         schedule_names = {s['name'] for s in schedules}
         assert 'enabled-schedule' in schedule_names
         assert 'disabled-schedule' not in schedule_names
+
+    @pytest.mark.asyncio
+    async def test_list_schedules_filter_by_queue(self, db_pool):
+        """Test listing schedules filtered by queue - covers lines 799-801."""
+        api = AdminAPI(db_pool)
+
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO jorb_schedule (
+                    name, job_class, cron_expr, queue, prio, kwargs, enabled, next_run
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+            """, 'priority-schedule', 'test.Job', '* * * * *', 'priority_queue', 100, {}, True)
+
+            await conn.execute("""
+                INSERT INTO jorb_schedule (
+                    name, job_class, cron_expr, queue, prio, kwargs, enabled, next_run
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+            """, 'default-schedule', 'test.Job', '* * * * *', 'default', 100, {}, True)
+
+        # Filter by specific queue - covers lines 799-801
+        schedules = await api.list_schedules(queue='priority_queue')
+
+        # All returned schedules should be in priority_queue
+        assert all(s['queue'] == 'priority_queue' for s in schedules)
+        schedule_names = {s['name'] for s in schedules}
+        assert 'priority-schedule' in schedule_names
+        assert 'default-schedule' not in schedule_names
+
+    @pytest.mark.asyncio
+    async def test_get_schedule_neither_id_nor_name_error(self, db_pool):
+        """Test get_schedule raises error when neither id nor name provided - covers line 838."""
+        async with db_pool.acquire() as conn:
+            api = AdminAPI(conn)
+
+            # Call without either parameter - covers line 838
+            with pytest.raises(ValueError, match="Must provide either schedule_id or name"):
+                await api.get_schedule()
+
+    @pytest.mark.asyncio
+    async def test_update_schedule_no_valid_fields_error(self, db_pool):
+        """Test update_schedule raises error when no valid fields - covers line 949."""
+        api = AdminAPI(db_pool)
+
+        async with db_pool.acquire() as conn:
+            schedule_id = await conn.fetchval("""
+                INSERT INTO jorb_schedule (
+                    name, job_class, cron_expr, queue, prio, kwargs, enabled, next_run
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                RETURNING id
+            """, 'test-schedule', 'test.Job', '* * * * *', 'default', 100, {}, True)
+
+            # Try to update with invalid/no fields - covers line 949
+            with pytest.raises(ValueError, match="No valid fields to update"):
+                await api.update_schedule(schedule_id, invalid_field='value')
+
+    @pytest.mark.asyncio
+    async def test_update_schedule_not_found_during_cron_recalc(self, db_pool):
+        """Test update_schedule handles schedule not found during cron recalc - covers line 955."""
+        async with db_pool.acquire() as conn:
+            api = AdminAPI(conn)
+
+            # Try to update non-existent schedule with cron change
+            # This triggers get_schedule which returns None, covering line 955
+            with pytest.raises(ValueError, match="Schedule 999999 not found"):
+                await api.update_schedule(999999, cron_expr='0 * * * *')
+
+    @pytest.mark.asyncio
+    async def test_update_schedule_invalid_cron_or_timezone(self, db_pool):
+        """Test update_schedule handles invalid cron expression or timezone - covers lines 969-970."""
+        api = AdminAPI(db_pool)
+
+        async with db_pool.acquire() as conn:
+            schedule_id = await conn.fetchval("""
+                INSERT INTO jorb_schedule (
+                    name, job_class, cron_expr, queue, prio, kwargs, enabled, next_run
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                RETURNING id
+            """, 'test-schedule', 'test.Job', '* * * * *', 'default', 100, {}, True)
+
+            # Try to update with invalid cron expression - covers lines 969-970
+            with pytest.raises(ValueError, match="Invalid cron expression or timezone"):
+                await api.update_schedule(schedule_id, cron_expr='INVALID_CRON')
+
+    @pytest.mark.asyncio
+    async def test_update_schedule_not_found_after_update(self, db_pool):
+        """Test update_schedule handles schedule not found after update - covers line 997."""
+        async with db_pool.acquire() as conn:
+            api = AdminAPI(conn)
+
+            # Create a schedule then delete it before updating
+            schedule_id = await conn.fetchval("""
+                INSERT INTO jorb_schedule (
+                    name, job_class, cron_expr, queue, prio, kwargs, enabled, next_run
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                RETURNING id
+            """, 'test-schedule', 'test.Job', '* * * * *', 'default', 100, {}, True)
+
+            # Delete it
+            await conn.execute("DELETE FROM jorb_schedule WHERE id = $1", schedule_id)
+
+            # Try to update - covers line 997
+            with pytest.raises(ValueError, match=f"Schedule {schedule_id} not found"):
+                await api.update_schedule(schedule_id, enabled=False)
+
+    @pytest.mark.asyncio
+    async def test_delete_schedule_not_found(self, db_pool):
+        """Test delete_schedule raises error when schedule doesn't exist - covers line 1016."""
+        async with db_pool.acquire() as conn:
+            api = AdminAPI(conn)
+
+            # Try to delete non-existent schedule - covers line 1016
+            with pytest.raises(ValueError, match="Schedule 999999 not found"):
+                await api.delete_schedule(999999)
 
 
 # =============================================================================
