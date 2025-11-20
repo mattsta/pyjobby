@@ -1423,90 +1423,80 @@ class TestSchedulerMainLoop:
             # Verify stop was logged (worker completed gracefully)
             assert worker.stop_requested is True
 
-    async def test_execution_result_counters_all_types(self, db_pool):
-        """Test result counters for success/failure/skip - covers lines 769-772."""
+    async def test_execution_result_counters_all_types(self, db_pool, monkeypatch):
+        """Test result counters for success/failure/skip in run() loop - covers lines 766-772."""
+        import asyncio
+
         async with db_pool.acquire() as conn:
             manager = ScheduleManager(conn)
-            worker = SchedulerWorker(conn, poll_interval=0.1)
 
-            # Verify counters start at zero
-            assert worker.executions_total == 0
-            assert worker.successes_total == 0
-            assert worker.failures_total == 0
-            assert worker.skips_total == 0
-
-            # Test 1: Execute successful schedule
-            sched_success = await manager.create_schedule(
+            # Create schedule 1: Will succeed
+            success_sched_id = await manager.create_schedule(
                 name="success-test",
                 job_class="test.SuccessJob",
                 cron_expr="* * * * *"
             )
             await conn.execute("UPDATE jorb_schedule SET next_run = $1 WHERE id = $2",
-                             datetime.utcnow() - timedelta(minutes=1), sched_success)
-            schedule1 = await conn.fetchrow("SELECT * FROM jorb_schedule WHERE id = $1", sched_success)
-            result1 = await worker.execute_schedule(dict(schedule1))
+                             datetime.utcnow() - timedelta(minutes=1), success_sched_id)
 
-            # Simulate run() loop counter logic
-            worker.executions_total += 1
-            if result1.result == 'success':
-                worker.successes_total += 1  # Line 768
-            elif result1.result == 'failure':
-                worker.failures_total += 1  # Line 770
-            elif result1.result == 'skipped':
-                worker.skips_total += 1  # Line 772
+            # Create schedule 2: Will be skipped due to concurrency
+            skip_sched_id = await manager.create_schedule(
+                name="skip-test",
+                job_class="test.SkipJob",
+                cron_expr="* * * * *"
+            )
+            await conn.execute("""
+                UPDATE jorb_schedule SET max_concurrent_jobs = 1, next_run = $1
+                WHERE id = $2
+            """, datetime.utcnow() - timedelta(minutes=1), skip_sched_id)
 
-            assert worker.successes_total == 1
+            # Create running job to trigger concurrency skip
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, admin_data)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            """, 'test.SkipJob', {}, 'default', 'running', 100,
+                {'schedule_id': str(skip_sched_id)})
 
-            # Test 2: Execute schedule that fails
-            sched_fail = await manager.create_schedule(
+            # Create schedule 3: Will fail (monkeypatch create_scheduled_job)
+            fail_sched_id = await manager.create_schedule(
                 name="fail-test",
-                job_class="nonexistent.BadClass",
+                job_class="test.FailJob",
                 cron_expr="* * * * *"
             )
             await conn.execute("UPDATE jorb_schedule SET next_run = $1 WHERE id = $2",
-                             datetime.utcnow() - timedelta(minutes=1), sched_fail)
-            schedule2 = await conn.fetchrow("SELECT * FROM jorb_schedule WHERE id = $1", sched_fail)
-            result2 = await worker.execute_schedule(dict(schedule2))
+                             datetime.utcnow() - timedelta(minutes=1), fail_sched_id)
 
-            worker.executions_total += 1
-            if result2.result == 'success':
-                worker.successes_total += 1
-            elif result2.result == 'failure':
-                worker.failures_total += 1  # Line 770 - covers failure path
-            elif result2.result == 'skipped':
-                worker.skips_total += 1
+            worker = SchedulerWorker(conn, poll_interval=0.1)
 
-            assert worker.failures_total == 1
+            # Inject failure for the fail-test schedule only
+            original_create = worker.create_scheduled_job
+            async def selective_failure(schedule, scheduled_time):
+                if schedule['name'] == 'fail-test':
+                    raise RuntimeError("Simulated failure for testing")
+                return await original_create(schedule, scheduled_time)
 
-            # Test 3: Execute schedule that gets skipped (concurrency limit)
-            sched_skip = await manager.create_schedule(
-                name="skip-test",
-                job_class="test.ConcurrentJob",
-                cron_expr="* * * * *",
-                max_concurrency=1
-            )
-            await conn.execute("UPDATE jorb_schedule SET next_run = $1 WHERE id = $2",
-                             datetime.utcnow() - timedelta(minutes=1), sched_skip)
-            # Create running job to hit concurrency limit
-            await conn.execute("""
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
-                VALUES ($1, $2, $3, $4, $5)
-            """, 'test.ConcurrentJob', {}, 'default', 'running', 100)
-            schedule3 = await conn.fetchrow("SELECT * FROM jorb_schedule WHERE id = $1", sched_skip)
-            result3 = await worker.execute_schedule(dict(schedule3))
+            monkeypatch.setattr(worker, 'create_scheduled_job', selective_failure)
 
-            worker.executions_total += 1
-            if result3.result == 'success':
-                worker.successes_total += 1
-            elif result3.result == 'failure':
-                worker.failures_total += 1
-            elif result3.result == 'skipped':
-                worker.skips_total += 1  # Line 772 - covers skip path
+            # Run scheduler loop in background
+            run_task = asyncio.create_task(worker.run())
 
-            assert worker.skips_total == 1
+            # Let it process all 3 schedules
+            await asyncio.sleep(1.0)
 
-            # Final verification - all counters tested!
-            assert worker.executions_total == 3
-            assert worker.successes_total == 1
-            assert worker.failures_total == 1  # Covers line 770
-            assert worker.skips_total == 1  # Covers line 772
+            # Stop worker
+            worker.stop()
+
+            try:
+                await asyncio.wait_for(run_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                run_task.cancel()
+                try:
+                    await run_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Verify ALL counter paths were executed by the REAL run() loop code!
+            assert worker.executions_total >= 3, f"Expected >=3 executions, got {worker.executions_total}"
+            assert worker.successes_total >= 1, f"Expected >=1 success, got {worker.successes_total}"  # Line 768 ✅
+            assert worker.failures_total >= 1, f"Expected >=1 failure, got {worker.failures_total}"  # Line 770 ✅
+            assert worker.skips_total >= 1, f"Expected >=1 skip, got {worker.skips_total}"  # Line 772 ✅
