@@ -1120,6 +1120,66 @@ class TestAdminAPIAdditionalCoverage:
 
         assert all('Email' in job['job_class'] and job['uid'] == 12345 for job in jobs)
 
+
+# =============================================================================
+# ERROR PATH TESTS
+# =============================================================================
+
+
+class TestAdminAPIErrorPaths:
+    """Test error handling and edge cases in AdminAPI."""
+
+    @pytest.mark.asyncio
+    async def test_retry_job_not_found(self, db_pool):
+        """Test retry_job with non-existent job ID."""
+        api = AdminAPI(db_pool)
+
+        with pytest.raises(ValueError, match="Job .* not found"):
+            await api.retry_job(999999)
+
+    @pytest.mark.asyncio
+    async def test_retry_job_wrong_state(self, db_pool):
+        """Test retry_job with job in wrong state."""
+        api = AdminAPI(db_pool)
+
+        async with db_pool.acquire() as conn:
+            # Create job in 'queued' state (not crashed/cancelled)
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
+            """, 'test.Job', {}, 'default', 'queued', 100)
+
+        with pytest.raises(ValueError, match="can only retry crashed or cancelled jobs"):
+            await api.retry_job(job_id)
+
+    @pytest.mark.asyncio
+    async def test_cancel_job_not_found(self, db_pool):
+        """Test cancel_job with non-existent job ID."""
+        api = AdminAPI(db_pool)
+
+        # cancel_job raises ValueError when job not found
+        with pytest.raises(ValueError, match="Job .* not found"):
+            await api.cancel_job(999999)
+
+    @pytest.mark.asyncio
+    async def test_cancel_job_wrong_state(self, db_pool):
+        """Test cancel_job with job in uncancellable state."""
+        api = AdminAPI(db_pool)
+
+        async with db_pool.acquire() as conn:
+            # Create job in 'running' state (not queued/waiting)
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
+            """, 'test.Job', {}, 'default', 'running', 100)
+
+        # Should raise ValueError for wrong state
+        with pytest.raises(ValueError, match="can only cancel queued or waiting jobs"):
+            await api.cancel_job(job_id)
+
+
 # =============================================================================
 # COMPREHENSIVE SUMMARY
 # =============================================================================
