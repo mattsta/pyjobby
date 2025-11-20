@@ -707,7 +707,15 @@ class TestJobRescheduling:
             capabilities=("test",),
             workerId=worker_id,
         )
-        await system.prepare()
+
+        # Manual initialization following existing test pattern
+        system.cxn = await asyncpg.connect(**db_params)
+        await setup_json_codec(system.cxn)
+
+        from pyjobby.pj import STMTS
+        system.stmts = {}
+        for name, stmt in STMTS.items():
+            system.stmts[name] = await system.cxn.prepare(stmt)
 
         # Create a test job
         async with db_pool.acquire() as conn:
@@ -745,7 +753,15 @@ class TestJobRescheduling:
             capabilities=("test",),
             workerId=worker_id,
         )
-        await system.prepare()
+
+        # Manual initialization
+        system.cxn = await asyncpg.connect(**db_params)
+        await setup_json_codec(system.cxn)
+
+        from pyjobby.pj import STMTS
+        system.stmts = {}
+        for name, stmt in STMTS.items():
+            system.stmts[name] = await system.cxn.prepare(stmt)
 
         async with db_pool.acquire() as conn:
             job_id = await conn.fetchval("""
@@ -779,7 +795,15 @@ class TestJobRescheduling:
             capabilities=("test",),
             workerId=worker_id,
         )
-        await system.prepare()
+
+        # Manual initialization
+        system.cxn = await asyncpg.connect(**db_params)
+        await setup_json_codec(system.cxn)
+
+        from pyjobby.pj import STMTS
+        system.stmts = {}
+        for name, stmt in STMTS.items():
+            system.stmts[name] = await system.cxn.prepare(stmt)
 
         # Create job with exponential retry strategy
         async with db_pool.acquire() as conn:
@@ -791,17 +815,19 @@ class TestJobRescheduling:
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING id
             """, 'test.Job', {}, 'default', 'crashed', 100, 3,
-                {"retry_strategy": "exponential", "retry_base_seconds": 2})
+                {"retry_strategy": "exponential", "initial_retry_delay": 2})
 
             job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
 
         job_class = Job(s=system, job=dict(job))
 
-        # Reschedule with backoff for attempt 3 (exponential: 2^3 = 8 seconds)
+        # Reschedule with backoff for attempt 3
+        # Formula: initial_delay * (2 ^ (error_count - 1)) = 2 * (2 ^ 2) = 8 seconds
+        # Note: Retry strategy adds jitter (0-10% of delay, max 5s) to prevent thundering herd
         interval = await job_class.rescheduleBackoff(attempt=3)
 
-        # Exponential with base 2: 2^3 = 8 seconds
-        assert interval == timedelta(seconds=8)
+        # Should be 8 seconds + jitter (0-0.8 seconds)
+        assert timedelta(seconds=8) <= interval <= timedelta(seconds=9)
 
         await system.cxn.close()
 
@@ -815,7 +841,15 @@ class TestJobRescheduling:
             capabilities=("test",),
             workerId=worker_id,
         )
-        await system.prepare()
+
+        # Manual initialization
+        system.cxn = await asyncpg.connect(**db_params)
+        await setup_json_codec(system.cxn)
+
+        from pyjobby.pj import STMTS
+        system.stmts = {}
+        for name, stmt in STMTS.items():
+            system.stmts[name] = await system.cxn.prepare(stmt)
 
         # Create job with error_count=5 and linear retry
         async with db_pool.acquire() as conn:
@@ -827,17 +861,19 @@ class TestJobRescheduling:
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING id
             """, 'test.Job', {}, 'default', 'crashed', 100, 5,
-                {"retry_strategy": "linear", "retry_base_seconds": 10})
+                {"retry_strategy": "linear", "initial_retry_delay": 10})
 
             job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
 
         job_class = Job(s=system, job=dict(job))
 
         # Reschedule with backoff (should use error_count=5)
-        # Linear: base * attempt = 10 * 5 = 50 seconds
+        # Linear formula: initial_delay * error_count = 10 * 5 = 50 seconds
+        # Note: Retry strategy adds jitter (0-10% of delay, max 5s) to prevent thundering herd
         interval = await job_class.rescheduleBackoff()
 
-        assert interval == timedelta(seconds=50)
+        # Should be 50 seconds + jitter (0-5 seconds)
+        assert timedelta(seconds=50) <= interval <= timedelta(seconds=55)
 
         await system.cxn.close()
 
@@ -858,7 +894,15 @@ class TestJobClassExecution:
             capabilities=("test",),
             workerId=worker_id,
         )
-        await system.prepare()
+
+        # Manual initialization
+        system.cxn = await asyncpg.connect(**db_params)
+        await setup_json_codec(system.cxn)
+
+        from pyjobby.pj import STMTS
+        system.stmts = {}
+        for name, stmt in STMTS.items():
+            system.stmts[name] = await system.cxn.prepare(stmt)
 
         # Create job with kwargs
         async with db_pool.acquire() as conn:
@@ -893,7 +937,15 @@ class TestJobClassExecution:
             capabilities=("test",),
             workerId=worker_id,
         )
-        await system.prepare()
+
+        # Manual initialization
+        system.cxn = await asyncpg.connect(**db_params)
+        await setup_json_codec(system.cxn)
+
+        from pyjobby.pj import STMTS
+        system.stmts = {}
+        for name, stmt in STMTS.items():
+            system.stmts[name] = await system.cxn.prepare(stmt)
 
         async with db_pool.acquire() as conn:
             job_id = await conn.fetchval("""
