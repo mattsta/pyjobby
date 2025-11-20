@@ -1422,3 +1422,96 @@ class TestSchedulerMainLoop:
 
             # Verify stop was logged (worker completed gracefully)
             assert worker.stop_requested is True
+
+    async def test_run_loop_with_execution_failure(self, db_pool):
+        """Test run() loop with schedule execution failure - covers lines 769-770."""
+        async with db_pool.acquire() as conn:
+            manager = ScheduleManager(conn)
+
+            # Create schedule that will fail
+            schedule_id = await manager.create_schedule(
+                name="failure-test",
+                job_class="nonexistent.FailJob",  # This class doesn't exist
+                cron_expr="* * * * *"
+            )
+
+            # Make it due
+            await conn.execute("""
+                UPDATE jorb_schedule
+                SET next_run = $1
+                WHERE id = $2
+            """, datetime.utcnow() - timedelta(minutes=1), schedule_id)
+
+            worker = SchedulerWorker(conn, poll_interval=0.1)
+
+            # Run scheduler in background
+            import asyncio
+            run_task = asyncio.create_task(worker.run())
+
+            # Let it run and fail
+            await asyncio.sleep(0.5)
+
+            # Stop the worker
+            worker.stop()
+
+            try:
+                await asyncio.wait_for(run_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                run_task.cancel()
+                try:
+                    await run_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Verify failure counter was incremented - covers line 769-770
+            assert worker.failures_total >= 1
+
+    async def test_run_loop_with_execution_skip(self, db_pool):
+        """Test run() loop with schedule execution skip - covers lines 771-772."""
+        async with db_pool.acquire() as conn:
+            manager = ScheduleManager(conn)
+
+            # Create schedule with max_concurrency=1
+            schedule_id = await manager.create_schedule(
+                name="skip-test",
+                job_class="test.SkipJob",
+                cron_expr="* * * * *",
+                max_concurrency=1
+            )
+
+            # Make it due
+            await conn.execute("""
+                UPDATE jorb_schedule
+                SET next_run = $1
+                WHERE id = $2
+            """, datetime.utcnow() - timedelta(minutes=1), schedule_id)
+
+            # Create a running job with same job_class to trigger concurrency limit
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+            """, 'test.SkipJob', {}, 'default', 'running', 100)
+
+            worker = SchedulerWorker(conn, poll_interval=0.1)
+
+            # Run scheduler in background
+            import asyncio
+            run_task = asyncio.create_task(worker.run())
+
+            # Let it run and skip
+            await asyncio.sleep(0.5)
+
+            # Stop the worker
+            worker.stop()
+
+            try:
+                await asyncio.wait_for(run_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                run_task.cancel()
+                try:
+                    await run_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Verify skip counter was incremented - covers lines 771-772
+            assert worker.skips_total >= 1
