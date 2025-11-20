@@ -76,6 +76,16 @@ class TestDAGNode:
         node_set = {node1, node2}
         assert len(node_set) == 1
 
+    def test_dagnode_equality_with_non_dagnode(self):
+        """Test DAGNode equality with non-DAGNode objects."""
+        node = DAGNode(job_class="test.Job", node_id="abc123")
+
+        # Should return False when comparing with non-DAGNode
+        assert node != "not a dag node"
+        assert node != 123
+        assert node != None
+        assert node != {"node_id": "abc123"}
+
 
 # =============================================================================
 # DAGBuilder Tests
@@ -516,3 +526,138 @@ class TestDAGErrorHandling:
 
         assert "cycle" in str(exc_info.value).lower()
         assert "acyclic" in str(exc_info.value).lower()
+
+    def test_topological_sort_cycle_detection(self):
+        """Test that topological_sort raises error on cycles."""
+        dag = DAGBuilder()
+
+        # Create a cycle
+        node_a = dag.add("JobA")
+        node_b = dag.add("JobB", depends_on=[node_a])
+        node_c = dag.add("JobC", depends_on=[node_b])
+        node_a.depends_on.append(node_c)  # Create cycle: A -> B -> C -> A
+
+        with pytest.raises(ValueError, match="cycle"):
+            dag.topological_sort()
+
+
+# =============================================================================
+# DAG Visualization Tests
+# =============================================================================
+
+
+class TestDAGVisualization:
+    """Tests for DAG visualization functionality."""
+
+    def test_visualize_simple_dag(self):
+        """Test visualization of a simple DAG."""
+        dag = DAGBuilder(name="Test Pipeline")
+        node1 = dag.add("Step1")
+        node2 = dag.add("Step2", depends_on=[node1])
+
+        viz = dag.visualize()
+
+        assert "Test Pipeline" in viz
+        assert "Level 0:" in viz
+        assert "Step1" in viz
+        assert "Level 1:" in viz
+        assert "Step2" in viz
+
+    def test_visualize_unnamed_dag(self):
+        """Test visualization of unnamed DAG."""
+        dag = DAGBuilder()
+        dag.add("Job1")
+
+        viz = dag.visualize()
+
+        assert "unnamed" in viz
+        assert "Job1" in viz
+
+    def test_visualize_shows_dependencies(self):
+        """Test that visualization shows dependencies."""
+        dag = DAGBuilder(name="Dependency Test")
+        node1 = dag.add("Parent")
+        node2 = dag.add("Child", depends_on=[node1])
+
+        viz = dag.visualize()
+
+        assert "Parent" in viz
+        assert "Child" in viz
+        assert "depends on: Parent" in viz
+
+    def test_visualize_cyclic_dag_shows_error(self):
+        """Test visualization of DAG with cycle shows error."""
+        dag = DAGBuilder(name="Broken DAG")
+        node_a = dag.add("JobA")
+        node_b = dag.add("JobB", depends_on=[node_a])
+        node_a.depends_on.append(node_b)  # Create cycle
+
+        viz = dag.visualize()
+
+        assert "ERROR:" in viz
+        assert "Nodes:" in viz
+        assert "JobA" in viz
+        assert "JobB" in viz
+
+
+# =============================================================================
+# DAG Helper Function Tests
+# =============================================================================
+
+
+class TestDAGHelperFunctions:
+    """Tests for DAG helper functions."""
+
+    @pytest.mark.asyncio
+    async def test_execute_dag_convenience_function(self, job_client, db_pool):
+        """Test execute_dag convenience function."""
+        from pyjobby.dag import execute_dag
+
+        # Clean database
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM jorb")
+            await conn.execute("DELETE FROM jorb_dag")
+
+        # Create simple DAG
+        dag = DAGBuilder(name="Helper Test")
+        dag.add("test.Job1", {"arg": 1})
+
+        # Execute using helper function
+        result = await execute_dag(job_client, dag)
+
+        assert len(result) == 1
+        assert all(isinstance(job_id, int) for job_id in result.values())
+
+    @pytest.mark.asyncio
+    async def test_get_dag_status_not_found(self, db_pool):
+        """Test get_dag_status with non-existent DAG."""
+        from pyjobby.dag import get_dag_status
+
+        status = await get_dag_status(db_pool, 999999)
+
+        assert 'error' in status
+        assert status['error'] == 'DAG not found'
+
+    @pytest.mark.asyncio
+    async def test_get_dag_status_found(self, job_client, db_pool):
+        """Test get_dag_status with existing DAG."""
+        from pyjobby.dag import get_dag_status
+
+        # Clean database
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM jorb")
+            await conn.execute("DELETE FROM jorb_dag")
+
+        # Create and execute DAG
+        dag = DAGBuilder(name="Status Test")
+        dag.add("test.Job1", {"arg": 1})
+        result = await dag.execute(job_client)
+
+        # Get DAG ID from result
+        dag_id = await db_pool.fetchval("SELECT MAX(id) FROM jorb_dag")
+
+        # Get status
+        status = await get_dag_status(db_pool, dag_id)
+
+        # Should have status information (may be None if view not populated yet)
+        assert status is not None
