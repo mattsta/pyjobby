@@ -970,6 +970,125 @@ class TestJobClassExecution:
 
 
 # =============================================================================
+# Error Handling and Edge Cases Tests
+# =============================================================================
+
+@pytest.mark.asyncio
+class TestJobSystemErrorHandling:
+    """Tests for error handling and edge cases in JobSystem."""
+
+    async def test_shutdown_signal_handler(self, db_params, worker_id):
+        """Test shutdown() sets stop flag - covers lines 325-326."""
+        system = JobSystem(
+            dsn=db_params,
+            qname="default",
+            capabilities=("test",),
+            workerId=worker_id,
+        )
+
+        # Initially stop should be False
+        assert system.stop == False
+
+        # Call shutdown (signal handler)
+        system.shutdown(15, None)  # SIGTERM = 15
+
+        # Verify stop flag is set
+        assert system.stop == True
+
+    async def test_class_not_found_error(self, db_params, worker_id):
+        """Test classForKlassFromName() raises FileNotFoundError for invalid class - covers line 393."""
+        system = JobSystem(
+            dsn=db_params,
+            qname="default",
+            capabilities=("test",),
+            workerId=worker_id,
+        )
+
+        # Try to load a class that doesn't exist in a valid module
+        # pyjobby.pj module exists, but NonExistentJobClass doesn't
+        with pytest.raises(FileNotFoundError) as exc_info:
+            system.classForKlassFromName("pyjobby.pj.NonExistentJobClass")
+
+        assert "Job class not found" in str(exc_info.value)
+        assert "pyjobby.pj.NonExistentJobClass" in str(exc_info.value)
+
+    async def test_recover_abandoned_jobs_exception_handling(self, db_params, worker_id):
+        """Test recover_abandoned_jobs() handles exceptions gracefully - covers lines 361-363."""
+        system = JobSystem(
+            dsn=db_params,
+            qname="default",
+            capabilities=("test",),
+            workerId=worker_id,
+            enable_recovery=True,
+        )
+
+        # Mock ex() to raise an exception
+        async def mock_ex_error(*args):
+            raise Exception("Database connection failed")
+
+        system.ex = mock_ex_error
+
+        # Should catch exception and return empty list
+        result = await system.recover_abandoned_jobs()
+
+        assert result == []
+
+    async def test_database_interface_error_reconnect(self, db_params, worker_id):
+        """Test ex() retries on InterfaceError - covers lines 318-321."""
+        system = JobSystem(
+            dsn=db_params,
+            qname="default",
+            capabilities=("test",),
+            workerId=worker_id,
+        )
+
+        # Setup connection and statements
+        system.cxn = await asyncpg.connect(**db_params)
+        await setup_json_codec(system.cxn)
+
+        from pyjobby.pj import STMTS
+        system.stmts = {}
+        for name, stmt in STMTS.items():
+            system.stmts[name] = await system.cxn.prepare(stmt)
+
+        # Create a test job to query
+        conn = await asyncpg.connect(**db_params)
+        await setup_json_codec(conn)
+        job_id = await conn.fetchval("""
+            INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id
+        """, 'test.Job', {}, 'default', 'queued', 100)
+        await conn.close()
+
+        # Mock statement fetch to raise InterfaceError then succeed
+        call_count = 0
+        original_stmt = system.stmts["get"]
+
+        class MockPreparedStatement:
+            async def fetch(self, *args):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    # First call raises InterfaceError
+                    raise asyncpg.InterfaceError("Connection lost")
+                # Second call succeeds
+                return await original_stmt.fetch(*args)
+
+        system.stmts["get"] = MockPreparedStatement()
+
+        # This should retry after InterfaceError and eventually succeed
+        # Note: The retry logic in ex() sleeps 0.5s between attempts
+        result = await system.ex("get", job_id)
+
+        # Verify it was called twice (once failed, once succeeded)
+        # This proves the retry logic in lines 318-321 works
+        assert call_count == 2
+
+        await system.cxn.close()
+
+
+# =============================================================================
 # COMPREHENSIVE SUMMARY
 # =============================================================================
 
