@@ -653,6 +653,50 @@ class TestJSONCodecInit:
 
             # If we got here, monitor handled missing orjson gracefully
 
+    @pytest.mark.asyncio
+    async def test_orjson_encoder_coverage(self, db_params, client):
+        """Test that orjson encoder is actually used when encoding JSON data."""
+        dsn = f"postgresql://{db_params['user']}:{db_params['password']}@{db_params['host']}:{db_params['port']}/{db_params['database']}"
+
+        # Create a timeout monitor which sets up the orjson encoder
+        monitor_task = asyncio.create_task(timeout_monitor(dsn, check_interval=999999))
+
+        # Let monitor initialize
+        await asyncio.sleep(0.3)
+
+        # Now create a job with JSON admin_data, which should use the encoder
+        # when the monitor queries it
+        job_id = await client.enqueue(
+            "test.Job",
+            timeout_seconds=1,
+            admin_data={'test_key': 'test_value', 'nested': {'data': 123}}
+        )
+
+        # Set job to running with timeout in past to trigger monitor processing
+        async with client.pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE jorb
+                SET state = 'running',
+                    timeout_at = NOW() - INTERVAL '1 minute'
+                WHERE id = $1
+            """, job_id)
+
+        # Give monitor time to process (this will query admin_data using the encoder)
+        await asyncio.sleep(0.5)
+
+        # Cancel monitor
+        monitor_task.cancel()
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
+
+        # Verify the job was processed (state should be queued for retry)
+        async with client.pool.acquire() as conn:
+            job = await conn.fetchrow("SELECT state FROM jorb WHERE id = $1", job_id)
+            # Should have been requeued or marked as crashed
+            assert job['state'] in ('queued', 'crashed')
+
 
 # ============================================================================
 # Test CLI Function

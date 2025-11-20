@@ -1179,6 +1179,40 @@ class TestAdminAPIErrorPaths:
         with pytest.raises(ValueError, match="can only cancel queued or waiting jobs"):
             await api.cancel_job(job_id)
 
+    @pytest.mark.asyncio
+    async def test_retry_jobs_bulk_with_errors(self, db_pool):
+        """Test retry_jobs handles mix of valid and invalid job IDs."""
+        api = AdminAPI(db_pool)
+
+        # Create one valid crashed job
+        async with db_pool.acquire() as conn:
+            valid_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, error_count, prio)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id
+            """, 'test.Job', {}, 'default', 'crashed', 1, 100)
+
+        # Mix valid and invalid IDs - this will trigger error path (lines 288-289)
+        results = await api.retry_jobs([valid_id, 999999, 999998])
+
+        assert len(results) == 3
+        # First should succeed
+        assert results[0]['status'] == 'retry_queued'
+        assert 'new_job_id' in results[0]
+        # Second and third should be errors (covering lines 288-289)
+        assert results[1]['status'] == 'error'
+        assert 'not found' in results[1]['error'].lower()
+        assert results[2]['status'] == 'error'
+
+    @pytest.mark.asyncio
+    async def test_delete_jobs_no_filters(self, db_pool):
+        """Test delete_jobs raises error when no filters provided."""
+        api = AdminAPI(db_pool)
+
+        # Should raise ValueError when no filters provided (line 418)
+        with pytest.raises(ValueError, match="Must specify at least one filter"):
+            await api.delete_jobs()
+
 
 # =============================================================================
 # COMPREHENSIVE SUMMARY
