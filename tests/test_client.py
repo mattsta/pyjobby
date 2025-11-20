@@ -700,3 +700,212 @@ async def test_enqueue_with_uid(client, clean_db, pool):
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT uid FROM jorb WHERE id = $1", job_id)
         assert row['uid'] == 12345
+
+
+# =============================================================================
+# Phase 2 Features and Edge Cases Tests
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_enqueue_with_save_result(client, clean_db, pool):
+    """Test enqueueing job with save_result flag - covers line 348."""
+    job_id = await client.enqueue('test.Job', save_result=True, data='test')
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT admin_data FROM jorb WHERE id = $1", job_id)
+        import json
+        admin_data = json.loads(row['admin_data']) if isinstance(row['admin_data'], str) else row['admin_data']
+        assert admin_data.get('save_result') is True
+
+
+@pytest.mark.asyncio
+async def test_enqueue_with_timeout_seconds(client, clean_db, pool):
+    """Test enqueueing job with timeout configuration - covers lines 358-359."""
+    job_id = await client.enqueue(
+        'test.Job',
+        timeout_seconds=300,
+        on_timeout='fail',
+        data='test'
+    )
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT admin_data FROM jorb WHERE id = $1", job_id)
+        import json
+        admin_data = json.loads(row['admin_data']) if isinstance(row['admin_data'], str) else row['admin_data']
+        assert admin_data.get('timeout_seconds') == 300
+        assert admin_data.get('on_timeout') == 'fail'
+
+
+@pytest.mark.asyncio
+async def test_enqueue_with_use_result_from(client, clean_db, pool):
+    """Test enqueueing job with use_result_from - covers lines 324-330."""
+    from pyjobby.pj import STMTS
+
+    # Create and finish upstream job with result
+    upstream_id = await client.enqueue('test.UpstreamJob', data='upstream')
+
+    async with pool.acquire() as conn:
+        # Claim, run, and finish with result
+        await conn.execute(STMTS["claim"], 12345, "worker", "default", [], 1000)
+        await conn.execute(STMTS["run"], upstream_id)
+        await conn.execute(
+            STMTS["finished"],
+            upstream_id,
+            {"status": "success", "value": 42}
+        )
+
+    # Create downstream job that uses upstream result
+    downstream_id = await client.enqueue(
+        'test.DownstreamJob',
+        use_result_from=upstream_id,
+        data='downstream'
+    )
+
+    # Verify downstream job received upstream result
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT kwargs FROM jorb WHERE id = $1", downstream_id)
+        # kwargs is already a dict with JSON codec
+        assert 'upstream_result' in row['kwargs']
+        assert row['kwargs']['upstream_result']['status'] == 'success'
+        assert row['kwargs']['upstream_result']['value'] == 42
+
+
+@pytest.mark.asyncio
+async def test_health_check_exception_path(pool):
+    """Test health_check returns False on exception - covers lines 1262-1263."""
+    import asyncpg
+    from unittest.mock import AsyncMock, MagicMock
+
+    # Create a client with a mock pool that raises an error
+    mock_pool = MagicMock()
+    mock_acquire = AsyncMock(side_effect=asyncpg.PostgresError("Connection failed"))
+    mock_pool.acquire = MagicMock(return_value=mock_acquire())
+
+    client = JobClient(mock_pool)
+
+    # Health check should return False on exception
+    healthy = await client.health_check()
+    assert healthy is False
+
+
+@pytest.mark.asyncio
+async def test_get_job_full_not_found(client, clean_db):
+    """Test get_job_full returns None for non-existent job - covers line 715."""
+    job = await client.get_job_full(999999999)
+    assert job is None
+
+
+@pytest.mark.asyncio
+async def test_get_job_result_with_string_result(client, clean_db, pool):
+    """Test get_job_result parses string JSON result - covers line 748."""
+    import json
+    from pyjobby.pj import STMTS
+
+    # Create and finish job with result
+    job_id = await client.enqueue('test.Job', data='test')
+
+    async with pool.acquire() as conn:
+        await conn.execute(STMTS["claim"], 12345, "worker", "default", [], 1000)
+        await conn.execute(STMTS["run"], job_id)
+        # Store result as JSON string
+        await conn.execute(
+            STMTS["finished"],
+            job_id,
+            json.dumps({"result": "completed", "value": 123})
+        )
+
+    # Get result - should parse JSON string
+    result = await client.get_job_result(job_id)
+    assert result is not None
+    assert result['result'] == 'completed'
+    assert result['value'] == 123
+
+
+@pytest.mark.asyncio
+async def test_get_jobs_with_invalid_order_by(client, clean_db):
+    """Test get_jobs validates order_by field - covers line 848."""
+    # Create some test jobs
+    await client.enqueue('test.Job', data='test1')
+    await client.enqueue('test.Job', data='test2')
+
+    # Try invalid order_by field (should default to 'created')
+    jobs = await client.get_jobs(order_by='invalid_field', limit=10)
+
+    # Should succeed with default ordering
+    assert len(jobs) >= 2
+
+
+@pytest.mark.asyncio
+async def test_create_pipeline_with_results(client, clean_db, pool):
+    """Test create_pipeline_with_results - covers lines 1409-1428."""
+    # Create pipeline with result passing
+    stages = [
+        ('test.FetchData', {'source': 'api'}, True),      # Save result
+        ('test.ProcessData', {'format': 'json'}, True),   # Save result
+        ('test.StoreData', {'dest': 'db'}, False),        # Don't save
+    ]
+
+    job_ids = await client.create_pipeline_with_results(
+        stages,
+        queue='pipeline',
+        priority=200
+    )
+
+    assert len(job_ids) == 3
+
+    # Verify all jobs created
+    async with pool.acquire() as conn:
+        for job_id in job_ids:
+            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+            assert job is not None
+            assert job['queue'] == 'pipeline'
+            assert job['prio'] == 200
+
+        # Verify first job is queued, others are waiting
+        job1 = await conn.fetchrow("SELECT state FROM jorb WHERE id = $1", job_ids[0])
+        assert job1['state'] == 'queued'
+
+        job2 = await conn.fetchrow("SELECT state, waitfor_job FROM jorb WHERE id = $1", job_ids[1])
+        assert job2['state'] == 'waiting'
+        assert job2['waitfor_job'] == job_ids[0]
+
+        job3 = await conn.fetchrow("SELECT state, waitfor_job FROM jorb WHERE id = $1", job_ids[2])
+        assert job3['state'] == 'waiting'
+        assert job3['waitfor_job'] == job_ids[1]
+
+
+@pytest.mark.asyncio
+async def test_from_config(tmp_path):
+    """Test creating client from config file - covers lines 184-194."""
+    # Create temporary config file
+    config_file = tmp_path / "pyjobby.conf.py"
+    config_content = """
+db_params = {
+    'host': 'localhost',
+    'port': 5432,
+    'database': 'pyjobby_test',
+    'user': 'pyjobby_test',
+    'password': 'pyjobby_test_password',
+}
+"""
+    config_file.write_text(config_content)
+
+    # Create client from config
+    client = await JobClient.from_config(str(config_file), min_size=2, max_size=5)
+
+    try:
+        assert client.pool is not None
+        assert not client._closed
+
+        # Test that pool works
+        async with client.pool.acquire() as conn:
+            result = await conn.fetchval("SELECT 1")
+            assert result == 1
+
+        # Verify pool has correct connection parameters
+        assert client.pool._minsize == 2
+        assert client.pool._maxsize == 5
+
+    finally:
+        await client.close()
+        assert client._closed
