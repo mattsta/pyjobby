@@ -661,3 +661,108 @@ class TestDAGHelperFunctions:
 
         # Should have status information (may be None if view not populated yet)
         assert status is not None
+
+    @pytest.mark.asyncio
+    async def test_wait_for_dag_success(self, job_client, db_pool):
+        """Test wait_for_dag returns True when DAG completes successfully."""
+        from pyjobby.dag import wait_for_dag
+
+        # Clean database
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM jorb")
+            await conn.execute("DELETE FROM jorb_dag")
+
+        # Create simple DAG that will complete
+        dag = DAGBuilder(name="Wait Success Test")
+        dag.add("test.Job1", {"arg": 1})
+        result = await dag.execute(job_client)
+
+        # Get DAG ID
+        dag_id = await db_pool.fetchval("SELECT MAX(id) FROM jorb_dag")
+
+        # Mark all jobs as finished to simulate completion
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE jorb
+                SET state = 'finished'
+                WHERE dag_id = $1
+            """, dag_id)
+
+        # Wait for DAG (should return True immediately since jobs are finished)
+        success = await wait_for_dag(db_pool, dag_id, timeout=5, poll_interval=0.1)
+
+        assert success is True
+
+    @pytest.mark.asyncio
+    async def test_wait_for_dag_failure(self, job_client, db_pool):
+        """Test wait_for_dag returns False when DAG fails."""
+        from pyjobby.dag import wait_for_dag
+
+        # Clean database
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM jorb")
+            await conn.execute("DELETE FROM jorb_dag")
+
+        # Create DAG
+        dag = DAGBuilder(name="Wait Failure Test")
+        dag.add("test.Job1", {"arg": 1})
+        result = await dag.execute(job_client)
+
+        # Get DAG ID
+        dag_id = await db_pool.fetchval("SELECT MAX(id) FROM jorb_dag")
+
+        # Mark jobs as crashed to simulate failure
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE jorb
+                SET state = 'crashed', error_message = 'Test failure'
+                WHERE dag_id = $1
+            """, dag_id)
+
+        # Wait for DAG (should return False due to crashed jobs)
+        success = await wait_for_dag(db_pool, dag_id, timeout=5, poll_interval=0.1)
+
+        assert success is False
+
+    @pytest.mark.asyncio
+    async def test_wait_for_dag_timeout(self, job_client, db_pool):
+        """Test wait_for_dag returns False when timeout is exceeded."""
+        from pyjobby.dag import wait_for_dag
+
+        # Clean database
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM jorb")
+            await conn.execute("DELETE FROM jorb_dag")
+
+        # Create DAG
+        dag = DAGBuilder(name="Wait Timeout Test")
+        dag.add("test.Job1", {"arg": 1})
+        result = await dag.execute(job_client)
+
+        # Get DAG ID
+        dag_id = await db_pool.fetchval("SELECT MAX(id) FROM jorb_dag")
+
+        # Leave jobs in running state (not finished, not crashed)
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE jorb
+                SET state = 'running'
+                WHERE dag_id = $1
+            """, dag_id)
+
+        # Wait with very short timeout
+        success = await wait_for_dag(db_pool, dag_id, timeout=0.2, poll_interval=0.05)
+
+        # Should timeout and return False
+        assert success is False
+
+    @pytest.mark.asyncio
+    async def test_wait_for_dag_not_found(self, db_pool):
+        """Test wait_for_dag returns False when DAG doesn't exist."""
+        from pyjobby.dag import wait_for_dag
+
+        # Wait for non-existent DAG
+        success = await wait_for_dag(db_pool, 999999, timeout=1, poll_interval=0.1)
+
+        # Should return False immediately
+        assert success is False
