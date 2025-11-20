@@ -1527,6 +1527,244 @@ class TestAdminAPIErrorPaths:
         with pytest.raises(ValueError, match="Must specify at least one filter"):
             await api.delete_jobs()
 
+    @pytest.mark.asyncio
+    async def test_cancel_jobs_bulk(self, db_pool):
+        """Test cancel_jobs with mixed valid/invalid IDs - covers lines 346-357."""
+        api = AdminAPI(db_pool)
+
+        # Create jobs in different states
+        async with db_pool.acquire() as conn:
+            job1 = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
+            """, 'test.Job1', {}, 'default', 'queued', 100)
+
+            job2 = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
+            """, 'test.Job2', {}, 'default', 'waiting', 100)
+
+            job3 = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
+            """, 'test.Job3', {}, 'default', 'running', 100)
+
+            job4 = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
+            """, 'test.Job4', {}, 'default', 'finished', 100)
+
+        # Bulk cancel with mix of valid IDs (queued, waiting), invalid ID, and non-cancellable states
+        results = await api.cancel_jobs([job1, job2, 999999, job3, job4])
+
+        assert len(results) == 5
+
+        # job1 (queued) should succeed
+        assert results[0]['status'] == 'cancelled'
+        assert results[0]['job_id'] == job1
+
+        # job2 (waiting) should succeed
+        assert results[1]['status'] == 'cancelled'
+        assert results[1]['job_id'] == job2
+
+        # 999999 (invalid) should error - covers lines 351-356
+        assert results[2]['status'] == 'error'
+        assert results[2]['job_id'] == 999999
+        assert 'error' in results[2]
+
+        # job3 (running) should error - can't cancel running jobs
+        assert results[3]['status'] == 'error'
+        assert results[3]['job_id'] == job3
+        assert 'error' in results[3]
+
+        # job4 (finished) should error - can't cancel finished jobs
+        assert results[4]['status'] == 'error'
+        assert results[4]['job_id'] == job4
+        assert 'error' in results[4]
+
+    @pytest.mark.asyncio
+    async def test_delete_jobs_by_queue(self, db_pool):
+        """Test delete_jobs with queue filter - covers lines 401-403."""
+        api = AdminAPI(db_pool)
+
+        # Create jobs in different queues
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+            """, 'test.Job1', {}, 'queue_a', 'finished', 100)
+
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+            """, 'test.Job2', {}, 'queue_a', 'finished', 100)
+
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+            """, 'test.Job3', {}, 'queue_b', 'finished', 100)
+
+        # Delete jobs from queue_a only
+        deleted = await api.delete_jobs(queue='queue_a')
+
+        assert deleted == 2
+
+        # Verify only queue_a jobs deleted
+        async with db_pool.acquire() as conn:
+            remaining = await conn.fetchval("SELECT COUNT(*) FROM jorb WHERE queue = 'queue_a'")
+            assert remaining == 0
+
+            remaining_b = await conn.fetchval("SELECT COUNT(*) FROM jorb WHERE queue = 'queue_b'")
+            assert remaining_b == 1
+
+    @pytest.mark.asyncio
+    async def test_delete_jobs_by_state(self, db_pool):
+        """Test delete_jobs with state filter - covers lines 406-408."""
+        api = AdminAPI(db_pool)
+
+        # Create jobs in different states
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+            """, 'test.Job1', {}, 'default', 'crashed', 100)
+
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+            """, 'test.Job2', {}, 'default', 'crashed', 100)
+
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+            """, 'test.Job3', {}, 'default', 'finished', 100)
+
+        # Delete only crashed jobs
+        deleted = await api.delete_jobs(state='crashed')
+
+        assert deleted == 2
+
+        # Verify only crashed jobs deleted
+        async with db_pool.acquire() as conn:
+            remaining_crashed = await conn.fetchval("SELECT COUNT(*) FROM jorb WHERE state = 'crashed'")
+            assert remaining_crashed == 0
+
+            remaining_finished = await conn.fetchval("SELECT COUNT(*) FROM jorb WHERE state = 'finished'")
+            assert remaining_finished == 1
+
+    @pytest.mark.asyncio
+    async def test_delete_jobs_by_age(self, db_pool):
+        """Test delete_jobs with older_than_days filter - covers lines 411-415."""
+        from datetime import timedelta
+
+        api = AdminAPI(db_pool)
+
+        # Create old and new jobs
+        async with db_pool.acquire() as conn:
+            # Old job (10 days ago)
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, updated)
+                VALUES ($1, $2, $3, $4, $5, TIMEZONE('utc', clock_timestamp()) - $6::interval)
+            """, 'test.OldJob', {}, 'default', 'finished', 100, timedelta(days=10))
+
+            # Recent job (1 day ago)
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, updated)
+                VALUES ($1, $2, $3, $4, $5, TIMEZONE('utc', clock_timestamp()) - $6::interval)
+            """, 'test.NewJob', {}, 'default', 'finished', 100, timedelta(days=1))
+
+        # Delete jobs older than 7 days
+        deleted = await api.delete_jobs(state='finished', older_than_days=7)
+
+        assert deleted == 1
+
+        # Verify only old job deleted
+        async with db_pool.acquire() as conn:
+            remaining = await conn.fetchval("SELECT COUNT(*) FROM jorb WHERE state = 'finished'")
+            assert remaining == 1
+
+            # Verify it's the new job that remains
+            job = await conn.fetchrow("SELECT job_class FROM jorb WHERE state = 'finished'")
+            assert job['job_class'] == 'test.NewJob'
+
+    @pytest.mark.asyncio
+    async def test_delete_jobs_combined_filters(self, db_pool):
+        """Test delete_jobs with multiple filters - covers lines 422-431."""
+        from datetime import timedelta
+
+        api = AdminAPI(db_pool)
+
+        # Create various jobs
+        async with db_pool.acquire() as conn:
+            # Old crashed job in queue_a (should be deleted)
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, updated)
+                VALUES ($1, $2, $3, $4, $5, TIMEZONE('utc', clock_timestamp()) - $6::interval)
+            """, 'test.Target', {}, 'queue_a', 'crashed', 100, timedelta(days=10))
+
+            # Old crashed job in queue_b (should NOT be deleted - wrong queue)
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, updated)
+                VALUES ($1, $2, $3, $4, $5, TIMEZONE('utc', clock_timestamp()) - $6::interval)
+            """, 'test.Wrong', {}, 'queue_b', 'crashed', 100, timedelta(days=10))
+
+            # New crashed job in queue_a (should NOT be deleted - too recent)
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, updated)
+                VALUES ($1, $2, $3, $4, $5, TIMEZONE('utc', clock_timestamp()) - $6::interval)
+            """, 'test.Recent', {}, 'queue_a', 'crashed', 100, timedelta(days=1))
+
+        # Delete only: queue_a AND crashed AND older than 7 days
+        deleted = await api.delete_jobs(
+            queue='queue_a',
+            state='crashed',
+            older_than_days=7
+        )
+
+        assert deleted == 1
+
+        # Verify correct job deleted
+        async with db_pool.acquire() as conn:
+            remaining = await conn.fetchval("SELECT COUNT(*) FROM jorb")
+            assert remaining == 2
+
+            # Verify the target job is gone
+            target = await conn.fetchval(
+                "SELECT COUNT(*) FROM jorb WHERE job_class = 'test.Target'"
+            )
+            assert target == 0
+
+    @pytest.mark.asyncio
+    async def test_clear_queue(self, db_pool):
+        """Test clear_queue calls delete_jobs correctly - covers line 532."""
+        api = AdminAPI(db_pool)
+
+        # Create jobs in test_queue
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+            """, 'test.Job1', {}, 'test_queue', 'finished', 100)
+
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+            """, 'test.Job2', {}, 'test_queue', 'crashed', 100)
+
+        # Clear queue
+        deleted = await api.clear_queue('test_queue')
+
+        assert deleted == 2
+
+        # Verify queue cleared
+        async with db_pool.acquire() as conn:
+            remaining = await conn.fetchval("SELECT COUNT(*) FROM jorb WHERE queue = 'test_queue'")
+            assert remaining == 0
+
 
 # =============================================================================
 # COMPREHENSIVE SUMMARY
