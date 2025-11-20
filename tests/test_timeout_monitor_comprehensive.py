@@ -496,17 +496,17 @@ class TestTimeoutMonitor:
 class TestRunTimeoutMonitor:
     """Test sync entry point."""
 
-    def test_run_timeout_monitor_starts(self, db_params):
-        """Test run_timeout_monitor starts the async monitor."""
+    def test_run_timeout_monitor_calls_asyncio_run(self, db_params):
+        """Test run_timeout_monitor calls asyncio.run with timeout_monitor."""
         dsn = f"postgresql://{db_params['user']}:{db_params['password']}@{db_params['host']}:{db_params['port']}/{db_params['database']}"
 
-        # Patch asyncio.run to avoid actually running
+        # Patch asyncio.run to prevent actually running the monitor
         with patch('asyncio.run') as mock_run:
-            with patch('pyjobby.timeout_monitor.timeout_monitor') as mock_monitor:
-                # This would normally block, but we've patched it
-                # Just verify the function exists and can be called
-                # We can't actually test it without blocking
-                pass
+            run_timeout_monitor(dsn)
+
+            # Verify asyncio.run was called
+            assert mock_run.called
+            assert mock_run.call_count == 1
 
 
 # ============================================================================
@@ -595,3 +595,116 @@ class TestTimeoutMonitorIntegration:
             assert job['state'] == 'crashed'
             assert job['error_count'] == 1
             assert 'max retries exceeded' in job['error_message']
+
+
+# ============================================================================
+# Test JSON Codec Initialization
+# ============================================================================
+
+class TestJSONCodecInit:
+    """Test JSON codec initialization in monitor."""
+
+    @pytest.mark.asyncio
+    async def test_monitor_with_orjson_available(self, db_params):
+        """Test monitor initializes with orjson codec when available."""
+        dsn = f"postgresql://{db_params['user']}:{db_params['password']}@{db_params['host']}:{db_params['port']}/{db_params['database']}"
+
+        monitor_task = asyncio.create_task(timeout_monitor(dsn, check_interval=999999))
+
+        # Let monitor initialize with orjson codec
+        await asyncio.sleep(0.2)
+
+        # Cancel monitor
+        monitor_task.cancel()
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
+
+        # If we got here without exceptions, orjson codec was set up successfully
+
+    @pytest.mark.asyncio
+    async def test_monitor_without_orjson(self, db_params):
+        """Test monitor handles missing orjson gracefully."""
+        dsn = f"postgresql://{db_params['user']}:{db_params['password']}@{db_params['host']}:{db_params['port']}/{db_params['database']}"
+
+        # Mock orjson import to fail
+        import sys
+        import builtins
+        real_import = builtins.__import__
+
+        def mock_import(name, *args, **kwargs):
+            if name == 'orjson':
+                raise ImportError("orjson not available")
+            return real_import(name, *args, **kwargs)
+
+        with patch('builtins.__import__', side_effect=mock_import):
+            monitor_task = asyncio.create_task(timeout_monitor(dsn, check_interval=999999))
+
+            # Let monitor initialize without orjson (should fall back gracefully)
+            await asyncio.sleep(0.2)
+
+            # Cancel monitor
+            monitor_task.cancel()
+            try:
+                await monitor_task
+            except asyncio.CancelledError:
+                pass
+
+            # If we got here, monitor handled missing orjson gracefully
+
+
+# ============================================================================
+# Test CLI Function
+# ============================================================================
+
+class TestCLI:
+    """Test CLI entry point - simplified to avoid async mock issues."""
+
+    def test_cli_with_dsn_executes(self, db_params):
+        """Test CLI executes with --dsn argument."""
+        dsn = f"postgresql://{db_params['user']}:{db_params['password']}@{db_params['host']}:{db_params['port']}/{db_params['database']}"
+        test_argv = ['timeout-monitor', '--dsn', dsn]
+
+        with patch('sys.argv', test_argv):
+            with patch('asyncio.run', return_value=None):  # Return None instead of mock
+                try:
+                    from pyjobby.timeout_monitor import cli
+                    cli()
+                except SystemExit as e:
+                    # Exit code 0 means success
+                    assert e.code in (None, 0)
+
+    def test_cli_with_config_executes(self, db_params, tmp_path):
+        """Test CLI executes with --config argument."""
+        config_file = tmp_path / "pyjobby.conf.py"
+        config_file.write_text(f"""
+DB_PARAMS = {{
+    'user': '{db_params['user']}',
+    'password': '{db_params['password']}',
+    'host': '{db_params['host']}',
+    'port': {db_params['port']},
+    'database': '{db_params['database']}'
+}}
+""")
+        test_argv = ['timeout-monitor', '--config', str(config_file)]
+
+        with patch('sys.argv', test_argv):
+            with patch('asyncio.run', return_value=None):
+                try:
+                    from pyjobby.timeout_monitor import cli
+                    cli()
+                except SystemExit as e:
+                    assert e.code in (None, 0)
+
+    def test_cli_missing_both_exits_with_error(self):
+        """Test CLI exits with error when neither DSN nor config provided."""
+        test_argv = ['timeout-monitor']
+
+        with patch('sys.argv', test_argv):
+            with pytest.raises(SystemExit) as exc_info:
+                from pyjobby.timeout_monitor import cli
+                cli()
+
+            # Should exit with non-zero code
+            assert exc_info.value.code == 1
