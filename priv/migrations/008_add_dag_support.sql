@@ -232,6 +232,8 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Create trigger to auto-complete DAGs
+-- NOTE: DROP IF EXISTS will show a NOTICE if trigger doesn't exist on first run.
+-- This is expected and safe - it ensures idempotent migration application.
 DROP TRIGGER IF EXISTS auto_complete_dag_trigger ON jorb;
 CREATE TRIGGER auto_complete_dag_trigger
     AFTER UPDATE OF state ON jorb

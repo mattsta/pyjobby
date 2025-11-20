@@ -36,13 +36,13 @@ SCHEMA_FILE="priv/schema.sql"
 if psql -U postgres -c "SELECT 1" > /dev/null 2>&1; then
     PG_USER="postgres"
     log_info "Connected as postgres user"
-elif [ "$USER" = "postgres" ]; then
+elif [ "${USER:-}" = "postgres" ]; then
     PG_USER="postgres"
     log_info "Running as postgres user"
 else
     log_error "Cannot connect to PostgreSQL"
     log_info "Either:"
-    log_info "  1. Run as postgres user: sudo -u postgres $0"
+    log_info "  1. Run as postgres user: su - postgres -c $0"
     log_info "  2. Configure pg_hba.conf to allow local connections"
     log_info "  3. Set PGPASSWORD environment variable"
     exit 1

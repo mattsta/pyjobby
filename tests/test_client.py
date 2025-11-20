@@ -25,26 +25,19 @@ from pyjobby.client import JobClient, JobOptions, JobInfo
 # Fixtures
 # =============================================================================
 
-@pytest.fixture
-async def pool(db_params):
-    """Create a connection pool for testing"""
-    pool = await asyncpg.create_pool(**db_params, min_size=2, max_size=5)
-    yield pool
-    await pool.close()
-
+# NOTE: We use the db_pool and client fixtures from conftest.py
+# which have proper JSON codec setup for asyncpg 0.30.0+
 
 @pytest.fixture
-async def client(pool):
-    """Create a JobClient for testing"""
-    client = JobClient(pool)
-    yield client
-    await client.close()
+async def pool(db_pool):
+    """Alias for db_pool to match test function signatures"""
+    return db_pool
 
 
 @pytest.fixture
-async def clean_db(pool):
+async def clean_db(db_pool):
     """Clean database before each test"""
-    async with pool.acquire() as conn:
+    async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM jorb")
         await conn.execute("DELETE FROM jorb_schedule_log")
         await conn.execute("DELETE FROM jorb_schedule")

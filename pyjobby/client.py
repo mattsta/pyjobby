@@ -556,10 +556,10 @@ class JobClient:
                     job_class, kwargs, queue, prio, uid, capability,
                     TIMEZONE('utc', clock_timestamp()) as run_after,
                     run_group,
-                    (COALESCE(admin_data::text::jsonb, '{}'::jsonb) || jsonb_build_object('retry_of', $1))::json as admin_data,
+                    (COALESCE(admin_data::text::jsonb, '{}'::jsonb) || jsonb_build_object('retry_of', $1::bigint))::json as admin_data,
                     'queued' as state
                 FROM jorb
-                WHERE id = $1
+                WHERE id = $1::bigint
                   AND state IN ('crashed', 'finished')
                 RETURNING id
             """, job_id)

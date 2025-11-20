@@ -10,7 +10,12 @@
 
 BEGIN;
 
--- Add result column to jorb table
+-- NOTE: The 'result' column already exists in the base schema (priv/schema.sql).
+-- This migration adds the index and constraints for result storage.
+-- The ADD COLUMN IF NOT EXISTS is kept for backwards compatibility with
+-- databases that were created before result column was added to base schema.
+
+-- Add result column to jorb table (idempotent - column exists in base schema)
 ALTER TABLE jorb ADD COLUMN IF NOT EXISTS result JSONB DEFAULT NULL;
 
 -- Add sparse index for jobs that have results
@@ -31,7 +36,7 @@ BEGIN
     END IF;
 END $$;
 
--- Add helpful comment
+-- Add helpful comment (this will update the comment if it already exists)
 COMMENT ON COLUMN jorb.result IS
     'Job execution result (optional). Max 10MB. Use for pipeline data passing. '
     'Set save_result=True in job options to enable.';
