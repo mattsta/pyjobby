@@ -909,3 +909,129 @@ db_params = {
     finally:
         await client.close()
         assert client._closed
+
+
+# =============================================================================
+# DAG Methods and Final Edge Cases - Push to 100%!
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_dag(client, clean_db):
+    """Test dag() returns DAGBuilder - covers lines 1301-1302."""
+    # Create DAG
+    dag = client.dag(name="test-dag", queue="default", priority=100)
+
+    # Verify it's a DAGBuilder
+    from pyjobby.dag import DAGBuilder
+    assert isinstance(dag, DAGBuilder)
+    assert dag.name == "test-dag"
+    assert dag.common_options['queue'] == "default"
+    assert dag.common_options['priority'] == 100
+
+
+@pytest.mark.asyncio
+async def test_execute_dag(client, clean_db, pool):
+    """Test execute_dag() delegates to dag.execute() - covers line 1324."""
+    # Create and build a simple DAG
+    dag = client.dag(name="execution-test")
+    node1 = dag.add("test.Job1", kwargs={"step": 1})
+    node2 = dag.add("test.Job2", kwargs={"step": 2}, depends_on=[node1])
+
+    # Execute DAG
+    node_to_job = await client.execute_dag(dag)
+
+    # Verify execution created jobs
+    assert len(node_to_job) == 2
+    assert node1 in node_to_job
+    assert node2 in node_to_job
+
+    # Verify jobs exist in database
+    async with pool.acquire() as conn:
+        job1 = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", node_to_job[node1])
+        job2 = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", node_to_job[node2])
+
+        assert job1 is not None
+        assert job1['job_class'] == 'test.Job1'
+        assert job2 is not None
+        assert job2['job_class'] == 'test.Job2'
+        assert job2['waitfor_job'] == node_to_job[node1]
+
+
+@pytest.mark.asyncio
+async def test_get_dag_status(client, clean_db, pool):
+    """Test get_dag_status() delegates correctly - covers lines 1341-1342."""
+    # Create and execute a simple DAG
+    dag = client.dag(name="status-test")
+    node = dag.add("test.StatusJob", kwargs={"data": "test"})
+    node_to_job = await client.execute_dag(dag)
+
+    # Get DAG ID from database
+    async with pool.acquire() as conn:
+        dag_record = await conn.fetchrow("SELECT * FROM jorb_dag WHERE name = $1", "status-test")
+        assert dag_record is not None
+        dag_id = dag_record['id']
+
+    # Get DAG status
+    status = await client.get_dag_status(dag_id)
+
+    # Verify status structure
+    assert 'dag_id' in status
+    assert 'name' in status
+    assert 'dag_state' in status
+    assert 'total_jobs' in status
+    assert status['dag_id'] == dag_id
+    assert status['name'] == "status-test"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_dag(client, clean_db, pool):
+    """Test wait_for_dag() delegates correctly - covers lines 1373-1374."""
+    # Create and execute a simple DAG
+    dag = client.dag(name="wait-test")
+    node = dag.add("test.WaitJob", kwargs={"data": "test"})
+    node_to_job = await client.execute_dag(dag)
+
+    # Get DAG ID
+    async with pool.acquire() as conn:
+        dag_record = await conn.fetchrow("SELECT * FROM jorb_dag WHERE name = $1", "wait-test")
+        dag_id = dag_record['id']
+
+        # Complete the job immediately so wait doesn't actually wait
+        job_id = node_to_job[node]
+        await conn.execute("UPDATE jorb SET state = 'finished' WHERE id = $1", job_id)
+        await conn.execute("UPDATE jorb_dag SET dag_state = 'completed' WHERE id = $1", dag_id)
+
+    # Wait for DAG (should return immediately since it's completed)
+    result = await client.wait_for_dag(dag_id, timeout=5)
+
+    # Should return True since DAG is completed
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_get_job_result_with_dict_result(client, clean_db, pool):
+    """Test get_job_result() with dict result (not string) - covers line 748."""
+    from pyjobby.pj import STMTS
+
+    # Create and finish job with dict result (not JSON string)
+    job_id = await client.enqueue('test.DictResultJob', data='test')
+
+    async with pool.acquire() as conn:
+        await conn.execute(STMTS["claim"], 12345, "worker", "default", [], 1000)
+        await conn.execute(STMTS["run"], job_id)
+        # Store result as dict (JSON codec will handle it)
+        await conn.execute(
+            STMTS["finished"],
+            job_id,
+            {"status": "completed", "value": 999, "nested": {"key": "val"}}
+        )
+
+    # Get result - should return dict directly (line 748)
+    result = await client.get_job_result(job_id)
+
+    assert result is not None
+    assert isinstance(result, dict)
+    assert result['status'] == 'completed'
+    assert result['value'] == 999
+    assert result['nested']['key'] == 'val'
+
