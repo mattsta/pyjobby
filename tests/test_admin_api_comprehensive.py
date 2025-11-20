@@ -1037,6 +1037,90 @@ class TestAdminAPIScheduleManagement:
 
 
 # =============================================================================
+# ADDITIONAL COVERAGE TESTS
+# =============================================================================
+
+
+class TestAdminAPIAdditionalCoverage:
+    """Additional tests to achieve 90%+ coverage."""
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_filter_by_job_class(self, db_pool):
+        """Test listing jobs filtered by job_class (LIKE query)."""
+        api = AdminAPI(db_pool)
+
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+            """, 'EmailJob', {}, 'default', 'queued', 100)
+
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+            """, 'DataJob', {}, 'default', 'queued', 100)
+
+        jobs = await api.list_jobs(job_class='Email')
+
+        assert all('Email' in job['job_class'] for job in jobs)
+        assert not any('Data' in job['job_class'] for job in jobs)
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_filter_by_uid(self, db_pool):
+        """Test listing jobs filtered by uid."""
+        api = AdminAPI(db_pool)
+
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, uid)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            """, 'test.Job', {}, 'default', 'queued', 100, 12345)
+
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, uid)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            """, 'test.Job', {}, 'default', 'queued', 100, 67890)
+
+        jobs = await api.list_jobs(uid=12345)
+
+        assert all(job['uid'] == 12345 for job in jobs)
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_invalid_order_by(self, db_pool):
+        """Test that invalid order_by defaults to 'created'."""
+        api = AdminAPI(db_pool)
+
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+            """, 'test.Job', {}, 'default', 'queued', 100)
+
+        # Should not raise error - defaults to 'created'
+        jobs = await api.list_jobs(order_by='invalid_column')
+        assert isinstance(jobs, list)
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_with_job_class_and_uid(self, db_pool):
+        """Test listing jobs with both job_class and uid filters."""
+        api = AdminAPI(db_pool)
+
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, uid)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            """, 'EmailJob', {}, 'default', 'queued', 100, 12345)
+
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, uid)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            """, 'DataJob', {}, 'default', 'queued', 100, 12345)
+
+        jobs = await api.list_jobs(job_class='Email', uid=12345)
+
+        assert all('Email' in job['job_class'] and job['uid'] == 12345 for job in jobs)
+
+# =============================================================================
 # COMPREHENSIVE SUMMARY
 # =============================================================================
 
