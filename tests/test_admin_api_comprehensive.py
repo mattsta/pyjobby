@@ -1120,6 +1120,161 @@ class TestAdminAPIAdditionalCoverage:
 
         assert all('Email' in job['job_class'] and job['uid'] == 12345 for job in jobs)
 
+    @pytest.mark.asyncio
+    async def test_get_schedule_history_basic(self, db_pool):
+        """Test getting schedule execution history."""
+        # Create a schedule
+        async with db_pool.acquire() as conn:
+            schedule_id = await conn.fetchval("""
+                INSERT INTO jorb_schedule (
+                    name, job_class, cron_expr, queue, prio, kwargs, enabled, next_run
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                RETURNING id
+            """, 'log-test-schedule', 'test.Job', '* * * * *', 'default', 100, {}, True)
+
+            # Add some execution logs
+            await conn.execute("""
+                INSERT INTO jorb_schedule_log (schedule_id, schedule_name, scheduled_time, result, duration_ms)
+                VALUES ($1, 'log-test-schedule', NOW() - INTERVAL '1 hour', 'success', 100)
+            """, schedule_id)
+
+            await conn.execute("""
+                INSERT INTO jorb_schedule_log (schedule_id, schedule_name, scheduled_time, result, duration_ms)
+                VALUES ($1, 'log-test-schedule', NOW() - INTERVAL '30 minutes', 'failure', 50)
+            """, schedule_id)
+
+            # Get history using AdminAPI with connection
+            api = AdminAPI(conn)
+            logs = await api.get_schedule_history(schedule_id)
+
+            assert len(logs) >= 2
+            assert all(log['schedule_id'] == schedule_id for log in logs)
+
+    @pytest.mark.asyncio
+    async def test_get_schedule_history_with_filter(self, db_pool):
+        """Test getting schedule history with result filter."""
+        async with db_pool.acquire() as conn:
+            schedule_id = await conn.fetchval("""
+                INSERT INTO jorb_schedule (
+                    name, job_class, cron_expr, queue, prio, kwargs, enabled, next_run
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                RETURNING id
+            """, 'filter-test-schedule', 'test.Job', '* * * * *', 'default', 100, {}, True)
+
+            # Add success and failure logs
+            await conn.execute("""
+                INSERT INTO jorb_schedule_log (schedule_id, schedule_name, scheduled_time, result, duration_ms)
+                VALUES ($1, 'filter-test-schedule', NOW(), 'success', 100),
+                       ($1, 'filter-test-schedule', NOW(), 'failure', 50)
+            """, schedule_id)
+
+            # Filter for only success
+            api = AdminAPI(conn)
+            logs = await api.get_schedule_history(schedule_id, result_filter='success')
+
+            assert all(log['result'] == 'success' for log in logs)
+
+    @pytest.mark.asyncio
+    async def test_get_schedule_history_pagination(self, db_pool):
+        """Test schedule history pagination."""
+        async with db_pool.acquire() as conn:
+            schedule_id = await conn.fetchval("""
+                INSERT INTO jorb_schedule (
+                    name, job_class, cron_expr, queue, prio, kwargs, enabled, next_run
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                RETURNING id
+            """, 'pagination-schedule', 'test.Job', '* * * * *', 'default', 100, {}, True)
+
+            # Add multiple logs
+            for i in range(5):
+                await conn.execute("""
+                    INSERT INTO jorb_schedule_log (schedule_id, schedule_name, scheduled_time, result, duration_ms)
+                    VALUES ($1, 'pagination-schedule', NOW() - INTERVAL '1 hour' * $2, 'success', 100)
+                """, schedule_id, i)
+
+            api = AdminAPI(conn)
+
+            # Get with limit
+            logs = await api.get_schedule_history(schedule_id, limit=2)
+
+            assert len(logs) == 2
+
+            # Get with offset
+            logs_offset = await api.get_schedule_history(schedule_id, limit=2, offset=2)
+
+            assert len(logs_offset) == 2
+            # Should be different logs
+            assert logs[0]['id'] != logs_offset[0]['id']
+
+    @pytest.mark.asyncio
+    async def test_get_schedule_stats_basic(self, db_pool):
+        """Test getting schedule statistics."""
+        # Create schedules with execution history
+        async with db_pool.acquire() as conn:
+            schedule_id1 = await conn.fetchval("""
+                INSERT INTO jorb_schedule (
+                    name, job_class, cron_expr, queue, prio, kwargs, enabled, next_run,
+                    run_count, success_count, failure_count, skip_count, consecutive_failures
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), 10, 8, 2, 0, 0)
+                RETURNING id
+            """, 'stats-schedule-1', 'test.Job1', '* * * * *', 'default', 100, {}, True)
+
+            schedule_id2 = await conn.fetchval("""
+                INSERT INTO jorb_schedule (
+                    name, job_class, cron_expr, queue, prio, kwargs, enabled, next_run,
+                    run_count, success_count, failure_count, skip_count, consecutive_failures
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), 5, 5, 0, 0, 0)
+                RETURNING id
+            """, 'stats-schedule-2', 'test.Job2', '0 * * * *', 'default', 100, {}, True)
+
+            # Get stats using AdminAPI with connection
+            api = AdminAPI(conn)
+            stats = await api.get_schedule_stats()
+
+            assert len(stats) >= 2
+
+            # Find our schedules in stats
+            schedule1_stats = next((s for s in stats if s['name'] == 'stats-schedule-1'), None)
+            schedule2_stats = next((s for s in stats if s['name'] == 'stats-schedule-2'), None)
+
+            assert schedule1_stats is not None
+            assert schedule1_stats['run_count'] == 10
+            assert schedule1_stats['success_count'] == 8
+            assert schedule1_stats['failure_count'] == 2
+            assert schedule1_stats['success_rate_pct'] == 80.0  # 8/10 * 100
+
+            assert schedule2_stats is not None
+            assert schedule2_stats['run_count'] == 5
+            assert schedule2_stats['success_count'] == 5
+            assert schedule2_stats['success_rate_pct'] == 100.0  # 5/5 * 100
+
+    @pytest.mark.asyncio
+    async def test_get_schedule_stats_null_success_rate(self, db_pool):
+        """Test schedule stats with no executions (NULL success rate)."""
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO jorb_schedule (
+                    name, job_class, cron_expr, queue, prio, kwargs, enabled, next_run,
+                    run_count, success_count, failure_count
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), 0, 0, 0)
+            """, 'no-exec-schedule', 'test.Job', '* * * * *', 'default', 100, {}, True)
+
+            api = AdminAPI(conn)
+            stats = await api.get_schedule_stats()
+
+            # Find the schedule with no executions
+            no_exec_stats = next((s for s in stats if s['name'] == 'no-exec-schedule'), None)
+
+            assert no_exec_stats is not None
+            assert no_exec_stats['run_count'] == 0
+            assert no_exec_stats['success_rate_pct'] is None  # NULL when no executions
+
 
 # =============================================================================
 # ERROR PATH TESTS
