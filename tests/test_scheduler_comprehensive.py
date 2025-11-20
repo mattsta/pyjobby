@@ -1116,3 +1116,309 @@ class TestSchedulerIntegration:
             # Verify next_run has timezone info
             assert schedule['next_run'] is not None
             assert schedule['timezone'] == "America/New_York"
+
+
+# =============================================================================
+# Edge Cases and Integration Tests for Remaining Coverage
+# =============================================================================
+
+@pytest.mark.asyncio
+class TestSchedulerEdgeCases:
+    """Tests for edge cases and remaining uncovered code paths."""
+
+    async def test_duplicate_skip_with_infailed_transaction_error(self, db_pool, client):
+        """Test InFailedSQLTransactionError handling in duplicate skip - covers lines 707-714."""
+        import asyncpg
+        from unittest.mock import AsyncMock, patch
+
+        async with db_pool.acquire() as conn:
+            manager = ScheduleManager(conn)
+
+            # Create schedule
+            schedule_id = await manager.create_schedule(
+                name="duplicate-skip-test",
+                job_class="test.DuplicateJob",
+                cron_expr="* * * * *"
+            )
+
+            # Make it due
+            await conn.execute("""
+                UPDATE jorb_schedule
+                SET next_run = $1
+                WHERE id = $2
+            """, datetime.utcnow() - timedelta(minutes=1), schedule_id)
+
+            # Get the schedule
+            schedule = await conn.fetchrow("SELECT * FROM jorb_schedule WHERE id = $1", schedule_id)
+
+            worker = SchedulerWorker(conn)
+
+            # Pre-create job with deadline_key to trigger duplicate
+            scheduled_time = schedule['next_run']
+            deadline_key = f"schedule:{schedule_id}:{scheduled_time.isoformat()}"
+
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, deadline_key)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            """, 'test.DuplicateJob', {}, 'default', 'queued', 100, deadline_key)
+
+            # Mock record_execution_skip to raise InFailedSQLTransactionError
+            original_record = worker.manager.record_execution_skip
+            call_count = [0]
+
+            async def mock_record_skip(*args, **kwargs):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    # First call raises InFailedSQLTransactionError
+                    raise asyncpg.InFailedSQLTransactionError("Transaction aborted")
+                return await original_record(*args, **kwargs)
+
+            with patch.object(worker.manager, 'record_execution_skip', side_effect=mock_record_skip):
+                # Execute schedule - should handle duplicate and InFailedSQLTransactionError
+                result = await worker.execute_schedule(dict(schedule))
+
+                # Should return skipped with duplicate reason
+                assert result.result == 'skipped'
+                assert result.skip_reason == 'duplicate'
+
+                # Verify the exception was caught and handled gracefully
+                assert call_count[0] == 1  # Mock was called once
+
+
+@pytest.mark.asyncio
+class TestSchedulerMainLoop:
+    """Integration tests for the main scheduler run() loop - covers lines 743-803."""
+
+    async def test_run_loop_executes_due_schedules(self, db_pool):
+        """Test run() loop finds and executes due schedules - covers main loop lines."""
+        async with db_pool.acquire() as conn:
+            manager = ScheduleManager(conn)
+
+            # Create schedule due now
+            schedule_id = await manager.create_schedule(
+                name="loop-test",
+                job_class="test.LoopJob",
+                cron_expr="* * * * *"
+            )
+
+            # Make it due
+            await conn.execute("""
+                UPDATE jorb_schedule
+                SET next_run = $1
+                WHERE id = $2
+            """, datetime.utcnow() - timedelta(minutes=1), schedule_id)
+
+            # Create worker with short poll interval
+            worker = SchedulerWorker(conn, poll_interval=0.1)
+
+            # Run scheduler in background for a short time
+            import asyncio
+            run_task = asyncio.create_task(worker.run())
+
+            # Let it run for 0.5 seconds (enough for 1-2 poll cycles)
+            await asyncio.sleep(0.5)
+
+            # Stop the worker
+            worker.stop()
+
+            # Wait for it to finish
+            try:
+                await asyncio.wait_for(run_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                run_task.cancel()
+                try:
+                    await run_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Verify schedule was executed
+            schedule = await conn.fetchrow("SELECT * FROM jorb_schedule WHERE id = $1", schedule_id)
+            assert schedule['run_count'] >= 1  # Should have run at least once
+
+            # Verify job was created
+            job = await conn.fetchrow("""
+                SELECT * FROM jorb
+                WHERE job_class = 'test.LoopJob'
+                ORDER BY created DESC
+                LIMIT 1
+            """)
+            assert job is not None
+
+            # Verify metrics were tracked
+            assert worker.executions_total >= 1
+            assert worker.successes_total >= 1
+
+    async def test_run_loop_handles_exceptions_gracefully(self, db_pool):
+        """Test run() loop handles exceptions in schedule execution - covers exception paths."""
+        from unittest.mock import patch
+
+        async with db_pool.acquire() as conn:
+            manager = ScheduleManager(conn)
+
+            # Create schedule
+            schedule_id = await manager.create_schedule(
+                name="exception-test",
+                job_class="test.ExceptionJob",
+                cron_expr="* * * * *"
+            )
+
+            # Make it due
+            await conn.execute("""
+                UPDATE jorb_schedule
+                SET next_run = $1
+                WHERE id = $2
+            """, datetime.utcnow() - timedelta(minutes=1), schedule_id)
+
+            worker = SchedulerWorker(conn, poll_interval=0.1)
+
+            # Mock execute_schedule to raise an exception on first call
+            original_execute = worker.execute_schedule
+            call_count = [0]
+
+            async def mock_execute(schedule):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    raise RuntimeError("Simulated execution error")
+                # After first exception, return success to allow loop to continue
+                return ScheduleExecutionResult(result='success', job_id=999)
+
+            with patch.object(worker, 'execute_schedule', side_effect=mock_execute):
+                # Run scheduler
+                import asyncio
+                run_task = asyncio.create_task(worker.run())
+
+                # Let it run briefly
+                await asyncio.sleep(0.5)
+
+                # Stop it
+                worker.stop()
+
+                try:
+                    await asyncio.wait_for(run_task, timeout=2.0)
+                except asyncio.TimeoutError:
+                    run_task.cancel()
+                    try:
+                        await run_task
+                    except asyncio.CancelledError:
+                        pass
+
+                # Verify exception was logged but loop continued
+                # Worker should have called execute at least once
+                assert call_count[0] >= 1
+
+    async def test_run_loop_updates_metrics_every_10_executions(self, db_pool):
+        """Test run() loop logs metrics every 10 executions - covers lines 788-794."""
+        async with db_pool.acquire() as conn:
+            manager = ScheduleManager(conn)
+
+            # Create 10 schedules all due now
+            schedule_ids = []
+            for i in range(10):
+                schedule_id = await manager.create_schedule(
+                    name=f"metrics-test-{i}",
+                    job_class=f"test.MetricsJob{i}",
+                    cron_expr="* * * * *"
+                )
+                schedule_ids.append(schedule_id)
+
+                # Make them all due
+                await conn.execute("""
+                    UPDATE jorb_schedule
+                    SET next_run = $1
+                    WHERE id = $2
+                """, datetime.utcnow() - timedelta(minutes=1), schedule_id)
+
+            worker = SchedulerWorker(conn, poll_interval=0.1)
+
+            # Run scheduler
+            import asyncio
+            run_task = asyncio.create_task(worker.run())
+
+            # Let it run long enough to process all 10 schedules
+            await asyncio.sleep(2.0)
+
+            # Stop it
+            worker.stop()
+
+            try:
+                await asyncio.wait_for(run_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                run_task.cancel()
+                try:
+                    await run_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Verify metrics tracking
+            assert worker.executions_total >= 10
+            assert worker.successes_total >= 10
+
+            # Verify all schedules were updated
+            for schedule_id in schedule_ids:
+                schedule = await conn.fetchrow("SELECT run_count FROM jorb_schedule WHERE id = $1", schedule_id)
+                assert schedule['run_count'] >= 1
+
+    async def test_run_loop_main_exception_handler(self, db_pool):
+        """Test run() loop handles main loop exceptions - covers lines 799-801."""
+        from unittest.mock import patch
+
+        async with db_pool.acquire() as conn:
+            worker = SchedulerWorker(conn, poll_interval=0.1)
+
+            # Mock find_due_schedules to raise exception on first call
+            original_find = worker.find_due_schedules
+            call_count = [0]
+
+            async def mock_find():
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    raise RuntimeError("Simulated main loop error")
+                # After first error, return empty list to continue gracefully
+                return []
+
+            with patch.object(worker, 'find_due_schedules', side_effect=mock_find):
+                # Run scheduler
+                import asyncio
+                run_task = asyncio.create_task(worker.run())
+
+                # Let it run briefly (should hit error, sleep 10s, then continue)
+                await asyncio.sleep(0.5)
+
+                # Stop it
+                worker.stop()
+
+                try:
+                    await asyncio.wait_for(run_task, timeout=2.0)
+                except asyncio.TimeoutError:
+                    run_task.cancel()
+                    try:
+                        await run_task
+                    except asyncio.CancelledError:
+                        pass
+
+                # Verify exception was handled - find_due_schedules was called
+                assert call_count[0] >= 1
+
+    async def test_run_loop_graceful_shutdown(self, db_pool):
+        """Test run() loop stops gracefully when stop() is called - covers lines 747, 803."""
+        async with db_pool.acquire() as conn:
+            worker = SchedulerWorker(conn, poll_interval=0.5)
+
+            # Start the worker
+            import asyncio
+            run_task = asyncio.create_task(worker.run())
+
+            # Let it start up
+            await asyncio.sleep(0.1)
+
+            # Request stop
+            worker.stop()
+
+            # Should finish within reasonable time
+            try:
+                await asyncio.wait_for(run_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                pytest.fail("Worker did not stop within timeout")
+
+            # Verify stop was logged (worker completed gracefully)
+            assert worker.stop_requested is True
