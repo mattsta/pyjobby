@@ -688,6 +688,236 @@ class TestJobClassLoading:
 
 
 # =============================================================================
+# Job Rescheduling and Retry Strategy Tests
+# =============================================================================
+
+@pytest.mark.asyncio
+class TestJobRescheduling:
+    """Tests for job rescheduling and retry backoff strategies."""
+
+    async def test_reschedule_seconds(self, db_pool, worker_id, db_params):
+        """Test reschedule() with seconds interval - covers lines 773-783."""
+        import asyncio
+        from datetime import timedelta
+
+        # Create system and job
+        system = JobSystem(
+            dsn=db_params,
+            qname="default",
+            capabilities=("test",),
+            workerId=worker_id,
+        )
+        await system.prepare()
+
+        # Create a test job
+        async with db_pool.acquire() as conn:
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
+            """, 'test.Job', {}, 'default', 'queued', 100)
+
+            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+
+        # Create Job instance
+        job_class = Job(s=system, job=dict(job))
+
+        # Reschedule 300 seconds in the future
+        interval = await job_class.reschedule(300, "seconds")
+
+        assert interval == timedelta(seconds=300)
+
+        # Verify job was updated in database
+        async with db_pool.acquire() as conn:
+            updated_job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+            # run_after should be ~300 seconds in the future
+            assert updated_job['run_after'] is not None
+
+        await system.cxn.close()
+
+    async def test_reschedule_with_custom_deltas(self, db_pool, worker_id, db_params):
+        """Test reschedule() with custom delta dict - covers lines 773-783."""
+        from datetime import timedelta
+
+        system = JobSystem(
+            dsn=db_params,
+            qname="default",
+            capabilities=("test",),
+            workerId=worker_id,
+        )
+        await system.prepare()
+
+        async with db_pool.acquire() as conn:
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
+            """, 'test.Job', {}, 'default', 'queued', 100)
+
+            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+
+        job_class = Job(s=system, job=dict(job))
+
+        # Reschedule with complex delta: 1 day + 2 hours + 30 minutes
+        interval = await job_class.reschedule(
+            0,  # relative is ignored when deltas provided
+            deltas={"days": 1, "hours": 2, "minutes": 30}
+        )
+
+        expected = timedelta(days=1, hours=2, minutes=30)
+        assert interval == expected
+
+        await system.cxn.close()
+
+    async def test_reschedule_backoff_with_retry_strategy(self, db_pool, worker_id, db_params):
+        """Test rescheduleBackoff() uses retry strategies - covers lines 743-752."""
+        from datetime import timedelta
+
+        system = JobSystem(
+            dsn=db_params,
+            qname="default",
+            capabilities=("test",),
+            workerId=worker_id,
+        )
+        await system.prepare()
+
+        # Create job with exponential retry strategy
+        async with db_pool.acquire() as conn:
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (
+                    job_class, kwargs, queue, state, prio, error_count,
+                    admin_data
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id
+            """, 'test.Job', {}, 'default', 'crashed', 100, 3,
+                {"retry_strategy": "exponential", "retry_base_seconds": 2})
+
+            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+
+        job_class = Job(s=system, job=dict(job))
+
+        # Reschedule with backoff for attempt 3 (exponential: 2^3 = 8 seconds)
+        interval = await job_class.rescheduleBackoff(attempt=3)
+
+        # Exponential with base 2: 2^3 = 8 seconds
+        assert interval == timedelta(seconds=8)
+
+        await system.cxn.close()
+
+    async def test_reschedule_backoff_uses_error_count(self, db_pool, worker_id, db_params):
+        """Test rescheduleBackoff() defaults to job error_count - covers lines 745-746."""
+        from datetime import timedelta
+
+        system = JobSystem(
+            dsn=db_params,
+            qname="default",
+            capabilities=("test",),
+            workerId=worker_id,
+        )
+        await system.prepare()
+
+        # Create job with error_count=5 and linear retry
+        async with db_pool.acquire() as conn:
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (
+                    job_class, kwargs, queue, state, prio, error_count,
+                    admin_data
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id
+            """, 'test.Job', {}, 'default', 'crashed', 100, 5,
+                {"retry_strategy": "linear", "retry_base_seconds": 10})
+
+            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+
+        job_class = Job(s=system, job=dict(job))
+
+        # Reschedule with backoff (should use error_count=5)
+        # Linear: base * attempt = 10 * 5 = 50 seconds
+        interval = await job_class.rescheduleBackoff()
+
+        assert interval == timedelta(seconds=50)
+
+        await system.cxn.close()
+
+
+# =============================================================================
+# JobClass Execution Tests
+# =============================================================================
+
+@pytest.mark.asyncio
+class TestJobClassExecution:
+    """Tests for JobClass.run() method."""
+
+    async def test_job_class_run_calls_task(self, db_pool, worker_id, db_params):
+        """Test JobClass.run() calls task() with kwargs - covers line 725."""
+        system = JobSystem(
+            dsn=db_params,
+            qname="default",
+            capabilities=("test",),
+            workerId=worker_id,
+        )
+        await system.prepare()
+
+        # Create job with kwargs
+        async with db_pool.acquire() as conn:
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
+            """, 'test.Job', {"arg1": "value1", "arg2": 42}, 'default', 'queued', 100)
+
+            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+
+        # Create a test Job subclass
+        class TestJob(Job):
+            def task(self, **kwargs):
+                # Return kwargs to verify they were passed
+                return kwargs
+
+        job_class = TestJob(s=system, job=dict(job))
+
+        # Call run() - should call task() with kwargs
+        result = job_class.run()
+
+        assert result == {"arg1": "value1", "arg2": 42}
+
+        await system.cxn.close()
+
+    async def test_job_class_run_with_empty_kwargs(self, db_pool, worker_id, db_params):
+        """Test JobClass.run() with empty kwargs - covers line 725."""
+        system = JobSystem(
+            dsn=db_params,
+            qname="default",
+            capabilities=("test",),
+            workerId=worker_id,
+        )
+        await system.prepare()
+
+        async with db_pool.acquire() as conn:
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
+            """, 'test.Job', {}, 'default', 'queued', 100)
+
+            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+
+        class TestJob(Job):
+            def task(self, **kwargs):
+                return "executed"
+
+        job_class = TestJob(s=system, job=dict(job))
+
+        result = job_class.run()
+
+        assert result == "executed"
+
+        await system.cxn.close()
+
+
+# =============================================================================
 # COMPREHENSIVE SUMMARY
 # =============================================================================
 
