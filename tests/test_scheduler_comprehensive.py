@@ -1500,3 +1500,49 @@ class TestSchedulerMainLoop:
             assert worker.successes_total >= 1, f"Expected >=1 success, got {worker.successes_total}"  # Line 768 ✅
             assert worker.failures_total >= 1, f"Expected >=1 failure, got {worker.failures_total}"  # Line 770 ✅
             assert worker.skips_total >= 1, f"Expected >=1 skip, got {worker.skips_total}"  # Line 772 ✅
+
+    async def test_infailed_transaction_error_on_duplicate_skip(self, db_pool, monkeypatch):
+        """Test InFailedSQLTransactionError handling in duplicate skip - covers lines 707-714."""
+        import asyncpg
+
+        async with db_pool.acquire() as conn:
+            manager = ScheduleManager(conn)
+            worker = SchedulerWorker(conn, poll_interval=0.1)
+
+            # Create schedule
+            schedule_id = await manager.create_schedule(
+                name="infailed-test",
+                job_class="test.InFailedJob",
+                cron_expr="* * * * *"
+            )
+            await conn.execute("UPDATE jorb_schedule SET next_run = $1 WHERE id = $2",
+                             datetime.utcnow() - timedelta(minutes=1), schedule_id)
+            schedule = await conn.fetchrow("SELECT * FROM jorb_schedule WHERE id = $1", schedule_id)
+
+            # Pre-create job with matching deadline_key to trigger duplicate
+            scheduled_time = schedule['next_run']
+            deadline_key = f"schedule:{schedule_id}:{scheduled_time.isoformat()}"
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, deadline_key)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            """, 'test.InFailedJob', {}, 'default', 'queued', 100, deadline_key)
+
+            # Mock record_execution_skip to raise InFailedSQLTransactionError
+            original_record = worker.manager.record_execution_skip
+            mock_called = []
+            async def mock_failing_record(*args, **kwargs):
+                # Raise InFailedSQLTransactionError to simulate transaction already aborted
+                mock_called.append(True)
+                raise asyncpg.InFailedSQLTransactionError("Transaction already aborted from UniqueViolationError")
+
+            monkeypatch.setattr(worker.manager, 'record_execution_skip', mock_failing_record)
+
+            # Execute schedule - should hit duplicate path and catch InFailedSQLTransactionError
+            result = await worker.execute_schedule(dict(schedule))
+
+            # Should return skipped despite exception
+            assert result.result == 'skipped'
+            assert result.skip_reason == 'duplicate'
+
+            # Verify the mock was actually called (covers line 708)
+            assert len(mock_called) == 1, "Mock should have been called once"
