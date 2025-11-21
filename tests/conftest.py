@@ -120,6 +120,7 @@ async def _cleanup_database(db_params: dict[str, str]) -> None:
     Clean all test data from database.
 
     This is called BEFORE each test to ensure a clean slate.
+    Creates a fresh connection to avoid event loop issues.
     """
     conn = await asyncpg.connect(**db_params)
     try:
@@ -188,10 +189,8 @@ async def ensure_clean_database(request, db_params: dict[str, str]):
         await _cleanup_database(db_params)
 
     yield
-
-    # Clean AFTER for safety in sequential mode
-    if needs_cleanup:
-        await _cleanup_database(db_params)
+    # NOTE: No post-test cleanup - reduces connections by 50%
+    # Pre-test cleanup is sufficient for isolation
 
 
 # ============================================================================
