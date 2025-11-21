@@ -12,6 +12,7 @@ Coverage Target: Drive pj.py from 44% to 70%+
 import pytest
 import asyncio
 import asyncpg
+import uuid
 from datetime import datetime, timedelta
 import time
 import os
@@ -450,9 +451,12 @@ class TestWorkerExceptionHandling:
     @pytest.mark.asyncio
     async def test_worker_handles_exception_with_retry(self, db_pool, db_params):
         """Test worker handles exception and creates retry job."""
+        # Use unique queue name to avoid interference
+        test_queue = f'exception_retry_{uuid.uuid4().hex[:8]}'
+
         async with db_pool.acquire() as conn:
             # Clean database
-            await conn.execute("DELETE FROM jorb WHERE job_class LIKE 'tests.test_pj_worker_run_loop.%'")
+            await conn.execute("DELETE FROM jorb")
 
             # Create failing job with retry
             job_id = await conn.fetchval("""
@@ -462,13 +466,13 @@ class TestWorkerExceptionHandling:
                 RETURNING id
             """, 'tests.test_pj_worker_run_loop.FailingTestJob',
                 {},
-                'default', 'queued', 100,
+                test_queue, 'queued', 100,
                 {'max_retries': 3, 'retry_strategy': 'exponential'})
 
         # Create and run worker
         system = JobSystem(
             dsn=db_params,
-            qname='default',
+            qname=test_queue,
             capabilities=('std',),
             workerId=6,
             checkInterval=0.1,
@@ -494,14 +498,15 @@ class TestWorkerExceptionHandling:
             assert 'Test error for retry' in original_job['error_message']
             assert 'Traceback' in (original_job['error_backtrace'] or '')
 
-            # Check retry job exists
+            # Check retry job exists (in the same unique queue)
             retry_jobs = await conn.fetch("""
                 SELECT * FROM jorb
                 WHERE job_class = 'tests.test_pj_worker_run_loop.FailingTestJob'
+                AND queue = $1
                 AND state = 'queued'
                 AND error_count = 1
-            """)
-            assert len(retry_jobs) >= 1
+            """, test_queue)
+            assert len(retry_jobs) >= 1, f"Expected retry job in queue {test_queue}"
 
     @pytest.mark.asyncio
     async def test_worker_stops_retry_after_max_attempts(self, db_pool, db_params):
@@ -604,32 +609,36 @@ class TestWorkerRunLoopEdgeCases:
     @pytest.mark.asyncio
     async def test_worker_respects_queue_filter(self, db_pool, db_params):
         """Test worker only processes jobs from specified queues."""
+        # Use unique queue names to avoid interference with other tests
+        queue_a = f'queue_a_{uuid.uuid4().hex[:8]}'
+        queue_b = f'queue_b_{uuid.uuid4().hex[:8]}'
+
         async with db_pool.acquire() as conn:
             # Clean database
             await conn.execute("DELETE FROM jorb")
 
-            # Create job in 'default' queue
-            job_id_default = await conn.fetchval("""
+            # Create job in queue_a
+            job_id_a = await conn.fetchval("""
                 INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
                 VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
                 RETURNING id
             """, 'tests.test_pj_worker_run_loop.QuickJob',
-                {'value': 'default'},
-                'default', 'queued', 100)
+                {'value': 'queue_a'},
+                queue_a, 'queued', 100)
 
-            # Create job in 'high' queue
-            job_id_high = await conn.fetchval("""
+            # Create job in queue_b (different queue)
+            job_id_b = await conn.fetchval("""
                 INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
                 VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
                 RETURNING id
             """, 'tests.test_pj_worker_run_loop.QuickJob',
-                {'value': 'high'},
-                'high', 'queued', 100)
+                {'value': 'queue_b'},
+                queue_b, 'queued', 100)
 
-        # Create worker that only processes 'default' queue
+        # Create worker that only processes queue_a (not queue_b)
         system = JobSystem(
             dsn=db_params,
-            qname='default',  # Only 'default', not 'high'
+            qname=queue_a,  # Only queue_a, not queue_b
             capabilities=('std',),
             workerId=9,
             checkInterval=0.1,
@@ -648,13 +657,13 @@ class TestWorkerRunLoopEdgeCases:
         except asyncio.TimeoutError:
             pass
 
-        # Verify only default queue job was processed
+        # Verify only queue_a job was processed
         async with db_pool.acquire() as conn:
-            default_job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id_default)
-            high_job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id_high)
+            job_a = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id_a)
+            job_b = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id_b)
 
-            assert default_job['state'] == 'finished'
-            assert high_job['state'] == 'queued'  # Not processed!
+            assert job_a['state'] == 'finished', f"queue_a job should be finished, got {job_a['state']}"
+            assert job_b['state'] == 'queued', f"queue_b job should not be processed, got {job_b['state']}"
 
     @pytest.mark.asyncio
     async def test_worker_processes_async_generator_job(self, db_pool, db_params):
