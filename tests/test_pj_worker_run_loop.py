@@ -17,7 +17,6 @@ import time
 import os
 import signal
 from typing import Any
-import orjson
 
 from pyjobby.pj import JobSystem, Job, STMTS
 
@@ -83,13 +82,13 @@ class TestWorkerRunLoop:
             # Clean database
             await conn.execute("DELETE FROM jorb")
 
-            # Create a job with properly encoded JSON kwargs
+            # Create a job - let asyncpg handle JSON encoding
             job_id = await conn.fetchval("""
                 INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2::jsonb, $3, $4, $5, NOW(), NOW())
+                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
                 RETURNING id
             """, 'tests.test_pj_worker_run_loop.QuickJob',
-                orjson.dumps({'value': 'test1'}).decode('utf-8'),
+                {'value': 'test1'},
                 'default', 'queued', 100)
 
         # Create worker
@@ -139,7 +138,8 @@ class TestWorkerRunLoop:
                     INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
                     VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
                     RETURNING id
-                """, 'tests.test_pj_worker_run_loop.QuickJob', {'value': f'job{i}'},
+                """, 'tests.test_pj_worker_run_loop.QuickJob',
+                    {'value': f'job{i}'},
                     'default', 'queued', 100)
                 job_ids.append(job_id)
 
@@ -188,7 +188,8 @@ class TestWorkerRunLoop:
                 INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
                 VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
                 RETURNING id
-            """, 'tests.test_pj_worker_run_loop.AsyncQuickJob', {'value': 'async_test'},
+            """, 'tests.test_pj_worker_run_loop.AsyncQuickJob',
+                {'value': 'async_test'},
                 'default', 'queued', 100)
 
         # Create and run worker
@@ -240,7 +241,8 @@ class TestWorkerTimeoutHandling:
                                  admin_data)
                 VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), $6)
                 RETURNING id
-            """, 'tests.test_pj_worker_run_loop.TimeoutTestJob', {},
+            """, 'tests.test_pj_worker_run_loop.TimeoutTestJob',
+                {},
                 'default', 'queued', 100,
                 {'timeout_seconds': 1, 'on_timeout': 'retry', 'max_retries': 3})
 
@@ -294,7 +296,8 @@ class TestWorkerTimeoutHandling:
                                  admin_data)
                 VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), $6)
                 RETURNING id
-            """, 'tests.test_pj_worker_run_loop.TimeoutTestJob', {},
+            """, 'tests.test_pj_worker_run_loop.TimeoutTestJob',
+                {},
                 'default', 'queued', 100,
                 {'timeout_seconds': 1, 'on_timeout': 'fail', 'max_retries': 3})
 
@@ -355,7 +358,8 @@ class TestWorkerExceptionHandling:
                                  admin_data)
                 VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), $6)
                 RETURNING id
-            """, 'tests.test_pj_worker_run_loop.FailingTestJob', {},
+            """, 'tests.test_pj_worker_run_loop.FailingTestJob',
+                {},
                 'default', 'queued', 100,
                 {'max_retries': 3, 'retry_strategy': 'exponential'})
 
@@ -410,7 +414,8 @@ class TestWorkerExceptionHandling:
                                  error_count, admin_data)
                 VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), $6, $7)
                 RETURNING id
-            """, 'tests.test_pj_worker_run_loop.FailingTestJob', {},
+            """, 'tests.test_pj_worker_run_loop.FailingTestJob',
+                {},
                 'default', 'queued', 100, 2,  # Already failed twice
                 {'max_retries': 3})
 
@@ -506,7 +511,8 @@ class TestWorkerRunLoopEdgeCases:
                 INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
                 VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
                 RETURNING id
-            """, 'tests.test_pj_worker_run_loop.QuickJob', {'value': 'default'},
+            """, 'tests.test_pj_worker_run_loop.QuickJob',
+                {'value': 'default'},
                 'default', 'queued', 100)
 
             # Create job in 'high' queue
@@ -514,14 +520,15 @@ class TestWorkerRunLoopEdgeCases:
                 INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
                 VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
                 RETURNING id
-            """, 'tests.test_pj_worker_run_loop.QuickJob', {'value': 'high'},
+            """, 'tests.test_pj_worker_run_loop.QuickJob',
+                {'value': 'high'},
                 'high', 'queued', 100)
 
         # Create worker that only processes 'default' queue
         system = JobSystem(
             dsn=db_params,
-            qname=['default'],  # Only 'default', not 'high'
-            capabilities=['std'],
+            qname='default',  # Only 'default', not 'high'
+            capabilities=('std',),
             workerId=9,
             checkInterval=0.1,
             webPort=None
@@ -559,7 +566,8 @@ class TestWorkerRunLoopEdgeCases:
                 INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
                 VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
                 RETURNING id
-            """, 'tests.test_pj_worker_run_loop.AsyncGenJob', {},
+            """, 'tests.test_pj_worker_run_loop.AsyncGenJob',
+                {},
                 'default', 'queued', 100)
 
         # Create and run worker

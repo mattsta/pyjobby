@@ -448,6 +448,9 @@ class JobSystem:
         await self.cxn.set_type_codec(
             "json", encoder=orjson_encoder, decoder=orjson.loads, schema="pg_catalog"
         )
+        await self.cxn.set_type_codec(
+            "jsonb", encoder=orjson_encoder, decoder=orjson.loads, schema="pg_catalog"
+        )
 
         # even though the asyncpg adapter will cache statements as they are run,
         # manually preparing all statements before use also validates all SQL is
