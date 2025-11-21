@@ -1090,3 +1090,142 @@ class TestJobReschedule:
             # Job finishes because it returned a result after calling reschedule()
             assert job['state'] == 'finished', f"Job should finish, got: {job['state']}"
             assert job['result'] == 'rescheduled_with_deltas'
+
+
+# ============================================================================
+# Test Job Recovery
+# ============================================================================
+
+class TestJobRecovery:
+    """Test abandoned job recovery on worker startup - covers lines 338-364."""
+
+    @pytest.mark.asyncio
+    async def test_recover_abandoned_jobs_disabled(self, db_pool, db_params):
+        """Test recovery when enable_recovery=False - covers lines 338-339."""
+        async with db_pool.acquire() as conn:
+            # Clean database
+            await conn.execute("DELETE FROM jorb")
+
+            # Create an abandoned job (claimed but old)
+            await conn.execute("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
+                                 worker_host, worker_pid)
+                VALUES ($1, $2, $3, $4, $5, NOW() - INTERVAL '10 minutes',
+                        NOW() - INTERVAL '10 minutes', $6, $7)
+            """, 'tests.test_pj_worker_run_loop.QuickJob',
+                {},
+                'default', 'claimed', 100, 'test-node', 12345)
+
+        # Create worker with recovery DISABLED
+        system = JobSystem(
+            dsn=db_params,
+            qname='default',
+            capabilities=('std',),
+            workerId=400,
+            checkInterval=0.1,
+            webPort=None,
+            enable_recovery=False  # DISABLE recovery
+        )
+
+        # Call recovery method
+        recovered = await system.recover_abandoned_jobs()
+
+        # Should return empty list when disabled
+        assert recovered == [], f"Should return empty list when recovery disabled, got: {recovered}"
+
+    @pytest.mark.asyncio
+    async def test_recover_abandoned_jobs_with_worker_startup(self, db_pool, db_params):
+        """Test recovery of abandoned jobs when worker starts - covers lines 346-359, 362-364."""
+        async with db_pool.acquire() as conn:
+            # Clean database
+            await conn.execute("DELETE FROM jorb")
+
+            # Create abandoned jobs (claimed/running but old) on a specific node
+            job1_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
+                                 worker_host, worker_pid)
+                VALUES ($1, $2, $3, $4, $5, NOW() - INTERVAL '10 minutes',
+                        NOW() - INTERVAL '10 minutes', $6, $7)
+                RETURNING id
+            """, 'tests.test_pj_worker_run_loop.QuickJob',
+                {},
+                'default', 'claimed', 100, 'abandoned-host', 999)
+
+            job2_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
+                                 worker_host, worker_pid)
+                VALUES ($1, $2, $3, $4, $5, NOW() - INTERVAL '10 minutes',
+                        NOW() - INTERVAL '10 minutes', $6, $7)
+                RETURNING id
+            """, 'tests.test_pj_worker_run_loop.QuickJob',
+                {},
+                'default', 'running', 100, 'abandoned-host', 999)
+
+        # Create worker with recovery ENABLED on the SAME host
+        system = JobSystem(
+            dsn=db_params,
+            qname='default',
+            capabilities=('std',),
+            workerId=401,
+            checkInterval=0.1,
+            webPort=None,
+            enable_recovery=True,
+            recovery_timeout=300  # Jobs older than 5 minutes get recovered
+        )
+
+        # Set node to match the abandoned jobs
+        system.node = 'abandoned-host'
+
+        # Start worker briefly (which triggers recovery in its run() method)
+        async def run_worker():
+            await asyncio.wait_for(system.run(), timeout=0.5)
+
+        worker_task = asyncio.create_task(run_worker())
+        await asyncio.sleep(0.2)  # Let worker start and run recovery
+        system.stop = True
+
+        try:
+            await worker_task
+        except asyncio.TimeoutError:
+            pass
+
+        # Verify jobs were recovered (moved back to queued)
+        async with db_pool.acquire() as conn:
+            job1 = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job1_id)
+            job2 = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job2_id)
+
+            # Jobs should be recovered to queued state
+            # NOTE: They might have been processed already, so we check they're not in claimed/running
+            assert job1['state'] in ('queued', 'finished'), f"Job 1 should be recovered, got: {job1['state']}"
+            assert job2['state'] in ('queued', 'finished'), f"Job 2 should be recovered, got: {job2['state']}"
+
+
+# ============================================================================
+# Test Shutdown Handler
+# ============================================================================
+
+class TestShutdownHandler:
+    """Test graceful shutdown signal handler - covers lines 326-327."""
+
+    @pytest.mark.asyncio
+    async def test_shutdown_sets_stop_flag(self, db_pool, db_params):
+        """Test shutdown() signal handler sets stop flag - covers lines 326-327."""
+        # Create worker
+        system = JobSystem(
+            dsn=db_params,
+            qname='default',
+            capabilities=('std',),
+            workerId=500,
+            checkInterval=0.1,
+            webPort=None
+        )
+
+        # Initially stop should be False
+        assert system.stop == False, "Stop flag should be False initially"
+
+        # Call shutdown handler (simulating SIGTERM)
+        import signal
+        system.shutdown(signal.SIGTERM, None)
+
+        # Stop flag should now be True
+        assert system.stop == True, "Stop flag should be True after shutdown()"
