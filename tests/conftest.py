@@ -138,11 +138,22 @@ async def ensure_clean_database(request, db_params: dict[str, str]):
     """
     Ensure database is clean BEFORE each test runs.
 
-    This is the key to test isolation - each test starts with a clean slate.
-    Runs automatically for every test function.
+    For sequential execution: Clean database before each test
+    For parallel execution: Skip cleanup, rely on unique names per test
+
+    This fixture detects if running under pytest-xdist and adjusts behavior.
     """
-    # Skip for tests that use db_connection (transaction-based isolation)
-    # Those tests don't need cleanup as transactions are rolled back
+    # Check if running with pytest-xdist (parallel)
+    # If PYTEST_XDIST_WORKER is set, we're in a worker process
+    is_parallel = os.environ.get('PYTEST_XDIST_WORKER') is not None
+
+    if is_parallel:
+        # In parallel mode, DON'T clean the whole database
+        # Tests should use unique names (test_id, unique_queue fixtures)
+        yield
+        return
+
+    # Sequential mode: clean database for isolation
     test_file = str(request.fspath)
 
     # List of test files that use db_pool (need cleanup)
@@ -178,7 +189,7 @@ async def ensure_clean_database(request, db_params: dict[str, str]):
 
     yield
 
-    # Optional: Also clean AFTER for extra safety
+    # Clean AFTER for safety in sequential mode
     if needs_cleanup:
         await _cleanup_database(db_params)
 
