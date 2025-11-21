@@ -229,7 +229,6 @@ class TestWorkerTimeoutHandling:
     """Test timeout handling within the run() loop."""
 
     @pytest.mark.asyncio
-    @pytest.mark.skip(reason="WIP: Timing-dependent test - worker needs more time to claim/timeout job")
     async def test_worker_handles_job_timeout_with_retry(self, db_pool, db_params):
         """Test worker handles timeout and creates retry job."""
         async with db_pool.acquire() as conn:
@@ -261,7 +260,34 @@ class TestWorkerTimeoutHandling:
             await asyncio.wait_for(system.run(), timeout=6.0)
 
         worker_task = asyncio.create_task(run_worker())
-        await asyncio.sleep(3.5)  # Wait for job to be claimed, timeout, and retry created
+
+        # Give worker time to claim and start processing job
+        await asyncio.sleep(0.5)
+
+        # Check job state after 0.5s (should be claimed or running)
+        async with db_pool.acquire() as conn:
+            job_after_claim = await conn.fetchrow("SELECT id, state, error_count FROM jorb WHERE id = $1", job_id)
+            print(f"\nAfter 0.5s: Job {job_after_claim['id']}, state={job_after_claim['state']}, error_count={job_after_claim['error_count']}")
+
+        # Wait for timeout to occur (job has 1s timeout, sleeps 10s)
+        await asyncio.sleep(1.2)  # Just past 1s timeout
+
+        # Check job state right after timeout
+        async with db_pool.acquire() as conn:
+            job_after_timeout = await conn.fetchrow("SELECT id, state, error_count, error_message FROM jorb WHERE id = $1", job_id)
+            print(f"After 1.7s (just after timeout): Job {job_after_timeout['id']}, state={job_after_timeout['state']}, error_count={job_after_timeout['error_count']}")
+            print(f"  error_message={job_after_timeout['error_message']}")
+
+            # Also check if any retry jobs exist yet
+            all_jobs = await conn.fetch("SELECT id, state, error_count FROM jorb ORDER BY id")
+            print(f"  Total jobs in system: {len(all_jobs)}")
+            for j in all_jobs:
+                print(f"    Job {j['id']}: state={j['state']}, error_count={j['error_count']}")
+
+        # Wait a bit more for retry creation
+        await asyncio.sleep(0.5)
+
+        # Now stop the worker
         system.stop = True
 
         try:
@@ -272,17 +298,22 @@ class TestWorkerTimeoutHandling:
         # Verify original job crashed and retry was created
         async with db_pool.acquire() as conn:
             original_job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-            assert original_job['state'] == 'crashed'
+
+            assert original_job['state'] == 'crashed', f"Expected 'crashed' but got '{original_job['state']}'"
             assert 'timed out' in original_job['error_message'].lower()
 
-            # Check retry job was created
+            # Check retry job(s) were created
+            # The retry job should have parent_job_id set in admin_data
             retry_jobs = await conn.fetch("""
                 SELECT * FROM jorb
                 WHERE job_class = 'tests.test_pj_worker_run_loop.TimeoutTestJob'
-                AND state = 'queued'
-                AND error_count = 1
+                AND admin_data ? 'parent_job_id'
             """)
-            assert len(retry_jobs) >= 1
+            assert len(retry_jobs) >= 1, f"Expected at least one retry job, found {len(retry_jobs)}"
+
+            # Verify that the original job is the parent
+            retry_parent_id = retry_jobs[0]['admin_data']['parent_job_id']
+            assert retry_parent_id == job_id, f"Retry job parent should be {job_id}, got {retry_parent_id}"
 
     @pytest.mark.asyncio
     async def test_worker_handles_timeout_with_fail(self, db_pool, db_params):
@@ -347,7 +378,6 @@ class TestWorkerExceptionHandling:
     """Test exception handling and retry logic in run() loop."""
 
     @pytest.mark.asyncio
-    @pytest.mark.skip(reason="WIP: Timing-dependent test - retry job creation needs verification")
     async def test_worker_handles_exception_with_retry(self, db_pool, db_params):
         """Test worker handles exception and creates retry job."""
         async with db_pool.acquire() as conn:
@@ -557,7 +587,6 @@ class TestWorkerRunLoopEdgeCases:
             assert high_job['state'] == 'queued'  # Not processed!
 
     @pytest.mark.asyncio
-    @pytest.mark.skip(reason="WIP: Async generator result serialization needs investigation")
     async def test_worker_processes_async_generator_job(self, db_pool, db_params):
         """Test worker can handle async generator jobs."""
         async with db_pool.acquire() as conn:

@@ -170,7 +170,8 @@ STMTS[
                 timeout_at = NULL,
                 finished = TIMEZONE('utc', clock_timestamp()),
                 updated = TIMEZONE('utc', clock_timestamp())
-              WHERE id = $1"""
+              WHERE id = $1
+          RETURNING *"""
 
 STMTS[
     "reschedule"
@@ -531,7 +532,7 @@ class JobSystem:
 
                 # Phase 2: Extract timeout from admin_data or use class attribute or default
                 admin_data = job.get("admin_data") or {}
-                job_timeout = admin_data.get("timeout_seconds")
+                job_timeout = admin_data.get("timeout_seconds") if isinstance(admin_data, dict) else None
                 if job_timeout is None:
                     job_timeout = getattr(klass, 'timeout', self.default_timeout)
 
@@ -615,7 +616,7 @@ class JobSystem:
                 # Retry or fail based on on_timeout configuration
                 current_error_count = job.get("error_count", 0) + 1
                 if on_timeout == "retry" and klass and current_error_count < max_retries:
-                    rescheduleFor = await klass.rescheduleBackoff(current_error_count)
+                    rescheduleFor = await klass.rescheduleBackoff(job, current_error_count)
                     retry_job_id = await self.stmts["create-retry"].fetchval(
                         job["id"],
                         rescheduleFor,
@@ -666,7 +667,7 @@ class JobSystem:
                 # This preserves the crashed job as audit trail
                 current_error_count = job.get("error_count", 0) + 1
                 if klass and current_error_count < max_retries:
-                    rescheduleFor = await klass.rescheduleBackoff(current_error_count)
+                    rescheduleFor = await klass.rescheduleBackoff(job, current_error_count)
 
                     # Create a NEW job for retry (separate row)
                     retry_job_id = await self.stmts["create-retry"].fetchval(
@@ -725,13 +726,13 @@ class Job:
         Subclasses can override 'run' if it needs to be async."""
         return self.task(**self.job["kwargs"])
 
-    def rescheduleBackoff(
-        self, attempt: Optional[int] = None
-    ) -> Awaitable[datetime.timedelta]:
-        """Reschedule using configurable retry strategy from admin_data.
+    @classmethod
+    async def rescheduleBackoff(
+        cls, job: dict, attempt: Optional[int] = None
+    ) -> datetime.timedelta:
+        """Calculate retry delay using configurable retry strategy from admin_data.
 
-        Returns a coroutine which returns amount of time before job runs
-        again as a timedelta.
+        Returns a timedelta for when the job should be retried.
 
         If no 'attempt' count is given, use the current job's error_count.
 
@@ -740,17 +741,20 @@ class Job:
         - linear: 1s, 2s, 3s, 4s, 5s...
         - fibonacci: 1s, 1s, 2s, 3s, 5s, 8s...
         - fixed (legacy): quadratic backoff
+
+        NOTE: This method only CALCULATES the delay. It does NOT update the database.
+        The caller is responsible for using the returned timedelta in database updates.
         """
         from .retry_strategies import calculate_retry_from_job
 
         if attempt is None:
-            attempt = self.job["error_count"]
+            attempt = job.get("error_count", 0)
 
         # Use Phase 2 retry strategies if configured
-        retry_delay = calculate_retry_from_job(self.job, attempt)
+        retry_delay = calculate_retry_from_job(job, attempt)
 
-        # Return the interval as timedelta
-        return self.reschedule(retry_delay.total_seconds(), "seconds")
+        # Return the interval as timedelta (do NOT call reschedule() which would UPDATE the database!)
+        return retry_delay
 
     async def reschedule(
         self,
