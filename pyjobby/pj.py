@@ -616,8 +616,7 @@ class JobSystem:
                 current_error_count = job.get("error_count", 0) + 1
                 if on_timeout == "retry" and klass and current_error_count < max_retries:
                     rescheduleFor = await klass.rescheduleBackoff(current_error_count)
-                    retry_job_id = await self.cxn.fetchval(
-                        self.stmts["create-retry"],
+                    retry_job_id = await self.stmts["create-retry"].fetchval(
                         job["id"],
                         rescheduleFor,
                         current_error_count
@@ -670,8 +669,7 @@ class JobSystem:
                     rescheduleFor = await klass.rescheduleBackoff(current_error_count)
 
                     # Create a NEW job for retry (separate row)
-                    retry_job_id = await self.cxn.fetchval(
-                        self.stmts["create-retry"],
+                    retry_job_id = await self.stmts["create-retry"].fetchval(
                         job["id"],
                         rescheduleFor,
                         current_error_count
