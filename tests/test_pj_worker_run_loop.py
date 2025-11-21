@@ -1229,3 +1229,115 @@ class TestShutdownHandler:
 
         # Stop flag should now be True
         assert system.stop == True, "Stop flag should be True after shutdown()"
+
+
+# ============================================================================
+# Test Web Handler
+# ============================================================================
+
+class WebEnabledJob(Job):
+    """Job that has a web() method for handling HTTP requests."""
+    @classmethod
+    def web(cls, request):
+        from aiohttp import web as aiohttp_web
+        return aiohttp_web.Response(text="web_job_response")
+
+
+class AsyncWebEnabledJob(Job):
+    """Job that has an async web() method."""
+    @classmethod
+    async def web(cls, request):
+        from aiohttp import web as aiohttp_web
+        await asyncio.sleep(0.01)  # Simulate async work
+        return aiohttp_web.Response(text="async_web_job_response")
+
+
+class TestWebHandler:
+    """Test web handler functionality - covers lines 367-379."""
+
+    @pytest.mark.asyncio
+    async def test_web_handler_sync_response(self, db_pool, db_params):
+        """Test webHandler with sync web() method - covers lines 367-377."""
+        from aiohttp import web
+        from aiohttp.test_utils import make_mocked_request
+        
+        # Create worker with webPort configured
+        system = JobSystem(
+            dsn=db_params,
+            qname='default',
+            capabilities=('std',),
+            workerId=600,
+            checkInterval=0.1,
+            webPort={
+                "paths": {"tests.test_pj_worker_run_loop.WebEnabledJob"},
+                "sites": []
+            }
+        )
+
+        # Create mock request
+        request = make_mocked_request('GET', '/tests.test_pj_worker_run_loop.WebEnabledJob')
+
+        # Call webHandler directly
+        response = await system.webHandler(request)
+
+        # Verify response
+        assert response.status == 200
+        assert response.text == "web_job_response"
+
+    @pytest.mark.asyncio
+    async def test_web_handler_async_response(self, db_pool, db_params):
+        """Test webHandler with async web() method - covers lines 372-373."""
+        from aiohttp import web
+        from aiohttp.test_utils import make_mocked_request
+        
+        # Create worker with webPort configured
+        system = JobSystem(
+            dsn=db_params,
+            qname='default',
+            capabilities=('std',),
+            workerId=601,
+            checkInterval=0.1,
+            webPort={
+                "paths": {"tests.test_pj_worker_run_loop.AsyncWebEnabledJob"},
+                "sites": []
+            }
+        )
+
+        # Create mock request
+        request = make_mocked_request('GET', '/tests.test_pj_worker_run_loop.AsyncWebEnabledJob')
+
+        # Call webHandler directly
+        response = await system.webHandler(request)
+
+        # Verify response
+        assert response.status == 200
+        assert response.text == "async_web_job_response"
+
+    @pytest.mark.asyncio
+    async def test_web_handler_invalid_path(self, db_pool, db_params):
+        """Test webHandler with invalid path - covers line 379."""
+        from aiohttp import web
+        from aiohttp.test_utils import make_mocked_request
+        
+        # Create worker with webPort configured
+        system = JobSystem(
+            dsn=db_params,
+            qname='default',
+            capabilities=('std',),
+            workerId=602,
+            checkInterval=0.1,
+            webPort={
+                "paths": {"tests.test_pj_worker_run_loop.WebEnabledJob"},
+                "sites": []
+            }
+        )
+
+        # Create mock request for invalid path
+        request = make_mocked_request('GET', '/invalid.path.NotFound')
+
+        # Call webHandler directly
+        response = await system.webHandler(request)
+
+        # Verify "not so fast!" response
+        assert response.status == 200
+        assert response.text == "not so fast!"
