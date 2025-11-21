@@ -97,6 +97,31 @@ class DirectAsyncGenJob(Job):
         return gen()
 
 
+class AsyncGenJobWithTimeout(Job):
+    """Async generator job WITH timeout configured."""
+    timeout = 5  # 5 second timeout
+
+    async def task(self):
+        async def gen():
+            for i in range(3):
+                await asyncio.sleep(0.01)
+                yield f"item_{i}"
+        return gen()
+
+
+class DirectAsyncGenJobWithTimeout(Job):
+    """Job that directly returns async generator WITH timeout."""
+    timeout = 5  # 5 second timeout
+
+    def run(self):
+        """Override run() to return async generator directly."""
+        async def gen():
+            for i in range(2):
+                await asyncio.sleep(0.01)
+                yield f"direct_{i}"
+        return gen()
+
+
 # ============================================================================
 # Test Main run() Loop
 # ============================================================================
@@ -848,3 +873,101 @@ class TestRescheduleBackoffEdgeCases:
 
         # With exponential and attempt=1, should be 1 second (2^0 = 1)
         assert delay.total_seconds() == 1.0, f"Expected 1s for attempt=1, got {delay.total_seconds()}s"
+
+
+# ============================================================================
+# Test Async Generator WITH Timeout
+# ============================================================================
+
+class TestAsyncGeneratorWithTimeout:
+    """Test async generators WITH timeout configured - cover lines 566, 574."""
+
+    @pytest.mark.asyncio
+    async def test_async_generator_from_async_function_with_timeout(self, db_pool, db_params):
+        """Test async generator (from async function) WITH timeout - covers line 566."""
+        async with db_pool.acquire() as conn:
+            # Clean database
+            await conn.execute("DELETE FROM jorb")
+
+            # Create async generator job WITH timeout
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
+                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+                RETURNING id
+            """, 'tests.test_pj_worker_run_loop.AsyncGenJobWithTimeout',
+                {},
+                'default', 'queued', 100)
+
+        # Create and run worker
+        system = JobSystem(
+            dsn=db_params,
+            qname='default',
+            capabilities=('std',),
+            workerId=300,
+            checkInterval=0.1,
+            webPort=None
+        )
+
+        async def run_worker():
+            await asyncio.wait_for(system.run(), timeout=1.0)
+
+        worker_task = asyncio.create_task(run_worker())
+        await asyncio.sleep(0.3)
+        system.stop = True
+
+        try:
+            await worker_task
+        except asyncio.TimeoutError:
+            pass
+
+        # Verify job completed and collected generator
+        async with db_pool.acquire() as conn:
+            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+            assert job['state'] == 'finished', f"Job should finish, got: {job['state']}"
+            # Result should be list from collected generator
+            assert job['result'] == ['item_0', 'item_1', 'item_2']
+
+    @pytest.mark.asyncio
+    async def test_direct_async_generator_with_timeout(self, db_pool, db_params):
+        """Test direct async generator (not from async function) WITH timeout - covers line 574."""
+        async with db_pool.acquire() as conn:
+            # Clean database
+            await conn.execute("DELETE FROM jorb")
+
+            # Create job that directly returns async generator WITH timeout
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
+                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+                RETURNING id
+            """, 'tests.test_pj_worker_run_loop.DirectAsyncGenJobWithTimeout',
+                {},
+                'default', 'queued', 100)
+
+        # Create and run worker
+        system = JobSystem(
+            dsn=db_params,
+            qname='default',
+            capabilities=('std',),
+            workerId=301,
+            checkInterval=0.1,
+            webPort=None
+        )
+
+        async def run_worker():
+            await asyncio.wait_for(system.run(), timeout=1.0)
+
+        worker_task = asyncio.create_task(run_worker())
+        await asyncio.sleep(0.3)
+        system.stop = True
+
+        try:
+            await worker_task
+        except asyncio.TimeoutError:
+            pass
+
+        # Verify job completed and collected generator
+        async with db_pool.acquire() as conn:
+            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+            assert job['state'] == 'finished', f"Job should finish, got: {job['state']}"
+            # Result should be list from collected generator
+            assert job['result'] == ['direct_0', 'direct_1']
