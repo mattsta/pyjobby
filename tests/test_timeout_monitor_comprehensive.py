@@ -658,14 +658,8 @@ class TestJSONCodecInit:
         """Test that orjson encoder is actually used when encoding JSON data."""
         dsn = f"postgresql://{db_params['user']}:{db_params['password']}@{db_params['host']}:{db_params['port']}/{db_params['database']}"
 
-        # Create a timeout monitor which sets up the orjson encoder
-        monitor_task = asyncio.create_task(timeout_monitor(dsn, check_interval=999999))
-
-        # Let monitor initialize
-        await asyncio.sleep(0.3)
-
-        # Now create a job with JSON admin_data, which should use the encoder
-        # when the monitor queries it
+        # Create a job with JSON admin_data BEFORE starting monitor
+        # so monitor's first check will find it
         job_id = await client.enqueue(
             "test.Job",
             timeout_seconds=1,
@@ -681,7 +675,11 @@ class TestJSONCodecInit:
                 WHERE id = $1
             """, job_id)
 
-        # Give monitor time to process (this will query admin_data using the encoder)
+        # Now start the timeout monitor which will find and process the timed-out job
+        # on its first check (using the orjson encoder when querying admin_data)
+        monitor_task = asyncio.create_task(timeout_monitor(dsn, check_interval=999999))
+
+        # Give monitor time to initialize and process (first check runs immediately)
         await asyncio.sleep(0.5)
 
         # Cancel monitor
@@ -710,8 +708,17 @@ class TestCLI:
         dsn = f"postgresql://{db_params['user']}:{db_params['password']}@{db_params['host']}:{db_params['port']}/{db_params['database']}"
         test_argv = ['timeout-monitor', '--dsn', dsn]
 
+        # Mock that properly consumes the coroutine to avoid warnings
+        def mock_asyncio_run(coro):
+            """Mock that consumes coroutine to avoid 'unawaited coroutine' warnings."""
+            try:
+                coro.close()  # Properly close the coroutine
+            except (GeneratorExit, StopIteration):
+                pass  # Expected when closing coroutine
+            return None
+
         with patch('sys.argv', test_argv):
-            with patch('asyncio.run', return_value=None):  # Return None instead of mock
+            with patch('asyncio.run', side_effect=mock_asyncio_run):
                 try:
                     from pyjobby.timeout_monitor import cli
                     cli()
@@ -733,8 +740,17 @@ DB_PARAMS = {{
 """)
         test_argv = ['timeout-monitor', '--config', str(config_file)]
 
+        # Mock that properly consumes the coroutine to avoid warnings
+        def mock_asyncio_run(coro):
+            """Mock that consumes coroutine to avoid 'unawaited coroutine' warnings."""
+            try:
+                coro.close()  # Properly close the coroutine
+            except (GeneratorExit, StopIteration):
+                pass  # Expected when closing coroutine
+            return None
+
         with patch('sys.argv', test_argv):
-            with patch('asyncio.run', return_value=None):
+            with patch('asyncio.run', side_effect=mock_asyncio_run):
                 try:
                     from pyjobby.timeout_monitor import cli
                     cli()
