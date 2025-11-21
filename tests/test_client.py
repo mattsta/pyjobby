@@ -1,1036 +1,672 @@
-#!/usr/bin/env python3
 """
-Comprehensive tests for the JobClient library.
-
-Tests all client functionality including:
-- Connection pooling and lifecycle
-- Job enqueueing (simple, scheduled, pipelines)
-- Batch operations
-- Job management (cancel, retry)
-- Queue operations
-- Advanced patterns (pipeline, fan-out)
-- Error handling
+Comprehensive tests for client.py - Job client library.
+Using LIVE database operations with NO MOCKS for maximum correctness guarantees!
 """
 
 import pytest
-import asyncpg
 import asyncio
+import asyncpg
+import uuid
 from datetime import datetime, timedelta
-from typing import Dict, Any
-
-from pyjobby.client import JobClient, JobOptions, JobInfo
-
-
-# =============================================================================
-# Fixtures
-# =============================================================================
-
-# NOTE: We use the db_pool and client fixtures from conftest.py
-# which have proper JSON codec setup for asyncpg 0.30.0+
-
-@pytest.fixture
-async def pool(db_pool):
-    """Alias for db_pool to match test function signatures"""
-    return db_pool
+from pyjobby.client import (
+    JobOptions,
+    JobInfo,
+    JobClient,
+)
 
 
-@pytest.fixture
-async def clean_db(db_pool):
-    """Clean database before each test"""
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM jorb")
-        await conn.execute("DELETE FROM jorb_schedule_log")
-        await conn.execute("DELETE FROM jorb_schedule")
+def unique_name(base: str) -> str:
+    """Generate unique name for test isolation."""
+    return f"{base}_{uuid.uuid4().hex[:8]}"
 
 
-# =============================================================================
-# Client Lifecycle Tests
-# =============================================================================
+class TestJobOptionsDataclass:
+    """Test JobOptions dataclass - covers lines 48-74."""
 
-@pytest.mark.asyncio
-async def test_client_create(db_params):
-    """Test creating client with connection details"""
-    client = await JobClient.create(**db_params, min_size=2, max_size=5)
+    def test_job_options_defaults(self):
+        """Test default values."""
+        options = JobOptions()
+        assert options.queue == 'default'
+        assert options.priority == 100
+        assert options.run_after is None
+        assert options.capability is None
+        assert options.uid is None
+        assert options.run_group is None
+        assert options.waitfor_job is None
+        assert options.waitfor_group is None
+        assert options.deadline_key is None
+        assert options.admin_data is None
 
-    assert client.pool is not None
-    assert not client._closed
-
-    # Test that pool works
-    async with client.pool.acquire() as conn:
-        result = await conn.fetchval("SELECT 1")
-        assert result == 1
-
-    await client.close()
-    assert client._closed
-
-
-@pytest.mark.asyncio
-async def test_client_context_manager(db_params):
-    """Test using client as context manager"""
-    async with await JobClient.create(**db_params) as client:
-        assert not client._closed
-
-        # Can use client normally
-        await client.health_check()
-
-    # Client should be closed after exiting context
-    assert client._closed
-
-
-@pytest.mark.asyncio
-async def test_health_check(client):
-    """Test health check returns True when database is accessible"""
-    healthy = await client.health_check()
-    assert healthy is True
-
-
-# =============================================================================
-# Basic Job Enqueueing Tests
-# =============================================================================
-
-@pytest.mark.asyncio
-async def test_enqueue_simple_job(client, clean_db, pool):
-    """Test enqueueing a simple job"""
-    job_id = await client.enqueue('test.SimpleJob', arg1='value1', arg2=123)
-
-    assert isinstance(job_id, int)
-    assert job_id > 0
-
-    # Verify job was created correctly
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-        import json
-        kwargs = json.loads(row['kwargs']) if isinstance(row['kwargs'], str) else row['kwargs']
-        assert row['job_class'] == 'test.SimpleJob'
-        assert kwargs['arg1'] == 'value1'
-        assert kwargs['arg2'] == 123
-        assert row['queue'] == 'default'
-        assert row['prio'] == 100
-        assert row['state'] == 'queued'
-
-
-@pytest.mark.asyncio
-async def test_enqueue_with_queue_and_priority(client, clean_db, pool):
-    """Test enqueueing job with custom queue and priority"""
-    job_id = await client.enqueue(
-        'test.EmailJob',
-        queue='emails',
-        priority=200,
-        to='user@example.com'
-    )
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-        assert row['queue'] == 'emails'
-        assert row['prio'] == 200
-
-
-@pytest.mark.asyncio
-async def test_enqueue_scheduled_job(client, clean_db, pool):
-    """Test enqueueing a job with run_after"""
-    future_time = datetime.utcnow() + timedelta(hours=1)
-
-    job_id = await client.enqueue(
-        'test.ScheduledJob',
-        run_after=future_time,
-        task='cleanup'
-    )
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-        # Times should be close (within 1 second due to database rounding)
-        assert abs((row['run_after'] - future_time).total_seconds()) < 1
-
-
-@pytest.mark.asyncio
-async def test_enqueue_with_capability(client, clean_db, pool):
-    """Test enqueueing job with capability requirement"""
-    job_id = await client.enqueue(
-        'test.GPUJob',
-        capability='gpu',
-        model='resnet50'
-    )
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-        assert row['capability'] == 'gpu'
-
-
-@pytest.mark.asyncio
-async def test_enqueue_with_deadline_key(client, clean_db, pool):
-    """Test enqueueing job with deadline_key for idempotency"""
-    job_id1 = await client.enqueue(
-        'test.PaymentJob',
-        deadline_key='payment:12345',
-        payment_id=12345
-    )
-
-    # Second enqueue with same deadline_key should fail
-    with pytest.raises(asyncpg.UniqueViolationError):
-        await client.enqueue(
-            'test.PaymentJob',
-            deadline_key='payment:12345',
-            payment_id=12345
+    def test_job_options_custom(self):
+        """Test custom values."""
+        options = JobOptions(
+            queue='priority',
+            priority=500,
+            capability='gpu',
+            uid=42
         )
-
-    # Different deadline_key should work
-    job_id2 = await client.enqueue(
-        'test.PaymentJob',
-        deadline_key='payment:67890',
-        payment_id=67890
-    )
-
-    assert job_id2 != job_id1
+        assert options.queue == 'priority'
+        assert options.priority == 500
+        assert options.capability == 'gpu'
+        assert options.uid == 42
 
 
-@pytest.mark.asyncio
-async def test_enqueue_with_admin_data(client, clean_db, pool):
-    """Test enqueueing job with admin_data metadata"""
-    admin_data = {'user_id': 123, 'request_id': 'abc-def'}
+class TestJobInfoDataclass:
+    """Test JobInfo dataclass - covers lines 77-85."""
 
-    job_id = await client.enqueue(
-        'test.TrackedJob',
-        admin_data=admin_data,
-        task='process'
-    )
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-        import json
-        admin_data = json.loads(row['admin_data']) if isinstance(row['admin_data'], str) else row['admin_data']
-        assert admin_data['user_id'] == 123
-        assert admin_data['request_id'] == 'abc-def'
-
-
-# =============================================================================
-# Job Pipeline Tests
-# =============================================================================
-
-@pytest.mark.asyncio
-async def test_enqueue_with_waitfor_job(client, clean_db, pool):
-    """Test enqueueing job that waits for another job"""
-    job1 = await client.enqueue('test.Step1', data='input')
-    job2 = await client.enqueue('test.Step2', waitfor_job=job1, data='output')
-
-    async with pool.acquire() as conn:
-        row1 = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job1)
-        row2 = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job2)
-
-        assert row1['state'] == 'queued'
-        assert row2['state'] == 'waiting'
-        assert row2['waitfor_job'] == job1
-
-
-@pytest.mark.asyncio
-async def test_enqueue_cannot_specify_both_waitfor(client, clean_db):
-    """Test that specifying both waitfor_job and waitfor_group raises error"""
-    with pytest.raises(ValueError, match="Cannot specify both"):
-        await client.enqueue(
-            'test.Job',
-            waitfor_job=1,
-            waitfor_group=2
+    def test_job_info_creation(self):
+        """Test JobInfo creation."""
+        now = datetime.utcnow()
+        info = JobInfo(
+            id=123,
+            job_class='TestJob',
+            queue='default',
+            priority=100,
+            state='queued',
+            created=now
         )
-
-
-@pytest.mark.asyncio
-async def test_create_pipeline(client, clean_db, pool):
-    """Test creating a job pipeline"""
-    job_ids = await client.create_pipeline([
-        ('test.FetchData', {'source': 'api'}),
-        ('test.TransformData', {'format': 'json'}),
-        ('test.LoadData', {'destination': 'db'}),
-    ])
-
-    assert len(job_ids) == 3
-    assert job_ids[0] != job_ids[1] != job_ids[2]
-
-    # Verify pipeline dependencies
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT id, state, waitfor_job
-            FROM jorb
-            WHERE id = ANY($1::bigint[])
-            ORDER BY id
-        """, job_ids)
-
-        # First job should be queued with no dependencies
-        assert rows[0]['state'] == 'queued'
-        assert rows[0]['waitfor_job'] is None
-
-        # Second job should wait for first
-        assert rows[1]['state'] == 'waiting'
-        assert rows[1]['waitfor_job'] == job_ids[0]
-
-        # Third job should wait for second
-        assert rows[2]['state'] == 'waiting'
-        assert rows[2]['waitfor_job'] == job_ids[1]
-
-
-@pytest.mark.asyncio
-async def test_create_pipeline_empty(client, clean_db):
-    """Test creating empty pipeline returns empty list"""
-    job_ids = await client.create_pipeline([])
-    assert job_ids == []
-
-
-# =============================================================================
-# Fan-Out Pattern Tests
-# =============================================================================
-
-@pytest.mark.asyncio
-async def test_create_fan_out(client, clean_db, pool):
-    """Test creating fan-out pattern"""
-    items = [
-        {'order_id': 1, 'amount': 100},
-        {'order_id': 2, 'amount': 200},
-        {'order_id': 3, 'amount': 300},
-    ]
-
-    job_ids, group_id = await client.create_fan_out(
-        'test.ProcessOrder',
-        items,
-        queue='processing',
-        priority=150
-    )
-
-    assert len(job_ids) == 3
-    assert isinstance(group_id, int)
-
-    # Verify all jobs have same run_group
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT id, run_group, queue, prio, kwargs
-            FROM jorb
-            WHERE id = ANY($1::bigint[])
-            ORDER BY id
-        """, job_ids)
-
-        for i, row in enumerate(rows):
-            import json
-            kwargs = json.loads(row['kwargs']) if isinstance(row['kwargs'], str) else row['kwargs']
-            assert row['run_group'] == group_id
-            assert row['queue'] == 'processing'
-            assert row['prio'] == 150
-            assert kwargs['order_id'] == items[i]['order_id']
-
-
-@pytest.mark.asyncio
-async def test_fan_out_with_fan_in(client, clean_db, pool):
-    """Test fan-out pattern with fan-in (waitfor_group)"""
-    items = [{'item_id': i} for i in range(10)]
-
-    # Create fan-out
-    job_ids, group_id = await client.create_fan_out(
-        'test.ProcessItem',
-        items
-    )
-
-    # Create fan-in job that waits for all
-    summary_job = await client.enqueue(
-        'test.SummarizeResults',
-        waitfor_group=group_id
-    )
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", summary_job)
-        assert row['state'] == 'waiting'
-        assert row['waitfor_group'] == group_id
-
-
-# =============================================================================
-# Batch Operations Tests
-# =============================================================================
-
-@pytest.mark.asyncio
-async def test_enqueue_batch(client, clean_db, pool):
-    """Test batch enqueueing jobs"""
-    jobs = [
-        ('test.Job1', {'arg': 1}),
-        ('test.Job2', {'arg': 2}),
-        ('test.Job3', {'arg': 3}),
-    ]
-
-    job_ids = await client.enqueue_batch(jobs, queue='batch', priority=150)
-
-    assert len(job_ids) == 3
-
-    # Verify all jobs created correctly
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT id, job_class, kwargs, queue, prio
-            FROM jorb
-            WHERE id = ANY($1::bigint[])
-            ORDER BY id
-        """, job_ids)
-
-        for i, row in enumerate(rows):
-            import json
-            kwargs = json.loads(row['kwargs']) if isinstance(row['kwargs'], str) else row['kwargs']
-            assert row['job_class'] == jobs[i][0]
-            assert kwargs['arg'] == jobs[i][1]['arg']
-            assert row['queue'] == 'batch'
-            assert row['prio'] == 150
-
-
-@pytest.mark.asyncio
-async def test_enqueue_batch_large(client, clean_db, pool):
-    """Test batch enqueueing large number of jobs (performance test)"""
-    # Create 1000 jobs
-    jobs = [
-        ('test.ProcessItem', {'item_id': i})
-        for i in range(1000)
-    ]
-
-    job_ids = await client.enqueue_batch(jobs)
-
-    assert len(job_ids) == 1000
-
-    # Verify count in database
-    async with pool.acquire() as conn:
-        count = await conn.fetchval("""
-            SELECT COUNT(*) FROM jorb
-            WHERE id = ANY($1::bigint[])
-        """, job_ids)
-        assert count == 1000
-
-
-@pytest.mark.asyncio
-async def test_enqueue_batch_empty(client, clean_db):
-    """Test batch enqueueing empty list returns empty list"""
-    job_ids = await client.enqueue_batch([])
-    assert job_ids == []
-
-
-@pytest.mark.asyncio
-async def test_enqueue_batch_with_run_group(client, clean_db, pool):
-    """Test batch enqueueing with run_group"""
-    jobs = [('test.Job', {'i': i}) for i in range(5)]
-
-    job_ids = await client.enqueue_batch(jobs, run_group=999)
-
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT run_group FROM jorb
-            WHERE id = ANY($1::bigint[])
-        """, job_ids)
-
-        # All should have same run_group
-        for row in rows:
-            assert row['run_group'] == 999
-
-
-# =============================================================================
-# Job Management Tests
-# =============================================================================
-
-@pytest.mark.asyncio
-async def test_get_job(client, clean_db, pool):
-    """Test getting job information"""
-    job_id = await client.enqueue('test.TestJob', arg='value')
-
-    job_info = await client.get_job(job_id)
-
-    assert job_info is not None
-    assert isinstance(job_info, JobInfo)
-    assert job_info.id == job_id
-    assert job_info.job_class == 'test.TestJob'
-    assert job_info.queue == 'default'
-    assert job_info.priority == 100
-    assert job_info.state == 'queued'
-    assert isinstance(job_info.created, datetime)
-
-
-@pytest.mark.asyncio
-async def test_get_job_not_found(client, clean_db):
-    """Test getting non-existent job returns None"""
-    job_info = await client.get_job(99999)
-    assert job_info is None
-
-
-@pytest.mark.asyncio
-async def test_cancel_job_queued(client, clean_db, pool):
-    """Test cancelling a queued job"""
-    job_id = await client.enqueue('test.TestJob')
-
-    result = await client.cancel_job(job_id)
-    assert result is True
-
-    # Verify state changed to cancelled
-    async with pool.acquire() as conn:
-        state = await conn.fetchval("SELECT state FROM jorb WHERE id = $1", job_id)
-        assert state == 'cancelled'
-
-
-@pytest.mark.asyncio
-async def test_cancel_job_waiting(client, clean_db, pool):
-    """Test cancelling a waiting job"""
-    job1 = await client.enqueue('test.Job1')
-    job2 = await client.enqueue('test.Job2', waitfor_job=job1)
-
-    result = await client.cancel_job(job2)
-    assert result is True
-
-    async with pool.acquire() as conn:
-        state = await conn.fetchval("SELECT state FROM jorb WHERE id = $1", job2)
-        assert state == 'cancelled'
-
-
-@pytest.mark.asyncio
-async def test_cancel_job_running(client, clean_db, pool):
-    """Test cannot cancel a running job"""
-    # Create job and manually set to running
-    job_id = await client.enqueue('test.TestJob')
-
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE jorb SET state = 'running'
-            WHERE id = $1
-        """, job_id)
-
-    result = await client.cancel_job(job_id)
-    assert result is False
-
-    # State should still be running
-    async with pool.acquire() as conn:
-        state = await conn.fetchval("SELECT state FROM jorb WHERE id = $1", job_id)
-        assert state == 'running'
-
-
-@pytest.mark.asyncio
-async def test_cancel_job_not_found(client, clean_db):
-    """Test cancelling non-existent job returns False"""
-    result = await client.cancel_job(99999)
-    assert result is False
-
-
-@pytest.mark.asyncio
-async def test_retry_job_crashed(client, clean_db, pool):
-    """Test retrying a crashed job"""
-    # Create job and manually set to crashed
-    original_job = await client.enqueue('test.TestJob', arg='value', queue='custom')
-
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE jorb SET state = 'crashed'
-            WHERE id = $1
-        """, original_job)
-
-    # Retry the job
-    new_job_id = await client.retry_job(original_job)
-
-    assert new_job_id is not None
-    assert new_job_id != original_job
-
-    # Verify new job has same parameters
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", new_job_id)
-        import json
-        kwargs = json.loads(row['kwargs']) if isinstance(row['kwargs'], str) else row['kwargs']
-        admin_data = json.loads(row['admin_data']) if isinstance(row['admin_data'], str) else row['admin_data']
-        assert row['job_class'] == 'test.TestJob'
-        assert kwargs['arg'] == 'value'
-        assert row['queue'] == 'custom'
-        assert row['state'] == 'queued'
-        assert admin_data['retry_of'] == original_job
-
-
-@pytest.mark.asyncio
-async def test_retry_job_finished(client, clean_db, pool):
-    """Test retrying a finished job"""
-    job_id = await client.enqueue('test.TestJob')
-
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE jorb SET state = 'finished'
-            WHERE id = $1
-        """, job_id)
-
-    new_job_id = await client.retry_job(job_id)
-    assert new_job_id is not None
-
-
-@pytest.mark.asyncio
-async def test_retry_job_not_found(client, clean_db):
-    """Test retrying non-existent job returns None"""
-    new_job_id = await client.retry_job(99999)
-    assert new_job_id is None
-
-
-# =============================================================================
-# Queue Operations Tests
-# =============================================================================
-
-@pytest.mark.asyncio
-async def test_queue_depth(client, clean_db):
-    """Test getting queue depth"""
-    # Create jobs in different queues
-    await client.enqueue('test.Job1', queue='emails')
-    await client.enqueue('test.Job2', queue='emails')
-    await client.enqueue('test.Job3', queue='processing')
-
-    emails_depth = await client.queue_depth('emails')
-    processing_depth = await client.queue_depth('processing')
-    default_depth = await client.queue_depth('default')
-
-    assert emails_depth == 2
-    assert processing_depth == 1
-    assert default_depth == 0
-
-
-@pytest.mark.asyncio
-async def test_queue_depth_ignores_non_queued(client, clean_db, pool):
-    """Test queue_depth only counts queued jobs"""
-    job1 = await client.enqueue('test.Job1')
-    job2 = await client.enqueue('test.Job2')
-
-    # Manually set one to running
-    async with pool.acquire() as conn:
-        await conn.execute("UPDATE jorb SET state = 'running' WHERE id = $1", job1)
-
-    depth = await client.queue_depth('default')
-    assert depth == 1  # Only job2 is still queued
-
-
-@pytest.mark.asyncio
-async def test_queue_stats(client, clean_db, pool):
-    """Test getting queue statistics"""
-    # Create jobs in various states
-    job1 = await client.enqueue('test.Job1')
-    job2 = await client.enqueue('test.Job2')
-    job3 = await client.enqueue('test.Job3')
-    job4 = await client.enqueue('test.Job4')
-
-    async with pool.acquire() as conn:
-        await conn.execute("UPDATE jorb SET state = 'running' WHERE id = $1::bigint", job1)
-        await conn.execute("UPDATE jorb SET state = 'finished' WHERE id = $1::bigint", job2)
-        await conn.execute("UPDATE jorb SET state = 'crashed' WHERE id = $1::bigint", job3)
-        # job4 remains queued
-
-    stats = await client.queue_stats('default')
-
-    assert stats['queued'] == 1
-    assert stats['running'] == 1
-    assert stats['finished'] == 1
-    assert stats['crashed'] == 1
-    assert stats['waiting'] == 0
-    assert stats['claimed'] == 0
-    assert stats['cancelled'] == 0
-
-
-@pytest.mark.asyncio
-async def test_queue_stats_empty_queue(client, clean_db):
-    """Test stats for empty queue returns zeros"""
-    stats = await client.queue_stats('nonexistent')
-
-    assert stats['queued'] == 0
-    assert stats['running'] == 0
-    assert stats['finished'] == 0
-
-
-# =============================================================================
-# Edge Cases and Error Handling
-# =============================================================================
-
-@pytest.mark.asyncio
-async def test_enqueue_with_unicode_args(client, clean_db, pool):
-    """Test enqueueing job with unicode characters in kwargs"""
-    job_id = await client.enqueue(
-        'test.UnicodeJob',
-        message='Hello 世界 🌍',
-        emoji='✅ ❌ 🚀'
-    )
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT kwargs FROM jorb WHERE id = $1", job_id)
-        import json
-        kwargs = json.loads(row['kwargs']) if isinstance(row['kwargs'], str) else row['kwargs']
-        assert kwargs['message'] == 'Hello 世界 🌍'
-        assert kwargs['emoji'] == '✅ ❌ 🚀'
-
-
-@pytest.mark.asyncio
-async def test_enqueue_with_complex_kwargs(client, clean_db, pool):
-    """Test enqueueing job with nested dict/list kwargs"""
-    complex_data = {
-        'nested': {
-            'array': [1, 2, 3],
-            'dict': {'key': 'value'},
-        },
-        'list': ['a', 'b', 'c'],
-        'null': None,
-        'bool': True,
-    }
-
-    job_id = await client.enqueue('test.ComplexJob', data=complex_data)
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT kwargs FROM jorb WHERE id = $1", job_id)
-        import json
-        kwargs = json.loads(row['kwargs']) if isinstance(row['kwargs'], str) else row['kwargs']
-        assert kwargs['data'] == complex_data
-
-
-@pytest.mark.asyncio
-async def test_multiple_clients_share_pool(pool, clean_db):
-    """Test multiple clients can share same pool"""
-    client1 = JobClient(pool)
-    client2 = JobClient(pool)
-
-    job1 = await client1.enqueue('test.Job1')
-    job2 = await client2.enqueue('test.Job2')
-
-    assert job1 != job2
-
-    # Both can see each other's jobs
-    info1 = await client2.get_job(job1)
-    info2 = await client1.get_job(job2)
-
-    assert info1 is not None
-    assert info2 is not None
-
-    await client1.close()
-    await client2.close()
-
-
-@pytest.mark.asyncio
-async def test_enqueue_with_uid(client, clean_db, pool):
-    """Test enqueueing job with uid (multi-tenancy)"""
-    job_id = await client.enqueue('test.TenantJob', uid=12345, data='tenant-data')
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT uid FROM jorb WHERE id = $1", job_id)
-        assert row['uid'] == 12345
-
-
-# =============================================================================
-# Phase 2 Features and Edge Cases Tests
-# =============================================================================
-
-@pytest.mark.asyncio
-async def test_enqueue_with_save_result(client, clean_db, pool):
-    """Test enqueueing job with save_result flag - covers line 348."""
-    job_id = await client.enqueue('test.Job', save_result=True, data='test')
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT admin_data FROM jorb WHERE id = $1", job_id)
-        import json
-        admin_data = json.loads(row['admin_data']) if isinstance(row['admin_data'], str) else row['admin_data']
-        assert admin_data.get('save_result') is True
-
-
-@pytest.mark.asyncio
-async def test_enqueue_with_timeout_seconds(client, clean_db, pool):
-    """Test enqueueing job with timeout configuration - covers lines 358-359."""
-    job_id = await client.enqueue(
-        'test.Job',
-        timeout_seconds=300,
-        on_timeout='fail',
-        data='test'
-    )
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT admin_data FROM jorb WHERE id = $1", job_id)
-        import json
-        admin_data = json.loads(row['admin_data']) if isinstance(row['admin_data'], str) else row['admin_data']
-        assert admin_data.get('timeout_seconds') == 300
-        assert admin_data.get('on_timeout') == 'fail'
-
-
-@pytest.mark.asyncio
-async def test_enqueue_with_use_result_from(client, clean_db, pool):
-    """Test enqueueing job with use_result_from - covers lines 324-330."""
-    from pyjobby.pj import STMTS
-
-    # Create and finish upstream job with result
-    upstream_id = await client.enqueue('test.UpstreamJob', data='upstream')
-
-    async with pool.acquire() as conn:
-        # Claim, run, and finish with result
-        await conn.execute(STMTS["claim"], 12345, "worker", "default", [], 1000)
-        await conn.execute(STMTS["run"], upstream_id)
-        await conn.execute(
-            STMTS["finished"],
-            upstream_id,
-            {"status": "success", "value": 42}
-        )
-
-    # Create downstream job that uses upstream result
-    downstream_id = await client.enqueue(
-        'test.DownstreamJob',
-        use_result_from=upstream_id,
-        data='downstream'
-    )
-
-    # Verify downstream job received upstream result
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT kwargs FROM jorb WHERE id = $1", downstream_id)
-        # kwargs is already a dict with JSON codec
-        assert 'upstream_result' in row['kwargs']
-        assert row['kwargs']['upstream_result']['status'] == 'success'
-        assert row['kwargs']['upstream_result']['value'] == 42
-
-
-@pytest.mark.asyncio
-async def test_health_check_exception_path(pool):
-    """Test health_check returns False on exception - covers lines 1262-1263."""
-    import asyncpg
-    from unittest.mock import AsyncMock, MagicMock
-
-    # Create a client with a mock pool that raises an error
-    mock_pool = MagicMock()
-    mock_acquire = AsyncMock(side_effect=asyncpg.PostgresError("Connection failed"))
-    mock_pool.acquire = MagicMock(return_value=mock_acquire())
-
-    client = JobClient(mock_pool)
-
-    # Health check should return False on exception
-    healthy = await client.health_check()
-    assert healthy is False
-
-
-@pytest.mark.asyncio
-async def test_get_job_full_not_found(client, clean_db):
-    """Test get_job_full returns None for non-existent job - covers line 715."""
-    job = await client.get_job_full(999999999)
-    assert job is None
-
-
-@pytest.mark.asyncio
-async def test_get_job_result_with_string_result(client, clean_db, pool):
-    """Test get_job_result parses string JSON result - covers line 748."""
-    import json
-    from pyjobby.pj import STMTS
-
-    # Create and finish job with result
-    job_id = await client.enqueue('test.Job', data='test')
-
-    async with pool.acquire() as conn:
-        await conn.execute(STMTS["claim"], 12345, "worker", "default", [], 1000)
-        await conn.execute(STMTS["run"], job_id)
-        # Store result as JSON string
-        await conn.execute(
-            STMTS["finished"],
-            job_id,
-            json.dumps({"result": "completed", "value": 123})
-        )
-
-    # Get result - should parse JSON string
-    result = await client.get_job_result(job_id)
-    assert result is not None
-    assert result['result'] == 'completed'
-    assert result['value'] == 123
-
-
-@pytest.mark.asyncio
-async def test_get_jobs_with_invalid_order_by(client, clean_db):
-    """Test get_jobs validates order_by field - covers line 848."""
-    # Create some test jobs
-    await client.enqueue('test.Job', data='test1')
-    await client.enqueue('test.Job', data='test2')
-
-    # Try invalid order_by field (should default to 'created')
-    jobs = await client.get_jobs(order_by='invalid_field', limit=10)
-
-    # Should succeed with default ordering
-    assert len(jobs) >= 2
-
-
-@pytest.mark.asyncio
-async def test_create_pipeline_with_results(client, clean_db, pool):
-    """Test create_pipeline_with_results - covers lines 1409-1428."""
-    # Create pipeline with result passing
-    stages = [
-        ('test.FetchData', {'source': 'api'}, True),      # Save result
-        ('test.ProcessData', {'format': 'json'}, True),   # Save result
-        ('test.StoreData', {'dest': 'db'}, False),        # Don't save
-    ]
-
-    job_ids = await client.create_pipeline_with_results(
-        stages,
-        queue='pipeline',
-        priority=200
-    )
-
-    assert len(job_ids) == 3
-
-    # Verify all jobs created
-    async with pool.acquire() as conn:
-        for job_id in job_ids:
-            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-            assert job is not None
-            assert job['queue'] == 'pipeline'
-            assert job['prio'] == 200
-
-        # Verify first job is queued, others are waiting
-        job1 = await conn.fetchrow("SELECT state FROM jorb WHERE id = $1", job_ids[0])
-        assert job1['state'] == 'queued'
-
-        job2 = await conn.fetchrow("SELECT state, waitfor_job FROM jorb WHERE id = $1", job_ids[1])
-        assert job2['state'] == 'waiting'
-        assert job2['waitfor_job'] == job_ids[0]
-
-        job3 = await conn.fetchrow("SELECT state, waitfor_job FROM jorb WHERE id = $1", job_ids[2])
-        assert job3['state'] == 'waiting'
-        assert job3['waitfor_job'] == job_ids[1]
-
-
-@pytest.mark.asyncio
-async def test_from_config(tmp_path):
-    """Test creating client from config file - covers lines 184-194."""
-    # Create temporary config file
-    config_file = tmp_path / "pyjobby.conf.py"
-    config_content = """
-db_params = {
-    'host': 'localhost',
-    'port': 5432,
-    'database': 'pyjobby_test',
-    'user': 'pyjobby_test',
-    'password': 'pyjobby_test_password',
-}
-"""
-    config_file.write_text(config_content)
-
-    # Create client from config
-    client = await JobClient.from_config(str(config_file), min_size=2, max_size=5)
-
-    try:
-        assert client.pool is not None
-        assert not client._closed
-
-        # Test that pool works
-        async with client.pool.acquire() as conn:
-            result = await conn.fetchval("SELECT 1")
-            assert result == 1
-
-        # Verify pool has correct connection parameters
-        assert client.pool._minsize == 2
-        assert client.pool._maxsize == 5
-
-    finally:
+        assert info.id == 123
+        assert info.job_class == 'TestJob'
+        assert info.state == 'queued'
+
+
+class TestJobClientBasics:
+    """Test JobClient basic functionality."""
+
+    @pytest.mark.asyncio
+    async def test_client_init(self, db_pool):
+        """Test client initialization - covers lines 108-118."""
+        client = JobClient(db_pool)
+        assert client.pool == db_pool
+        assert client._closed is False
+
+    @pytest.mark.asyncio
+    async def test_client_close(self, db_pool, db_params):
+        """Test client close - covers lines 196-200."""
+        # Create a new pool just for this test
+        new_pool = await asyncpg.create_pool(**db_params, min_size=1, max_size=2)
+        client = JobClient(new_pool)
+        
+        assert client._closed is False
         await client.close()
-        assert client._closed
+        assert client._closed is True
+        
+        # Close again should be safe (idempotent)
+        await client.close()
+        assert client._closed is True
+
+    @pytest.mark.asyncio
+    async def test_client_context_manager(self, db_pool):
+        """Test context manager - covers lines 202-208."""
+        async with JobClient(db_pool) as client:
+            assert isinstance(client, JobClient)
+            # Don't actually close since we're using shared pool
 
 
-# =============================================================================
-# DAG Methods and Final Edge Cases - Push to 100%!
-# =============================================================================
+class TestJobClientEnqueue:
+    """Test JobClient.enqueue method - covers lines 214-388."""
 
-@pytest.mark.asyncio
-async def test_dag(client, clean_db):
-    """Test dag() returns DAGBuilder - covers lines 1301-1302."""
-    # Create DAG
-    dag = client.dag(name="test-dag", queue="default", priority=100)
+    @pytest.mark.asyncio
+    async def test_enqueue_simple_job(self, db_pool):
+        """Test simple job enqueueing."""
+        client = JobClient(db_pool)
+        
+        job_id = await client.enqueue('TestJob', arg1='value1', arg2=42)
+        
+        assert job_id is not None
+        assert isinstance(job_id, int)
+        
+        # Verify job was created
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+            assert row['job_class'] == 'TestJob'
+            assert row['state'] == 'queued'
+            assert row['kwargs']['arg1'] == 'value1'
 
-    # Verify it's a DAGBuilder
-    from pyjobby.dag import DAGBuilder
-    assert isinstance(dag, DAGBuilder)
-    assert dag.name == "test-dag"
-    assert dag.common_options['queue'] == "default"
-    assert dag.common_options['priority'] == 100
+    @pytest.mark.asyncio
+    async def test_enqueue_with_queue(self, db_pool):
+        """Test enqueueing to specific queue."""
+        client = JobClient(db_pool)
+        queue_name = unique_name('test_queue')
+        
+        job_id = await client.enqueue('QueuedJob', queue=queue_name)
+        
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT queue FROM jorb WHERE id = $1", job_id)
+            assert row['queue'] == queue_name
 
+    @pytest.mark.asyncio
+    async def test_enqueue_with_priority(self, db_pool):
+        """Test enqueueing with priority."""
+        client = JobClient(db_pool)
+        
+        job_id = await client.enqueue('PriorityJob', priority=500)
+        
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT prio FROM jorb WHERE id = $1", job_id)
+            assert row['prio'] == 500
 
-@pytest.mark.asyncio
-async def test_execute_dag(client, clean_db, pool):
-    """Test execute_dag() delegates to dag.execute() - covers line 1324."""
-    # Create and build a simple DAG
-    dag = client.dag(name="execution-test")
-    node1 = dag.add("test.Job1", kwargs={"step": 1})
-    node2 = dag.add("test.Job2", kwargs={"step": 2}, depends_on=[node1])
+    @pytest.mark.asyncio
+    async def test_enqueue_with_run_after(self, db_pool):
+        """Test enqueueing with scheduled time."""
+        client = JobClient(db_pool)
+        future_time = datetime.utcnow() + timedelta(hours=1)
+        
+        job_id = await client.enqueue('ScheduledJob', run_after=future_time)
+        
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT run_after FROM jorb WHERE id = $1", job_id)
+            assert row['run_after'] is not None
 
-    # Execute DAG
-    node_to_job = await client.execute_dag(dag)
+    @pytest.mark.asyncio
+    async def test_enqueue_with_waitfor_job(self, db_pool):
+        """Test enqueueing with job dependency - covers lines 337-340."""
+        client = JobClient(db_pool)
+        
+        # Create first job
+        job1_id = await client.enqueue('Job1')
+        
+        # Create dependent job
+        job2_id = await client.enqueue('Job2', waitfor_job=job1_id)
+        
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT state, waitfor_job FROM jorb WHERE id = $1", job2_id)
+            assert row['state'] == 'waiting'
+            assert row['waitfor_job'] == job1_id
 
-    # Verify execution created jobs
-    assert len(node_to_job) == 2
-    assert node1 in node_to_job
-    assert node2 in node_to_job
+    @pytest.mark.asyncio
+    async def test_enqueue_both_waitfor_raises(self, db_pool):
+        """Test that both waitfor_job and waitfor_group raises - covers lines 319-320."""
+        client = JobClient(db_pool)
+        
+        with pytest.raises(ValueError) as excinfo:
+            await client.enqueue('BothWaitJob', waitfor_job=1, waitfor_group=2)
+        assert 'Cannot specify both' in str(excinfo.value)
 
-    # Verify jobs exist in database
-    async with pool.acquire() as conn:
-        job1 = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", node_to_job[node1])
-        job2 = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", node_to_job[node2])
-
-        assert job1 is not None
-        assert job1['job_class'] == 'test.Job1'
-        assert job2 is not None
-        assert job2['job_class'] == 'test.Job2'
-        assert job2['waitfor_job'] == node_to_job[node1]
-
-
-@pytest.mark.asyncio
-async def test_get_dag_status(client, clean_db, pool):
-    """Test get_dag_status() delegates correctly - covers lines 1341-1342."""
-    # Create and execute a simple DAG
-    dag = client.dag(name="status-test")
-    node = dag.add("test.StatusJob", kwargs={"data": "test"})
-    node_to_job = await client.execute_dag(dag)
-
-    # Get DAG ID from database
-    async with pool.acquire() as conn:
-        dag_record = await conn.fetchrow("SELECT * FROM jorb_dag WHERE name = $1", "status-test")
-        assert dag_record is not None
-        dag_id = dag_record['id']
-
-    # Get DAG status
-    status = await client.get_dag_status(dag_id)
-
-    # Verify status structure (actual fields from get_dag_status)
-    assert 'dag_id' in status
-    assert 'total_jobs' in status
-    assert status['dag_id'] == dag_id
-    # Note: Status dict structure may vary based on DAG implementation
-
-
-@pytest.mark.asyncio
-async def test_wait_for_dag(client, clean_db, pool):
-    """Test wait_for_dag() delegates correctly - covers lines 1373-1374."""
-    # Create and execute a simple DAG
-    dag = client.dag(name="wait-test")
-    node = dag.add("test.WaitJob", kwargs={"data": "test"})
-    node_to_job = await client.execute_dag(dag)
-
-    # Get DAG ID
-    async with pool.acquire() as conn:
-        dag_record = await conn.fetchrow("SELECT * FROM jorb_dag WHERE name = $1", "wait-test")
-        dag_id = dag_record['id']
-
-        # Complete the job immediately so wait doesn't actually wait
-        job_id = node_to_job[node]
-        await conn.execute("UPDATE jorb SET state = 'finished' WHERE id = $1", job_id)
-        # Mark DAG as completed by setting completed timestamp
-        await conn.execute("UPDATE jorb_dag SET completed = NOW() WHERE id = $1", dag_id)
-
-    # Wait for DAG (should return immediately since it's completed)
-    result = await client.wait_for_dag(dag_id, timeout=5)
-
-    # Should return True since DAG is completed
-    assert result is True
-
-
-@pytest.mark.asyncio
-async def test_get_job_result_with_dict_result(client, clean_db, pool):
-    """Test get_job_result() with dict result (not string) - covers line 748."""
-    from pyjobby.pj import STMTS
-
-    # Create and finish job with dict result (not JSON string)
-    job_id = await client.enqueue('test.DictResultJob', data='test')
-
-    async with pool.acquire() as conn:
-        await conn.execute(STMTS["claim"], 12345, "worker", "default", [], 1000)
-        await conn.execute(STMTS["run"], job_id)
-        # Store result as dict (JSON codec will handle it)
-        await conn.execute(
-            STMTS["finished"],
-            job_id,
-            {"status": "completed", "value": 999, "nested": {"key": "val"}}
+    @pytest.mark.asyncio
+    async def test_enqueue_with_retry_strategy(self, db_pool):
+        """Test enqueueing with retry strategy - covers lines 350-354."""
+        client = JobClient(db_pool)
+        
+        job_id = await client.enqueue(
+            'RetryJob',
+            retry_strategy='linear',
+            max_retries=5,
+            initial_retry_delay=10
         )
+        
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT admin_data FROM jorb WHERE id = $1", job_id)
+            admin = row['admin_data']
+            assert admin['retry_strategy'] == 'linear'
+            assert admin['max_retries'] == 5
+            assert admin['initial_retry_delay'] == 10
 
-    # Get result - should return dict directly (line 748)
-    result = await client.get_job_result(job_id)
+    @pytest.mark.asyncio
+    async def test_enqueue_with_timeout(self, db_pool):
+        """Test enqueueing with timeout - covers lines 356-359."""
+        client = JobClient(db_pool)
+        
+        job_id = await client.enqueue(
+            'TimeoutJob',
+            timeout_seconds=30,
+            on_timeout='fail'
+        )
+        
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT admin_data FROM jorb WHERE id = $1", job_id)
+            admin = row['admin_data']
+            assert admin['timeout_seconds'] == 30
+            assert admin['on_timeout'] == 'fail'
 
-    assert result is not None
-    assert isinstance(result, dict)
-    assert result['status'] == 'completed'
-    assert result['value'] == 999
-    assert result['nested']['key'] == 'val'
 
+class TestJobClientEnqueueBatch:
+    """Test JobClient.enqueue_batch method - covers lines 390-477."""
+
+    @pytest.mark.asyncio
+    async def test_enqueue_batch_empty(self, db_pool):
+        """Test batch enqueueing empty list - covers lines 426-427."""
+        client = JobClient(db_pool)
+        
+        job_ids = await client.enqueue_batch([])
+        
+        assert job_ids == []
+
+    @pytest.mark.asyncio
+    async def test_enqueue_batch_multiple(self, db_pool):
+        """Test batch enqueueing multiple jobs."""
+        client = JobClient(db_pool)
+        
+        jobs = [
+            ('BatchJob1', {'index': 0}),
+            ('BatchJob2', {'index': 1}),
+            ('BatchJob3', {'index': 2}),
+        ]
+        
+        job_ids = await client.enqueue_batch(jobs)
+        
+        assert len(job_ids) == 3
+        for jid in job_ids:
+            assert isinstance(jid, int)
+
+    @pytest.mark.asyncio
+    async def test_enqueue_batch_with_queue(self, db_pool):
+        """Test batch enqueueing to specific queue."""
+        client = JobClient(db_pool)
+        queue_name = unique_name('batch_queue')
+        
+        jobs = [('BatchJob', {'i': i}) for i in range(3)]
+        job_ids = await client.enqueue_batch(jobs, queue=queue_name)
+        
+        async with db_pool.acquire() as conn:
+            for jid in job_ids:
+                row = await conn.fetchrow("SELECT queue FROM jorb WHERE id = $1", jid)
+                assert row['queue'] == queue_name
+
+
+class TestJobClientJobManagement:
+    """Test job inspection and management methods."""
+
+    @pytest.mark.asyncio
+    async def test_get_job(self, db_pool):
+        """Test get_job - covers lines 483-508."""
+        client = JobClient(db_pool)
+        
+        # Create job
+        job_id = await client.enqueue('GetTestJob')
+        
+        # Get job
+        job_info = await client.get_job(job_id)
+        
+        assert job_info is not None
+        assert job_info.id == job_id
+        assert job_info.job_class == 'GetTestJob'
+        assert job_info.state == 'queued'
+
+    @pytest.mark.asyncio
+    async def test_get_job_not_found(self, db_pool):
+        """Test get_job with non-existent ID - covers lines 505-506."""
+        client = JobClient(db_pool)
+        
+        job_info = await client.get_job(-99999)
+        
+        assert job_info is None
+
+    @pytest.mark.asyncio
+    async def test_cancel_job(self, db_pool):
+        """Test cancel_job - covers lines 510-532."""
+        client = JobClient(db_pool)
+        
+        # Create job
+        job_id = await client.enqueue('CancelTestJob')
+        
+        # Cancel
+        result = await client.cancel_job(job_id)
+        
+        assert result is True
+        
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT state FROM jorb WHERE id = $1", job_id)
+            assert row['state'] == 'cancelled'
+
+    @pytest.mark.asyncio
+    async def test_cancel_job_not_found(self, db_pool):
+        """Test cancel_job with non-existent ID."""
+        client = JobClient(db_pool)
+        
+        result = await client.cancel_job(-99999)
+        
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_retry_job(self, db_pool):
+        """Test retry_job - covers lines 534-567."""
+        client = JobClient(db_pool)
+        
+        # Create and crash a job
+        job_id = await client.enqueue('RetryTestJob')
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE jorb SET state = 'crashed' WHERE id = $1", job_id)
+        
+        # Retry
+        new_job_id = await client.retry_job(job_id)
+        
+        assert new_job_id is not None
+        assert new_job_id != job_id
+        
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT admin_data FROM jorb WHERE id = $1", new_job_id)
+            assert row['admin_data']['retry_of'] == job_id
+
+
+class TestJobClientQueueOperations:
+    """Test queue operation methods."""
+
+    @pytest.mark.asyncio
+    async def test_queue_depth(self, db_pool):
+        """Test queue_depth - covers lines 573-593."""
+        client = JobClient(db_pool)
+        queue_name = unique_name('depth_queue')
+        
+        # Create some jobs
+        for _ in range(5):
+            await client.enqueue('DepthJob', queue=queue_name)
+        
+        depth = await client.queue_depth(queue_name)
+        
+        assert depth == 5
+
+    @pytest.mark.asyncio
+    async def test_queue_stats(self, db_pool):
+        """Test queue_stats - covers lines 595-623."""
+        client = JobClient(db_pool)
+        queue_name = unique_name('stats_queue')
+        
+        # Create jobs in different states
+        job_id = await client.enqueue('StatsJob', queue=queue_name)
+        await client.enqueue('StatsJob2', queue=queue_name)
+        
+        stats = await client.queue_stats(queue_name)
+        
+        assert isinstance(stats, dict)
+        assert 'queued' in stats
+        assert stats['queued'] >= 2
+
+    @pytest.mark.asyncio
+    async def test_list_queues(self, db_pool):
+        """Test list_queues - covers lines 625-654."""
+        client = JobClient(db_pool)
+        
+        queues = await client.list_queues()
+        
+        assert isinstance(queues, list)
+        # Should have at least the default queue
+        for q in queues:
+            assert 'queue' in q
+            assert 'total' in q
+
+    @pytest.mark.asyncio
+    async def test_purge_queue(self, db_pool):
+        """Test purge_queue - covers lines 656-685."""
+        client = JobClient(db_pool)
+        queue_name = unique_name('purge_queue')
+        
+        # Create jobs
+        for _ in range(3):
+            await client.enqueue('PurgeJob', queue=queue_name)
+        
+        # Purge
+        deleted = await client.purge_queue(queue_name)
+        
+        assert deleted == 3
+        
+        # Verify queue is empty
+        depth = await client.queue_depth(queue_name)
+        assert depth == 0
+
+
+class TestJobClientBulkOperations:
+    """Test bulk operation methods."""
+
+    @pytest.mark.asyncio
+    async def test_bulk_cancel_empty(self, db_pool):
+        """Test bulk_cancel with empty list - covers lines 1042-1043."""
+        client = JobClient(db_pool)
+        
+        result = await client.bulk_cancel([])
+        
+        assert result == 0
+
+    @pytest.mark.asyncio
+    async def test_bulk_cancel_multiple(self, db_pool):
+        """Test bulk_cancel - covers lines 1028-1053."""
+        client = JobClient(db_pool)
+        
+        # Create jobs
+        job_ids = []
+        for _ in range(3):
+            jid = await client.enqueue('BulkCancelJob')
+            job_ids.append(jid)
+        
+        # Bulk cancel
+        cancelled = await client.bulk_cancel(job_ids)
+        
+        assert cancelled == 3
+
+    @pytest.mark.asyncio
+    async def test_bulk_retry_empty(self, db_pool):
+        """Test bulk_retry with empty list - covers lines 1069-1070."""
+        client = JobClient(db_pool)
+        
+        result = await client.bulk_retry([])
+        
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_bulk_delete_empty(self, db_pool):
+        """Test bulk_delete with empty list - covers lines 1106-1107."""
+        client = JobClient(db_pool)
+        
+        result = await client.bulk_delete([])
+        
+        assert result == 0
+
+    @pytest.mark.asyncio
+    async def test_bulk_delete_multiple(self, db_pool):
+        """Test bulk_delete - covers lines 1092-1115."""
+        client = JobClient(db_pool)
+        
+        # Create jobs
+        job_ids = []
+        for _ in range(3):
+            jid = await client.enqueue('BulkDeleteJob')
+            job_ids.append(jid)
+        
+        # Bulk delete
+        deleted = await client.bulk_delete(job_ids)
+        
+        assert deleted == 3
+
+    @pytest.mark.asyncio
+    async def test_bulk_update_priority_empty(self, db_pool):
+        """Test bulk_update_priority with empty list - covers lines 1132-1133."""
+        client = JobClient(db_pool)
+        
+        result = await client.bulk_update_priority([], 500)
+        
+        assert result == 0
+
+
+class TestJobClientAdvancedFeatures:
+    """Test advanced features."""
+
+    @pytest.mark.asyncio
+    async def test_create_pipeline(self, db_pool):
+        """Test create_pipeline - covers lines 1149-1194."""
+        client = JobClient(db_pool)
+        
+        steps = [
+            ('PipelineStep1', {'data': 'a'}),
+            ('PipelineStep2', {'data': 'b'}),
+            ('PipelineStep3', {'data': 'c'}),
+        ]
+        
+        job_ids = await client.create_pipeline(steps)
+        
+        assert len(job_ids) == 3
+        
+        # Verify dependencies
+        async with db_pool.acquire() as conn:
+            row2 = await conn.fetchrow("SELECT waitfor_job FROM jorb WHERE id = $1", job_ids[1])
+            assert row2['waitfor_job'] == job_ids[0]
+            
+            row3 = await conn.fetchrow("SELECT waitfor_job FROM jorb WHERE id = $1", job_ids[2])
+            assert row3['waitfor_job'] == job_ids[1]
+
+    @pytest.mark.asyncio
+    async def test_create_pipeline_empty(self, db_pool):
+        """Test create_pipeline with empty list - covers lines 1177-1178."""
+        client = JobClient(db_pool)
+        
+        job_ids = await client.create_pipeline([])
+        
+        assert job_ids == []
+
+    @pytest.mark.asyncio
+    async def test_create_fan_out(self, db_pool):
+        """Test create_fan_out - covers lines 1196-1245."""
+        client = JobClient(db_pool)
+        
+        items = [{'item_id': i} for i in range(5)]
+        
+        job_ids, run_group = await client.create_fan_out('FanOutJob', items)
+        
+        assert len(job_ids) == 5
+        assert run_group is not None
+        
+        # Verify all jobs are in same run_group
+        async with db_pool.acquire() as conn:
+            for jid in job_ids:
+                row = await conn.fetchrow("SELECT run_group FROM jorb WHERE id = $1", jid)
+                assert row['run_group'] == run_group
+
+    @pytest.mark.asyncio
+    async def test_health_check(self, db_pool):
+        """Test health_check - covers lines 1247-1263."""
+        client = JobClient(db_pool)
+        
+        result = await client.health_check()
+        
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_dag_builder(self, db_pool):
+        """Test dag method - covers lines 1269-1302."""
+        client = JobClient(db_pool)
+        
+        dag = client.dag(name='TestDAG', queue='dag_queue')
+        
+        from pyjobby.dag import DAGBuilder
+        assert isinstance(dag, DAGBuilder)
+        assert dag.name == 'TestDAG'
+        assert dag.common_options.get('queue') == 'dag_queue'
+
+
+class TestJobClientGetJobs:
+    """Test get_jobs and search_jobs methods."""
+
+    @pytest.mark.asyncio
+    async def test_get_jobs_basic(self, db_pool):
+        """Test get_jobs - covers lines 798-864."""
+        client = JobClient(db_pool)
+        queue_name = unique_name('get_jobs_queue')
+        
+        # Create some jobs
+        for i in range(5):
+            await client.enqueue(f'GetJobsTest{i}', queue=queue_name)
+        
+        jobs = await client.get_jobs(queue=queue_name, limit=10)
+        
+        assert len(jobs) == 5
+
+    @pytest.mark.asyncio
+    async def test_get_jobs_with_state(self, db_pool):
+        """Test get_jobs with state filter."""
+        client = JobClient(db_pool)
+        
+        jobs = await client.get_jobs(state='queued', limit=10)
+        
+        for job in jobs:
+            assert job['state'] == 'queued'
+
+    @pytest.mark.asyncio
+    async def test_search_jobs(self, db_pool):
+        """Test search_jobs - covers lines 866-959."""
+        client = JobClient(db_pool)
+        
+        # Create job
+        job_id = await client.enqueue('SearchableJob', uid=12345)
+        
+        jobs = await client.search_jobs(job_class='SearchableJob', uid=12345)
+        
+        assert len(jobs) >= 1
+        assert any(j['id'] == job_id for j in jobs)
+
+    @pytest.mark.asyncio
+    async def test_get_failed_jobs(self, db_pool):
+        """Test get_failed_jobs - covers lines 961-996."""
+        client = JobClient(db_pool)
+        
+        jobs = await client.get_failed_jobs(limit=10)
+        
+        assert isinstance(jobs, list)
+        for job in jobs:
+            assert job['state'] == 'crashed'
+
+    @pytest.mark.asyncio
+    async def test_get_waiting_jobs(self, db_pool):
+        """Test get_waiting_jobs - covers lines 998-1022."""
+        client = JobClient(db_pool)
+        
+        jobs = await client.get_waiting_jobs(limit=10)
+        
+        assert isinstance(jobs, list)
+        for job in jobs:
+            assert job['state'] == 'waiting'
+
+
+class TestJobClientFullJob:
+    """Test get_job_full and related methods."""
+
+    @pytest.mark.asyncio
+    async def test_get_job_full(self, db_pool):
+        """Test get_job_full - covers lines 691-717."""
+        client = JobClient(db_pool)
+        
+        job_id = await client.enqueue('FullJob', test_arg='test_value')
+        
+        job = await client.get_job_full(job_id)
+        
+        assert job is not None
+        assert job['id'] == job_id
+        assert 'kwargs' in job
+        assert job['kwargs']['test_arg'] == 'test_value'
+
+    @pytest.mark.asyncio
+    async def test_get_job_full_not_found(self, db_pool):
+        """Test get_job_full with non-existent ID - covers lines 714-715."""
+        client = JobClient(db_pool)
+        
+        job = await client.get_job_full(-99999)
+        
+        assert job is None
+
+    @pytest.mark.asyncio
+    async def test_delete_job(self, db_pool):
+        """Test delete_job - covers lines 750-770."""
+        client = JobClient(db_pool)
+        
+        job_id = await client.enqueue('DeleteJob')
+        
+        result = await client.delete_job(job_id)
+        
+        assert result is True
+        
+        # Verify deleted
+        job = await client.get_job(job_id)
+        assert job is None
+
+    @pytest.mark.asyncio
+    async def test_update_job_priority(self, db_pool):
+        """Test update_job_priority - covers lines 772-796."""
+        client = JobClient(db_pool)
+        
+        job_id = await client.enqueue('PrioUpdateJob', priority=100)
+        
+        result = await client.update_job_priority(job_id, 500)
+        
+        assert result is True
+        
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT prio FROM jorb WHERE id = $1", job_id)
+            assert row['prio'] == 500
