@@ -1429,3 +1429,54 @@ class TestWebServerStartup:
             await worker_task
         except asyncio.TimeoutError:
             pass
+
+    @pytest.mark.asyncio
+    async def test_web_server_unix_socket_startup(self, db_pool, db_params):
+        """Test that worker starts Unix socket web server when configured - covers lines 415-418."""
+        import tempfile
+        import os
+        
+        # Create a temporary file path for the Unix socket
+        with tempfile.NamedTemporaryFile(delete=True) as f:
+            socket_path = f.name
+        
+        # Create worker with webPort Unix socket site configured
+        system = JobSystem(
+            dsn=db_params,
+            qname='default',
+            capabilities=('std',),
+            workerId=801,
+            checkInterval=0.1,
+            webPort={
+                "paths": {"tests.test_pj_worker_run_loop.WebEnabledJob"},
+                "sites": [{"path": socket_path}]  # Unix socket path
+            }
+        )
+
+        # Start worker briefly
+        async def run_worker():
+            await asyncio.wait_for(system.run(), timeout=0.5)
+
+        worker_task = asyncio.create_task(run_worker())
+        
+        # Wait for server to start
+        await asyncio.sleep(0.2)
+        
+        # Check that socket file was created (with worker ID appended)
+        expected_socket = f"{socket_path}-{system.workerId}"
+        socket_exists = os.path.exists(expected_socket)
+        
+        # Stop worker
+        system.stop = True
+        
+        try:
+            await worker_task
+        except asyncio.TimeoutError:
+            pass
+        
+        # Clean up socket file if it exists
+        if os.path.exists(expected_socket):
+            os.unlink(expected_socket)
+        
+        # Verify socket was created (indicates Unix socket path was executed)
+        assert socket_exists, f"Unix socket should have been created at {expected_socket}"
