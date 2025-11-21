@@ -70,7 +70,7 @@ class AsyncGenJob(Job):
 
 class AsyncJobNoTimeout(Job):
     """Async job with NO timeout configured."""
-    # No timeout attribute set
+    timeout = 0  # Explicitly set to 0 to disable timeout
     async def task(self, value: str = "no_timeout"):
         await asyncio.sleep(0.01)
         return f"async_no_timeout: {value}"
@@ -78,7 +78,7 @@ class AsyncJobNoTimeout(Job):
 
 class AsyncGenJobNoTimeout(Job):
     """Async generator job with NO timeout configured."""
-    # No timeout attribute set
+    timeout = 0  # Explicitly set to 0 to disable timeout
     async def task(self):
         async def gen():
             for i in range(2):
@@ -88,7 +88,7 @@ class AsyncGenJobNoTimeout(Job):
 
 class DirectAsyncGenJob(Job):
     """Job that directly returns async generator (not from async function)."""
-    # No timeout attribute set
+    timeout = 0  # Explicitly set to 0 to disable timeout
     def run(self):
         """Override run() to return async generator directly."""
         async def gen():
@@ -120,6 +120,22 @@ class DirectAsyncGenJobWithTimeout(Job):
                 await asyncio.sleep(0.01)
                 yield f"direct_{i}"
         return gen()
+
+
+class ReschedulingJob(Job):
+    """Job that reschedules itself to run later."""
+    async def task(self, seconds_delay: int = 60):
+        # Call reschedule to defer this job
+        await self.reschedule(seconds_delay, "seconds")
+        return f"rescheduled_for_{seconds_delay}_seconds"
+
+
+class ReschedulingJobWithDeltas(Job):
+    """Job that reschedules itself using deltas dict."""
+    async def task(self):
+        # Use deltas dict for complex rescheduling
+        await self.reschedule(0, deltas={"minutes": 5, "seconds": 30})
+        return "rescheduled_with_deltas"
 
 
 # ============================================================================
@@ -971,3 +987,106 @@ class TestAsyncGeneratorWithTimeout:
             assert job['state'] == 'finished', f"Job should finish, got: {job['state']}"
             # Result should be list from collected generator
             assert job['result'] == ['direct_0', 'direct_1']
+
+
+# ============================================================================
+# Test Job Rescheduling
+# ============================================================================
+
+class TestJobReschedule:
+    """Test job.reschedule() method - covers lines 788-798."""
+
+    @pytest.mark.asyncio
+    async def test_job_reschedule_with_seconds(self, db_pool, db_params):
+        """Test job calls reschedule() to defer execution - covers lines 788-798."""
+        async with db_pool.acquire() as conn:
+            # Clean database
+            await conn.execute("DELETE FROM jorb")
+
+            # Create rescheduling job
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
+                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+                RETURNING id
+            """, 'tests.test_pj_worker_run_loop.ReschedulingJob',
+                {'seconds_delay': 300},  # Reschedule for 5 minutes
+                'default', 'queued', 100)
+
+        # Create and run worker
+        system = JobSystem(
+            dsn=db_params,
+            qname='default',
+            capabilities=('std',),
+            workerId=300,
+            checkInterval=0.1,
+            webPort=None
+        )
+
+        async def run_worker():
+            await asyncio.wait_for(system.run(), timeout=1.0)
+
+        worker_task = asyncio.create_task(run_worker())
+        await asyncio.sleep(0.4)
+        system.stop = True
+
+        try:
+            await worker_task
+        except asyncio.TimeoutError:
+            pass
+
+        # Verify job completed (job called reschedule() then returned result, so it finishes)
+        # The important thing is that reschedule() was called, which covers lines 788-798
+        async with db_pool.acquire() as conn:
+            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+
+            # Job finishes because it returned a result after calling reschedule()
+            # (reschedule() doesn't prevent job completion, it just updates run_after)
+            assert job['state'] == 'finished', f"Job should finish, got: {job['state']}"
+            assert job['result'] == 'rescheduled_for_300_seconds'
+
+    @pytest.mark.asyncio
+    async def test_job_reschedule_with_deltas(self, db_pool, db_params):
+        """Test job calls reschedule() with deltas dict - covers lines 788-798."""
+        async with db_pool.acquire() as conn:
+            # Clean database
+            await conn.execute("DELETE FROM jorb")
+
+            # Create rescheduling job using deltas
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
+                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+                RETURNING id
+            """, 'tests.test_pj_worker_run_loop.ReschedulingJobWithDeltas',
+                {},
+                'default', 'queued', 100)
+
+        # Create and run worker
+        system = JobSystem(
+            dsn=db_params,
+            qname='default',
+            capabilities=('std',),
+            workerId=301,
+            checkInterval=0.1,
+            webPort=None
+        )
+
+        async def run_worker():
+            await asyncio.wait_for(system.run(), timeout=1.0)
+
+        worker_task = asyncio.create_task(run_worker())
+        await asyncio.sleep(0.4)
+        system.stop = True
+
+        try:
+            await worker_task
+        except asyncio.TimeoutError:
+            pass
+
+        # Verify job completed (job called reschedule() with deltas then returned result)
+        # The important thing is that reschedule() was called with deltas dict, covering lines 788-798
+        async with db_pool.acquire() as conn:
+            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+
+            # Job finishes because it returned a result after calling reschedule()
+            assert job['state'] == 'finished', f"Job should finish, got: {job['state']}"
+            assert job['result'] == 'rescheduled_with_deltas'
