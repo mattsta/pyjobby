@@ -1341,3 +1341,33 @@ class TestWebHandler:
         # Verify "not so fast!" response
         assert response.status == 200
         assert response.text == "not so fast!"
+
+
+# ============================================================================
+# Test Class Loading Error Handling
+# ============================================================================
+
+class TestClassLoadingErrors:
+    """Test error handling when loading job classes - covers lines 393-396."""
+
+    @pytest.mark.asyncio
+    async def test_class_not_found_raises_file_not_found(self, db_pool, db_params):
+        """Test that loading non-existent job class raises FileNotFoundError - covers lines 393-396."""
+        # Create worker
+        system = JobSystem(
+            dsn=db_params,
+            qname='default',
+            capabilities=('std',),
+            workerId=700,
+            checkInterval=0.1,
+            webPort=None
+        )
+
+        # Try to load class from existing module but non-existent class
+        # Use a real module (asyncio) but fake class name
+        with pytest.raises(FileNotFoundError) as excinfo:
+            system.classForKlassFromName('asyncio.NonExistentClass')
+
+        # Verify error message
+        assert "Job class not found" in str(excinfo.value)
+        assert "asyncio.NonExistentClass" in str(excinfo.value)
