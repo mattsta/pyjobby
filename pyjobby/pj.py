@@ -556,8 +556,18 @@ class JobSystem:
                         result = await asyncio.wait_for(resultStageA, timeout=job_timeout)
                     else:
                         result = await resultStageA
+
+                    # Check if the awaited result is an async generator
+                    if inspect.isasyncgen(result):
+                        async def collect_gen():
+                            return [x async for x in result]
+                        if job_timeout:
+                            # Note: timeout already consumed by outer wait_for, this is for generator collection
+                            result = await collect_gen()
+                        else:
+                            result = await collect_gen()
                 elif inspect.isasyncgen(resultStageA):
-                    # Apply timeout to async generator jobs
+                    # Apply timeout to async generator jobs (direct return, not from async function)
                     async def collect_with_timeout():
                         return [x async for x in resultStageA]
                     if job_timeout:

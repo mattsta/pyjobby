@@ -159,7 +159,9 @@ async def cleanup_after_pool_tests(request, db_params: dict[str, str]):
         "test_client_management" in test_file or
         "test_dag_comprehensive" in test_file or
         "test_scheduler_comprehensive" in test_file or
-        "test_admin_api_comprehensive" in test_file):
+        "test_admin_api_comprehensive" in test_file or
+        "test_pj_worker_run_loop" in test_file or
+        "test_pj_worker_integration" in test_file):
         conn = await asyncpg.connect(**db_params)
         try:
             # Delete all jobs and schedules created during pool-based tests
