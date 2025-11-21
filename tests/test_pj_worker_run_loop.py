@@ -801,3 +801,50 @@ class TestJobsWithoutTimeouts:
             assert job['state'] == 'finished', f"Job should finish, got: {job['state']}"
             # Result should be list from collected generator
             assert job['result'] == ['direct_0', 'direct_1']
+
+
+# ============================================================================
+# Test RescheduleBackoff Edge Cases
+# ============================================================================
+
+class TestRescheduleBackoffEdgeCases:
+    """Test rescheduleBackoff edge cases - cover line 761."""
+
+    @pytest.mark.asyncio
+    async def test_rescheduleBackoff_with_none_attempt(self):
+        """Test rescheduleBackoff when attempt=None (uses job error_count) - covers line 761."""
+        from pyjobby.pj import Job
+
+        # Create a job dict with error_count
+        job_dict = {
+            'id': 999,
+            'error_count': 2,
+            'admin_data': {}  # No retry_strategy specified, will use default
+        }
+
+        # Call rescheduleBackoff with attempt=None
+        # This should use job.get("error_count", 0) = 2
+        delay = await Job.rescheduleBackoff(job_dict, attempt=None)
+
+        # Verify we got a timedelta back
+        assert isinstance(delay, type(delay)), "Should return timedelta"
+        assert delay.total_seconds() > 0, "Delay should be positive"
+
+    @pytest.mark.asyncio
+    async def test_rescheduleBackoff_with_explicit_attempt(self):
+        """Test rescheduleBackoff with explicit attempt value (doesn't use error_count)."""
+        from pyjobby.pj import Job
+
+        # Create a job dict
+        job_dict = {
+            'id': 999,
+            'error_count': 5,  # This should be ignored when attempt is provided
+            'admin_data': {'retry_strategy': 'exponential'}
+        }
+
+        # Call rescheduleBackoff with explicit attempt=1
+        # Should use attempt=1, NOT error_count=5
+        delay = await Job.rescheduleBackoff(job_dict, attempt=1)
+
+        # With exponential and attempt=1, should be 1 second (2^0 = 1)
+        assert delay.total_seconds() == 1.0, f"Expected 1s for attempt=1, got {delay.total_seconds()}s"
