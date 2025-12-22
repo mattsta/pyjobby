@@ -5,8 +5,8 @@ Script to fix pytestmark asyncio issues in test files.
 Removes global pytestmark and adds @pytest.mark.asyncio only to async functions.
 """
 
-import sys
 import re
+import sys
 from pathlib import Path
 
 
@@ -15,7 +15,9 @@ def fix_test_file(file_path: Path) -> None:
     content = file_path.read_text()
 
     # Remove global pytestmark line
-    content = re.sub(r'^pytestmark = pytest\.mark\.asyncio\s*\n', '', content, flags=re.MULTILINE)
+    content = re.sub(
+        r"^pytestmark = pytest\.mark\.asyncio\s*\n", "", content, flags=re.MULTILINE
+    )
 
     # Find all async def test_ functions and add decorator if not present
     def add_decorator(match):
@@ -28,10 +30,10 @@ def fix_test_file(file_path: Path) -> None:
 
     # Match async test functions that don't already have the decorator
     # Look for:  optional indent, "async def test_", function name, parameters
-    pattern = r'^(\s*)async def (test_[a-zA-Z0-9_]+\([^)]*\):)'
+    pattern = r"^(\s*)async def (test_[a-zA-Z0-9_]+\([^)]*\):)"
 
     # First, collect all async test functions
-    lines = content.split('\n')
+    lines = content.split("\n")
     new_lines = []
     i = 0
 
@@ -49,7 +51,7 @@ def fix_test_file(file_path: Path) -> None:
 
             has_decorator = False
             if prev_line_idx >= 0:
-                if '@pytest.mark.asyncio' in lines[prev_line_idx]:
+                if "@pytest.mark.asyncio" in lines[prev_line_idx]:
                     has_decorator = True
 
             if not has_decorator:
@@ -59,7 +61,7 @@ def fix_test_file(file_path: Path) -> None:
         new_lines.append(line)
         i += 1
 
-    content = '\n'.join(new_lines)
+    content = "\n".join(new_lines)
 
     # Write back
     file_path.write_text(content)

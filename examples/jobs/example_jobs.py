@@ -10,6 +10,7 @@ These examples show how to use the new features:
 
 import asyncio
 import time
+
 from pyjobby.pj import Job
 
 
@@ -28,7 +29,9 @@ class FailingJob(Job):
         current_attempt = self.job.get("error_count", 0) + 1
 
         if current_attempt <= fail_count:
-            raise Exception(f"Intentional failure (attempt {current_attempt}/{fail_count})")
+            raise Exception(
+                f"Intentional failure (attempt {current_attempt}/{fail_count})"
+            )
 
         return {"status": "success", "attempts": current_attempt}
 
@@ -73,7 +76,9 @@ class RetryableAPICall(Job):
             import aiohttp
 
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=25)) as response:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=25)
+                ) as response:
                     response.raise_for_status()
                     data = await response.json()
                     return {"status": "success", "data": data}
@@ -87,7 +92,11 @@ class RetryableAPICall(Job):
                 raise Exception("Rate limited - will retry with backoff")
             else:
                 # Client error - not retryable
-                return {"status": "error", "code": e.status, "message": "Client error (not retried)"}
+                return {
+                    "status": "error",
+                    "code": e.status,
+                    "message": "Client error (not retried)",
+                }
 
         except aiohttp.ClientError as e:
             # Network error - retryable
@@ -129,11 +138,7 @@ class StreamingJob(Job):
         """Process items and yield results as they complete"""
         for i in range(num_items):
             await asyncio.sleep(0.5)  # Simulate processing
-            yield {
-                "item": i,
-                "status": "processed",
-                "timestamp": time.time()
-            }
+            yield {"item": i, "status": "processed", "timestamp": time.time()}
 
 
 class DatabaseTransactionJob(Job):
@@ -147,19 +152,23 @@ class DatabaseTransactionJob(Job):
             # Debit source
             await self.s.cxn.execute(
                 "UPDATE accounts SET balance = balance - $1 WHERE user_id = $2",
-                amount, user_id
+                amount,
+                user_id,
             )
 
             # Credit destination
             await self.s.cxn.execute(
                 "UPDATE accounts SET balance = balance + $1 WHERE user_id = $2",
-                amount, user_id + 1
+                amount,
+                user_id + 1,
             )
 
             # Log transaction
             tx_id = await self.s.cxn.fetchval(
                 "INSERT INTO transactions (from_user, to_user, amount) VALUES ($1, $2, $3) RETURNING id",
-                user_id, user_id + 1, amount
+                user_id,
+                user_id + 1,
+                amount,
             )
 
         return {"status": "success", "transaction_id": tx_id}
@@ -174,6 +183,7 @@ class CachedResourceJob(Job):
         # Get or create cached session
         if "http_session" not in self.s.cache:
             import aiohttp
+
             self.s.cache["http_session"] = aiohttp.ClientSession(
                 headers={"Authorization": f"Bearer {api_key}"}
             )
@@ -189,17 +199,21 @@ class CachedResourceJob(Job):
 
 # Example job submission functions
 
+
 async def submit_basic_job(db_conn):
     """Submit a simple job"""
     import orjson
 
-    job_id = await db_conn.fetchval("""
+    job_id = await db_conn.fetchval(
+        """
         INSERT INTO jorb (job_class, kwargs, queue)
         VALUES ($1, $2, $3)
         RETURNING id
-    """, "examples.jobs.example_jobs.BasicJob",
+    """,
+        "examples.jobs.example_jobs.BasicJob",
         orjson.dumps({"message": "Hello from pyjobby!"}),
-        "default")
+        "default",
+    )
 
     print(f"Submitted job {job_id}")
     return job_id
@@ -209,13 +223,16 @@ async def submit_failing_job(db_conn, fail_count=3):
     """Submit a job that will fail and retry"""
     import orjson
 
-    job_id = await db_conn.fetchval("""
+    job_id = await db_conn.fetchval(
+        """
         INSERT INTO jorb (job_class, kwargs, queue)
         VALUES ($1, $2, $3)
         RETURNING id
-    """, "examples.jobs.example_jobs.FailingJob",
+    """,
+        "examples.jobs.example_jobs.FailingJob",
         orjson.dumps({"fail_count": fail_count}),
-        "default")
+        "default",
+    )
 
     print(f"Submitted failing job {job_id} (will fail {fail_count} times then succeed)")
     return job_id
@@ -225,13 +242,16 @@ async def submit_timeout_job(db_conn):
     """Submit a job that will timeout"""
     import orjson
 
-    job_id = await db_conn.fetchval("""
+    job_id = await db_conn.fetchval(
+        """
         INSERT INTO jorb (job_class, kwargs, queue)
         VALUES ($1, $2, $3)
         RETURNING id
-    """, "examples.jobs.example_jobs.TimeoutJob",
+    """,
+        "examples.jobs.example_jobs.TimeoutJob",
         orjson.dumps({"sleep_duration": 10}),  # Will timeout after 5s
-        "default")
+        "default",
+    )
 
     print(f"Submitted timeout job {job_id} (will timeout and retry)")
     return job_id

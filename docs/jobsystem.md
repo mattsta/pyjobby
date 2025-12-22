@@ -144,12 +144,14 @@ Location: `pyjobby/pj.py:249-263`
 Execute a prepared statement by name.
 
 **Parameters**:
+
 - `op`: Statement name (e.g., "claim", "finished", "crash")
 - `*args`: Arguments to pass to the prepared statement
 
 **Returns**: List of asyncpg.Record objects
 
 **Features**:
+
 - Automatic retry on connection errors
 - Uses prepared statements for performance and safety
 
@@ -182,12 +184,14 @@ Location: `pyjobby/pj.py:284-303`
 Dynamically load and instantiate a job class from its string path.
 
 **Parameters**:
+
 - `klassName`: Full Python path (e.g., "job.email.SendEmail")
 - `job`: Job row data from database (optional)
 
 **Returns**: Instance of the Job subclass
 
 **Features**:
+
 - **Hot reloading**: Reloads the module on every invocation to pick up code changes
 - **Error handling**: Raises `FileNotFoundError` if class not found
 - **Dependency injection**: Injects `JobSystem` reference and job data
@@ -269,6 +273,7 @@ Signal handler for graceful shutdown.
 **Signals Handled**: SIGTERM, SIGINT (via parent process)
 
 **Behavior**:
+
 - Sets `self.stop = True`
 - Allows current job to complete
 - Exits polling loop
@@ -294,17 +299,17 @@ Location: `pyjobby/pj.py:99-224`
 
 JobSystem uses prepared statements for all database operations:
 
-| Statement | Purpose | Parameters | Returns |
-|-----------|---------|------------|---------|
-| `claim` | Atomically claim next job | pid, host, queue, capabilities[], max_prio | Job row or empty |
-| `get` | Retrieve claimed job | job_id | Job row |
-| `run` | Mark job as running | job_id | Updated row |
-| `finished` | Mark job complete | job_id, result (JSONB) | Updated row |
-| `crash` | Record error | job_id, error_msg, backtrace | Updated row |
-| `reschedule` | Re-queue job | job_id, interval | Updated row |
-| `schedule-deadline` | Insert with deadline key | deadline_key, queue, prio, run_after, uid, run_group, job_class, kwargs, admin_data | New row ID |
-| `enqueue-next-self-finished` | Trigger dependent jobs | job_id | Triggered job rows |
-| `enqueue-next-if-peer-group-is-finished` | Trigger group deps | run_group | Triggered job rows |
+| Statement                                | Purpose                   | Parameters                                                                          | Returns            |
+| ---------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------- | ------------------ |
+| `claim`                                  | Atomically claim next job | pid, host, queue, capabilities[], max_prio                                          | Job row or empty   |
+| `get`                                    | Retrieve claimed job      | job_id                                                                              | Job row            |
+| `run`                                    | Mark job as running       | job_id                                                                              | Updated row        |
+| `finished`                               | Mark job complete         | job_id, result (JSONB)                                                              | Updated row        |
+| `crash`                                  | Record error              | job_id, error_msg, backtrace                                                        | Updated row        |
+| `reschedule`                             | Re-queue job              | job_id, interval                                                                    | Updated row        |
+| `schedule-deadline`                      | Insert with deadline key  | deadline_key, queue, prio, run_after, uid, run_group, job_class, kwargs, admin_data | New row ID         |
+| `enqueue-next-self-finished`             | Trigger dependent jobs    | job_id                                                                              | Triggered job rows |
+| `enqueue-next-if-peer-group-is-finished` | Trigger group deps        | run_group                                                                           | Triggered job rows |
 
 ### Job Claiming Algorithm
 
@@ -332,6 +337,7 @@ RETURNING *
 ```
 
 **Selection Criteria** (in order):
+
 1. **Queue match**: Job in worker's queue
 2. **Capability match**: Job requires capability worker has (or no capability)
 3. **Priority filter**: Job priority ≤ worker's max priority
@@ -341,6 +347,7 @@ RETURNING *
 7. **Atomic lock**: `FOR UPDATE SKIP LOCKED` prevents conflicts
 
 **Performance Characteristics**:
+
 - **Index used**: `jorb_poll_idx` (partial index on `state='queued'`)
 - **Typical latency**: <1ms even with millions of completed jobs
 - **Contention**: Zero (workers never wait on each other)
@@ -355,6 +362,7 @@ class JobSystem:
 ```
 
 **Use Cases**:
+
 - **Credentials**: Load once, reuse across jobs
 - **Connections**: Database/API connection pools
 - **Statistics**: Track worker performance metrics
@@ -407,11 +415,13 @@ web_listen = {
 ### Load Balancing
 
 **Linux (TCP sockets)**:
+
 - Each worker binds to same `host:port` with `SO_REUSEPORT`
 - Kernel distributes incoming connections across workers
 - Automatic load balancing and failover
 
 **Other Platforms (Unix sockets)**:
+
 - Each worker creates separate socket: `/var/run/pyjobby.sock-0`, `.sock-1`, etc.
 - Use nginx/haproxy to balance:
 
@@ -824,6 +834,7 @@ runner = JobSystem(..., checkInterval=5)  # 5 seconds
 ```
 
 **Trade-offs**:
+
 - Lower interval: Jobs start faster, but more DB queries when idle
 - Higher interval: Fewer DB queries, but jobs wait longer to start
 
@@ -975,6 +986,7 @@ When a job raises an exception:
 3. **Job rescheduled**: New job created with future `run_after`
 
 **Backoff Schedule**:
+
 ```
 Attempt 1: 16 seconds
 Attempt 2: 32 seconds

@@ -1,4 +1,4 @@
-""" Sample sqlalchemy schema for the pyjobby schema.
+"""Sample sqlalchemy schema for the pyjobby schema.
 
 This can be used as a reference for including in your
 own application endpoints as the source of truth for
@@ -6,64 +6,23 @@ pyjobby to query for jobs."""
 
 import enum
 
-from sqlalchemy.ext.declarative import declared_attr
 from sqlalchemy import (
-    Boolean,
-    LargeBinary,
-    Column,
-    Integer,
     BigInteger,
-    String,
-    Text,
-    UnicodeText,
+    Column,
     DateTime,
     ForeignKey,
-    ForeignKeyConstraint,
-    UniqueConstraint,
-    func,
     Index,
-    inspect,
+    Integer,
+    Text,
     and_,
-    or_
+    or_,
 )
-
 from sqlalchemy.dialects.postgresql import (
-    ARRAY,
-    BIGINT,
-    BIT,
-    BOOLEAN,
-    BYTEA,
-    CHAR,
-    CIDR,
-    DATE,
-    DOUBLE_PRECISION,
     ENUM,
-    FLOAT,
-    HSTORE,
-    INET,
-    INTEGER,
-    INTERVAL,
     JSON,
-    JSONB,
-    MACADDR,
-    MONEY,
-    NUMERIC,
-    OID,
-    REAL,
-    SMALLINT,
-    TEXT,
-    TIME,
-    TIMESTAMP,
-    UUID,
-    VARCHAR,
-    INT4RANGE,
-    INT8RANGE,
-    NUMRANGE,
-    DATERANGE,
-    TSRANGE,
-    TSTZRANGE,
-    TSVECTOR,
 )
+from sqlalchemy.ext.declarative import declared_attr
+
 
 # ============================================================================
 # Common Helpers
@@ -98,7 +57,7 @@ class Timestamps:
 # Jorbs
 # ============================================================================
 class JorbState(str, enum.Enum):
-    """ State machine flow for job status """
+    """State machine flow for job status"""
 
     waiting = "waiting"
     queued = "queued"

@@ -8,16 +8,17 @@ Designed to be used by both CLI tools and web interfaces.
 All methods are async and return structured data (dicts/lists).
 """
 
-import asyncpg
-from typing import Optional, Any
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
-from dataclasses import dataclass, asdict
-import json
+from typing import Any
+
+import asyncpg
 
 
 @dataclass
 class JobInfo:
     """Structured job information"""
+
     id: int
     state: str
     queue: str
@@ -29,25 +30,25 @@ class JobInfo:
     updated: datetime
     run_count: int
     error_count: int
-    capability: Optional[str] = None
-    uid: Optional[int] = None
-    run_group: Optional[int] = None
-    waitfor_job: Optional[int] = None
-    waitfor_group: Optional[int] = None
-    deadline_key: Optional[str] = None
-    worker_pid: Optional[int] = None
-    worker_host: Optional[str] = None
-    result: Optional[dict] = None
-    error_message: Optional[str] = None
-    error_backtrace: Optional[str] = None
-    admin_data: Optional[dict] = None
-    started: Optional[datetime] = None
-    finished: Optional[datetime] = None
-    timeout_at: Optional[datetime] = None
-    dag_id: Optional[int] = None
+    capability: str | None = None
+    uid: int | None = None
+    run_group: int | None = None
+    waitfor_job: int | None = None
+    waitfor_group: int | None = None
+    deadline_key: str | None = None
+    worker_pid: int | None = None
+    worker_host: str | None = None
+    result: dict | None = None
+    error_message: str | None = None
+    error_backtrace: str | None = None
+    admin_data: dict | None = None
+    started: datetime | None = None
+    finished: datetime | None = None
+    timeout_at: datetime | None = None
+    dag_id: int | None = None
 
     @classmethod
-    def from_record(cls, record: asyncpg.Record) -> "JobInfo":
+    def from_record(cls, record: asyncpg.Record) -> JobInfo:
         """Create JobInfo from asyncpg Record"""
         return cls(**dict(record))
 
@@ -55,7 +56,14 @@ class JobInfo:
         """Convert to dictionary with datetime serialization"""
         data = asdict(self)
         # Convert datetimes to ISO strings for JSON serialization
-        for key in ['run_after', 'created', 'updated', 'started', 'finished', 'timeout_at']:
+        for key in [
+            "run_after",
+            "created",
+            "updated",
+            "started",
+            "finished",
+            "timeout_at",
+        ]:
             if data.get(key):
                 data[key] = data[key].isoformat()
         return data
@@ -64,6 +72,7 @@ class JobInfo:
 @dataclass
 class QueueStats:
     """Queue statistics"""
+
     queue: str
     queued: int = 0
     claimed: int = 0
@@ -73,7 +82,7 @@ class QueueStats:
     crashed: int = 0
     cancelled: int = 0
     total: int = 0
-    oldest_queued_age_seconds: Optional[float] = None
+    oldest_queued_age_seconds: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -82,6 +91,7 @@ class QueueStats:
 @dataclass
 class WorkerInfo:
     """Worker information"""
+
     worker_host: str
     worker_pid: int
     job_id: int
@@ -90,13 +100,13 @@ class WorkerInfo:
     started_at: datetime
 
     @classmethod
-    def from_record(cls, record: asyncpg.Record) -> "WorkerInfo":
+    def from_record(cls, record: asyncpg.Record) -> WorkerInfo:
         return cls(**dict(record))
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
-        if data['started_at']:
-            data['started_at'] = data['started_at'].isoformat()
+        if data["started_at"]:
+            data["started_at"] = data["started_at"].isoformat()
         return data
 
 
@@ -128,10 +138,10 @@ class AdminAPI:
 
     async def list_jobs(
         self,
-        queue: Optional[str] = None,
-        state: Optional[str] = None,
-        job_class: Optional[str] = None,
-        uid: Optional[int] = None,
+        queue: str | None = None,
+        state: str | None = None,
+        job_class: str | None = None,
+        uid: int | None = None,
         limit: int = 50,
         offset: int = 0,
         order_by: str = "created",
@@ -182,7 +192,13 @@ class AdminAPI:
 
         # Validate order_by to prevent SQL injection
         allowed_columns = [
-            "id", "created", "updated", "run_after", "prio", "state", "queue"
+            "id",
+            "created",
+            "updated",
+            "run_after",
+            "prio",
+            "state",
+            "queue",
         ]
         if order_by not in allowed_columns:
             order_by = "created"
@@ -200,7 +216,7 @@ class AdminAPI:
         records = await self.conn.fetch(query, *params)
         return [JobInfo.from_record(r).to_dict() for r in records]
 
-    async def get_job(self, job_id: int) -> Optional[dict[str, Any]]:
+    async def get_job(self, job_id: int) -> dict[str, Any] | None:
         """
         Get detailed information about a specific job.
 
@@ -229,21 +245,20 @@ class AdminAPI:
             ValueError: If job not found or not in retriable state
         """
         # Check if job exists and is in a retriable state
-        job = await self.conn.fetchrow(
-            "SELECT * FROM jorb WHERE id = $1", job_id
-        )
+        job = await self.conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
 
         if not job:
             raise ValueError(f"Job {job_id} not found")
 
-        if job['state'] not in ['crashed', 'cancelled']:
+        if job["state"] not in ["crashed", "cancelled"]:
             raise ValueError(
                 f"Job {job_id} is in state '{job['state']}', "
                 f"can only retry crashed or cancelled jobs"
             )
 
         # Create retry job using same logic as automatic retry
-        new_job_id = await self.conn.fetchval("""
+        new_job_id = await self.conn.fetchval(
+            """
             INSERT INTO jorb (
                 job_class, kwargs, queue, prio, uid, capability,
                 run_after, run_group, admin_data, state, error_count
@@ -262,12 +277,14 @@ class AdminAPI:
             FROM jorb
             WHERE id = $1
             RETURNING id
-        """, job_id)
+        """,
+            job_id,
+        )
 
         return {
             "original_job_id": job_id,
             "new_job_id": new_job_id,
-            "status": "retry_queued"
+            "status": "retry_queued",
         }
 
     async def retry_jobs(self, job_ids: list[int]) -> list[dict[str, Any]]:
@@ -286,11 +303,9 @@ class AdminAPI:
                 result = await self.retry_job(job_id)
                 results.append(result)
             except ValueError as e:
-                results.append({
-                    "original_job_id": job_id,
-                    "status": "error",
-                    "error": str(e)
-                })
+                results.append(
+                    {"original_job_id": job_id, "status": "error", "error": str(e)}
+                )
         return results
 
     async def cancel_job(self, job_id: int) -> dict[str, Any]:
@@ -306,14 +321,17 @@ class AdminAPI:
         Raises:
             ValueError: If job not found or not cancellable
         """
-        result = await self.conn.fetchrow("""
+        result = await self.conn.fetchrow(
+            """
             UPDATE jorb
             SET state = 'cancelled',
                 updated = TIMEZONE('utc', clock_timestamp())
             WHERE id = $1
               AND state IN ('queued', 'waiting')
             RETURNING id, state
-        """, job_id)
+        """,
+            job_id,
+        )
 
         if not result:
             # Check if job exists
@@ -328,10 +346,7 @@ class AdminAPI:
                     f"can only cancel queued or waiting jobs"
                 )
 
-        return {
-            "job_id": job_id,
-            "status": "cancelled"
-        }
+        return {"job_id": job_id, "status": "cancelled"}
 
     async def cancel_jobs(self, job_ids: list[int]) -> list[dict[str, Any]]:
         """
@@ -349,11 +364,7 @@ class AdminAPI:
                 result = await self.cancel_job(job_id)
                 results.append(result)
             except ValueError as e:
-                results.append({
-                    "job_id": job_id,
-                    "status": "error",
-                    "error": str(e)
-                })
+                results.append({"job_id": job_id, "status": "error", "error": str(e)})
         return results
 
     async def delete_job(self, job_id: int) -> bool:
@@ -368,17 +379,15 @@ class AdminAPI:
         Returns:
             True if deleted, False if not found
         """
-        result = await self.conn.execute(
-            "DELETE FROM jorb WHERE id = $1", job_id
-        )
+        result = await self.conn.execute("DELETE FROM jorb WHERE id = $1", job_id)
         # asyncpg returns "DELETE N" where N is number of rows deleted
         return result == "DELETE 1"
 
     async def delete_jobs(
         self,
-        queue: Optional[str] = None,
-        state: Optional[str] = None,
-        older_than_days: Optional[int] = None,
+        queue: str | None = None,
+        state: str | None = None,
+        older_than_days: int | None = None,
     ) -> int:
         """
         Bulk delete jobs matching criteria.
@@ -421,10 +430,7 @@ class AdminAPI:
 
         where_sql = "WHERE " + " AND ".join(where_clauses)
 
-        result = await self.conn.execute(
-            f"DELETE FROM jorb {where_sql}",
-            *params
-        )
+        result = await self.conn.execute(f"DELETE FROM jorb {where_sql}", *params)
 
         # Parse "DELETE N" to get count
         deleted_count = int(result.split()[-1])
@@ -444,9 +450,9 @@ class AdminAPI:
         records = await self.conn.fetch(
             "SELECT DISTINCT queue FROM jorb ORDER BY queue"
         )
-        return [r['queue'] for r in records]
+        return [r["queue"] for r in records]
 
-    async def queue_stats(self, queue: Optional[str] = None) -> list[dict[str, Any]]:
+    async def queue_stats(self, queue: str | None = None) -> list[dict[str, Any]]:
         """
         Get statistics for queues.
 
@@ -484,28 +490,28 @@ class AdminAPI:
         queue_stats_map: dict[str, QueueStats] = {}
 
         for r in records:
-            q = r['queue']
+            q = r["queue"]
             if q not in queue_stats_map:
                 queue_stats_map[q] = QueueStats(queue=q)
 
             stats = queue_stats_map[q]
-            state = r['state']
-            count = r['count']
+            state = r["state"]
+            count = r["count"]
 
-            if state == 'queued':
+            if state == "queued":
                 stats.queued = count
-                stats.oldest_queued_age_seconds = r['oldest_queued_age_seconds']
-            elif state == 'claimed':
+                stats.oldest_queued_age_seconds = r["oldest_queued_age_seconds"]
+            elif state == "claimed":
                 stats.claimed = count
-            elif state == 'running':
+            elif state == "running":
                 stats.running = count
-            elif state == 'waiting':
+            elif state == "waiting":
                 stats.waiting = count
-            elif state == 'finished':
+            elif state == "finished":
                 stats.finished = count
-            elif state == 'crashed':
+            elif state == "crashed":
                 stats.crashed = count
-            elif state == 'cancelled':
+            elif state == "cancelled":
                 stats.cancelled = count
 
             stats.total += count
@@ -515,8 +521,8 @@ class AdminAPI:
     async def clear_queue(
         self,
         queue: str,
-        state: Optional[str] = None,
-        older_than_days: Optional[int] = None,
+        state: str | None = None,
+        older_than_days: int | None = None,
     ) -> int:
         """
         Clear (delete) jobs from a queue.
@@ -530,9 +536,7 @@ class AdminAPI:
             Number of jobs deleted
         """
         return await self.delete_jobs(
-            queue=queue,
-            state=state,
-            older_than_days=older_than_days
+            queue=queue, state=state, older_than_days=older_than_days
         )
 
     # =========================================================================
@@ -592,14 +596,15 @@ class AdminAPI:
             "active_workers": worker_count or 0,
             "workers": [
                 {
-                    "host": r['worker_host'],
-                    "pid": r['worker_pid'],
-                    "job_count": r['job_count'],
-                    "oldest_job_started": r['oldest_job_started'].isoformat()
-                        if r['oldest_job_started'] else None
+                    "host": r["worker_host"],
+                    "pid": r["worker_pid"],
+                    "job_count": r["job_count"],
+                    "oldest_job_started": r["oldest_job_started"].isoformat()
+                    if r["oldest_job_started"]
+                    else None,
                 }
                 for r in jobs_by_worker
-            ]
+            ],
         }
 
     # =========================================================================
@@ -608,8 +613,8 @@ class AdminAPI:
 
     async def get_metrics(
         self,
-        since: Optional[datetime] = None,
-        queue: Optional[str] = None,
+        since: datetime | None = None,
+        queue: str | None = None,
     ) -> dict[str, Any]:
         """
         Get system metrics.
@@ -636,15 +641,19 @@ class AdminAPI:
         where_sql = "WHERE " + " AND ".join(where_clauses)
 
         # Overall counts by state
-        state_counts = await self.conn.fetch(f"""
+        state_counts = await self.conn.fetch(
+            f"""
             SELECT state, COUNT(*) as count
             FROM jorb
             {where_sql}
             GROUP BY state
-        """, *params)
+        """,
+            *params,
+        )
 
         # Job completion rate
-        completion_stats = await self.conn.fetchrow(f"""
+        completion_stats = await self.conn.fetchrow(
+            f"""
             SELECT
                 COUNT(*) FILTER (WHERE state = 'finished') as finished_count,
                 COUNT(*) FILTER (WHERE state = 'crashed') as crashed_count,
@@ -652,10 +661,13 @@ class AdminAPI:
                     FILTER (WHERE state = 'finished') as avg_duration_seconds
             FROM jorb
             {where_sql}
-        """, *params)
+        """,
+            *params,
+        )
 
         # Top error job classes
-        top_errors = await self.conn.fetch(f"""
+        top_errors = await self.conn.fetch(
+            f"""
             SELECT
                 job_class,
                 COUNT(*) as error_count,
@@ -665,24 +677,28 @@ class AdminAPI:
             GROUP BY job_class
             ORDER BY error_count DESC
             LIMIT 10
-        """, *params)
+        """,
+            *params,
+        )
 
         return {
             "period_start": since.isoformat(),
             "period_end": datetime.utcnow().isoformat(),
             "queue": queue,
-            "state_counts": {r['state']: r['count'] for r in state_counts},
-            "finished_count": completion_stats['finished_count'] or 0,
-            "crashed_count": completion_stats['crashed_count'] or 0,
-            "avg_duration_seconds": float(completion_stats['avg_duration_seconds'] or 0),
+            "state_counts": {r["state"]: r["count"] for r in state_counts},
+            "finished_count": completion_stats["finished_count"] or 0,
+            "crashed_count": completion_stats["crashed_count"] or 0,
+            "avg_duration_seconds": float(
+                completion_stats["avg_duration_seconds"] or 0
+            ),
             "top_errors": [
                 {
-                    "job_class": r['job_class'],
-                    "error_count": r['error_count'],
-                    "latest_error": r['latest_error']
+                    "job_class": r["job_class"],
+                    "error_count": r["error_count"],
+                    "latest_error": r["latest_error"],
                 }
                 for r in top_errors
-            ]
+            ],
         }
 
     # =========================================================================
@@ -702,13 +718,16 @@ class AdminAPI:
         Returns:
             List of DLQ job dictionaries
         """
-        records = await self.conn.fetch("""
+        records = await self.conn.fetch(
+            """
             SELECT * FROM jorb
             WHERE state = 'crashed'
               AND error_count >= 10
             ORDER BY updated DESC
             LIMIT $1
-        """, limit)
+        """,
+            limit,
+        )
 
         return [JobInfo.from_record(r).to_dict() for r in records]
 
@@ -723,20 +742,17 @@ class AdminAPI:
             Dictionary with original_job_id and new_job_id
         """
         # Same as regular retry, but reset error_count
-        job = await self.conn.fetchrow(
-            "SELECT * FROM jorb WHERE id = $1", job_id
-        )
+        job = await self.conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
 
         if not job:
             raise ValueError(f"Job {job_id} not found")
 
-        if job['state'] != 'crashed':
-            raise ValueError(
-                f"Job {job_id} is not in DLQ (state: {job['state']})"
-            )
+        if job["state"] != "crashed":
+            raise ValueError(f"Job {job_id} is not in DLQ (state: {job['state']})")
 
         # Create retry job with error_count reset to 0
-        new_job_id = await self.conn.fetchval("""
+        new_job_id = await self.conn.fetchval(
+            """
             INSERT INTO jorb (
                 job_class, kwargs, queue, prio, uid, capability,
                 run_after, run_group, admin_data, state, error_count
@@ -755,12 +771,14 @@ class AdminAPI:
             FROM jorb
             WHERE id = $1
             RETURNING id
-        """, job_id)
+        """,
+            job_id,
+        )
 
         return {
             "original_job_id": job_id,
             "new_job_id": new_job_id,
-            "status": "retry_queued_from_dlq"
+            "status": "retry_queued_from_dlq",
         }
 
     # =========================================================================
@@ -769,8 +787,8 @@ class AdminAPI:
 
     async def list_schedules(
         self,
-        enabled: Optional[bool] = None,
-        queue: Optional[str] = None,
+        enabled: bool | None = None,
+        queue: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
@@ -814,8 +832,8 @@ class AdminAPI:
         return [dict(r) for r in records]
 
     async def get_schedule(
-        self, schedule_id: Optional[int] = None, name: Optional[str] = None
-    ) -> Optional[dict[str, Any]]:
+        self, schedule_id: int | None = None, name: str | None = None
+    ) -> dict[str, Any] | None:
         """
         Get single schedule by ID or name.
 
@@ -845,17 +863,17 @@ class AdminAPI:
         job_class: str,
         cron_expr: str,
         queue: str = "default",
-        kwargs: Optional[dict] = None,
+        kwargs: dict | None = None,
         prio: int = 100,
-        capability: Optional[str] = None,
+        capability: str | None = None,
         timezone: str = "UTC",
         enabled: bool = True,
         max_concurrent_jobs: int = 1,
         jitter_seconds: int = 0,
-        backpressure_threshold: Optional[int] = 1000,
+        backpressure_threshold: int | None = 1000,
         circuit_breaker_threshold: int = 5,
-        description: Optional[str] = None,
-        created_by: Optional[str] = None,
+        description: str | None = None,
+        created_by: str | None = None,
     ) -> dict[str, Any]:
         """
         Create new recurring schedule.
@@ -880,8 +898,8 @@ class AdminAPI:
         Returns:
             Created schedule dictionary
         """
-        from croniter import croniter
         import pytz
+        from croniter import croniter
 
         # Validate cron expression
         try:
@@ -893,7 +911,8 @@ class AdminAPI:
             raise ValueError(f"Invalid cron expression or timezone: {e}")
 
         # Create schedule
-        record = await self.conn.fetchrow("""
+        record = await self.conn.fetchrow(
+            """
             INSERT INTO jorb_schedule (
                 name, description, job_class, kwargs, queue, prio, capability,
                 cron_expr, timezone, enabled,
@@ -908,21 +927,27 @@ class AdminAPI:
             )
             RETURNING *
         """,
-            name, description, job_class,
-            kwargs or {}, queue, prio, capability,
-            cron_expr, timezone, enabled,
-            max_concurrent_jobs, jitter_seconds,
-            backpressure_threshold, circuit_breaker_threshold,
-            next_run, created_by
+            name,
+            description,
+            job_class,
+            kwargs or {},
+            queue,
+            prio,
+            capability,
+            cron_expr,
+            timezone,
+            enabled,
+            max_concurrent_jobs,
+            jitter_seconds,
+            backpressure_threshold,
+            circuit_breaker_threshold,
+            next_run,
+            created_by,
         )
 
         return dict(record)
 
-    async def update_schedule(
-        self,
-        schedule_id: int,
-        **updates: Any
-    ) -> dict[str, Any]:
+    async def update_schedule(self, schedule_id: int, **updates: Any) -> dict[str, Any]:
         """
         Update existing schedule.
 
@@ -935,11 +960,21 @@ class AdminAPI:
         """
         # Allowed fields for update
         allowed_fields = {
-            'name', 'description', 'job_class', 'kwargs', 'queue', 'prio',
-            'capability', 'cron_expr', 'timezone', 'enabled',
-            'max_concurrent_jobs', 'jitter_seconds',
-            'backpressure_threshold', 'circuit_breaker_threshold',
-            'consecutive_failures'  # Allow resetting failure counter
+            "name",
+            "description",
+            "job_class",
+            "kwargs",
+            "queue",
+            "prio",
+            "capability",
+            "cron_expr",
+            "timezone",
+            "enabled",
+            "max_concurrent_jobs",
+            "jitter_seconds",
+            "backpressure_threshold",
+            "circuit_breaker_threshold",
+            "consecutive_failures",  # Allow resetting failure counter
         }
 
         # Filter to only allowed fields
@@ -949,23 +984,23 @@ class AdminAPI:
             raise ValueError("No valid fields to update")
 
         # If cron_expr or timezone changed, recalculate next_run
-        if 'cron_expr' in updates or 'timezone' in updates:
+        if "cron_expr" in updates or "timezone" in updates:
             schedule = await self.get_schedule(schedule_id=schedule_id)
             if not schedule:
                 raise ValueError(f"Schedule {schedule_id} not found")
 
-            from croniter import croniter
             import pytz
+            from croniter import croniter
 
-            cron_expr = updates.get('cron_expr', schedule['cron_expr'])
-            timezone = updates.get('timezone', schedule['timezone'])
+            cron_expr = updates.get("cron_expr", schedule["cron_expr"])
+            timezone = updates.get("timezone", schedule["timezone"])
 
             try:
                 tz = pytz.timezone(timezone)
                 now = datetime.now(tz)
                 cron = croniter(cron_expr, now)
                 next_run = cron.get_next(datetime)
-                updates['next_run'] = next_run
+                updates["next_run"] = next_run
             except Exception as e:
                 raise ValueError(f"Invalid cron expression or timezone: {e}")
 
@@ -986,7 +1021,7 @@ class AdminAPI:
 
         query = f"""
             UPDATE jorb_schedule
-            SET {', '.join(set_clauses)}
+            SET {", ".join(set_clauses)}
             WHERE id = ${param_idx}
             RETURNING *
         """
@@ -1030,7 +1065,7 @@ class AdminAPI:
         return await self.update_schedule(
             schedule_id,
             enabled=True,
-            consecutive_failures=0  # Reset failure counter
+            consecutive_failures=0,  # Reset failure counter
         )
 
     async def disable_schedule(self, schedule_id: int) -> dict[str, Any]:
@@ -1050,7 +1085,7 @@ class AdminAPI:
         schedule_id: int,
         limit: int = 100,
         offset: int = 0,
-        result_filter: Optional[str] = None,
+        result_filter: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Get execution history for a schedule.

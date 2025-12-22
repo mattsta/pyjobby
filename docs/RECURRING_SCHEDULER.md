@@ -134,6 +134,7 @@ The scheduler includes multiple safety mechanisms to prevent system overload:
 **How it works**: Before creating a new job, the scheduler counts how many jobs from this schedule are currently running. If the count reaches `max_concurrent_jobs`, the execution is skipped.
 
 **Example**:
+
 ```bash
 # Only allow 1 daily report to run at a time
 pj-admin schedule add daily-report \
@@ -142,6 +143,7 @@ pj-admin schedule add daily-report \
 ```
 
 **When to use**:
+
 - Jobs that take a long time (> 1 hour)
 - Jobs that shouldn't overlap (database migrations, backups)
 - Resource-intensive jobs
@@ -153,6 +155,7 @@ pj-admin schedule add daily-report \
 **How it works**: Adds a random delay between 0 and `jitter_seconds` before creating the job. This spreads the load over time.
 
 **Example**:
+
 ```bash
 # Hourly job with 5-minute jitter window
 pj-admin schedule add hourly-sync \
@@ -161,6 +164,7 @@ pj-admin schedule add hourly-sync \
 ```
 
 **When to use**:
+
 - Many schedules running at the same time
 - Jobs that access external APIs (spread load)
 - Jobs that compete for resources
@@ -172,6 +176,7 @@ pj-admin schedule add hourly-sync \
 **How it works**: Before creating a job, checks the queue depth. If there are more than `backpressure_threshold` jobs waiting, the execution is skipped.
 
 **Example**:
+
 ```bash
 # Skip if queue has > 500 jobs waiting
 pj-admin schedule add data-export \
@@ -180,6 +185,7 @@ pj-admin schedule add data-export \
 ```
 
 **When to use**:
+
 - Non-critical jobs that can be skipped
 - Jobs during peak load times
 - Systems with variable load
@@ -191,6 +197,7 @@ pj-admin schedule add data-export \
 **How it works**: Tracks consecutive failures. When failures reach `circuit_breaker_threshold`, the schedule is automatically disabled. Requires manual re-enabling after fixing the issue.
 
 **Example**:
+
 ```bash
 # Disable after 5 consecutive failures
 pj-admin schedule add critical-job \
@@ -199,6 +206,7 @@ pj-admin schedule add critical-job \
 ```
 
 **When to re-enable**:
+
 1. Fix the underlying issue (bug, database problem, etc.)
 2. Re-enable the schedule: `pj-admin schedule enable critical-job`
 3. The failure counter is automatically reset when re-enabled
@@ -221,6 +229,7 @@ pj-admin schedule stats
 ```
 
 Output:
+
 ```
 Schedule Statistics
 Name         Enabled  Runs  Success  Fails  Skips  Rate    Next
@@ -247,6 +256,7 @@ pj-admin schedule show daily-cleanup
 ```
 
 Output shows:
+
 - Current enabled/disabled status
 - Next run time
 - Safety feature configuration
@@ -257,17 +267,20 @@ Output shows:
 ### Common Issues
 
 **Schedule not running:**
+
 1. Check if enabled: `pj-admin schedule show <name>`
 2. Check next_run time - might be in the future
 3. Check scheduler worker is running
 4. Check circuit breaker hasn't triggered (consecutive_failures)
 
 **Schedule skipping executions:**
+
 1. Check logs for skip reason (concurrency, backpressure, etc.)
 2. View history: `pj-admin schedule history <name>`
 3. Adjust safety thresholds if needed
 
 **Circuit breaker triggered:**
+
 1. Check error logs for the underlying issue
 2. Fix the problem (bug, database, API, etc.)
 3. Re-enable: `pj-admin schedule enable <name>`
@@ -298,21 +311,25 @@ pj scheduler ./pyjobby.conf.py
 ### Choosing Safety Parameters
 
 **max_concurrent_jobs**:
+
 - `1` - Jobs that must run sequentially (migrations, backups)
 - `3-5` - Normal jobs that can overlap but shouldn't run unlimited
 - Higher values - Fast, stateless jobs
 
 **jitter_seconds**:
+
 - `0` - Time-critical jobs that must run at exact time
 - `60-300` (1-5 min) - Normal jobs, spreads thundering herd
 - `600-1800` (10-30 min) - Background jobs, very flexible timing
 
 **backpressure_threshold**:
+
 - `100-500` - High-priority queues, catch overload early
 - `1000-5000` - Normal queues
 - `null` - Disable backpressure (job always runs)
 
 **circuit_breaker_threshold**:
+
 - `3-5` - Critical jobs, fail fast
 - `10-20` - Normal jobs
 - Higher values - Jobs with expected occasional failures
@@ -320,6 +337,7 @@ pj scheduler ./pyjobby.conf.py
 ### Schedule Naming
 
 Use descriptive names with hyphens:
+
 - ✓ `daily-user-cleanup`
 - ✓ `hourly-report-generation`
 - ✓ `weekly-database-backup`
@@ -328,6 +346,7 @@ Use descriptive names with hyphens:
 ### Job Arguments
 
 Pass configuration via kwargs:
+
 ```python
 await api.create_schedule(
     name='cleanup-old-data',
@@ -358,6 +377,7 @@ await api.create_schedule(
 ```
 
 Common timezones:
+
 - `UTC` (default)
 - `America/New_York` (Eastern)
 - `America/Los_Angeles` (Pacific)
@@ -369,6 +389,7 @@ Common timezones:
 Access the web interface at `http://localhost:8081/schedules` (default port).
 
 Features:
+
 - View all schedules with status and statistics
 - Create new schedules with form validation
 - Enable/disable schedules with one click
@@ -381,6 +402,7 @@ Features:
 See [Admin API Documentation](ADMIN_TOOLS.md#schedule-management) for complete API reference.
 
 Key methods:
+
 - `await api.create_schedule(...)`
 - `await api.list_schedules(enabled=True, queue='default')`
 - `await api.get_schedule(schedule_id=1)` or `get_schedule(name='daily-cleanup')`
@@ -406,6 +428,7 @@ The scheduler is designed for high performance:
 ### From cron
 
 Replace cron jobs with pyjobby schedules to get:
+
 - Centralized management
 - Safety features (concurrency limits, backpressure)
 - Execution history and statistics
@@ -415,6 +438,7 @@ Replace cron jobs with pyjobby schedules to get:
 ### From Celery Beat
 
 Replace Celery Beat with pyjobby scheduler to get:
+
 - Better safety features (circuit breaker, backpressure)
 - Native PostgreSQL integration (no Redis required)
 - Execution history in database
@@ -425,6 +449,7 @@ Replace Celery Beat with pyjobby scheduler to get:
 For detailed design information, see [SCHEDULER_DESIGN.md](SCHEDULER_DESIGN.md).
 
 For issues or questions:
+
 - Check logs for detailed error messages
 - Review schedule statistics and history
 - Verify safety thresholds are appropriate for your use case

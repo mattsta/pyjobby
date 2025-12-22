@@ -644,15 +644,15 @@ await server.start()
 
 ## 📊 Comparison
 
-| Feature | Admin API | CLI (`pj-admin`) | Web (`pj-web`) |
-|---------|-----------|------------------|----------------|
-| **Platform** | Python library | Terminal | Browser |
-| **Best for** | Automation, scripts | DevOps, debugging | Monitoring, dashboards |
-| **Real-time** | Manual refresh | Manual commands | Auto-refresh (htmx) |
-| **Filtering** | Full control | Command-line args | URL parameters |
-| **Output** | Python dicts | Tables, JSON | HTML, JSON |
-| **Batch ops** | ✅ Yes | ✅ Yes (multi-arg) | ⚠️ Limited |
-| **Authentication** | App-level | None | None (add reverse proxy) |
+| Feature            | Admin API           | CLI (`pj-admin`)   | Web (`pj-web`)           |
+| ------------------ | ------------------- | ------------------ | ------------------------ |
+| **Platform**       | Python library      | Terminal           | Browser                  |
+| **Best for**       | Automation, scripts | DevOps, debugging  | Monitoring, dashboards   |
+| **Real-time**      | Manual refresh      | Manual commands    | Auto-refresh (htmx)      |
+| **Filtering**      | Full control        | Command-line args  | URL parameters           |
+| **Output**         | Python dicts        | Tables, JSON       | HTML, JSON               |
+| **Batch ops**      | ✅ Yes              | ✅ Yes (multi-arg) | ⚠️ Limited               |
+| **Authentication** | App-level           | None               | None (add reverse proxy) |
 
 ---
 
@@ -698,6 +698,7 @@ poetry run pytest tests/test_admin_api.py -v
 ```
 
 Test coverage:
+
 - Job management (18 tests)
 - Queue management (6 tests)
 - Worker management (3 tests)
@@ -726,7 +727,7 @@ All three share the same backend implementation, ensuring consistency and reliab
 
 - API Reference: `pyjobby/admin_api.py` (docstrings)
 - CLI Help: `pj-admin --help`, `pj-admin jobs --help`, etc.
-- Web API: http://localhost:8081/api/* (JSON endpoints)
+- Web API: http://localhost:8081/api/\* (JSON endpoints)
 
 ---
 

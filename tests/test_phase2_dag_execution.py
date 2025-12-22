@@ -9,20 +9,9 @@ Comprehensive tests for Dynamic Job Graphs (DAGs):
 - DAG status tracking
 """
 
-import asyncio
-from datetime import datetime
-from typing import List
-
 import pytest
-import asyncpg
 
-from pyjobby.dag import (
-    DAGBuilder,
-    DAGNode,
-    execute_dag,
-    get_dag_status,
-    wait_for_dag
-)
+from pyjobby.dag import DAGBuilder, DAGNode, execute_dag, get_dag_status, wait_for_dag
 from tests.utils.factories import create_job, get_job
 
 
@@ -32,9 +21,7 @@ class TestDAGNode:
     def test_dag_node_creation(self):
         """Test creating a DAG node."""
         node = DAGNode(
-            job_class="test.Job",
-            kwargs={"param": "value"},
-            node_id="node_0"
+            job_class="test.Job", kwargs={"param": "value"}, node_id="node_0"
         )
 
         assert node.job_class == "test.Job"
@@ -46,11 +33,7 @@ class TestDAGNode:
         """Test node with dependencies."""
         dep1 = DAGNode(job_class="test.Dep1", node_id="node_0")
         dep2 = DAGNode(job_class="test.Dep2", node_id="node_1")
-        node = DAGNode(
-            job_class="test.Job",
-            depends_on=[dep1, dep2],
-            node_id="node_2"
-        )
+        node = DAGNode(job_class="test.Job", depends_on=[dep1, dep2], node_id="node_2")
 
         assert len(node.depends_on) == 2
         assert dep1 in node.depends_on
@@ -315,7 +298,7 @@ class TestDAGDatabaseSchema:
             FROM information_schema.columns
             WHERE table_name = 'jorb' AND column_name = 'dag_id'
         """)
-        assert result == 'dag_id'
+        assert result == "dag_id"
 
     @pytest.mark.asyncio
     async def test_dag_id_index_exists(self, db_connection):
@@ -325,16 +308,20 @@ class TestDAGDatabaseSchema:
             FROM pg_indexes
             WHERE tablename = 'jorb' AND indexname = 'jorb_dag_id_idx'
         """)
-        assert result == 'jorb_dag_id_idx'
+        assert result == "jorb_dag_id_idx"
 
     @pytest.mark.asyncio
     async def test_create_dag_record(self, db_connection):
         """Test creating a DAG record."""
-        dag_id = await db_connection.fetchval("""
+        dag_id = await db_connection.fetchval(
+            """
             INSERT INTO jorb_dag (name, metadata)
             VALUES ($1, $2)
             RETURNING id
-        """, "Test DAG", {"total_nodes": 5})
+        """,
+            "Test DAG",
+            {"total_nodes": 5},
+        )
 
         assert dag_id is not None
 
@@ -342,9 +329,9 @@ class TestDAGDatabaseSchema:
         dag = await db_connection.fetchrow(
             "SELECT * FROM jorb_dag WHERE id = $1", dag_id
         )
-        assert dag['name'] == 'Test DAG'
-        assert dag['metadata']['total_nodes'] == 5
-        assert dag['completed'] is None
+        assert dag["name"] == "Test DAG"
+        assert dag["metadata"]["total_nodes"] == 5
+        assert dag["completed"] is None
 
 
 class TestDAGViews:
@@ -376,81 +363,125 @@ class TestDAGViews:
     async def test_dag_status_view_simple(self, db_connection):
         """Test jorb_dag_status view with simple DAG."""
         # Create DAG
-        dag_id = await db_connection.fetchval("""
+        dag_id = await db_connection.fetchval(
+            """
             INSERT INTO jorb_dag (name) VALUES ($1) RETURNING id
-        """, "Simple DAG")
+        """,
+            "Simple DAG",
+        )
 
         # Create 3 jobs in DAG
         for i in range(3):
-            await db_connection.execute("""
+            await db_connection.execute(
+                """
                 INSERT INTO jorb (job_class, kwargs, queue, dag_id, state)
                 VALUES ($1, $2, $3, $4, $5)
-            """, f"test.Job{i}", '{}', "default", dag_id, "queued")
+            """,
+                f"test.Job{i}",
+                "{}",
+                "default",
+                dag_id,
+                "queued",
+            )
 
         # Query view
-        status = await db_connection.fetchrow("""
+        status = await db_connection.fetchrow(
+            """
             SELECT * FROM jorb_dag_status WHERE dag_id = $1
-        """, dag_id)
+        """,
+            dag_id,
+        )
 
-        assert status['dag_name'] == 'Simple DAG'
-        assert status['total_jobs'] == 3
-        assert status['queued_jobs'] == 3
-        assert status['running_jobs'] == 0
-        assert status['finished_jobs'] == 0
-        assert status['dag_state'] == 'queued'
+        assert status["dag_name"] == "Simple DAG"
+        assert status["total_jobs"] == 3
+        assert status["queued_jobs"] == 3
+        assert status["running_jobs"] == 0
+        assert status["finished_jobs"] == 0
+        assert status["dag_state"] == "queued"
 
     @pytest.mark.asyncio
     async def test_dag_status_view_mixed_states(self, db_connection):
         """Test jorb_dag_status with mixed job states."""
-        dag_id = await db_connection.fetchval("""
+        dag_id = await db_connection.fetchval(
+            """
             INSERT INTO jorb_dag (name) VALUES ($1) RETURNING id
-        """, "Mixed DAG")
+        """,
+            "Mixed DAG",
+        )
 
         states = ["finished", "finished", "running", "queued", "crashed"]
         for i, state in enumerate(states):
-            await db_connection.execute("""
+            await db_connection.execute(
+                """
                 INSERT INTO jorb (job_class, kwargs, queue, dag_id, state)
                 VALUES ($1, $2, $3, $4, $5)
-            """, f"test.Job{i}", '{}', "default", dag_id, state)
+            """,
+                f"test.Job{i}",
+                "{}",
+                "default",
+                dag_id,
+                state,
+            )
 
-        status = await db_connection.fetchrow("""
+        status = await db_connection.fetchrow(
+            """
             SELECT * FROM jorb_dag_status WHERE dag_id = $1
-        """, dag_id)
+        """,
+            dag_id,
+        )
 
-        assert status['total_jobs'] == 5
-        assert status['finished_jobs'] == 2
-        assert status['running_jobs'] == 1
-        assert status['queued_jobs'] == 1
-        assert status['crashed_jobs'] == 1
-        assert status['dag_state'] == 'failed'  # Has crashed jobs
+        assert status["total_jobs"] == 5
+        assert status["finished_jobs"] == 2
+        assert status["running_jobs"] == 1
+        assert status["queued_jobs"] == 1
+        assert status["crashed_jobs"] == 1
+        assert status["dag_state"] == "failed"  # Has crashed jobs
 
     @pytest.mark.asyncio
     async def test_dag_status_completion_percentage(self, db_connection):
         """Test completion_percentage calculation."""
-        dag_id = await db_connection.fetchval("""
+        dag_id = await db_connection.fetchval(
+            """
             INSERT INTO jorb_dag (name) VALUES ($1) RETURNING id
-        """, "Progress DAG")
+        """,
+            "Progress DAG",
+        )
 
         # 10 jobs: 7 finished, 3 running
         for i in range(7):
-            await db_connection.execute("""
+            await db_connection.execute(
+                """
                 INSERT INTO jorb (job_class, kwargs, queue, dag_id, state)
                 VALUES ($1, $2, $3, $4, 'finished')
-            """, f"test.Job{i}", '{}', "default", dag_id)
+            """,
+                f"test.Job{i}",
+                "{}",
+                "default",
+                dag_id,
+            )
 
         for i in range(3):
-            await db_connection.execute("""
+            await db_connection.execute(
+                """
                 INSERT INTO jorb (job_class, kwargs, queue, dag_id, state)
                 VALUES ($1, $2, $3, $4, 'running')
-            """, f"test.Job{i+7}", '{}', "default", dag_id)
+            """,
+                f"test.Job{i + 7}",
+                "{}",
+                "default",
+                dag_id,
+            )
 
-        status = await db_connection.fetchrow("""
+        status = await db_connection.fetchrow(
+            """
             SELECT * FROM jorb_dag_status WHERE dag_id = $1
-        """, dag_id)
+        """,
+            dag_id,
+        )
 
-        assert status['total_jobs'] == 10
-        assert status['finished_jobs'] == 7
-        assert status['completion_percentage'] == 70.0
+        assert status["total_jobs"] == 10
+        assert status["finished_jobs"] == 7
+        assert status["completion_percentage"] == 70.0
 
 
 class TestDAGSQLFunctions:
@@ -484,15 +515,24 @@ class TestDAGSQLFunctions:
     async def test_validate_dag_acyclic_valid_dag(self, db_connection):
         """Test validate_dag_acyclic with valid DAG."""
         # Create DAG with linear dependencies
-        dag_id = await db_connection.fetchval("""
+        dag_id = await db_connection.fetchval(
+            """
             INSERT INTO jorb_dag (name) VALUES ($1) RETURNING id
-        """, "Valid DAG")
+        """,
+            "Valid DAG",
+        )
 
         job1_id = await create_job(db_connection, job_class="test.Job1")
-        await db_connection.execute("UPDATE jorb SET dag_id = $1 WHERE id = $2", dag_id, job1_id)
+        await db_connection.execute(
+            "UPDATE jorb SET dag_id = $1 WHERE id = $2", dag_id, job1_id
+        )
 
-        job2_id = await create_job(db_connection, job_class="test.Job2", waitfor_job=job1_id)
-        await db_connection.execute("UPDATE jorb SET dag_id = $1 WHERE id = $2", dag_id, job2_id)
+        job2_id = await create_job(
+            db_connection, job_class="test.Job2", waitfor_job=job1_id
+        )
+        await db_connection.execute(
+            "UPDATE jorb SET dag_id = $1 WHERE id = $2", dag_id, job2_id
+        )
 
         # Validate
         is_valid = await db_connection.fetchval(
@@ -504,34 +544,55 @@ class TestDAGSQLFunctions:
     async def test_auto_complete_dag_trigger(self, db_connection):
         """Test that DAG auto-completes when all jobs finish."""
         # Create DAG
-        dag_id = await db_connection.fetchval("""
+        dag_id = await db_connection.fetchval(
+            """
             INSERT INTO jorb_dag (name) VALUES ($1) RETURNING id
-        """, "Auto Complete DAG")
+        """,
+            "Auto Complete DAG",
+        )
 
         # Create 2 jobs in DAG
-        job1_id = await create_job(db_connection, job_class="test.Job1", state="running")
-        await db_connection.execute("UPDATE jorb SET dag_id = $1 WHERE id = $2", dag_id, job1_id)
+        job1_id = await create_job(
+            db_connection, job_class="test.Job1", state="running"
+        )
+        await db_connection.execute(
+            "UPDATE jorb SET dag_id = $1 WHERE id = $2", dag_id, job1_id
+        )
 
-        job2_id = await create_job(db_connection, job_class="test.Job2", state="running")
-        await db_connection.execute("UPDATE jorb SET dag_id = $1 WHERE id = $2", dag_id, job2_id)
+        job2_id = await create_job(
+            db_connection, job_class="test.Job2", state="running"
+        )
+        await db_connection.execute(
+            "UPDATE jorb SET dag_id = $1 WHERE id = $2", dag_id, job2_id
+        )
 
         # Verify DAG not completed
-        dag = await db_connection.fetchrow("SELECT * FROM jorb_dag WHERE id = $1", dag_id)
-        assert dag['completed'] is None
+        dag = await db_connection.fetchrow(
+            "SELECT * FROM jorb_dag WHERE id = $1", dag_id
+        )
+        assert dag["completed"] is None
 
         # Mark first job finished
-        await db_connection.execute("UPDATE jorb SET state = 'finished' WHERE id = $1", job1_id)
+        await db_connection.execute(
+            "UPDATE jorb SET state = 'finished' WHERE id = $1", job1_id
+        )
 
         # DAG still not completed
-        dag = await db_connection.fetchrow("SELECT * FROM jorb_dag WHERE id = $1", dag_id)
-        assert dag['completed'] is None
+        dag = await db_connection.fetchrow(
+            "SELECT * FROM jorb_dag WHERE id = $1", dag_id
+        )
+        assert dag["completed"] is None
 
         # Mark second job finished
-        await db_connection.execute("UPDATE jorb SET state = 'finished' WHERE id = $1", job2_id)
+        await db_connection.execute(
+            "UPDATE jorb SET state = 'finished' WHERE id = $1", job2_id
+        )
 
         # DAG should now be completed
-        dag = await db_connection.fetchrow("SELECT * FROM jorb_dag WHERE id = $1", dag_id)
-        assert dag['completed'] is not None
+        dag = await db_connection.fetchrow(
+            "SELECT * FROM jorb_dag WHERE id = $1", dag_id
+        )
+        assert dag["completed"] is not None
 
 
 class TestDAGExecution:
@@ -563,13 +624,13 @@ class TestDAGExecution:
         job2_record = await get_job(db_pool, job2.job_id)
         job3_record = await get_job(db_pool, job3.job_id)
 
-        assert job2_record['waitfor_job'] == job1.job_id
-        assert job3_record['waitfor_job'] == job2.job_id
+        assert job2_record["waitfor_job"] == job1.job_id
+        assert job3_record["waitfor_job"] == job2.job_id
 
         # Verify all jobs have dag_id
         for node in [job1, job2, job3]:
             job = await get_job(db_pool, node.job_id)
-            assert job['dag_id'] is not None
+            assert job["dag_id"] is not None
 
     @pytest.mark.asyncio
     async def test_execute_parallel_dag(self, db_pool):
@@ -591,11 +652,11 @@ class TestDAGExecution:
         # Verify parallel jobs have no dependencies
         for node in [job1, job2, job3]:
             job = await get_job(db_pool, node.job_id)
-            assert job['waitfor_job'] is None
+            assert job["waitfor_job"] is None
 
         # Verify aggregator waits for group
         agg_job = await get_job(db_pool, agg.job_id)
-        assert agg_job['waitfor_group'] is not None
+        assert agg_job["waitfor_group"] is not None
 
     @pytest.mark.asyncio
     async def test_execute_diamond_dag(self, db_pool):
@@ -619,9 +680,9 @@ class TestDAGExecution:
         c_job = await get_job(db_pool, c.job_id)
         d_job = await get_job(db_pool, d.job_id)
 
-        assert b_job['waitfor_job'] == a.job_id
-        assert c_job['waitfor_job'] == a.job_id
-        assert d_job['waitfor_group'] is not None  # Waits for both b and c
+        assert b_job["waitfor_job"] == a.job_id
+        assert c_job["waitfor_job"] == a.job_id
+        assert d_job["waitfor_group"] is not None  # Waits for both b and c
 
     @pytest.mark.asyncio
     async def test_dag_with_common_options(self, db_pool):
@@ -641,8 +702,8 @@ class TestDAGExecution:
         job1_record = await get_job(db_pool, job1.job_id)
         job2_record = await get_job(db_pool, job2.job_id)
 
-        assert job1_record['queue'] == 'special_queue'
-        assert job2_record['queue'] == 'special_queue'
+        assert job1_record["queue"] == "special_queue"
+        assert job2_record["queue"] == "special_queue"
 
     @pytest.mark.asyncio
     async def test_execute_dag_validates_first(self, db_pool):
@@ -683,43 +744,61 @@ class TestDAGHelperFunctions:
     async def test_get_dag_status_helper(self, db_pool):
         """Test get_dag_status() helper function."""
         # Create a DAG with jobs
-        dag_id = await db_pool.fetchval("""
+        dag_id = await db_pool.fetchval(
+            """
             INSERT INTO jorb_dag (name) VALUES ($1) RETURNING id
-        """, "Status Test DAG")
+        """,
+            "Status Test DAG",
+        )
 
-        await db_pool.execute("""
+        await db_pool.execute(
+            """
             INSERT INTO jorb (job_class, kwargs, queue, dag_id, state)
             VALUES ($1, $2, $3, $4, 'finished')
-        """, "test.Job", '{}', "default", dag_id)
+        """,
+            "test.Job",
+            "{}",
+            "default",
+            dag_id,
+        )
 
         # Get status
         status = await get_dag_status(db_pool, dag_id)
 
-        assert status['dag_id'] == dag_id
-        assert status['dag_name'] == 'Status Test DAG'
-        assert status['total_jobs'] == 1
-        assert status['finished_jobs'] == 1
+        assert status["dag_id"] == dag_id
+        assert status["dag_name"] == "Status Test DAG"
+        assert status["total_jobs"] == 1
+        assert status["finished_jobs"] == 1
 
     @pytest.mark.asyncio
     async def test_get_dag_status_not_found(self, db_pool):
         """Test get_dag_status() with non-existent DAG."""
         status = await get_dag_status(db_pool, 999999)
 
-        assert 'error' in status
-        assert status['error'] == 'DAG not found'
+        assert "error" in status
+        assert status["error"] == "DAG not found"
 
     @pytest.mark.asyncio
     async def test_wait_for_dag_success(self, db_pool):
         """Test wait_for_dag() completes when DAG finishes."""
         # Create completed DAG
-        dag_id = await db_pool.fetchval("""
+        dag_id = await db_pool.fetchval(
+            """
             INSERT INTO jorb_dag (name, completed) VALUES ($1, NOW()) RETURNING id
-        """, "Completed DAG")
+        """,
+            "Completed DAG",
+        )
 
-        await db_pool.execute("""
+        await db_pool.execute(
+            """
             INSERT INTO jorb (job_class, kwargs, queue, dag_id, state)
             VALUES ($1, $2, $3, $4, 'finished')
-        """, "test.Job", '{}', "default", dag_id)
+        """,
+            "test.Job",
+            "{}",
+            "default",
+            dag_id,
+        )
 
         # Should return immediately
         result = await wait_for_dag(db_pool, dag_id, timeout=5)
@@ -729,14 +808,23 @@ class TestDAGHelperFunctions:
     async def test_wait_for_dag_failure(self, db_pool):
         """Test wait_for_dag() fails when jobs crash."""
         # Create DAG with crashed job
-        dag_id = await db_pool.fetchval("""
+        dag_id = await db_pool.fetchval(
+            """
             INSERT INTO jorb_dag (name) VALUES ($1) RETURNING id
-        """, "Failed DAG")
+        """,
+            "Failed DAG",
+        )
 
-        await db_pool.execute("""
+        await db_pool.execute(
+            """
             INSERT INTO jorb (job_class, kwargs, queue, dag_id, state)
             VALUES ($1, $2, $3, $4, 'crashed')
-        """, "test.Job", '{}', "default", dag_id)
+        """,
+            "test.Job",
+            "{}",
+            "default",
+            dag_id,
+        )
 
         # Should detect failure
         result = await wait_for_dag(db_pool, dag_id, timeout=5)
@@ -746,14 +834,23 @@ class TestDAGHelperFunctions:
     async def test_wait_for_dag_timeout(self, db_pool):
         """Test wait_for_dag() times out for incomplete DAG."""
         # Create incomplete DAG
-        dag_id = await db_pool.fetchval("""
+        dag_id = await db_pool.fetchval(
+            """
             INSERT INTO jorb_dag (name) VALUES ($1) RETURNING id
-        """, "Incomplete DAG")
+        """,
+            "Incomplete DAG",
+        )
 
-        await db_pool.execute("""
+        await db_pool.execute(
+            """
             INSERT INTO jorb (job_class, kwargs, queue, dag_id, state)
             VALUES ($1, $2, $3, $4, 'running')
-        """, "test.Job", '{}', "default", dag_id)
+        """,
+            "test.Job",
+            "{}",
+            "default",
+            dag_id,
+        )
 
         # Should timeout
         result = await wait_for_dag(db_pool, dag_id, timeout=1, poll_interval=0.5)
@@ -827,7 +924,9 @@ class TestComplexDAGPatterns:
         extract3 = dag.add("etl.ExtractDB", {"table": "users"})
 
         # Transform phase (waits for all extracts)
-        transform = dag.add("etl.TransformAll", depends_on=[extract1, extract2, extract3])
+        transform = dag.add(
+            "etl.TransformAll", depends_on=[extract1, extract2, extract3]
+        )
 
         # Load phase (waits for transform)
         load = dag.add("etl.LoadWarehouse", depends_on=[transform])
@@ -867,9 +966,9 @@ class TestComplexDAGPatterns:
 
         levels = dag.topological_sort()
         assert len(levels) == 3
-        assert len(levels[0]) == 1   # Split
-        assert len(levels[1]) == 5   # Mappers (parallel)
-        assert len(levels[2]) == 1   # Reduce
+        assert len(levels[0]) == 1  # Split
+        assert len(levels[1]) == 5  # Mappers (parallel)
+        assert len(levels[2]) == 1  # Reduce
 
     @pytest.mark.asyncio
     async def test_multi_stage_pipeline(self, db_pool):

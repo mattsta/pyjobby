@@ -7,12 +7,9 @@ the majority of real-world usage patterns.
 Coverage Target: Most critical client methods (enqueue, batch, get, cancel, stats)
 """
 
-import pytest
-import asyncpg
 from datetime import datetime, timedelta
 
-from pyjobby.client import JobClient, JobOptions, JobInfo
-
+import pytest
 
 # =============================================================================
 # BASIC JOB OPERATIONS
@@ -25,7 +22,7 @@ class TestJobEnqueue:
     @pytest.mark.asyncio
     async def test_enqueue_minimal(self, client):
         """Test enqueueing with minimal parameters."""
-        job_id = await client.enqueue('test.SimpleJob')
+        job_id = await client.enqueue("test.SimpleJob")
 
         assert isinstance(job_id, int)
         assert job_id > 0
@@ -34,10 +31,7 @@ class TestJobEnqueue:
     async def test_enqueue_with_kwargs(self, client):
         """Test enqueueing with job arguments."""
         job_id = await client.enqueue(
-            'test.EmailJob',
-            to='user@example.com',
-            subject='Test',
-            body='Hello world'
+            "test.EmailJob", to="user@example.com", subject="Test", body="Hello world"
         )
 
         assert isinstance(job_id, int)
@@ -45,47 +39,34 @@ class TestJobEnqueue:
     @pytest.mark.asyncio
     async def test_enqueue_with_queue(self, client):
         """Test enqueueing to specific queue."""
-        job_id = await client.enqueue(
-            'test.Job',
-            queue='high-priority'
-        )
+        job_id = await client.enqueue("test.Job", queue="high-priority")
 
         # Verify queue was set
         async with client.pool.acquire() as conn:
-            queue = await conn.fetchval(
-                "SELECT queue FROM jorb WHERE id = $1",
-                job_id
-            )
-        assert queue == 'high-priority'
+            queue = await conn.fetchval("SELECT queue FROM jorb WHERE id = $1", job_id)
+        assert queue == "high-priority"
 
     @pytest.mark.asyncio
     async def test_enqueue_with_priority(self, client):
         """Test enqueueing with custom priority."""
         job_id = await client.enqueue(
-            'test.Job',
-            priority=10  # High priority
+            "test.Job",
+            priority=10,  # High priority
         )
 
         async with client.pool.acquire() as conn:
-            prio = await conn.fetchval(
-                "SELECT prio FROM jorb WHERE id = $1",
-                job_id
-            )
+            prio = await conn.fetchval("SELECT prio FROM jorb WHERE id = $1", job_id)
         assert prio == 10
 
     @pytest.mark.asyncio
     async def test_enqueue_with_delay(self, client):
         """Test enqueueing with delayed execution."""
         run_after = datetime.utcnow() + timedelta(hours=1)
-        job_id = await client.enqueue(
-            'test.Job',
-            run_after=run_after
-        )
+        job_id = await client.enqueue("test.Job", run_after=run_after)
 
         async with client.pool.acquire() as conn:
             job_run_after = await conn.fetchval(
-                "SELECT run_after FROM jorb WHERE id = $1",
-                job_id
+                "SELECT run_after FROM jorb WHERE id = $1", job_id
             )
         # Check it's approximately correct (within 2 seconds)
         diff = abs((job_run_after - run_after).total_seconds())
@@ -94,17 +75,13 @@ class TestJobEnqueue:
     @pytest.mark.asyncio
     async def test_enqueue_with_capability(self, client):
         """Test enqueueing with capability requirement."""
-        job_id = await client.enqueue(
-            'test.Job',
-            capability='gpu'
-        )
+        job_id = await client.enqueue("test.Job", capability="gpu")
 
         async with client.pool.acquire() as conn:
             cap = await conn.fetchval(
-                "SELECT capability FROM jorb WHERE id = $1",
-                job_id
+                "SELECT capability FROM jorb WHERE id = $1", job_id
             )
-        assert cap == 'gpu'
+        assert cap == "gpu"
 
 
 # =============================================================================
@@ -119,9 +96,9 @@ class TestJobEnqueueBatch:
     async def test_enqueue_batch_simple(self, client):
         """Test enqueueing multiple jobs at once."""
         jobs = [
-            ('test.Job1', {'arg': 1}),
-            ('test.Job2', {'arg': 2}),
-            ('test.Job3', {'arg': 3}),
+            ("test.Job1", {"arg": 1}),
+            ("test.Job2", {"arg": 2}),
+            ("test.Job3", {"arg": 3}),
         ]
 
         job_ids = await client.enqueue_batch(jobs)
@@ -134,25 +111,20 @@ class TestJobEnqueueBatch:
     async def test_enqueue_batch_with_queue_and_priority(self, client):
         """Test batch enqueue with custom queue and priority."""
         jobs = [
-            ('test.Job1', {'data': 'a'}),
-            ('test.Job2', {'data': 'b'}),
+            ("test.Job1", {"data": "a"}),
+            ("test.Job2", {"data": "b"}),
         ]
 
-        job_ids = await client.enqueue_batch(
-            jobs,
-            queue='batch',
-            priority=50
-        )
+        job_ids = await client.enqueue_batch(jobs, queue="batch", priority=50)
 
         # Verify options applied to all jobs
         async with client.pool.acquire() as conn:
             queues = await conn.fetch(
-                "SELECT id, queue, prio FROM jorb WHERE id = ANY($1)",
-                job_ids
+                "SELECT id, queue, prio FROM jorb WHERE id = ANY($1)", job_ids
             )
 
-        assert all(q['queue'] == 'batch' for q in queues)
-        assert all(q['prio'] == 50 for q in queues)
+        assert all(q["queue"] == "batch" for q in queues)
+        assert all(q["prio"] == 50 for q in queues)
 
     @pytest.mark.asyncio
     async def test_enqueue_batch_empty(self, client):
@@ -173,15 +145,15 @@ class TestJobGet:
     async def test_get_job_exists(self, client):
         """Test getting an existing job."""
         # Create a job first
-        job_id = await client.enqueue('test.MyJob', arg=123)
+        job_id = await client.enqueue("test.MyJob", arg=123)
 
         # Retrieve it
         job = await client.get_job(job_id)
 
         assert job is not None
         assert job.id == job_id
-        assert job.job_class == 'test.MyJob'
-        assert job.state == 'queued'
+        assert job.job_class == "test.MyJob"
+        assert job.state == "queued"
 
     @pytest.mark.asyncio
     async def test_get_job_not_exists(self, client):
@@ -201,14 +173,14 @@ class TestJobCancel:
     @pytest.mark.asyncio
     async def test_cancel_queued_job(self, client):
         """Test cancelling a queued job."""
-        job_id = await client.enqueue('test.Job')
+        job_id = await client.enqueue("test.Job")
 
         success = await client.cancel_job(job_id)
         assert success is True
 
         # Verify state changed
         job = await client.get_job(job_id)
-        assert job.state == 'cancelled'
+        assert job.state == "cancelled"
 
     @pytest.mark.asyncio
     async def test_cancel_nonexistent_job(self, client):
@@ -229,23 +201,23 @@ class TestQueueStats:
     async def test_queue_stats_default(self, client):
         """Test getting stats for default queue."""
         # Create some jobs in default queue
-        await client.enqueue('test.Job1')
-        await client.enqueue('test.Job2')
+        await client.enqueue("test.Job1")
+        await client.enqueue("test.Job2")
 
         stats = await client.queue_stats()
 
         assert isinstance(stats, dict)
-        assert 'queued' in stats
-        assert stats['queued'] >= 2  # At least our 2 jobs
+        assert "queued" in stats
+        assert stats["queued"] >= 2  # At least our 2 jobs
 
     @pytest.mark.asyncio
     async def test_queue_depth(self, client):
         """Test getting queue depth."""
         # Create jobs
-        await client.enqueue('test.Job1', queue='test-depth')
-        await client.enqueue('test.Job2', queue='test-depth')
+        await client.enqueue("test.Job1", queue="test-depth")
+        await client.enqueue("test.Job2", queue="test-depth")
 
-        depth = await client.queue_depth('test-depth')
+        depth = await client.queue_depth("test-depth")
         assert depth >= 2
 
 

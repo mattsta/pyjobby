@@ -18,22 +18,24 @@ Example:
     job_ids = await dag.execute(client)
 """
 
-import asyncpg
 import uuid
-from typing import List, Dict, Optional, Any, Set
 from dataclasses import dataclass, field
+from typing import Any
+
+import asyncpg
 from loguru import logger
 
 
 @dataclass
 class DAGNode:
     """A node in the DAG representing a job"""
+
     job_class: str
-    kwargs: Dict[str, Any] = field(default_factory=dict)
-    depends_on: List['DAGNode'] = field(default_factory=list)
-    job_id: Optional[int] = None
+    kwargs: dict[str, Any] = field(default_factory=dict)
+    depends_on: list[DAGNode] = field(default_factory=list)
+    job_id: int | None = None
     node_id: str = ""  # Internal unique ID
-    _job_options: Dict[str, Any] = field(default_factory=dict)
+    _job_options: dict[str, Any] = field(default_factory=dict)
 
     def __hash__(self):
         return hash(self.node_id)
@@ -56,7 +58,7 @@ class DAGBuilder:
     - Named DAGs for monitoring
     """
 
-    def __init__(self, name: Optional[str] = None, **common_options):
+    def __init__(self, name: str | None = None, **common_options):
         """
         Create a new DAG builder.
 
@@ -66,14 +68,14 @@ class DAGBuilder:
         """
         self.name = name
         self.common_options = common_options
-        self.nodes: List[DAGNode] = []
+        self.nodes: list[DAGNode] = []
 
     def add(
         self,
         job_class: str,
-        kwargs: Optional[Dict[str, Any]] = None,
-        depends_on: Optional[List[DAGNode]] = None,
-        **options
+        kwargs: dict[str, Any] | None = None,
+        depends_on: list[DAGNode] | None = None,
+        **options,
     ) -> DAGNode:
         """
         Add a job to the DAG.
@@ -95,7 +97,7 @@ class DAGBuilder:
             job_class=job_class,
             kwargs=kwargs or {},
             depends_on=depends_on or [],
-            node_id=str(uuid.uuid4())
+            node_id=str(uuid.uuid4()),
         )
 
         # Merge common and job-specific options
@@ -120,13 +122,12 @@ class DAGBuilder:
             for dep in node.depends_on:
                 if dep not in self.nodes:
                     raise ValueError(
-                        f"Node {node.job_class} depends on {dep.job_class} "
-                        f"which is not in this DAG"
+                        f"Node {node.job_class} depends on {dep.job_class} which is not in this DAG"
                     )
 
         # Check for cycles using DFS
-        visited: Set[DAGNode] = set()
-        rec_stack: Set[DAGNode] = set()
+        visited: set[DAGNode] = set()
+        rec_stack: set[DAGNode] = set()
 
         def has_cycle(node: DAGNode) -> bool:
             visited.add(node)
@@ -143,13 +144,10 @@ class DAGBuilder:
             return False
 
         for node in self.nodes:
-            if node not in visited:
-                if has_cycle(node):
-                    raise ValueError(
-                        "DAG contains a cycle - dependencies must be acyclic"
-                    )
+            if node not in visited and has_cycle(node):
+                raise ValueError("DAG contains a cycle - dependencies must be acyclic")
 
-    def topological_sort(self) -> List[List[DAGNode]]:
+    def topological_sort(self) -> list[list[DAGNode]]:
         """
         Return nodes in topological order, grouped by execution level.
 
@@ -167,13 +165,13 @@ class DAGBuilder:
             # Level 2: node4 and node5 run in parallel after node3
         """
         # Calculate in-degree for each node
-        in_degree: Dict[DAGNode, int] = {node: 0 for node in self.nodes}
+        in_degree: dict[DAGNode, int] = dict.fromkeys(self.nodes, 0)
         for node in self.nodes:
             for dep in node.depends_on:
                 in_degree[node] += 1
 
         # Build levels
-        levels: List[List[DAGNode]] = []
+        levels: list[list[DAGNode]] = []
         remaining = set(self.nodes)
 
         while remaining:
@@ -195,7 +193,7 @@ class DAGBuilder:
 
         return levels
 
-    async def execute(self, client) -> Dict[DAGNode, int]:
+    async def execute(self, client) -> dict[DAGNode, int]:
         """
         Execute the DAG using the provided client.
 
@@ -222,7 +220,7 @@ class DAGBuilder:
             RETURNING id
             """,
             self.name,
-            {"total_nodes": len(self.nodes)}
+            {"total_nodes": len(self.nodes)},
         )
 
         logger.info(
@@ -231,7 +229,7 @@ class DAGBuilder:
         )
 
         # Track node -> job_id mapping
-        node_to_job: Dict[DAGNode, int] = {}
+        node_to_job: dict[DAGNode, int] = {}
 
         # Execute level by level
         for level_num, level in enumerate(levels):
@@ -251,7 +249,7 @@ class DAGBuilder:
                 # Handle dependencies
                 if len(waitfor_jobs) == 1:
                     # Single dependency - use waitfor_job
-                    job_options['waitfor_job'] = waitfor_jobs[0]
+                    job_options["waitfor_job"] = waitfor_jobs[0]
                 elif len(waitfor_jobs) > 1:
                     # Multiple dependencies - create a group
                     # Use the first job's ID as the group ID
@@ -261,23 +259,19 @@ class DAGBuilder:
                     await client.pool.execute(
                         "UPDATE jorb SET run_group = $1 WHERE id = ANY($2)",
                         group_id,
-                        waitfor_jobs
+                        waitfor_jobs,
                     )
 
-                    job_options['waitfor_group'] = group_id
+                    job_options["waitfor_group"] = group_id
 
                 # Enqueue job
                 job_id = await client.enqueue(
-                    node.job_class,
-                    **node.kwargs,
-                    **job_options
+                    node.job_class, **node.kwargs, **job_options
                 )
 
                 # Tag with DAG ID
                 await client.pool.execute(
-                    "UPDATE jorb SET dag_id = $1 WHERE id = $2",
-                    dag_id,
-                    job_id
+                    "UPDATE jorb SET dag_id = $1 WHERE id = $2", dag_id, job_id
                 )
 
                 # Track mapping
@@ -286,8 +280,7 @@ class DAGBuilder:
 
             job_ids = [node_to_job[n] for n in level]
             logger.info(
-                f"DAG '{self.name}' ({dag_id}): Level {level_num} enqueued "
-                f"(job IDs: {job_ids})"
+                f"DAG '{self.name}' ({dag_id}): Level {level_num} enqueued (job IDs: {job_ids})"
             )
 
         logger.info(
@@ -326,12 +319,13 @@ class DAGBuilder:
 
 # Convenience functions
 
-async def execute_dag(client, dag: DAGBuilder) -> Dict[DAGNode, int]:
+
+async def execute_dag(client, dag: DAGBuilder) -> dict[DAGNode, int]:
     """Execute a DAG. Shortcut for dag.execute(client)."""
     return await dag.execute(client)
 
 
-async def get_dag_status(pool: asyncpg.Pool, dag_id: int) -> Dict[str, Any]:
+async def get_dag_status(pool: asyncpg.Pool, dag_id: int) -> dict[str, Any]:
     """
     Get status of a DAG execution.
 
@@ -342,20 +336,17 @@ async def get_dag_status(pool: asyncpg.Pool, dag_id: int) -> Dict[str, Any]:
         """
         SELECT * FROM jorb_dag_status WHERE dag_id = $1
         """,
-        dag_id
+        dag_id,
     )
 
     if not status:
-        return {'error': 'DAG not found'}
+        return {"error": "DAG not found"}
 
     return dict(status)
 
 
 async def wait_for_dag(
-    pool: asyncpg.Pool,
-    dag_id: int,
-    timeout: int = 3600,
-    poll_interval: int = 1
+    pool: asyncpg.Pool, dag_id: int, timeout: int = 3600, poll_interval: int = 1
 ) -> bool:
     """
     Wait for DAG to complete.
@@ -377,17 +368,17 @@ async def wait_for_dag(
     while True:
         status = await get_dag_status(pool, dag_id)
 
-        if 'error' in status:
+        if "error" in status:
             logger.error(f"DAG {dag_id} not found")
             return False
 
-        state = status.get('dag_state')
-        if state == 'complete':
+        state = status.get("dag_state")
+        if state == "complete":
             logger.info(
                 f"DAG {dag_id} completed: {status['finished_jobs']}/{status['total_jobs']} jobs finished"
             )
             return True
-        elif state == 'failed':
+        elif state == "failed":
             logger.error(
                 f"DAG {dag_id} failed: {status['crashed_jobs']} crashed, "
                 f"{status['finished_jobs']}/{status['total_jobs']} finished"

@@ -7,27 +7,26 @@ locking behavior under high contention scenarios.
 
 import asyncio
 from datetime import datetime, timedelta
-from typing import List
 
 import asyncpg
-import pytest
 import orjson
+import pytest
 
 from tests.utils.factories import (
+    count_jobs_by_state,
     create_job,
     create_job_batch,
-    count_jobs_by_state,
     get_job,
 )
-
 
 pytestmark = pytest.mark.asyncio
 
 
 async def setup_json_codec(conn: asyncpg.Connection):
     """Configure orjson codec for a connection."""
+
     def orjson_encoder(obj):
-        return orjson.dumps(obj).decode('utf-8')
+        return orjson.dumps(obj).decode("utf-8")
 
     await conn.set_type_codec(
         "json",
@@ -66,7 +65,7 @@ class TestConcurrentJobClaiming:
         from pyjobby.pj import STMTS
 
         # Simulate 5 workers claiming jobs concurrently
-        async def worker_claim(worker_id: int) -> List[int]:
+        async def worker_claim(worker_id: int) -> list[int]:
             """Worker claims jobs until none are available."""
             conn = await connect_with_codec(db_params)
             claimed = []
@@ -79,7 +78,7 @@ class TestConcurrentJobClaiming:
                         f"worker-{worker_id}",
                         "test_queue",
                         ["test"],
-                        1000
+                        1000,
                     )
                     if result:
                         claimed.append(result["id"])
@@ -94,9 +93,7 @@ class TestConcurrentJobClaiming:
             return claimed
 
         # Run 5 workers concurrently
-        results = await asyncio.gather(
-            *[worker_claim(i) for i in range(5)]
-        )
+        results = await asyncio.gather(*[worker_claim(i) for i in range(5)])
 
         # Verify results
         all_claimed = []
@@ -132,16 +129,14 @@ class TestConcurrentJobClaiming:
                     f"worker-{worker_id}",
                     "test_queue",
                     ["test"],
-                    1000
+                    1000,
                 )
                 return result
             finally:
                 await conn.close()
 
         # 10 workers try to claim the same job simultaneously
-        results = await asyncio.gather(
-            *[attempt_claim(i) for i in range(10)]
-        )
+        results = await asyncio.gather(*[attempt_claim(i) for i in range(10)])
 
         # Only one should succeed
         successful_claims = [r for r in results if r is not None]
@@ -160,12 +155,8 @@ class TestConcurrentJobClaiming:
         queue_b_jobs = []
 
         for i in range(10):
-            queue_a_jobs.append(
-                await create_job(conn, queue="queue_a", state="queued")
-            )
-            queue_b_jobs.append(
-                await create_job(conn, queue="queue_b", state="queued")
-            )
+            queue_a_jobs.append(await create_job(conn, queue="queue_a", state="queued"))
+            queue_b_jobs.append(await create_job(conn, queue="queue_b", state="queued"))
 
         await conn.close()
 
@@ -184,7 +175,7 @@ class TestConcurrentJobClaiming:
                         f"worker-{queue_name}-{worker_id}",
                         queue_name,
                         ["test"],
-                        1000
+                        1000,
                     )
                     if result:
                         claimed.append(result["id"])
@@ -198,8 +189,7 @@ class TestConcurrentJobClaiming:
 
         # Workers claim from both queues concurrently
         queue_a_results, queue_b_results = await asyncio.gather(
-            claim_from_queue("queue_a", 1),
-            claim_from_queue("queue_b", 2)
+            claim_from_queue("queue_a", 1), claim_from_queue("queue_b", 2)
         )
 
         # Each queue should have all its jobs claimed
@@ -234,16 +224,14 @@ class TestConcurrentStateTransitions:
                 result = await conn.fetchrow(
                     STMTS["finished"],
                     job_id,
-                    {"status": "success", "result": f"job-{job_id}"}
+                    {"status": "success", "result": f"job-{job_id}"},
                 )
                 return result["id"]
             finally:
                 await conn.close()
 
         # Finish all jobs concurrently
-        finished_ids = await asyncio.gather(
-            *[finish_job(jid) for jid in job_ids]
-        )
+        finished_ids = await asyncio.gather(*[finish_job(jid) for jid in job_ids])
 
         # All should finish successfully
         assert set(finished_ids) == set(job_ids)
@@ -276,7 +264,7 @@ class TestConcurrentStateTransitions:
                     STMTS["crash"],
                     job_id,
                     f"Error {error_num}",
-                    f"Traceback for error {error_num}"
+                    f"Traceback for error {error_num}",
                 )
                 return job_id
             finally:
@@ -322,7 +310,7 @@ class TestConcurrentRetryCreation:
                     STMTS["create-retry"],
                     original_id,
                     timedelta(minutes=delay_minutes),
-                    1
+                    1,
                 )
                 return result["id"]
             finally:
@@ -330,7 +318,7 @@ class TestConcurrentRetryCreation:
 
         # Create retries concurrently
         retry_ids = await asyncio.gather(
-            *[create_retry(cid, i+1) for i, cid in enumerate(crashed_ids)]
+            *[create_retry(cid, i + 1) for i, cid in enumerate(crashed_ids)]
         )
 
         # All retries should be created
@@ -363,11 +351,7 @@ class TestConcurrentDependencyResolution:
         # Create child jobs waiting for parents
         child_ids = []
         for parent_id in parent_ids:
-            child_id = await create_job(
-                conn,
-                waitfor_job=parent_id,
-                state="waiting"
-            )
+            child_id = await create_job(conn, waitfor_job=parent_id, state="waiting")
             child_ids.append(child_id)
 
         await conn.close()
@@ -379,17 +363,14 @@ class TestConcurrentDependencyResolution:
             conn = await connect_with_codec(db_params)
             try:
                 results = await conn.fetch(
-                    STMTS["enqueue-next-self-finished"],
-                    parent_id
+                    STMTS["enqueue-next-self-finished"], parent_id
                 )
                 return len(results)
             finally:
                 await conn.close()
 
         # Resolve all dependencies concurrently
-        results = await asyncio.gather(
-            *[resolve_dependency(pid) for pid in parent_ids]
-        )
+        results = await asyncio.gather(*[resolve_dependency(pid) for pid in parent_ids])
 
         # Each should have resolved 1 dependency
         assert all(r >= 0 for r in results)
@@ -415,11 +396,7 @@ class TestConcurrentDependencyResolution:
                 await create_job(conn, run_group=group_id, state="finished")
 
             # Create waiter for group
-            waiter_id = await create_job(
-                conn,
-                waitfor_group=group_id,
-                state="waiting"
-            )
+            waiter_id = await create_job(conn, waitfor_group=group_id, state="waiting")
 
             groups.append((group_id, waiter_id))
 
@@ -432,17 +409,14 @@ class TestConcurrentDependencyResolution:
             conn = await connect_with_codec(db_params)
             try:
                 results = await conn.fetch(
-                    STMTS["enqueue-next-if-peer-group-is-finished"],
-                    group_id
+                    STMTS["enqueue-next-if-peer-group-is-finished"], group_id
                 )
                 return len(results)
             finally:
                 await conn.close()
 
         # Resolve all groups concurrently
-        results = await asyncio.gather(
-            *[resolve_group(gid) for gid, _ in groups]
-        )
+        results = await asyncio.gather(*[resolve_group(gid) for gid, _ in groups])
 
         # Verify all waiters are queued
         conn = await connect_with_codec(db_params)
@@ -480,7 +454,7 @@ class TestConcurrentRecovery:
                     10000 + worker_num,
                     worker_host,
                     old_time,
-                    job_id
+                    job_id,
                 )
                 worker_jobs[worker_host].append(job_id)
 
@@ -494,9 +468,7 @@ class TestConcurrentRecovery:
             try:
                 recovery_timeout = timedelta(minutes=5)
                 results = await conn.fetch(
-                    STMTS["recover-abandoned"],
-                    worker_host,
-                    recovery_timeout
+                    STMTS["recover-abandoned"], worker_host, recovery_timeout
                 )
                 return [r["id"] for r in results]
             finally:
@@ -504,7 +476,7 @@ class TestConcurrentRecovery:
 
         # Recover all workers concurrently
         results = await asyncio.gather(
-            *[recover_worker(whost) for whost in worker_jobs.keys()]
+            *[recover_worker(whost) for whost in worker_jobs]
         )
 
         # Verify each worker's jobs were recovered
@@ -548,7 +520,7 @@ class TestHighContentionScenarios:
                         f"worker-{worker_id}",
                         "test_queue",
                         ["test"],
-                        1000
+                        1000,
                     )
                     if result:
                         claimed.append(result["id"])
@@ -559,9 +531,7 @@ class TestHighContentionScenarios:
             return claimed
 
         # 20 workers compete for 5 jobs
-        results = await asyncio.gather(
-            *[aggressive_claimer(i) for i in range(20)]
-        )
+        results = await asyncio.gather(*[aggressive_claimer(i) for i in range(20)])
 
         # Collect all claims
         all_claimed = []
@@ -596,15 +566,13 @@ class TestHighContentionScenarios:
                     f"worker-{worker_id}",
                     "test_queue",
                     ["test"],
-                    1000
+                    1000,
                 )
 
                 if claimed:
                     # Try to finish
                     await conn.fetchrow(
-                        STMTS["finished"],
-                        claimed["id"],
-                        {"worker": worker_id}
+                        STMTS["finished"], claimed["id"], {"worker": worker_id}
                     )
                     return True
                 return False
@@ -612,9 +580,7 @@ class TestHighContentionScenarios:
                 await conn.close()
 
         # 10 workers race to claim and finish
-        results = await asyncio.gather(
-            *[claim_and_finish(i) for i in range(10)]
-        )
+        results = await asyncio.gather(*[claim_and_finish(i) for i in range(10)])
 
         # Only one should succeed
         successes = sum(1 for r in results if r)
@@ -654,7 +620,7 @@ class TestDeadlockPrevention:
                         f"worker-{worker_id}",
                         "test_queue",
                         ["test"],
-                        1000
+                        1000,
                     )
 
                     if not claimed:
@@ -670,9 +636,7 @@ class TestDeadlockPrevention:
 
                     # Finish
                     await conn.fetchrow(
-                        STMTS["finished"],
-                        job_id,
-                        {"worker": worker_id}
+                        STMTS["finished"], job_id, {"worker": worker_id}
                     )
 
                     processed += 1
@@ -682,9 +646,7 @@ class TestDeadlockPrevention:
             return processed
 
         # Run 10 workers concurrently
-        results = await asyncio.gather(
-            *[worker_lifecycle(i) for i in range(10)]
-        )
+        results = await asyncio.gather(*[worker_lifecycle(i) for i in range(10)])
 
         # All jobs should be processed
         total_processed = sum(results)
@@ -723,7 +685,7 @@ class TestStressScenarios:
                         f"worker-{worker_id}",
                         "test_queue",
                         ["test"],
-                        1000
+                        1000,
                     )
 
                     if not claimed:
@@ -732,9 +694,7 @@ class TestStressScenarios:
                     await conn.execute(STMTS["run"], claimed["id"])
                     await asyncio.sleep(0.0001)  # Tiny processing time
                     await conn.fetchrow(
-                        STMTS["finished"],
-                        claimed["id"],
-                        {"worker": worker_id}
+                        STMTS["finished"], claimed["id"], {"worker": worker_id}
                     )
 
                     processed += 1
@@ -745,9 +705,7 @@ class TestStressScenarios:
 
         # 50 workers
         start_time = datetime.utcnow()
-        results = await asyncio.gather(
-            *[worker_process(i) for i in range(50)]
-        )
+        results = await asyncio.gather(*[worker_process(i) for i in range(50)])
         duration = (datetime.utcnow() - start_time).total_seconds()
 
         # Verify all jobs processed
@@ -758,7 +716,7 @@ class TestStressScenarios:
         assert duration < 10.0  # 100 jobs in under 10 seconds
 
         print(f"\nProcessed 100 jobs with 50 workers in {duration:.2f}s")
-        print(f"Throughput: {total_processed/duration:.1f} jobs/sec")
+        print(f"Throughput: {total_processed / duration:.1f} jobs/sec")
 
 
 @pytest.mark.integration
@@ -774,11 +732,7 @@ class TestConcurrencyIntegration:
 
         child_ids = []
         for i in range(5):
-            child_id = await create_job(
-                conn,
-                waitfor_job=parent_id,
-                state="waiting"
-            )
+            child_id = await create_job(conn, waitfor_job=parent_id, state="waiting")
             child_ids.append(child_id)
 
         await conn.close()
@@ -788,8 +742,7 @@ class TestConcurrencyIntegration:
         # Process parent
         conn = await connect_with_codec(db_params)
         claimed = await conn.fetchrow(
-            STMTS["claim"],
-            1, "worker-1", "test_queue", ["test"], 1000
+            STMTS["claim"], 1, "worker-1", "test_queue", ["test"], 1000
         )
         await conn.execute(STMTS["run"], claimed["id"])
         await conn.fetchrow(STMTS["finished"], claimed["id"], {})
@@ -805,8 +758,11 @@ class TestConcurrencyIntegration:
             try:
                 claimed = await conn.fetchrow(
                     STMTS["claim"],
-                    worker_id, f"worker-{worker_id}",
-                    "test_queue", ["test"], 1000
+                    worker_id,
+                    f"worker-{worker_id}",
+                    "test_queue",
+                    ["test"],
+                    1000,
                 )
                 if claimed:
                     await conn.execute(STMTS["run"], claimed["id"])
@@ -817,9 +773,7 @@ class TestConcurrencyIntegration:
                 await conn.close()
 
         # 5 workers process 5 children
-        results = await asyncio.gather(
-            *[process_child(i) for i in range(5)]
-        )
+        results = await asyncio.gather(*[process_child(i) for i in range(5)])
 
         # All children should be processed
         processed_ids = [r for r in results if r]

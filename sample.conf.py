@@ -22,5 +22,5 @@ db_params = {
 #   - 'paths' key is an iterable of all job classes to make available as endpoints.
 web_listen = {
     "sites": [{"host": "127.0.0.1", "port": 6661}, {"path": "/tmp/pj.sock"}],
-    "paths": set(["job.image.thumbnails.Thumbnails"]),
+    "paths": {"job.image.thumbnails.Thumbnails"},
 }

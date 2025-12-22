@@ -5,6 +5,7 @@
 ### Workers Not Claiming Jobs
 
 **Symptoms**:
+
 - Jobs stuck in `queued` state
 - Workers running but idle
 - No logs showing job execution
@@ -14,6 +15,7 @@
 #### 1. Queue Mismatch
 
 **Diagnosis**:
+
 ```sql
 -- Check which queues have jobs
 SELECT queue, COUNT(*) FROM jorb WHERE state = 'queued' GROUP BY queue;
@@ -23,6 +25,7 @@ grep "Connected and waiting for jobs" /var/log/pyjobby/worker.log
 ```
 
 **Solution**:
+
 ```bash
 # Workers must match job queue
 pj --queue email  # If jobs are in 'email' queue
@@ -36,6 +39,7 @@ pj --queue default --queue email
 #### 2. Capability Mismatch
 
 **Diagnosis**:
+
 ```sql
 -- Check required capabilities
 SELECT DISTINCT capability FROM jorb WHERE state = 'queued';
@@ -49,6 +53,7 @@ WHERE state = 'queued'
 ```
 
 **Solution**:
+
 ```bash
 # Add required capability to worker
 pj --cap "gpu" --cap "ml-node"
@@ -62,6 +67,7 @@ UPDATE jorb SET capability = NULL WHERE id = 12345;
 #### 3. Future `run_after` Timestamp
 
 **Diagnosis**:
+
 ```sql
 -- Check if jobs are scheduled for the future
 SELECT id, job_class, run_after, run_after - NOW() as time_until_run
@@ -72,6 +78,7 @@ WHERE state = 'queued'
 
 **Solution**:
 Wait for timestamp to pass, or update to run immediately:
+
 ```sql
 UPDATE jorb
 SET run_after = NOW()
@@ -83,6 +90,7 @@ WHERE id = 12345;
 #### 4. Priority Too Low
 
 **Diagnosis**:
+
 ```sql
 -- Check job priorities
 SELECT id, job_class, prio FROM jorb WHERE state = 'queued' ORDER BY prio;
@@ -92,6 +100,7 @@ grep "prio" /var/log/pyjobby/worker.log
 ```
 
 **Solution**:
+
 ```bash
 # Start worker with higher priority limit
 pj --prio 10000  # Process jobs with prio <= 10000
@@ -105,6 +114,7 @@ UPDATE jorb SET prio = 0 WHERE id = 12345;
 #### 5. Database Connection Issues
 
 **Diagnosis**:
+
 ```bash
 # Check worker logs for connection errors
 grep -i "error" /var/log/pyjobby/worker.log
@@ -115,6 +125,7 @@ psql -h localhost -U pyjobby -d pyjobby_prod -c "SELECT 1;"
 ```
 
 **Solution**:
+
 ```python
 # Check config file
 cat pyjobby.conf.py
@@ -131,6 +142,7 @@ tail -f /var/log/postgresql/postgresql-15-main.log
 ### Jobs Stuck in "claimed" or "running" State
 
 **Symptoms**:
+
 - Jobs never complete
 - `state` is "claimed" or "running" for hours/days
 - Worker that claimed job is no longer running
@@ -140,6 +152,7 @@ tail -f /var/log/postgresql/postgresql-15-main.log
 **Solution**:
 
 **Immediate Fix** (Manual Recovery):
+
 ```sql
 -- Find stuck jobs
 SELECT id, job_class, worker_host, worker_pid, updated,
@@ -156,6 +169,7 @@ WHERE state IN ('claimed', 'running')
 ```
 
 **Automated Solution** (Create Cron Job):
+
 ```bash
 # /usr/local/bin/pyjobby-recover-stuck-jobs.sh
 #!/bin/bash
@@ -178,6 +192,7 @@ EOF
 ### High Error Rate
 
 **Symptoms**:
+
 - Many jobs in `crashed` state
 - Worker logs show frequent exceptions
 
@@ -216,6 +231,7 @@ WHERE job_class = 'job.email.SendEmail'
 ```
 
 **Solution**: Validate inputs before submission
+
 ```python
 def validate_email(email: str) -> bool:
     return "@" in email and "." in email.split("@")[1]
@@ -262,6 +278,7 @@ class ProcessLargeFile(Job):
 ### Database Performance Issues
 
 **Symptoms**:
+
 - Slow job claiming
 - Workers timing out
 - High database CPU usage
@@ -285,6 +302,7 @@ LIMIT 1;
 ```
 
 **Solution** (If indexes missing):
+
 ```sql
 -- Recreate indexes
 CREATE INDEX jorb_poll_idx ON jorb (queue, capability, prio, run_after)
@@ -294,6 +312,7 @@ WHERE state = 'queued' OR state = 'crashed';
 #### 2. Table Bloat
 
 **Diagnosis**:
+
 ```sql
 -- Check table size
 SELECT pg_size_pretty(pg_total_relation_size('jorb'));
@@ -306,6 +325,7 @@ WHERE relname = 'jorb';
 ```
 
 **Solution**:
+
 ```sql
 -- Vacuum the table
 VACUUM VERBOSE jorb;
@@ -320,6 +340,7 @@ ANALYZE jorb;
 #### 3. Too Many Completed Jobs
 
 **Diagnosis**:
+
 ```sql
 -- Count jobs by state
 SELECT state, COUNT(*) FROM jorb GROUP BY state;
@@ -328,6 +349,7 @@ SELECT state, COUNT(*) FROM jorb GROUP BY state;
 ```
 
 **Solution**:
+
 ```bash
 # Archive old jobs
 psql -U pyjobby -d pyjobby_prod <<EOF
@@ -350,6 +372,7 @@ EOF
 ```
 
 **Automate** (Add to cron):
+
 ```bash
 # /etc/cron.daily/pyjobby-cleanup
 0 2 * * * /usr/local/bin/pyjobby-archive-old-jobs.sh
@@ -358,6 +381,7 @@ EOF
 #### 4. Connection Pool Exhaustion
 
 **Diagnosis**:
+
 ```sql
 -- Check current connections
 SELECT COUNT(*), state
@@ -370,6 +394,7 @@ SHOW max_connections;
 ```
 
 **Solution**:
+
 ```python
 # Reduce pool size in config
 db_params = {
@@ -388,10 +413,12 @@ max_connections = 200  # Increase from 100
 ### Worker Memory Leaks
 
 **Symptoms**:
+
 - Worker memory usage grows over time
 - Eventually crashes with OOM error
 
 **Diagnosis**:
+
 ```bash
 # Monitor worker memory
 ps aux | grep pj
@@ -405,6 +432,7 @@ watch -n 5 'ps aux | grep pj | grep -v grep'
 #### 1. Cache Growing Unbounded
 
 **Problem**:
+
 ```python
 class LeakyJob(Job):
     def task(self, data: str):
@@ -414,6 +442,7 @@ class LeakyJob(Job):
 ```
 
 **Solution**:
+
 ```python
 class FixedJob(Job):
     def task(self, data: str):
@@ -432,6 +461,7 @@ class FixedJob(Job):
 #### 2. Unclosed Resources
 
 **Problem**:
+
 ```python
 class LeakyJob(Job):
     async def task(self, url: str):
@@ -442,6 +472,7 @@ class LeakyJob(Job):
 ```
 
 **Solution**:
+
 ```python
 class FixedJob(Job):
     async def task(self, url: str):
@@ -458,6 +489,7 @@ class FixedJob(Job):
 #### 3. Large Result Objects
 
 **Problem**:
+
 ```python
 class LeakyJob(Job):
     def task(self, filepath: str):
@@ -467,6 +499,7 @@ class LeakyJob(Job):
 ```
 
 **Solution**:
+
 ```python
 class FixedJob(Job):
     def task(self, filepath: str):
@@ -476,6 +509,7 @@ class FixedJob(Job):
 ```
 
 **Monitoring**:
+
 ```python
 # Add memory tracking
 import psutil
@@ -502,6 +536,7 @@ class MonitoredJob(Job):
 ### Web Endpoint Not Working
 
 **Symptoms**:
+
 - HTTP requests to job endpoints return 404 or timeout
 - Workers running but web requests not handled
 
@@ -521,6 +556,7 @@ web_listen = {
 ```
 
 **Solution**:
+
 ```python
 # Add job class to paths
 web_listen = {
@@ -544,6 +580,7 @@ ss -tlnp | grep 8080
 ```
 
 **Solution**:
+
 ```bash
 # Check firewall
 sudo ufw status
@@ -570,6 +607,7 @@ tail -f /var/log/pyjobby/worker.log
 ### Job Not Found Error
 
 **Symptoms**:
+
 ```
 FileNotFoundError: Job class not found: job.email.SendEmail; search path: [...]
 ```
@@ -587,6 +625,7 @@ grep "class SendEmail" job/email.py
 ```
 
 **Solution**:
+
 ```python
 # Ensure proper structure
 # job/email.py
@@ -607,6 +646,7 @@ python3 -c "import job.email; print(job.email.SendEmail)"
 ```
 
 **Solution**:
+
 ```bash
 # Add path when starting worker
 pj --path /opt/myapp --path /opt/myapp/workers
@@ -633,6 +673,7 @@ SELECT DISTINCT job_class FROM jorb;
 ### Jobs Running Multiple Times
 
 **Symptoms**:
+
 - Same job executes multiple times
 - Duplicate side effects (emails sent twice, etc.)
 
@@ -641,6 +682,7 @@ SELECT DISTINCT job_class FROM jorb;
 #### 1. Non-Idempotent Job Retrying
 
 **Problem**:
+
 ```python
 class SendEmail(Job):
     def task(self, to: str):
@@ -649,6 +691,7 @@ class SendEmail(Job):
 ```
 
 **Solution**: Make idempotent
+
 ```python
 class SendEmail(Job):
     async def task(self, to: str, message_id: str):
@@ -671,6 +714,7 @@ class SendEmail(Job):
 #### 2. Duplicate Job Submission
 
 **Problem**:
+
 ```python
 # User clicks "submit" button multiple times
 for _ in range(5):  # Oops!
@@ -678,6 +722,7 @@ for _ in range(5):  # Oops!
 ```
 
 **Solution**: Use deadline_key
+
 ```python
 import uuid
 
@@ -696,6 +741,7 @@ await conn.execute("""
 ### Slow Job Processing
 
 **Symptoms**:
+
 - Jobs taking much longer than expected
 - Queue depth growing
 
@@ -726,6 +772,7 @@ ORDER BY avg_seconds DESC;
 #### 2. Optimize Jobs
 
 **Profile Job**:
+
 ```python
 import time
 
@@ -743,6 +790,7 @@ class SlowJob(Job):
 ```
 
 **Common Optimizations**:
+
 ```python
 # Bad: N+1 queries
 for user_id in user_ids:
@@ -826,16 +874,19 @@ LIMIT 50;
 If you're still stuck:
 
 1. **Check worker logs**:
+
    ```bash
    journalctl -u pyjobby@default -f
    ```
 
 2. **Check PostgreSQL logs**:
+
    ```bash
    tail -f /var/log/postgresql/postgresql-15-main.log
    ```
 
 3. **Enable query logging** (temporarily):
+
    ```sql
    ALTER DATABASE pyjobby_prod SET log_statement = 'all';
    ```

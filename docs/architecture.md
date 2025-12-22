@@ -72,12 +72,14 @@ pj --queue default --workers 4 --cap "gpu" --config ./pyjobby.conf.py
 ```
 
 **Responsibilities**:
+
 - Parse command-line arguments
 - Load configuration file
 - Spawn N worker processes using `multiprocessing.Process`
 - Handle graceful shutdown on SIGTERM/SIGINT
 
 **Key Parameters**:
+
 - `--queue`: Which queue(s) to process (can specify multiple)
 - `--workers`: Number of parallel worker processes (default: CPU count / 2)
 - `--cap`: Capabilities this server advertises (e.g., "gpu", "ml-node")
@@ -91,11 +93,13 @@ pj --queue default --workers 4 --cap "gpu" --config ./pyjobby.conf.py
 Each worker process runs an instance of `JobSystem`, which is the orchestrator for:
 
 **Database Connection**:
+
 - Uses `asyncpg` for async PostgreSQL operations
 - Connection pooling for efficiency
 - Prepared statements for all common operations
 
 **Job Polling Loop**:
+
 ```python
 while True:
     job_data = await self.claim()  # Atomically claim next eligible job
@@ -107,17 +111,20 @@ while True:
 ```
 
 **Web Server (Optional)**:
+
 - Each worker can run an aiohttp web server
 - Jobs with a `web()` method can be invoked directly via HTTP
 - Linux kernel TCP load balancing distributes requests across workers
 - Bypasses queue for real-time processing
 
 **Shared Cache**:
+
 - `self.cache` dictionary available to all jobs on a worker
 - Persist state, credentials, or stats across job executions
 - Not shared between workers (process-local only)
 
 **Signal Handling**:
+
 - SIGTERM/SIGINT: Graceful shutdown after current job completes
 - Prevents orphaned jobs in "running" state
 
@@ -137,6 +144,7 @@ class MyJob(Job):
 ```
 
 **Provided Attributes**:
+
 - `self.s`: Reference to the JobSystem instance
 - `self.job`: Dict containing the job row data from database
 - `self.cache`: Shortcut to `self.s.cache` for worker-local storage
@@ -146,6 +154,7 @@ class MyJob(Job):
 Jobs can implement `task()` in three ways:
 
 1. **Synchronous**:
+
 ```python
 def task(self, url: str) -> dict:
     response = requests.get(url)
@@ -153,6 +162,7 @@ def task(self, url: str) -> dict:
 ```
 
 2. **Asynchronous**:
+
 ```python
 async def task(self, url: str) -> dict:
     async with aiohttp.ClientSession() as session:
@@ -161,6 +171,7 @@ async def task(self, url: str) -> dict:
 ```
 
 3. **Async Generator** (streaming results):
+
 ```python
 async def task(self, urls: list[str]):
     for url in urls:
@@ -169,6 +180,7 @@ async def task(self, urls: list[str]):
 ```
 
 **Lifecycle Methods**:
+
 - `run()`: Called by JobSystem, invokes `task()` with kwargs from DB
 - `reschedule(relative: int, unit: str)`: Reschedule job for future execution
 - `rescheduleBackoff(attempt: int)`: Exponential backoff (16s to 17.2 min)
@@ -180,6 +192,7 @@ async def task(self, urls: list[str]):
 The `jorb` table is the heart of the system:
 
 **Key Columns**:
+
 - `id`: Primary key (auto-increment)
 - `state`: Enum (waiting, queued, claimed, running, heartbeat, crashed, finished)
 - `job_class`: Full Python path to job class (e.g., "job.email.SendEmail")
@@ -197,6 +210,7 @@ The `jorb` table is the heart of the system:
 - `uid`: User ID (for multi-tenant tracking)
 
 **State Machine**:
+
 ```
 waiting ──┐
           │
@@ -228,17 +242,17 @@ waiting ──┐
 
 All database operations use prepared statements for performance and safety:
 
-| Statement | Purpose | Key SQL Features |
-|-----------|---------|------------------|
-| `claim` | Atomically claim next eligible job | `FOR UPDATE SKIP LOCKED`, filters by queue/capability/priority/time |
-| `get` | Retrieve claimed job details | Simple SELECT by ID |
-| `run` | Mark job as running | UPDATE state, set `run_at` timestamp |
-| `finished` | Mark job complete | UPDATE state, store result JSONB |
-| `crash` | Record job failure | UPDATE state, store backtrace, increment attempt counter |
-| `reschedule` | Re-queue failed job | UPDATE state to 'queued', set future `run_after` |
-| `schedule-deadline` | Insert job with deadline key | INSERT with ON CONFLICT handling for unique deadline |
-| `enqueue-next-self-finished` | Activate dependent jobs | UPDATE jobs waiting on this job ID |
-| `enqueue-next-if-peer-group-is-finished` | Activate group-dependent jobs | Complex query checking if all jobs in run_group are finished |
+| Statement                                | Purpose                            | Key SQL Features                                                    |
+| ---------------------------------------- | ---------------------------------- | ------------------------------------------------------------------- |
+| `claim`                                  | Atomically claim next eligible job | `FOR UPDATE SKIP LOCKED`, filters by queue/capability/priority/time |
+| `get`                                    | Retrieve claimed job details       | Simple SELECT by ID                                                 |
+| `run`                                    | Mark job as running                | UPDATE state, set `run_at` timestamp                                |
+| `finished`                               | Mark job complete                  | UPDATE state, store result JSONB                                    |
+| `crash`                                  | Record job failure                 | UPDATE state, store backtrace, increment attempt counter            |
+| `reschedule`                             | Re-queue failed job                | UPDATE state to 'queued', set future `run_after`                    |
+| `schedule-deadline`                      | Insert job with deadline key       | INSERT with ON CONFLICT handling for unique deadline                |
+| `enqueue-next-self-finished`             | Activate dependent jobs            | UPDATE jobs waiting on this job ID                                  |
+| `enqueue-next-if-peer-group-is-finished` | Activate group-dependent jobs      | Complex query checking if all jobs in run_group are finished        |
 
 **Example: Job Claiming Algorithm**
 
@@ -261,6 +275,7 @@ RETURNING *;
 ```
 
 This query ensures:
+
 - **Atomicity**: Only one worker claims each job
 - **Priority**: Lower `prio` values selected first
 - **Scheduling**: Jobs only run after `run_after` timestamp
@@ -289,6 +304,7 @@ await conn.execute("""
 ```
 
 Database state:
+
 ```
 id: 1001
 state: queued
@@ -309,6 +325,7 @@ job_data = await conn.fetchrow("claim", ["default"], ["hostname:web-1"])
 ```
 
 Database state changes:
+
 ```
 id: 1001
 state: claimed          # ← Changed from 'queued'
@@ -334,6 +351,7 @@ result = await job_instance.run()  # Calls task(**kwargs)
 ```
 
 Database state during execution:
+
 ```
 id: 1001
 state: running          # ← Changed from 'claimed'
@@ -351,6 +369,7 @@ await conn.execute("enqueue-next-self-finished", job_data['id'])
 ```
 
 Final database state:
+
 ```
 id: 1001
 state: finished         # ← Changed from 'running'
@@ -375,6 +394,7 @@ except Exception as e:
 ```
 
 Database state after crash:
+
 ```
 id: 1001
 state: crashed
@@ -404,6 +424,7 @@ Machine 3:  pj --workers 8 --cap "ml-gpu" --queue ml
 ```
 
 Key benefits:
+
 - **Automatic Load Balancing**: PostgreSQL's row locking distributes work
 - **Fault Tolerance**: If one machine dies, others continue processing
 - **Specialization**: Different machines can advertise different capabilities
@@ -412,6 +433,7 @@ Key benefits:
 ### Vertical Scaling
 
 Within a single machine:
+
 - Increase `--workers` count (default: CPU count / 2)
 - Each worker is a separate OS process (true parallelism)
 - Workers share nothing (no GIL contention)
@@ -419,18 +441,21 @@ Within a single machine:
 ### Performance Characteristics
 
 **Polling Overhead**:
+
 - Each worker polls every 5-6 seconds when idle
 - With 10 workers: ~120 queries/minute when idle
 - Queries are fast (index-only scans): <1ms each
 - Minimal CPU/network impact
 
 **WAL Pollution**:
+
 - Every state transition commits an UPDATE
 - High job throughput generates PostgreSQL WAL traffic
 - Requires regular VACUUM on busy systems
 - Trade-off: Durability and observability over raw speed
 
 **Throughput Benchmarks** (typical hardware):
+
 - Small jobs (<1s): ~100-500 jobs/second per worker
 - Large jobs (>1s): Limited by job duration, not system overhead
 - Database becomes bottleneck around 1000 jobs/second aggregate
@@ -533,6 +558,7 @@ pj --cap "hostname:web-1" --workers 8
 ```
 
 **Default Capabilities**:
+
 - Every worker automatically advertises `hostname:<platform.node()>`
 - Jobs with `capability=NULL` can run on any worker
 
@@ -561,6 +587,7 @@ await addJob(db,
 ```
 
 The unique constraint is:
+
 ```sql
 CREATE UNIQUE INDEX jorb_deadline_noconflict_idx
 ON jorb (queue, deadline_key)
@@ -594,6 +621,7 @@ Jobs remain in `queued` state until `run_after` timestamp passes, then become el
 Jobs can be invoked directly via HTTP, bypassing the queue:
 
 **Configuration**:
+
 ```python
 # pyjobby.conf.py
 web_listen = {
@@ -609,6 +637,7 @@ web_listen = {
 ```
 
 **Job Implementation**:
+
 ```python
 from aiohttp import web
 
@@ -627,6 +656,7 @@ class Thumbnail(Job):
 ```
 
 **Usage**:
+
 ```bash
 # Direct web request (immediate processing)
 curl -X POST http://localhost:8080/job.image.Thumbnail \
@@ -640,6 +670,7 @@ psql -c "INSERT INTO jorb (job_class, kwargs)
 ```
 
 **Load Balancing**:
+
 - On Linux: Kernel distributes TCP connections across all worker processes
 - On macOS/BSD: Only one worker receives connections (use Unix sockets + nginx)
 
@@ -650,12 +681,14 @@ psql -c "INSERT INTO jorb (job_class, kwargs)
 When a job raises an exception, Phase 1 implements a robust retry mechanism:
 
 1. **Crash Recorded** (Original job marked for audit trail):
+
    ```python
    await conn.execute("crash", job_id, str(exception), full_traceback)
    # Sets: state='crashed', error_message='...', error_backtrace='...'
    ```
 
 2. **Backoff Calculated**:
+
    ```python
    # Exponential backoff: 16s, 32s, 1m, 2m, 4m, 8m, 17m
    def rescheduleBackoff(self, attempt: int) -> timedelta:
@@ -665,6 +698,7 @@ When a job raises an exception, Phase 1 implements a robust retry mechanism:
    ```
 
 3. **Check Retry Limit**:
+
    ```python
    current_error_count = job["error_count"] + 1
    if current_error_count < max_retries:
@@ -691,12 +725,14 @@ When a job raises an exception, Phase 1 implements a robust retry mechanism:
    ```
 
 **Result**:
+
 - Original job: `state='crashed'`, complete audit trail preserved
 - Retry job: `state='queued'`, `run_after=NOW() + delay`, `admin_data={parent_job_id: original_id}`
 
 **Maximum Retries**: Configurable via `JobSystem.max_retries` (default: 10)
 
 **Benefits**:
+
 - ✅ Complete audit trail of all failures
 - ✅ Clear parent-child relationship via `admin_data`
 - ✅ Retries actually work (critical bug fix from v1.0.0)
@@ -893,6 +929,7 @@ class MetricsJob(Job):
 ### vs. Celery
 
 **Pyjobby**:
+
 - ✅ Simple: 1,000 lines of code
 - ✅ PostgreSQL-backed (durable)
 - ✅ No message broker needed
@@ -902,6 +939,7 @@ class MetricsJob(Job):
 - ❌ Lower throughput for small jobs
 
 **Celery**:
+
 - ❌ Complex: Large codebase
 - ❌ Requires Redis/RabbitMQ
 - ✅ Web UI (Flower)
@@ -911,12 +949,14 @@ class MetricsJob(Job):
 ### vs. RQ (Redis Queue)
 
 **Pyjobby**:
+
 - ✅ Durable (survives DB restart)
 - ✅ ACID guarantees
 - ✅ Advanced dependencies (groups)
 - ❌ Slower for tiny jobs
 
 **RQ**:
+
 - ✅ Simple like pyjobby
 - ❌ Redis-based (less durable)
 - ✅ Faster for small jobs
@@ -925,11 +965,13 @@ class MetricsJob(Job):
 ### vs. Dramatiq
 
 **Pyjobby**:
+
 - ✅ No broker needed
 - ✅ SQL-queryable state
 - ❌ Lower raw throughput
 
 **Dramatiq**:
+
 - ✅ Higher throughput
 - ❌ Requires RabbitMQ/Redis
 - ❌ Less visibility into state
@@ -939,11 +981,13 @@ class MetricsJob(Job):
 ### Chosen: Simplicity over Performance
 
 **Impact**:
+
 - 5-6 second polling interval (not instant)
 - Every state change commits to WAL (write amplification)
 - `FOR UPDATE SKIP LOCKED` (not fastest locking method)
 
 **Benefit**:
+
 - Entire system fits in one file
 - Easy to audit and understand
 - No complex pub/sub coordination
@@ -952,10 +996,12 @@ class MetricsJob(Job):
 ### Chosen: PostgreSQL over Message Broker
 
 **Impact**:
+
 - WAL traffic from frequent updates
 - Not optimal for millions of tiny jobs/second
 
 **Benefit**:
+
 - One dependency instead of two (no Redis/RabbitMQ)
 - Durable by default
 - Observable with standard SQL tools
@@ -964,10 +1010,12 @@ class MetricsJob(Job):
 ### Chosen: Multiprocessing over Async-Only
 
 **Impact**:
+
 - Higher memory usage (each process has own Python interpreter)
 - Can't share in-memory data structures across workers
 
 **Benefit**:
+
 - True parallelism (no GIL)
 - Process isolation (one job crash doesn't kill others)
 - Supports sync and async jobs equally well
@@ -1031,12 +1079,14 @@ Pyjobby provides a production-ready job queue system with:
 - ✅ **Observability**: SQL-queryable state, full error traces
 
 Best suited for:
+
 - Applications already using PostgreSQL
 - Moderate job volumes (< 1000 jobs/second)
 - Need for durable, observable job state
 - Teams valuing simplicity and maintainability
 
 Not ideal for:
+
 - Ultra-high throughput requirements (millions of tiny jobs/second)
 - Real-time job execution (5-6 second polling delay)
 - Complex workflow orchestration (better suited to Airflow/Prefect)

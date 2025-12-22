@@ -14,8 +14,8 @@ This architecture supports concurrent test execution.
 import asyncio
 import os
 import uuid
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
-from typing import AsyncIterator, Iterator
 
 import asyncpg
 import pytest
@@ -25,13 +25,16 @@ import pytest_asyncio
 SCHEMA_PATH = Path(__file__).parent.parent / "priv" / "schema.sql"
 
 # Get database connection from environment or use default
-DEFAULT_TEST_DSN = "postgresql://pyjobby_test:pyjobby_test_password@localhost:5432/pyjobby_test"
+DEFAULT_TEST_DSN = (
+    "postgresql://pyjobby_test:pyjobby_test_password@localhost:5432/pyjobby_test"
+)
 TEST_DSN = os.getenv("PYJOBBY_TEST_DSN", DEFAULT_TEST_DSN)
 
 
 # ============================================================================
 # Test Isolation Helpers
 # ============================================================================
+
 
 def unique_name(base: str) -> str:
     """
@@ -79,6 +82,7 @@ def unique_queue(test_id: str) -> str:
 # Event Loop Configuration
 # ============================================================================
 
+
 @pytest.fixture(scope="session")
 def event_loop() -> Iterator[asyncio.AbstractEventLoop]:
     """Create an event loop for the test session."""
@@ -90,6 +94,7 @@ def event_loop() -> Iterator[asyncio.AbstractEventLoop]:
 # ============================================================================
 # Database Connection Parameters
 # ============================================================================
+
 
 @pytest.fixture(scope="session")
 def db_params() -> dict[str, str]:
@@ -114,6 +119,7 @@ def db_params() -> dict[str, str]:
 # ============================================================================
 # Database Cleanup - BEFORE each test for clean slate
 # ============================================================================
+
 
 async def _cleanup_database(db_params: dict[str, str]) -> None:
     """
@@ -146,7 +152,7 @@ async def ensure_clean_database(request, db_params: dict[str, str]):
     """
     # Check if running with pytest-xdist (parallel)
     # If PYTEST_XDIST_WORKER is set, we're in a worker process
-    is_parallel = os.environ.get('PYTEST_XDIST_WORKER') is not None
+    is_parallel = os.environ.get("PYTEST_XDIST_WORKER") is not None
 
     if is_parallel:
         # In parallel mode, DON'T clean the whole database
@@ -197,12 +203,13 @@ async def ensure_clean_database(request, db_params: dict[str, str]):
 # JSON Codec Configuration
 # ============================================================================
 
+
 async def _configure_json_codec(conn: asyncpg.Connection) -> None:
     """Configure orjson codec for JSON/JSONB types."""
     import orjson
 
     def orjson_encoder(obj):
-        return orjson.dumps(obj).decode('utf-8')
+        return orjson.dumps(obj).decode("utf-8")
 
     def orjson_decoder(s):
         return orjson.loads(s)
@@ -212,20 +219,21 @@ async def _configure_json_codec(conn: asyncpg.Connection) -> None:
         encoder=orjson_encoder,
         decoder=orjson_decoder,
         schema="pg_catalog",
-        format="text"
+        format="text",
     )
     await conn.set_type_codec(
         "jsonb",
         encoder=orjson_encoder,
         decoder=orjson_decoder,
         schema="pg_catalog",
-        format="text"
+        format="text",
     )
 
 
 # ============================================================================
 # Database Connection Fixtures
 # ============================================================================
+
 
 @pytest_asyncio.fixture
 async def db_connection(db_params: dict[str, str]) -> AsyncIterator[asyncpg.Connection]:
@@ -258,7 +266,9 @@ async def db_connection(db_params: dict[str, str]) -> AsyncIterator[asyncpg.Conn
 
 
 @pytest_asyncio.fixture
-async def clean_db(db_connection: asyncpg.Connection) -> AsyncIterator[asyncpg.Connection]:
+async def clean_db(
+    db_connection: asyncpg.Connection,
+) -> AsyncIterator[asyncpg.Connection]:
     """
     Provide a clean database with all tables truncated.
 
@@ -275,6 +285,7 @@ async def clean_db(db_connection: asyncpg.Connection) -> AsyncIterator[asyncpg.C
 # Connection Pool Fixtures
 # ============================================================================
 
+
 @pytest_asyncio.fixture
 async def db_pool(db_params: dict[str, str]) -> AsyncIterator[asyncpg.Pool]:
     """
@@ -286,14 +297,12 @@ async def db_pool(db_params: dict[str, str]) -> AsyncIterator[asyncpg.Pool]:
     Yields:
         asyncpg.Pool: Connection pool
     """
+
     async def init_connection(conn):
         await _configure_json_codec(conn)
 
     pool = await asyncpg.create_pool(
-        **db_params,
-        min_size=2,
-        max_size=10,
-        init=init_connection
+        **db_params, min_size=2, max_size=10, init=init_connection
     )
 
     try:
@@ -305,6 +314,7 @@ async def db_pool(db_params: dict[str, str]) -> AsyncIterator[asyncpg.Pool]:
 # ============================================================================
 # Worker Configuration Fixtures
 # ============================================================================
+
 
 @pytest.fixture
 def worker_params(unique_queue: str) -> dict:
@@ -333,6 +343,7 @@ def worker_params(unique_queue: str) -> dict:
 # Client Fixtures
 # ============================================================================
 
+
 @pytest_asyncio.fixture
 async def client(db_pool: asyncpg.Pool):
     """
@@ -352,6 +363,7 @@ async def client(db_pool: asyncpg.Pool):
 # ============================================================================
 # JobSystem Fixtures
 # ============================================================================
+
 
 @pytest_asyncio.fixture
 async def job_system(db_params: dict[str, str], db_connection, worker_params: dict):
@@ -375,6 +387,7 @@ async def job_system(db_params: dict[str, str], db_connection, worker_params: di
 
     # Prepare all SQL statements
     from pyjobby.pj import STMTS
+
     system.stmts = {}
     for name, stmt in STMTS.items():
         system.stmts[name] = await db_connection.prepare(stmt)
@@ -388,6 +401,7 @@ async def job_system(db_params: dict[str, str], db_connection, worker_params: di
 # ============================================================================
 # Isolated JobSystem Factory (for tests that need custom configuration)
 # ============================================================================
+
 
 @pytest_asyncio.fixture
 async def create_isolated_job_system(db_params: dict[str, str], db_pool: asyncpg.Pool):
@@ -405,15 +419,15 @@ async def create_isolated_job_system(db_params: dict[str, str], db_pool: asyncpg
     Returns:
         Callable that creates isolated JobSystem instances
     """
-    from pyjobby.pj import JobSystem, STMTS
+    from pyjobby.pj import STMTS, JobSystem
 
     created_systems = []
 
     async def _factory(
         queue_suffix: str = None,
-        capabilities: tuple = ('test',),
+        capabilities: tuple = ("test",),
         worker_id: int = None,
-        **kwargs
+        **kwargs,
     ) -> JobSystem:
         # Generate unique queue name
         unique_suffix = queue_suffix or uuid.uuid4().hex[:8]
@@ -429,10 +443,10 @@ async def create_isolated_job_system(db_params: dict[str, str], db_pool: asyncpg
             workerId=wid,
             checkInterval=0.1,
             webPort=None,
-            max_retries=kwargs.get('max_retries', 10),
-            default_timeout=kwargs.get('default_timeout', 3600),
-            recovery_timeout=kwargs.get('recovery_timeout', 300),
-            enable_recovery=kwargs.get('enable_recovery', True),
+            max_retries=kwargs.get("max_retries", 10),
+            default_timeout=kwargs.get("default_timeout", 3600),
+            recovery_timeout=kwargs.get("recovery_timeout", 300),
+            enable_recovery=kwargs.get("enable_recovery", True),
         )
 
         # Connect and prepare statements
@@ -459,6 +473,7 @@ async def create_isolated_job_system(db_params: dict[str, str], db_pool: asyncpg
 # Test Markers
 # ============================================================================
 
+
 def pytest_configure(config):
     """Register custom markers."""
     config.addinivalue_line("markers", "slow: slow running tests")
@@ -466,5 +481,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "concurrency: concurrency tests")
     config.addinivalue_line("markers", "performance: performance benchmarks")
     config.addinivalue_line("markers", "e2e: end-to-end producer/consumer tests")
-    config.addinivalue_line("markers", "hypothesis: property-based tests using Hypothesis")
+    config.addinivalue_line(
+        "markers", "hypothesis: property-based tests using Hypothesis"
+    )
     config.addinivalue_line("markers", "isolated: tests that require full isolation")

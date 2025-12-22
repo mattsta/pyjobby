@@ -7,11 +7,11 @@ Built on top of the admin API for clean separation.
 """
 
 import asyncio
+import json
+from datetime import datetime, timedelta
+
 import asyncpg
 from aiohttp import web
-import json
-from typing import Optional
-from datetime import datetime, timedelta
 
 from .admin_api import AdminAPI
 
@@ -24,7 +24,7 @@ class WebAdminServer:
     Uses htmx for dynamic updates without full page reloads.
     """
 
-    def __init__(self, db_params: dict, host: str = '0.0.0.0', port: int = 8081):
+    def __init__(self, db_params: dict, host: str = "0.0.0.0", port: int = 8081):
         """
         Initialize web admin server.
 
@@ -42,40 +42,48 @@ class WebAdminServer:
     def setup_routes(self):
         """Setup HTTP routes"""
         # HTML pages
-        self.app.router.add_get('/', self.index)
-        self.app.router.add_get('/jobs', self.jobs_page)
-        self.app.router.add_get('/queues', self.queues_page)
-        self.app.router.add_get('/workers', self.workers_page)
-        self.app.router.add_get('/dlq', self.dlq_page)
-        self.app.router.add_get('/metrics', self.metrics_page)
-        self.app.router.add_get('/schedules', self.schedules_page)
+        self.app.router.add_get("/", self.index)
+        self.app.router.add_get("/jobs", self.jobs_page)
+        self.app.router.add_get("/queues", self.queues_page)
+        self.app.router.add_get("/workers", self.workers_page)
+        self.app.router.add_get("/dlq", self.dlq_page)
+        self.app.router.add_get("/metrics", self.metrics_page)
+        self.app.router.add_get("/schedules", self.schedules_page)
 
         # API endpoints for htmx
-        self.app.router.add_get('/api/jobs', self.api_jobs_list)
-        self.app.router.add_get('/api/jobs/{job_id}', self.api_job_get)
-        self.app.router.add_post('/api/jobs/{job_id}/retry', self.api_job_retry)
-        self.app.router.add_post('/api/jobs/{job_id}/cancel', self.api_job_cancel)
-        self.app.router.add_delete('/api/jobs/{job_id}', self.api_job_delete)
+        self.app.router.add_get("/api/jobs", self.api_jobs_list)
+        self.app.router.add_get("/api/jobs/{job_id}", self.api_job_get)
+        self.app.router.add_post("/api/jobs/{job_id}/retry", self.api_job_retry)
+        self.app.router.add_post("/api/jobs/{job_id}/cancel", self.api_job_cancel)
+        self.app.router.add_delete("/api/jobs/{job_id}", self.api_job_delete)
 
-        self.app.router.add_get('/api/queues', self.api_queues_list)
-        self.app.router.add_get('/api/queues/{queue}/stats', self.api_queue_stats)
+        self.app.router.add_get("/api/queues", self.api_queues_list)
+        self.app.router.add_get("/api/queues/{queue}/stats", self.api_queue_stats)
 
-        self.app.router.add_get('/api/workers', self.api_workers_list)
-        self.app.router.add_get('/api/workers/stats', self.api_workers_stats)
+        self.app.router.add_get("/api/workers", self.api_workers_list)
+        self.app.router.add_get("/api/workers/stats", self.api_workers_stats)
 
-        self.app.router.add_get('/api/dlq', self.api_dlq_list)
-        self.app.router.add_post('/api/dlq/{job_id}/retry', self.api_dlq_retry)
+        self.app.router.add_get("/api/dlq", self.api_dlq_list)
+        self.app.router.add_post("/api/dlq/{job_id}/retry", self.api_dlq_retry)
 
-        self.app.router.add_get('/api/metrics', self.api_metrics)
+        self.app.router.add_get("/api/metrics", self.api_metrics)
 
         # Schedule management endpoints
-        self.app.router.add_get('/api/schedules', self.api_schedules_list)
-        self.app.router.add_get('/api/schedules/{schedule_id}', self.api_schedule_get)
-        self.app.router.add_post('/api/schedules', self.api_schedule_create)
-        self.app.router.add_post('/api/schedules/{schedule_id}/enable', self.api_schedule_enable)
-        self.app.router.add_post('/api/schedules/{schedule_id}/disable', self.api_schedule_disable)
-        self.app.router.add_delete('/api/schedules/{schedule_id}', self.api_schedule_delete)
-        self.app.router.add_get('/api/schedules/{schedule_id}/history', self.api_schedule_history)
+        self.app.router.add_get("/api/schedules", self.api_schedules_list)
+        self.app.router.add_get("/api/schedules/{schedule_id}", self.api_schedule_get)
+        self.app.router.add_post("/api/schedules", self.api_schedule_create)
+        self.app.router.add_post(
+            "/api/schedules/{schedule_id}/enable", self.api_schedule_enable
+        )
+        self.app.router.add_post(
+            "/api/schedules/{schedule_id}/disable", self.api_schedule_disable
+        )
+        self.app.router.add_delete(
+            "/api/schedules/{schedule_id}", self.api_schedule_delete
+        )
+        self.app.router.add_get(
+            "/api/schedules/{schedule_id}/history", self.api_schedule_history
+        )
 
     async def get_api(self) -> AdminAPI:
         """Get AdminAPI instance with fresh database connection"""
@@ -255,7 +263,7 @@ class WebAdminServer:
     </div>
 </body>
 </html>"""
-        return web.Response(text=html, content_type='text/html')
+        return web.Response(text=html, content_type="text/html")
 
     async def jobs_page(self, request: web.Request) -> web.Response:
         """Jobs management page"""
@@ -290,23 +298,31 @@ class WebAdminServer:
     </div>
 </body>
 </html>"""
-        return web.Response(text=html, content_type='text/html')
+        return web.Response(text=html, content_type="text/html")
 
     async def queues_page(self, request: web.Request) -> web.Response:
         """Queues management page - Placeholder"""
-        return web.Response(text="<h1>Queues Page - Coming Soon</h1>", content_type='text/html')
+        return web.Response(
+            text="<h1>Queues Page - Coming Soon</h1>", content_type="text/html"
+        )
 
     async def workers_page(self, request: web.Request) -> web.Response:
         """Workers management page - Placeholder"""
-        return web.Response(text="<h1>Workers Page - Coming Soon</h1>", content_type='text/html')
+        return web.Response(
+            text="<h1>Workers Page - Coming Soon</h1>", content_type="text/html"
+        )
 
     async def dlq_page(self, request: web.Request) -> web.Response:
         """DLQ management page - Placeholder"""
-        return web.Response(text="<h1>DLQ Page - Coming Soon</h1>", content_type='text/html')
+        return web.Response(
+            text="<h1>DLQ Page - Coming Soon</h1>", content_type="text/html"
+        )
 
     async def metrics_page(self, request: web.Request) -> web.Response:
         """Metrics page - Placeholder"""
-        return web.Response(text="<h1>Metrics Page - Coming Soon</h1>", content_type='text/html')
+        return web.Response(
+            text="<h1>Metrics Page - Coming Soon</h1>", content_type="text/html"
+        )
 
     # =========================================================================
     # API Endpoints
@@ -317,20 +333,17 @@ class WebAdminServer:
         api = await self.get_api()
         try:
             # Parse query parameters
-            queue = request.query.get('queue')
-            state = request.query.get('state')
-            limit = int(request.query.get('limit', 50))
-            offset = int(request.query.get('offset', 0))
-            format_type = request.query.get('format', 'json')
+            queue = request.query.get("queue")
+            state = request.query.get("state")
+            limit = int(request.query.get("limit", 50))
+            offset = int(request.query.get("offset", 0))
+            format_type = request.query.get("format", "json")
 
             jobs = await api.list_jobs(
-                queue=queue,
-                state=state,
-                limit=limit,
-                offset=offset
+                queue=queue, state=state, limit=limit, offset=offset
             )
 
-            if format_type == 'html':
+            if format_type == "html":
                 # Return HTML fragment for htmx
                 if not jobs:
                     html = '<p style="padding: 1rem; color: #888;">No jobs found</p>'
@@ -342,21 +355,21 @@ class WebAdminServer:
                     html += '<th style="padding: 0.75rem;">Queue</th>'
                     html += '<th style="padding: 0.75rem;">Job Class</th>'
                     html += '<th style="padding: 0.75rem;">Created</th>'
-                    html += '</tr></thead><tbody>'
+                    html += "</tr></thead><tbody>"
 
                     for job in jobs:
-                        created = job['created'][:19] if job['created'] else ''
+                        created = job["created"][:19] if job["created"] else ""
                         html += f'<tr style="border-bottom: 1px solid #eee;">'
                         html += f'<td style="padding: 0.75rem;">{job["id"]}</td>'
                         html += f'<td style="padding: 0.75rem;"><span class="badge {job["state"]}">{job["state"]}</span></td>'
                         html += f'<td style="padding: 0.75rem;">{job["queue"]}</td>'
                         html += f'<td style="padding: 0.75rem;">{job["job_class"]}</td>'
                         html += f'<td style="padding: 0.75rem;">{created}</td>'
-                        html += '</tr>'
+                        html += "</tr>"
 
-                    html += '</tbody></table>'
+                    html += "</tbody></table>"
 
-                return web.Response(text=html, content_type='text/html')
+                return web.Response(text=html, content_type="text/html")
             else:
                 return web.json_response(jobs)
 
@@ -365,50 +378,50 @@ class WebAdminServer:
 
     async def api_job_get(self, request: web.Request) -> web.Response:
         """Get single job"""
-        job_id = int(request.match_info['job_id'])
+        job_id = int(request.match_info["job_id"])
         api = await self.get_api()
         try:
             job = await api.get_job(job_id)
             if not job:
-                return web.json_response({'error': 'Job not found'}, status=404)
+                return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response(job)
         finally:
             await api.conn.close()
 
     async def api_job_retry(self, request: web.Request) -> web.Response:
         """Retry a job"""
-        job_id = int(request.match_info['job_id'])
+        job_id = int(request.match_info["job_id"])
         api = await self.get_api()
         try:
             result = await api.retry_job(job_id)
             return web.json_response(result)
         except ValueError as e:
-            return web.json_response({'error': str(e)}, status=400)
+            return web.json_response({"error": str(e)}, status=400)
         finally:
             await api.conn.close()
 
     async def api_job_cancel(self, request: web.Request) -> web.Response:
         """Cancel a job"""
-        job_id = int(request.match_info['job_id'])
+        job_id = int(request.match_info["job_id"])
         api = await self.get_api()
         try:
             result = await api.cancel_job(job_id)
             return web.json_response(result)
         except ValueError as e:
-            return web.json_response({'error': str(e)}, status=400)
+            return web.json_response({"error": str(e)}, status=400)
         finally:
             await api.conn.close()
 
     async def api_job_delete(self, request: web.Request) -> web.Response:
         """Delete a job"""
-        job_id = int(request.match_info['job_id'])
+        job_id = int(request.match_info["job_id"])
         api = await self.get_api()
         try:
             deleted = await api.delete_job(job_id)
             if deleted:
-                return web.json_response({'status': 'deleted', 'job_id': job_id})
+                return web.json_response({"status": "deleted", "job_id": job_id})
             else:
-                return web.json_response({'error': 'Job not found'}, status=404)
+                return web.json_response({"error": "Job not found"}, status=404)
         finally:
             await api.conn.close()
 
@@ -417,26 +430,26 @@ class WebAdminServer:
         api = await self.get_api()
         try:
             stats = await api.queue_stats()
-            format_type = request.query.get('format', 'json')
+            format_type = request.query.get("format", "json")
 
-            if format_type == 'html':
+            if format_type == "html":
                 if not stats:
-                    html = '<p>No queue data</p>'
+                    html = "<p>No queue data</p>"
                 else:
                     html = '<div class="stats-grid">'
                     for s in stats:
                         html += '<div class="stat-item">'
-                        html += f'<span><strong>{s["queue"]}</strong></span>'
-                        html += '<span>'
-                        if s['queued'] > 0:
+                        html += f"<span><strong>{s['queue']}</strong></span>"
+                        html += "<span>"
+                        if s["queued"] > 0:
                             html += f'<span class="badge queued">{s["queued"]} queued</span> '
-                        if s['running'] > 0:
+                        if s["running"] > 0:
                             html += f'<span class="badge running">{s["running"]} running</span> '
-                        if s['crashed'] > 0:
+                        if s["crashed"] > 0:
                             html += f'<span class="badge crashed">{s["crashed"]} crashed</span>'
-                        html += '</span></div>'
-                    html += '</div>'
-                return web.Response(text=html, content_type='text/html')
+                        html += "</span></div>"
+                    html += "</div>"
+                return web.Response(text=html, content_type="text/html")
             else:
                 return web.json_response(stats)
         finally:
@@ -444,7 +457,7 @@ class WebAdminServer:
 
     async def api_queue_stats(self, request: web.Request) -> web.Response:
         """Get stats for specific queue"""
-        queue = request.match_info['queue']
+        queue = request.match_info["queue"]
         api = await self.get_api()
         try:
             stats = await api.queue_stats(queue=queue)
@@ -466,12 +479,12 @@ class WebAdminServer:
         api = await self.get_api()
         try:
             stats = await api.worker_stats()
-            format_type = request.query.get('format', 'json')
+            format_type = request.query.get("format", "json")
 
-            if format_type == 'html':
+            if format_type == "html":
                 html = f'<div class="stat-value">{stats["active_workers"]}</div>'
                 html += f'<div class="stat-label">Active Workers</div>'
-                return web.Response(text=html, content_type='text/html')
+                return web.Response(text=html, content_type="text/html")
             else:
                 return web.json_response(stats)
         finally:
@@ -481,7 +494,7 @@ class WebAdminServer:
         """List Dead Letter Queue jobs"""
         api = await self.get_api()
         try:
-            limit = int(request.query.get('limit', 100))
+            limit = int(request.query.get("limit", 100))
             jobs = await api.list_dlq(limit=limit)
             return web.json_response(jobs)
         finally:
@@ -489,13 +502,13 @@ class WebAdminServer:
 
     async def api_dlq_retry(self, request: web.Request) -> web.Response:
         """Retry job from DLQ"""
-        job_id = int(request.match_info['job_id'])
+        job_id = int(request.match_info["job_id"])
         api = await self.get_api()
         try:
             result = await api.retry_from_dlq(job_id)
             return web.json_response(result)
         except ValueError as e:
-            return web.json_response({'error': str(e)}, status=400)
+            return web.json_response({"error": str(e)}, status=400)
         finally:
             await api.conn.close()
 
@@ -503,26 +516,26 @@ class WebAdminServer:
         """Get system metrics"""
         api = await self.get_api()
         try:
-            since_hours = int(request.query.get('since_hours', 24))
-            queue = request.query.get('queue')
-            format_type = request.query.get('format', 'json')
+            since_hours = int(request.query.get("since_hours", 24))
+            queue = request.query.get("queue")
+            format_type = request.query.get("format", "json")
 
             since = datetime.utcnow() - timedelta(hours=since_hours)
             metrics = await api.get_metrics(since=since, queue=queue)
 
-            if format_type == 'html':
+            if format_type == "html":
                 html = '<div class="stats-grid">'
                 html += '<div class="stat-item">'
                 html += f'<span>Finished</span><span class="badge finished">{metrics["finished_count"]}</span>'
-                html += '</div>'
+                html += "</div>"
                 html += '<div class="stat-item">'
                 html += f'<span>Crashed</span><span class="badge crashed">{metrics["crashed_count"]}</span>'
-                html += '</div>'
+                html += "</div>"
                 html += '<div class="stat-item">'
-                html += f'<span>Avg Duration</span><span>{metrics["avg_duration_seconds"]:.2f}s</span>'
-                html += '</div>'
-                html += '</div>'
-                return web.Response(text=html, content_type='text/html')
+                html += f"<span>Avg Duration</span><span>{metrics['avg_duration_seconds']:.2f}s</span>"
+                html += "</div>"
+                html += "</div>"
+                return web.Response(text=html, content_type="text/html")
             else:
                 return web.json_response(metrics)
         finally:
@@ -816,68 +829,74 @@ class WebAdminServer:
     </script>
 </body>
 </html>"""
-        return web.Response(text=html, content_type='text/html')
+        return web.Response(text=html, content_type="text/html")
 
     async def api_schedules_list(self, request: web.Request) -> web.Response:
         """List schedules (JSON or HTML)"""
         api = await self.get_api()
         try:
-            format_type = request.query.get('format', 'json')
-            enabled = request.query.get('enabled')
-            queue = request.query.get('queue')
+            format_type = request.query.get("format", "json")
+            enabled = request.query.get("enabled")
+            queue = request.query.get("queue")
 
             # Convert enabled to bool if provided
             enabled_bool = None
             if enabled:
-                enabled_bool = enabled.lower() in ('true', '1', 'yes')
+                enabled_bool = enabled.lower() in ("true", "1", "yes")
 
             schedules = await api.list_schedules(
-                enabled=enabled_bool,
-                queue=queue if queue else None
+                enabled=enabled_bool, queue=queue if queue else None
             )
 
-            if format_type == 'html':
-                html = '<table><thead><tr>'
-                html += '<th>Name</th><th>Status</th><th>Cron</th><th>Queue</th>'
-                html += '<th>Next Run</th><th>Stats</th><th>Actions</th>'
-                html += '</tr></thead><tbody>'
+            if format_type == "html":
+                html = "<table><thead><tr>"
+                html += "<th>Name</th><th>Status</th><th>Cron</th><th>Queue</th>"
+                html += "<th>Next Run</th><th>Stats</th><th>Actions</th>"
+                html += "</tr></thead><tbody>"
 
                 for s in schedules:
-                    status_badge = 'badge-enabled' if s['enabled'] else 'badge-disabled'
-                    status_text = 'Enabled' if s['enabled'] else 'Disabled'
+                    status_badge = "badge-enabled" if s["enabled"] else "badge-disabled"
+                    status_text = "Enabled" if s["enabled"] else "Disabled"
 
                     success_rate = None
-                    if s['success_count'] + s['failure_count'] > 0:
-                        success_rate = (s['success_count'] / (s['success_count'] + s['failure_count'])) * 100
+                    if s["success_count"] + s["failure_count"] > 0:
+                        success_rate = (
+                            s["success_count"]
+                            / (s["success_count"] + s["failure_count"])
+                        ) * 100
 
-                    html += '<tr>'
-                    html += f'<td><strong>{s["name"]}</strong><br><small>{s.get("description") or ""}</small></td>'
+                    html += "<tr>"
+                    html += f"<td><strong>{s['name']}</strong><br><small>{s.get('description') or ''}</small></td>"
                     html += f'<td><span class="badge {status_badge}">{status_text}</span></td>'
-                    html += f'<td><code>{s["cron_expr"]}</code></td>'
-                    html += f'<td>{s["queue"]}</td>'
-                    html += f'<td>{s["next_run"].strftime("%Y-%m-%d %H:%M") if s.get("next_run") else "-"}</td>'
-                    html += f'<td>{s["run_count"]} runs<br>'
+                    html += f"<td><code>{s['cron_expr']}</code></td>"
+                    html += f"<td>{s['queue']}</td>"
+                    html += f"<td>{s['next_run'].strftime('%Y-%m-%d %H:%M') if s.get('next_run') else '-'}</td>"
+                    html += f"<td>{s['run_count']} runs<br>"
                     if success_rate is not None:
-                        rate_class = 'badge-success' if success_rate >= 95 else 'badge-warning'
+                        rate_class = (
+                            "badge-success" if success_rate >= 95 else "badge-warning"
+                        )
                         html += f'<span class="badge {rate_class}">{success_rate:.1f}% success</span>'
-                    html += '</td>'
-                    html += f'<td>'
+                    html += "</td>"
+                    html += f"<td>"
 
-                    schedule_id = s['id']
-                    if s['enabled']:
+                    schedule_id = s["id"]
+                    if s["enabled"]:
                         html += f'<button class="btn btn-danger" hx-post="/api/schedules/{schedule_id}/disable" hx-target="#schedules-table" hx-swap="innerHTML">Disable</button>'
                     else:
                         html += f'<button class="btn btn-success" hx-post="/api/schedules/{schedule_id}/enable" hx-target="#schedules-table" hx-swap="innerHTML">Enable</button>'
 
                     html += f' <button class="btn btn-danger" hx-delete="/api/schedules/{schedule_id}" hx-confirm="Delete schedule {s["name"]}?" hx-target="#schedules-table" hx-swap="innerHTML">Delete</button>'
-                    html += '</td>'
-                    html += '</tr>'
+                    html += "</td>"
+                    html += "</tr>"
 
-                html += '</tbody></table>'
-                return web.Response(text=html, content_type='text/html')
+                html += "</tbody></table>"
+                return web.Response(text=html, content_type="text/html")
             else:
                 # JSON response
-                return web.json_response(schedules, dumps=lambda x: json.dumps(x, default=str))
+                return web.json_response(
+                    schedules, dumps=lambda x: json.dumps(x, default=str)
+                )
         finally:
             await api.conn.close()
 
@@ -885,13 +904,15 @@ class WebAdminServer:
         """Get single schedule"""
         api = await self.get_api()
         try:
-            schedule_id = int(request.match_info['schedule_id'])
+            schedule_id = int(request.match_info["schedule_id"])
             schedule = await api.get_schedule(schedule_id=schedule_id)
 
             if not schedule:
-                return web.json_response({'error': 'Schedule not found'}, status=404)
+                return web.json_response({"error": "Schedule not found"}, status=404)
 
-            return web.json_response(schedule, dumps=lambda x: json.dumps(x, default=str))
+            return web.json_response(
+                schedule, dumps=lambda x: json.dumps(x, default=str)
+            )
         finally:
             await api.conn.close()
 
@@ -902,60 +923,66 @@ class WebAdminServer:
             data = await request.post()
 
             schedule = await api.create_schedule(
-                name=data['name'],
-                job_class=data['job_class'],
-                cron_expr=data['cron_expr'],
-                queue=data.get('queue', 'default'),
-                prio=int(data.get('prio', 100)),
-                description=data.get('description'),
-                max_concurrent_jobs=int(data.get('max_concurrent_jobs', 1)),
-                jitter_seconds=int(data.get('jitter_seconds', 0)),
-                backpressure_threshold=int(data.get('backpressure_threshold', 1000)),
-                circuit_breaker_threshold=int(data.get('circuit_breaker_threshold', 5)),
+                name=data["name"],
+                job_class=data["job_class"],
+                cron_expr=data["cron_expr"],
+                queue=data.get("queue", "default"),
+                prio=int(data.get("prio", 100)),
+                description=data.get("description"),
+                max_concurrent_jobs=int(data.get("max_concurrent_jobs", 1)),
+                jitter_seconds=int(data.get("jitter_seconds", 0)),
+                backpressure_threshold=int(data.get("backpressure_threshold", 1000)),
+                circuit_breaker_threshold=int(data.get("circuit_breaker_threshold", 5)),
             )
 
             # Return refreshed schedules list as HTML
             schedules = await api.list_schedules()
-            html = '<table><thead><tr>'
-            html += '<th>Name</th><th>Status</th><th>Cron</th><th>Queue</th>'
-            html += '<th>Next Run</th><th>Stats</th><th>Actions</th>'
-            html += '</tr></thead><tbody>'
+            html = "<table><thead><tr>"
+            html += "<th>Name</th><th>Status</th><th>Cron</th><th>Queue</th>"
+            html += "<th>Next Run</th><th>Stats</th><th>Actions</th>"
+            html += "</tr></thead><tbody>"
 
             for s in schedules:
-                status_badge = 'badge-enabled' if s['enabled'] else 'badge-disabled'
-                status_text = 'Enabled' if s['enabled'] else 'Disabled'
+                status_badge = "badge-enabled" if s["enabled"] else "badge-disabled"
+                status_text = "Enabled" if s["enabled"] else "Disabled"
 
                 success_rate = None
-                if s['success_count'] + s['failure_count'] > 0:
-                    success_rate = (s['success_count'] / (s['success_count'] + s['failure_count'])) * 100
+                if s["success_count"] + s["failure_count"] > 0:
+                    success_rate = (
+                        s["success_count"] / (s["success_count"] + s["failure_count"])
+                    ) * 100
 
-                html += '<tr>'
-                html += f'<td><strong>{s["name"]}</strong><br><small>{s.get("description") or ""}</small></td>'
-                html += f'<td><span class="badge {status_badge}">{status_text}</span></td>'
-                html += f'<td><code>{s["cron_expr"]}</code></td>'
-                html += f'<td>{s["queue"]}</td>'
-                html += f'<td>{s["next_run"].strftime("%Y-%m-%d %H:%M") if s.get("next_run") else "-"}</td>'
-                html += f'<td>{s["run_count"]} runs<br>'
+                html += "<tr>"
+                html += f"<td><strong>{s['name']}</strong><br><small>{s.get('description') or ''}</small></td>"
+                html += (
+                    f'<td><span class="badge {status_badge}">{status_text}</span></td>'
+                )
+                html += f"<td><code>{s['cron_expr']}</code></td>"
+                html += f"<td>{s['queue']}</td>"
+                html += f"<td>{s['next_run'].strftime('%Y-%m-%d %H:%M') if s.get('next_run') else '-'}</td>"
+                html += f"<td>{s['run_count']} runs<br>"
                 if success_rate is not None:
-                    rate_class = 'badge-success' if success_rate >= 95 else 'badge-warning'
+                    rate_class = (
+                        "badge-success" if success_rate >= 95 else "badge-warning"
+                    )
                     html += f'<span class="badge {rate_class}">{success_rate:.1f}% success</span>'
-                html += '</td>'
-                html += f'<td>'
+                html += "</td>"
+                html += f"<td>"
 
-                schedule_id = s['id']
-                if s['enabled']:
+                schedule_id = s["id"]
+                if s["enabled"]:
                     html += f'<button class="btn btn-danger" hx-post="/api/schedules/{schedule_id}/disable" hx-target="#schedules-table" hx-swap="innerHTML">Disable</button>'
                 else:
                     html += f'<button class="btn btn-success" hx-post="/api/schedules/{schedule_id}/enable" hx-target="#schedules-table" hx-swap="innerHTML">Enable</button>'
 
                 html += f' <button class="btn btn-danger" hx-delete="/api/schedules/{schedule_id}" hx-confirm="Delete schedule {s["name"]}?" hx-target="#schedules-table" hx-swap="innerHTML">Delete</button>'
-                html += '</td>'
-                html += '</tr>'
+                html += "</td>"
+                html += "</tr>"
 
-            html += '</tbody></table>'
-            return web.Response(text=html, content_type='text/html')
+            html += "</tbody></table>"
+            return web.Response(text=html, content_type="text/html")
         except ValueError as e:
-            return web.json_response({'error': str(e)}, status=400)
+            return web.json_response({"error": str(e)}, status=400)
         finally:
             await api.conn.close()
 
@@ -963,7 +990,7 @@ class WebAdminServer:
         """Enable schedule"""
         api = await self.get_api()
         try:
-            schedule_id = int(request.match_info['schedule_id'])
+            schedule_id = int(request.match_info["schedule_id"])
             await api.enable_schedule(schedule_id)
 
             # Return refreshed list
@@ -975,7 +1002,7 @@ class WebAdminServer:
         """Disable schedule"""
         api = await self.get_api()
         try:
-            schedule_id = int(request.match_info['schedule_id'])
+            schedule_id = int(request.match_info["schedule_id"])
             await api.disable_schedule(schedule_id)
 
             # Return refreshed list
@@ -987,7 +1014,7 @@ class WebAdminServer:
         """Delete schedule"""
         api = await self.get_api()
         try:
-            schedule_id = int(request.match_info['schedule_id'])
+            schedule_id = int(request.match_info["schedule_id"])
             await api.delete_schedule(schedule_id)
 
             # Return refreshed list
@@ -999,11 +1026,15 @@ class WebAdminServer:
         """Get schedule execution history"""
         api = await self.get_api()
         try:
-            schedule_id = int(request.match_info['schedule_id'])
-            limit = int(request.query.get('limit', 50))
+            schedule_id = int(request.match_info["schedule_id"])
+            limit = int(request.query.get("limit", 50))
 
-            history = await api.get_schedule_history(schedule_id=schedule_id, limit=limit)
-            return web.json_response(history, dumps=lambda x: json.dumps(x, default=str))
+            history = await api.get_schedule_history(
+                schedule_id=schedule_id, limit=limit
+            )
+            return web.json_response(
+                history, dumps=lambda x: json.dumps(x, default=str)
+            )
         finally:
             await api.conn.close()
 
@@ -1026,9 +1057,10 @@ class WebAdminServer:
 async def async_main():
     """Run web admin server standalone (async)"""
     import sys
+
     from .configloader import load_config_from_file
 
-    config_path = sys.argv[1] if len(sys.argv) > 1 else './pyjobby.conf.py'
+    config_path = sys.argv[1] if len(sys.argv) > 1 else "./pyjobby.conf.py"
     config = load_config_from_file(config_path, keys=["db_params"])
     db_params = config.get("db_params")
 
@@ -1045,5 +1077,5 @@ def main():
     asyncio.run(async_main())
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -7,26 +7,26 @@ So, in January 2021 I wrote `pyjobby` and this is all about it.
 ## 🎯 Goals
 
 - **simplicity**
-    - core job system is under 1,000 lines in one file: [`pyjobby/pj.py`](pyjobby/pj.py)
-    - job workers are any python class inheriting from `pyjobby.pj.Job`
-         - includes automatic logging of failures and backoff retries
+  - core job system is under 1,000 lines in one file: [`pyjobby/pj.py`](pyjobby/pj.py)
+  - job workers are any python class inheriting from `pyjobby.pj.Job`
+    - includes automatic logging of failures and backoff retries
 - **modernness**
-    - python 3.9 minimum
-    - passes mypy strict
-    - full async/await support
+  - python 3.9 minimum
+  - passes mypy strict
+  - full async/await support
 - **outsourced persistence**
-    - use standard postgres for durable job storage instead of custom memory queue servers
-    - use postgres to record job state transitions as jobs advance through the work queue
-    - fully distributed job servers can be run from the same postgres database for moderate scalability needs
+  - use standard postgres for durable job storage instead of custom memory queue servers
+  - use postgres to record job state transitions as jobs advance through the work queue
+  - fully distributed job servers can be run from the same postgres database for moderate scalability needs
 - **logical extensibility**
-    - jobs each have a `uid` field for multi-tenancy
-    - full multiprocessing by default (workers can further spawn threadpools/workers)
-    - custom priority levels so important jobs can jump the queue
-    - custom capability pinning so jobs run on workers with specific resources
-    - job dependencies: `waitfor_job` and `waitfor_group` for pipelines
-    - scheduled jobs with `run_after` for cron-like applications
-    - deadline keys for idempotent job creation (prevent duplicates)
-    - optionally listens for web connections to run worker job classes directly
+  - jobs each have a `uid` field for multi-tenancy
+  - full multiprocessing by default (workers can further spawn threadpools/workers)
+  - custom priority levels so important jobs can jump the queue
+  - custom capability pinning so jobs run on workers with specific resources
+  - job dependencies: `waitfor_job` and `waitfor_group` for pipelines
+  - scheduled jobs with `run_after` for cron-like applications
+  - deadline keys for idempotent job creation (prevent duplicates)
+  - optionally listens for web connections to run worker job classes directly
 
 ---
 
@@ -37,6 +37,7 @@ Pyjobby has evolved from a simple job queue into a **production-ready job orches
 ### ✅ Client Library (NEW!)
 
 Clean, high-performance Python client with:
+
 - Type hints and auto-completion
 - Connection pooling (5-20 connections)
 - Batch operations (enqueue 1000+ jobs efficiently)
@@ -105,6 +106,7 @@ pj-web ./pyjobby.conf.py --port 8081
 ```
 
 Features:
+
 - Live job monitoring
 - Queue statistics
 - Worker status
@@ -132,6 +134,7 @@ pj scheduler ./pyjobby.conf.py
 ```
 
 **Safety Features:**
+
 - Max concurrent jobs (prevent runaway creation)
 - Random jitter (prevent thundering herd)
 - Backpressure handling (skip when overloaded)
@@ -145,6 +148,7 @@ See [docs/RECURRING_SCHEDULER.md](docs/RECURRING_SCHEDULER.md) for complete docu
 Production-grade features for complex workflows:
 
 **Job Result Storage & Passing**
+
 ```python
 # Store results from jobs
 job_id = await client.enqueue(
@@ -160,6 +164,7 @@ pipeline_job = await client.enqueue(
 ```
 
 **Configurable Retry Strategies**
+
 ```python
 # Exponential backoff: 1s, 2s, 4s, 8s, 16s...
 await client.enqueue(
@@ -173,6 +178,7 @@ await client.enqueue(
 ```
 
 **Job Timeout Enforcement**
+
 ```python
 # Worker-side timeout with automatic retry
 await client.enqueue(
@@ -186,6 +192,7 @@ pj-timeout-monitor --dsn postgresql://... --check-interval 10
 ```
 
 **DAG Support (Directed Acyclic Graphs)**
+
 ```python
 from pyjobby.dag import DAGBuilder
 
@@ -212,6 +219,7 @@ pj-admin dag visualize 123  # ASCII art visualization
 ```
 
 **Advanced Statistics**
+
 ```bash
 # Retry statistics by strategy
 pj-admin jobs retry-stats --queue default --since-hours 48
@@ -257,9 +265,9 @@ See [docs/PHASE2_USER_GUIDE.md](docs/PHASE2_USER_GUIDE.md) for complete Phase 2 
 - **run_after** - a minimum start time for the job to run
 - **priority** - numeric values allowing **job (storage)** added later in a queue to run before other previously queued jobs. lower numbers are higher selection priority
 - **deadline key** - a unique constraint on `(deadline_key, state==queued)` per queue. allows you to request the same job multiple times, but the server will only schedule one instance
-- **run_group** - multiple tasks may be assigned the same `run_group` value if you would like to run other jobs only when *all* jobs in a group move to a *finished* state
-- **waitfor_group** - jobs in *waiting* state with a `waitfor_group` value will run **only** when *all* job rows with the matching `run_group` have moved to a *finished* state
-- **waitfor_job** - same as **waitfor_group** except only waits on a specific `id` to become *finished* before running
+- **run_group** - multiple tasks may be assigned the same `run_group` value if you would like to run other jobs only when _all_ jobs in a group move to a _finished_ state
+- **waitfor_group** - jobs in _waiting_ state with a `waitfor_group` value will run **only** when _all_ job rows with the matching `run_group` have moved to a _finished_ state
+- **waitfor_job** - same as **waitfor_group** except only waits on a specific `id` to become _finished_ before running
 
 ### Job States
 
@@ -275,11 +283,11 @@ See [docs/PHASE2_USER_GUIDE.md](docs/PHASE2_USER_GUIDE.md) for complete Phase 2 
 
 - Using the `pj` script, on startup `--workers` numbers of completely independent workers are forked using `multiprocessing.Process` (defaults to number of cores on the system)
 - If web endpoints are enabled, each worker also opens a web server for requests
-    - Under linux, each web server on each worker process can receive queries due to in-kernel TCP port load balancing
-    - On other platforms, only one of the workers will receive all web requests
+  - Under linux, each web server on each worker process can receive queries due to in-kernel TCP port load balancing
+  - On other platforms, only one of the workers will receive all web requests
 - Each worker polls the job database at 5 to 6 second intervals
 - If a worker finds a job, it claims the job, runs it, completes it, then immediately checks the job database for more jobs without entering the delay loop again
-    - see query `claim` for logic behind next job selection based on: matching server capability, allowed server priority, highest job priority (lower number is higher priority), scheduled run time, and current job state
+  - see query `claim` for logic behind next job selection based on: matching server capability, allowed server priority, highest job priority (lower number is higher priority), scheduled run time, and current job state
 - If a worker doesn't find an eligible job, it returns to the 'sleep 5-6 seconds' request loop
 
 ---
@@ -301,6 +309,7 @@ pip install git+https://github.com/mattsta/pyjobby.git#main
 ### Database Setup
 
 The postgres DB schema is available as:
+
 - SQL dump: [`priv/schema.sql`](priv/schema.sql)
 - SQLAlchemy classes: [`priv/schema.py`](priv/schema.py)
 - Migrations: [`priv/migrations/`](priv/migrations/)
@@ -536,6 +545,7 @@ await client.enqueue(
   - We've avoided the postgres pub/sub notify interface with in-memory tables that [some projects use](https://github.com/que-rb/que/blob/master/lib/que/migrations/4/up.sql) for higher performance, preferring simplicity
 
 **Note**: Many limitations from the original 2021 version have been addressed:
+
 - ✅ Web console (added in 2024)
 - ✅ Client library (added in 2024)
 - ✅ Job reclamation on worker crash (added)

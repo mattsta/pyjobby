@@ -3,17 +3,15 @@ Comprehensive tests for websocket_server.py - WebSocket Real-Time Monitoring.
 Using LIVE database operations with NO MOCKS for maximum correctness guarantees!
 """
 
-import pytest
-import pytest_asyncio
-import asyncpg
+import asyncio
 import json
 import uuid
-import asyncio
 from datetime import datetime
-from aiohttp import web
-from aiohttp.test_utils import AioHTTPTestCase
 
-from pyjobby.websocket_server import WebSocketServer, ClientConnection
+import pytest
+from aiohttp import web
+
+from pyjobby.websocket_server import ClientConnection, WebSocketServer
 
 
 def unique_name(base: str) -> str:
@@ -51,9 +49,7 @@ class TestWebSocketServerInit:
     def test_init_custom_params(self, db_params):
         """Test server initialization with custom parameters."""
         server = WebSocketServer(
-            db_params,
-            max_subscriptions=50,
-            max_actions_per_second=5
+            db_params, max_subscriptions=50, max_actions_per_second=5
         )
 
         assert server.max_subscriptions == 50
@@ -63,12 +59,12 @@ class TestWebSocketServerInit:
         """Test that stats are properly initialized."""
         server = WebSocketServer(db_params)
 
-        assert server.stats['total_connections'] == 0
-        assert server.stats['current_connections'] == 0
-        assert server.stats['messages_sent'] == 0
-        assert server.stats['messages_received'] == 0
-        assert server.stats['events_received'] == 0
-        assert server.stats['errors'] == 0
+        assert server.stats["total_connections"] == 0
+        assert server.stats["current_connections"] == 0
+        assert server.stats["messages_sent"] == 0
+        assert server.stats["messages_received"] == 0
+        assert server.stats["events_received"] == 0
+        assert server.stats["errors"] == 0
 
 
 class TestClientConnection:
@@ -79,15 +75,15 @@ class TestClientConnection:
         ws = None  # In real tests, this would be a WebSocketResponse
         conn = ClientConnection(
             ws=ws,
-            channels={'jobs', 'queues:default'},
+            channels={"jobs", "queues:default"},
             connected_at=1234567890.0,
             last_action=1234567890.0,
-            action_count=0
+            action_count=0,
         )
 
         assert conn.ws is None
-        assert 'jobs' in conn.channels
-        assert 'queues:default' in conn.channels
+        assert "jobs" in conn.channels
+        assert "queues:default" in conn.channels
         assert conn.connected_at == 1234567890.0
         assert conn.last_action == 1234567890.0
         assert conn.action_count == 0
@@ -101,7 +97,7 @@ class TestClientConnection:
             connected_at=0.0,
             last_action=0.0,
             action_count=0,
-            uid=12345
+            uid=12345,
         )
 
         assert conn.uid == 12345
@@ -186,20 +182,20 @@ class TestBroadcastChannels:
         """Test determining broadcast channel for job state changes."""
         server = WebSocketServer(db_params)
 
-        data = {'queue': 'default', 'id': 123}
-        channel = server.determine_broadcast_channel('job_state_change', data)
+        data = {"queue": "default", "id": 123}
+        channel = server.determine_broadcast_channel("job_state_change", data)
 
-        assert channel == 'queues:default'
+        assert channel == "queues:default"
 
     @pytest.mark.asyncio
     async def test_determine_broadcast_channel_schedule(self, db_params):
         """Test determining broadcast channel for schedule events."""
         server = WebSocketServer(db_params)
 
-        data = {'schedule_name': 'daily-cleanup'}
-        channel = server.determine_broadcast_channel('schedule_executed', data)
+        data = {"schedule_name": "daily-cleanup"}
+        channel = server.determine_broadcast_channel("schedule_executed", data)
 
-        assert channel == 'schedules'
+        assert channel == "schedules"
 
 
 class TestMessageProcessing:
@@ -211,17 +207,13 @@ class TestMessageProcessing:
         server = WebSocketServer(db_params)
 
         # Process a job state change notification
-        payload = json.dumps({
-            'id': 123,
-            'queue': 'default',
-            'state': 'running'
-        })
+        payload = json.dumps({"id": 123, "queue": "default", "state": "running"})
 
         # This should not raise
-        await server.process_notification('job_state_change', payload)
+        await server.process_notification("job_state_change", payload)
 
         # Stats should be updated
-        assert server.stats['events_received'] == 1
+        assert server.stats["events_received"] == 1
 
 
 class TestQueueStatsQuery:
@@ -235,15 +227,21 @@ class TestQueueStatsQuery:
 
         # Create some jobs
         async with db_pool.acquire() as conn:
-            queue = unique_name('ws_stats')
-            await conn.execute("""
+            queue = unique_name("ws_stats")
+            await conn.execute(
+                """
                 INSERT INTO jorb (job_class, kwargs, queue, prio, state)
                 VALUES ('StatsJob', '{}', $1, 100, 'queued')
-            """, queue)
-            await conn.execute("""
+            """,
+                queue,
+            )
+            await conn.execute(
+                """
                 INSERT INTO jorb (job_class, kwargs, queue, prio, state)
                 VALUES ('StatsJob', '{}', $1, 100, 'running')
-            """, queue)
+            """,
+                queue,
+            )
 
         # Query stats using server's pool
         async with server.db_pool.acquire() as conn:
@@ -274,26 +272,30 @@ class TestServerStart:
         app = web.Application()
 
         async def health_check(request):
-            return web.json_response({
-                'status': 'healthy',
-                'stats': server.stats,
-                'notify_connection': not server.notify_conn.is_closed() if server.notify_conn else False,
-                'timestamp': datetime.utcnow().isoformat()
-            })
+            return web.json_response(
+                {
+                    "status": "healthy",
+                    "stats": server.stats,
+                    "notify_connection": not server.notify_conn.is_closed()
+                    if server.notify_conn
+                    else False,
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+            )
 
-        app.router.add_get('/health', health_check)
+        app.router.add_get("/health", health_check)
 
         # Create test client
         client = await aiohttp_client(app)
 
         # Test health check
-        resp = await client.get('/health')
+        resp = await client.get("/health")
         assert resp.status == 200
 
         data = await resp.json()
-        assert data['status'] == 'healthy'
-        assert 'stats' in data
-        assert data['notify_connection'] is True
+        assert data["status"] == "healthy"
+        assert "stats" in data
+        assert data["notify_connection"] is True
 
         # Cleanup
         await server.notify_conn.close()
@@ -319,14 +321,14 @@ class TestHandleNotification:
         server.process_notification = mock_process
 
         # Call handle_notification
-        payload = json.dumps({'id': 1, 'queue': 'test', 'state': 'running'})
-        server.handle_notification(None, 123, 'job_state_change', payload)
+        payload = json.dumps({"id": 1, "queue": "test", "state": "running"})
+        server.handle_notification(None, 123, "job_state_change", payload)
 
         # Wait for task to complete
         await asyncio.sleep(0.1)
 
         assert len(called) == 1
-        assert called[0][0] == 'job_state_change'
+        assert called[0][0] == "job_state_change"
 
 
 class TestProcessNotificationErrors:
@@ -338,10 +340,10 @@ class TestProcessNotificationErrors:
         server = WebSocketServer(db_params)
 
         # Process invalid JSON
-        await server.process_notification('job_state_change', 'not valid json')
+        await server.process_notification("job_state_change", "not valid json")
 
         # Error should be recorded in stats
-        assert server.stats['errors'] == 1
+        assert server.stats["errors"] == 1
 
     @pytest.mark.asyncio
     async def test_process_notification_json_decode_error(self, db_params):
@@ -349,10 +351,10 @@ class TestProcessNotificationErrors:
         server = WebSocketServer(db_params)
 
         # Process malformed JSON
-        await server.process_notification('test', '{invalid}')
+        await server.process_notification("test", "{invalid}")
 
-        assert server.stats['errors'] == 1
-        assert server.stats['events_received'] == 0
+        assert server.stats["errors"] == 1
+        assert server.stats["events_received"] == 0
 
 
 class TestDetermineChannelQueueAlert:
@@ -362,28 +364,28 @@ class TestDetermineChannelQueueAlert:
         """Test queue_alert broadcast channel determination."""
         server = WebSocketServer(db_params)
 
-        data = {'queue': 'high-priority', 'alert': 'queue_depth_high'}
-        channel = server.determine_broadcast_channel('queue_alert', data)
+        data = {"queue": "high-priority", "alert": "queue_depth_high"}
+        channel = server.determine_broadcast_channel("queue_alert", data)
 
-        assert channel == 'alerts:queues:high-priority'
+        assert channel == "alerts:queues:high-priority"
 
     def test_queue_alert_default_queue(self, db_params):
         """Test queue_alert with default queue."""
         server = WebSocketServer(db_params)
 
-        data = {'alert': 'some_alert'}  # No queue specified
-        channel = server.determine_broadcast_channel('queue_alert', data)
+        data = {"alert": "some_alert"}  # No queue specified
+        channel = server.determine_broadcast_channel("queue_alert", data)
 
-        assert channel == 'alerts:queues:default'
+        assert channel == "alerts:queues:default"
 
     def test_unknown_event_type(self, db_params):
         """Test unknown event type defaults to 'jobs' channel."""
         server = WebSocketServer(db_params)
 
-        data = {'something': 'else'}
-        channel = server.determine_broadcast_channel('unknown_event', data)
+        data = {"something": "else"}
+        channel = server.determine_broadcast_channel("unknown_event", data)
 
-        assert channel == 'jobs'
+        assert channel == "jobs"
 
 
 class TestBroadcastEventNoClients:
@@ -395,13 +397,13 @@ class TestBroadcastEventNoClients:
         server = WebSocketServer(db_params)
 
         # No clients subscribed
-        event = {'event': 'test', 'data': {}}
+        event = {"event": "test", "data": {}}
 
         # Should not raise
-        await server.broadcast_event('empty_channel', event)
+        await server.broadcast_event("empty_channel", event)
 
         # Messages sent should still be 0
-        assert server.stats['messages_sent'] == 0
+        assert server.stats["messages_sent"] == 0
 
 
 class TestSendError:
@@ -414,7 +416,7 @@ class TestSendError:
 
         # We can't easily test without a real WebSocket connection,
         # but we can verify the method exists and has correct signature
-        assert hasattr(server, 'send_error')
+        assert hasattr(server, "send_error")
         assert asyncio.iscoroutinefunction(server.send_error)
 
 
@@ -427,7 +429,7 @@ class TestHandleGetStats:
         server = WebSocketServer(db_params)
 
         # Verify method exists
-        assert hasattr(server, 'handle_get_stats')
+        assert hasattr(server, "handle_get_stats")
         assert asyncio.iscoroutinefunction(server.handle_get_stats)
 
 
@@ -446,7 +448,7 @@ class TestNotifyConnectionListen:
 
         # The connection should have notification handler
         # We verify by checking it's a valid asyncpg connection
-        assert hasattr(server.notify_conn, 'add_listener')
+        assert hasattr(server.notify_conn, "add_listener")
 
         # Cleanup
         await server.notify_conn.close()

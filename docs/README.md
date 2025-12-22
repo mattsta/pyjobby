@@ -66,25 +66,25 @@ See [PHASE1_IMPROVEMENTS.md](../PHASE1_IMPROVEMENTS.md) for complete details.
 
 ### Features
 
-6. **Configuration System** *(See sample.conf.py)* - How to configure pyjobby
+6. **Configuration System** _(See sample.conf.py)_ - How to configure pyjobby
    - Database connection parameters
    - Web server configuration
    - Custom application settings
    - Environment-specific configs
 
-7. **Job Dependencies** *(Covered in architecture.md and job-class.md)* - waitfor_job and waitfor_group
+7. **Job Dependencies** _(Covered in architecture.md and job-class.md)_ - waitfor_job and waitfor_group
    - Single job dependencies
    - Group dependencies (fan-out/fan-in)
    - Complex workflow examples
    - Best practices
 
-8. **Web Server Integration** *(Covered in jobsystem.md)* - Direct HTTP job invocation
+8. **Web Server Integration** _(Covered in jobsystem.md)_ - Direct HTTP job invocation
    - Configuration and setup
    - Job web() method
    - Load balancing strategies
    - Security considerations
 
-9. **Retry and Backoff** *(Covered in job-class.md)* - Automatic error handling
+9. **Retry and Backoff** _(Covered in job-class.md)_ - Automatic error handling
    - Exponential backoff algorithm
    - Custom retry logic
    - Manual rescheduling
@@ -188,21 +188,21 @@ Trigger Dependent Jobs
 
 ## Database Schema Summary
 
-| Column | Purpose |
-|--------|---------|
-| `id` | Primary key |
-| `queue` | Route jobs to specific workers |
-| `state` | Current status (queued → claimed → running → finished/crashed) |
-| `prio` | Priority (lower = higher priority) |
-| `run_after` | Minimum start time |
-| `job_class` | Python class path |
-| `kwargs` | Arguments (JSONB) |
-| `result` | Return value (JSONB) |
-| `error_backtrace` | Stack trace on failure |
-| `waitfor_job` | Dependency on specific job |
-| `waitfor_group` | Dependency on job group |
-| `run_group` | Group identifier for this job |
-| `deadline_key` | Unique key for singleton scheduling |
+| Column            | Purpose                                                        |
+| ----------------- | -------------------------------------------------------------- |
+| `id`              | Primary key                                                    |
+| `queue`           | Route jobs to specific workers                                 |
+| `state`           | Current status (queued → claimed → running → finished/crashed) |
+| `prio`            | Priority (lower = higher priority)                             |
+| `run_after`       | Minimum start time                                             |
+| `job_class`       | Python class path                                              |
+| `kwargs`          | Arguments (JSONB)                                              |
+| `result`          | Return value (JSONB)                                           |
+| `error_backtrace` | Stack trace on failure                                         |
+| `waitfor_job`     | Dependency on specific job                                     |
+| `waitfor_group`   | Dependency on job group                                        |
+| `run_group`       | Group identifier for this job                                  |
+| `deadline_key`    | Unique key for singleton scheduling                            |
 
 ## Example Workflows
 
@@ -252,24 +252,26 @@ await db.execute("""
 
 ## Performance Characteristics
 
-| Metric | Typical Value |
-|--------|---------------|
-| Job claiming latency | <1ms |
-| Polling interval | 5-6 seconds |
+| Metric                  | Typical Value               |
+| ----------------------- | --------------------------- |
+| Job claiming latency    | <1ms                        |
+| Polling interval        | 5-6 seconds                 |
 | Throughput (small jobs) | 100-500 jobs/sec per worker |
-| Throughput (large jobs) | Limited by job duration |
-| Database bottleneck | ~1000 jobs/sec aggregate |
+| Throughput (large jobs) | Limited by job duration     |
+| Database bottleneck     | ~1000 jobs/sec aggregate    |
 
 ## Design Trade-offs
 
 ### Chosen: Simplicity over Raw Performance
 
 **What we sacrificed**:
+
 - 5-6 second polling (not instant job start)
 - Every state change writes to WAL
 - FOR UPDATE SKIP LOCKED (not advisory locks)
 
 **What we gained**:
+
 - <1000 lines of code
 - No complex pub/sub coordination
 - Easy to understand and debug
@@ -278,10 +280,12 @@ await db.execute("""
 ### Chosen: PostgreSQL over Message Broker
 
 **What we sacrificed**:
+
 - Peak throughput vs Redis/RabbitMQ
 - Real-time job execution
 
 **What we gained**:
+
 - One dependency instead of two
 - Durable by default
 - Observable with SQL
@@ -290,6 +294,7 @@ await db.execute("""
 ## When to Use Pyjobby
 
 **Good fit**:
+
 - Applications already using PostgreSQL
 - Job volumes <1000/second
 - Need for durable job state
@@ -297,6 +302,7 @@ await db.execute("""
 - Mixed sync/async workloads
 
 **Not ideal for**:
+
 - Ultra-high throughput (millions of tiny jobs/second)
 - Real-time requirements (<1 second latency)
 - Complex workflow orchestration (use Airflow/Prefect)
@@ -324,6 +330,7 @@ See LICENSE file in repository root.
 Created by Matt Stancliff (@mattsta) in January 2021.
 
 Inspired by:
+
 - Que (Ruby) - PostgreSQL-backed job queue
 - RQ (Python) - Simple Redis queue
 - Celery (Python) - Distributed task queue

@@ -8,16 +8,15 @@ Comprehensive tests for configurable retry strategies:
 - Fixed (legacy) backoff
 """
 
-import asyncio
 from datetime import datetime, timedelta
 
 import pytest
 
 from pyjobby.retry_strategies import (
+    RetryStrategy,
     calculate_retry_delay,
-    get_retry_config,
     calculate_retry_from_job,
-    RetryStrategy
+    get_retry_config,
 )
 from tests.utils.factories import create_job, get_job
 
@@ -73,8 +72,7 @@ class TestRetryDelayCalculation:
     def test_fixed_backoff_legacy(self):
         """Test fixed (legacy) backoff: quadratic."""
         delays = [
-            calculate_retry_delay(attempt, strategy="fixed")
-            for attempt in range(1, 5)
+            calculate_retry_delay(attempt, strategy="fixed") for attempt in range(1, 5)
         ]
 
         # Fixed: 2*(n^2) + jitter
@@ -93,7 +91,7 @@ class TestRetryDelayCalculation:
             20,  # Would be huge without cap
             strategy="exponential",
             initial_delay=1,
-            max_delay=60  # Cap at 60 seconds
+            max_delay=60,  # Cap at 60 seconds
         )
 
         assert delay.total_seconds() <= 60
@@ -101,11 +99,7 @@ class TestRetryDelayCalculation:
     def test_initial_delay_parameter(self):
         """Test that initial_delay parameter works."""
         # Start with 10 seconds
-        delay = calculate_retry_delay(
-            1,
-            strategy="exponential",
-            initial_delay=10
-        )
+        delay = calculate_retry_delay(1, strategy="exponential", initial_delay=10)
 
         assert 9.5 <= delay.total_seconds() <= 10.5
 
@@ -117,7 +111,7 @@ class TestRetryDelayCalculation:
         ]
 
         # All should be around 16s but slightly different
-        unique_delays = set(d.total_seconds() for d in delays)
+        unique_delays = {d.total_seconds() for d in delays}
         assert len(unique_delays) > 1  # Not all identical
 
     def test_returns_timedelta(self):
@@ -135,7 +129,7 @@ class TestRetryConfigExtraction:
             "retry_strategy": "linear",
             "max_retries": 15,
             "initial_retry_delay": 5,
-            "max_retry_delay": 600
+            "max_retry_delay": 600,
         }
 
         config = get_retry_config(admin_data)
@@ -158,7 +152,7 @@ class TestRetryConfigExtraction:
         """Test partial config with some defaults."""
         admin_data = {
             "retry_strategy": "fibonacci",
-            "max_retries": 20
+            "max_retries": 20,
             # Missing initial_retry_delay and max_retry_delay
         }
 
@@ -176,8 +170,8 @@ class TestRetryConfigExtraction:
             "admin_data": {
                 "retry_strategy": "exponential",
                 "initial_retry_delay": 2,
-                "max_retry_delay": 300
-            }
+                "max_retry_delay": 300,
+            },
         }
 
         delay = calculate_retry_from_job(job, error_count=3)
@@ -197,20 +191,26 @@ class TestAdminDataRetryConfig:
             "retry_strategy": "exponential",
             "max_retries": 15,
             "initial_retry_delay": 1,
-            "max_retry_delay": 300
+            "max_retry_delay": 300,
         }
 
-        job_id = await db_connection.fetchval("""
+        job_id = await db_connection.fetchval(
+            """
             INSERT INTO jorb (job_class, kwargs, queue, admin_data)
             VALUES ($1, $2, $3, $4)
             RETURNING id
-        """, "test.Job", '{}', "default", admin_data)
+        """,
+            "test.Job",
+            "{}",
+            "default",
+            admin_data,
+        )
 
         job = await get_job(db_connection, job_id)
-        assert job['admin_data']['retry_strategy'] == 'exponential'
-        assert job['admin_data']['max_retries'] == 15
-        assert job['admin_data']['initial_retry_delay'] == 1
-        assert job['admin_data']['max_retry_delay'] == 300
+        assert job["admin_data"]["retry_strategy"] == "exponential"
+        assert job["admin_data"]["max_retries"] == 15
+        assert job["admin_data"]["initial_retry_delay"] == 1
+        assert job["admin_data"]["max_retry_delay"] == 300
 
     @pytest.mark.asyncio
     async def test_default_retry_config(self, db_connection):
@@ -219,9 +219,9 @@ class TestAdminDataRetryConfig:
         job = await get_job(db_connection, job_id)
 
         # Extract config (should get defaults)
-        config = get_retry_config(job.get('admin_data'))
-        assert config['retry_strategy'] == 'exponential'
-        assert config['max_retries'] == 10
+        config = get_retry_config(job.get("admin_data"))
+        assert config["retry_strategy"] == "exponential"
+        assert config["max_retries"] == 10
 
 
 class TestRetryStrategiesIntegration:
@@ -234,30 +234,41 @@ class TestRetryStrategiesIntegration:
             "retry_strategy": "exponential",
             "max_retries": 5,
             "initial_retry_delay": 1,
-            "max_retry_delay": 60
+            "max_retry_delay": 60,
         }
 
         # Create job that will fail and retry
-        job_id = await db_connection.fetchval("""
+        job_id = await db_connection.fetchval(
+            """
             INSERT INTO jorb (job_class, kwargs, queue, admin_data, state)
             VALUES ($1, $2, $3, $4, $5)
             RETURNING id
-        """, "test.FailingJob", '{}', "default", admin_data, "queued")
+        """,
+            "test.FailingJob",
+            "{}",
+            "default",
+            admin_data,
+            "queued",
+        )
 
         # Simulate first failure
-        await db_connection.execute("""
+        await db_connection.execute(
+            """
             UPDATE jorb
             SET state = 'crashed',
                 error_count = 1,
                 error_message = 'Test failure'
             WHERE id = $1
-        """, job_id)
+        """,
+            job_id,
+        )
 
         # Create retry job (this is what the worker would do)
         job = await get_job(db_connection, job_id)
         retry_delay = calculate_retry_from_job(job, error_count=1)
 
-        retry_id = await db_connection.fetchval("""
+        retry_id = await db_connection.fetchval(
+            """
             INSERT INTO jorb (
                 job_class, kwargs, queue, admin_data, state, error_count,
                 run_after
@@ -268,33 +279,42 @@ class TestRetryStrategiesIntegration:
             FROM jorb
             WHERE id = $1
             RETURNING id
-        """, job_id, 1, retry_delay)
+        """,
+            job_id,
+            1,
+            retry_delay,
+        )
 
         retry_job = await get_job(db_connection, retry_id)
-        assert retry_job['error_count'] == 1
-        assert retry_job['state'] == 'queued'
+        assert retry_job["error_count"] == 1
+        assert retry_job["state"] == "queued"
         # run_after should be ~1 second from now
-        assert retry_job['run_after'] > datetime.utcnow()
+        assert retry_job["run_after"] > datetime.utcnow()
 
     @pytest.mark.asyncio
     async def test_max_retries_enforcement(self, db_connection):
         """Test that max_retries limit is enforced."""
-        admin_data = {
-            "retry_strategy": "exponential",
-            "max_retries": 3
-        }
+        admin_data = {"retry_strategy": "exponential", "max_retries": 3}
 
-        job_id = await db_connection.fetchval("""
+        job_id = await db_connection.fetchval(
+            """
             INSERT INTO jorb (job_class, kwargs, queue, admin_data, state, error_count)
             VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING id
-        """, "test.Job", '{}', "default", admin_data, "crashed", 3)
+        """,
+            "test.Job",
+            "{}",
+            "default",
+            admin_data,
+            "crashed",
+            3,
+        )
 
         job = await get_job(db_connection, job_id)
-        config = get_retry_config(job['admin_data'])
+        config = get_retry_config(job["admin_data"])
 
         # Should not retry - at max
-        assert job['error_count'] >= config['max_retries']
+        assert job["error_count"] >= config["max_retries"]
 
     @pytest.mark.asyncio
     async def test_different_strategies_produce_different_delays(self, db_connection):
@@ -303,16 +323,19 @@ class TestRetryStrategiesIntegration:
         delays = {}
 
         for strategy in strategies:
-            admin_data = {
-                "retry_strategy": strategy,
-                "initial_retry_delay": 1
-            }
+            admin_data = {"retry_strategy": strategy, "initial_retry_delay": 1}
 
-            job_id = await db_connection.fetchval("""
+            job_id = await db_connection.fetchval(
+                """
                 INSERT INTO jorb (job_class, kwargs, queue, admin_data)
                 VALUES ($1, $2, $3, $4)
                 RETURNING id
-            """, "test.Job", '{}', "default", admin_data)
+            """,
+                "test.Job",
+                "{}",
+                "default",
+                admin_data,
+            )
 
             job = await get_job(db_connection, job_id)
             delay = calculate_retry_from_job(job, error_count=6)
@@ -340,9 +363,7 @@ class TestRetryStrategyEnum:
     def test_enum_can_be_used_in_calculation(self):
         """Test that enum values work with calculate_retry_delay."""
         delay = calculate_retry_delay(
-            1,
-            strategy=RetryStrategy.EXPONENTIAL,
-            initial_delay=1
+            1, strategy=RetryStrategy.EXPONENTIAL, initial_delay=1
         )
         assert isinstance(delay, timedelta)
 
@@ -352,31 +373,20 @@ class TestEdgeCases:
 
     def test_zero_initial_delay(self):
         """Test with zero initial delay."""
-        delay = calculate_retry_delay(
-            1,
-            strategy="exponential",
-            initial_delay=0
-        )
+        delay = calculate_retry_delay(1, strategy="exponential", initial_delay=0)
         # Should still have jitter
         assert delay.total_seconds() >= 0
 
     def test_very_large_attempt_number(self):
         """Test with very large attempt number."""
         delay = calculate_retry_delay(
-            100,
-            strategy="exponential",
-            initial_delay=1,
-            max_delay=3600
+            100, strategy="exponential", initial_delay=1, max_delay=3600
         )
         # Should be capped at max_delay
         assert delay.total_seconds() <= 3600
 
     def test_unknown_strategy_defaults_to_exponential(self):
         """Test that unknown strategy falls back to exponential."""
-        delay = calculate_retry_delay(
-            2,
-            strategy="unknown_strategy",
-            initial_delay=1
-        )
+        delay = calculate_retry_delay(2, strategy="unknown_strategy", initial_delay=1)
         # Should behave like exponential (attempt 2 = ~2s)
         assert 1.5 <= delay.total_seconds() <= 2.5

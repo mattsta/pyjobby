@@ -8,11 +8,11 @@ These tests validate:
 - Status logging improvements (manual verification)
 """
 
-import pytest
 from datetime import datetime, timedelta
 
-from tests.utils.factories import create_job, get_job
+import pytest
 
+from tests.utils.factories import create_job, get_job
 
 pytestmark = pytest.mark.asyncio
 
@@ -50,7 +50,9 @@ class TestJobCancellation:
         parent_job_id = await create_job(db_connection, state="queued")
 
         # Create a waiting job that waits for parent
-        job_id = await create_job(db_connection, state="waiting", waitfor_job=parent_job_id)
+        job_id = await create_job(
+            db_connection, state="waiting", waitfor_job=parent_job_id
+        )
 
         # Verify it's waiting
         job = await get_job(db_connection, job_id)
@@ -74,7 +76,7 @@ class TestJobCancellation:
         await db_connection.execute(
             """UPDATE jorb SET state = 'claimed', worker_pid = 12345,
                worker_host = 'test-host' WHERE id = $1""",
-            job_id
+            job_id,
         )
 
         # Try to cancel it
@@ -97,7 +99,7 @@ class TestJobCancellation:
         await db_connection.execute(
             """UPDATE jorb SET state = 'running', worker_pid = 12345,
                worker_host = 'test-host' WHERE id = $1""",
-            job_id
+            job_id,
         )
 
         # Try to cancel it
@@ -118,8 +120,7 @@ class TestJobCancellation:
         job_id = await create_job(db_connection, state="queued")
 
         await db_connection.execute(
-            "UPDATE jorb SET state = 'finished' WHERE id = $1",
-            job_id
+            "UPDATE jorb SET state = 'finished' WHERE id = $1", job_id
         )
 
         # Try to cancel it
@@ -151,8 +152,7 @@ class TestJobCancellation:
 
         old_time = datetime.utcnow() - timedelta(hours=1)
         await db_connection.execute(
-            "UPDATE jorb SET updated = $1 WHERE id = $2",
-            old_time, job_id
+            "UPDATE jorb SET updated = $1 WHERE id = $2", old_time, job_id
         )
 
         # Cancel it
@@ -191,15 +191,13 @@ class TestRecoveryIndex:
                 """UPDATE jorb SET state = 'claimed', worker_host = $1,
                    updated = $2 WHERE id IN (SELECT id FROM jorb LIMIT 1)""",
                 f"worker-{i % 3}",
-                datetime.utcnow() - timedelta(minutes=10)
+                datetime.utcnow() - timedelta(minutes=10),
             )
 
         # Get query plan
         recovery_timeout = timedelta(minutes=5)
         plan = await db_connection.fetch(
-            f"EXPLAIN {STMTS['recover-abandoned']}",
-            "worker-1",
-            recovery_timeout
+            f"EXPLAIN {STMTS['recover-abandoned']}", "worker-1", recovery_timeout
         )
 
         # Convert plan to string
@@ -222,7 +220,7 @@ class TestOrjsonEncoder:
         job_id = await create_job(
             db_connection,
             kwargs={"test": "value", "nested": {"key": "value"}, "list": [1, 2, 3]},
-            admin_data={"tags": ["tag1", "tag2"], "priority": "high"}
+            admin_data={"tags": ["tag1", "tag2"], "priority": "high"},
         )
 
         # Retrieve the job
@@ -240,7 +238,7 @@ class TestOrjsonEncoder:
         job_id = await create_job(
             db_connection,
             kwargs={"message": "Hello 世界 🌍"},
-            admin_data={"emoji": "🚀💻"}
+            admin_data={"emoji": "🚀💻"},
         )
 
         job = await get_job(db_connection, job_id)
@@ -250,11 +248,7 @@ class TestOrjsonEncoder:
 
     async def test_orjson_encoder_handles_empty_objects(self, db_connection):
         """Test that empty JSON objects are handled."""
-        job_id = await create_job(
-            db_connection,
-            kwargs={},
-            admin_data={}
-        )
+        job_id = await create_job(db_connection, kwargs={}, admin_data={})
 
         job = await get_job(db_connection, job_id)
 
@@ -271,11 +265,11 @@ class TestConfigurationParameters:
 
         # Create JobSystem with custom recovery timeout
         system = JobSystem(
-            dsn=worker_params["dsn"] if "dsn" in worker_params else {},
+            dsn=worker_params.get("dsn", {}),
             qname="test",
             capabilities=("test",),
             workerId=0,
-            recovery_timeout=600  # 10 minutes
+            recovery_timeout=600,  # 10 minutes
         )
 
         assert system.recovery_timeout == 600
@@ -285,11 +279,11 @@ class TestConfigurationParameters:
         from pyjobby.pj import JobSystem
 
         system = JobSystem(
-            dsn=worker_params["dsn"] if "dsn" in worker_params else {},
+            dsn=worker_params.get("dsn", {}),
             qname="test",
             capabilities=("test",),
             workerId=0,
-            max_retries=5
+            max_retries=5,
         )
 
         assert system.max_retries == 5
@@ -299,11 +293,11 @@ class TestConfigurationParameters:
         from pyjobby.pj import JobSystem
 
         system = JobSystem(
-            dsn=worker_params["dsn"] if "dsn" in worker_params else {},
+            dsn=worker_params.get("dsn", {}),
             qname="test",
             capabilities=("test",),
             workerId=0,
-            default_timeout=7200  # 2 hours
+            default_timeout=7200,  # 2 hours
         )
 
         assert system.default_timeout == 7200
@@ -313,11 +307,11 @@ class TestConfigurationParameters:
         from pyjobby.pj import JobSystem
 
         system = JobSystem(
-            dsn=worker_params["dsn"] if "dsn" in worker_params else {},
+            dsn=worker_params.get("dsn", {}),
             qname="test",
             capabilities=("test",),
             workerId=0,
-            enable_recovery=False
+            enable_recovery=False,
         )
 
         assert system.enable_recovery is False

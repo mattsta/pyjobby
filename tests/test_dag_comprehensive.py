@@ -13,14 +13,14 @@ Tests cover:
 """
 
 import pytest
-import asyncio
-from pyjobby.dag import DAGBuilder, DAGNode
-from pyjobby.client import JobClient
 
+from pyjobby.client import JobClient
+from pyjobby.dag import DAGBuilder, DAGNode
 
 # =============================================================================
 # Test Fixtures
 # =============================================================================
+
 
 @pytest.fixture
 async def job_client(db_pool):
@@ -33,6 +33,7 @@ async def job_client(db_pool):
 # =============================================================================
 # DAGNode Tests
 # =============================================================================
+
 
 class TestDAGNode:
     """Tests for DAGNode functionality."""
@@ -91,6 +92,7 @@ class TestDAGNode:
 # DAGBuilder Tests
 # =============================================================================
 
+
 class TestDAGBuilder:
     """Tests for DAG building functionality."""
 
@@ -147,12 +149,17 @@ class TestDAGBuilder:
         node = dag.add("test.Job", priority=500, capability="gpu")
 
         # Node-specific options should override common options
-        assert node._job_options == {"queue": "default", "priority": 500, "capability": "gpu"}
+        assert node._job_options == {
+            "queue": "default",
+            "priority": 500,
+            "capability": "gpu",
+        }
 
 
 # =============================================================================
 # DAG Validation Tests
 # =============================================================================
+
 
 class TestDAGValidation:
     """Tests for DAG validation."""
@@ -227,6 +234,7 @@ class TestDAGValidation:
 # =============================================================================
 # Topological Sort Tests
 # =============================================================================
+
 
 class TestTopologicalSort:
     """Tests for topological sorting."""
@@ -320,6 +328,7 @@ class TestTopologicalSort:
 # DAG Execution Tests
 # =============================================================================
 
+
 @pytest.mark.asyncio
 class TestDAGExecution:
     """Tests for DAG execution against live database."""
@@ -380,8 +389,8 @@ class TestDAGExecution:
         job2 = await job_client.get_job_full(result[node2])
         job3 = await job_client.get_job_full(result[node3])
 
-        assert job2['waitfor_job'] == result[node1]
-        assert job3['waitfor_job'] == result[node2]
+        assert job2["waitfor_job"] == result[node1]
+        assert job3["waitfor_job"] == result[node2]
 
     async def test_execute_diamond_dag(self, db_pool, job_client):
         """Test executing diamond pattern DAG."""
@@ -400,19 +409,16 @@ class TestDAGExecution:
             # Check that all jobs belong to same DAG
             jobs = await conn.fetch(
                 "SELECT id, dag_id FROM jorb WHERE id = ANY($1::bigint[])",
-                list(result.values())
+                list(result.values()),
             )
-            dag_ids = {job['dag_id'] for job in jobs}
+            dag_ids = {job["dag_id"] for job in jobs}
             assert len(dag_ids) == 1  # All jobs in same DAG
             assert None not in dag_ids  # DAG ID is set
 
     async def test_execute_with_common_options(self, db_pool, job_client):
         """Test executing DAG with common options."""
         dag = DAGBuilder(
-            name="Common Options DAG",
-            queue="high-priority",
-            priority=500,
-            uid=12345
+            name="Common Options DAG", queue="high-priority", priority=500, uid=12345
         )
         node1 = dag.add("test.Job1")
         node2 = dag.add("test.Job2")
@@ -422,28 +428,30 @@ class TestDAGExecution:
         # Verify options were applied
         for job_id in result.values():
             job = await job_client.get_job_full(job_id)
-            assert job['queue'] == "high-priority"
-            assert job['prio'] == 500
-            assert job['uid'] == 12345
+            assert job["queue"] == "high-priority"
+            assert job["prio"] == 500
+            assert job["uid"] == 12345
 
     async def test_execute_with_node_specific_options(self, db_pool, job_client):
         """Test executing DAG with node-specific options."""
         dag = DAGBuilder(name="Node Options DAG", queue="default", priority=100)
         node1 = dag.add("test.Job1")  # Uses common options
-        node2 = dag.add("test.Job2", priority=800, capability="gpu")  # Overrides priority
+        node2 = dag.add(
+            "test.Job2", priority=800, capability="gpu"
+        )  # Overrides priority
 
         result = await dag.execute(job_client)
 
         # Verify node1 has common options
         job1 = await job_client.get_job_full(result[node1])
-        assert job1['queue'] == "default"
-        assert job1['prio'] == 100
+        assert job1["queue"] == "default"
+        assert job1["prio"] == 100
 
         # Verify node2 has overridden options
         job2 = await job_client.get_job_full(result[node2])
-        assert job2['queue'] == "default"  # Inherited
-        assert job2['prio'] == 800  # Overridden
-        assert job2['capability'] == "gpu"  # Added
+        assert job2["queue"] == "default"  # Inherited
+        assert job2["prio"] == 800  # Overridden
+        assert job2["capability"] == "gpu"  # Added
 
     async def test_execute_rejects_cyclic_dag(self, db_pool, job_client):
         """Test that executing cyclic DAG raises error."""
@@ -468,8 +476,12 @@ class TestDAGExecution:
         extract3 = dag.add("test.ExtractAPI", {"url": "api.example.com"})
 
         # Transform phase (depends on extracts)
-        transform1 = dag.add("test.Transform", {"type": "normalize"}, depends_on=[extract1])
-        transform2 = dag.add("test.Transform", {"type": "normalize"}, depends_on=[extract2])
+        transform1 = dag.add(
+            "test.Transform", {"type": "normalize"}, depends_on=[extract1]
+        )
+        transform2 = dag.add(
+            "test.Transform", {"type": "normalize"}, depends_on=[extract2]
+        )
         transform3 = dag.add("test.Transform", {"type": "parse"}, depends_on=[extract3])
 
         # Merge phase
@@ -489,12 +501,13 @@ class TestDAGExecution:
 
         # Verify final load job depends on merge
         load_job = await job_client.get_job_full(result[load])
-        assert load_job['waitfor_job'] == result[merge]
+        assert load_job["waitfor_job"] == result[merge]
 
 
 # =============================================================================
 # Error Handling Tests
 # =============================================================================
+
 
 class TestDAGErrorHandling:
     """Tests for DAG error handling."""
@@ -635,8 +648,8 @@ class TestDAGHelperFunctions:
 
         status = await get_dag_status(db_pool, 999999)
 
-        assert 'error' in status
-        assert status['error'] == 'DAG not found'
+        assert "error" in status
+        assert status["error"] == "DAG not found"
 
     @pytest.mark.asyncio
     async def test_get_dag_status_found(self, job_client, db_pool):
@@ -682,11 +695,14 @@ class TestDAGHelperFunctions:
 
         # Mark all jobs as finished to simulate completion
         async with db_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE jorb
                 SET state = 'finished'
                 WHERE dag_id = $1
-            """, dag_id)
+            """,
+                dag_id,
+            )
 
         # Wait for DAG (should return True immediately since jobs are finished)
         success = await wait_for_dag(db_pool, dag_id, timeout=5, poll_interval=0.1)
@@ -713,11 +729,14 @@ class TestDAGHelperFunctions:
 
         # Mark jobs as crashed to simulate failure
         async with db_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE jorb
                 SET state = 'crashed', error_message = 'Test failure'
                 WHERE dag_id = $1
-            """, dag_id)
+            """,
+                dag_id,
+            )
 
         # Wait for DAG (should return False due to crashed jobs)
         success = await wait_for_dag(db_pool, dag_id, timeout=5, poll_interval=0.1)
@@ -744,11 +763,14 @@ class TestDAGHelperFunctions:
 
         # Leave jobs in running state (not finished, not crashed)
         async with db_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE jorb
                 SET state = 'running'
                 WHERE dag_id = $1
-            """, dag_id)
+            """,
+                dag_id,
+            )
 
         # Wait with very short timeout
         success = await wait_for_dag(db_pool, dag_id, timeout=0.2, poll_interval=0.05)

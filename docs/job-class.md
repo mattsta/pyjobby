@@ -19,6 +19,7 @@ class Job:
 ```
 
 **Key Attributes**:
+
 - `s`: Access to the JobSystem that's running this job
   - Database connection: `self.s.cxn`
   - Worker cache: `self.s.cache`
@@ -35,6 +36,7 @@ class Job:
   - See full schema in `priv/schema.py`
 
 **Configurable Class Attributes** (Phase 1 Improvements):
+
 - `timeout`: Maximum execution time in seconds (default: uses `JobSystem.default_timeout`)
 
 ```python
@@ -63,6 +65,7 @@ Location: `pyjobby/pj.py:513-519`
 **Execution Modes**:
 
 1. **Synchronous** (regular Python function):
+
 ```python
 class SyncJob(Job):
     def task(self, url: str) -> dict:
@@ -72,6 +75,7 @@ class SyncJob(Job):
 ```
 
 2. **Asynchronous** (coroutine):
+
 ```python
 class AsyncJob(Job):
     async def task(self, url: str) -> dict:
@@ -82,6 +86,7 @@ class AsyncJob(Job):
 ```
 
 3. **Async Generator** (streaming results):
+
 ```python
 class StreamingJob(Job):
     async def task(self, urls: list[str]):
@@ -94,6 +99,7 @@ class StreamingJob(Job):
 ```
 
 **Important Notes**:
+
 - If task raises an exception, job is marked as `crashed` and rescheduled
 - Return value is serialized to JSON and stored in `result` column
 - Don't return large objects (>1MB) - use external storage and return a reference
@@ -105,6 +111,7 @@ Location: `pyjobby/pj.py:521-525`
 Wrapper method that calls `task()` with kwargs from the database.
 
 **Default Implementation**:
+
 ```python
 def run(self) -> Any:
     """Call subclass .task() with arguments from DB"""
@@ -134,6 +141,7 @@ Location: `pyjobby/pj.py:547-576`
 Reschedule this job to run at a future time.
 
 **Parameters**:
+
 - `relative`: Number of time units in the future
 - `unit`: Time unit (default: "seconds")
   - Valid units: `"microseconds"`, `"milliseconds"`, `"seconds"`, `"minutes"`, `"hours"`, `"days"`, `"weeks"`
@@ -168,12 +176,14 @@ await self.reschedule(deltas={
 ```
 
 **How it Works**:
+
 1. Updates current job's `run_after` to future timestamp
 2. Sets state to `queued`
 3. Job becomes eligible when `run_after` passes
 4. Workers will claim it again
 
 **Use Cases**:
+
 - Rate limiting (retry after limit resets)
 - Business logic scheduling (retry during business hours)
 - Dependency waiting (check again later if prerequisite not ready)
@@ -185,11 +195,13 @@ Location: `pyjobby/pj.py:527-545`
 Reschedule with exponential backoff (automatically called on job failure).
 
 **Parameters**:
+
 - `attempt`: Retry attempt number (default: uses `job["error_count"]`)
 
 **Returns**: `datetime.timedelta` of the backoff delay
 
 **Backoff Schedule**:
+
 ```python
 attempt = 0: 16s  (2^4)
 attempt = 1: 32s  (2^5)
@@ -201,6 +213,7 @@ attempt = 6+: 1024s (2^10) = ~17 minutes (capped)
 ```
 
 **Implementation**:
+
 ```python
 def rescheduleBackoff(self, attempt: Optional[int] = None) -> Awaitable[datetime.timedelta]:
     if attempt is None:
@@ -224,6 +237,7 @@ except Exception as e:
 ```
 
 **Custom Backoff**:
+
 ```python
 class MyJob(Job):
     async def rescheduleBackoff(self, attempt: int = None) -> timedelta:

@@ -25,44 +25,50 @@ Each test runs 100+ examples by default to find edge cases.
 
 import asyncio
 from datetime import datetime, timedelta
-from typing import List, Tuple, Optional, Set
-import pytest
-from hypothesis import given, strategies as st, settings, assume, HealthCheck
-from hypothesis.stateful import RuleBasedStateMachine, rule, initialize, invariant
+
 import asyncpg
+import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
+from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, rule
 
-from pyjobby.pj import STMTS, JobSystem
+from pyjobby.pj import STMTS
 from tests.utils.factories import create_job, get_job
-
 
 # ============================================================================
 # Hypothesis Strategies (Data Generators)
 # ============================================================================
 
 # Strategy for generating valid job classes
-job_classes = st.sampled_from([
-    "examples.jobs.example_jobs.BasicJob",
-    "examples.jobs.example_jobs.FailingJob",
-    "examples.jobs.example_jobs.TimeoutJob",
-])
+job_classes = st.sampled_from(
+    [
+        "examples.jobs.example_jobs.BasicJob",
+        "examples.jobs.example_jobs.FailingJob",
+        "examples.jobs.example_jobs.TimeoutJob",
+    ]
+)
 
 # Strategy for generating queue names
 queue_names = st.sampled_from(["default", "high_priority", "low_priority", "batch"])
 
 # Strategy for generating capabilities
-capabilities = st.sampled_from([
-    None,  # No capability requirement
-    "cpu_intensive",
-    "gpu_required",
-    "disk_io",
-    "network_io",
-])
+capabilities = st.sampled_from(
+    [
+        None,  # No capability requirement
+        "cpu_intensive",
+        "gpu_required",
+        "disk_io",
+        "network_io",
+    ]
+)
 
 # Strategy for generating priorities (lower = higher priority)
 priorities = st.integers(min_value=1, max_value=10000)
 
 # Strategy for generating job states
-job_states = st.sampled_from(["queued", "claimed", "running", "finished", "crashed", "waiting"])
+job_states = st.sampled_from(
+    ["queued", "claimed", "running", "finished", "crashed", "waiting"]
+)
 
 # Strategy for small positive integers (job counts, worker counts)
 small_counts = st.integers(min_value=1, max_value=10)
@@ -89,7 +95,8 @@ pytestmark = pytest.mark.asyncio
 # hypothesis.settings.register_profile("default", max_examples=100)
 
 # Stress profile: Exhaustive testing with thousands of examples
-from hypothesis import settings, Phase
+from hypothesis import Phase, settings
+
 settings.register_profile(
     "stress",
     max_examples=1000,  # 1000 examples per test!
@@ -113,7 +120,11 @@ settings.register_profile(
 class TestProducerConsumerInvariants:
     """Property-based tests for producer-consumer invariants."""
 
-    @settings(max_examples=500, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(
+        max_examples=500,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
     @given(
         job_count=st.integers(min_value=1, max_value=50),  # Increased range
         queue=queue_names,
@@ -153,14 +164,16 @@ class TestProducerConsumerInvariants:
         assert len(claimed) == job_count
         assert set(claimed) == set(job_ids)
 
-    @settings(max_examples=500, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(
+        max_examples=500,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
     @given(
         job_count=st.integers(min_value=2, max_value=30),  # Increased range
         queue=queue_names,
     )
-    async def test_no_duplicate_claims(
-        self, db_connection, job_count: int, queue: str
-    ):
+    async def test_no_duplicate_claims(self, db_connection, job_count: int, queue: str):
         """Property: Each job should be claimed at most once (SKIP LOCKED ensures this)."""
 
         # Create N jobs
@@ -189,10 +202,14 @@ class TestProducerConsumerInvariants:
         assert len(claimed_jobs) == len(set(claimed_jobs)), "Duplicate claims detected!"
         assert len(claimed_jobs) == job_count
 
-    @settings(max_examples=500, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(
+        max_examples=500,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
     @given(
         finish_count=st.integers(min_value=1, max_value=20),  # Increased range
-        crash_count=st.integers(min_value=1, max_value=20),   # Increased range
+        crash_count=st.integers(min_value=1, max_value=20),  # Increased range
     )
     async def test_jobs_reach_terminal_states(
         self, db_connection, finish_count: int, crash_count: int
@@ -209,7 +226,7 @@ class TestProducerConsumerInvariants:
             await db_connection.execute(
                 """UPDATE jorb SET state = 'claimed', worker_pid = 12345,
                    worker_host = 'test-host' WHERE id = $1""",
-                job_id
+                job_id,
             )
             job_ids.append(job_id)
 
@@ -234,11 +251,16 @@ class TestProducerConsumerInvariants:
 # Property Test: Concurrent Producers
 # ============================================================================
 
+
 @pytest.mark.hypothesis
 class TestConcurrentProducers:
     """Property tests for concurrent job producers."""
 
-    @settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(
+        max_examples=300,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
     @given(
         producer_count=st.integers(min_value=2, max_value=8),  # More producers
         jobs_per_producer=st.integers(min_value=1, max_value=10),  # More jobs
@@ -255,7 +277,7 @@ class TestConcurrentProducers:
                 job_id = await create_job(
                     conn,
                     state="queued",
-                    admin_data={"producer_id": producer_id, "job_number": i}
+                    admin_data={"producer_id": producer_id, "job_number": i},
                 )
                 created.append(job_id)
             return created
@@ -263,7 +285,8 @@ class TestConcurrentProducers:
         # Helper to setup JSON codec
         def orjson_encoder(obj):
             import orjson
-            return orjson.dumps(obj).decode('utf-8')
+
+            return orjson.dumps(obj).decode("utf-8")
 
         # Create connections for each producer
         connections = []
@@ -271,17 +294,23 @@ class TestConcurrentProducers:
             conn = await asyncpg.connect(**db_params)
             # Setup JSON codec
             import orjson
+
             await conn.set_type_codec(
-                "json", encoder=orjson_encoder, decoder=orjson.loads, schema="pg_catalog"
+                "json",
+                encoder=orjson_encoder,
+                decoder=orjson.loads,
+                schema="pg_catalog",
             )
             connections.append(conn)
 
         try:
             # Run producers concurrently
-            results = await asyncio.gather(*[
-                producer(i, jobs_per_producer, connections[i])
-                for i in range(producer_count)
-            ])
+            results = await asyncio.gather(
+                *[
+                    producer(i, jobs_per_producer, connections[i])
+                    for i in range(producer_count)
+                ]
+            )
 
             # Invariant: Total jobs created = producer_count * jobs_per_producer
             all_job_ids = [job_id for result in results for job_id in result]
@@ -308,11 +337,16 @@ class TestConcurrentProducers:
 # Property Test: Recovery Invariants
 # ============================================================================
 
+
 @pytest.mark.hypothesis
 class TestRecoveryInvariants:
     """Property tests for job recovery after worker crashes."""
 
-    @settings(max_examples=500, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(
+        max_examples=500,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
     @given(
         crashed_job_count=st.integers(min_value=1, max_value=25),  # More jobs
         recovery_timeout_minutes=st.integers(min_value=1, max_value=60),  # Wider range
@@ -332,7 +366,8 @@ class TestRecoveryInvariants:
             await db_connection.execute(
                 """UPDATE jorb SET state = 'claimed', worker_host = 'crashed-worker',
                    worker_pid = 99999, updated = $1 WHERE id = $2""",
-                old_time, job_id
+                old_time,
+                job_id,
             )
             job_ids.append(job_id)
 
@@ -352,7 +387,11 @@ class TestRecoveryInvariants:
             job = await get_job(db_connection, job_id)
             assert job["state"] == "queued"
 
-    @settings(max_examples=500, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(
+        max_examples=500,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
     @given(
         old_job_count=st.integers(min_value=1, max_value=15),  # More jobs
         recent_job_count=st.integers(min_value=1, max_value=15),  # More jobs
@@ -372,7 +411,8 @@ class TestRecoveryInvariants:
             await db_connection.execute(
                 """UPDATE jorb SET state = 'claimed', worker_host = 'worker-1',
                    updated = $1 WHERE id = $2""",
-                old_time, job_id
+                old_time,
+                job_id,
             )
             old_job_ids.append(job_id)
 
@@ -384,7 +424,8 @@ class TestRecoveryInvariants:
             await db_connection.execute(
                 """UPDATE jorb SET state = 'claimed', worker_host = 'worker-1',
                    updated = $1 WHERE id = $2""",
-                recent_time, job_id
+                recent_time,
+                job_id,
             )
             recent_job_ids.append(job_id)
 
@@ -408,33 +449,33 @@ class TestRecoveryInvariants:
 # Property Test: Priority Ordering
 # ============================================================================
 
+
 @pytest.mark.hypothesis
 class TestPriorityOrdering:
     """Property tests for job priority ordering."""
 
-    @settings(max_examples=500, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(
+        max_examples=500,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
     @given(
         priorities=st.lists(
             st.integers(min_value=1, max_value=10000),  # Wider range
             min_size=2,
             max_size=25,  # More priorities to test
-            unique=True
+            unique=True,
         )
     )
     async def test_jobs_claimed_in_priority_order(
-        self, db_connection, priorities: List[int]
+        self, db_connection, priorities: list[int]
     ):
         """Property: Jobs should be claimed in priority order (lower number first)."""
 
         # Create jobs with different priorities
         queue = "test"
         for prio in priorities:
-            await create_job(
-                db_connection,
-                state="queued",
-                queue=queue,
-                prio=prio
-            )
+            await create_job(db_connection, state="queued", queue=queue, prio=prio)
 
         # Claim jobs one by one
         claimed_priorities = []
@@ -458,12 +499,19 @@ class TestPriorityOrdering:
 # Property Test: Capability Matching
 # ============================================================================
 
+
 @pytest.mark.hypothesis
 class TestCapabilityMatching:
     """Property tests for capability-based job routing."""
 
-    @pytest.mark.skip(reason="Capability matching test needs refinement - core functionality tested elsewhere")
-    @settings(max_examples=30, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @pytest.mark.skip(
+        reason="Capability matching test needs refinement - core functionality tested elsewhere"
+    )
+    @settings(
+        max_examples=30,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
     @given(
         required_capability=st.sampled_from(["cpu", "gpu", "disk", "network"]),
         job_count=st.integers(min_value=1, max_value=5),
@@ -477,9 +525,7 @@ class TestCapabilityMatching:
         matching_job_ids = []
         for _ in range(job_count):
             job_id = await create_job(
-                db_connection,
-                state="queued",
-                capability=required_capability
+                db_connection, state="queued", capability=required_capability
             )
             matching_job_ids.append(job_id)
 
@@ -489,7 +535,7 @@ class TestCapabilityMatching:
             job_id = await create_job(
                 db_connection,
                 state="queued",
-                capability=None  # No capability - any worker can claim
+                capability=None,  # No capability - any worker can claim
             )
             no_cap_job_ids.append(job_id)
 
@@ -517,11 +563,16 @@ class TestCapabilityMatching:
 # Property Test: Dependency Resolution
 # ============================================================================
 
+
 @pytest.mark.hypothesis
 class TestDependencyResolution:
     """Property tests for job dependency resolution."""
 
-    @settings(max_examples=400, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(
+        max_examples=400,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
     @given(
         parent_count=st.integers(min_value=1, max_value=10),  # More parents
         children_per_parent=st.integers(min_value=1, max_value=5),  # More children
@@ -539,9 +590,7 @@ class TestDependencyResolution:
             child_ids = []
             for _ in range(children_per_parent):
                 child_id = await create_job(
-                    db_connection,
-                    state="waiting",
-                    waitfor_job=parent_id
+                    db_connection, state="waiting", waitfor_job=parent_id
                 )
                 child_ids.append(child_id)
 
@@ -559,9 +608,7 @@ class TestDependencyResolution:
             )
 
             # Trigger dependency resolution
-            await db_connection.fetch(
-                STMTS["enqueue-next-self-finished"], parent_id
-            )
+            await db_connection.fetch(STMTS["enqueue-next-self-finished"], parent_id)
 
             # Invariant: All children should now be queued
             for child_id in child_ids:
@@ -572,6 +619,7 @@ class TestDependencyResolution:
 # ============================================================================
 # Stateful Testing: Job State Machine
 # ============================================================================
+
 
 @pytest.mark.hypothesis
 class JobStateMachine(RuleBasedStateMachine):
@@ -584,10 +632,10 @@ class JobStateMachine(RuleBasedStateMachine):
 
     def __init__(self):
         super().__init__()
-        self.job_ids: Set[int] = set()
-        self.claimed_jobs: Set[int] = set()
-        self.finished_jobs: Set[int] = set()
-        self.crashed_jobs: Set[int] = set()
+        self.job_ids: set[int] = set()
+        self.claimed_jobs: set[int] = set()
+        self.finished_jobs: set[int] = set()
+        self.crashed_jobs: set[int] = set()
 
     @initialize()
     async def setup(self):

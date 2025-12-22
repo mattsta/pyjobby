@@ -13,6 +13,7 @@ This document describes the comprehensive property-based testing implementation 
 ### Why Property-Based Testing?
 
 Traditional example-based tests check specific scenarios:
+
 ```python
 def test_two_jobs_processed():
     create_jobs(2)
@@ -21,6 +22,7 @@ def test_two_jobs_processed():
 ```
 
 Property-based tests check invariants across **thousands of random scenarios**:
+
 ```python
 @given(job_count=st.integers(min_value=1, max_value=100))
 def test_all_jobs_eventually_processed(job_count):
@@ -30,6 +32,7 @@ def test_all_jobs_eventually_processed(job_count):
 ```
 
 Hypothesis automatically:
+
 1. Generates diverse random inputs
 2. Finds edge cases you didn't think of
 3. Minimizes failing examples (shrinking)
@@ -49,14 +52,14 @@ tests/
 
 ### Test Categories
 
-| Category | Tests | Examples/Test | What It Verifies |
-|----------|-------|---------------|------------------|
-| **Producer-Consumer Invariants** | 3 | 30-50 | Jobs created = jobs processed |
-| **Concurrent Producers** | 1 | 20 | N producers × M jobs = N·M total |
-| **Recovery Invariants** | 2 | 20-30 | Crashed jobs recovered correctly |
-| **Priority Ordering** | 1 | 30 | Jobs claimed in priority order |
-| **Dependency Resolution** | 1 | 20 | Dependencies respected |
-| **Live Workflows** | 5 | 5-10 | Real workers process real jobs |
+| Category                         | Tests | Examples/Test | What It Verifies                 |
+| -------------------------------- | ----- | ------------- | -------------------------------- |
+| **Producer-Consumer Invariants** | 3     | 30-50         | Jobs created = jobs processed    |
+| **Concurrent Producers**         | 1     | 20            | N producers × M jobs = N·M total |
+| **Recovery Invariants**          | 2     | 20-30         | Crashed jobs recovered correctly |
+| **Priority Ordering**            | 1     | 30            | Jobs claimed in priority order   |
+| **Dependency Resolution**        | 1     | 20            | Dependencies respected           |
+| **Live Workflows**               | 5     | 5-10          | Real workers process real jobs   |
 
 **Total**: 13 test methods, generating **~400 random test scenarios**
 
@@ -83,6 +86,7 @@ async def test_all_created_jobs_are_claimable(job_count):
 ```
 
 **Random Scenarios Tested**:
+
 - 1 job, 5 jobs, 20 jobs
 - Different queues: default, high_priority, batch
 - Different priorities: 1, 500, 10000
@@ -162,6 +166,7 @@ async def test_concurrent_producers_create_all_jobs(producer_count, jobs_per_pro
 ```
 
 **Scenarios Tested**:
+
 - 2 producers × 1 job = 2 total
 - 5 producers × 5 jobs = 25 total
 - 3 producers × 3 jobs = 9 total
@@ -226,6 +231,7 @@ async def test_jobs_claimed_in_priority_order(priorities):
 ```
 
 **Example Random Scenarios**:
+
 - `[7, 3, 9, 1]` → claimed as `[1, 3, 7, 9]` ✅
 - `[555, 42, 999, 1, 333]` → claimed as `[1, 42, 333, 555, 999]` ✅
 
@@ -304,6 +310,7 @@ async def test_all_jobs_eventually_processed(job_count, worker_count):
 ```
 
 **What This Tests**:
+
 - Real PostgreSQL database operations
 - Actual multiprocessing worker spawning
 - Concurrent job claiming across processes
@@ -311,6 +318,7 @@ async def test_all_jobs_eventually_processed(job_count, worker_count):
 - Recovery after worker crashes
 
 **Example Scenarios**:
+
 - 1 job, 1 worker → passes ✅
 - 20 jobs, 3 workers → passes ✅
 - 10 jobs, 2 workers → passes ✅
@@ -328,6 +336,7 @@ poetry run pytest tests/test_hypothesis_properties.py -v -m "hypothesis and not 
 ```
 
 **Output**:
+
 ```
 8 passed, 1 skipped in 9.96s
 ```
@@ -393,6 +402,7 @@ time_offsets = st.integers(min_value=-3600, max_value=3600)
 ### 1. Found Edge Cases Automatically
 
 Hypothesis automatically tests:
+
 - Boundary conditions (1 job, 0 workers, maximum values)
 - Empty collections
 - Large datasets

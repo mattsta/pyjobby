@@ -5,14 +5,14 @@ Provides configurable retry backoff strategies to replace fixed retry intervals.
 Supports exponential, linear, fibonacci, and fixed (legacy) strategies.
 """
 
-import random
 import datetime
-from typing import Optional
+import random
 from enum import Enum
 
 
 class RetryStrategy(str, Enum):
     """Retry backoff strategies"""
+
     FIXED = "fixed"  # Fixed interval (legacy behavior)
     EXPONENTIAL = "exponential"  # Exponential backoff (recommended)
     LINEAR = "linear"  # Linear increase
@@ -51,7 +51,7 @@ def calculate_retry_delay(
     """
     if strategy == "fixed":
         # Legacy behavior: quadratic with jitter
-        delay = 2 * (error_count ** 2) + random.randint(1, 5)
+        delay = 2 * (error_count**2) + random.randint(1, 5)
 
     elif strategy == "exponential":
         # Exponential backoff: initial * (multiplier ^ attempts)
@@ -89,7 +89,7 @@ def calculate_retry_delay(
     return datetime.timedelta(seconds=delay)
 
 
-def get_retry_config(admin_data: Optional[dict]) -> dict:
+def get_retry_config(admin_data: dict | None) -> dict:
     """
     Extract retry configuration from admin_data.
 

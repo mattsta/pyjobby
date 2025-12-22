@@ -11,28 +11,30 @@ Production-grade recurring job scheduler with comprehensive safety features:
 """
 
 import asyncio
-import asyncpg
-from typing import Optional, Dict, Any, List
-from datetime import datetime, timedelta
-import random
 import json
-from dataclasses import dataclass, asdict
-from loguru import logger
+import random
 import time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
+
+import asyncpg
 import pytz
+from loguru import logger
 
 
 @dataclass
 class ScheduleExecutionResult:
     """Result of schedule execution attempt"""
+
     result: str  # 'success', 'failure', 'skipped'
-    job_id: Optional[int] = None
-    skip_reason: Optional[str] = None
-    error_message: Optional[str] = None
+    job_id: int | None = None
+    skip_reason: str | None = None
+    error_message: str | None = None
     jitter_applied: int = 0
-    queue_depth: Optional[int] = None
-    concurrent_jobs: Optional[int] = None
-    duration_ms: Optional[int] = None
+    queue_depth: int | None = None
+    concurrent_jobs: int | None = None
+    duration_ms: int | None = None
 
 
 class ScheduleSafetyManager:
@@ -56,9 +58,7 @@ class ScheduleSafetyManager:
         self.conn = conn
 
     async def check_concurrency(
-        self,
-        schedule_id: int,
-        max_concurrent: int
+        self, schedule_id: int, max_concurrent: int
     ) -> tuple[bool, int]:
         """
         Check if schedule has reached max concurrent jobs limit.
@@ -71,25 +71,25 @@ class ScheduleSafetyManager:
             Tuple of (is_safe: bool, current_count: int)
         """
         # Count jobs from this schedule that are still running
-        count = await self.conn.fetchval("""
+        count = await self.conn.fetchval(
+            """
             SELECT COUNT(*) FROM jorb
             WHERE admin_data->>'schedule_id' = $1
               AND state IN ('queued', 'claimed', 'running', 'waiting')
-        """, str(schedule_id))
+        """,
+            str(schedule_id),
+        )
 
         is_safe = count < max_concurrent
 
         logger.debug(
-            f"Concurrency check: {count}/{max_concurrent} jobs running "
-            f"(safe: {is_safe})"
+            f"Concurrency check: {count}/{max_concurrent} jobs running (safe: {is_safe})"
         )
 
         return is_safe, count
 
     async def check_backpressure(
-        self,
-        queue: str,
-        threshold: Optional[int]
+        self, queue: str, threshold: int | None
     ) -> tuple[bool, int]:
         """
         Check if queue is overloaded (backpressure).
@@ -105,11 +105,14 @@ class ScheduleSafetyManager:
             return True, 0
 
         # Count jobs in queue that are not finished
-        depth = await self.conn.fetchval("""
+        depth = await self.conn.fetchval(
+            """
             SELECT COUNT(*) FROM jorb
             WHERE queue = $1
               AND state IN ('queued', 'claimed', 'running')
-        """, queue)
+        """,
+            queue,
+        )
 
         is_safe = depth < threshold
 
@@ -138,10 +141,7 @@ class ScheduleSafetyManager:
 
         return jitter
 
-    async def check_circuit_breaker(
-        self,
-        schedule: Dict[str, Any]
-    ) -> tuple[bool, str]:
+    async def check_circuit_breaker(self, schedule: dict[str, Any]) -> tuple[bool, str]:
         """
         Check if circuit breaker should be triggered.
 
@@ -153,17 +153,20 @@ class ScheduleSafetyManager:
         Returns:
             Tuple of (is_safe: bool, reason: str)
         """
-        consecutive_failures = schedule['consecutive_failures']
-        threshold = schedule['circuit_breaker_threshold']
+        consecutive_failures = schedule["consecutive_failures"]
+        threshold = schedule["circuit_breaker_threshold"]
 
         if consecutive_failures >= threshold:
             # Circuit breaker triggered! Disable schedule
-            await self.conn.execute("""
+            await self.conn.execute(
+                """
                 UPDATE jorb_schedule
                 SET enabled = false,
                     updated = NOW()
                 WHERE id = $1
-            """, schedule['id'])
+            """,
+                schedule["id"],
+            )
 
             reason = (
                 f"Circuit breaker triggered: {consecutive_failures} "
@@ -173,11 +176,11 @@ class ScheduleSafetyManager:
             logger.error(
                 f"Schedule '{schedule['name']}' disabled: {reason}",
                 extra={
-                    'schedule_id': schedule['id'],
-                    'schedule_name': schedule['name'],
-                    'consecutive_failures': consecutive_failures,
-                    'threshold': threshold
-                }
+                    "schedule_id": schedule["id"],
+                    "schedule_name": schedule["name"],
+                    "consecutive_failures": consecutive_failures,
+                    "threshold": threshold,
+                },
             )
 
             return False, reason
@@ -206,7 +209,7 @@ class ScheduleManager:
         self.conn = conn
 
     @staticmethod
-    def calculate_next_run(cron_expr: str, timezone: str = 'UTC') -> datetime:
+    def calculate_next_run(cron_expr: str, timezone: str = "UTC") -> datetime:
         """
         Calculate next run time from cron expression.
 
@@ -221,8 +224,8 @@ class ScheduleManager:
             ValueError: If cron expression is invalid
         """
         try:
-            from croniter import croniter
             import pytz
+            from croniter import croniter
 
             # Get timezone
             tz = pytz.timezone(timezone)
@@ -244,11 +247,7 @@ class ScheduleManager:
             raise ValueError(f"Invalid cron expression '{cron_expr}': {e}")
 
     async def create_schedule(
-        self,
-        name: str,
-        job_class: str,
-        cron_expr: str,
-        **kwargs
+        self, name: str, job_class: str, cron_expr: str, **kwargs
     ) -> int:
         """
         Create new recurring schedule.
@@ -266,11 +265,12 @@ class ScheduleManager:
             ValueError: If validation fails
         """
         # Calculate initial next_run
-        timezone = kwargs.get('timezone', 'UTC')
+        timezone = kwargs.get("timezone", "UTC")
         next_run = self.calculate_next_run(cron_expr, timezone)
 
         # Insert schedule
-        schedule_id = await self.conn.fetchval("""
+        schedule_id = await self.conn.fetchval(
+            """
             INSERT INTO jorb_schedule (
                 name, description,
                 job_class, kwargs, queue, prio, capability,
@@ -289,41 +289,38 @@ class ScheduleManager:
             RETURNING id
         """,
             name,
-            kwargs.get('description'),
+            kwargs.get("description"),
             job_class,
-            json.dumps(kwargs.get('kwargs', {})),
-            kwargs.get('queue', 'default'),
-            kwargs.get('prio', 100),
-            kwargs.get('capability'),
+            json.dumps(kwargs.get("kwargs", {})),
+            kwargs.get("queue", "default"),
+            kwargs.get("prio", 100),
+            kwargs.get("capability"),
             cron_expr,
             timezone,
-            kwargs.get('enabled', True),
-            kwargs.get('max_concurrent_jobs', 1),
-            kwargs.get('jitter_seconds', 0),
-            kwargs.get('backpressure_threshold', 1000),
-            kwargs.get('circuit_breaker_threshold', 5),
+            kwargs.get("enabled", True),
+            kwargs.get("max_concurrent_jobs", 1),
+            kwargs.get("jitter_seconds", 0),
+            kwargs.get("backpressure_threshold", 1000),
+            kwargs.get("circuit_breaker_threshold", 5),
             next_run,
-            kwargs.get('created_by')
+            kwargs.get("created_by"),
         )
 
         logger.info(
             f"Created schedule '{name}' (ID: {schedule_id})",
             extra={
-                'schedule_id': schedule_id,
-                'schedule_name': name,
-                'job_class': job_class,
-                'cron_expr': cron_expr,
-                'next_run': next_run.isoformat()
-            }
+                "schedule_id": schedule_id,
+                "schedule_name": name,
+                "job_class": job_class,
+                "cron_expr": cron_expr,
+                "next_run": next_run.isoformat(),
+            },
         )
 
         return schedule_id
 
     async def update_schedule_next_run(
-        self,
-        schedule_id: int,
-        cron_expr: str,
-        timezone: str
+        self, schedule_id: int, cron_expr: str, timezone: str
     ) -> None:
         """
         Update schedule's next_run timestamp.
@@ -335,28 +332,28 @@ class ScheduleManager:
         """
         next_run = self.calculate_next_run(cron_expr, timezone)
 
-        await self.conn.execute("""
+        await self.conn.execute(
+            """
             UPDATE jorb_schedule
             SET next_run = $1,
                 updated = NOW()
             WHERE id = $2
-        """, next_run, schedule_id)
-
-        logger.debug(
-            f"Updated schedule {schedule_id} next_run to {next_run}"
+        """,
+            next_run,
+            schedule_id,
         )
 
-    async def record_execution_success(
-        self,
-        schedule_id: int
-    ) -> None:
+        logger.debug(f"Updated schedule {schedule_id} next_run to {next_run}")
+
+    async def record_execution_success(self, schedule_id: int) -> None:
         """
         Record successful execution (reset consecutive failures).
 
         Args:
             schedule_id: Schedule ID
         """
-        await self.conn.execute("""
+        await self.conn.execute(
+            """
             UPDATE jorb_schedule
             SET run_count = run_count + 1,
                 success_count = success_count + 1,
@@ -365,19 +362,19 @@ class ScheduleManager:
                 last_success = NOW(),
                 updated = NOW()
             WHERE id = $1
-        """, schedule_id)
+        """,
+            schedule_id,
+        )
 
-    async def record_execution_failure(
-        self,
-        schedule_id: int
-    ) -> None:
+    async def record_execution_failure(self, schedule_id: int) -> None:
         """
         Record failed execution (increment consecutive failures).
 
         Args:
             schedule_id: Schedule ID
         """
-        await self.conn.execute("""
+        await self.conn.execute(
+            """
             UPDATE jorb_schedule
             SET run_count = run_count + 1,
                 failure_count = failure_count + 1,
@@ -386,13 +383,11 @@ class ScheduleManager:
                 last_failure = NOW(),
                 updated = NOW()
             WHERE id = $1
-        """, schedule_id)
+        """,
+            schedule_id,
+        )
 
-    async def record_execution_skip(
-        self,
-        schedule_id: int,
-        reason: str
-    ) -> None:
+    async def record_execution_skip(self, schedule_id: int, reason: str) -> None:
         """
         Record skipped execution.
 
@@ -400,12 +395,15 @@ class ScheduleManager:
             schedule_id: Schedule ID
             reason: Why execution was skipped
         """
-        await self.conn.execute("""
+        await self.conn.execute(
+            """
             UPDATE jorb_schedule
             SET skip_count = skip_count + 1,
                 updated = NOW()
             WHERE id = $1
-        """, schedule_id)
+        """,
+            schedule_id,
+        )
 
 
 class SchedulerWorker:
@@ -416,11 +414,7 @@ class SchedulerWorker:
     comprehensive safety checks and logging.
     """
 
-    def __init__(
-        self,
-        conn: asyncpg.Connection,
-        poll_interval: int = 60
-    ):
+    def __init__(self, conn: asyncpg.Connection, poll_interval: int = 60):
         """
         Initialize scheduler worker.
 
@@ -440,7 +434,7 @@ class SchedulerWorker:
         self.failures_total = 0
         self.skips_total = 0
 
-    async def find_due_schedules(self) -> List[Dict[str, Any]]:
+    async def find_due_schedules(self) -> list[dict[str, Any]]:
         """
         Find all schedules that are due to run.
 
@@ -462,10 +456,8 @@ class SchedulerWorker:
         return schedules
 
     async def create_scheduled_job(
-        self,
-        schedule: Dict[str, Any],
-        scheduled_time: datetime
-    ) -> Optional[int]:
+        self, schedule: dict[str, Any], scheduled_time: datetime
+    ) -> int | None:
         """
         Create job for schedule with deadline key.
 
@@ -484,44 +476,45 @@ class SchedulerWorker:
 
         # Prepare admin_data with schedule metadata
         admin_data = {
-            'schedule_id': str(schedule['id']),  # Store as string for consistency
-            'schedule_name': schedule['name'],
-            'scheduled_time': scheduled_time.isoformat()
+            "schedule_id": str(schedule["id"]),  # Store as string for consistency
+            "schedule_name": schedule["name"],
+            "scheduled_time": scheduled_time.isoformat(),
         }
 
         # Convert scheduled_time to naive UTC if it's timezone-aware
         run_after_time = scheduled_time
-        if hasattr(scheduled_time, 'tzinfo') and scheduled_time.tzinfo is not None:
+        if hasattr(scheduled_time, "tzinfo") and scheduled_time.tzinfo is not None:
             # Convert to UTC and remove timezone info
             run_after_time = scheduled_time.astimezone(pytz.UTC).replace(tzinfo=None)
 
         try:
-            job_id = await self.conn.fetchval("""
+            job_id = await self.conn.fetchval(
+                """
                 INSERT INTO jorb (
                     job_class, kwargs, queue, prio, capability,
                     deadline_key, run_after, admin_data, state
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued')
                 RETURNING id
             """,
-                schedule['job_class'],
-                schedule['kwargs'],  # Dict - custom codec handles conversion
-                schedule['queue'],
-                schedule['prio'],
-                schedule['capability'],
+                schedule["job_class"],
+                schedule["kwargs"],  # Dict - custom codec handles conversion
+                schedule["queue"],
+                schedule["prio"],
+                schedule["capability"],
                 deadline_key,
                 run_after_time,
-                admin_data  # Dict - custom codec handles conversion
+                admin_data,  # Dict - custom codec handles conversion
             )
 
             logger.info(
                 f"Created job {job_id} for schedule '{schedule['name']}'",
                 extra={
-                    'schedule_id': schedule['id'],
-                    'schedule_name': schedule['name'],
-                    'job_id': job_id,
-                    'job_class': schedule['job_class'],
-                    'queue': schedule['queue']
-                }
+                    "schedule_id": schedule["id"],
+                    "schedule_name": schedule["name"],
+                    "job_id": job_id,
+                    "job_class": schedule["job_class"],
+                    "queue": schedule["queue"],
+                },
             )
 
             return job_id
@@ -531,18 +524,18 @@ class SchedulerWorker:
             logger.warning(
                 f"Schedule '{schedule['name']}': job already exists (duplicate prevented)",
                 extra={
-                    'schedule_id': schedule['id'],
-                    'schedule_name': schedule['name'],
-                    'deadline_key': deadline_key
-                }
+                    "schedule_id": schedule["id"],
+                    "schedule_name": schedule["name"],
+                    "deadline_key": deadline_key,
+                },
             )
             return None
 
     async def log_execution(
         self,
-        schedule: Dict[str, Any],
+        schedule: dict[str, Any],
         scheduled_time: datetime,
-        result: ScheduleExecutionResult
+        result: ScheduleExecutionResult,
     ) -> None:
         """
         Log execution to jorb_schedule_log.
@@ -552,7 +545,8 @@ class SchedulerWorker:
             scheduled_time: When job should have run
             result: Execution result
         """
-        await self.conn.execute("""
+        await self.conn.execute(
+            """
             INSERT INTO jorb_schedule_log (
                 schedule_id, schedule_name,
                 scheduled_time, actual_time,
@@ -562,8 +556,8 @@ class SchedulerWorker:
                 concurrent_jobs_at_run, jitter_applied_seconds
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         """,
-            schedule['id'],
-            schedule['name'],
+            schedule["id"],
+            schedule["name"],
             scheduled_time,
             datetime.utcnow(),
             result.result,
@@ -573,12 +567,11 @@ class SchedulerWorker:
             result.duration_ms,
             result.queue_depth,
             result.concurrent_jobs,
-            result.jitter_applied
+            result.jitter_applied,
         )
 
     async def execute_schedule(
-        self,
-        schedule: Dict[str, Any]
+        self, schedule: dict[str, Any]
     ) -> ScheduleExecutionResult:
         """
         Execute single schedule with all safety checks.
@@ -590,85 +583,80 @@ class SchedulerWorker:
             Execution result
         """
         start_time = time.time()
-        scheduled_time = schedule['next_run']
+        scheduled_time = schedule["next_run"]
 
         logger.debug(
             f"Executing schedule '{schedule['name']}'",
             extra={
-                'schedule_id': schedule['id'],
-                'schedule_name': schedule['name'],
-                'scheduled_time': scheduled_time.isoformat()
-            }
+                "schedule_id": schedule["id"],
+                "schedule_name": schedule["name"],
+                "scheduled_time": scheduled_time.isoformat(),
+            },
         )
 
         # Safety check 1: Circuit breaker
         circuit_ok, circuit_reason = await self.safety.check_circuit_breaker(schedule)
         if not circuit_ok:
             result = ScheduleExecutionResult(
-                result='skipped',
-                skip_reason='circuit_breaker'
+                result="skipped", skip_reason="circuit_breaker"
             )
-            await self.manager.record_execution_skip(schedule['id'], 'circuit_breaker')
+            await self.manager.record_execution_skip(schedule["id"], "circuit_breaker")
             return result
 
         # Safety check 2: Concurrency limit
         concurrency_ok, concurrent_count = await self.safety.check_concurrency(
-            schedule['id'],
-            schedule['max_concurrent_jobs']
+            schedule["id"], schedule["max_concurrent_jobs"]
         )
         if not concurrency_ok:
             logger.warning(
                 f"Schedule '{schedule['name']}' skipped: max_concurrent limit "
                 f"({concurrent_count}/{schedule['max_concurrent_jobs']})",
                 extra={
-                    'schedule_id': schedule['id'],
-                    'schedule_name': schedule['name'],
-                    'concurrent_jobs': concurrent_count,
-                    'max_concurrent': schedule['max_concurrent_jobs']
-                }
+                    "schedule_id": schedule["id"],
+                    "schedule_name": schedule["name"],
+                    "concurrent_jobs": concurrent_count,
+                    "max_concurrent": schedule["max_concurrent_jobs"],
+                },
             )
             result = ScheduleExecutionResult(
-                result='skipped',
-                skip_reason='max_concurrent',
-                concurrent_jobs=concurrent_count
+                result="skipped",
+                skip_reason="max_concurrent",
+                concurrent_jobs=concurrent_count,
             )
-            await self.manager.record_execution_skip(schedule['id'], 'max_concurrent')
+            await self.manager.record_execution_skip(schedule["id"], "max_concurrent")
             return result
 
         # Safety check 3: Backpressure
         backpressure_ok, queue_depth = await self.safety.check_backpressure(
-            schedule['queue'],
-            schedule['backpressure_threshold']
+            schedule["queue"], schedule["backpressure_threshold"]
         )
         if not backpressure_ok:
             logger.warning(
                 f"Schedule '{schedule['name']}' skipped: backpressure "
                 f"(queue depth: {queue_depth}, threshold: {schedule['backpressure_threshold']})",
                 extra={
-                    'schedule_id': schedule['id'],
-                    'schedule_name': schedule['name'],
-                    'queue_depth': queue_depth,
-                    'backpressure_threshold': schedule['backpressure_threshold']
-                }
+                    "schedule_id": schedule["id"],
+                    "schedule_name": schedule["name"],
+                    "queue_depth": queue_depth,
+                    "backpressure_threshold": schedule["backpressure_threshold"],
+                },
             )
             result = ScheduleExecutionResult(
-                result='skipped',
-                skip_reason='backpressure',
-                queue_depth=queue_depth
+                result="skipped", skip_reason="backpressure", queue_depth=queue_depth
             )
-            await self.manager.record_execution_skip(schedule['id'], 'backpressure')
+            await self.manager.record_execution_skip(schedule["id"], "backpressure")
             return result
 
         # Safety feature 4: Apply jitter
-        jitter = self.safety.calculate_jitter(schedule['jitter_seconds'])
+        jitter = self.safety.calculate_jitter(schedule["jitter_seconds"])
         if jitter > 0:
             logger.debug(
                 f"Schedule '{schedule['name']}' applying jitter: {jitter}s",
                 extra={
-                    'schedule_id': schedule['id'],
-                    'schedule_name': schedule['name'],
-                    'jitter_seconds': jitter
-                }
+                    "schedule_id": schedule["id"],
+                    "schedule_name": schedule["name"],
+                    "jitter_seconds": jitter,
+                },
             )
             await asyncio.sleep(jitter)
 
@@ -678,71 +666,67 @@ class SchedulerWorker:
 
             if job_id:
                 # Success!
-                await self.manager.record_execution_success(schedule['id'])
+                await self.manager.record_execution_success(schedule["id"])
 
                 duration_ms = int((time.time() - start_time) * 1000)
 
                 logger.info(
-                    f"Schedule '{schedule['name']}' executed successfully "
-                    f"(job_id: {job_id})",
+                    f"Schedule '{schedule['name']}' executed successfully (job_id: {job_id})",
                     extra={
-                        'schedule_id': schedule['id'],
-                        'schedule_name': schedule['name'],
-                        'job_id': job_id,
-                        'duration_ms': duration_ms,
-                        'jitter_applied': jitter
-                    }
+                        "schedule_id": schedule["id"],
+                        "schedule_name": schedule["name"],
+                        "job_id": job_id,
+                        "duration_ms": duration_ms,
+                        "jitter_applied": jitter,
+                    },
                 )
 
                 return ScheduleExecutionResult(
-                    result='success',
+                    result="success",
                     job_id=job_id,
                     jitter_applied=jitter,
                     queue_depth=queue_depth,
                     concurrent_jobs=concurrent_count,
-                    duration_ms=duration_ms
+                    duration_ms=duration_ms,
                 )
             else:
                 # Duplicate (deadline key collision)
                 try:
-                    await self.manager.record_execution_skip(schedule['id'], 'duplicate')
+                    await self.manager.record_execution_skip(
+                        schedule["id"], "duplicate"
+                    )
                 except asyncpg.InFailedSQLTransactionError:
                     # Transaction already aborted from UniqueViolationError
                     # This can happen in test environments with transaction isolation
                     pass
 
                 return ScheduleExecutionResult(
-                    result='skipped',
-                    skip_reason='duplicate'
+                    result="skipped", skip_reason="duplicate"
                 )
 
         except Exception as e:
             # Failure!
-            await self.manager.record_execution_failure(schedule['id'])
+            await self.manager.record_execution_failure(schedule["id"])
 
             duration_ms = int((time.time() - start_time) * 1000)
 
             logger.error(
                 f"Schedule '{schedule['name']}' failed: {e}",
                 extra={
-                    'schedule_id': schedule['id'],
-                    'schedule_name': schedule['name'],
-                    'error': str(e),
-                    'duration_ms': duration_ms
-                }
+                    "schedule_id": schedule["id"],
+                    "schedule_name": schedule["name"],
+                    "error": str(e),
+                    "duration_ms": duration_ms,
+                },
             )
 
             return ScheduleExecutionResult(
-                result='failure',
-                error_message=str(e),
-                duration_ms=duration_ms
+                result="failure", error_message=str(e), duration_ms=duration_ms
             )
 
     async def run(self) -> None:
         """Main scheduler loop"""
-        logger.info(
-            f"Scheduler worker started (poll interval: {self.poll_interval}s)"
-        )
+        logger.info(f"Scheduler worker started (poll interval: {self.poll_interval}s)")
 
         while not self.stop_requested:
             try:
@@ -756,32 +740,26 @@ class SchedulerWorker:
                         result = await self.execute_schedule(schedule)
 
                         # Log execution
-                        await self.log_execution(
-                            schedule,
-                            schedule['next_run'],
-                            result
-                        )
+                        await self.log_execution(schedule, schedule["next_run"], result)
 
                         # Update metrics
                         self.executions_total += 1
-                        if result.result == 'success':
+                        if result.result == "success":
                             self.successes_total += 1
-                        elif result.result == 'failure':
+                        elif result.result == "failure":
                             self.failures_total += 1
-                        elif result.result == 'skipped':
+                        elif result.result == "skipped":
                             self.skips_total += 1
 
                         # Update next_run
                         await self.manager.update_schedule_next_run(
-                            schedule['id'],
-                            schedule['cron_expr'],
-                            schedule['timezone']
+                            schedule["id"], schedule["cron_expr"], schedule["timezone"]
                         )
 
                     except Exception as e:
                         logger.error(
                             f"Failed to execute schedule '{schedule['name']}': {e}",
-                            exc_info=True
+                            exc_info=True,
                         )
 
                 # Log metrics every 10 iterations

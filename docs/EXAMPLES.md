@@ -776,18 +776,21 @@ async def main():
 ## Common Patterns Summary
 
 ### Pattern 1: Simple Queue
+
 ```python
 # Just enqueue and forget
 await client.enqueue('MyJob', arg=value)
 ```
 
 ### Pattern 2: Scheduled Execution
+
 ```python
 # Run later
 await client.enqueue('MyJob', run_after=future_time, arg=value)
 ```
 
 ### Pattern 3: Sequential Pipeline
+
 ```python
 # A → B → C
 job_ids = await client.create_pipeline([
@@ -798,6 +801,7 @@ job_ids = await client.create_pipeline([
 ```
 
 ### Pattern 4: Parallel + Aggregate
+
 ```python
 # Many jobs → Summary
 job_ids, group_id = await client.create_fan_out('ProcessItem', items)
@@ -805,6 +809,7 @@ summary = await client.enqueue('Summary', waitfor_group=group_id)
 ```
 
 ### Pattern 5: Batch Processing
+
 ```python
 # Efficient bulk enqueue
 jobs = [('Job', {'id': i}) for i in range(10000)]
@@ -812,12 +817,14 @@ job_ids = await client.enqueue_batch(jobs)
 ```
 
 ### Pattern 6: Idempotent Jobs
+
 ```python
 # Prevent duplicates
 await client.enqueue('Job', deadline_key=f'unique:{id}', data=value)
 ```
 
 ### Pattern 7: Priority Queue
+
 ```python
 # High priority first
 await client.enqueue('UrgentJob', priority=500)
@@ -826,6 +833,7 @@ await client.enqueue('LowPriorityJob', priority=10)
 ```
 
 ### Pattern 8: Capability Routing
+
 ```python
 # Route to specific workers
 await client.enqueue('GPUJob', capability='gpu', model=...)

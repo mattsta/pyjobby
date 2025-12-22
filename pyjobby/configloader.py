@@ -2,12 +2,13 @@
 # https://github.com/benoitc/gunicorn/blob/d1f0f11b7b7d00f74dc22ead8e62d322eb128431/gunicorn/app/base.py
 
 # This file is part of gunicorn released under the MIT license.
-import importlib.util
 import importlib.machinery
+import importlib.util
 import os
 import sys
 import traceback
-from typing import Iterable, Any, Dict
+from collections.abc import Iterable
+from typing import Any
 
 
 def chdir_addpath(path: str) -> None:
@@ -20,9 +21,9 @@ def chdir_addpath(path: str) -> None:
         sys.path.insert(0, path)
 
 
-def get_config_from_filename(filename: str) -> Dict[str, Any]:
+def get_config_from_filename(filename: str) -> dict[str, Any]:
     if not os.path.exists(filename):
-        raise RuntimeError("%r doesn't exist" % filename)
+        raise RuntimeError(f"{filename!r} doesn't exist")
 
     ext = os.path.splitext(filename)[1]
 
@@ -40,7 +41,7 @@ def get_config_from_filename(filename: str) -> Dict[str, Any]:
         sys.modules[module_name] = mod
         spec.loader.exec_module(mod)  # type: ignore
     except Exception:
-        print("Failed to read config file: %s" % filename, file=sys.stderr)
+        print(f"Failed to read config file: {filename}", file=sys.stderr)
         traceback.print_exc()
         sys.stderr.flush()
         sys.exit(1)
@@ -48,13 +49,13 @@ def get_config_from_filename(filename: str) -> Dict[str, Any]:
     return vars(mod)
 
 
-def get_config_from_module_name(module_name: str) -> Dict[str, Any]:
+def get_config_from_module_name(module_name: str) -> dict[str, Any]:
     return vars(importlib.import_module(module_name))
 
 
 def load_config_from_module_name_or_filename(
     location: str, keys: Iterable[str]
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Loads the configuration file: the file is a python file, otherwise raise an RuntimeError
     Exception or stop the process if the configuration file contains a syntax error.
@@ -64,17 +65,14 @@ def load_config_from_module_name_or_filename(
         module_name = location[len("python:") :]
         cfg = get_config_from_module_name(module_name)
     else:
-        if location.startswith("file:"):
-            filename = location[len("file:") :]
-        else:
-            filename = location
+        filename = location.removeprefix("file:")
 
         cfg = get_config_from_filename(filename)
 
     return {k.lower(): v for k, v in cfg.items() if k.lower() in keys}
 
 
-def load_config_from_file(filename: str, keys: Iterable[str]) -> Dict[str, Any]:
+def load_config_from_file(filename: str, keys: Iterable[str]) -> dict[str, Any]:
     """Main entry point for loading config file.
 
     An iterable of 'keys' must be provided to limit which parts of the module

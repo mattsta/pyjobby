@@ -11,7 +11,6 @@ import pytest
 
 from tests.utils.factories import create_job, get_job
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -34,7 +33,7 @@ class TestTimeBasedRecovery:
                worker_host = 'test-worker',
                updated = $1 WHERE id = $2""",
             very_old_time,
-            very_old_job
+            very_old_job,
         )
 
         # Old: 6 minutes ago (should be recovered with 5 min timeout)
@@ -44,7 +43,7 @@ class TestTimeBasedRecovery:
                worker_host = 'test-worker',
                updated = $1 WHERE id = $2""",
             old_time,
-            old_job
+            old_job,
         )
 
         # Recent: 2 minutes ago (should NOT be recovered)
@@ -54,15 +53,13 @@ class TestTimeBasedRecovery:
                worker_host = 'test-worker',
                updated = $1 WHERE id = $2""",
             recent_time,
-            recent_job
+            recent_job,
         )
 
         # Recover with 5 minute timeout
         recovery_timeout = timedelta(minutes=5)
         results = await db_connection.fetch(
-            STMTS["recover-abandoned"],
-            "test-worker",
-            recovery_timeout
+            STMTS["recover-abandoned"], "test-worker", recovery_timeout
         )
 
         recovered_ids = [r["id"] for r in results]
@@ -99,15 +96,13 @@ class TestTimeBasedRecovery:
                worker_pid = 12345,
                updated = $1 WHERE id = $2""",
             recent_time,
-            job_id
+            job_id,
         )
 
         # New process on same host tries to recover (with 5 min timeout)
         recovery_timeout = timedelta(minutes=5)
         results = await db_connection.fetch(
-            STMTS["recover-abandoned"],
-            "host-1",
-            recovery_timeout
+            STMTS["recover-abandoned"], "host-1", recovery_timeout
         )
 
         # Should NOT recover this job (old process is still alive)
@@ -132,7 +127,7 @@ class TestTimeBasedRecovery:
                worker_host = 'test-worker',
                updated = $1 WHERE id = $2""",
             time_2min,
-            job_2min
+            job_2min,
         )
 
         # 10 minutes old
@@ -142,30 +137,26 @@ class TestTimeBasedRecovery:
                worker_host = 'test-worker',
                updated = $1 WHERE id = $2""",
             time_10min,
-            job_10min
+            job_10min,
         )
 
         # Try with 1 minute timeout - should recover both
         short_timeout = timedelta(minutes=1)
         results1 = await db_connection.fetch(
-            STMTS["recover-abandoned"],
-            "test-worker",
-            short_timeout
+            STMTS["recover-abandoned"], "test-worker", short_timeout
         )
         assert len(results1) == 2
 
         # Reset jobs back to claimed
         await db_connection.execute(
             "UPDATE jorb SET state = 'claimed' WHERE id = ANY($1::bigint[])",
-            [job_2min, job_10min]
+            [job_2min, job_10min],
         )
 
         # Try with 15 minute timeout - should recover none
         long_timeout = timedelta(minutes=15)
         results2 = await db_connection.fetch(
-            STMTS["recover-abandoned"],
-            "test-worker",
-            long_timeout
+            STMTS["recover-abandoned"], "test-worker", long_timeout
         )
         assert len(results2) == 0
 
@@ -182,16 +173,14 @@ class TestTimeBasedRecovery:
                worker_host = 'test-worker',
                updated = $1 WHERE id = $2""",
             old_time,
-            job_id
+            job_id,
         )
 
         # Recover
         before_recovery = datetime.utcnow()
         recovery_timeout = timedelta(minutes=5)
         await db_connection.fetch(
-            STMTS["recover-abandoned"],
-            "test-worker",
-            recovery_timeout
+            STMTS["recover-abandoned"], "test-worker", recovery_timeout
         )
 
         # Check timestamp was updated
@@ -216,15 +205,13 @@ class TestTimeBasedRecovery:
                WHERE id = $3""",
             old_time,
             future_time,
-            job_id
+            job_id,
         )
 
         # Recover
         recovery_timeout = timedelta(minutes=5)
         await db_connection.fetch(
-            STMTS["recover-abandoned"],
-            "test-worker",
-            recovery_timeout
+            STMTS["recover-abandoned"], "test-worker", recovery_timeout
         )
 
         # run_after should be reset to now (not future)
@@ -252,7 +239,7 @@ class TestRecoveryEdgeCases:
                worker_host = 'test-worker',
                updated = $1 WHERE id = $2""",
             old_time,
-            claimed_job
+            claimed_job,
         )
 
         await db_connection.execute(
@@ -260,7 +247,7 @@ class TestRecoveryEdgeCases:
                worker_host = 'test-worker',
                updated = $1 WHERE id = $2""",
             old_time,
-            running_job
+            running_job,
         )
 
         await db_connection.execute(
@@ -268,15 +255,13 @@ class TestRecoveryEdgeCases:
                worker_host = 'test-worker',
                updated = $1 WHERE id = $2""",
             old_time,
-            finished_job
+            finished_job,
         )
 
         # Recover
         recovery_timeout = timedelta(minutes=5)
         results = await db_connection.fetch(
-            STMTS["recover-abandoned"],
-            "test-worker",
-            recovery_timeout
+            STMTS["recover-abandoned"], "test-worker", recovery_timeout
         )
 
         recovered_ids = [r["id"] for r in results]
@@ -300,7 +285,7 @@ class TestRecoveryEdgeCases:
                worker_host = 'test-worker',
                updated = $1 WHERE id = $2""",
             old_time,
-            claimed_job
+            claimed_job,
         )
 
         await db_connection.execute(
@@ -308,15 +293,13 @@ class TestRecoveryEdgeCases:
                worker_host = 'test-worker',
                updated = $1 WHERE id = $2""",
             old_time,
-            running_job
+            running_job,
         )
 
         # Recover
         recovery_timeout = timedelta(minutes=5)
         results = await db_connection.fetch(
-            STMTS["recover-abandoned"],
-            "test-worker",
-            recovery_timeout
+            STMTS["recover-abandoned"], "test-worker", recovery_timeout
         )
 
         # Check old_state is returned (confusingly named - it's the NEW state)
@@ -338,7 +321,7 @@ class TestRecoveryEdgeCases:
                worker_host = 'worker-1',
                updated = $1 WHERE id = $2""",
             old_time,
-            worker1_job
+            worker1_job,
         )
 
         await db_connection.execute(
@@ -346,15 +329,13 @@ class TestRecoveryEdgeCases:
                worker_host = 'worker-2',
                updated = $1 WHERE id = $2""",
             old_time,
-            worker2_job
+            worker2_job,
         )
 
         # Recover only worker-1
         recovery_timeout = timedelta(minutes=5)
         results = await db_connection.fetch(
-            STMTS["recover-abandoned"],
-            "worker-1",
-            recovery_timeout
+            STMTS["recover-abandoned"], "worker-1", recovery_timeout
         )
 
         assert len(results) == 1

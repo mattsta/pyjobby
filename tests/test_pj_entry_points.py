@@ -7,25 +7,24 @@ Using LIVE database operations with NO MOCKS for maximum correctness guarantees!
 Coverage Target: Cover lines 319-322, 349-356, 362-364, 496-501, 813-832, 910-985
 """
 
-import pytest
 import asyncio
-import asyncpg
-import signal
+import contextlib
 import os
+import signal
 import sys
 import tempfile
 import time
-import multiprocessing
-from datetime import datetime, timedelta
-from unittest.mock import patch, MagicMock
+
+import asyncpg
+import pytest
 from click.testing import CliRunner
 
-from pyjobby.pj import JobSystem, Job, STMTS, runAndDone, workit
-
+from pyjobby.pj import STMTS, Job, JobSystem, workit
 
 # ============================================================================
 # Test runAndDone Function - covers lines 813-832
 # ============================================================================
+
 
 class TestRunAndDoneFunction:
     """Test the runAndDone function that creates and runs a JobSystem."""
@@ -37,8 +36,8 @@ class TestRunAndDoneFunction:
         # We'll run it briefly and then terminate
 
         # Create a simple config
-        queue = 'test_run_done'
-        caps = ('test_cap',)
+        queue = "test_run_done"
+        caps = ("test_cap",)
         worker_id = 999
 
         # Start process - it will run asyncio.run(runner.run())
@@ -78,7 +77,7 @@ assert system.enable_recovery == True
 
 print("SUCCESS")
 """
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
             f.write(test_script)
             script_path = f.name
 
@@ -88,7 +87,7 @@ print("SUCCESS")
                 capture_output=True,
                 text=True,
                 timeout=10,
-                cwd=os.path.dirname(os.path.dirname(__file__))
+                cwd=os.path.dirname(os.path.dirname(__file__)),
             )
             assert "SUCCESS" in result.stdout, f"Script failed: {result.stderr}"
         finally:
@@ -100,8 +99,8 @@ print("SUCCESS")
         # Create a JobSystem and verify signal handling
         system = JobSystem(
             dsn=db_params,
-            qname='signal_test',
-            capabilities=('test',),
+            qname="signal_test",
+            capabilities=("test",),
             workerId=888,
             checkInterval=0.1,
             webPort=None,
@@ -124,12 +123,13 @@ print("SUCCESS")
         # When KeyboardInterrupt is raised, it should just return
 
         import uuid
-        unique_queue = f'interrupt_test_{uuid.uuid4().hex[:8]}'
+
+        unique_queue = f"interrupt_test_{uuid.uuid4().hex[:8]}"
 
         system = JobSystem(
             dsn=db_params,
             qname=unique_queue,
-            capabilities=('test',),
+            capabilities=("test",),
             workerId=777,
             checkInterval=0.1,
             webPort=None,
@@ -156,13 +156,14 @@ print("SUCCESS")
 # Test CLI Entry Point - covers lines 910-985
 # ============================================================================
 
+
 class TestWorkitCLI:
     """Test the workit CLI command."""
 
     def test_workit_version_flag(self):
         """Test --version flag shows version and exits - covers lines 912-914."""
         runner = CliRunner()
-        result = runner.invoke(workit, ['-v'])
+        result = runner.invoke(workit, ["-v"])
 
         assert result.exit_code == 0
         # Version should be a valid version string
@@ -171,7 +172,7 @@ class TestWorkitCLI:
     def test_workit_config_not_found(self):
         """Test error when config file not found - covers lines 916-918."""
         runner = CliRunner()
-        result = runner.invoke(workit, ['--config', '/nonexistent/path/config.py'])
+        result = runner.invoke(workit, ["--config", "/nonexistent/path/config.py"])
 
         assert result.exit_code == 1
         # Should not crash
@@ -179,22 +180,22 @@ class TestWorkitCLI:
     def test_workit_help(self):
         """Test --help shows usage information."""
         runner = CliRunner()
-        result = runner.invoke(workit, ['--help'])
+        result = runner.invoke(workit, ["--help"])
 
         assert result.exit_code == 0
-        assert '--queue' in result.output
-        assert '--workers' in result.output
-        assert '--max-retries' in result.output
-        assert '--default-timeout' in result.output
-        assert '--recovery-timeout' in result.output
-        assert '--no-recovery' in result.output
+        assert "--queue" in result.output
+        assert "--workers" in result.output
+        assert "--max-retries" in result.output
+        assert "--default-timeout" in result.output
+        assert "--recovery-timeout" in result.output
+        assert "--no-recovery" in result.output
 
     def test_workit_default_options(self):
         """Test default option values are set correctly."""
         runner = CliRunner()
         # Run with a non-existent config to trigger early exit
         # This still validates the option parsing
-        result = runner.invoke(workit, ['--config', '/tmp/nonexistent_pyjobby.conf.py'])
+        result = runner.invoke(workit, ["--config", "/tmp/nonexistent_pyjobby.conf.py"])
 
         # Should fail due to missing config, but options should parse
         assert result.exit_code == 1
@@ -202,7 +203,9 @@ class TestWorkitCLI:
     def test_workit_custom_max_retries(self):
         """Test --max-retries option parsing."""
         runner = CliRunner()
-        result = runner.invoke(workit, ['--max-retries', '20', '--config', '/nonexistent'])
+        result = runner.invoke(
+            workit, ["--max-retries", "20", "--config", "/nonexistent"]
+        )
 
         # Should fail due to config, but option should be parsed
         assert result.exit_code == 1
@@ -210,7 +213,7 @@ class TestWorkitCLI:
     def test_workit_no_recovery_flag(self):
         """Test --no-recovery flag parsing."""
         runner = CliRunner()
-        result = runner.invoke(workit, ['--no-recovery', '--config', '/nonexistent'])
+        result = runner.invoke(workit, ["--no-recovery", "--config", "/nonexistent"])
 
         # Should fail due to config, but flag should be parsed
         assert result.exit_code == 1
@@ -219,6 +222,7 @@ class TestWorkitCLI:
 # ============================================================================
 # Test InterfaceError Handling - covers lines 319-322
 # ============================================================================
+
 
 class TestInterfaceErrorHandling:
     """Test InterfaceError handling in ex() method."""
@@ -229,8 +233,8 @@ class TestInterfaceErrorHandling:
         # Create worker
         system = JobSystem(
             dsn=db_params,
-            qname='interface_error_test',
-            capabilities=('test',),
+            qname="interface_error_test",
+            capabilities=("test",),
             workerId=666,
             checkInterval=0.1,
             webPort=None,
@@ -243,7 +247,9 @@ class TestInterfaceErrorHandling:
             system.stmts[name] = await system.cxn.prepare(stmt)
 
         # Successfully execute a query first
-        result = await system.ex("claim", os.getpid(), "testhost", "test_queue", ("test",), 1000)
+        result = await system.ex(
+            "claim", os.getpid(), "testhost", "test_queue", ("test",), 1000
+        )
 
         # Result should be list (even if empty)
         assert isinstance(result, list)
@@ -256,8 +262,8 @@ class TestInterfaceErrorHandling:
         """Test that ex() returns list from fetch operation."""
         system = JobSystem(
             dsn=db_params,
-            qname='fetch_test',
-            capabilities=('test',),
+            qname="fetch_test",
+            capabilities=("test",),
             workerId=555,
             checkInterval=0.1,
             webPort=None,
@@ -270,7 +276,9 @@ class TestInterfaceErrorHandling:
             system.stmts[name] = await system.cxn.prepare(stmt)
 
         # Execute claim (will return empty list if no jobs)
-        result = await system.ex("claim", os.getpid(), "testhost", "fetch_test_queue", ("test",), 1000)
+        result = await system.ex(
+            "claim", os.getpid(), "testhost", "fetch_test_queue", ("test",), 1000
+        )
 
         assert isinstance(result, list)
 
@@ -281,6 +289,7 @@ class TestInterfaceErrorHandling:
 # ============================================================================
 # Test Recovery Logging - covers lines 349-356
 # ============================================================================
+
 
 class TestRecoveryLogging:
     """Test recovery logging paths."""
@@ -293,38 +302,52 @@ class TestRecoveryLogging:
             await conn.execute("DELETE FROM jorb")
 
             # Create abandoned jobs
-            job1_id = await conn.fetchval("""
+            job1_id = await conn.fetchval(
+                """
                 INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
                                  worker_host, worker_pid)
                 VALUES ($1, $2, $3, $4, $5, NOW() - INTERVAL '15 minutes',
                         NOW() - INTERVAL '15 minutes', $6, $7)
                 RETURNING id
-            """, 'tests.test_pj_entry_points.SimpleJob',
+            """,
+                "tests.test_pj_entry_points.SimpleJob",
                 {},
-                'recovery_log_test', 'claimed', 100, 'recovery-log-host', 11111)
+                "recovery_log_test",
+                "claimed",
+                100,
+                "recovery-log-host",
+                11111,
+            )
 
-            job2_id = await conn.fetchval("""
+            job2_id = await conn.fetchval(
+                """
                 INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
                                  worker_host, worker_pid)
                 VALUES ($1, $2, $3, $4, $5, NOW() - INTERVAL '15 minutes',
                         NOW() - INTERVAL '15 minutes', $6, $7)
                 RETURNING id
-            """, 'tests.test_pj_entry_points.SimpleJob',
+            """,
+                "tests.test_pj_entry_points.SimpleJob",
                 {},
-                'recovery_log_test', 'running', 100, 'recovery-log-host', 11111)
+                "recovery_log_test",
+                "running",
+                100,
+                "recovery-log-host",
+                11111,
+            )
 
         # Create worker with recovery enabled on same host
         system = JobSystem(
             dsn=db_params,
-            qname='recovery_log_test',
-            capabilities=('test',),
+            qname="recovery_log_test",
+            capabilities=("test",),
             workerId=444,
             checkInterval=0.1,
             webPort=None,
             enable_recovery=True,
-            recovery_timeout=300
+            recovery_timeout=300,
         )
-        system.node = 'recovery-log-host'
+        system.node = "recovery-log-host"
 
         # Connect and prepare statements
         system.cxn = await asyncpg.connect(**db_params)
@@ -339,7 +362,7 @@ class TestRecoveryLogging:
         assert len(recovered) == 2, f"Expected 2 recovered jobs, got {len(recovered)}"
 
         # Verify job IDs are in recovered list
-        recovered_ids = [r['id'] for r in recovered]
+        recovered_ids = [r["id"] for r in recovered]
         assert job1_id in recovered_ids
         assert job2_id in recovered_ids
 
@@ -351,6 +374,7 @@ class TestRecoveryLogging:
 # Test Recovery Exception Handling - covers lines 362-364
 # ============================================================================
 
+
 class TestRecoveryExceptionHandling:
     """Test exception handling in recover_abandoned_jobs."""
 
@@ -359,13 +383,13 @@ class TestRecoveryExceptionHandling:
         """Test that recovery handles exceptions gracefully - covers lines 362-364."""
         system = JobSystem(
             dsn=db_params,
-            qname='recovery_exception_test',
-            capabilities=('test',),
+            qname="recovery_exception_test",
+            capabilities=("test",),
             workerId=333,
             checkInterval=0.1,
             webPort=None,
             enable_recovery=True,
-            recovery_timeout=300
+            recovery_timeout=300,
         )
 
         # Don't initialize connection - recovery should handle exception
@@ -389,6 +413,7 @@ class TestRecoveryExceptionHandling:
 # Test Status Logging - covers lines 496-501
 # ============================================================================
 
+
 class TestStatusLogging:
     """Test status logging during worker run loop."""
 
@@ -399,8 +424,8 @@ class TestStatusLogging:
         # But we can verify the variables are initialized correctly
         system = JobSystem(
             dsn=db_params,
-            qname='status_log_test',
-            capabilities=('test',),
+            qname="status_log_test",
+            capabilities=("test",),
             workerId=222,
             checkInterval=0.1,
             webPort=None,
@@ -417,8 +442,10 @@ class TestStatusLogging:
 # Test Job Class for Tests
 # ============================================================================
 
+
 class SimpleJob(Job):
     """Simple job for testing recovery scenarios."""
+
     def task(self):
         return "simple_result"
 
@@ -427,13 +454,14 @@ class SimpleJob(Job):
 # Test Queue Padding Logic - covers lines 925-928
 # ============================================================================
 
+
 class TestQueuePaddingLogic:
     """Test queue padding logic in workit."""
 
     def test_queue_padding_extends_with_defaults(self):
         """Test that queue list is padded with 'default' when less than workers."""
         # This tests the logic: if len(queue) < workers, extend with defaults
-        queue = ['high', 'critical']
+        queue = ["high", "critical"]
         workers = 5
 
         lqueue = list(queue)
@@ -441,11 +469,11 @@ class TestQueuePaddingLogic:
             lqueue.extend(["default"] * (workers - len(queue)))
 
         assert len(lqueue) == 5
-        assert lqueue == ['high', 'critical', 'default', 'default', 'default']
+        assert lqueue == ["high", "critical", "default", "default", "default"]
 
     def test_queue_no_padding_when_equal(self):
         """Test no padding when queue count equals workers."""
-        queue = ['q1', 'q2', 'q3']
+        queue = ["q1", "q2", "q3"]
         workers = 3
 
         lqueue = list(queue)
@@ -453,12 +481,13 @@ class TestQueuePaddingLogic:
             lqueue.extend(["default"] * (workers - len(queue)))
 
         assert len(lqueue) == 3
-        assert lqueue == ['q1', 'q2', 'q3']
+        assert lqueue == ["q1", "q2", "q3"]
 
 
 # ============================================================================
 # Test Capability Hostname Logic - covers line 937
 # ============================================================================
+
 
 class TestCapabilityHostname:
     """Test capability hostname appending logic."""
@@ -467,16 +496,17 @@ class TestCapabilityHostname:
         """Test that hostname capability is appended."""
         import platform
 
-        lcap = ['gpu', 'memory-16g']
+        lcap = ["gpu", "memory-16g"]
         lcap.append(f"host:{platform.node()}")
 
         assert len(lcap) == 3
-        assert lcap[2].startswith('host:')
+        assert lcap[2].startswith("host:")
 
 
 # ============================================================================
 # Test Signal Broadcast - covers lines 969-975
 # ============================================================================
+
 
 class TestSignalBroadcast:
     """Test signal broadcast to child processes."""
@@ -508,6 +538,7 @@ class TestSignalBroadcast:
 # Test Job Processing Counter - covers lines 517, 653, 708
 # ============================================================================
 
+
 class TestJobProcessingCounters:
     """Test job processing counters in run loop."""
 
@@ -519,17 +550,22 @@ class TestJobProcessingCounters:
 
             # Create jobs
             for i in range(3):
-                await conn.execute("""
+                await conn.execute(
+                    """
                     INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
                     VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                """, 'tests.test_pj_worker_run_loop.QuickJob',
-                    {'value': f'counter_{i}'},
-                    'counter_test', 'queued', 100)
+                """,
+                    "tests.test_pj_worker_run_loop.QuickJob",
+                    {"value": f"counter_{i}"},
+                    "counter_test",
+                    "queued",
+                    100,
+                )
 
         system = JobSystem(
             dsn=db_params,
-            qname='counter_test',
-            capabilities=('test',),
+            qname="counter_test",
+            capabilities=("test",),
             workerId=111,
             checkInterval=0.1,
             webPort=None,
@@ -542,10 +578,8 @@ class TestJobProcessingCounters:
         await asyncio.sleep(1.0)
         system.stop = True
 
-        try:
+        with contextlib.suppress(TimeoutError):
             await worker_task
-        except asyncio.TimeoutError:
-            pass
 
         # Verify jobs processed
         async with db_pool.acquire() as conn:
@@ -559,6 +593,7 @@ class TestJobProcessingCounters:
 # Test runAndDone with Real Config - covers lines 813-832
 # ============================================================================
 
+
 class TestRunAndDoneWithConfig:
     """Test runAndDone function with actual config."""
 
@@ -571,8 +606,8 @@ class TestRunAndDoneWithConfig:
 
         runner = JobSystem(
             dsn=db_params,
-            qname='direct_test',
-            capabilities=('test_cap',),
+            qname="direct_test",
+            capabilities=("test_cap",),
             workerId=1000,
             checkInterval=5,
             webPort=None,
@@ -584,8 +619,8 @@ class TestRunAndDoneWithConfig:
 
         # Verify all parameters were set correctly
         assert runner.dsn == db_params
-        assert runner.qname == 'direct_test'
-        assert runner.capabilities == ('test_cap',)
+        assert runner.qname == "direct_test"
+        assert runner.capabilities == ("test_cap",)
         assert runner.workerId == 1000
         assert runner.checkInterval == 5
         assert runner.webPort is None
@@ -600,13 +635,13 @@ class TestRunAndDoneWithConfig:
 
         web_config = {
             "sites": [{"host": "127.0.0.1", "port": 9999}],
-            "paths": {"test.Job"}
+            "paths": {"test.Job"},
         }
 
         runner = JobSystem(
             dsn=db_params,
-            qname='web_test',
-            capabilities=('web',),
+            qname="web_test",
+            capabilities=("web",),
             workerId=1001,
             checkInterval=5,
             webPort=web_config,
@@ -624,25 +659,33 @@ class TestRunAndDoneWithConfig:
 # Test workit CLI with Valid Config - covers lines 920-985
 # ============================================================================
 
+
 class TestWorkitCLIWithConfig:
     """Test workit CLI with valid configuration."""
 
     def test_workit_loads_config_and_exits_quickly(self):
         """Test workit loads config successfully - covers lines 920-941."""
-        import subprocess
         import os
+        import subprocess
 
         # Get path to config file
         config_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
-            'pyjobby.conf.py'
+            os.path.dirname(os.path.dirname(__file__)), "pyjobby.conf.py"
         )
 
         # Run workit with a very short timeout to just test config loading
         # Use --workers=1 for minimal spawning
         try:
             result = subprocess.run(
-                [sys.executable, '-m', 'pyjobby.pj', '--config', config_path, '--workers', '1'],
+                [
+                    sys.executable,
+                    "-m",
+                    "pyjobby.pj",
+                    "--config",
+                    config_path,
+                    "--workers",
+                    "1",
+                ],
                 capture_output=True,
                 text=True,
                 timeout=2,
@@ -656,22 +699,29 @@ class TestWorkitCLIWithConfig:
 
     def test_workit_with_multiple_queues(self):
         """Test workit with multiple queue options - covers queue padding logic."""
-        import subprocess
         import os
+        import subprocess
 
         config_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
-            'pyjobby.conf.py'
+            os.path.dirname(os.path.dirname(__file__)), "pyjobby.conf.py"
         )
 
         # Run with multiple queues
         try:
             result = subprocess.run(
-                [sys.executable, '-m', 'pyjobby.pj',
-                 '--config', config_path,
-                 '--queue', 'high',
-                 '--queue', 'low',
-                 '--workers', '3'],  # More workers than queues to test padding
+                [
+                    sys.executable,
+                    "-m",
+                    "pyjobby.pj",
+                    "--config",
+                    config_path,
+                    "--queue",
+                    "high",
+                    "--queue",
+                    "low",
+                    "--workers",
+                    "3",
+                ],  # More workers than queues to test padding
                 capture_output=True,
                 text=True,
                 timeout=2,
@@ -682,22 +732,29 @@ class TestWorkitCLIWithConfig:
 
     def test_workit_with_capabilities(self):
         """Test workit with capability options."""
-        import subprocess
         import os
+        import subprocess
 
         config_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
-            'pyjobby.conf.py'
+            os.path.dirname(os.path.dirname(__file__)), "pyjobby.conf.py"
         )
 
         # Run with capabilities
         try:
             result = subprocess.run(
-                [sys.executable, '-m', 'pyjobby.pj',
-                 '--config', config_path,
-                 '--cap', 'gpu',
-                 '--cap', 'memory-16g',
-                 '--workers', '1'],
+                [
+                    sys.executable,
+                    "-m",
+                    "pyjobby.pj",
+                    "--config",
+                    config_path,
+                    "--cap",
+                    "gpu",
+                    "--cap",
+                    "memory-16g",
+                    "--workers",
+                    "1",
+                ],
                 capture_output=True,
                 text=True,
                 timeout=2,
@@ -708,22 +765,29 @@ class TestWorkitCLIWithConfig:
 
     def test_workit_with_path_option(self):
         """Test workit with path option - covers line 939-941."""
-        import subprocess
         import os
+        import subprocess
 
         config_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
-            'pyjobby.conf.py'
+            os.path.dirname(os.path.dirname(__file__)), "pyjobby.conf.py"
         )
 
         # Run with extra paths
         try:
             result = subprocess.run(
-                [sys.executable, '-m', 'pyjobby.pj',
-                 '--config', config_path,
-                 '--path', '/tmp',
-                 '--path', '/var',
-                 '--workers', '1'],
+                [
+                    sys.executable,
+                    "-m",
+                    "pyjobby.pj",
+                    "--config",
+                    config_path,
+                    "--path",
+                    "/tmp",
+                    "--path",
+                    "/var",
+                    "--workers",
+                    "1",
+                ],
                 capture_output=True,
                 text=True,
                 timeout=2,
@@ -734,20 +798,25 @@ class TestWorkitCLIWithConfig:
 
     def test_workit_no_recovery_flag_passed(self):
         """Test workit with --no-recovery flag - covers line 957."""
-        import subprocess
         import os
+        import subprocess
 
         config_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
-            'pyjobby.conf.py'
+            os.path.dirname(os.path.dirname(__file__)), "pyjobby.conf.py"
         )
 
         try:
             result = subprocess.run(
-                [sys.executable, '-m', 'pyjobby.pj',
-                 '--config', config_path,
-                 '--no-recovery',
-                 '--workers', '1'],
+                [
+                    sys.executable,
+                    "-m",
+                    "pyjobby.pj",
+                    "--config",
+                    config_path,
+                    "--no-recovery",
+                    "--workers",
+                    "1",
+                ],
                 capture_output=True,
                 text=True,
                 timeout=2,
@@ -760,6 +829,7 @@ class TestWorkitCLIWithConfig:
 # ============================================================================
 # Test Status Logging Logic - covers lines 496-501
 # ============================================================================
+
 
 class TestStatusLoggingLogic:
     """Test the status logging logic without waiting 5 minutes."""
@@ -777,7 +847,7 @@ class TestStatusLoggingLogic:
 
         pdiff_total = (processed - prev_processed) / (now - prev_status)
 
-        assert pdiff_total == pytest.approx(50/300, rel=0.01)
+        assert pdiff_total == pytest.approx(50 / 300, rel=0.01)
         # 50 jobs in 300 seconds = 0.166 jobs/sec
 
     def test_status_logging_time_check(self):
@@ -788,7 +858,7 @@ class TestStatusLoggingLogic:
 
         prev_status = 100.0
         now_before = 399.0  # 299 seconds elapsed, not yet 5 minutes
-        now_after = 401.0   # 301 seconds elapsed, past 5 minutes
+        now_after = 401.0  # 301 seconds elapsed, past 5 minutes
 
         # Should NOT log
         assert (now_before - prev_status) < 300
@@ -800,6 +870,7 @@ class TestStatusLoggingLogic:
 # ============================================================================
 # Test InterfaceError Retry Logic - covers lines 319-322
 # ============================================================================
+
 
 class TestInterfaceErrorRetryLogic:
     """Test the InterfaceError retry logic pattern."""
@@ -846,17 +917,18 @@ class TestInterfaceErrorRetryLogic:
 # Test configloader Integration - covers line 920
 # ============================================================================
 
+
 class TestConfigloaderIntegration:
     """Test configloader integration with workit."""
 
     def test_load_config_from_file(self):
         """Test that load_config_from_file works correctly."""
         import os
+
         from pyjobby.configloader import load_config_from_file
 
         config_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
-            'pyjobby.conf.py'
+            os.path.dirname(os.path.dirname(__file__)), "pyjobby.conf.py"
         )
 
         if os.path.exists(config_path):
@@ -871,6 +943,7 @@ class TestConfigloaderIntegration:
 # Test runAndDone Direct Execution - covers lines 813-832
 # ============================================================================
 
+
 class TestRunAndDoneDirectExecution:
     """Test runAndDone by directly importing and testing its logic."""
 
@@ -882,8 +955,8 @@ class TestRunAndDoneDirectExecution:
         # This is exactly what runAndDone does internally
         runner = JobSystem(
             dsn=db_params,
-            qname='direct_exec_test',
-            capabilities=('test_cap',),
+            qname="direct_exec_test",
+            capabilities=("test_cap",),
             workerId=2000,
             checkInterval=5,
             webPort=None,
@@ -895,6 +968,7 @@ class TestRunAndDoneDirectExecution:
 
         # Simulate signal handler registration (line 826)
         import signal
+
         original_handler = signal.getsignal(signal.SIGTERM)
 
         # Register and verify handler
@@ -906,18 +980,18 @@ class TestRunAndDoneDirectExecution:
         signal.signal(signal.SIGTERM, original_handler)
 
         # Test that runner was created with correct attributes
-        assert runner.qname == 'direct_exec_test'
+        assert runner.qname == "direct_exec_test"
         assert runner.max_retries == 10
 
     def test_runAndDone_exception_handler_pattern(self, db_params):
         """Test exception handling pattern in runAndDone - covers lines 827-832."""
+
         from pyjobby.pj import JobSystem
-        import asyncio
 
         runner = JobSystem(
             dsn=db_params,
-            qname='exception_test',
-            capabilities=('test',),
+            qname="exception_test",
+            capabilities=("test",),
             workerId=2001,
             checkInterval=5,
             webPort=None,
@@ -950,6 +1024,7 @@ class TestRunAndDoneDirectExecution:
 # Test workit Logic Direct - covers lines 920-985
 # ============================================================================
 
+
 class TestWorkitLogicDirect:
     """Test workit CLI logic by directly testing the code paths."""
 
@@ -980,8 +1055,7 @@ class TestWorkitLogicDirect:
 
         # Test with existing config
         real_config = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
-            'pyjobby.conf.py'
+            os.path.dirname(os.path.dirname(__file__)), "pyjobby.conf.py"
         )
         if os.path.isfile(real_config):
             config_exists = True
@@ -990,7 +1064,7 @@ class TestWorkitLogicDirect:
 
     def test_workit_queue_padding_logic(self):
         """Test queue padding logic - covers lines 925-928."""
-        queue = ('high', 'low')
+        queue = ("high", "low")
         workers = 5
 
         lqueue = list(queue)
@@ -998,25 +1072,25 @@ class TestWorkitLogicDirect:
             lqueue.extend(["default"] * (workers - len(queue)))
 
         assert len(lqueue) == 5
-        assert lqueue == ['high', 'low', 'default', 'default', 'default']
+        assert lqueue == ["high", "low", "default", "default", "default"]
 
     def test_workit_capability_hostname_logic(self):
         """Test hostname capability logic - covers line 937."""
         import platform
 
-        cap = ('gpu', 'fast')
+        cap = ("gpu", "fast")
         lcap = list(cap)
         lcap.append(f"host:{platform.node()}")
 
         assert len(lcap) == 3
-        assert lcap[2].startswith('host:')
+        assert lcap[2].startswith("host:")
         assert platform.node() in lcap[2]
 
     def test_workit_path_append_logic(self):
         """Test path append logic - covers lines 939-941."""
         import sys
 
-        path = ('/custom/path1', '/custom/path2')
+        path = ("/custom/path1", "/custom/path2")
 
         # Capture original path length
         orig_len = len(sys.path)
@@ -1026,12 +1100,12 @@ class TestWorkitLogicDirect:
 
         # Verify paths were added
         assert len(sys.path) == orig_len + 2
-        assert '/custom/path1' in sys.path
-        assert '/custom/path2' in sys.path
+        assert "/custom/path1" in sys.path
+        assert "/custom/path2" in sys.path
 
         # Clean up
-        sys.path.remove('/custom/path1')
-        sys.path.remove('/custom/path2')
+        sys.path.remove("/custom/path1")
+        sys.path.remove("/custom/path2")
 
     def test_workit_process_launch_pattern(self):
         """Test process launch pattern - covers lines 944-962."""
@@ -1039,7 +1113,7 @@ class TestWorkitLogicDirect:
 
         # Test the pattern used for launching processes
         launched = set()
-        queue = ['default']
+        queue = ["default"]
 
         # Create a mock target function (we won't actually start it)
         def mock_target(*args):
@@ -1048,7 +1122,7 @@ class TestWorkitLogicDirect:
         for idx, q in enumerate(queue):
             p = Process(
                 target=mock_target,
-                args=(q, ('test',), idx, {}, None),
+                args=(q, ("test",), idx, {}, None),
             )
             # Don't actually start - just verify process was created
             launched.add(p)
@@ -1057,7 +1131,6 @@ class TestWorkitLogicDirect:
 
     def test_workit_signal_broadcast_pattern(self):
         """Test signal broadcast pattern - covers lines 969-975."""
-        import os
 
         # Create mock processes with PIDs
         class MockProcess:
@@ -1081,6 +1154,7 @@ class TestWorkitLogicDirect:
 
     def test_workit_process_join_pattern(self):
         """Test process join pattern - covers lines 978-982."""
+
         # Test the pattern used for joining processes
         class MockProcess:
             def __init__(self):
@@ -1092,10 +1166,8 @@ class TestWorkitLogicDirect:
         launched = {MockProcess(), MockProcess()}
 
         for l in launched:
-            try:
+            with contextlib.suppress(KeyboardInterrupt):
                 l.join()
-            except KeyboardInterrupt:
-                pass
 
         # Verify all were joined
         for l in launched:

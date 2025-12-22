@@ -5,24 +5,24 @@ Provides helpers for creating jobs, workers, and test scenarios.
 """
 
 import secrets
-from datetime import datetime, timedelta
-from typing import Any, Optional
+from datetime import datetime
+from typing import Any
 
 
 def make_job_kwargs(
     job_class: str = "test.TestJob",
-    kwargs: Optional[dict[str, Any]] = None,
+    kwargs: dict[str, Any] | None = None,
     queue: str = "test_queue",
     prio: int = 100,
     state: str = "queued",
-    run_after: Optional[datetime] = None,
-    uid: Optional[int] = None,
-    run_group: Optional[int] = None,
-    waitfor_job: Optional[int] = None,
-    waitfor_group: Optional[int] = None,
-    capability: Optional[str] = None,
-    deadline_key: Optional[str] = None,
-    admin_data: Optional[dict] = None,
+    run_after: datetime | None = None,
+    uid: int | None = None,
+    run_group: int | None = None,
+    waitfor_job: int | None = None,
+    waitfor_group: int | None = None,
+    capability: str | None = None,
+    deadline_key: str | None = None,
+    admin_data: dict | None = None,
 ) -> dict[str, Any]:
     """
     Create parameters for inserting a job into the database.
@@ -71,8 +71,8 @@ def make_job_kwargs(
 async def create_job(
     conn,
     job_class: str = "test.TestJob",
-    kwargs: Optional[dict[str, Any]] = None,
-    **options
+    kwargs: dict[str, Any] | None = None,
+    **options,
 ) -> int:
     """
     Insert a job into the database and return its ID.
@@ -121,7 +121,7 @@ async def create_job_batch(
     count: int,
     job_class: str = "test.TestJob",
     queue: str = "test_queue",
-    **options
+    **options,
 ) -> list[int]:
     """
     Create multiple jobs at once.
@@ -139,11 +139,7 @@ async def create_job_batch(
     job_ids = []
     for i in range(count):
         job_id = await create_job(
-            conn,
-            job_class=job_class,
-            kwargs={"batch_index": i},
-            queue=queue,
-            **options
+            conn, job_class=job_class, kwargs={"batch_index": i}, queue=queue, **options
         )
         job_ids.append(job_id)
 
@@ -151,9 +147,7 @@ async def create_job_batch(
 
 
 async def create_dependency_chain(
-    conn,
-    depth: int,
-    queue: str = "test_queue"
+    conn, depth: int, queue: str = "test_queue"
 ) -> list[int]:
     """
     Create a chain of dependent jobs.
@@ -200,7 +194,7 @@ async def create_job_group(
     conn,
     group_size: int,
     queue: str = "test_queue",
-    run_group: Optional[int] = None,
+    run_group: int | None = None,
 ) -> tuple[int, list[int]]:
     """
     Create a group of jobs with the same run_group.
@@ -267,7 +261,7 @@ async def create_group_dependency(
     return run_group, parent_ids, dependent_id
 
 
-async def get_job(conn, job_id: int) -> Optional[dict]:
+async def get_job(conn, job_id: int) -> dict | None:
     """
     Fetch a job by ID.
 

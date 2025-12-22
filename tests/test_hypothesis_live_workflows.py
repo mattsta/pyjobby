@@ -18,15 +18,14 @@ import asyncio
 import multiprocessing
 import signal
 import time
-from datetime import datetime, timedelta
-from typing import List, Dict, Set
-import pytest
+
 import asyncpg
-from hypothesis import given, strategies as st, settings, assume, HealthCheck, Phase
+import pytest
+from hypothesis import HealthCheck, Phase, assume, given, settings
+from hypothesis import strategies as st
 
 from pyjobby.pj import JobSystem
-from tests.utils.factories import create_job, get_job
-
+from tests.utils.factories import create_job
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.hypothesis, pytest.mark.slow]
 
@@ -34,6 +33,7 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.hypothesis, pytest.mark.slow]
 # ============================================================================
 # Test Job Implementations
 # ============================================================================
+
 
 class SuccessJob:
     """Simple job that always succeeds for testing."""
@@ -78,6 +78,7 @@ class SlowJob:
 # Helper Functions
 # ============================================================================
 
+
 def run_worker_process(
     worker_id: int,
     queue: str,
@@ -112,15 +113,18 @@ def run_worker_process(
         # Setup JSON codec
         def orjson_encoder(obj):
             import orjson
-            return orjson.dumps(obj).decode('utf-8')
+
+            return orjson.dumps(obj).decode("utf-8")
 
         import orjson
+
         await worker.cxn.set_type_codec(
             "json", encoder=orjson_encoder, decoder=orjson.loads, schema="pg_catalog"
         )
 
         # Prepare statements
         from pyjobby.pj import STMTS
+
         worker.stmts = {}
         for name, stmt in STMTS.items():
             worker.stmts[name] = await worker.cxn.prepare(stmt)
@@ -130,7 +134,12 @@ def run_worker_process(
         while time.time() - start_time < duration_seconds and not worker.stop:
             # Poll for job
             jobs = await worker.ex(
-                "claim", worker.pid, worker.node, worker.qname, worker.capabilities, worker.prio
+                "claim",
+                worker.pid,
+                worker.node,
+                worker.qname,
+                worker.capabilities,
+                worker.prio,
             )
 
             if jobs:
@@ -160,7 +169,7 @@ def run_worker_process(
 
 async def wait_for_jobs_completion(
     conn: asyncpg.Connection,
-    job_ids: List[int],
+    job_ids: list[int],
     timeout_seconds: int = 30,
     check_interval: float = 0.5,
 ) -> bool:
@@ -177,7 +186,7 @@ async def wait_for_jobs_completion(
             """SELECT COUNT(*) FROM jorb
                WHERE id = ANY($1::bigint[])
                  AND state IN ('finished', 'crashed', 'cancelled')""",
-            job_ids
+            job_ids,
         )
 
         if result == len(job_ids):
@@ -188,13 +197,15 @@ async def wait_for_jobs_completion(
     return False
 
 
-async def get_job_states(conn: asyncpg.Connection, job_ids: List[int]) -> Dict[str, int]:
+async def get_job_states(
+    conn: asyncpg.Connection, job_ids: list[int]
+) -> dict[str, int]:
     """Get count of jobs in each state."""
     results = await conn.fetch(
         """SELECT state, COUNT(*) as count FROM jorb
            WHERE id = ANY($1::bigint[])
            GROUP BY state""",
-        job_ids
+        job_ids,
     )
 
     return {row["state"]: row["count"] for row in results}
@@ -204,6 +215,7 @@ async def get_job_states(conn: asyncpg.Connection, job_ids: List[int]) -> Dict[s
 # Property Tests: Live Worker Integration
 # ============================================================================
 
+
 @pytest.mark.hypothesis
 class TestLiveProducerConsumerWorkflows:
     """Property tests with real workers processing real jobs."""
@@ -211,7 +223,10 @@ class TestLiveProducerConsumerWorkflows:
     @settings(
         max_examples=10,  # Fewer examples because these are slow
         deadline=None,
-        suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
+        suppress_health_check=[
+            HealthCheck.function_scoped_fixture,
+            HealthCheck.too_slow,
+        ],
         phases=[Phase.explicit, Phase.reuse, Phase.generate],
     )
     @given(
@@ -234,11 +249,16 @@ class TestLiveProducerConsumerWorkflows:
             # Setup JSON codec
             def orjson_encoder(obj):
                 import orjson
-                return orjson.dumps(obj).decode('utf-8')
+
+                return orjson.dumps(obj).decode("utf-8")
 
             import orjson
+
             await conn.set_type_codec(
-                "json", encoder=orjson_encoder, decoder=orjson.loads, schema="pg_catalog"
+                "json",
+                encoder=orjson_encoder,
+                decoder=orjson.loads,
+                schema="pg_catalog",
             )
 
             # Create jobs
@@ -248,7 +268,7 @@ class TestLiveProducerConsumerWorkflows:
                     conn,
                     state="queued",
                     queue="test",
-                    admin_data={"test_job_number": i}
+                    admin_data={"test_job_number": i},
                 )
                 job_ids.append(job_id)
 
@@ -257,13 +277,15 @@ class TestLiveProducerConsumerWorkflows:
             for i in range(worker_count):
                 p = multiprocessing.Process(
                     target=run_worker_process,
-                    args=(i, "test", db_params, 15)  # Run for 15 seconds
+                    args=(i, "test", db_params, 15),  # Run for 15 seconds
                 )
                 p.start()
                 workers.append(p)
 
             # Wait for jobs to complete
-            completed = await wait_for_jobs_completion(conn, job_ids, timeout_seconds=20)
+            completed = await wait_for_jobs_completion(
+                conn, job_ids, timeout_seconds=20
+            )
 
             # Stop workers
             for p in workers:
@@ -286,8 +308,9 @@ class TestLiveProducerConsumerWorkflows:
 
             # At least 90% should have finished successfully
             success_rate = finished_count / job_count
-            assert success_rate >= 0.9, \
+            assert success_rate >= 0.9, (
                 f"Success rate too low: {success_rate:.1%} ({finished_count}/{job_count} finished, {crashed_count} crashed)"
+            )
 
             # INVARIANT: No jobs should remain in claimed/running state
             assert states.get("claimed", 0) == 0, "Jobs stuck in claimed state"
@@ -301,15 +324,16 @@ class TestLiveProducerConsumerWorkflows:
     @settings(
         max_examples=10,
         deadline=None,
-        suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
+        suppress_health_check=[
+            HealthCheck.function_scoped_fixture,
+            HealthCheck.too_slow,
+        ],
         phases=[Phase.explicit, Phase.reuse, Phase.generate],
     )
     @given(
         job_count=st.integers(min_value=5, max_value=15),
     )
-    async def test_no_duplicate_processing(
-        self, db_params, job_count: int
-    ):
+    async def test_no_duplicate_processing(self, db_params, job_count: int):
         """
         Property: Each job should be processed exactly once (no duplicates).
 
@@ -321,11 +345,16 @@ class TestLiveProducerConsumerWorkflows:
             # Setup codec
             def orjson_encoder(obj):
                 import orjson
-                return orjson.dumps(obj).decode('utf-8')
+
+                return orjson.dumps(obj).decode("utf-8")
 
             import orjson
+
             await conn.set_type_codec(
-                "json", encoder=orjson_encoder, decoder=orjson.loads, schema="pg_catalog"
+                "json",
+                encoder=orjson_encoder,
+                decoder=orjson.loads,
+                schema="pg_catalog",
             )
 
             # Create jobs with unique markers
@@ -335,7 +364,7 @@ class TestLiveProducerConsumerWorkflows:
                     conn,
                     state="queued",
                     queue="test",
-                    admin_data={"unique_id": f"job-{i}"}
+                    admin_data={"unique_id": f"job-{i}"},
                 )
                 job_ids.append(job_id)
 
@@ -344,8 +373,7 @@ class TestLiveProducerConsumerWorkflows:
             workers = []
             for i in range(worker_count):
                 p = multiprocessing.Process(
-                    target=run_worker_process,
-                    args=(i, "test", db_params, 10)
+                    target=run_worker_process, args=(i, "test", db_params, 10)
                 )
                 p.start()
                 workers.append(p)
@@ -365,12 +393,13 @@ class TestLiveProducerConsumerWorkflows:
             # INVARIANT: Each job should have run_count = 1 (processed exactly once)
             results = await conn.fetch(
                 """SELECT id, run_count FROM jorb WHERE id = ANY($1::bigint[])""",
-                job_ids
+                job_ids,
             )
 
             for row in results:
-                assert row["run_count"] == 1, \
+                assert row["run_count"] == 1, (
                     f"Job {row['id']} was processed {row['run_count']} times (expected 1)"
+                )
 
         finally:
             await conn.execute("DELETE FROM jorb")
@@ -379,18 +408,19 @@ class TestLiveProducerConsumerWorkflows:
     @settings(
         max_examples=5,  # Very slow test
         deadline=None,
-        suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
+        suppress_health_check=[
+            HealthCheck.function_scoped_fixture,
+            HealthCheck.too_slow,
+        ],
         phases=[Phase.explicit, Phase.reuse, Phase.generate],
     )
     @given(
         job_batches=st.lists(
-            st.integers(min_value=1, max_value=5),
-            min_size=2,
-            max_size=4
+            st.integers(min_value=1, max_value=5), min_size=2, max_size=4
         ),
     )
     async def test_continuous_producer_consumer(
-        self, db_params, job_batches: List[int]
+        self, db_params, job_batches: list[int]
     ):
         """
         Property: Continuous producers adding jobs should all be consumed.
@@ -403,11 +433,16 @@ class TestLiveProducerConsumerWorkflows:
             # Setup codec
             def orjson_encoder(obj):
                 import orjson
-                return orjson.dumps(obj).decode('utf-8')
+
+                return orjson.dumps(obj).decode("utf-8")
 
             import orjson
+
             await conn.set_type_codec(
-                "json", encoder=orjson_encoder, decoder=orjson.loads, schema="pg_catalog"
+                "json",
+                encoder=orjson_encoder,
+                decoder=orjson.loads,
+                schema="pg_catalog",
             )
 
             # Start workers first
@@ -416,7 +451,7 @@ class TestLiveProducerConsumerWorkflows:
             for i in range(worker_count):
                 p = multiprocessing.Process(
                     target=run_worker_process,
-                    args=(i, "test", db_params, 20)  # Run longer
+                    args=(i, "test", db_params, 20),  # Run longer
                 )
                 p.start()
                 workers.append(p)
@@ -431,7 +466,7 @@ class TestLiveProducerConsumerWorkflows:
                         conn,
                         state="queued",
                         queue="test",
-                        admin_data={"batch": batch_idx, "job_in_batch": i}
+                        admin_data={"batch": batch_idx, "job_in_batch": i},
                     )
                     batch_ids.append(job_id)
                     all_job_ids.append(job_id)
@@ -460,8 +495,9 @@ class TestLiveProducerConsumerWorkflows:
             finished_count = states.get("finished", 0)
 
             success_rate = finished_count / len(all_job_ids)
-            assert success_rate >= 0.9, \
+            assert success_rate >= 0.9, (
                 f"Success rate: {success_rate:.1%} ({finished_count}/{len(all_job_ids)})"
+            )
 
         finally:
             await conn.execute("DELETE FROM jorb")
@@ -470,15 +506,16 @@ class TestLiveProducerConsumerWorkflows:
     @settings(
         max_examples=5,
         deadline=None,
-        suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
+        suppress_health_check=[
+            HealthCheck.function_scoped_fixture,
+            HealthCheck.too_slow,
+        ],
         phases=[Phase.explicit, Phase.reuse, Phase.generate],
     )
     @given(
         job_count=st.integers(min_value=5, max_value=10),
     )
-    async def test_worker_crash_and_recovery(
-        self, db_params, job_count: int
-    ):
+    async def test_worker_crash_and_recovery(self, db_params, job_count: int):
         """
         Property: If workers crash, jobs should be recovered and processed.
 
@@ -490,28 +527,30 @@ class TestLiveProducerConsumerWorkflows:
             # Setup codec
             def orjson_encoder(obj):
                 import orjson
-                return orjson.dumps(obj).decode('utf-8')
+
+                return orjson.dumps(obj).decode("utf-8")
 
             import orjson
+
             await conn.set_type_codec(
-                "json", encoder=orjson_encoder, decoder=orjson.loads, schema="pg_catalog"
+                "json",
+                encoder=orjson_encoder,
+                decoder=orjson.loads,
+                schema="pg_catalog",
             )
 
             # Create jobs
             job_ids = []
             for i in range(job_count):
                 job_id = await create_job(
-                    conn,
-                    state="queued",
-                    queue="test",
-                    admin_data={"job_number": i}
+                    conn, state="queued", queue="test", admin_data={"job_number": i}
                 )
                 job_ids.append(job_id)
 
             # Start a worker
             worker1 = multiprocessing.Process(
                 target=run_worker_process,
-                args=(1, "test", db_params, 3)  # Short duration
+                args=(1, "test", db_params, 3),  # Short duration
             )
             worker1.start()
 
@@ -529,12 +568,14 @@ class TestLiveProducerConsumerWorkflows:
             # Start a new worker with recovery enabled
             worker2 = multiprocessing.Process(
                 target=run_worker_process,
-                args=(2, "test", db_params, 15, True)  # enable_recovery=True
+                args=(2, "test", db_params, 15, True),  # enable_recovery=True
             )
             worker2.start()
 
             # Wait for all jobs to complete
-            completed = await wait_for_jobs_completion(conn, job_ids, timeout_seconds=20)
+            completed = await wait_for_jobs_completion(
+                conn, job_ids, timeout_seconds=20
+            )
 
             # Stop worker
             if worker2.is_alive():
@@ -552,8 +593,7 @@ class TestLiveProducerConsumerWorkflows:
 
             # Most should succeed (some may have been mid-execution during crash)
             success_rate = finished_count / job_count
-            assert success_rate >= 0.7, \
-                f"Success rate after crash: {success_rate:.1%}"
+            assert success_rate >= 0.7, f"Success rate after crash: {success_rate:.1%}"
 
         finally:
             await conn.execute("DELETE FROM jorb")
@@ -564,6 +604,7 @@ class TestLiveProducerConsumerWorkflows:
 # Property Tests: Priority and Capability Routing (Live)
 # ============================================================================
 
+
 @pytest.mark.hypothesis
 class TestLivePriorityAndCapability:
     """Property tests for priority and capability with real workers."""
@@ -571,7 +612,10 @@ class TestLivePriorityAndCapability:
     @settings(
         max_examples=5,
         deadline=None,
-        suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
+        suppress_health_check=[
+            HealthCheck.function_scoped_fixture,
+            HealthCheck.too_slow,
+        ],
     )
     @given(
         high_prio_count=st.integers(min_value=1, max_value=5),
@@ -589,19 +633,27 @@ class TestLivePriorityAndCapability:
             # Setup codec
             def orjson_encoder(obj):
                 import orjson
-                return orjson.dumps(obj).decode('utf-8')
+
+                return orjson.dumps(obj).decode("utf-8")
 
             import orjson
+
             await conn.set_type_codec(
-                "json", encoder=orjson_encoder, decoder=orjson.loads, schema="pg_catalog"
+                "json",
+                encoder=orjson_encoder,
+                decoder=orjson.loads,
+                schema="pg_catalog",
             )
 
             # Create high priority jobs
             high_prio_ids = []
             for i in range(high_prio_count):
                 job_id = await create_job(
-                    conn, state="queued", queue="test", prio=10,
-                    admin_data={"priority": "high", "order": i}
+                    conn,
+                    state="queued",
+                    queue="test",
+                    prio=10,
+                    admin_data={"priority": "high", "order": i},
                 )
                 high_prio_ids.append(job_id)
 
@@ -609,15 +661,17 @@ class TestLivePriorityAndCapability:
             low_prio_ids = []
             for i in range(low_prio_count):
                 job_id = await create_job(
-                    conn, state="queued", queue="test", prio=1000,
-                    admin_data={"priority": "low", "order": i}
+                    conn,
+                    state="queued",
+                    queue="test",
+                    prio=1000,
+                    admin_data={"priority": "low", "order": i},
                 )
                 low_prio_ids.append(job_id)
 
             # Start ONE worker (to enforce ordering)
             worker = multiprocessing.Process(
-                target=run_worker_process,
-                args=(1, "test", db_params, 15)
+                target=run_worker_process, args=(1, "test", db_params, 15)
             )
             worker.start()
 
@@ -637,14 +691,14 @@ class TestLivePriorityAndCapability:
                 """SELECT id, updated FROM jorb
                    WHERE id = ANY($1::bigint[]) AND state = 'finished'
                    ORDER BY updated""",
-                high_prio_ids
+                high_prio_ids,
             )
 
             low_prio_times = await conn.fetch(
                 """SELECT id, updated FROM jorb
                    WHERE id = ANY($1::bigint[]) AND state = 'finished'
                    ORDER BY updated""",
-                low_prio_ids
+                low_prio_ids,
             )
 
             # INVARIANT: Last high priority job should finish before first low priority job
@@ -652,8 +706,9 @@ class TestLivePriorityAndCapability:
                 last_high_prio = high_prio_times[-1]["updated"]
                 first_low_prio = low_prio_times[0]["updated"]
 
-                assert last_high_prio <= first_low_prio, \
+                assert last_high_prio <= first_low_prio, (
                     "Low priority job finished before all high priority jobs"
+                )
 
         finally:
             await conn.execute("DELETE FROM jorb")

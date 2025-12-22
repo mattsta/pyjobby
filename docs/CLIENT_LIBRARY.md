@@ -135,6 +135,7 @@ Jobs flow through the following states:
 Enqueue a single job.
 
 **Parameters:**
+
 - `job_class` (str): Full Python class path (e.g., `'myapp.jobs.SendEmail'`)
 - `queue` (str): Queue name (default: `'default'`)
 - `priority` (int): Priority (higher = more urgent, default: 100)
@@ -211,6 +212,7 @@ job_id = await client.enqueue(
 Enqueue multiple jobs efficiently in a single transaction.
 
 **Parameters:**
+
 - `jobs` (List[Tuple[str, Dict]]): List of (job_class, kwargs) tuples
 - `queue` (str): Queue name for all jobs
 - `priority` (int): Priority for all jobs
@@ -704,12 +706,14 @@ await bulk_enqueue_from_csv(
 ### 1. Use Batch Operations
 
 **❌ Slow (1000 round-trips):**
+
 ```python
 for i in range(1000):
     await client.enqueue('myapp.jobs.ProcessItem', item_id=i)
 ```
 
 **✅ Fast (1 round-trip):**
+
 ```python
 jobs = [('myapp.jobs.ProcessItem', {'item_id': i}) for i in range(1000)]
 await client.enqueue_batch(jobs)

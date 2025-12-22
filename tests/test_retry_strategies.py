@@ -3,13 +3,13 @@ Comprehensive tests for retry_strategies.py - all retry backoff strategies.
 Using LIVE calculations with NO MOCKS for maximum correctness guarantees!
 """
 
-import pytest
 import datetime
+
 from pyjobby.retry_strategies import (
+    RetryStrategy,
     calculate_retry_delay,
-    get_retry_config,
     calculate_retry_from_job,
-    RetryStrategy
+    get_retry_config,
 )
 
 
@@ -22,7 +22,7 @@ class TestRetryStrategies:
         assert isinstance(delay, datetime.timedelta)
         # Fixed: 2 * (1^2) + jitter(1-5) = 2 + jitter, so 3-7 seconds
         assert 2 <= delay.total_seconds() <= 10
-        
+
         delay2 = calculate_retry_delay(3, strategy="fixed")
         # Fixed: 2 * (3^2) + jitter = 18 + jitter
         assert 18 <= delay2.total_seconds() <= 30
@@ -32,11 +32,11 @@ class TestRetryStrategies:
         delay1 = calculate_retry_delay(1, strategy="exponential", initial_delay=1)
         # 1 * (2^0) = 1 + jitter
         assert 1 <= delay1.total_seconds() <= 5
-        
+
         delay3 = calculate_retry_delay(3, strategy="exponential", initial_delay=1)
         # 1 * (2^2) = 4 + jitter
         assert 4 <= delay3.total_seconds() <= 10
-        
+
         delay5 = calculate_retry_delay(5, strategy="exponential", initial_delay=1)
         # 1 * (2^4) = 16 + jitter
         assert 16 <= delay5.total_seconds() <= 25
@@ -46,7 +46,7 @@ class TestRetryStrategies:
         delay1 = calculate_retry_delay(1, strategy="linear", initial_delay=10)
         # 10 * 1 = 10 + jitter
         assert 10 <= delay1.total_seconds() <= 15
-        
+
         delay5 = calculate_retry_delay(5, strategy="linear", initial_delay=10)
         # 10 * 5 = 50 + jitter
         assert 50 <= delay5.total_seconds() <= 60
@@ -86,13 +86,17 @@ class TestRetryStrategies:
 
     def test_max_delay_cap(self):
         """Test delay is capped at max_delay - covers line 87."""
-        delay = calculate_retry_delay(100, strategy="exponential", initial_delay=1, max_delay=60)
+        delay = calculate_retry_delay(
+            100, strategy="exponential", initial_delay=1, max_delay=60
+        )
         # Should be capped at 60 seconds
         assert delay.total_seconds() <= 65  # max_delay + jitter
 
     def test_custom_multiplier(self):
         """Test custom multiplier for exponential."""
-        delay = calculate_retry_delay(3, strategy="exponential", initial_delay=1, multiplier=3.0)
+        delay = calculate_retry_delay(
+            3, strategy="exponential", initial_delay=1, multiplier=3.0
+        )
         # 1 * (3^2) = 9 + jitter
         assert 9 <= delay.total_seconds() <= 15
 
@@ -120,7 +124,7 @@ class TestRetryConfig:
             "retry_strategy": "linear",
             "max_retries": 5,
             "initial_retry_delay": 10,
-            "max_retry_delay": 300
+            "max_retry_delay": 300,
         }
         config = get_retry_config(admin_data)
         assert config["retry_strategy"] == "linear"
@@ -139,8 +143,8 @@ class TestCalculateRetryFromJob:
             "admin_data": {
                 "retry_strategy": "linear",
                 "initial_retry_delay": 5,
-                "max_retry_delay": 100
-            }
+                "max_retry_delay": 100,
+            },
         }
         delay = calculate_retry_from_job(job, error_count=3)
         # Linear: 5 * 3 = 15 + jitter

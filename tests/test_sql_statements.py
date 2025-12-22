@@ -13,12 +13,8 @@ import pytest
 from tests.utils.factories import (
     create_job,
     create_job_batch,
-    create_dependency_chain,
-    create_group_dependency,
-    count_jobs_by_state,
     get_job,
 )
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -66,8 +62,7 @@ class TestClaimStatement:
 
         # Claim from queue_a
         result = await db_connection.fetchrow(
-            STMTS["claim"],
-            12345, "test-host", "queue_a", ["test"], 1000
+            STMTS["claim"], 12345, "test-host", "queue_a", ["test"], 1000
         )
 
         assert result["id"] == job1_id
@@ -77,25 +72,20 @@ class TestClaimStatement:
         """Test that claiming respects capability requirements."""
         # Create job requiring specific capability
         job_id = await create_job(
-            db_connection,
-            queue="test_queue",
-            capability="special",
-            state="queued"
+            db_connection, queue="test_queue", capability="special", state="queued"
         )
 
         from pyjobby.pj import STMTS
 
         # Try to claim without capability - should fail
         result = await db_connection.fetchrow(
-            STMTS["claim"],
-            12345, "test-host", "test_queue", ["basic"], 1000
+            STMTS["claim"], 12345, "test-host", "test_queue", ["basic"], 1000
         )
         assert result is None
 
         # Claim with correct capability - should succeed
         result = await db_connection.fetchrow(
-            STMTS["claim"],
-            12345, "test-host", "test_queue", ["special"], 1000
+            STMTS["claim"], 12345, "test-host", "test_queue", ["special"], 1000
         )
         assert result is not None
         assert result["id"] == job_id
@@ -109,8 +99,7 @@ class TestClaimStatement:
         from pyjobby.pj import STMTS
 
         result = await db_connection.fetchrow(
-            STMTS["claim"],
-            12345, "test-host", "test_queue", ["test"], 1000
+            STMTS["claim"], 12345, "test-host", "test_queue", ["test"], 1000
         )
 
         assert result["id"] == job_high
@@ -120,17 +109,14 @@ class TestClaimStatement:
         # Create job scheduled for future
         future_time = datetime.utcnow() + timedelta(hours=1)
         job_future = await create_job(
-            db_connection,
-            run_after=future_time,
-            state="queued"
+            db_connection, run_after=future_time, state="queued"
         )
 
         from pyjobby.pj import STMTS
 
         # Should not claim job scheduled for future
         result = await db_connection.fetchrow(
-            STMTS["claim"],
-            12345, "test-host", "test_queue", ["test"], 1000
+            STMTS["claim"], 12345, "test-host", "test_queue", ["test"], 1000
         )
         assert result is None
 
@@ -145,15 +131,13 @@ class TestClaimStatement:
 
         # In same transaction, job should be claimed
         result1 = await db_connection.fetchrow(
-            STMTS["claim"],
-            12345, "test-host", "test_queue", ["test"], 1000
+            STMTS["claim"], 12345, "test-host", "test_queue", ["test"], 1000
         )
         assert result1 is not None
 
         # Second claim attempt should return None (already claimed)
         result2 = await db_connection.fetchrow(
-            STMTS["claim"],
-            12346, "test-host2", "test_queue", ["test"], 1000
+            STMTS["claim"], 12346, "test-host2", "test_queue", ["test"], 1000
         )
         assert result2 is None
 
@@ -168,9 +152,7 @@ class TestFinishedStatement:
         from pyjobby.pj import STMTS
 
         result = await db_connection.fetchrow(
-            STMTS["finished"],
-            job_id,
-            {"status": "success", "output": "done"}
+            STMTS["finished"], job_id, {"status": "success", "output": "done"}
         )
 
         assert result["id"] == job_id
@@ -189,11 +171,7 @@ class TestFinishedStatement:
 
         from pyjobby.pj import STMTS
 
-        result = await db_connection.fetchrow(
-            STMTS["finished"],
-            job_id,
-            {}
-        )
+        result = await db_connection.fetchrow(STMTS["finished"], job_id, {})
 
         assert result["updated"] > job_before["updated"]
 
@@ -226,7 +204,7 @@ class TestCrashStatement:
             STMTS["crash"],
             job_id,
             "ValueError: invalid input",
-            "Traceback:\n  File test.py, line 1\n    raise ValueError()"
+            "Traceback:\n  File test.py, line 1\n    raise ValueError()",
         )
 
         job = await get_job(db_connection, job_id)
@@ -245,15 +223,11 @@ class TestCrashStatement:
         for i in range(3):
             # Set back to running for next crash
             await db_connection.execute(
-                "UPDATE jorb SET state = 'running' WHERE id = $1",
-                job_id
+                "UPDATE jorb SET state = 'running' WHERE id = $1", job_id
             )
 
             await db_connection.execute(
-                STMTS["crash"],
-                job_id,
-                f"Error {i+1}",
-                "Traceback"
+                STMTS["crash"], job_id, f"Error {i + 1}", "Traceback"
             )
 
         job = await get_job(db_connection, job_id)
@@ -270,11 +244,7 @@ class TestRescheduleStatement:
         from pyjobby.pj import STMTS
 
         # Reschedule to run in 1 hour
-        await db_connection.execute(
-            STMTS["reschedule"],
-            job_id,
-            timedelta(hours=1)
-        )
+        await db_connection.execute(STMTS["reschedule"], job_id, timedelta(hours=1))
 
         job = await get_job(db_connection, job_id)
         assert job["state"] == "queued"
@@ -291,17 +261,14 @@ class TestCreateRetryStatement:
             db_connection,
             job_class="test.RetryableJob",
             kwargs={"attempt": 1},
-            state="crashed"
+            state="crashed",
         )
 
         from pyjobby.pj import STMTS
 
         # Create retry with 5 minute delay, error_count = 1
         result = await db_connection.fetchrow(
-            STMTS["create-retry"],
-            original_id,
-            timedelta(minutes=5),
-            1
+            STMTS["create-retry"], original_id, timedelta(minutes=5), 1
         )
 
         retry_id = result["id"]
@@ -327,16 +294,13 @@ class TestCreateRetryStatement:
             queue="special_queue",
             prio=50,
             capability="special",
-            state="crashed"
+            state="crashed",
         )
 
         from pyjobby.pj import STMTS
 
         result = await db_connection.fetchrow(
-            STMTS["create-retry"],
-            original_id,
-            timedelta(minutes=1),
-            2
+            STMTS["create-retry"], original_id, timedelta(minutes=1), 2
         )
 
         retry_job = await get_job(db_connection, result["id"])
@@ -366,7 +330,7 @@ class TestRecoverAbandonedStatement:
                    updated = $1
                WHERE id = $2""",
             old_time,
-            old_job_id
+            old_job_id,
         )
 
         # Recent job: updated 1 minute ago (should NOT be recovered with 5 min timeout)
@@ -379,7 +343,7 @@ class TestRecoverAbandonedStatement:
                    updated = $1
                WHERE id = $2""",
             recent_time,
-            recent_job_id
+            recent_job_id,
         )
 
         from pyjobby.pj import STMTS
@@ -387,9 +351,7 @@ class TestRecoverAbandonedStatement:
         # Recover jobs from dead-host older than 5 minutes
         recovery_timeout = timedelta(minutes=5)
         results = await db_connection.fetch(
-            STMTS["recover-abandoned"],
-            "dead-host",
-            recovery_timeout
+            STMTS["recover-abandoned"], "dead-host", recovery_timeout
         )
 
         # Should only recover the old job, not the recent one
@@ -418,17 +380,14 @@ class TestEnqueueStatements:
 
         # Create job waiting for group
         waiter = await create_job(
-            db_connection,
-            waitfor_group=group_id,
-            state="waiting"
+            db_connection, waitfor_group=group_id, state="waiting"
         )
 
         from pyjobby.pj import STMTS
 
         # Enqueue jobs waiting for this group
         results = await db_connection.fetch(
-            STMTS["enqueue-next-if-peer-group-is-finished"],
-            group_id
+            STMTS["enqueue-next-if-peer-group-is-finished"], group_id
         )
 
         assert len(results) > 0
@@ -444,17 +403,14 @@ class TestEnqueueStatements:
 
         # Create job waiting for finished job
         waiter = await create_job(
-            db_connection,
-            waitfor_job=finished_id,
-            state="waiting"
+            db_connection, waitfor_job=finished_id, state="waiting"
         )
 
         from pyjobby.pj import STMTS
 
         # Enqueue jobs waiting for finished job
         results = await db_connection.fetch(
-            STMTS["enqueue-next-self-finished"],
-            finished_id
+            STMTS["enqueue-next-self-finished"], finished_id
         )
 
         assert len(results) > 0
@@ -484,7 +440,7 @@ class TestScheduleDeadlineStatement:
             None,  # run_group
             "test.DailyReport",
             {"date": "2024-01-01"},
-            None  # admin_data
+            None,  # admin_data
         )
 
         # Try to schedule duplicate - should fail with unique constraint
@@ -499,7 +455,7 @@ class TestScheduleDeadlineStatement:
                 None,
                 "test.DailyReport",
                 {"date": "2024-01-01"},
-                None
+                None,
             )
 
 
@@ -523,7 +479,7 @@ class TestConcurrentClaiming:
                 f"worker-{worker_id}",
                 "test_queue",
                 ["test"],
-                1000
+                1000,
             )
             if result:
                 claimed.append(result["id"])
@@ -552,13 +508,12 @@ class TestSQLStatementIntegration:
             db_connection,
             job_class="test.FullLifecycle",
             kwargs={"step": 1},
-            state="queued"
+            state="queued",
         )
 
         # 2. Claim job
         claimed = await db_connection.fetchrow(
-            STMTS["claim"],
-            12345, "test-host", "test_queue", ["test"], 1000
+            STMTS["claim"], 12345, "test-host", "test_queue", ["test"], 1000
         )
         assert claimed["id"] == job_id
         assert claimed["state"] == "claimed"
@@ -570,9 +525,7 @@ class TestSQLStatementIntegration:
 
         # 4. Complete successfully
         finished = await db_connection.fetchrow(
-            STMTS["finished"],
-            job_id,
-            {"result": "success"}
+            STMTS["finished"], job_id, {"result": "success"}
         )
         assert finished["state"] == "finished"
 
@@ -590,8 +543,8 @@ class TestSQLStatementIntegration:
             result = await db_connection.fetchrow(
                 STMTS["create-retry"],
                 retry_chain[-1],
-                timedelta(minutes=(i+1)*5),
-                i + 1
+                timedelta(minutes=(i + 1) * 5),
+                i + 1,
             )
             retry_chain.append(result["id"])
 

@@ -4,8 +4,7 @@ Tests for pyjobby/__init__.py module initialization.
 Covers version detection and fallback mechanisms.
 """
 
-import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 
 class TestVersionDetection:
@@ -16,7 +15,7 @@ class TestVersionDetection:
         import pyjobby
 
         # Should have a version (either from metadata or "dev")
-        assert hasattr(pyjobby, '__version__')
+        assert hasattr(pyjobby, "__version__")
         assert isinstance(pyjobby.__version__, str)
         assert len(pyjobby.__version__) > 0
 
@@ -26,13 +25,15 @@ class TestVersionDetection:
         # This is tricky because the module is already imported
 
         # Instead, let's test the logic by importing the module code
-        with patch('importlib.metadata.version') as mock_version:
+        with patch("importlib.metadata.version") as mock_version:
             # Make metadata.version() raise an exception
             mock_version.side_effect = Exception("Package not found")
 
             # Re-import the module to trigger the fallback
             import importlib
+
             import pyjobby
+
             importlib.reload(pyjobby)
 
             # Should fall back to "dev"
@@ -47,7 +48,7 @@ class TestVersionDetection:
         from importlib import metadata
 
         # Verify metadata module has version function
-        assert hasattr(metadata, 'version')
+        assert hasattr(metadata, "version")
 
         # Note: Lines 3-5 are defensive code for older Python versions
         # They won't execute in Python 3.11+ environment

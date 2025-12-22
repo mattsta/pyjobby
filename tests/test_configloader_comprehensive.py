@@ -6,20 +6,18 @@ Tests configuration loading from files and modules.
 Coverage target: 70%+
 """
 
-import pytest
 import os
 import sys
-import tempfile
-from pathlib import Path
+
+import pytest
 
 from pyjobby.configloader import (
     chdir_addpath,
     get_config_from_filename,
     get_config_from_module_name,
-    load_config_from_module_name_or_filename,
     load_config_from_file,
+    load_config_from_module_name_or_filename,
 )
-
 
 # =============================================================================
 # Test chdir_addpath
@@ -97,11 +95,11 @@ MAX_WORKERS = 10
 
         config = get_config_from_filename(str(config_file))
 
-        assert config['DB_HOST'] == "localhost"
-        assert config['DB_PORT'] == 5432
-        assert config['DB_NAME'] == "testdb"
-        assert config['DEBUG'] is True
-        assert config['MAX_WORKERS'] == 10
+        assert config["DB_HOST"] == "localhost"
+        assert config["DB_PORT"] == 5432
+        assert config["DB_NAME"] == "testdb"
+        assert config["DEBUG"] is True
+        assert config["MAX_WORKERS"] == 10
 
     def test_load_file_with_no_extension(self, tmp_path):
         """Test loading a config file with no extension."""
@@ -113,8 +111,8 @@ TIMEOUT = 30
 
         config = get_config_from_filename(str(config_file))
 
-        assert config['QUEUE'] == "high-priority"
-        assert config['TIMEOUT'] == 30
+        assert config["QUEUE"] == "high-priority"
+        assert config["TIMEOUT"] == 30
 
     def test_nonexistent_file_raises_error(self):
         """Test that loading non-existent file raises RuntimeError."""
@@ -147,11 +145,11 @@ class TestGetConfigFromModuleName:
     def test_load_existing_module(self):
         """Test loading configuration from an existing module."""
         # Use a real Python module
-        config = get_config_from_module_name('os')
+        config = get_config_from_module_name("os")
 
         # Should have standard os module attributes
-        assert 'path' in config
-        assert 'environ' in config
+        assert "path" in config
+        assert "environ" in config
 
     def test_load_custom_module(self, tmp_path, monkeypatch):
         """Test loading a custom module."""
@@ -169,11 +167,11 @@ ENABLED = True
         # Add to sys.path so it can be imported
         monkeypatch.syspath_prepend(str(module_dir))
 
-        config = get_config_from_module_name('my_config')
+        config = get_config_from_module_name("my_config")
 
-        assert config['APP_NAME'] == "PyJobby"
-        assert config['VERSION'] == "2.0.0"
-        assert config['ENABLED'] is True
+        assert config["APP_NAME"] == "PyJobby"
+        assert config["VERSION"] == "2.0.0"
+        assert config["ENABLED"] is True
 
 
 # =============================================================================
@@ -201,18 +199,17 @@ other_var = "ignored"
         monkeypatch.syspath_prepend(str(module_dir))
 
         config = load_config_from_module_name_or_filename(
-            "python:app_config",
-            keys=['db_host', 'db_port', 'api_key']
+            "python:app_config", keys=["db_host", "db_port", "api_key"]
         )
 
         # Only requested keys should be returned (lowercased)
         assert config == {
-            'db_host': 'localhost',
-            'db_port': 5432,
-            'api_key': 'secret123'
+            "db_host": "localhost",
+            "db_port": 5432,
+            "api_key": "secret123",
         }
         # other_var should not be in config
-        assert 'other_var' not in config
+        assert "other_var" not in config
 
     def test_load_with_file_prefix(self, tmp_path):
         """Test loading with 'file:' prefix."""
@@ -225,16 +222,11 @@ IGNORED = "not requested"
 """)
 
         config = load_config_from_module_name_or_filename(
-            f"file:{config_file}",
-            keys=['redis_host', 'redis_port', 'workers']
+            f"file:{config_file}", keys=["redis_host", "redis_port", "workers"]
         )
 
-        assert config == {
-            'redis_host': '127.0.0.1',
-            'redis_port': 6379,
-            'workers': 5
-        }
-        assert 'ignored' not in config
+        assert config == {"redis_host": "127.0.0.1", "redis_port": 6379, "workers": 5}
+        assert "ignored" not in config
 
     def test_load_without_prefix(self, tmp_path):
         """Test loading without any prefix (defaults to file)."""
@@ -245,14 +237,10 @@ PRIORITY = 100
 """)
 
         config = load_config_from_module_name_or_filename(
-            str(config_file),
-            keys=['queue_name', 'priority']
+            str(config_file), keys=["queue_name", "priority"]
         )
 
-        assert config == {
-            'queue_name': 'default',
-            'priority': 100
-        }
+        assert config == {"queue_name": "default", "priority": 100}
 
     def test_keys_case_insensitive(self, tmp_path):
         """Test that keys matching is case-insensitive."""
@@ -264,14 +252,13 @@ Db_Name = "testdb"
 """)
 
         config = load_config_from_module_name_or_filename(
-            str(config_file),
-            keys=['db_host', 'db_port', 'db_name']
+            str(config_file), keys=["db_host", "db_port", "db_name"]
         )
 
         # All should be lowercased in result
-        assert 'db_host' in config
-        assert 'db_port' in config
-        assert 'db_name' in config
+        assert "db_host" in config
+        assert "db_port" in config
+        assert "db_name" in config
 
 
 # =============================================================================
@@ -292,13 +279,12 @@ WORKERS = 4
 """)
 
         config = load_config_from_file(
-            str(config_file),
-            keys=['server_host', 'server_port', 'workers']
+            str(config_file), keys=["server_host", "server_port", "workers"]
         )
 
-        assert config['server_host'] == "0.0.0.0"
-        assert config['server_port'] == 8080
-        assert config['workers'] == 4
+        assert config["server_host"] == "0.0.0.0"
+        assert config["server_port"] == 8080
+        assert config["workers"] == 4
 
     def test_main_entry_point_with_module(self, tmp_path, monkeypatch):
         """Test main entry point loads module correctly."""
@@ -314,12 +300,11 @@ listen_port = 9000
         monkeypatch.syspath_prepend(str(module_dir))
 
         config = load_config_from_file(
-            "python:server_config",
-            keys=['listen_host', 'listen_port']
+            "python:server_config", keys=["listen_host", "listen_port"]
         )
 
-        assert config['listen_host'] == "0.0.0.0"
-        assert config['listen_port'] == 9000
+        assert config["listen_host"] == "0.0.0.0"
+        assert config["listen_port"] == 9000
 
     def test_empty_keys_returns_empty_dict(self, tmp_path):
         """Test that requesting no keys returns empty dict."""
@@ -360,15 +345,14 @@ POOL_TIMEOUT = 30
 """)
 
         config = load_config_from_file(
-            str(config_file),
-            keys=['db_params', 'pool_size', 'pool_timeout']
+            str(config_file), keys=["db_params", "pool_size", "pool_timeout"]
         )
 
-        assert isinstance(config['db_params'], dict)
-        assert config['db_params']['host'] == 'localhost'
-        assert config['db_params']['port'] == 5432
-        assert config['pool_size'] == 10
-        assert config['pool_timeout'] == 30
+        assert isinstance(config["db_params"], dict)
+        assert config["db_params"]["host"] == "localhost"
+        assert config["db_params"]["port"] == 5432
+        assert config["pool_size"] == 10
+        assert config["pool_timeout"] == 30
 
     def test_load_worker_config(self, tmp_path):
         """Test loading typical worker configuration."""
@@ -383,11 +367,11 @@ CAPABILITIES = ["email", "sms", "webhook"]
 
         config = load_config_from_file(
             str(config_file),
-            keys=['queue', 'prio', 'check_interval', 'batch_size', 'capabilities']
+            keys=["queue", "prio", "check_interval", "batch_size", "capabilities"],
         )
 
-        assert config['queue'] == "high-priority"
-        assert config['prio'] == 500
-        assert config['check_interval'] == 1.0
-        assert config['batch_size'] == 100
-        assert config['capabilities'] == ["email", "sms", "webhook"]
+        assert config["queue"] == "high-priority"
+        assert config["prio"] == 500
+        assert config["check_interval"] == 1.0
+        assert config["batch_size"] == 100
+        assert config["capabilities"] == ["email", "sms", "webhook"]

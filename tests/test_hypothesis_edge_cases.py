@@ -14,16 +14,15 @@ Test categories:
 """
 
 import json
-import random
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from datetime import UTC
+from typing import Any
 
 import pytest
-from hypothesis import given, settings, strategies as st, assume, HealthCheck
+from hypothesis import HealthCheck, assume, given, settings
+from hypothesis import strategies as st
 
 from pyjobby.retry_strategies import (
     calculate_retry_delay,
-    RetryStrategy,
     get_retry_config,
 )
 
@@ -35,7 +34,7 @@ class TestRetryStrategyEdgeCases:
     @given(
         error_count=st.integers(min_value=1, max_value=1000),
         initial_delay=st.integers(min_value=1, max_value=3600),
-        max_delay=st.integers(min_value=60, max_value=86400)
+        max_delay=st.integers(min_value=60, max_value=86400),
     )
     @settings(suppress_health_check=[HealthCheck.filter_too_much])
     def test_retry_delay_never_exceeds_max(self, error_count, initial_delay, max_delay):
@@ -47,14 +46,15 @@ class TestRetryStrategyEdgeCases:
                 error_count,
                 strategy=strategy,
                 initial_delay=initial_delay,
-                max_delay=max_delay
+                max_delay=max_delay,
             )
-            assert delay.total_seconds() <= max_delay, \
+            assert delay.total_seconds() <= max_delay, (
                 f"{strategy} strategy violated max_delay: {delay.total_seconds()} > {max_delay}"
+            )
 
     @given(
         error_count=st.integers(min_value=1, max_value=100),
-        multiplier=st.floats(min_value=1.1, max_value=10.0)
+        multiplier=st.floats(min_value=1.1, max_value=10.0),
     )
     def test_exponential_backoff_increases_monotonically(self, error_count, multiplier):
         """Property: Exponential backoff increases with error count."""
@@ -65,23 +65,25 @@ class TestRetryStrategyEdgeCases:
             error_count - 1,
             strategy="exponential",
             multiplier=multiplier,
-            max_delay=1000000  # Large max to avoid capping
+            max_delay=1000000,  # Large max to avoid capping
         )
         delay2 = calculate_retry_delay(
             error_count,
             strategy="exponential",
             multiplier=multiplier,
-            max_delay=1000000
+            max_delay=1000000,
         )
 
         # With jitter, delay might not be strictly monotonic, but should be close
         # Allow for jitter (up to 10% + 5s)
-        assert delay2.total_seconds() >= delay1.total_seconds() * 0.8, \
+        assert delay2.total_seconds() >= delay1.total_seconds() * 0.8, (
             f"Exponential backoff not increasing: {delay1} -> {delay2}"
+        )
 
     @given(error_count=st.integers(min_value=1, max_value=50))
     def test_fibonacci_sequence_property(self, error_count):
         """Property: Fibonacci sequence follows F(n) = F(n-1) + F(n-2)."""
+
         def fib(n: int) -> int:
             if n <= 0:
                 return 0
@@ -98,7 +100,7 @@ class TestRetryStrategyEdgeCases:
 
     @given(
         error_count=st.integers(min_value=1, max_value=100),
-        initial_delay=st.integers(min_value=1, max_value=60)
+        initial_delay=st.integers(min_value=1, max_value=60),
     )
     def test_linear_backoff_proportional(self, error_count, initial_delay):
         """Property: Linear backoff is proportional to error count."""
@@ -106,7 +108,7 @@ class TestRetryStrategyEdgeCases:
             error_count,
             strategy="linear",
             initial_delay=initial_delay,
-            max_delay=1000000
+            max_delay=1000000,
         )
 
         # Linear: delay = initial * error_count (+ jitter)
@@ -116,13 +118,22 @@ class TestRetryStrategyEdgeCases:
 
         assert expected_base <= delay.total_seconds() <= expected_base + max_jitter + 1
 
-    @given(admin_data=st.one_of(
-        st.none(),
-        st.dictionaries(
-            keys=st.sampled_from(["retry_strategy", "max_retries", "initial_retry_delay", "max_retry_delay"]),
-            values=st.one_of(st.integers(), st.text(max_size=20))
+    @given(
+        admin_data=st.one_of(
+            st.none(),
+            st.dictionaries(
+                keys=st.sampled_from(
+                    [
+                        "retry_strategy",
+                        "max_retries",
+                        "initial_retry_delay",
+                        "max_retry_delay",
+                    ]
+                ),
+                values=st.one_of(st.integers(), st.text(max_size=20)),
+            ),
         )
-    ))
+    )
     def test_get_retry_config_handles_invalid_data(self, admin_data):
         """Property: get_retry_config handles any admin_data without crashing."""
         # Should not raise exception, should return valid defaults
@@ -146,9 +157,9 @@ class TestResultStorageEdgeCases:
                 st.floats(allow_nan=False, allow_infinity=False),
                 st.text(max_size=1000),
                 st.booleans(),
-                st.none()
+                st.none(),
             ),
-            max_size=100
+            max_size=100,
         )
     )
     def test_result_data_json_serializable(self, result_data):
@@ -162,9 +173,7 @@ class TestResultStorageEdgeCases:
         except (TypeError, ValueError) as e:
             pytest.fail(f"Result data not JSON serializable: {e}")
 
-    @given(
-        list_size=st.integers(min_value=0, max_value=10000)
-    )
+    @given(list_size=st.integers(min_value=0, max_value=10000))
     def test_large_result_arrays(self, list_size):
         """Property: Large arrays should be handled (up to reasonable size)."""
         result = {"data": list(range(list_size))}
@@ -176,13 +185,11 @@ class TestResultStorageEdgeCases:
         if list_size <= 10000:
             assert len(serialized) < 1024 * 1024  # 1MB
 
-    @given(
-        nesting_depth=st.integers(min_value=1, max_value=20)
-    )
+    @given(nesting_depth=st.integers(min_value=1, max_value=20))
     def test_nested_result_structures(self, nesting_depth):
         """Property: Nested dictionaries should be handled up to reasonable depth."""
         # Create nested structure
-        result: Dict[str, Any] = {"level": 0}
+        result: dict[str, Any] = {"level": 0}
         current = result
 
         for i in range(1, nesting_depth):
@@ -204,7 +211,7 @@ class TestResultStorageEdgeCases:
         data=st.lists(
             st.integers(min_value=-1000000, max_value=1000000),
             min_size=1,
-            max_size=1000
+            max_size=1000,
         )
     )
     def test_numeric_result_precision(self, data):
@@ -221,14 +228,12 @@ class TestResultStorageEdgeCases:
 class TestTimeoutBoundaryConditions:
     """Property-based tests for timeout edge cases."""
 
-    @given(
-        timeout_seconds=st.integers(min_value=1, max_value=86400)
-    )
+    @given(timeout_seconds=st.integers(min_value=1, max_value=86400))
     def test_timeout_at_calculation(self, timeout_seconds):
         """Property: timeout_at should be current time + timeout_seconds."""
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         timeout_at = now + timedelta(seconds=timeout_seconds)
 
         # Timeout should be in the future
@@ -240,14 +245,14 @@ class TestTimeoutBoundaryConditions:
 
     @given(
         timeout_seconds=st.integers(min_value=1, max_value=3600),
-        elapsed_seconds=st.integers(min_value=0, max_value=7200)
+        elapsed_seconds=st.integers(min_value=0, max_value=7200),
     )
     def test_timeout_detection(self, timeout_seconds, elapsed_seconds):
         """Property: Job is timed out iff elapsed > timeout."""
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         # Use fixed timestamps to avoid timing precision issues
-        started = datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        started = datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC)
         timeout_at = started + timedelta(seconds=timeout_seconds)
         now = started + timedelta(seconds=elapsed_seconds)
 
@@ -257,13 +262,15 @@ class TestTimeoutBoundaryConditions:
         # At exactly timeout_seconds, not yet timed out
         assert is_timed_out == (elapsed_seconds > timeout_seconds)
 
-    @given(admin_data=st.dictionaries(
-        keys=st.sampled_from(["timeout_seconds", "on_timeout"]),
-        values=st.one_of(
-            st.integers(min_value=1, max_value=86400),
-            st.sampled_from(["retry", "fail", "ignore"])
+    @given(
+        admin_data=st.dictionaries(
+            keys=st.sampled_from(["timeout_seconds", "on_timeout"]),
+            values=st.one_of(
+                st.integers(min_value=1, max_value=86400),
+                st.sampled_from(["retry", "fail", "ignore"]),
+            ),
         )
-    ))
+    )
     def test_timeout_config_validation(self, admin_data):
         """Property: Timeout config should handle various valid admin_data."""
         # Extract timeout configuration
@@ -281,9 +288,7 @@ class TestTimeoutBoundaryConditions:
 class TestDAGTopologyProperties:
     """Property-based tests for DAG structure invariants."""
 
-    @given(
-        num_jobs=st.integers(min_value=1, max_value=100)
-    )
+    @given(num_jobs=st.integers(min_value=1, max_value=100))
     def test_linear_dag_depth(self, num_jobs):
         """Property: Linear DAG depth equals number of jobs."""
         # Linear DAG: Job1 → Job2 → ... → JobN
@@ -294,7 +299,7 @@ class TestDAGTopologyProperties:
 
     @given(
         num_branches=st.integers(min_value=2, max_value=20),
-        jobs_per_branch=st.integers(min_value=1, max_value=10)
+        jobs_per_branch=st.integers(min_value=1, max_value=10),
     )
     def test_parallel_dag_structure(self, num_branches, jobs_per_branch):
         """Property: Parallel DAG should have num_branches independent paths."""
@@ -307,16 +312,18 @@ class TestDAGTopologyProperties:
         edges=st.lists(
             st.tuples(
                 st.integers(min_value=1, max_value=10),
-                st.integers(min_value=1, max_value=10)
+                st.integers(min_value=1, max_value=10),
             ),
             min_size=0,
-            max_size=20
+            max_size=20,
         )
     )
     def test_dag_no_self_loops(self, edges):
         """Property: DAG should not have self-loops (node pointing to itself)."""
         # Filter out self-loops
-        valid_edges = [(from_node, to_node) for from_node, to_node in edges if from_node != to_node]
+        valid_edges = [
+            (from_node, to_node) for from_node, to_node in edges if from_node != to_node
+        ]
 
         # Valid DAG should have no self-loops
         for from_node, to_node in valid_edges:
@@ -324,9 +331,7 @@ class TestDAGTopologyProperties:
 
     @given(
         dependencies=st.lists(
-            st.integers(min_value=1, max_value=50),
-            min_size=0,
-            max_size=10
+            st.integers(min_value=1, max_value=50), min_size=0, max_size=10
         )
     )
     def test_dag_dependency_ordering(self, dependencies):
@@ -344,9 +349,7 @@ class TestConcurrentOperationsInvariants:
 
     @given(
         job_priorities=st.lists(
-            st.integers(min_value=1, max_value=1000),
-            min_size=1,
-            max_size=100
+            st.integers(min_value=1, max_value=1000), min_size=1, max_size=100
         )
     )
     def test_priority_queue_ordering(self, job_priorities):
@@ -361,10 +364,8 @@ class TestConcurrentOperationsInvariants:
     @given(
         initial_count=st.integers(min_value=0, max_value=100),
         increments=st.lists(
-            st.integers(min_value=0, max_value=5),
-            min_size=0,
-            max_size=20
-        )
+            st.integers(min_value=0, max_value=5), min_size=0, max_size=20
+        ),
     )
     def test_run_count_monotonic_increase(self, initial_count, increments):
         """Property: run_count should only increase or stay the same."""
@@ -375,14 +376,13 @@ class TestConcurrentOperationsInvariants:
 
         # Verify monotonic increase
         for i in range(1, len(counts)):
-            assert counts[i] >= counts[i-1], \
-                f"run_count should only increase: {counts[i-1]} -> {counts[i]}"
+            assert counts[i] >= counts[i - 1], (
+                f"run_count should only increase: {counts[i - 1]} -> {counts[i]}"
+            )
 
     @given(
         worker_ids=st.lists(
-            st.integers(min_value=1, max_value=10),
-            min_size=1,
-            max_size=20
+            st.integers(min_value=1, max_value=10), min_size=1, max_size=20
         )
     )
     def test_job_claimed_by_single_worker(self, worker_ids):
@@ -406,9 +406,9 @@ class TestAdminDataValidation:
                 st.integers(),
                 st.text(max_size=100),
                 st.booleans(),
-                st.floats(allow_nan=False, allow_infinity=False)
+                st.floats(allow_nan=False, allow_infinity=False),
             ),
-            max_size=20
+            max_size=20,
         )
     )
     def test_admin_data_json_serializable(self, admin_data):
@@ -423,14 +423,11 @@ class TestAdminDataValidation:
 
     @given(
         max_retries=st.integers(min_value=0, max_value=100),
-        timeout_seconds=st.integers(min_value=1, max_value=86400)
+        timeout_seconds=st.integers(min_value=1, max_value=86400),
     )
     def test_admin_data_constraints(self, max_retries, timeout_seconds):
         """Property: admin_data constraints should be valid."""
-        admin_data = {
-            "max_retries": max_retries,
-            "timeout_seconds": timeout_seconds
-        }
+        admin_data = {"max_retries": max_retries, "timeout_seconds": timeout_seconds}
 
         # max_retries should be non-negative
         assert admin_data["max_retries"] >= 0
@@ -440,18 +437,20 @@ class TestAdminDataValidation:
 
     @given(
         on_timeout=st.sampled_from(["retry", "fail", "ignore"]),
-        retry_strategy=st.sampled_from(["exponential", "linear", "fibonacci", "fixed"])
+        retry_strategy=st.sampled_from(["exponential", "linear", "fibonacci", "fixed"]),
     )
     def test_admin_data_enum_values(self, on_timeout, retry_strategy):
         """Property: Enum-like admin_data fields should have valid values."""
-        admin_data = {
-            "on_timeout": on_timeout,
-            "retry_strategy": retry_strategy
-        }
+        admin_data = {"on_timeout": on_timeout, "retry_strategy": retry_strategy}
 
         # Validate enum values
         assert admin_data["on_timeout"] in ["retry", "fail", "ignore"]
-        assert admin_data["retry_strategy"] in ["exponential", "linear", "fibonacci", "fixed"]
+        assert admin_data["retry_strategy"] in [
+            "exponential",
+            "linear",
+            "fibonacci",
+            "fixed",
+        ]
 
 
 @pytest.mark.hypothesis
@@ -460,10 +459,14 @@ class TestQueueOperationsProperties:
 
     @given(
         queue_names=st.lists(
-            st.text(min_size=1, max_size=50, alphabet=st.characters(min_codepoint=97, max_codepoint=122)),
+            st.text(
+                min_size=1,
+                max_size=50,
+                alphabet=st.characters(min_codepoint=97, max_codepoint=122),
+            ),
             min_size=1,
             max_size=10,
-            unique=True
+            unique=True,
         )
     )
     def test_queue_name_uniqueness(self, queue_names):
@@ -475,7 +478,7 @@ class TestQueueOperationsProperties:
             keys=st.text(min_size=1, max_size=20),
             values=st.integers(min_value=0, max_value=1000),
             min_size=1,
-            max_size=10
+            max_size=10,
         )
     )
     def test_total_job_count(self, job_counts):
@@ -487,7 +490,7 @@ class TestQueueOperationsProperties:
 
     @given(
         enqueue_count=st.integers(min_value=0, max_value=100),
-        dequeue_count=st.integers(min_value=0, max_value=100)
+        dequeue_count=st.integers(min_value=0, max_value=100),
     )
     def test_queue_size_invariant(self, enqueue_count, dequeue_count):
         """Property: Queue size = enqueued - dequeued (if dequeued <= enqueued)."""

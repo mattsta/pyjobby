@@ -4,11 +4,10 @@ Using LIVE database operations with NO MOCKS for maximum correctness guarantees!
 """
 
 import pytest
-import asyncio
-import asyncpg
+
 from pyjobby.dag import (
-    DAGNode,
     DAGBuilder,
+    DAGNode,
     execute_dag,
     get_dag_status,
     wait_for_dag,
@@ -32,7 +31,7 @@ class TestDAGNode:
         node = DAGNode(
             job_class="TestJob",
             kwargs={"arg1": "value1", "arg2": 42},
-            node_id="test-456"
+            node_id="test-456",
         )
         assert node.kwargs == {"arg1": "value1", "arg2": 42}
 
@@ -178,7 +177,9 @@ class TestDAGBuilderValidate:
         external_node = dag1.add("ExternalJob")
 
         dag2 = DAGBuilder()
-        dag2.add("Job1", depends_on=[external_node])  # Depends on node from different DAG
+        dag2.add(
+            "Job1", depends_on=[external_node]
+        )  # Depends on node from different DAG
 
         with pytest.raises(ValueError) as excinfo:
             dag2.validate()
@@ -418,10 +419,7 @@ class MockClient:
 
     async def enqueue(self, job_class, **kwargs):
         """Mock enqueue that records calls and returns incrementing IDs."""
-        self.enqueue_calls.append({
-            'job_class': job_class,
-            'kwargs': kwargs
-        })
+        self.enqueue_calls.append({"job_class": job_class, "kwargs": kwargs})
 
         # Actually insert a job record so dag_id updates work
         # Uses correct schema column names: kwargs (jsonb), state (jorbstate)
@@ -432,7 +430,7 @@ class MockClient:
             RETURNING id
             """,
             job_class,
-            {}  # Empty kwargs
+            {},  # Empty kwargs
         )
 
         return job_id
@@ -475,10 +473,10 @@ class TestDAGExecuteIntegration:
         # Check DAG record was created
         record = await db_pool.fetchrow(
             "SELECT * FROM jorb_dag WHERE name = $1 ORDER BY id DESC LIMIT 1",
-            "Record Test DAG"
+            "Record Test DAG",
         )
         assert record is not None
-        assert record['name'] == "Record Test DAG"
+        assert record["name"] == "Record Test DAG"
 
     @pytest.mark.asyncio
     async def test_dag_execute_parallel_jobs(self, db_pool):
@@ -522,8 +520,8 @@ class TestGetDAGStatus:
     async def test_get_dag_status_not_found(self, db_pool):
         """Test get_dag_status with non-existent DAG - covers lines 348-349."""
         status = await get_dag_status(db_pool, -99999)
-        assert 'error' in status
-        assert status['error'] == 'DAG not found'
+        assert "error" in status
+        assert status["error"] == "DAG not found"
 
     @pytest.mark.asyncio
     async def test_get_dag_status_existing(self, db_pool):
@@ -536,7 +534,7 @@ class TestGetDAGStatus:
             RETURNING id
             """,
             "Status Test DAG",
-            {"test": True}
+            {"test": True},
         )
 
         status = await get_dag_status(db_pool, dag_id)
@@ -566,16 +564,11 @@ class TestWaitForDAG:
             RETURNING id
             """,
             "Timeout Test DAG",
-            {"test": True}
+            {"test": True},
         )
 
         # Wait with very short timeout
-        result = await wait_for_dag(
-            db_pool,
-            dag_id,
-            timeout=0.1,
-            poll_interval=0.05
-        )
+        result = await wait_for_dag(db_pool, dag_id, timeout=0.1, poll_interval=0.05)
 
         # Should timeout (return False) because DAG never completes
         # Note: actual result depends on jorb_dag_status view
@@ -650,8 +643,7 @@ class TestDAGComplexScenarios:
 
         # Fan out to many parallel jobs
         parallel_nodes = [
-            dag.add(f"Parallel{i}", depends_on=[start])
-            for i in range(10)
+            dag.add(f"Parallel{i}", depends_on=[start]) for i in range(10)
         ]
 
         # Converge to single end

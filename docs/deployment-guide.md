@@ -301,7 +301,7 @@ CMD ["pj", "--config", "/etc/pyjobby/pyjobby.conf.py"]
 #### `docker-compose.yml`
 
 ```yaml
-version: '3.8'
+version: "3.8"
 
 services:
   postgres:
@@ -382,43 +382,43 @@ spec:
         queue: default
     spec:
       containers:
-      - name: worker
-        image: myregistry/pyjobby:latest
-        command: ["pj", "--queue", "default", "--workers", "4"]
-        env:
-        - name: DB_HOST
-          valueFrom:
-            secretKeyRef:
-              name: pyjobby-db
-              key: host
-        - name: DB_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: pyjobby-db
-              key: password
-        volumeMounts:
-        - name: config
-          mountPath: /etc/pyjobby
-          readOnly: true
-        resources:
-          requests:
-            memory: "512Mi"
-            cpu: "500m"
-          limits:
-            memory: "2Gi"
-            cpu: "2000m"
-        livenessProbe:
-          exec:
-            command:
-            - /bin/sh
-            - -c
-            - "pgrep -f 'pj --queue default' || exit 1"
-          initialDelaySeconds: 30
-          periodSeconds: 60
+        - name: worker
+          image: myregistry/pyjobby:latest
+          command: ["pj", "--queue", "default", "--workers", "4"]
+          env:
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: pyjobby-db
+                  key: host
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pyjobby-db
+                  key: password
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pyjobby
+              readOnly: true
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "pgrep -f 'pj --queue default' || exit 1"
+            initialDelaySeconds: 30
+            periodSeconds: 60
       volumes:
-      - name: config
-        configMap:
-          name: pyjobby-config
+        - name: config
+          configMap:
+            name: pyjobby-config
 ---
 apiVersion: v1
 kind: ConfigMap

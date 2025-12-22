@@ -1,45 +1,31 @@
 #!/usr/bin/env python3
 
 import asyncio
-import asyncpg  # type: ignore
-from aiohttp import web
+import contextlib
+import datetime
 import importlib
-
-from .configloader import load_config_from_file
-
-import abc
+import inspect
+import os
+import platform
+import pydoc  # for instantiating classes from string names
+import random
 import signal
-
-from enum import Enum
+import sys
+import time
+import traceback
 from dataclasses import dataclass, field
-
-from multiprocessing import Process, Queue
+from multiprocessing import Process
 from typing import (
     Any,
-    Type,
-    Union,
-    Awaitable,
-    Coroutine,
-    Optional,
-    Callable,
 )
 
-import inspect
-import random
-
-import os
-import sys
-import platform
-import traceback
-import datetime
-
-import pydoc  # for instantiating classes from string names
-import time
+import asyncpg  # type: ignore
 import click
 import orjson
-
-import subprocess
+from aiohttp import web
 from loguru import logger
+
+from .configloader import load_config_from_file
 
 fmt = (
     "<yellow>{process.id:>}:{process.name:<}</yellow> "
@@ -96,16 +82,14 @@ logger = logger.patch(cleanupLogLengths)  # type: ignore
 # enqueue a job with a giant priority (3 million), you better also have workers
 # with priority levels that high to read them. Lower priorities denote higher
 # importance since we sort jobs with low priority numbers first.
-STMTS: dict[str, str] = dict()
+STMTS: dict[str, str] = {}
 
 
 # For alternative "in-memory lock without writing the update back to claim"
 # appoach, see que project lib/que/poller.rb for their CTE and server-side
 # SQL function for taking advisory locks without needing to update rows while
 # consuming a job.
-STMTS[
-    "claim"
-] = """UPDATE jorb
+STMTS["claim"] = """UPDATE jorb
               SET state = 'claimed',
                   worker_pid = $1,
                   worker_host = $2,
@@ -126,15 +110,11 @@ STMTS[
 
 # It's implicit in this 'claimed' lookup *we* are the node with the claim.
 # TODO: need crash recovery to detect 'claimed' but not error or finished jobs.
-STMTS[
-    "get"
-] = """SELECT * FROM jorb
+STMTS["get"] = """SELECT * FROM jorb
                      WHERE id = $1
                         AND state = 'claimed'"""
 
-STMTS[
-    "finished"
-] = """UPDATE jorb
+STMTS["finished"] = """UPDATE jorb
               SET state = 'finished',
                   result = $2,
                   finished = TIMEZONE('utc', clock_timestamp()),
@@ -143,26 +123,20 @@ STMTS[
               WHERE id = $1
           RETURNING *"""
 
-STMTS[
-    "run"
-] = """UPDATE jorb
+STMTS["run"] = """UPDATE jorb
               SET state = 'running',
                   started = TIMEZONE('utc', clock_timestamp()),
                   updated = TIMEZONE('utc', clock_timestamp())
               WHERE id = $1
           RETURNING *"""
 
-STMTS[
-    "set-timeout"
-] = """UPDATE jorb
+STMTS["set-timeout"] = """UPDATE jorb
               SET timeout_at = TIMEZONE('utc', clock_timestamp()) + $2::interval
               WHERE id = $1"""
 
 # Phase 2 improvement: Crashed jobs create retry jobs (see create-retry below)
 # instead of being requeued directly, preserving crash audit trail
-STMTS[
-    "crash"
-] = """UPDATE jorb
+STMTS["crash"] = """UPDATE jorb
               SET state = 'crashed',
                 error_message = $2,
                 error_backtrace = $3,
@@ -173,9 +147,7 @@ STMTS[
               WHERE id = $1
           RETURNING *"""
 
-STMTS[
-    "reschedule"
-] = """UPDATE jorb
+STMTS["reschedule"] = """UPDATE jorb
               SET state = 'queued',
                   run_after = TIMEZONE('utc', clock_timestamp()) + $2::interval,
                   updated = TIMEZONE('utc', clock_timestamp())
@@ -184,9 +156,7 @@ STMTS[
 
 # Deadline scheduler stops multiple tasks from being queued for
 # the same deadline key.
-STMTS[
-    "schedule-deadline"
-] = """ INSERT INTO jorb
+STMTS["schedule-deadline"] = """ INSERT INTO jorb
             (deadline_key, queue, prio, run_after, uid, run_group,
              job_class, kwargs, admin_data) 
             VALUES
@@ -197,9 +167,7 @@ STMTS[
 # Then update waiting waitfor_group jobs to be queued.
 # Also need nested selects with FOR UPDATE SKIP LOCKED so the inner
 # sub-select isn't run twice if jobs are completing at the same time.
-STMTS[
-    "enqueue-next-if-peer-group-is-finished"
-] = """ UPDATE jorb
+STMTS["enqueue-next-if-peer-group-is-finished"] = """ UPDATE jorb
             SET state = 'queued',
                 updated = TIMEZONE('utc', clock_timestamp())
             WHERE id IN (
@@ -216,9 +184,7 @@ STMTS[
             RETURNING *"""
 
 # Wake up any waiting jobs for a job ID we just finished.
-STMTS[
-    "enqueue-next-self-finished"
-] = """ UPDATE jorb
+STMTS["enqueue-next-self-finished"] = """ UPDATE jorb
             SET state = 'queued',
                 updated = TIMEZONE('utc', clock_timestamp())
             WHERE id IN (
@@ -236,9 +202,7 @@ STMTS[
 
 # Recover jobs that were stuck when this worker crashed previously
 # Updated to include time-based check to prevent recovering jobs from slow-but-alive workers
-STMTS[
-    "recover-abandoned"
-] = """UPDATE jorb
+STMTS["recover-abandoned"] = """UPDATE jorb
               SET state = 'queued',
                   run_after = TIMEZONE('utc', clock_timestamp()),
                   updated = TIMEZONE('utc', clock_timestamp())
@@ -249,9 +213,7 @@ STMTS[
 
 # Create a retry job (new row) instead of modifying the crashed job
 # This preserves the crashed job as audit trail and creates clean retry
-STMTS[
-    "create-retry"
-] = """INSERT INTO jorb (
+STMTS["create-retry"] = """INSERT INTO jorb (
                 job_class, kwargs, queue, prio, uid, capability,
                 run_after, run_group, admin_data, state, error_count
             )
@@ -268,9 +230,7 @@ STMTS[
 
 # Cancel a queued or waiting job
 # Only jobs not yet claimed can be cancelled
-STMTS[
-    "cancel"
-] = """UPDATE jorb
+STMTS["cancel"] = """UPDATE jorb
               SET state = 'cancelled',
                   updated = TIMEZONE('utc', clock_timestamp())
               WHERE id = $1
@@ -293,7 +253,7 @@ class JobSystem:
     capabilities: tuple[str]
     workerId: int
     checkInterval: int = 5  # seconds
-    webPort: Optional[dict[str, Union[list[dict[str, Any]], set[str]]]] = None
+    webPort: dict[str, list[dict[str, Any]] | set[str]] | None = None
     prio: int = 1000
     stop: bool = False
     pid: int = field(default_factory=lambda: os.getpid())
@@ -303,7 +263,9 @@ class JobSystem:
     max_retries: int = 10  # Maximum retry attempts before dead letter
     default_timeout: int = 3600  # Default job timeout in seconds (1 hour)
     enable_recovery: bool = True  # Enable abandoned job recovery on startup
-    recovery_timeout: int = 300  # Time in seconds before job is considered abandoned (5 minutes)
+    recovery_timeout: int = (
+        300  # Time in seconds before job is considered abandoned (5 minutes)
+    )
 
     async def ex(self, op: str, *args: Any) -> list[asyncpg.Record]:
         """Execute 'op' from prepared statement dict with *args.
@@ -341,6 +303,7 @@ class JobSystem:
         try:
             # Convert recovery_timeout seconds to timedelta for PostgreSQL interval
             from datetime import timedelta
+
             recovery_interval = timedelta(seconds=self.recovery_timeout)
 
             recovered = await self.ex("recover-abandoned", self.node, recovery_interval)
@@ -379,7 +342,7 @@ class JobSystem:
         return web.Response(text="not so fast!")
 
     def classForKlassFromName(
-        self, klassName: str, job: Optional[dict[str, Any]] = None
+        self, klassName: str, job: dict[str, Any] | None = None
     ) -> Any:
         # reload worker module on each run to catch any worker code changes
         # reload details:
@@ -405,7 +368,7 @@ class JobSystem:
             # https://docs.aiohttp.org/en/stable/web_lowlevel.html
             # Ignore typing on Server() because it is too specific to the
             # internals of aiohttp and mypy isn't matching the class hierarchy.
-            server = web.Server(self.webHandler) # type: ignore
+            server = web.Server(self.webHandler)  # type: ignore
             runner = web.ServerRunner(server)
             await runner.setup()
 
@@ -419,7 +382,7 @@ class JobSystem:
                 else:
                     # allow multiple binding under Linux...
                     assert isinstance(site, dict)
-                    site.update(dict(reuse_port=True))
+                    site.update({"reuse_port": True})
                     await web.TCPSite(runner, **site).start()
 
                 logger.info(
@@ -444,7 +407,7 @@ class JobSystem:
         # tell asyncpg we want to use orjson for json types
         # orjson.dumps returns bytes, but asyncpg expects str for text types
         def orjson_encoder(obj: Any) -> str:
-            return orjson.dumps(obj).decode('utf-8')
+            return orjson.dumps(obj).decode("utf-8")
 
         await self.cxn.set_type_codec(
             "json", encoder=orjson_encoder, decoder=orjson.loads, schema="pg_catalog"
@@ -473,7 +436,7 @@ class JobSystem:
         prev_processed: int = 0  # Initialize BEFORE loop for correct rate calculation
         skipSleep: bool = True  # process without sleeping until job retrieval is empty
         jobs: list[asyncpg.Record] = []
-        klass: Optional[Job] = None
+        klass: Job | None = None
         sleepytime: bool = False  # skip initial sleep check
         while not self.stop:
             # only check for next job after checkInterval seconds
@@ -532,16 +495,20 @@ class JobSystem:
 
                 # Phase 2: Extract timeout from admin_data or use class attribute or default
                 admin_data = job.get("admin_data") or {}
-                job_timeout = admin_data.get("timeout_seconds") if isinstance(admin_data, dict) else None
+                job_timeout = (
+                    admin_data.get("timeout_seconds")
+                    if isinstance(admin_data, dict)
+                    else None
+                )
                 if job_timeout is None:
-                    job_timeout = getattr(klass, 'timeout', self.default_timeout)
+                    job_timeout = getattr(klass, "timeout", self.default_timeout)
 
                 # Phase 2: Set timeout_at in database if timeout is configured
                 if job_timeout:
                     await self.ex(
                         "set-timeout",
                         job["id"],
-                        datetime.timedelta(seconds=job_timeout)
+                        datetime.timedelta(seconds=job_timeout),
                     )
 
                 # if job is async, .run() returns a coroutine we need to await.
@@ -553,14 +520,18 @@ class JobSystem:
                 if asyncio.iscoroutine(resultStageA):
                     # Apply timeout to async jobs
                     if job_timeout:
-                        result = await asyncio.wait_for(resultStageA, timeout=job_timeout)
+                        result = await asyncio.wait_for(
+                            resultStageA, timeout=job_timeout
+                        )
                     else:
                         result = await resultStageA
 
                     # Check if the awaited result is an async generator
                     if inspect.isasyncgen(result):
+
                         async def collect_gen():
                             return [x async for x in result]
+
                         if job_timeout:
                             # Note: timeout already consumed by outer wait_for, this is for generator collection
                             result = await collect_gen()
@@ -570,8 +541,11 @@ class JobSystem:
                     # Apply timeout to async generator jobs (direct return, not from async function)
                     async def collect_with_timeout():
                         return [x async for x in resultStageA]
+
                     if job_timeout:
-                        result = await asyncio.wait_for(collect_with_timeout(), timeout=job_timeout)
+                        result = await asyncio.wait_for(
+                            collect_with_timeout(), timeout=job_timeout
+                        )
                     else:
                         result = await collect_with_timeout()
                 else:
@@ -603,7 +577,7 @@ class JobSystem:
                         logger.info(
                             f"[job {jid}:{jname}; group {hex(gid)[2:]}] Triggered scheduling of {nextJobIds}"
                         )
-            except asyncio.TimeoutError as e:
+            except TimeoutError as e:
                 # Phase 2: Handle timeouts based on on_timeout configuration
                 admin_data = job.get("admin_data") or {}
                 on_timeout = admin_data.get("on_timeout", "retry")
@@ -612,7 +586,11 @@ class JobSystem:
 
                 logger.error(
                     "[job {}:{}] TIMEOUT in {} after {}s (on_timeout={})",
-                    job["id"], jname, job["job_class"], job_timeout, on_timeout
+                    job["id"],
+                    jname,
+                    job["job_class"],
+                    job_timeout,
+                    on_timeout,
                 )
 
                 # Mark original job as crashed (audit trail)
@@ -625,12 +603,16 @@ class JobSystem:
 
                 # Retry or fail based on on_timeout configuration
                 current_error_count = job.get("error_count", 0) + 1
-                if on_timeout == "retry" and klass and current_error_count < max_retries:
-                    rescheduleFor = await klass.rescheduleBackoff(job, current_error_count)
+                if (
+                    on_timeout == "retry"
+                    and klass
+                    and current_error_count < max_retries
+                ):
+                    rescheduleFor = await klass.rescheduleBackoff(
+                        job, current_error_count
+                    )
                     retry_job_id = await self.stmts["create-retry"].fetchval(
-                        job["id"],
-                        rescheduleFor,
-                        current_error_count
+                        job["id"], rescheduleFor, current_error_count
                     )
                     logger.info(
                         "[job {}] Created retry job {} (attempt {}/{}) "
@@ -642,12 +624,16 @@ class JobSystem:
                         rescheduleFor.total_seconds() / 60,
                     )
                 else:
-                    reason = "max retries exceeded" if current_error_count >= max_retries else "on_timeout=fail"
+                    reason = (
+                        "max retries exceeded"
+                        if current_error_count >= max_retries
+                        else "on_timeout=fail"
+                    )
                     logger.error(
                         "[job {}] PERMANENTLY FAILED after {} attempts - {}",
                         job["id"],
                         current_error_count,
-                        reason
+                        reason,
                     )
 
                 error += 1
@@ -677,13 +663,13 @@ class JobSystem:
                 # This preserves the crashed job as audit trail
                 current_error_count = job.get("error_count", 0) + 1
                 if klass and current_error_count < max_retries:
-                    rescheduleFor = await klass.rescheduleBackoff(job, current_error_count)
+                    rescheduleFor = await klass.rescheduleBackoff(
+                        job, current_error_count
+                    )
 
                     # Create a NEW job for retry (separate row)
                     retry_job_id = await self.stmts["create-retry"].fetchval(
-                        job["id"],
-                        rescheduleFor,
-                        current_error_count
+                        job["id"], rescheduleFor, current_error_count
                     )
 
                     logger.info(
@@ -694,15 +680,14 @@ class JobSystem:
                         current_error_count + 1,
                         max_retries,
                         rescheduleFor.total_seconds() / 60,
-                        admin_data.get("retry_strategy", "exponential")
+                        admin_data.get("retry_strategy", "exponential"),
                     )
                 else:
                     logger.error(
-                        "[job {}] PERMANENTLY FAILED after {} attempts - "
-                        "max retries ({}) exceeded",
+                        "[job {}] PERMANENTLY FAILED after {} attempts - max retries ({}) exceeded",
                         job["id"],
                         current_error_count,
-                        max_retries
+                        max_retries,
                     )
 
                 error += 1
@@ -738,7 +723,7 @@ class Job:
 
     @classmethod
     async def rescheduleBackoff(
-        cls, job: dict, attempt: Optional[int] = None
+        cls, job: dict, attempt: int | None = None
     ) -> datetime.timedelta:
         """Calculate retry delay using configurable retry strategy from admin_data.
 
@@ -803,13 +788,13 @@ def runAndDone(
     caps: tuple[str],
     n: int,
     db_params: dict[str, str],
-    web_listen: Optional[dict[str, Any]],
+    web_listen: dict[str, Any] | None,
     max_retries: int = 10,
     default_timeout: int = 3600,
     recovery_timeout: int = 300,
     enable_recovery: bool = True,
 ) -> None:
-    """ Run the JobSystem for this worker process """
+    """Run the JobSystem for this worker process"""
     runner = JobSystem(
         dsn=db_params,
         qname=qname,
@@ -967,7 +952,7 @@ def workit(
         time.sleep(random.uniform(0.001, 0.010))
 
     def signalBroadcast(signum: int, frame: Any) -> None:
-        """ Forward main interrupt to child processes """
+        """Forward main interrupt to child processes"""
         try:
             for p in launched:
                 os.kill(p.pid, signum)  # type: ignore
@@ -976,10 +961,8 @@ def workit(
 
     signal.signal(signal.SIGTERM, signalBroadcast)
     for l in launched:
-        try:
+        with contextlib.suppress(KeyboardInterrupt):
             l.join()
-        except KeyboardInterrupt:
-            pass
 
     # success!
     sys.exit(0)

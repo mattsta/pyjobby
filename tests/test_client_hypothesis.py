@@ -12,20 +12,21 @@ All tests use:
 - Hypothesis for generating test cases
 """
 
-import pytest
 import asyncio
 import json
-from datetime import datetime, timedelta, timezone
-from hypothesis import given, strategies as st, settings, assume, HealthCheck
-from typing import Dict, Any
+from datetime import datetime, timedelta
+
+import pytest
+from hypothesis import HealthCheck, assume, given, settings
+from hypothesis import strategies as st
 
 from pyjobby.client import JobClient
 from pyjobby.pj import STMTS
 
-
 # =============================================================================
 # Hypothesis Strategies
 # =============================================================================
+
 
 @st.composite
 def job_kwargs_strategy(draw):
@@ -34,7 +35,7 @@ def job_kwargs_strategy(draw):
         "test_id": draw(st.integers(min_value=0, max_value=10000)),
         "message": draw(st.text(min_size=0, max_size=100)),
         "value": draw(st.floats(allow_nan=False, allow_infinity=False) | st.integers()),
-        "flag": draw(st.booleans())
+        "flag": draw(st.booleans()),
     }
 
 
@@ -54,6 +55,7 @@ def queue_name_strategy(draw):
 # Fixtures
 # =============================================================================
 
+
 @pytest.fixture
 async def job_client(db_pool):
     """Create a JobClient using the test database pool."""
@@ -66,6 +68,7 @@ async def job_client(db_pool):
 # Helper Functions
 # =============================================================================
 
+
 async def claim_and_finish_job(conn, queue="default"):
     """Claim a job and mark it as finished."""
     claimed = await conn.fetchrow(
@@ -74,14 +77,12 @@ async def claim_and_finish_job(conn, queue="default"):
         "test-worker",
         queue,
         [],  # capabilities
-        1000  # max_priority
+        1000,  # max_priority
     )
     if claimed:
         await conn.execute(STMTS["run"], claimed["id"])
         await conn.execute(
-            STMTS["finished"],
-            claimed["id"],
-            json.dumps({"result": "success"})
+            STMTS["finished"], claimed["id"], json.dumps({"result": "success"})
         )
     return claimed
 
@@ -90,25 +91,29 @@ async def claim_and_finish_job(conn, queue="default"):
 # Property-Based Tests: JobClient.enqueue()
 # =============================================================================
 
+
 @pytest.mark.hypothesis
 @pytest.mark.asyncio
 class TestEnqueueProperties:
     """Property-based tests for JobClient.enqueue()."""
 
-    @settings(max_examples=50, deadline=10000, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(
+        max_examples=50,
+        deadline=10000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
     @given(
         kwargs=job_kwargs_strategy(),
         priority=priority_strategy(),
-        queue=queue_name_strategy()
+        queue=queue_name_strategy(),
     )
-    async def test_enqueue_creates_claimable_job(self, db_pool, job_client, kwargs, priority, queue):
+    async def test_enqueue_creates_claimable_job(
+        self, db_pool, job_client, kwargs, priority, queue
+    ):
         """Property: Enqueued job can be claimed by worker."""
         # PRODUCER: Enqueue job using JobClient
         job_id = await job_client.enqueue(
-            "test.Job",
-            queue=queue,
-            priority=priority,
-            **kwargs
+            "test.Job", queue=queue, priority=priority, **kwargs
         )
 
         assert job_id is not None
@@ -118,12 +123,7 @@ class TestEnqueueProperties:
         # CONSUMER: Worker can claim the job
         async with db_pool.acquire() as conn:
             claimed = await conn.fetchrow(
-                STMTS["claim"],
-                12345,
-                "test-worker",
-                queue,
-                [],
-                1000
+                STMTS["claim"], 12345, "test-worker", queue, [], 1000
             )
 
             assert claimed is not None
@@ -135,22 +135,23 @@ class TestEnqueueProperties:
             # Cleanup: Delete job created in this example
             await conn.execute("DELETE FROM jorb WHERE id = $1", job_id)
 
-    @settings(max_examples=30, deadline=10000, suppress_health_check=[HealthCheck.function_scoped_fixture])
-    @given(
-        job_count=st.integers(min_value=1, max_value=20),
-        priority=priority_strategy()
+    @settings(
+        max_examples=30,
+        deadline=10000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
-    async def test_enqueue_preserves_priority_order(self, db_pool, job_client, job_count, priority):
+    @given(
+        job_count=st.integers(min_value=1, max_value=20), priority=priority_strategy()
+    )
+    async def test_enqueue_preserves_priority_order(
+        self, db_pool, job_client, job_count, priority
+    ):
         """Property: Jobs are claimed in priority order (lower prio number = higher priority)."""
         # PRODUCER: Enqueue jobs with different priorities
         job_priorities = []
         for i in range(job_count):
             prio = priority + (i * 10)  # Ascending priorities
-            job_id = await job_client.enqueue(
-                "test.Job",
-                priority=prio,
-                test_index=i
-            )
+            job_id = await job_client.enqueue("test.Job", priority=prio, test_index=i)
             job_priorities.append((job_id, prio))
 
         # CONSUMER: Claim jobs and verify priority order
@@ -163,7 +164,7 @@ class TestEnqueueProperties:
                     "test-worker",
                     "default",
                     [],
-                    10000  # High enough to claim all
+                    10000,  # High enough to claim all
                 )
                 if claimed:
                     claimed_priorities.append(claimed["prio"])
@@ -175,30 +176,25 @@ class TestEnqueueProperties:
             job_ids = [job_id for job_id, _ in job_priorities]
             await conn.execute("DELETE FROM jorb WHERE id = ANY($1::bigint[])", job_ids)
 
-    @settings(max_examples=30, deadline=10000, suppress_health_check=[HealthCheck.function_scoped_fixture])
-    @given(
-        delay_seconds=st.integers(min_value=1, max_value=10)
+    @settings(
+        max_examples=30,
+        deadline=10000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
+    @given(delay_seconds=st.integers(min_value=1, max_value=10))
     async def test_enqueue_respects_run_after(self, db_pool, job_client, delay_seconds):
         """Property: Jobs with run_after are not claimable until specified time."""
         future_time = datetime.now() + timedelta(seconds=delay_seconds)
 
         # PRODUCER: Enqueue job for future
         job_id = await job_client.enqueue(
-            "test.Job",
-            run_after=future_time,
-            test="delayed"
+            "test.Job", run_after=future_time, test="delayed"
         )
 
         # CONSUMER: Cannot claim immediately
         async with db_pool.acquire() as conn:
             claimed_early = await conn.fetchrow(
-                STMTS["claim"],
-                12345,
-                "test-worker",
-                "default",
-                [],
-                1000
+                STMTS["claim"], 12345, "test-worker", "default", [], 1000
             )
             assert claimed_early is None  # Too early
 
@@ -215,16 +211,21 @@ class TestEnqueueProperties:
 # Property-Based Tests: JobClient.enqueue_batch()
 # =============================================================================
 
+
 @pytest.mark.hypothesis
 @pytest.mark.asyncio
 class TestBatchEnqueueProperties:
     """Property-based tests for JobClient.enqueue_batch()."""
 
-    @settings(max_examples=30, deadline=15000, suppress_health_check=[HealthCheck.function_scoped_fixture])
-    @given(
-        batch_size=st.integers(min_value=1, max_value=50)
+    @settings(
+        max_examples=30,
+        deadline=15000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
-    async def test_batch_enqueue_creates_all_jobs(self, db_pool, job_client, batch_size):
+    @given(batch_size=st.integers(min_value=1, max_value=50))
+    async def test_batch_enqueue_creates_all_jobs(
+        self, db_pool, job_client, batch_size
+    ):
         """Property: Batch enqueue creates exactly N claimable jobs."""
         # PRODUCER: Batch enqueue
         jobs = [("test.Job", {"index": i}) for i in range(batch_size)]
@@ -243,7 +244,7 @@ class TestBatchEnqueueProperties:
                     f"worker-{claimed_count}",
                     "default",
                     [],
-                    1000
+                    1000,
                 )
                 if not claimed:
                     break
@@ -254,12 +255,17 @@ class TestBatchEnqueueProperties:
             # Cleanup: Delete jobs created in this example
             await conn.execute("DELETE FROM jorb WHERE id = ANY($1::bigint[])", job_ids)
 
-    @settings(max_examples=20, deadline=15000, suppress_health_check=[HealthCheck.function_scoped_fixture])
-    @given(
-        batch_size=st.integers(min_value=2, max_value=20),
-        priority=priority_strategy()
+    @settings(
+        max_examples=20,
+        deadline=15000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
-    async def test_batch_enqueue_same_priority(self, db_pool, job_client, batch_size, priority):
+    @given(
+        batch_size=st.integers(min_value=2, max_value=20), priority=priority_strategy()
+    )
+    async def test_batch_enqueue_same_priority(
+        self, db_pool, job_client, batch_size, priority
+    ):
         """Property: Batch enqueued jobs with same priority are all claimable."""
         # PRODUCER: Batch enqueue with same priority
         jobs = [("test.Job", {"index": i}) for i in range(batch_size)]
@@ -270,12 +276,7 @@ class TestBatchEnqueueProperties:
             claimed_priorities = []
             for _ in range(batch_size):
                 claimed = await conn.fetchrow(
-                    STMTS["claim"],
-                    12345,
-                    "test-worker",
-                    "default",
-                    [],
-                    10000
+                    STMTS["claim"], 12345, "test-worker", "default", [], 10000
                 )
                 if claimed:
                     claimed_priorities.append(claimed["prio"])
@@ -292,27 +293,28 @@ class TestBatchEnqueueProperties:
 # Property-Based Tests: Job Dependencies (waitfor_job)
 # =============================================================================
 
+
 @pytest.mark.hypothesis
 @pytest.mark.asyncio
 class TestDependencyProperties:
     """Property-based tests for job dependencies."""
 
-    @settings(max_examples=20, deadline=15000, suppress_health_check=[HealthCheck.function_scoped_fixture])
-    @given(
-        chain_length=st.integers(min_value=2, max_value=10)
+    @settings(
+        max_examples=20,
+        deadline=15000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
-    async def test_dependency_chain_execution_order(self, db_pool, job_client, chain_length):
+    @given(chain_length=st.integers(min_value=2, max_value=10))
+    async def test_dependency_chain_execution_order(
+        self, db_pool, job_client, chain_length
+    ):
         """Property: Jobs in dependency chain execute in correct order."""
         # PRODUCER: Create dependency chain
         job_ids = []
         prev_job = None
 
         for i in range(chain_length):
-            job_id = await job_client.enqueue(
-                "test.Job",
-                step=i,
-                waitfor_job=prev_job
-            )
+            job_id = await job_client.enqueue("test.Job", step=i, waitfor_job=prev_job)
             job_ids.append(job_id)
             prev_job = job_id
 
@@ -323,12 +325,7 @@ class TestDependencyProperties:
             for expected_index in range(chain_length):
                 # Claim next available job
                 claimed = await conn.fetchrow(
-                    STMTS["claim"],
-                    12345,
-                    "test-worker",
-                    "default",
-                    [],
-                    1000
+                    STMTS["claim"], 12345, "test-worker", "default", [], 1000
                 )
 
                 assert claimed is not None
@@ -339,14 +336,11 @@ class TestDependencyProperties:
                 await conn.execute(
                     STMTS["finished"],
                     claimed["id"],
-                    json.dumps({"step": expected_index})
+                    json.dumps({"step": expected_index}),
                 )
 
                 # Release waiting jobs
-                await conn.execute(
-                    STMTS["enqueue-next-self-finished"],
-                    claimed["id"]
-                )
+                await conn.execute(STMTS["enqueue-next-self-finished"], claimed["id"])
 
             # Verify jobs executed in dependency order
             assert executed_order == job_ids
@@ -359,17 +353,24 @@ class TestDependencyProperties:
 # Property-Based Tests: Queue Isolation
 # =============================================================================
 
+
 @pytest.mark.hypothesis
 @pytest.mark.asyncio
 class TestQueueIsolationProperties:
     """Property-based tests for queue isolation."""
 
-    @settings(max_examples=30, deadline=10000, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(
+        max_examples=30,
+        deadline=10000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
     @given(
         queue1_jobs=st.integers(min_value=1, max_value=20),
-        queue2_jobs=st.integers(min_value=1, max_value=20)
+        queue2_jobs=st.integers(min_value=1, max_value=20),
     )
-    async def test_queues_are_isolated(self, db_pool, job_client, queue1_jobs, queue2_jobs):
+    async def test_queues_are_isolated(
+        self, db_pool, job_client, queue1_jobs, queue2_jobs
+    ):
         """Property: Jobs in different queues don't interfere."""
         # PRODUCER: Enqueue to two different queues
         queue1_ids = []
@@ -392,7 +393,7 @@ class TestQueueIsolationProperties:
                     "worker-queue1",
                     "queue1",  # Only claim from queue1
                     [],
-                    1000
+                    1000,
                 )
                 if claimed:
                     queue1_claimed.append(claimed["id"])
@@ -404,29 +405,38 @@ class TestQueueIsolationProperties:
             # Queue2 jobs still available (filter by our specific job IDs)
             queue2_count = await conn.fetchval(
                 "SELECT COUNT(*) FROM jorb WHERE id = ANY($1::bigint[]) AND state = 'queued'",
-                queue2_ids
+                queue2_ids,
             )
             assert queue2_count == queue2_jobs
 
             # Cleanup: Delete jobs created in this example
-            await conn.execute("DELETE FROM jorb WHERE id = ANY($1::bigint[])", queue1_ids + queue2_ids)
+            await conn.execute(
+                "DELETE FROM jorb WHERE id = ANY($1::bigint[])", queue1_ids + queue2_ids
+            )
 
 
 # =============================================================================
 # Property-Based Tests: Concurrent Operations
 # =============================================================================
 
+
 @pytest.mark.hypothesis
 @pytest.mark.asyncio
 class TestConcurrentOperationProperties:
     """Property-based tests for concurrent producer/consumer operations."""
 
-    @settings(max_examples=20, deadline=20000, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(
+        max_examples=20,
+        deadline=20000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
     @given(
         producer_count=st.integers(min_value=2, max_value=5),
-        jobs_per_producer=st.integers(min_value=1, max_value=10)
+        jobs_per_producer=st.integers(min_value=1, max_value=10),
     )
-    async def test_concurrent_producers_no_job_loss(self, db_pool, job_client, producer_count, jobs_per_producer):
+    async def test_concurrent_producers_no_job_loss(
+        self, db_pool, job_client, producer_count, jobs_per_producer
+    ):
         """Property: Concurrent producers don't lose jobs."""
         total_jobs = producer_count * jobs_per_producer
 
@@ -435,16 +445,18 @@ class TestConcurrentOperationProperties:
             job_ids = []
             for i in range(jobs_per_producer):
                 job_id = await job_client.enqueue(
-                    "test.Job",
-                    producer_id=producer_id,
-                    job_index=i
+                    "test.Job", producer_id=producer_id, job_index=i
                 )
                 job_ids.append(job_id)
             return job_ids
 
         # Run producers concurrently
-        all_job_ids = await asyncio.gather(*[producer(i) for i in range(producer_count)])
-        flat_job_ids = [job_id for producer_jobs in all_job_ids for job_id in producer_jobs]
+        all_job_ids = await asyncio.gather(
+            *[producer(i) for i in range(producer_count)]
+        )
+        flat_job_ids = [
+            job_id for producer_jobs in all_job_ids for job_id in producer_jobs
+        ]
 
         # Verify all jobs created
         assert len(flat_job_ids) == total_jobs
@@ -455,12 +467,7 @@ class TestConcurrentOperationProperties:
             claimed_count = 0
             for _ in range(total_jobs):
                 claimed = await conn.fetchrow(
-                    STMTS["claim"],
-                    12345,
-                    "test-worker",
-                    "default",
-                    [],
-                    1000
+                    STMTS["claim"], 12345, "test-worker", "default", [], 1000
                 )
                 if claimed:
                     claimed_count += 1
@@ -468,14 +475,22 @@ class TestConcurrentOperationProperties:
             assert claimed_count == total_jobs
 
             # Cleanup: Delete jobs created in this example
-            await conn.execute("DELETE FROM jorb WHERE id = ANY($1::bigint[])", flat_job_ids)
+            await conn.execute(
+                "DELETE FROM jorb WHERE id = ANY($1::bigint[])", flat_job_ids
+            )
 
-    @settings(max_examples=15, deadline=20000, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(
+        max_examples=15,
+        deadline=20000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
     @given(
         worker_count=st.integers(min_value=2, max_value=5),
-        total_jobs=st.integers(min_value=5, max_value=20)
+        total_jobs=st.integers(min_value=5, max_value=20),
     )
-    async def test_concurrent_workers_no_duplicate_claims(self, db_pool, job_client, worker_count, total_jobs):
+    async def test_concurrent_workers_no_duplicate_claims(
+        self, db_pool, job_client, worker_count, total_jobs
+    ):
         """Property: Concurrent workers don't claim the same job."""
         # Ensure we have more jobs than workers
         assume(total_jobs >= worker_count)
@@ -498,7 +513,7 @@ class TestConcurrentOperationProperties:
                     f"worker-{worker_id}",
                     "default",
                     [],
-                    1000
+                    1000,
                 )
                 if claimed:
                     async with claim_lock:
@@ -520,15 +535,18 @@ class TestConcurrentOperationProperties:
 # Property-Based Tests: Job State Transitions
 # =============================================================================
 
+
 @pytest.mark.hypothesis
 @pytest.mark.asyncio
 class TestStateTransitionProperties:
     """Property-based tests for job state transitions."""
 
-    @settings(max_examples=30, deadline=10000, suppress_health_check=[HealthCheck.function_scoped_fixture])
-    @given(
-        kwargs=job_kwargs_strategy()
+    @settings(
+        max_examples=30,
+        deadline=10000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
+    @given(kwargs=job_kwargs_strategy())
     async def test_job_lifecycle_state_invariants(self, db_pool, job_client, kwargs):
         """Property: Job follows valid state transitions (queued -> claimed -> running -> finished)."""
         # PRODUCER: Enqueue job
@@ -542,12 +560,7 @@ class TestStateTransitionProperties:
 
             # Claim job: queued -> claimed
             await conn.execute(
-                STMTS["claim"],
-                12345,
-                "test-worker",
-                "default",
-                [],
-                1000
+                STMTS["claim"], 12345, "test-worker", "default", [], 1000
             )
             job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
             assert job["state"] == "claimed"
@@ -561,9 +574,7 @@ class TestStateTransitionProperties:
 
             # Mark finished: running -> finished
             await conn.execute(
-                STMTS["finished"],
-                job_id,
-                json.dumps({"result": "success"})
+                STMTS["finished"], job_id, json.dumps({"result": "success"})
             )
             job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
             assert job["state"] == "finished"
@@ -578,12 +589,17 @@ class TestStateTransitionProperties:
 # Property-Based Tests: Result Storage
 # =============================================================================
 
+
 @pytest.mark.hypothesis
 @pytest.mark.asyncio
 class TestResultStorageProperties:
     """Property-based tests for result storage."""
 
-    @settings(max_examples=30, deadline=10000, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(
+        max_examples=30,
+        deadline=10000,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
     @given(
         result_data=st.dictionaries(
             keys=st.text(min_size=1, max_size=20),
@@ -591,10 +607,10 @@ class TestResultStorageProperties:
                 st.integers(),
                 st.floats(allow_nan=False, allow_infinity=False),
                 st.text(max_size=100),
-                st.booleans()
+                st.booleans(),
             ),
             min_size=1,
-            max_size=10
+            max_size=10,
         )
     )
     async def test_result_data_roundtrip(self, db_pool, job_client, result_data):
@@ -611,12 +627,16 @@ class TestResultStorageProperties:
             await conn.execute(
                 "UPDATE jorb SET result = $2::json WHERE id = $1",
                 claimed["id"],
-                json.dumps(result_data)
+                json.dumps(result_data),
             )
 
             # Retrieve and verify
             job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", claimed["id"])
-            stored_result = json.loads(job["result"]) if isinstance(job["result"], str) else job["result"]
+            stored_result = (
+                json.loads(job["result"])
+                if isinstance(job["result"], str)
+                else job["result"]
+            )
 
             assert stored_result == result_data
 

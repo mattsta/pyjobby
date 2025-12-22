@@ -10,18 +10,17 @@ Runs as a separate process, checks every 10 seconds.
 """
 
 import asyncio
+
 import asyncpg
-import datetime
 from loguru import logger
-from typing import Optional
 
 
 async def handle_timed_out_job(
     pool: asyncpg.Pool,
     job_id: int,
     job_class: str,
-    admin_data: Optional[dict],
-    error_count: int
+    admin_data: dict | None,
+    error_count: int,
 ) -> None:
     """
     Handle a job that has exceeded its timeout.
@@ -65,7 +64,7 @@ async def handle_timed_out_job(
             """,
             job_id,
             "Timeout exceeded - retrying",
-            retry_delay
+            retry_delay,
         )
 
         logger.info(
@@ -73,7 +72,11 @@ async def handle_timed_out_job(
         )
     else:
         # Mark as crashed (exceeded max retries or on_timeout='fail')
-        reason = "max retries exceeded" if (error_count + 1) >= max_retries else "on_timeout=fail"
+        reason = (
+            "max retries exceeded"
+            if (error_count + 1) >= max_retries
+            else "on_timeout=fail"
+        )
 
         await pool.execute(
             """
@@ -85,18 +88,14 @@ async def handle_timed_out_job(
             WHERE id = $1
             """,
             job_id,
-            f"Timeout exceeded - marked as failed ({reason})"
+            f"Timeout exceeded - marked as failed ({reason})",
         )
 
-        logger.error(
-            f"Job {job_id} marked as crashed: {reason}"
-        )
+        logger.error(f"Job {job_id} marked as crashed: {reason}")
 
 
 async def timeout_monitor(
-    dsn: str,
-    check_interval: int = 10,
-    batch_size: int = 100
+    dsn: str, check_interval: int = 10, batch_size: int = 100
 ) -> None:
     """
     Monitor and enforce job timeouts.
@@ -109,13 +108,14 @@ async def timeout_monitor(
         check_interval: How often to check for timeouts (seconds)
         batch_size: Maximum jobs to process per check
     """
+
     # Custom codec init function
     async def init_connection(conn):
         try:
             import orjson
 
             def orjson_encoder(obj):
-                return orjson.dumps(obj).decode('utf-8')
+                return orjson.dumps(obj).decode("utf-8")
 
             def orjson_decoder(s):
                 return orjson.loads(s)
@@ -125,14 +125,14 @@ async def timeout_monitor(
                 encoder=orjson_encoder,
                 decoder=orjson_decoder,
                 schema="pg_catalog",
-                format="text"
+                format="text",
             )
             await conn.set_type_codec(
                 "jsonb",
                 encoder=orjson_encoder,
                 decoder=orjson_decoder,
                 schema="pg_catalog",
-                format="text"
+                format="text",
             )
         except ImportError:
             pass
@@ -140,8 +140,7 @@ async def timeout_monitor(
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2, init=init_connection)
 
     logger.info(
-        f"Timeout monitor started (check every {check_interval}s, "
-        f"batch size {batch_size})"
+        f"Timeout monitor started (check every {check_interval}s, batch size {batch_size})"
     )
 
     try:
@@ -158,16 +157,16 @@ async def timeout_monitor(
                     FOR UPDATE SKIP LOCKED
                     LIMIT $1
                     """,
-                    batch_size
+                    batch_size,
                 )
 
                 for job in timed_out:
                     await handle_timed_out_job(
                         pool,
-                        job['id'],
-                        job['job_class'],
-                        job['admin_data'],
-                        job['error_count']
+                        job["id"],
+                        job["job_class"],
+                        job["admin_data"],
+                        job["error_count"],
                     )
 
                 if timed_out:
@@ -177,9 +176,9 @@ async def timeout_monitor(
 
             except Exception as e:
                 import traceback
+
                 logger.error(
-                    f"Timeout monitor error: {e}\n"
-                    f"Full traceback: {traceback.format_exc()}"
+                    f"Timeout monitor error: {e}\nFull traceback: {traceback.format_exc()}"
                 )
 
             await asyncio.sleep(check_interval)
@@ -204,24 +203,21 @@ def run_timeout_monitor(dsn: str) -> None:
 def cli() -> None:
     """CLI entry point for timeout monitor."""
     import sys
+
     import click
 
     @click.command()
     @click.option(
-        '--dsn',
-        envvar='PYJOBBY_DSN',
+        "--dsn",
+        envvar="PYJOBBY_DSN",
         required=False,
-        help='PostgreSQL DSN (or use PYJOBBY_DSN env var)'
+        help="PostgreSQL DSN (or use PYJOBBY_DSN env var)",
     )
     @click.option(
-        '--config',
-        type=click.Path(exists=True),
-        help='Path to pyjobby.conf.py'
+        "--config", type=click.Path(exists=True), help="Path to pyjobby.conf.py"
     )
     @click.option(
-        '--check-interval',
-        default=10,
-        help='Check interval in seconds (default: 10)'
+        "--check-interval", default=10, help="Check interval in seconds (default: 10)"
     )
     def main(dsn: str, config: str, check_interval: int) -> None:
         """Start pyjobby timeout monitor process."""
@@ -230,6 +226,7 @@ def cli() -> None:
         if not dsn:
             if config:
                 from .configloader import load_config_from_file
+
                 cfg = load_config_from_file(config, keys=["db_params"])
                 db_params = cfg.get("db_params", {})
                 # Build DSN from params
@@ -239,12 +236,14 @@ def cli() -> None:
                 sys.exit(1)
 
         click.echo(f"Starting timeout monitor (check every {check_interval}s)...")
-        click.echo(f"DSN: {dsn.split('@')[1] if '@' in dsn else dsn}")  # Don't show password
+        click.echo(
+            f"DSN: {dsn.split('@')[1] if '@' in dsn else dsn}"
+        )  # Don't show password
 
         asyncio.run(timeout_monitor(dsn, check_interval=check_interval))
 
     main()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     cli()

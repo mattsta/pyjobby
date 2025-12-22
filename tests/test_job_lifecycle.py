@@ -5,20 +5,17 @@ Tests complete job lifecycle scenarios from creation through execution,
 failure handling, retries, and dependencies.
 """
 
-import asyncio
 from datetime import datetime, timedelta
 
 import pytest
 
 from tests.utils.factories import (
+    count_jobs_by_state,
+    create_dependency_chain,
     create_job,
     create_job_batch,
-    create_dependency_chain,
-    create_group_dependency,
-    count_jobs_by_state,
     get_job,
 )
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -101,7 +98,7 @@ class TestJobClaiming:
             "worker-1",  # worker_host
             "test_queue",
             ["test"],
-            1000
+            1000,
         )
 
         assert claimed is not None
@@ -117,15 +114,13 @@ class TestJobClaiming:
 
         # First claim succeeds
         claim1 = await db_connection.fetchrow(
-            STMTS["claim"],
-            12345, "worker-1", "test_queue", ["test"], 1000
+            STMTS["claim"], 12345, "worker-1", "test_queue", ["test"], 1000
         )
         assert claim1 is not None
 
         # Second claim fails (no more queued jobs)
         claim2 = await db_connection.fetchrow(
-            STMTS["claim"],
-            12346, "worker-2", "test_queue", ["test"], 1000
+            STMTS["claim"], 12346, "worker-2", "test_queue", ["test"], 1000
         )
         assert claim2 is None
 
@@ -140,13 +135,11 @@ class TestJobClaiming:
             # Set back to queued for next claim
             if expected_count > 1:
                 await db_connection.execute(
-                    "UPDATE jorb SET state = 'queued' WHERE id = $1",
-                    job_id
+                    "UPDATE jorb SET state = 'queued' WHERE id = $1", job_id
                 )
 
             claimed = await db_connection.fetchrow(
-                STMTS["claim"],
-                12345, "worker-1", "test_queue", ["test"], 1000
+                STMTS["claim"], 12345, "worker-1", "test_queue", ["test"], 1000
             )
             assert claimed["run_count"] == expected_count
 
@@ -165,8 +158,7 @@ class TestJobExecution:
 
         # 2. Claim job
         claimed = await db_connection.fetchrow(
-            STMTS["claim"],
-            12345, "worker-1", "test_queue", ["test"], 1000
+            STMTS["claim"], 12345, "worker-1", "test_queue", ["test"], 1000
         )
         assert claimed["state"] == "claimed"
 
@@ -177,9 +169,7 @@ class TestJobExecution:
 
         # 4. Mark as finished
         await db_connection.fetchrow(
-            STMTS["finished"],
-            job_id,
-            {"result": "success", "output": "completed"}
+            STMTS["finished"], job_id, {"result": "success", "output": "completed"}
         )
         job = await get_job(db_connection, job_id)
         assert job["state"] == "finished"
@@ -192,8 +182,7 @@ class TestJobExecution:
         # Create and claim job
         job_id = await create_job(db_connection, state="queued")
         await db_connection.fetchrow(
-            STMTS["claim"],
-            12345, "worker-1", "test_queue", ["test"], 1000
+            STMTS["claim"], 12345, "worker-1", "test_queue", ["test"], 1000
         )
 
         # Mark as running
@@ -204,7 +193,7 @@ class TestJobExecution:
             STMTS["crash"],
             job_id,
             "RuntimeError: something went wrong",
-            "Traceback (most recent call last):\n  ..."
+            "Traceback (most recent call last):\n  ...",
         )
 
         job = await get_job(db_connection, job_id)
@@ -225,7 +214,7 @@ class TestRetryMechanism:
             db_connection,
             job_class="test.RetryableJob",
             kwargs={"attempt": 1},
-            state="crashed"
+            state="crashed",
         )
 
         # Create retry
@@ -233,7 +222,7 @@ class TestRetryMechanism:
             STMTS["create-retry"],
             original_id,
             timedelta(minutes=5),
-            1  # error_count
+            1,  # error_count
         )
 
         retry_id = retry_result["id"]
@@ -259,10 +248,7 @@ class TestRetryMechanism:
 
         for i in range(5):
             result = await db_connection.fetchrow(
-                STMTS["create-retry"],
-                current_id,
-                timedelta(minutes=(i+1)*5),
-                i + 1
+                STMTS["create-retry"], current_id, timedelta(minutes=(i + 1) * 5), i + 1
             )
             current_id = result["id"]
             retry_ids.append(current_id)
@@ -277,19 +263,17 @@ class TestRetryMechanism:
                 assert job["admin_data"]["parent_job_id"] == original_id
             else:
                 # Subsequent retries reference previous retry
-                assert job["admin_data"]["parent_job_id"] == retry_ids[i-1]
+                assert job["admin_data"]["parent_job_id"] == retry_ids[i - 1]
 
     async def test_max_retries_exceeded(self, db_connection):
         """Test that jobs stop retrying after max attempts."""
-        from pyjobby.pj import STMTS
 
         # Create job that has exceeded max retries
         job_id = await create_job(db_connection, state="crashed")
 
         # Update error_count to max (10 in default config)
         await db_connection.execute(
-            "UPDATE jorb SET error_count = 10 WHERE id = $1",
-            job_id
+            "UPDATE jorb SET error_count = 10 WHERE id = $1", job_id
         )
 
         # In a real system, this job would not create another retry
@@ -308,23 +292,16 @@ class TestJobDependencies:
 
         # Create parent job and complete it
         parent_id = await create_job(db_connection, state="running")
-        await db_connection.fetchrow(
-            STMTS["finished"],
-            parent_id,
-            {"status": "done"}
-        )
+        await db_connection.fetchrow(STMTS["finished"], parent_id, {"status": "done"})
 
         # Create child job waiting for parent
         child_id = await create_job(
-            db_connection,
-            waitfor_job=parent_id,
-            state="waiting"
+            db_connection, waitfor_job=parent_id, state="waiting"
         )
 
         # Trigger dependency resolution
         results = await db_connection.fetch(
-            STMTS["enqueue-next-self-finished"],
-            parent_id
+            STMTS["enqueue-next-self-finished"], parent_id
         )
 
         # Child should be enqueued
@@ -343,15 +320,12 @@ class TestJobDependencies:
 
         # Create job waiting for group
         waiter = await create_job(
-            db_connection,
-            waitfor_group=group_id,
-            state="waiting"
+            db_connection, waitfor_group=group_id, state="waiting"
         )
 
         # Trigger group dependency resolution
         results = await db_connection.fetch(
-            STMTS["enqueue-next-if-peer-group-is-finished"],
-            group_id
+            STMTS["enqueue-next-if-peer-group-is-finished"], group_id
         )
 
         # Waiter should be enqueued
@@ -366,13 +340,9 @@ class TestJobDependencies:
 
         # Complete first job
         await db_connection.execute(
-            "UPDATE jorb SET state = 'finished' WHERE id = $1",
-            job_ids[0]
+            "UPDATE jorb SET state = 'finished' WHERE id = $1", job_ids[0]
         )
-        await db_connection.fetch(
-            STMTS["enqueue-next-self-finished"],
-            job_ids[0]
-        )
+        await db_connection.fetch(STMTS["enqueue-next-self-finished"], job_ids[0])
 
         # Second job should be queued
         job2 = await get_job(db_connection, job_ids[1])
@@ -393,24 +363,19 @@ class TestWorkerRecovery:
         # Create and claim job
         job_id = await create_job(db_connection, state="queued")
         await db_connection.fetchrow(
-            STMTS["claim"],
-            12345, "worker-1", "test_queue", ["test"], 1000
+            STMTS["claim"], 12345, "worker-1", "test_queue", ["test"], 1000
         )
 
         # Simulate time passing (worker has been dead for 10 minutes)
         old_time = datetime.utcnow() - timedelta(minutes=10)
         await db_connection.execute(
-            "UPDATE jorb SET updated = $1 WHERE id = $2",
-            old_time,
-            job_id
+            "UPDATE jorb SET updated = $1 WHERE id = $2", old_time, job_id
         )
 
         # Worker crashes - recover jobs from this worker (older than 5 minutes)
         recovery_timeout = timedelta(minutes=5)
         results = await db_connection.fetch(
-            STMTS["recover-abandoned"],
-            "worker-1",
-            recovery_timeout
+            STMTS["recover-abandoned"], "worker-1", recovery_timeout
         )
 
         assert len(results) == 1
@@ -427,25 +392,20 @@ class TestWorkerRecovery:
         # Create, claim, and start running
         job_id = await create_job(db_connection, state="queued")
         await db_connection.fetchrow(
-            STMTS["claim"],
-            12345, "worker-1", "test_queue", ["test"], 1000
+            STMTS["claim"], 12345, "worker-1", "test_queue", ["test"], 1000
         )
         await db_connection.execute(STMTS["run"], job_id)
 
         # Simulate time passing (worker has been dead for 10 minutes)
         old_time = datetime.utcnow() - timedelta(minutes=10)
         await db_connection.execute(
-            "UPDATE jorb SET updated = $1 WHERE id = $2",
-            old_time,
-            job_id
+            "UPDATE jorb SET updated = $1 WHERE id = $2", old_time, job_id
         )
 
         # Worker crashes - recover jobs (older than 5 minutes)
         recovery_timeout = timedelta(minutes=5)
         results = await db_connection.fetch(
-            STMTS["recover-abandoned"],
-            "worker-1",
-            recovery_timeout
+            STMTS["recover-abandoned"], "worker-1", recovery_timeout
         )
 
         assert len(results) == 1
@@ -464,20 +424,17 @@ class TestJobScheduling:
         future_job = await create_job(
             db_connection,
             run_after=datetime.utcnow() + timedelta(hours=1),
-            state="queued"
+            state="queued",
         )
 
         # Create job for now
         now_job = await create_job(
-            db_connection,
-            run_after=datetime.utcnow(),
-            state="queued"
+            db_connection, run_after=datetime.utcnow(), state="queued"
         )
 
         # Claim should get the "now" job, not future job
         claimed = await db_connection.fetchrow(
-            STMTS["claim"],
-            12345, "worker-1", "test_queue", ["test"], 1000
+            STMTS["claim"], 12345, "worker-1", "test_queue", ["test"], 1000
         )
 
         assert claimed["id"] == now_job
@@ -491,11 +448,7 @@ class TestJobScheduling:
         before = datetime.utcnow()
 
         # Reschedule for 2 hours later
-        await db_connection.execute(
-            STMTS["reschedule"],
-            job_id,
-            timedelta(hours=2)
-        )
+        await db_connection.execute(STMTS["reschedule"], job_id, timedelta(hours=2))
 
         job = await get_job(db_connection, job_id)
         assert job["state"] == "queued"
@@ -518,10 +471,11 @@ class TestDeadlineKeys:
             "test_queue",
             100,
             datetime.utcnow(),
-            None, None,
+            None,
+            None,
             "test.DailyReport",
             {"date": "2024-01-15"},
-            None
+            None,
         )
 
         # Try to schedule duplicate - should fail
@@ -532,14 +486,17 @@ class TestDeadlineKeys:
                 "test_queue",
                 100,
                 datetime.utcnow(),
-                None, None,
+                None,
+                None,
                 "test.DailyReport",
                 {"date": "2024-01-15"},
-                None
+                None,
             )
 
         # Should be a unique constraint violation
-        assert "unique" in str(exc.value).lower() or "duplicate" in str(exc.value).lower()
+        assert (
+            "unique" in str(exc.value).lower() or "duplicate" in str(exc.value).lower()
+        )
 
     async def test_different_deadline_keys_allowed(self, db_connection):
         """Test that different deadline keys can coexist."""
@@ -549,15 +506,27 @@ class TestDeadlineKeys:
         await db_connection.execute(
             STMTS["schedule-deadline"],
             "report-2024-01-15",
-            "test_queue", 100, datetime.utcnow(),
-            None, None, "test.Report", {}, None
+            "test_queue",
+            100,
+            datetime.utcnow(),
+            None,
+            None,
+            "test.Report",
+            {},
+            None,
         )
 
         await db_connection.execute(
             STMTS["schedule-deadline"],
             "report-2024-01-16",
-            "test_queue", 100, datetime.utcnow(),
-            None, None, "test.Report", {}, None
+            "test_queue",
+            100,
+            datetime.utcnow(),
+            None,
+            None,
+            "test.Report",
+            {},
+            None,
         )
 
         # Both should exist
@@ -581,13 +550,12 @@ class TestCompleteJobFlows:
             job_class="test.SuccessfulJob",
             kwargs={"input": "data"},
             queue="production",
-            prio=50
+            prio=50,
         )
 
         # Worker claims job
         claimed = await db_connection.fetchrow(
-            STMTS["claim"],
-            12345, "worker-prod-1", "production", ["test"], 1000
+            STMTS["claim"], 12345, "worker-prod-1", "production", ["test"], 1000
         )
         assert claimed["id"] == job_id
 
@@ -598,7 +566,7 @@ class TestCompleteJobFlows:
         await db_connection.fetchrow(
             STMTS["finished"],
             job_id,
-            {"status": "completed", "output": "processed data"}
+            {"status": "completed", "output": "processed data"},
         )
 
         # Verify final state
@@ -617,37 +585,25 @@ class TestCompleteJobFlows:
 
         # First attempt - claim, run, crash
         await db_connection.fetchrow(
-            STMTS["claim"],
-            12345, "worker-1", "test_queue", ["test"], 1000
+            STMTS["claim"], 12345, "worker-1", "test_queue", ["test"], 1000
         )
         await db_connection.execute(STMTS["run"], job_id)
         await db_connection.execute(
-            STMTS["crash"],
-            job_id,
-            "Temporary error",
-            "Traceback..."
+            STMTS["crash"], job_id, "Temporary error", "Traceback..."
         )
 
         # Create retry
         retry_result = await db_connection.fetchrow(
-            STMTS["create-retry"],
-            job_id,
-            timedelta(minutes=1),
-            1
+            STMTS["create-retry"], job_id, timedelta(minutes=1), 1
         )
         retry_id = retry_result["id"]
 
         # Second attempt - claim, run, succeed
         await db_connection.fetchrow(
-            STMTS["claim"],
-            12346, "worker-2", "test_queue", ["test"], 1000
+            STMTS["claim"], 12346, "worker-2", "test_queue", ["test"], 1000
         )
         await db_connection.execute(STMTS["run"], retry_id)
-        await db_connection.fetchrow(
-            STMTS["finished"],
-            retry_id,
-            {"status": "success"}
-        )
+        await db_connection.fetchrow(STMTS["finished"], retry_id, {"status": "success"})
 
         # Verify: original crashed, retry succeeded
         original = await get_job(db_connection, job_id)
@@ -663,9 +619,7 @@ class TestCompleteJobFlows:
 
         # Create parent job
         parent_id = await create_job(
-            db_connection,
-            job_class="test.DataFetch",
-            state="queued"
+            db_connection, job_class="test.DataFetch", state="queued"
         )
 
         # Create child job waiting for parent
@@ -673,26 +627,18 @@ class TestCompleteJobFlows:
             db_connection,
             job_class="test.DataProcess",
             waitfor_job=parent_id,
-            state="waiting"
+            state="waiting",
         )
 
         # Execute parent job
         await db_connection.fetchrow(
-            STMTS["claim"],
-            12345, "worker-1", "test_queue", ["test"], 1000
+            STMTS["claim"], 12345, "worker-1", "test_queue", ["test"], 1000
         )
         await db_connection.execute(STMTS["run"], parent_id)
-        await db_connection.fetchrow(
-            STMTS["finished"],
-            parent_id,
-            {"data": "fetched"}
-        )
+        await db_connection.fetchrow(STMTS["finished"], parent_id, {"data": "fetched"})
 
         # Trigger dependency resolution
-        await db_connection.fetch(
-            STMTS["enqueue-next-self-finished"],
-            parent_id
-        )
+        await db_connection.fetch(STMTS["enqueue-next-self-finished"], parent_id)
 
         # Child should now be queued
         child = await get_job(db_connection, child_id)
@@ -700,14 +646,11 @@ class TestCompleteJobFlows:
 
         # Execute child job
         await db_connection.fetchrow(
-            STMTS["claim"],
-            12346, "worker-2", "test_queue", ["test"], 1000
+            STMTS["claim"], 12346, "worker-2", "test_queue", ["test"], 1000
         )
         await db_connection.execute(STMTS["run"], child_id)
         await db_connection.fetchrow(
-            STMTS["finished"],
-            child_id,
-            {"result": "processed"}
+            STMTS["finished"], child_id, {"result": "processed"}
         )
 
         # Both jobs should be finished

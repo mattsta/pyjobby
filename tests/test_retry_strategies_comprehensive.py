@@ -6,13 +6,11 @@ Tests all retry backoff strategies, edge cases, and helper functions.
 Coverage target: 95%+
 """
 
-import pytest
-import datetime
 from pyjobby.retry_strategies import (
     RetryStrategy,
     calculate_retry_delay,
-    get_retry_config,
     calculate_retry_from_job,
+    get_retry_config,
 )
 
 
@@ -52,7 +50,9 @@ class TestCalculateRetryDelay:
 
     def test_exponential_custom_multiplier(self):
         """Test exponential backoff with custom multiplier"""
-        delay = calculate_retry_delay(3, "exponential", initial_delay=1, max_delay=3600, multiplier=3.0)
+        delay = calculate_retry_delay(
+            3, "exponential", initial_delay=1, max_delay=3600, multiplier=3.0
+        )
         # 1 * (3^2) = 9 seconds + jitter
         assert 9 <= delay.total_seconds() <= 9.9
 
@@ -146,8 +146,12 @@ class TestCalculateRetryDelay:
 
     def test_unknown_strategy_defaults_to_exponential(self):
         """Test unknown strategy defaults to exponential"""
-        delay1 = calculate_retry_delay(3, "unknown_strategy", initial_delay=1, max_delay=3600)
-        delay2 = calculate_retry_delay(3, "exponential", initial_delay=1, max_delay=3600)
+        delay1 = calculate_retry_delay(
+            3, "unknown_strategy", initial_delay=1, max_delay=3600
+        )
+        delay2 = calculate_retry_delay(
+            3, "exponential", initial_delay=1, max_delay=3600
+        )
         # Both should be approximately 4 seconds (1 * 2^2)
         assert 4 <= delay1.total_seconds() <= 5
         assert 4 <= delay2.total_seconds() <= 5
@@ -156,7 +160,9 @@ class TestCalculateRetryDelay:
 
     def test_jitter_capped_at_5_seconds(self):
         """Test jitter is capped at 5 seconds for large delays"""
-        delay = calculate_retry_delay(15, "exponential", initial_delay=1, max_delay=10000)
+        delay = calculate_retry_delay(
+            15, "exponential", initial_delay=1, max_delay=10000
+        )
         # Base delay would be 2^14 = 16384, jitter capped at 5
         # So delay should be between base and base+5
         assert delay.total_seconds() <= 16389  # 16384 + 5
@@ -171,7 +177,9 @@ class TestCalculateRetryDelay:
 
     def test_negative_error_count(self):
         """Test with negative error count"""
-        delay = calculate_retry_delay(-1, "exponential", initial_delay=1, max_delay=3600)
+        delay = calculate_retry_delay(
+            -1, "exponential", initial_delay=1, max_delay=3600
+        )
         # 1 * (2^-2) = 0.25 seconds + jitter
         assert 0 <= delay.total_seconds() <= 5
 
@@ -287,7 +295,10 @@ class TestCalculateRetryFromJob:
 
     def test_job_with_custom_strategy(self):
         """Test job with custom retry strategy"""
-        job = {"id": 1, "admin_data": {"retry_strategy": "linear", "initial_retry_delay": 10}}
+        job = {
+            "id": 1,
+            "admin_data": {"retry_strategy": "linear", "initial_retry_delay": 10},
+        }
         delay = calculate_retry_from_job(job, error_count=3)
         # Linear: 10 * 3 = 30 seconds
         assert 30 <= delay.total_seconds() <= 33
@@ -320,7 +331,9 @@ class TestRetryStrategyIntegration:
 
     def test_retry_progression_exponential(self):
         """Test retry delay progression with exponential strategy"""
-        job = {"admin_data": {"retry_strategy": "exponential", "initial_retry_delay": 1}}
+        job = {
+            "admin_data": {"retry_strategy": "exponential", "initial_retry_delay": 1}
+        }
 
         delays = [calculate_retry_from_job(job, i) for i in range(1, 6)]
 

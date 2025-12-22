@@ -5,14 +5,14 @@ description = "PostgreSQL Job Consumer Platform"
 authors = ["Matt Stancliff <matt@genges.com>"]
 
 [tool.poetry.dependencies]
-python = "^3.10.2"
-orjson = "^3.5.0"
-click = "^8.0.0"
-asyncpg = "^0.30.0"
-loguru = "^0.7.3"
-aiohttp = "^3.7.3"
-croniter = "^6.0.0"
-pytz = "^2025.2"
+python = ">3.12"
+orjson = ">3.5.0"
+click = ">8.0.0"
+asyncpg = ">0.30.0"
+loguru = "*"
+aiohttp = ">3.7.3"
+croniter = "*"
+pytz = "*"
 
 [tool.poetry.scripts]
 pj = "pyjobby.pj:workit"
@@ -29,9 +29,8 @@ pytest-xdist = "^3.5"
 hypothesis = "^6.148.2"
 
 [tool.poetry.group.dev.dependencies]
-mypy = "^1.8"
-ruff = "^0.14.5"
-black = "^25.11.0"
+mypy = ">1.8"
+ruff = ">0.14.5"
 types-orjson = "^3.6"
 pytest-aiohttp = "^1.1.0"
 
@@ -79,7 +78,7 @@ exclude_lines = [
 ]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.14"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
@@ -92,14 +91,8 @@ warn_no_return = true
 strict_equality = true
 
 [tool.ruff]
-line-length = 100
-target-version = "py39"
-select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
-ignore = ["E501"]  # Line too long (handled by black)
-
-[tool.black]
-line-length = 100
-target-version = ["py39"]
+target-version = "py314"
+lint.select = ["I", "FURB", "UP", "C4", "SIM", "F401"]
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

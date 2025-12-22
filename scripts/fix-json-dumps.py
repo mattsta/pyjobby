@@ -22,40 +22,38 @@ def fix_test_file(file_path: Path) -> None:
     # We need to match balanced parentheses/braces
 
     # For simple variable references: json.dumps(var_name)
-    content = re.sub(
-        r'json\.dumps\((\w+(?:\[[\w\'\"]+\])?)\)',
-        r'\1',
-        content
-    )
+    content = re.sub(r"json\.dumps\((\w+(?:\[[\w\'\"]+\])?)\)", r"\1", content)
 
     # For dict literals: json.dumps({"key": "value", ...})
     # This is tricky - we need to match balanced braces
     def replace_json_dumps_dict(text):
         """Replace json.dumps({...}) with just {...}"""
-        pattern = r'json\.dumps\(\s*(\{[^}]*\})\s*\)'
-        return re.sub(pattern, r'\1', text)
+        pattern = r"json\.dumps\(\s*(\{[^}]*\})\s*\)"
+        return re.sub(pattern, r"\1", text)
 
     content = replace_json_dumps_dict(content)
 
     # Remove json import if it's no longer used
-    lines = content.split('\n')
-    has_json_usage = any('json.' in line and 'import json' not in line for line in lines)
+    lines = content.split("\n")
+    has_json_usage = any(
+        "json." in line and "import json" not in line for line in lines
+    )
 
     if not has_json_usage:
         # Remove json import
         new_lines = []
         for line in lines:
-            if line.strip() == 'import json' or line.strip().startswith('import json,'):
+            if line.strip() == "import json" or line.strip().startswith("import json,"):
                 # Skip this line
                 continue
-            elif 'import json' in line:
+            elif "import json" in line:
                 # Remove from multi-import
-                line = re.sub(r',?\s*json\s*,?', '', line)
-                if line.strip() not in ['import', 'from']:
+                line = re.sub(r",?\s*json\s*,?", "", line)
+                if line.strip() not in ["import", "from"]:
                     new_lines.append(line)
             else:
                 new_lines.append(line)
-        content = '\n'.join(new_lines)
+        content = "\n".join(new_lines)
 
     file_path.write_text(content)
     print(f"Fixed {file_path}")

@@ -8,8 +8,7 @@ These tests verify that:
 - Test isolation works
 """
 
-import pytest
-from tests.utils.factories import create_job, get_job, count_jobs_by_state
+from tests.utils.factories import count_jobs_by_state, create_job, get_job
 
 
 async def test_database_connection(db_connection):

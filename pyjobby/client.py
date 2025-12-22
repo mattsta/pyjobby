@@ -36,13 +36,12 @@ Example:
         ])
 """
 
-import asyncpg
 import json
-from typing import Optional, Any, List, Tuple, Dict, Union
-from datetime import datetime, timedelta
-from dataclasses import dataclass, asdict
-from contextlib import asynccontextmanager
-import asyncio
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
+
+import asyncpg
 
 
 @dataclass
@@ -62,21 +61,23 @@ class JobOptions:
         deadline_key: Idempotency key (default: None)
         admin_data: Metadata dict (default: None)
     """
-    queue: str = 'default'
+
+    queue: str = "default"
     priority: int = 100
-    run_after: Optional[datetime] = None
-    capability: Optional[str] = None
-    uid: Optional[int] = None
-    run_group: Optional[int] = None
-    waitfor_job: Optional[int] = None
-    waitfor_group: Optional[int] = None
-    deadline_key: Optional[str] = None
-    admin_data: Optional[Dict[str, Any]] = None
+    run_after: datetime | None = None
+    capability: str | None = None
+    uid: int | None = None
+    run_group: int | None = None
+    waitfor_job: int | None = None
+    waitfor_group: int | None = None
+    deadline_key: str | None = None
+    admin_data: dict[str, Any] | None = None
 
 
 @dataclass
 class JobInfo:
     """Information about an enqueued job"""
+
     id: int
     job_class: str
     queue: str
@@ -120,15 +121,15 @@ class JobClient:
     @classmethod
     async def create(
         cls,
-        host: str = 'localhost',
+        host: str = "localhost",
         port: int = 5432,
-        database: str = 'pyjobby',
-        user: str = 'postgres',
-        password: Optional[str] = None,
+        database: str = "pyjobby",
+        user: str = "postgres",
+        password: str | None = None,
         min_size: int = 5,
         max_size: int = 20,
-        **kwargs
-    ) -> 'JobClient':
+        **kwargs,
+    ) -> JobClient:
         """
         Create client with new connection pool.
 
@@ -161,12 +162,14 @@ class JobClient:
             password=password,
             min_size=min_size,
             max_size=max_size,
-            **kwargs
+            **kwargs,
         )
         return cls(pool)
 
     @classmethod
-    async def from_config(cls, config_path: str, min_size: int = 5, max_size: int = 20) -> 'JobClient':
+    async def from_config(
+        cls, config_path: str, min_size: int = 5, max_size: int = 20
+    ) -> JobClient:
         """
         Create client from pyjobby config file.
 
@@ -187,9 +190,7 @@ class JobClient:
         db_params = config.get("db_params", {})
 
         pool = await asyncpg.create_pool(
-            min_size=min_size,
-            max_size=max_size,
-            **db_params
+            min_size=min_size, max_size=max_size, **db_params
         )
         return cls(pool)
 
@@ -199,7 +200,7 @@ class JobClient:
             await self.pool.close()
             self._closed = True
 
-    async def __aenter__(self) -> 'JobClient':
+    async def __aenter__(self) -> JobClient:
         """Context manager entry"""
         return self
 
@@ -215,28 +216,28 @@ class JobClient:
         self,
         job_class: str,
         *,
-        queue: str = 'default',
+        queue: str = "default",
         priority: int = 100,
-        run_after: Optional[datetime] = None,
-        capability: Optional[str] = None,
-        uid: Optional[int] = None,
-        run_group: Optional[int] = None,
-        waitfor_job: Optional[int] = None,
-        waitfor_group: Optional[int] = None,
-        deadline_key: Optional[str] = None,
-        admin_data: Optional[Dict[str, Any]] = None,
+        run_after: datetime | None = None,
+        capability: str | None = None,
+        uid: int | None = None,
+        run_group: int | None = None,
+        waitfor_job: int | None = None,
+        waitfor_group: int | None = None,
+        deadline_key: str | None = None,
+        admin_data: dict[str, Any] | None = None,
         # Phase 2: Result Storage & Passing
         save_result: bool = False,
-        use_result_from: Optional[int] = None,
+        use_result_from: int | None = None,
         # Phase 2: Retry Strategies
         retry_strategy: str = "exponential",
         max_retries: int = 10,
         initial_retry_delay: int = 1,
         max_retry_delay: int = 3600,
         # Phase 2: Timeout Enforcement
-        timeout_seconds: Optional[int] = None,
+        timeout_seconds: int | None = None,
         on_timeout: str = "retry",
-        **kwargs: Any
+        **kwargs: Any,
     ) -> int:
         """
         Enqueue a job.
@@ -323,21 +324,17 @@ class JobClient:
         if use_result_from:
             async with self.pool.acquire() as conn:
                 upstream = await conn.fetchrow(
-                    "SELECT result FROM jorb WHERE id = $1",
-                    use_result_from
+                    "SELECT result FROM jorb WHERE id = $1", use_result_from
                 )
-                if upstream and upstream['result']:
-                    kwargs['upstream_result'] = upstream['result']
+                if upstream and upstream["result"]:
+                    kwargs["upstream_result"] = upstream["result"]
 
         # Default run_after to now if not specified
         if run_after is None:
             run_after = datetime.utcnow()
 
         # Determine initial state
-        if waitfor_job or waitfor_group:
-            state = 'waiting'
-        else:
-            state = 'queued'
+        state = "waiting" if waitfor_job or waitfor_group else "queued"
 
         # Phase 2: Build admin_data with Phase 2 features
         if admin_data is None:
@@ -345,22 +342,23 @@ class JobClient:
 
         # Add save_result flag if requested
         if save_result:
-            admin_data['save_result'] = True
+            admin_data["save_result"] = True
 
         # Add retry strategy configuration
-        admin_data['retry_strategy'] = retry_strategy
-        admin_data['max_retries'] = max_retries
-        admin_data['initial_retry_delay'] = initial_retry_delay
-        admin_data['max_retry_delay'] = max_retry_delay
+        admin_data["retry_strategy"] = retry_strategy
+        admin_data["max_retries"] = max_retries
+        admin_data["initial_retry_delay"] = initial_retry_delay
+        admin_data["max_retry_delay"] = max_retry_delay
 
         # Add timeout configuration if specified
         if timeout_seconds:
-            admin_data['timeout_seconds'] = timeout_seconds
-            admin_data['on_timeout'] = on_timeout
+            admin_data["timeout_seconds"] = timeout_seconds
+            admin_data["on_timeout"] = on_timeout
 
         # Execute INSERT
         async with self.pool.acquire() as conn:
-            job_id = await conn.fetchval("""
+            job_id = await conn.fetchval(
+                """
                 INSERT INTO jorb (
                     job_class, kwargs, queue, prio, run_after,
                     capability, uid, run_group,
@@ -382,19 +380,19 @@ class JobClient:
                 waitfor_group,
                 deadline_key,
                 admin_data,  # Dict - custom codec handles conversion
-                state
+                state,
             )
 
         return job_id
 
     async def enqueue_batch(
         self,
-        jobs: List[Tuple[str, Dict[str, Any]]],
-        queue: str = 'default',
+        jobs: list[tuple[str, dict[str, Any]]],
+        queue: str = "default",
         priority: int = 100,
-        run_after: Optional[datetime] = None,
-        run_group: Optional[int] = None,
-    ) -> List[int]:
+        run_after: datetime | None = None,
+        run_group: int | None = None,
+    ) -> list[int]:
         """
         Enqueue multiple jobs efficiently in a single transaction.
 
@@ -432,19 +430,22 @@ class JobClient:
         # Prepare values for batch insert
         values = []
         for job_class, kwargs in jobs:
-            values.append((
-                job_class,
-                json.dumps(kwargs),
-                queue,
-                priority,
-                run_after,
-                run_group,
-            ))
+            values.append(
+                (
+                    job_class,
+                    json.dumps(kwargs),
+                    queue,
+                    priority,
+                    run_after,
+                    run_group,
+                )
+            )
 
         # Execute batch INSERT
         async with self.pool.acquire() as conn:
             # Use unnest for efficient bulk insert
-            job_ids = await conn.fetch("""
+            job_ids = await conn.fetch(
+                """
                 INSERT INTO jorb (
                     job_class, kwargs, queue, prio, run_after, run_group, state
                 )
@@ -474,13 +475,13 @@ class JobClient:
                 [v[5] for v in values],  # run_group
             )
 
-        return [row['id'] for row in job_ids]
+        return [row["id"] for row in job_ids]
 
     # =========================================================================
     # Job Inspection & Management
     # =========================================================================
 
-    async def get_job(self, job_id: int) -> Optional[JobInfo]:
+    async def get_job(self, job_id: int) -> JobInfo | None:
         """
         Get job information.
 
@@ -496,11 +497,14 @@ class JobClient:
                 print(f"Job {job.id} is {job.state}")
         """
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT id, job_class, queue, prio as priority, state, created
                 FROM jorb
                 WHERE id = $1
-            """, job_id)
+            """,
+                job_id,
+            )
 
         if not row:
             return None
@@ -522,16 +526,19 @@ class JobClient:
                 print("Job cancelled")
         """
         async with self.pool.acquire() as conn:
-            result = await conn.execute("""
+            result = await conn.execute(
+                """
                 UPDATE jorb
                 SET state = 'cancelled'
                 WHERE id = $1
                   AND state IN ('queued', 'waiting')
-            """, job_id)
+            """,
+                job_id,
+            )
 
         return result != "UPDATE 0"
 
-    async def retry_job(self, job_id: int) -> Optional[int]:
+    async def retry_job(self, job_id: int) -> int | None:
         """
         Retry a failed/crashed job (creates a new job).
 
@@ -547,7 +554,8 @@ class JobClient:
                 print(f"Created retry job: {new_job_id}")
         """
         async with self.pool.acquire() as conn:
-            new_job_id = await conn.fetchval("""
+            new_job_id = await conn.fetchval(
+                """
                 INSERT INTO jorb (
                     job_class, kwargs, queue, prio, uid, capability,
                     run_after, run_group, admin_data, state
@@ -562,7 +570,9 @@ class JobClient:
                 WHERE id = $1::bigint
                   AND state IN ('crashed', 'finished')
                 RETURNING id
-            """, job_id)
+            """,
+                job_id,
+            )
 
         return new_job_id
 
@@ -570,7 +580,7 @@ class JobClient:
     # Queue Operations
     # =========================================================================
 
-    async def queue_depth(self, queue: str = 'default') -> int:
+    async def queue_depth(self, queue: str = "default") -> int:
         """
         Get number of queued jobs in a queue.
 
@@ -585,14 +595,17 @@ class JobClient:
             print(f"Queue has {depth} jobs waiting")
         """
         async with self.pool.acquire() as conn:
-            return await conn.fetchval("""
+            return await conn.fetchval(
+                """
                 SELECT COUNT(*)
                 FROM jorb
                 WHERE queue = $1
                   AND state = 'queued'
-            """, queue)
+            """,
+                queue,
+            )
 
-    async def queue_stats(self, queue: str = 'default') -> Dict[str, int]:
+    async def queue_stats(self, queue: str = "default") -> dict[str, int]:
         """
         Get statistics for a queue.
 
@@ -607,22 +620,33 @@ class JobClient:
             print(f"Queued: {stats['queued']}, Running: {stats['running']}")
         """
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT state, COUNT(*) as count
                 FROM jorb
                 WHERE queue = $1
                 GROUP BY state
-            """, queue)
+            """,
+                queue,
+            )
 
-        stats = {row['state']: row['count'] for row in rows}
+        stats = {row["state"]: row["count"] for row in rows}
 
         # Ensure all states are present
-        for state in ['queued', 'claimed', 'running', 'waiting', 'finished', 'crashed', 'cancelled']:
+        for state in [
+            "queued",
+            "claimed",
+            "running",
+            "waiting",
+            "finished",
+            "crashed",
+            "cancelled",
+        ]:
             stats.setdefault(state, 0)
 
         return stats
 
-    async def list_queues(self) -> List[Dict[str, Any]]:
+    async def list_queues(self) -> list[dict[str, Any]]:
         """
         List all queues with statistics.
 
@@ -653,7 +677,7 @@ class JobClient:
 
         return [dict(row) for row in rows]
 
-    async def purge_queue(self, queue: str, states: Optional[List[str]] = None) -> int:
+    async def purge_queue(self, queue: str, states: list[str] | None = None) -> int:
         """
         Delete jobs from a queue.
 
@@ -672,14 +696,18 @@ class JobClient:
             deleted = await client.purge_queue('emails', states=['finished'])
         """
         if states is None:
-            states = ['queued', 'waiting']
+            states = ["queued", "waiting"]
 
         async with self.pool.acquire() as conn:
-            result = await conn.execute("""
+            result = await conn.execute(
+                """
                 DELETE FROM jorb
                 WHERE queue = $1
                   AND state = ANY($2::jorbstate[])
-            """, queue, states)
+            """,
+                queue,
+                states,
+            )
 
         # Extract row count from result like "DELETE 42"
         return int(result.split()[-1]) if result.split()[-1].isdigit() else 0
@@ -688,7 +716,7 @@ class JobClient:
     # Extended Job Management
     # =========================================================================
 
-    async def get_job_full(self, job_id: int) -> Optional[Dict[str, Any]]:
+    async def get_job_full(self, job_id: int) -> dict[str, Any] | None:
         """
         Get complete job details including kwargs, result, etc.
 
@@ -705,18 +733,21 @@ class JobClient:
                 print(f"Result: {job['result']}")
         """
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT *
                 FROM jorb
                 WHERE id = $1
-            """, job_id)
+            """,
+                job_id,
+            )
 
         if not row:
             return None
 
         return dict(row)
 
-    async def get_job_result(self, job_id: int) -> Optional[Any]:
+    async def get_job_result(self, job_id: int) -> Any | None:
         """
         Get job result.
 
@@ -732,17 +763,20 @@ class JobClient:
                 print(f"Job returned: {result}")
         """
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            row = await conn.fetchrow(
+                """
                 SELECT result, state
                 FROM jorb
                 WHERE id = $1
-            """, job_id)
+            """,
+                job_id,
+            )
 
-        if not row or row['state'] != 'finished' or not row['result']:
+        if not row or row["state"] != "finished" or not row["result"]:
             return None
 
         # Result is stored as JSON
-        result = row['result']
+        result = row["result"]
         if isinstance(result, str):
             return json.loads(result)
         return result
@@ -762,10 +796,13 @@ class JobClient:
                 print("Job deleted")
         """
         async with self.pool.acquire() as conn:
-            result = await conn.execute("""
+            result = await conn.execute(
+                """
                 DELETE FROM jorb
                 WHERE id = $1
-            """, job_id)
+            """,
+                job_id,
+            )
 
         return result != "DELETE 0"
 
@@ -786,24 +823,28 @@ class JobClient:
                 print("Priority updated")
         """
         async with self.pool.acquire() as conn:
-            result = await conn.execute("""
+            result = await conn.execute(
+                """
                 UPDATE jorb
                 SET prio = $2
                 WHERE id = $1
                   AND state IN ('queued', 'waiting')
-            """, job_id, new_priority)
+            """,
+                job_id,
+                new_priority,
+            )
 
         return result != "UPDATE 0"
 
     async def get_jobs(
         self,
-        queue: Optional[str] = None,
-        state: Optional[str] = None,
+        queue: str | None = None,
+        state: str | None = None,
         limit: int = 100,
         offset: int = 0,
-        order_by: str = 'created',
-        ascending: bool = False
-    ) -> List[Dict[str, Any]]:
+        order_by: str = "created",
+        ascending: bool = False,
+    ) -> list[dict[str, Any]]:
         """
         List jobs with filtering and pagination.
 
@@ -843,38 +884,50 @@ class JobClient:
         where_sql = " AND ".join(where_clauses) if where_clauses else "TRUE"
 
         # Validate order_by to prevent SQL injection
-        valid_fields = ['id', 'created', 'prio', 'run_after', 'started', 'finished', 'queue', 'state']
+        valid_fields = [
+            "id",
+            "created",
+            "prio",
+            "run_after",
+            "started",
+            "finished",
+            "queue",
+            "state",
+        ]
         if order_by not in valid_fields:
-            order_by = 'created'
+            order_by = "created"
 
-        direction = 'ASC' if ascending else 'DESC'
+        direction = "ASC" if ascending else "DESC"
 
         params.extend([limit, offset])
 
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch(f"""
+            rows = await conn.fetch(
+                f"""
                 SELECT *
                 FROM jorb
                 WHERE {where_sql}
                 ORDER BY {order_by} {direction}
                 LIMIT ${param_num}
                 OFFSET ${param_num + 1}
-            """, *params)
+            """,
+                *params,
+            )
 
         return [dict(row) for row in rows]
 
     async def search_jobs(
         self,
-        job_class: Optional[str] = None,
-        min_priority: Optional[int] = None,
-        max_priority: Optional[int] = None,
-        created_after: Optional[datetime] = None,
-        created_before: Optional[datetime] = None,
-        uid: Optional[int] = None,
-        run_group: Optional[int] = None,
-        capability: Optional[str] = None,
-        limit: int = 100
-    ) -> List[Dict[str, Any]]:
+        job_class: str | None = None,
+        min_priority: int | None = None,
+        max_priority: int | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        uid: int | None = None,
+        run_group: int | None = None,
+        capability: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
         """
         Search jobs by various criteria.
 
@@ -948,17 +1001,22 @@ class JobClient:
         params.append(limit)
 
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch(f"""
+            rows = await conn.fetch(
+                f"""
                 SELECT *
                 FROM jorb
                 WHERE {where_sql}
                 ORDER BY created DESC
                 LIMIT ${param_num}
-            """, *params)
+            """,
+                *params,
+            )
 
         return [dict(row) for row in rows]
 
-    async def get_failed_jobs(self, queue: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+    async def get_failed_jobs(
+        self, queue: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
         """
         Get crashed/failed jobs.
 
@@ -985,17 +1043,20 @@ class JobClient:
             params.append(limit)
 
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch(f"""
+            rows = await conn.fetch(
+                f"""
                 SELECT *
                 FROM jorb
                 WHERE {where}
                 ORDER BY finished DESC
                 LIMIT ${len(params)}
-            """, *params)
+            """,
+                *params,
+            )
 
         return [dict(row) for row in rows]
 
-    async def get_waiting_jobs(self, limit: int = 100) -> List[Dict[str, Any]]:
+    async def get_waiting_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
         """
         Get jobs waiting on dependencies.
 
@@ -1011,13 +1072,16 @@ class JobClient:
                 print(f"Job {job['id']} waiting for {job['waitfor_job'] or job['waitfor_group']}")
         """
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 SELECT *
                 FROM jorb
                 WHERE state = 'waiting'
                 ORDER BY created DESC
                 LIMIT $1
-            """, limit)
+            """,
+                limit,
+            )
 
         return [dict(row) for row in rows]
 
@@ -1025,7 +1089,7 @@ class JobClient:
     # Bulk Operations
     # =========================================================================
 
-    async def bulk_cancel(self, job_ids: List[int]) -> int:
+    async def bulk_cancel(self, job_ids: list[int]) -> int:
         """
         Cancel multiple jobs.
 
@@ -1043,16 +1107,19 @@ class JobClient:
             return 0
 
         async with self.pool.acquire() as conn:
-            result = await conn.execute("""
+            result = await conn.execute(
+                """
                 UPDATE jorb
                 SET state = 'cancelled'
                 WHERE id = ANY($1::bigint[])
                   AND state IN ('queued', 'waiting')
-            """, job_ids)
+            """,
+                job_ids,
+            )
 
         return int(result.split()[-1]) if result.split()[-1].isdigit() else 0
 
-    async def bulk_retry(self, job_ids: List[int]) -> List[int]:
+    async def bulk_retry(self, job_ids: list[int]) -> list[int]:
         """
         Retry multiple failed jobs.
 
@@ -1070,7 +1137,8 @@ class JobClient:
             return []
 
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch("""
+            rows = await conn.fetch(
+                """
                 INSERT INTO jorb (
                     job_class, kwargs, queue, prio, uid, capability,
                     run_after, run_group, admin_data, state
@@ -1085,11 +1153,13 @@ class JobClient:
                 WHERE id = ANY($1::bigint[])
                   AND state IN ('crashed', 'finished')
                 RETURNING id
-            """, job_ids)
+            """,
+                job_ids,
+            )
 
-        return [row['id'] for row in rows]
+        return [row["id"] for row in rows]
 
-    async def bulk_delete(self, job_ids: List[int]) -> int:
+    async def bulk_delete(self, job_ids: list[int]) -> int:
         """
         Delete multiple jobs.
 
@@ -1107,14 +1177,17 @@ class JobClient:
             return 0
 
         async with self.pool.acquire() as conn:
-            result = await conn.execute("""
+            result = await conn.execute(
+                """
                 DELETE FROM jorb
                 WHERE id = ANY($1::bigint[])
-            """, job_ids)
+            """,
+                job_ids,
+            )
 
         return int(result.split()[-1]) if result.split()[-1].isdigit() else 0
 
-    async def bulk_update_priority(self, job_ids: List[int], new_priority: int) -> int:
+    async def bulk_update_priority(self, job_ids: list[int], new_priority: int) -> int:
         """
         Update priority for multiple jobs.
 
@@ -1133,12 +1206,16 @@ class JobClient:
             return 0
 
         async with self.pool.acquire() as conn:
-            result = await conn.execute("""
+            result = await conn.execute(
+                """
                 UPDATE jorb
                 SET prio = $2
                 WHERE id = ANY($1::bigint[])
                   AND state IN ('queued', 'waiting')
-            """, job_ids, new_priority)
+            """,
+                job_ids,
+                new_priority,
+            )
 
         return int(result.split()[-1]) if result.split()[-1].isdigit() else 0
 
@@ -1148,10 +1225,10 @@ class JobClient:
 
     async def create_pipeline(
         self,
-        steps: List[Tuple[str, Dict[str, Any]]],
-        queue: str = 'default',
+        steps: list[tuple[str, dict[str, Any]]],
+        queue: str = "default",
         priority: int = 100,
-    ) -> List[int]:
+    ) -> list[int]:
         """
         Create a job pipeline where each step waits for the previous.
 
@@ -1186,7 +1263,7 @@ class JobClient:
                 queue=queue,
                 priority=priority,
                 waitfor_job=previous_job,
-                **kwargs
+                **kwargs,
             )
             job_ids.append(job_id)
             previous_job = job_id
@@ -1196,11 +1273,11 @@ class JobClient:
     async def create_fan_out(
         self,
         job_class: str,
-        items: List[Dict[str, Any]],
-        queue: str = 'default',
+        items: list[dict[str, Any]],
+        queue: str = "default",
         priority: int = 100,
-        run_group: Optional[int] = None,
-    ) -> Tuple[List[int], int]:
+        run_group: int | None = None,
+    ) -> tuple[list[int], int]:
         """
         Create fan-out pattern: process many items in parallel.
 
@@ -1236,10 +1313,7 @@ class JobClient:
 
         jobs = [(job_class, kwargs) for kwargs in items]
         job_ids = await self.enqueue_batch(
-            jobs,
-            queue=queue,
-            priority=priority,
-            run_group=run_group
+            jobs, queue=queue, priority=priority, run_group=run_group
         )
 
         return job_ids, run_group
@@ -1266,7 +1340,7 @@ class JobClient:
     # Phase 2: DAG Support
     # =========================================================================
 
-    def dag(self, name: Optional[str] = None, **common_options) -> 'DAGBuilder':
+    def dag(self, name: str | None = None, **common_options) -> DAGBuilder:
         """
         Create a DAG (Directed Acyclic Graph) builder.
 
@@ -1299,9 +1373,10 @@ class JobClient:
             node_to_job = await dag.execute(client)
         """
         from .dag import DAGBuilder
+
         return DAGBuilder(name=name, **common_options)
 
-    async def execute_dag(self, dag: 'DAGBuilder') -> Dict:
+    async def execute_dag(self, dag: DAGBuilder) -> dict:
         """
         Execute a DAG and return node->job_id mapping.
 
@@ -1323,7 +1398,7 @@ class JobClient:
         """
         return await dag.execute(self)
 
-    async def get_dag_status(self, dag_id: int) -> Dict[str, Any]:
+    async def get_dag_status(self, dag_id: int) -> dict[str, Any]:
         """
         Get DAG execution status.
 
@@ -1339,6 +1414,7 @@ class JobClient:
             print(f"Completed: {status['finished_jobs']}/{status['total_jobs']}")
         """
         from .dag import get_dag_status
+
         return await get_dag_status(self.pool, dag_id)
 
     async def wait_for_dag(self, dag_id: int, timeout: int = 3600) -> bool:
@@ -1371,6 +1447,7 @@ class JobClient:
                 print("DAG failed or timed out")
         """
         from .dag import wait_for_dag
+
         return await wait_for_dag(self.pool, dag_id, timeout)
 
     # =========================================================================
@@ -1379,11 +1456,11 @@ class JobClient:
 
     async def create_pipeline_with_results(
         self,
-        stages: List[Tuple[str, dict, bool]],
-        queue: str = 'default',
+        stages: list[tuple[str, dict, bool]],
+        queue: str = "default",
         priority: int = 100,
-        **common_options
-    ) -> List[int]:
+        **common_options,
+    ) -> list[int]:
         """
         Create a linear pipeline where each stage can receive the previous stage's result.
 
@@ -1419,7 +1496,7 @@ class JobClient:
                 save_result=save_result,
                 use_result_from=previous_job if previous_saved_result else None,
                 waitfor_job=previous_job,
-                **common_options
+                **common_options,
             )
             job_ids.append(job_id)
             previous_job = job_id

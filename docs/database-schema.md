@@ -3,6 +3,7 @@
 ## Overview
 
 Pyjobby uses a single PostgreSQL table (`jorb`) to store all job state. The schema is designed for:
+
 - **Performance**: Partial indexes for fast job selection
 - **Atomicity**: Row-level locking prevents conflicts
 - **Observability**: Complete audit trail of all state transitions
@@ -14,31 +15,31 @@ Schema location: `priv/schema.py` (SQLAlchemy) and `priv/schema.sql` (raw SQL)
 
 ### Complete Column Reference
 
-| Column | Type | Nullable | Default | Purpose |
-|--------|------|----------|---------|---------|
-| `id` | BIGINT | NO | AUTO | Primary key, auto-increment |
-| `queue` | TEXT | NO | 'default' | Queue identifier for routing jobs |
-| `capability` | TEXT | YES | NULL | Required worker capability (or ANY if NULL) |
-| `prio` | INTEGER | NO | 100 | Priority (lower = higher priority) |
-| `run_after` | TIMESTAMP | NO | NOW() | Minimum start time |
-| `deadline_key` | TEXT | YES | NULL | Unique key for singleton future jobs |
-| `state` | ENUM | NO | 'queued' | Current job state (see state machine below) |
-| `run_count` | INTEGER | NO | 0 | Number of times job has been claimed |
-| `job_class` | TEXT | NO | - | Full Python path to job class |
-| `kwargs` | JSONB | NO | - | Arguments for task(**kwargs) |
-| `uid` | INTEGER | YES | NULL | User ID (for multi-tenancy) |
-| `run_group` | BIGINT | YES | NULL | Group ID for parallel jobs |
-| `waitfor_group` | BIGINT | YES | NULL | Wait for this group to finish |
-| `waitfor_job` | BIGINT | YES | NULL | Wait for this job ID to finish |
-| `admin_data` | JSONB | YES | NULL | Additional metadata/tags |
-| `result` | JSONB | YES | NULL | Result from successful execution |
-| `error_message` | TEXT | YES | NULL | Most recent error message |
-| `error_backtrace` | TEXT | YES | NULL | Full stack trace from last error |
-| `error_count` | INTEGER | NO | 0 | Number of failures |
-| `worker_pid` | INTEGER | YES | NULL | Process ID of last worker |
-| `worker_host` | TEXT | YES | NULL | Hostname of last worker |
-| `created` | TIMESTAMP | NO | NOW() | When job was created |
-| `updated` | TIMESTAMP | NO | NOW() | When job was last modified |
+| Column            | Type      | Nullable | Default   | Purpose                                     |
+| ----------------- | --------- | -------- | --------- | ------------------------------------------- |
+| `id`              | BIGINT    | NO       | AUTO      | Primary key, auto-increment                 |
+| `queue`           | TEXT      | NO       | 'default' | Queue identifier for routing jobs           |
+| `capability`      | TEXT      | YES      | NULL      | Required worker capability (or ANY if NULL) |
+| `prio`            | INTEGER   | NO       | 100       | Priority (lower = higher priority)          |
+| `run_after`       | TIMESTAMP | NO       | NOW()     | Minimum start time                          |
+| `deadline_key`    | TEXT      | YES      | NULL      | Unique key for singleton future jobs        |
+| `state`           | ENUM      | NO       | 'queued'  | Current job state (see state machine below) |
+| `run_count`       | INTEGER   | NO       | 0         | Number of times job has been claimed        |
+| `job_class`       | TEXT      | NO       | -         | Full Python path to job class               |
+| `kwargs`          | JSONB     | NO       | -         | Arguments for task(\*\*kwargs)              |
+| `uid`             | INTEGER   | YES      | NULL      | User ID (for multi-tenancy)                 |
+| `run_group`       | BIGINT    | YES      | NULL      | Group ID for parallel jobs                  |
+| `waitfor_group`   | BIGINT    | YES      | NULL      | Wait for this group to finish               |
+| `waitfor_job`     | BIGINT    | YES      | NULL      | Wait for this job ID to finish              |
+| `admin_data`      | JSONB     | YES      | NULL      | Additional metadata/tags                    |
+| `result`          | JSONB     | YES      | NULL      | Result from successful execution            |
+| `error_message`   | TEXT      | YES      | NULL      | Most recent error message                   |
+| `error_backtrace` | TEXT      | YES      | NULL      | Full stack trace from last error            |
+| `error_count`     | INTEGER   | NO       | 0         | Number of failures                          |
+| `worker_pid`      | INTEGER   | YES      | NULL      | Process ID of last worker                   |
+| `worker_host`     | TEXT      | YES      | NULL      | Hostname of last worker                     |
+| `created`         | TIMESTAMP | NO       | NOW()     | When job was created                        |
+| `updated`         | TIMESTAMP | NO       | NOW()     | When job was last modified                  |
 
 ### State Machine
 
@@ -92,6 +93,7 @@ WHERE state = 'queued' OR state = 'crashed';
 ```
 
 **Columns**:
+
 - `queue`: Exact match on queue name
 - `capability`: Match worker capabilities
 - `prio`: Order by priority (ASC)
@@ -100,6 +102,7 @@ WHERE state = 'queued' OR state = 'crashed';
 **Why Partial**: Only indexes jobs that are eligible to be claimed. Completed jobs (finished/crashed) are excluded, dramatically reducing index size and scan time.
 
 **Query Pattern**:
+
 ```sql
 SELECT * FROM jorb
 WHERE queue = 'default'
@@ -125,12 +128,14 @@ WHERE state = 'queued' AND deadline_key IS NOT NULL;
 **Uniqueness Constraint**: `(deadline_key, queue)` must be unique for all queued jobs.
 
 **Lifecycle**:
+
 - Job A inserted with `deadline_key='billing:123:2025-11-18'`, `state='queued'` → SUCCESS
 - Job B inserted with same deadline_key → **FAILS** (unique violation)
 - Job A transitions to `state='finished'` → Index entry removed
 - Job C inserted with same deadline_key → SUCCESS (previous instance finished)
 
 **Use Case**:
+
 ```python
 # User uploads multiple files, but only schedule one billing update
 for file in uploaded_files:
@@ -157,6 +162,7 @@ WHERE run_group IS NOT NULL;
 ```
 
 **Query Pattern**:
+
 ```sql
 -- Check if all jobs in group are finished
 SELECT COUNT(*) FROM jorb
@@ -178,6 +184,7 @@ WHERE waitfor_group IS NOT NULL AND state = 'waiting';
 ```
 
 **Query Pattern**:
+
 ```sql
 -- Activate jobs waiting for group 123456789
 UPDATE jorb
@@ -200,6 +207,7 @@ WHERE waitfor_job IS NOT NULL AND state = 'waiting';
 ```
 
 **Query Pattern**:
+
 ```sql
 -- Activate jobs waiting for job 1001
 UPDATE jorb
@@ -221,6 +229,7 @@ CREATE INDEX jorb_uid_idx ON jorb (uid);
 ```
 
 **Query Pattern**:
+
 ```sql
 -- Get all jobs for user 12345
 SELECT * FROM jorb WHERE uid = 12345;
@@ -638,6 +647,7 @@ The pyjobby database schema is designed for:
 - ✅ **Scalability**: Efficient even with millions of rows
 
 Key design decisions:
+
 - Single table keeps schema simple
 - Partial indexes reduce overhead
 - JSONB columns provide flexibility

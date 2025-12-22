@@ -15,23 +15,23 @@ These tests demonstrate:
 - Error handling and retry logic with real client code
 """
 
-import pytest
 import asyncio
-import asyncpg
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, Optional
 import json
+from datetime import UTC, datetime, timedelta
 
-from pyjobby.client import JobClient, JobOptions
+import pytest
+
+from pyjobby.client import JobClient
 from pyjobby.pj import STMTS
-
 
 # =============================================================================
 # Test Job Classes
 # =============================================================================
 
+
 class SimpleTestJob:
     """Simple job that returns success."""
+
     def __init__(self, **kwargs):
         self.kwargs = kwargs
 
@@ -42,7 +42,10 @@ class SimpleTestJob:
 
 class DataProcessingJob:
     """Job that processes data from upstream result."""
-    def __init__(self, upstream_result: Optional[dict] = None, operation: str = "identity", **kwargs):
+
+    def __init__(
+        self, upstream_result: dict | None = None, operation: str = "identity", **kwargs
+    ):
         self.upstream_result = upstream_result
         self.operation = operation
         self.kwargs = kwargs
@@ -68,6 +71,7 @@ class DataProcessingJob:
 
 class FailingJob:
     """Job that fails with an error."""
+
     def __init__(self, error_message: str = "Test error", **kwargs):
         self.error_message = error_message
 
@@ -79,6 +83,7 @@ class FailingJob:
 # =============================================================================
 # Fixtures
 # =============================================================================
+
 
 @pytest.fixture
 async def job_client(db_pool):
@@ -92,6 +97,7 @@ async def job_client(db_pool):
 # Helper Functions
 # =============================================================================
 
+
 async def claim_job(conn, queue="default", capabilities=None, max_priority=1000):
     """Claim a job using the actual worker STMTS."""
     if capabilities is None:
@@ -103,44 +109,28 @@ async def claim_job(conn, queue="default", capabilities=None, max_priority=1000)
         "test-worker",  # worker_host
         queue,
         capabilities,
-        max_priority
+        max_priority,
     )
     return claimed
 
 
 async def mark_running(conn, job_id, timeout_seconds=None):
     """Mark job as running using actual worker STMTS."""
-    await conn.execute(
-        STMTS["run"],
-        job_id
-    )
+    await conn.execute(STMTS["run"], job_id)
 
     # Set timeout if specified
     if timeout_seconds:
-        await conn.execute(
-            STMTS["set-timeout"],
-            job_id,
-            f"{timeout_seconds} seconds"
-        )
+        await conn.execute(STMTS["set-timeout"], job_id, f"{timeout_seconds} seconds")
 
 
 async def mark_finished(conn, job_id, result: dict):
     """Mark job as finished using actual worker STMTS."""
-    await conn.execute(
-        STMTS["finished"],
-        job_id,
-        json.dumps(result)
-    )
+    await conn.execute(STMTS["finished"], job_id, json.dumps(result))
 
 
 async def mark_error(conn, job_id, error_message: str, error_backtrace: str = ""):
     """Mark job as crashed using actual worker STMTS."""
-    await conn.execute(
-        STMTS["crash"],
-        job_id,
-        error_message,
-        error_backtrace
-    )
+    await conn.execute(STMTS["crash"], job_id, error_message, error_backtrace)
 
 
 async def execute_job(conn, job_row):
@@ -178,6 +168,7 @@ async def execute_job(conn, job_row):
 # Integration Tests: Producer + Consumer Workflows
 # =============================================================================
 
+
 @pytest.mark.asyncio
 @pytest.mark.integration
 class TestProducerConsumerIntegration:
@@ -188,7 +179,7 @@ class TestProducerConsumerIntegration:
         # PRODUCER: Enqueue using JobClient
         job_id = await job_client.enqueue(
             "tests.test_client_worker_integration.SimpleTestJob",
-            message="Hello from client!"
+            message="Hello from client!",
         )
 
         assert job_id is not None
@@ -216,18 +207,24 @@ class TestProducerConsumerIntegration:
             assert final_job["state"] == "finished"
 
             # Parse result from JSON
-            result_data = json.loads(final_job["result"]) if isinstance(final_job["result"], str) else final_job["result"]
+            result_data = (
+                json.loads(final_job["result"])
+                if isinstance(final_job["result"], str)
+                else final_job["result"]
+            )
             assert result_data["status"] == "success"
             assert result_data["input"]["message"] == "Hello from client!"
 
     async def test_batch_enqueue_and_process(self, db_pool, job_client):
         """Test: Producer batch enqueues -> Consumer processes all."""
         # PRODUCER: Batch enqueue using JobClient
-        job_ids = await job_client.enqueue_batch([
-            ("tests.test_client_worker_integration.SimpleTestJob", {"task": 1}),
-            ("tests.test_client_worker_integration.SimpleTestJob", {"task": 2}),
-            ("tests.test_client_worker_integration.SimpleTestJob", {"task": 3}),
-        ])
+        job_ids = await job_client.enqueue_batch(
+            [
+                ("tests.test_client_worker_integration.SimpleTestJob", {"task": 1}),
+                ("tests.test_client_worker_integration.SimpleTestJob", {"task": 2}),
+                ("tests.test_client_worker_integration.SimpleTestJob", {"task": 3}),
+            ]
+        )
 
         assert len(job_ids) == 3
 
@@ -266,17 +263,17 @@ class TestProducerConsumerIntegration:
         low_priority = await job_client.enqueue(
             "tests.test_client_worker_integration.SimpleTestJob",
             priority=1000,
-            task="low"
+            task="low",
         )
         high_priority = await job_client.enqueue(
             "tests.test_client_worker_integration.SimpleTestJob",
             priority=10,
-            task="high"
+            task="high",
         )
         medium_priority = await job_client.enqueue(
             "tests.test_client_worker_integration.SimpleTestJob",
             priority=100,
-            task="medium"
+            task="medium",
         )
 
         # CONSUMER: Claim jobs - should get high priority first
@@ -306,20 +303,19 @@ class TestProducerConsumerIntegration:
         """Test: Pipeline jobs pass results through dependency chain."""
         # PRODUCER: Create pipeline (Job1 -> Job2 -> Job3)
         job1_id = await job_client.enqueue(
-            "tests.test_client_worker_integration.DataProcessingJob",
-            operation="init"
+            "tests.test_client_worker_integration.DataProcessingJob", operation="init"
         )
 
         job2_id = await job_client.enqueue(
             "tests.test_client_worker_integration.DataProcessingJob",
             operation="double",
-            waitfor_job=job1_id
+            waitfor_job=job1_id,
         )
 
         job3_id = await job_client.enqueue(
             "tests.test_client_worker_integration.DataProcessingJob",
             operation="sum",
-            waitfor_job=job2_id
+            waitfor_job=job2_id,
         )
 
         # CONSUMER: Process pipeline
@@ -334,7 +330,7 @@ class TestProducerConsumerIntegration:
             # Job2 should now be available (waitfor_job satisfied)
             await conn.execute(
                 "UPDATE jorb SET state = 'queued' WHERE id = $1 AND state = 'waiting'",
-                job2_id
+                job2_id,
             )
 
             # Process Job2 with Job1's result
@@ -343,12 +339,16 @@ class TestProducerConsumerIntegration:
 
             # Inject upstream result (simulating dependency resolution)
             job2 = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job2_id)
-            job2_kwargs = json.loads(job2["kwargs"]) if isinstance(job2["kwargs"], str) else job2["kwargs"]
+            job2_kwargs = (
+                json.loads(job2["kwargs"])
+                if isinstance(job2["kwargs"], str)
+                else job2["kwargs"]
+            )
             job2_kwargs["upstream_result"] = result1
             await conn.execute(
                 "UPDATE jorb SET kwargs = $2::json WHERE id = $1",
                 job2_id,
-                json.dumps(job2_kwargs)
+                json.dumps(job2_kwargs),
             )
 
             claimed2 = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job2_id)
@@ -362,17 +362,21 @@ class TestProducerConsumerIntegration:
             # Job3 should now be available
             await conn.execute(
                 "UPDATE jorb SET state = 'queued' WHERE id = $1 AND state = 'waiting'",
-                job3_id
+                job3_id,
             )
 
             # Process Job3 with Job2's result
             job3 = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job3_id)
-            job3_kwargs = json.loads(job3["kwargs"]) if isinstance(job3["kwargs"], str) else job3["kwargs"]
+            job3_kwargs = (
+                json.loads(job3["kwargs"])
+                if isinstance(job3["kwargs"], str)
+                else job3["kwargs"]
+            )
             job3_kwargs["upstream_result"] = result2
             await conn.execute(
                 "UPDATE jorb SET kwargs = $2::json WHERE id = $1",
                 job3_id,
-                json.dumps(job3_kwargs)
+                json.dumps(job3_kwargs),
             )
 
             claimed3 = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job3_id)
@@ -388,7 +392,7 @@ class TestProducerConsumerIntegration:
         # PRODUCER: Enqueue failing job
         job_id = await job_client.enqueue(
             "tests.test_client_worker_integration.FailingJob",
-            error_message="Intentional test failure"
+            error_message="Intentional test failure",
         )
 
         # CONSUMER: First attempt fails
@@ -416,10 +420,15 @@ class TestProducerConsumerIntegration:
     async def test_concurrent_workers_no_duplicate_claims(self, db_pool, job_client):
         """Test: Multiple workers don't claim the same job."""
         # PRODUCER: Enqueue several jobs
-        job_ids = await job_client.enqueue_batch([
-            ("tests.test_client_worker_integration.SimpleTestJob", {"worker_test": i})
-            for i in range(10)
-        ])
+        job_ids = await job_client.enqueue_batch(
+            [
+                (
+                    "tests.test_client_worker_integration.SimpleTestJob",
+                    {"worker_test": i},
+                )
+                for i in range(10)
+            ]
+        )
 
         # CONSUMER: Simulate 5 concurrent workers
         claimed_jobs = []
@@ -432,7 +441,7 @@ class TestProducerConsumerIntegration:
                     f"worker-{worker_id}",
                     "default",
                     [],
-                    1000
+                    1000,
                 )
                 if claimed:
                     claimed_jobs.append(claimed["id"])
@@ -449,6 +458,7 @@ class TestProducerConsumerIntegration:
 # Integration Tests: DAG Execution
 # =============================================================================
 
+
 @pytest.mark.asyncio
 @pytest.mark.integration
 class TestDAGIntegration:
@@ -460,31 +470,33 @@ class TestDAGIntegration:
         dag_id = await db_pool.fetchval(
             "INSERT INTO jorb_dag (name, created) VALUES ($1, $2) RETURNING id",
             "Client Test Linear DAG",
-            datetime.now(timezone.utc)
+            datetime.now(UTC),
         )
 
         # Create linear chain using client
         job1_id = await job_client.enqueue(
-            "tests.test_client_worker_integration.DataProcessingJob",
-            operation="init"
+            "tests.test_client_worker_integration.DataProcessingJob", operation="init"
         )
 
         job2_id = await job_client.enqueue(
             "tests.test_client_worker_integration.DataProcessingJob",
             operation="double",
-            waitfor_job=job1_id
+            waitfor_job=job1_id,
         )
 
         job3_id = await job_client.enqueue(
             "tests.test_client_worker_integration.DataProcessingJob",
             operation="sum",
-            waitfor_job=job2_id
+            waitfor_job=job2_id,
         )
 
         # Link jobs to DAG (manual since client doesn't support dag_id parameter)
         async with db_pool.acquire() as conn:
-            await conn.execute("UPDATE jorb SET dag_id = $1 WHERE id = ANY($2::bigint[])",
-                             dag_id, [job1_id, job2_id, job3_id])
+            await conn.execute(
+                "UPDATE jorb SET dag_id = $1 WHERE id = ANY($2::bigint[])",
+                dag_id,
+                [job1_id, job2_id, job3_id],
+            )
 
         # CONSUMER: Execute DAG sequentially
         async with db_pool.acquire() as conn:
@@ -498,17 +510,21 @@ class TestDAGIntegration:
             # Release Job2
             await conn.execute(
                 "UPDATE jorb SET state = 'queued' WHERE id = $1 AND state = 'waiting'",
-                job2_id
+                job2_id,
             )
 
             # Inject Job1 result into Job2
             job2 = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job2_id)
-            job2_kwargs = json.loads(job2["kwargs"]) if isinstance(job2["kwargs"], str) else job2["kwargs"]
+            job2_kwargs = (
+                json.loads(job2["kwargs"])
+                if isinstance(job2["kwargs"], str)
+                else job2["kwargs"]
+            )
             job2_kwargs["upstream_result"] = result1
             await conn.execute(
                 "UPDATE jorb SET kwargs = $2::json WHERE id = $1",
                 job2_id,
-                json.dumps(job2_kwargs)
+                json.dumps(job2_kwargs),
             )
 
             # Execute Job2
@@ -522,17 +538,21 @@ class TestDAGIntegration:
             # Release Job3
             await conn.execute(
                 "UPDATE jorb SET state = 'queued' WHERE id = $1 AND state = 'waiting'",
-                job3_id
+                job3_id,
             )
 
             # Inject Job2 result into Job3
             job3 = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job3_id)
-            job3_kwargs = json.loads(job3["kwargs"]) if isinstance(job3["kwargs"], str) else job3["kwargs"]
+            job3_kwargs = (
+                json.loads(job3["kwargs"])
+                if isinstance(job3["kwargs"], str)
+                else job3["kwargs"]
+            )
             job3_kwargs["upstream_result"] = result2
             await conn.execute(
                 "UPDATE jorb SET kwargs = $2::json WHERE id = $1",
                 job3_id,
-                json.dumps(job3_kwargs)
+                json.dumps(job3_kwargs),
             )
 
             # Execute Job3
@@ -545,8 +565,7 @@ class TestDAGIntegration:
 
             # Verify DAG completion
             dag_status = await conn.fetchrow(
-                "SELECT * FROM jorb_dag_status WHERE dag_id = $1",
-                dag_id
+                "SELECT * FROM jorb_dag_status WHERE dag_id = $1", dag_id
             )
             assert dag_status["finished_jobs"] == 3
             assert dag_status["dag_state"] == "complete"
@@ -557,23 +576,24 @@ class TestDAGIntegration:
         dag_id = await db_pool.fetchval(
             "INSERT INTO jorb_dag (name, created) VALUES ($1, $2) RETURNING id",
             "Client Test Parallel DAG",
-            datetime.now(timezone.utc)
+            datetime.now(UTC),
         )
 
         job1_id = await job_client.enqueue(
-            "tests.test_client_worker_integration.SimpleTestJob",
-            branch="A"
+            "tests.test_client_worker_integration.SimpleTestJob", branch="A"
         )
 
         job2_id = await job_client.enqueue(
-            "tests.test_client_worker_integration.SimpleTestJob",
-            branch="B"
+            "tests.test_client_worker_integration.SimpleTestJob", branch="B"
         )
 
         # Link jobs to DAG (manual since client doesn't support dag_id parameter)
         async with db_pool.acquire() as conn:
-            await conn.execute("UPDATE jorb SET dag_id = $1 WHERE id = ANY($2::bigint[])",
-                             dag_id, [job1_id, job2_id])
+            await conn.execute(
+                "UPDATE jorb SET dag_id = $1 WHERE id = ANY($2::bigint[])",
+                dag_id,
+                [job1_id, job2_id],
+            )
 
         # CONSUMER: Process both in parallel
         async with db_pool.acquire() as conn1, db_pool.acquire() as conn2:
@@ -593,14 +613,12 @@ class TestDAGIntegration:
                 await mark_finished(conn, claimed["id"], result)
 
             await asyncio.gather(
-                execute_and_finish(conn1, claimed1),
-                execute_and_finish(conn2, claimed2)
+                execute_and_finish(conn1, claimed1), execute_and_finish(conn2, claimed2)
             )
 
             # Verify both finished
             finished_jobs = await conn1.fetch(
-                "SELECT * FROM jorb WHERE dag_id = $1 AND state = 'finished'",
-                dag_id
+                "SELECT * FROM jorb WHERE dag_id = $1 AND state = 'finished'", dag_id
             )
             assert len(finished_jobs) == 2
 
@@ -608,6 +626,7 @@ class TestDAGIntegration:
 # =============================================================================
 # Integration Tests: Advanced Features
 # =============================================================================
+
 
 @pytest.mark.asyncio
 @pytest.mark.integration
@@ -621,7 +640,7 @@ class TestAdvancedClientFeatures:
         job_id = await job_client.enqueue(
             "tests.test_client_worker_integration.SimpleTestJob",
             run_after=future_time,
-            scheduled=True
+            scheduled=True,
         )
 
         # CONSUMER: Cannot claim immediately
@@ -643,7 +662,7 @@ class TestAdvancedClientFeatures:
         job_id = await job_client.enqueue(
             "tests.test_client_worker_integration.SimpleTestJob",
             capability="gpu",
-            gpu_task=True
+            gpu_task=True,
         )
 
         # CONSUMER: Worker without GPU cannot claim
@@ -654,7 +673,7 @@ class TestAdvancedClientFeatures:
                 "cpu-worker",
                 "default",
                 ["cpu"],  # Only has CPU capability
-                1000
+                1000,
             )
             assert claimed_no_gpu is None
 
@@ -665,7 +684,7 @@ class TestAdvancedClientFeatures:
                 "gpu-worker",
                 "default",
                 ["cpu", "gpu"],  # Has GPU capability
-                1000
+                1000,
             )
             assert claimed_with_gpu is not None
             assert claimed_with_gpu["id"] == job_id
@@ -676,13 +695,13 @@ class TestAdvancedClientFeatures:
         critical_job = await job_client.enqueue(
             "tests.test_client_worker_integration.SimpleTestJob",
             queue="critical",
-            priority=10
+            priority=10,
         )
 
         normal_job = await job_client.enqueue(
             "tests.test_client_worker_integration.SimpleTestJob",
             queue="normal",
-            priority=100
+            priority=100,
         )
 
         # CONSUMER: Normal queue worker doesn't get critical jobs

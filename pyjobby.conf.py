@@ -9,11 +9,6 @@ db_params = {
 }
 
 web_listen = {
-    "sites": [
-        {"host": "127.0.0.1", "port": 8080}
-    ],
-    "paths": set([
-        # Add job classes that should be callable via web
-        # Example: "job.image.Thumbnail"
-    ])
+    "sites": [{"host": "127.0.0.1", "port": 8080}],
+    "paths": set(),
 }

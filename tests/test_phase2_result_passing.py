@@ -5,11 +5,10 @@ Comprehensive tests for result storage and passing between jobs in pipelines.
 Tests both database storage and automatic result injection.
 """
 
-import asyncio
 from datetime import datetime
 
-import pytest
 import asyncpg
+import pytest
 
 from tests.utils.factories import create_job, get_job
 
@@ -25,7 +24,7 @@ class TestResultStorage:
             FROM information_schema.columns
             WHERE table_name = 'jorb' AND column_name = 'result'
         """)
-        assert result == 'result'
+        assert result == "result"
 
     @pytest.mark.asyncio
     async def test_result_index_exists(self, db_connection):
@@ -35,7 +34,7 @@ class TestResultStorage:
             FROM pg_indexes
             WHERE tablename = 'jorb' AND indexname = 'jorb_result_exists_idx'
         """)
-        assert result == 'jorb_result_exists_idx'
+        assert result == "jorb_result_exists_idx"
 
     @pytest.mark.asyncio
     async def test_store_simple_result(self, db_connection):
@@ -44,24 +43,28 @@ class TestResultStorage:
 
         # Store result
         test_result = {"status": "success", "count": 42}
-        await db_connection.execute("""
+        await db_connection.execute(
+            """
             UPDATE jorb
             SET result = $1, state = 'finished'
             WHERE id = $2
-        """, test_result, job_id)
+        """,
+            test_result,
+            job_id,
+        )
 
         # Retrieve and verify
         job = await get_job(db_connection, job_id)
-        assert job['result'] is not None
-        assert job['result']['status'] == 'success'
-        assert job['result']['count'] == 42
+        assert job["result"] is not None
+        assert job["result"]["status"] == "success"
+        assert job["result"]["count"] == 42
 
     @pytest.mark.asyncio
     async def test_result_null_by_default(self, db_connection):
         """Test that result is NULL by default."""
         job_id = await create_job(db_connection, job_class="test.Job")
         job = await get_job(db_connection, job_id)
-        assert job['result'] is None
+        assert job["result"] is None
 
     @pytest.mark.asyncio
     async def test_store_complex_result(self, db_connection):
@@ -72,26 +75,24 @@ class TestResultStorage:
             "status": "success",
             "data": {
                 "items": [1, 2, 3, 4, 5],
-                "metadata": {
-                    "timestamp": datetime.now().isoformat(),
-                    "version": "1.0"
-                }
+                "metadata": {"timestamp": datetime.now().isoformat(), "version": "1.0"},
             },
-            "stats": {
-                "processed": 100,
-                "failed": 0
-            }
+            "stats": {"processed": 100, "failed": 0},
         }
 
-        await db_connection.execute("""
+        await db_connection.execute(
+            """
             UPDATE jorb
             SET result = $1, state = 'finished'
             WHERE id = $2
-        """, complex_result, job_id)
+        """,
+            complex_result,
+            job_id,
+        )
 
         job = await get_job(db_connection, job_id)
-        assert job['result']['data']['items'] == [1, 2, 3, 4, 5]
-        assert job['result']['stats']['processed'] == 100
+        assert job["result"]["data"]["items"] == [1, 2, 3, 4, 5]
+        assert job["result"]["stats"]["processed"] == 100
 
     @pytest.mark.asyncio
     async def test_result_size_limit(self, db_connection):
@@ -102,11 +103,15 @@ class TestResultStorage:
         large_result = {"data": "x" * (11 * 1024 * 1024)}  # 11MB of 'x'
 
         with pytest.raises(asyncpg.exceptions.CheckViolationError):
-            await db_connection.execute("""
+            await db_connection.execute(
+                """
                 UPDATE jorb
                 SET result = $1, state = 'finished'
                 WHERE id = $2
-            """, large_result, job_id)
+            """,
+                large_result,
+                job_id,
+            )
 
     @pytest.mark.asyncio
     async def test_result_with_finished_statement(self, db_connection):
@@ -116,15 +121,12 @@ class TestResultStorage:
         job_id = await create_job(db_connection, job_class="test.Job", state="claimed")
 
         result = {"status": "completed", "value": 123}
-        await db_connection.execute(
-            STMTS["finished"],
-            job_id, result
-        )
+        await db_connection.execute(STMTS["finished"], job_id, result)
 
         job = await get_job(db_connection, job_id)
-        assert job['state'] == 'finished'
-        assert job['result'] is not None
-        assert job['result']['value'] == 123
+        assert job["state"] == "finished"
+        assert job["result"] is not None
+        assert job["result"]["value"] == 123
 
 
 class TestResultPassing:
@@ -136,34 +138,49 @@ class TestResultPassing:
         # Create upstream job with result
         upstream_id = await create_job(db_connection, job_class="test.Upstream")
         upstream_result = {"data": "from_upstream", "count": 42}
-        await db_connection.execute("""
+        await db_connection.execute(
+            """
             UPDATE jorb
             SET result = $1, state = 'finished'
             WHERE id = $2
-        """, upstream_result, upstream_id)
+        """,
+            upstream_result,
+            upstream_id,
+        )
 
         # Create downstream job referencing upstream
         downstream_kwargs = {"param": "value"}
-        downstream_id = await db_connection.fetchval("""
+        downstream_id = await db_connection.fetchval(
+            """
             INSERT INTO jorb (job_class, kwargs, queue, state, waitfor_job)
             VALUES ($1, $2, $3, $4, $5)
             RETURNING id
-        """, "test.Downstream", downstream_kwargs, "default", "waiting", upstream_id)
+        """,
+            "test.Downstream",
+            downstream_kwargs,
+            "default",
+            "waiting",
+            upstream_id,
+        )
 
         # Simulate client.enqueue with use_result_from
         # In real usage, client would inject upstream_result into kwargs
         upstream_job = await get_job(db_connection, upstream_id)
-        if upstream_job['result']:
-            downstream_kwargs['upstream_result'] = upstream_job['result']
-            await db_connection.execute("""
+        if upstream_job["result"]:
+            downstream_kwargs["upstream_result"] = upstream_job["result"]
+            await db_connection.execute(
+                """
                 UPDATE jorb SET kwargs = $1 WHERE id = $2
-            """, downstream_kwargs, downstream_id)
+            """,
+                downstream_kwargs,
+                downstream_id,
+            )
 
         # Verify downstream has upstream result
         downstream_job = await get_job(db_connection, downstream_id)
-        assert 'upstream_result' in downstream_job['kwargs']
-        assert downstream_job['kwargs']['upstream_result']['data'] == 'from_upstream'
-        assert downstream_job['kwargs']['upstream_result']['count'] == 42
+        assert "upstream_result" in downstream_job["kwargs"]
+        assert downstream_job["kwargs"]["upstream_result"]["data"] == "from_upstream"
+        assert downstream_job["kwargs"]["upstream_result"]["count"] == 42
 
     @pytest.mark.asyncio
     async def test_result_passing_in_chain(self, db_connection):
@@ -171,69 +188,85 @@ class TestResultPassing:
         # Job 1: Initial data
         job1_id = await create_job(db_connection, job_class="test.Job1")
         job1_result = {"step": 1, "data": "initial"}
-        await db_connection.execute("""
+        await db_connection.execute(
+            """
             UPDATE jorb SET result = $1, state = 'finished' WHERE id = $2
-        """, job1_result, job1_id)
+        """,
+            job1_result,
+            job1_id,
+        )
 
         # Job 2: Waits for job1, processes its result
         job2_id = await create_job(
-            db_connection,
-            job_class="test.Job2",
-            waitfor_job=job1_id
+            db_connection, job_class="test.Job2", waitfor_job=job1_id
         )
         # Inject result from job1
         job1 = await get_job(db_connection, job1_id)
-        await db_connection.execute("""
+        await db_connection.execute(
+            """
             UPDATE jorb
             SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1))
             WHERE id = $2
-        """, job1['result'], job2_id)
+        """,
+            job1["result"],
+            job2_id,
+        )
 
         # Job 2 produces its own result
-        job2_result = {"step": 2, "data": "processed", "from_step1": job1_result['data']}
-        await db_connection.execute("""
+        job2_result = {
+            "step": 2,
+            "data": "processed",
+            "from_step1": job1_result["data"],
+        }
+        await db_connection.execute(
+            """
             UPDATE jorb SET result = $1, state = 'finished' WHERE id = $2
-        """, job2_result, job2_id)
+        """,
+            job2_result,
+            job2_id,
+        )
 
         # Job 3: Waits for job2
         job3_id = await create_job(
-            db_connection,
-            job_class="test.Job3",
-            waitfor_job=job2_id
+            db_connection, job_class="test.Job3", waitfor_job=job2_id
         )
         # Inject result from job2
         job2 = await get_job(db_connection, job2_id)
-        await db_connection.execute("""
+        await db_connection.execute(
+            """
             UPDATE jorb
             SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1))
             WHERE id = $2
-        """, job2['result'], job3_id)
+        """,
+            job2["result"],
+            job3_id,
+        )
 
         # Verify job3 has result from job2
         job3 = await get_job(db_connection, job3_id)
-        assert job3['kwargs']['upstream_result']['step'] == 2
-        assert job3['kwargs']['upstream_result']['from_step1'] == 'initial'
+        assert job3["kwargs"]["upstream_result"]["step"] == 2
+        assert job3["kwargs"]["upstream_result"]["from_step1"] == "initial"
 
     @pytest.mark.asyncio
     async def test_result_passing_with_null_result(self, db_connection):
         """Test that NULL result doesn't break downstream jobs."""
         # Upstream job with no result
-        upstream_id = await create_job(db_connection, job_class="test.Upstream", state="finished")
+        upstream_id = await create_job(
+            db_connection, job_class="test.Upstream", state="finished"
+        )
 
         # Downstream job
         downstream_id = await create_job(
-            db_connection,
-            job_class="test.Downstream",
-            waitfor_job=upstream_id
+            db_connection, job_class="test.Downstream", waitfor_job=upstream_id
         )
 
         # Simulate client checking for upstream result (would be NULL)
         upstream = await get_job(db_connection, upstream_id)
-        assert upstream['result'] is None
+        assert upstream["result"] is None
 
         # Downstream kwargs should not have upstream_result
         downstream = await get_job(db_connection, downstream_id)
-        assert 'upstream_result' not in downstream['kwargs']
+        assert "upstream_result" not in downstream["kwargs"]
 
 
 class TestAdminDataSaveResult:
@@ -243,15 +276,21 @@ class TestAdminDataSaveResult:
     async def test_save_result_flag_in_admin_data(self, db_connection):
         """Test that save_result flag can be stored in admin_data."""
         admin_data = {"save_result": True, "other_meta": "value"}
-        job_id = await db_connection.fetchval("""
+        job_id = await db_connection.fetchval(
+            """
             INSERT INTO jorb (job_class, kwargs, queue, admin_data)
             VALUES ($1, $2, $3, $4)
             RETURNING id
-        """, "test.Job", '{}', "default", admin_data)
+        """,
+            "test.Job",
+            "{}",
+            "default",
+            admin_data,
+        )
 
         job = await get_job(db_connection, job_id)
-        assert job['admin_data'] is not None
-        assert job['admin_data']['save_result'] is True
+        assert job["admin_data"] is not None
+        assert job["admin_data"]["save_result"] is True
 
     @pytest.mark.asyncio
     async def test_save_result_defaults_to_false(self, db_connection):
@@ -260,8 +299,8 @@ class TestAdminDataSaveResult:
         job = await get_job(db_connection, job_id)
 
         # admin_data may be None or empty
-        if job['admin_data']:
-            assert job['admin_data'].get('save_result', False) is False
+        if job["admin_data"]:
+            assert job["admin_data"].get("save_result", False) is False
         else:
             # No admin_data means save_result is False
             assert True
@@ -279,57 +318,67 @@ class TestPipelinePatterns:
         # Fetch job (saves result)
         fetch_id = await create_job(db_connection, job_class="test.Fetch")
         jobs.append(fetch_id)
-        await db_connection.execute("""
+        await db_connection.execute(
+            """
             UPDATE jorb
             SET admin_data = $1, result = $2, state = 'finished'
             WHERE id = $3
-        """, {"save_result": True},
+        """,
+            {"save_result": True},
             {"fetched_data": [1, 2, 3]},
-            fetch_id)
+            fetch_id,
+        )
 
         # Process job (saves result, uses fetch result)
         process_id = await create_job(
-            db_connection,
-            job_class="test.Process",
-            waitfor_job=fetch_id
+            db_connection, job_class="test.Process", waitfor_job=fetch_id
         )
         jobs.append(process_id)
         # Inject upstream result
         fetch_job = await get_job(db_connection, fetch_id)
-        await db_connection.execute("""
+        await db_connection.execute(
+            """
             UPDATE jorb
             SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1)),
                 admin_data = $2
             WHERE id = $3
-        """, fetch_job['result'],
+        """,
+            fetch_job["result"],
             {"save_result": True},
-            process_id)
+            process_id,
+        )
 
         # Process produces result
-        await db_connection.execute("""
+        await db_connection.execute(
+            """
             UPDATE jorb
             SET result = $1, state = 'finished'
             WHERE id = $2
-        """, {"processed_data": [2, 4, 6]}, process_id)
+        """,
+            {"processed_data": [2, 4, 6]},
+            process_id,
+        )
 
         # Store job (doesn't save result, uses process result)
         store_id = await create_job(
-            db_connection,
-            job_class="test.Store",
-            waitfor_job=process_id
+            db_connection, job_class="test.Store", waitfor_job=process_id
         )
         jobs.append(store_id)
         # Inject upstream result
         process_job = await get_job(db_connection, process_id)
-        await db_connection.execute("""
+        await db_connection.execute(
+            """
             UPDATE jorb
             SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1))
             WHERE id = $2
-        """, process_job['result'], store_id)
+        """,
+            process_job["result"],
+            store_id,
+        )
 
         # Verify store job has processed data
         store_job = await get_job(db_connection, store_id)
-        assert store_job['kwargs']['upstream_result']['processed_data'] == [2, 4, 6]
+        assert store_job["kwargs"]["upstream_result"]["processed_data"] == [2, 4, 6]
 
     @pytest.mark.asyncio
     async def test_fan_out_with_results(self, db_connection):
@@ -337,34 +386,40 @@ class TestPipelinePatterns:
         # Upstream job produces result
         upstream_id = await create_job(db_connection, job_class="test.Upstream")
         upstream_result = {"shared_data": "available_to_all"}
-        await db_connection.execute("""
+        await db_connection.execute(
+            """
             UPDATE jorb
             SET result = $1, state = 'finished'
             WHERE id = $2
-        """, upstream_result, upstream_id)
+        """,
+            upstream_result,
+            upstream_id,
+        )
 
         # Create 3 downstream jobs, all using the same upstream result
         downstream_ids = []
         for i in range(3):
             job_id = await create_job(
-                db_connection,
-                job_class=f"test.Downstream{i}",
-                waitfor_job=upstream_id
+                db_connection, job_class=f"test.Downstream{i}", waitfor_job=upstream_id
             )
             downstream_ids.append(job_id)
 
             # Inject upstream result into each
             upstream = await get_job(db_connection, upstream_id)
-            await db_connection.execute("""
+            await db_connection.execute(
+                """
                 UPDATE jorb
                 SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1))
                 WHERE id = $2
-            """, upstream['result'], job_id)
+            """,
+                upstream["result"],
+                job_id,
+            )
 
         # Verify all downstream jobs have the shared data
         for job_id in downstream_ids:
             job = await get_job(db_connection, job_id)
-            assert job['kwargs']['upstream_result']['shared_data'] == 'available_to_all'
+            assert job["kwargs"]["upstream_result"]["shared_data"] == "available_to_all"
 
 
 class TestResultCleanup:
@@ -374,15 +429,19 @@ class TestResultCleanup:
     async def test_result_deleted_with_job(self, db_connection):
         """Test that result is deleted when job row is deleted."""
         job_id = await create_job(db_connection, job_class="test.Job")
-        await db_connection.execute("""
+        await db_connection.execute(
+            """
             UPDATE jorb
             SET result = $1, state = 'finished'
             WHERE id = $2
-        """, {"data": "test"}, job_id)
+        """,
+            {"data": "test"},
+            job_id,
+        )
 
         # Verify result exists
         job = await get_job(db_connection, job_id)
-        assert job['result'] is not None
+        assert job["result"] is not None
 
         # Delete job
         await db_connection.execute("DELETE FROM jorb WHERE id = $1", job_id)
@@ -397,18 +456,25 @@ class TestResultCleanup:
         job_id = await create_job(db_connection, job_class="test.Job")
         test_result = {"data": "persistent"}
 
-        await db_connection.execute("""
+        await db_connection.execute(
+            """
             UPDATE jorb
             SET result = $1, state = 'finished'
             WHERE id = $2
-        """, test_result, job_id)
+        """,
+            test_result,
+            job_id,
+        )
 
         # Change state (simulating inspection or retry)
-        await db_connection.execute("""
+        await db_connection.execute(
+            """
             UPDATE jorb SET state = 'queued' WHERE id = $1
-        """, job_id)
+        """,
+            job_id,
+        )
 
         # Result should still be there
         job = await get_job(db_connection, job_id)
-        assert job['result'] is not None
-        assert job['result']['data'] == 'persistent'
+        assert job["result"] is not None
+        assert job["result"]["data"] == "persistent"

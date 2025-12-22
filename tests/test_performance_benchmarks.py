@@ -15,13 +15,12 @@ Test categories:
 
 import asyncio
 import time
-from datetime import datetime, timedelta, timezone
-from typing import List
+from datetime import UTC, datetime
 
 import pytest
 
 from pyjobby.client import JobClient
-from tests.utils.factories import create_job, get_job
+from tests.utils.factories import get_job
 
 
 @pytest.mark.slow
@@ -40,23 +39,25 @@ class TestThroughputBenchmarks:
         job_ids = []
         for i in range(num_jobs):
             job_id = await client.enqueue(
-                "test.BenchmarkJob",
-                kwargs={"index": i},
-                queue="benchmark"
+                "test.BenchmarkJob", kwargs={"index": i}, queue="benchmark"
             )
             job_ids.append(job_id)
 
         elapsed = time.time() - start_time
         throughput = num_jobs / elapsed
 
-        print(f"\n📊 Enqueue throughput (single): {throughput:.1f} jobs/sec ({num_jobs} jobs in {elapsed:.2f}s)")
+        print(
+            f"\n📊 Enqueue throughput (single): {throughput:.1f} jobs/sec ({num_jobs} jobs in {elapsed:.2f}s)"
+        )
 
         # Cleanup
         for job_id in job_ids:
             await db_pool.execute("DELETE FROM jorb WHERE id = $1", job_id)
 
         # Expectation: Should enqueue at least 50 jobs/second
-        assert throughput >= 50, f"Enqueue throughput too low: {throughput:.1f} jobs/sec"
+        assert throughput >= 50, (
+            f"Enqueue throughput too low: {throughput:.1f} jobs/sec"
+        )
 
     @pytest.mark.asyncio
     async def test_enqueue_throughput_batch(self, db_pool):
@@ -73,9 +74,7 @@ class TestThroughputBenchmarks:
             batch_jobs = []
             for i in range(batch_start, min(batch_start + batch_size, num_jobs)):
                 job_id = await client.enqueue(
-                    "test.BenchmarkJob",
-                    kwargs={"batch": i},
-                    queue="benchmark"
+                    "test.BenchmarkJob", kwargs={"batch": i}, queue="benchmark"
                 )
                 batch_jobs.append(job_id)
             job_ids.extend(batch_jobs)
@@ -83,13 +82,17 @@ class TestThroughputBenchmarks:
         elapsed = time.time() - start_time
         throughput = num_jobs / elapsed
 
-        print(f"\n📊 Enqueue throughput (batch): {throughput:.1f} jobs/sec ({num_jobs} jobs in {elapsed:.2f}s)")
+        print(
+            f"\n📊 Enqueue throughput (batch): {throughput:.1f} jobs/sec ({num_jobs} jobs in {elapsed:.2f}s)"
+        )
 
         # Cleanup
         await db_pool.execute("DELETE FROM jorb WHERE id = ANY($1::bigint[])", job_ids)
 
         # Expectation: Batch should be faster than single
-        assert throughput >= 100, f"Batch enqueue throughput too low: {throughput:.1f} jobs/sec"
+        assert throughput >= 100, (
+            f"Batch enqueue throughput too low: {throughput:.1f} jobs/sec"
+        )
 
     @pytest.mark.asyncio
     async def test_query_throughput(self, db_pool):
@@ -97,11 +100,17 @@ class TestThroughputBenchmarks:
         # Create test jobs
         job_ids = []
         for i in range(100):
-            job_id = await db_pool.fetchval("""
+            job_id = await db_pool.fetchval(
+                """
                 INSERT INTO jorb (job_class, kwargs, queue, state)
                 VALUES ($1, $2, $3, $4)
                 RETURNING id
-            """, "test.Job", {"i": i}, "benchmark", "queued")
+            """,
+                "test.Job",
+                {"i": i},
+                "benchmark",
+                "queued",
+            )
             job_ids.append(job_id)
 
         # Benchmark queries
@@ -115,13 +124,17 @@ class TestThroughputBenchmarks:
         elapsed = time.time() - start_time
         throughput = num_queries / elapsed
 
-        print(f"\n📊 Query throughput: {throughput:.1f} queries/sec ({num_queries} queries in {elapsed:.2f}s)")
+        print(
+            f"\n📊 Query throughput: {throughput:.1f} queries/sec ({num_queries} queries in {elapsed:.2f}s)"
+        )
 
         # Cleanup
         await db_pool.execute("DELETE FROM jorb WHERE id = ANY($1::bigint[])", job_ids)
 
         # Expectation: Should query at least 500/second
-        assert throughput >= 500, f"Query throughput too low: {throughput:.1f} queries/sec"
+        assert throughput >= 500, (
+            f"Query throughput too low: {throughput:.1f} queries/sec"
+        )
 
 
 @pytest.mark.slow
@@ -141,9 +154,7 @@ class TestLatencyBenchmarks:
             start = time.time()
 
             job_id = await client.enqueue(
-                "test.Job",
-                kwargs={"sample": i},
-                queue="latency_test"
+                "test.Job", kwargs={"sample": i}, queue="latency_test"
             )
 
             latency = (time.time() - start) * 1000  # Convert to ms
@@ -172,11 +183,17 @@ class TestLatencyBenchmarks:
     async def test_state_update_latency(self, db_pool):
         """Benchmark: Latency for job state updates."""
         # Create test job
-        job_id = await db_pool.fetchval("""
+        job_id = await db_pool.fetchval(
+            """
             INSERT INTO jorb (job_class, kwargs, queue, state)
             VALUES ($1, $2, $3, $4)
             RETURNING id
-        """, "test.Job", {}, "latency_test", "queued")
+        """,
+            "test.Job",
+            {},
+            "latency_test",
+            "queued",
+        )
 
         num_samples = 100
         latencies = []
@@ -188,11 +205,16 @@ class TestLatencyBenchmarks:
 
             start = time.time()
 
-            await db_pool.execute("""
+            await db_pool.execute(
+                """
                 UPDATE jorb
                 SET state = $2, updated = $3
                 WHERE id = $1
-            """, job_id, state, datetime.now())
+            """,
+                job_id,
+                state,
+                datetime.now(),
+            )
 
             latency = (time.time() - start) * 1000
             latencies.append(latency)
@@ -201,7 +223,9 @@ class TestLatencyBenchmarks:
         avg_latency = sum(latencies) / len(latencies)
         p95_latency = sorted(latencies)[int(len(latencies) * 0.95)]
 
-        print(f"\n📊 State update latency: avg={avg_latency:.2f}ms, p95={p95_latency:.2f}ms")
+        print(
+            f"\n📊 State update latency: avg={avg_latency:.2f}ms, p95={p95_latency:.2f}ms"
+        )
 
         # Cleanup
         await db_pool.execute("DELETE FROM jorb WHERE id = $1", job_id)
@@ -230,9 +254,7 @@ class TestScalabilityBenchmarks:
             job_ids = []
             for i in range(size):
                 job_id = await client.enqueue(
-                    "test.Job",
-                    kwargs={"index": i},
-                    queue="scaling_test"
+                    "test.Job", kwargs={"index": i}, queue="scaling_test"
                 )
                 job_ids.append(job_id)
 
@@ -244,7 +266,9 @@ class TestScalabilityBenchmarks:
             print(f"\n📊 {size:4d} jobs: {throughput:6.1f} jobs/sec ({elapsed:.2f}s)")
 
             # Cleanup
-            await db_pool.execute("DELETE FROM jorb WHERE id = ANY($1::bigint[])", job_ids)
+            await db_pool.execute(
+                "DELETE FROM jorb WHERE id = ANY($1::bigint[])", job_ids
+            )
 
         # Verify scaling is roughly linear (throughput doesn't degrade significantly)
         if len(results) >= 2:
@@ -253,7 +277,9 @@ class TestScalabilityBenchmarks:
 
             # Throughput shouldn't degrade by more than 50%
             degradation = (first_throughput - last_throughput) / first_throughput
-            assert degradation < 0.5, f"Throughput degraded too much: {degradation*100:.1f}%"
+            assert degradation < 0.5, (
+                f"Throughput degraded too much: {degradation * 100:.1f}%"
+            )
 
     @pytest.mark.asyncio
     async def test_scaling_concurrent_queries(self, db_pool):
@@ -261,11 +287,17 @@ class TestScalabilityBenchmarks:
         # Create test jobs
         job_ids = []
         for i in range(10):
-            job_id = await db_pool.fetchval("""
+            job_id = await db_pool.fetchval(
+                """
                 INSERT INTO jorb (job_class, kwargs, queue, state)
                 VALUES ($1, $2, $3, $4)
                 RETURNING id
-            """, "test.Job", {"i": i}, "concurrent_test", "queued")
+            """,
+                "test.Job",
+                {"i": i},
+                "concurrent_test",
+                "queued",
+            )
             job_ids.append(job_id)
 
         async def query_job(job_id):
@@ -288,7 +320,9 @@ class TestScalabilityBenchmarks:
 
             throughput = concurrency / elapsed
 
-            print(f"\n📊 Concurrency {concurrency:3d}: {throughput:6.1f} queries/sec ({elapsed:.3f}s)")
+            print(
+                f"\n📊 Concurrency {concurrency:3d}: {throughput:6.1f} queries/sec ({elapsed:.3f}s)"
+            )
 
         # Cleanup
         await db_pool.execute("DELETE FROM jorb WHERE id = ANY($1::bigint[])", job_ids)
@@ -303,11 +337,15 @@ class TestLargeDAGBenchmarks:
     async def test_large_linear_dag_creation(self, db_pool):
         """Benchmark: Create large linear DAG (100 jobs)."""
         # Create DAG
-        dag_id = await db_pool.fetchval("""
+        dag_id = await db_pool.fetchval(
+            """
             INSERT INTO jorb_dag (name, created)
             VALUES ($1, $2)
             RETURNING id
-        """, "Large Linear DAG", datetime.now(timezone.utc))
+        """,
+            "Large Linear DAG",
+            datetime.now(UTC),
+        )
 
         num_jobs = 100
 
@@ -318,14 +356,19 @@ class TestLargeDAGBenchmarks:
         job_ids = []
 
         for i in range(num_jobs):
-            job_id = await db_pool.fetchval("""
+            job_id = await db_pool.fetchval(
+                """
                 INSERT INTO jorb (job_class, kwargs, queue, state, dag_id, waitfor_job)
                 VALUES ($1, $2, $3, $4, $5, $6)
                 RETURNING id
-            """, "test.Job", {"step": i}, "dag_test",
+            """,
+                "test.Job",
+                {"step": i},
+                "dag_test",
                 "queued" if i == 0 else "waiting",
                 dag_id,
-                prev_job_id)
+                prev_job_id,
+            )
 
             job_ids.append(job_id)
             prev_job_id = job_id
@@ -333,7 +376,9 @@ class TestLargeDAGBenchmarks:
         elapsed = time.time() - start_time
         throughput = num_jobs / elapsed
 
-        print(f"\n📊 Large linear DAG creation: {throughput:.1f} jobs/sec ({num_jobs} jobs in {elapsed:.2f}s)")
+        print(
+            f"\n📊 Large linear DAG creation: {throughput:.1f} jobs/sec ({num_jobs} jobs in {elapsed:.2f}s)"
+        )
 
         # Cleanup
         await db_pool.execute("DELETE FROM jorb WHERE dag_id = $1", dag_id)
@@ -346,11 +391,15 @@ class TestLargeDAGBenchmarks:
     async def test_large_parallel_dag_creation(self, db_pool):
         """Benchmark: Create large parallel DAG (10 branches x 10 jobs)."""
         # Create DAG
-        dag_id = await db_pool.fetchval("""
+        dag_id = await db_pool.fetchval(
+            """
             INSERT INTO jorb_dag (name, created)
             VALUES ($1, $2)
             RETURNING id
-        """, "Large Parallel DAG", datetime.now(timezone.utc))
+        """,
+            "Large Parallel DAG",
+            datetime.now(UTC),
+        )
 
         num_branches = 10
         jobs_per_branch = 10
@@ -365,14 +414,19 @@ class TestLargeDAGBenchmarks:
             prev_job_id = None
 
             for step in range(jobs_per_branch):
-                job_id = await db_pool.fetchval("""
+                job_id = await db_pool.fetchval(
+                    """
                     INSERT INTO jorb (job_class, kwargs, queue, state, dag_id, waitfor_job)
                     VALUES ($1, $2, $3, $4, $5, $6)
                     RETURNING id
-                """, "test.Job", {"branch": branch, "step": step}, "dag_test",
+                """,
+                    "test.Job",
+                    {"branch": branch, "step": step},
+                    "dag_test",
                     "queued" if step == 0 else "waiting",
                     dag_id,
-                    prev_job_id)
+                    prev_job_id,
+                )
 
                 job_ids.append(job_id)
                 prev_job_id = job_id
@@ -380,35 +434,51 @@ class TestLargeDAGBenchmarks:
         elapsed = time.time() - start_time
         throughput = total_jobs / elapsed
 
-        print(f"\n📊 Large parallel DAG creation: {throughput:.1f} jobs/sec ({total_jobs} jobs in {elapsed:.2f}s)")
+        print(
+            f"\n📊 Large parallel DAG creation: {throughput:.1f} jobs/sec ({total_jobs} jobs in {elapsed:.2f}s)"
+        )
 
         # Cleanup
         await db_pool.execute("DELETE FROM jorb WHERE dag_id = $1", dag_id)
         await db_pool.execute("DELETE FROM jorb_dag WHERE id = $1", dag_id)
 
         # Expectation: Should maintain good throughput even with parallel structure
-        assert throughput >= 50, f"Parallel DAG creation too slow: {throughput:.1f} jobs/sec"
+        assert throughput >= 50, (
+            f"Parallel DAG creation too slow: {throughput:.1f} jobs/sec"
+        )
 
     @pytest.mark.asyncio
     async def test_dag_validation_performance(self, db_pool):
         """Benchmark: DAG cycle validation on large DAG."""
         # Create DAG with 50 jobs
-        dag_id = await db_pool.fetchval("""
+        dag_id = await db_pool.fetchval(
+            """
             INSERT INTO jorb_dag (name, created)
             VALUES ($1, $2)
             RETURNING id
-        """, "Validation Test DAG", datetime.now(timezone.utc))
+        """,
+            "Validation Test DAG",
+            datetime.now(UTC),
+        )
 
         num_jobs = 50
 
         # Create linear chain (no cycles)
         prev_job_id = None
         for i in range(num_jobs):
-            job_id = await db_pool.fetchval("""
+            job_id = await db_pool.fetchval(
+                """
                 INSERT INTO jorb (job_class, kwargs, queue, state, dag_id, waitfor_job)
                 VALUES ($1, $2, $3, $4, $5, $6)
                 RETURNING id
-            """, "test.Job", {"i": i}, "dag_test", "queued", dag_id, prev_job_id)
+            """,
+                "test.Job",
+                {"i": i},
+                "dag_test",
+                "queued",
+                dag_id,
+                prev_job_id,
+            )
             prev_job_id = job_id
 
         # Benchmark validation
@@ -416,9 +486,12 @@ class TestLargeDAGBenchmarks:
         start_time = time.time()
 
         for _ in range(num_validations):
-            is_valid = await db_pool.fetchval("""
+            is_valid = await db_pool.fetchval(
+                """
                 SELECT validate_dag_acyclic($1)
-            """, dag_id)
+            """,
+                dag_id,
+            )
             assert is_valid is True
 
         elapsed = time.time() - start_time
@@ -442,6 +515,7 @@ class TestConnectionPoolingBenchmarks:
     @pytest.mark.asyncio
     async def test_connection_pool_under_load(self, db_pool):
         """Benchmark: Connection pool handling concurrent queries."""
+
         async def query():
             """Execute a query using the pool."""
             async with db_pool.acquire() as conn:
@@ -459,7 +533,9 @@ class TestConnectionPoolingBenchmarks:
             elapsed = time.time() - start_time
             throughput = load / elapsed
 
-            print(f"\n📊 Connection pool (load={load}): {throughput:.1f} queries/sec ({elapsed:.3f}s)")
+            print(
+                f"\n📊 Connection pool (load={load}): {throughput:.1f} queries/sec ({elapsed:.3f}s)"
+            )
 
             assert len(results) == load
 
@@ -487,7 +563,9 @@ class TestConnectionPoolingBenchmarks:
 
         elapsed = time.time() - start_time
 
-        print(f"\n📊 Pool saturation ({num_operations} ops, {pool_size} connections): {elapsed:.2f}s")
+        print(
+            f"\n📊 Pool saturation ({num_operations} ops, {pool_size} connections): {elapsed:.2f}s"
+        )
 
         assert len(results) == num_operations
 
@@ -515,11 +593,18 @@ class TestMemoryUsageBenchmarks:
             start_time = time.time()
 
             # Store in database
-            job_id = await db_pool.fetchval("""
+            job_id = await db_pool.fetchval(
+                """
                 INSERT INTO jorb (job_class, kwargs, queue, state, result)
                 VALUES ($1, $2, $3, $4, $5)
                 RETURNING id
-            """, "test.Job", {}, "memory_test", "finished", result)
+            """,
+                "test.Job",
+                {},
+                "memory_test",
+                "finished",
+                result,
+            )
 
             # Retrieve from database
             retrieved_job = await get_job(db_pool, job_id)
@@ -529,7 +614,7 @@ class TestMemoryUsageBenchmarks:
             print(f"\n📊 Result size {size:5d} items: {elapsed:.2f}ms round-trip")
 
             # Verify data integrity
-            assert retrieved_job['result']['data'] == list(range(size))
+            assert retrieved_job["result"]["data"] == list(range(size))
 
             # Cleanup
             await db_pool.execute("DELETE FROM jorb WHERE id = $1", job_id)

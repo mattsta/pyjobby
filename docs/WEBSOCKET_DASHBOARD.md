@@ -48,6 +48,7 @@ PostgreSQL triggers that send NOTIFY events:
 - **job_created**: Fires for 20% of new jobs (sampled to avoid spam)
 
 **Install**:
+
 ```bash
 psql pyjobby < priv/migrations/004_add_realtime_events.sql
 ```
@@ -63,11 +64,13 @@ Python WebSocket server using aiohttp and asyncpg:
 - Provides health check endpoint
 
 **Start**:
+
 ```bash
 python -m pyjobby.websocket_server ./pyjobby.conf.py --port 8082
 ```
 
 Or with custom host:
+
 ```bash
 python -m pyjobby.websocket_server ./pyjobby.conf.py --host 0.0.0.0 --port 8082
 ```
@@ -84,6 +87,7 @@ Single-page HTML dashboard with:
 - Auto-reconnect on disconnect
 
 **Open**:
+
 ```bash
 # Edit WS_URL in HTML to point to your WebSocket server
 # Default: ws://localhost:8082/ws
@@ -109,6 +113,7 @@ python -m pyjobby.websocket_server ./pyjobby.conf.py
 ```
 
 You should see:
+
 ```
 WebSocket server running on ws://0.0.0.0:8082/ws
 Health check available at http://0.0.0.0:8082/health
@@ -149,142 +154,155 @@ Watch the jobs appear live in the dashboard!
 ### Connection
 
 ```javascript
-const ws = new WebSocket('ws://localhost:8082/ws');
+const ws = new WebSocket("ws://localhost:8082/ws");
 
 ws.onopen = () => {
-    console.log('Connected!');
+  console.log("Connected!");
 
-    // Subscribe to channels
-    ws.send(JSON.stringify({
-        action: 'subscribe',
-        channels: ['jobs', 'queues:default', 'schedules']
-    }));
+  // Subscribe to channels
+  ws.send(
+    JSON.stringify({
+      action: "subscribe",
+      channels: ["jobs", "queues:default", "schedules"],
+    }),
+  );
 };
 ```
 
 ### Events Received
 
 #### connected
+
 ```json
 {
-    "event": "connected",
-    "timestamp": "2025-11-18T10:30:00.000Z",
-    "data": {
-        "server": "pyjobby-websocket",
-        "version": "1.0.0",
-        "backend": "PostgreSQL LISTEN/NOTIFY"
-    }
+  "event": "connected",
+  "timestamp": "2025-11-18T10:30:00.000Z",
+  "data": {
+    "server": "pyjobby-websocket",
+    "version": "1.0.0",
+    "backend": "PostgreSQL LISTEN/NOTIFY"
+  }
 }
 ```
 
 #### job_state_change
+
 ```json
 {
-    "event": "job_state_change",
-    "timestamp": "2025-11-18T10:30:01.000Z",
-    "data": {
-        "job_id": 12345,
-        "old_state": "queued",
-        "new_state": "running",
-        "queue": "default",
-        "job_class": "myapp.jobs.ProcessData",
-        "priority": 100
-    }
+  "event": "job_state_change",
+  "timestamp": "2025-11-18T10:30:01.000Z",
+  "data": {
+    "job_id": 12345,
+    "old_state": "queued",
+    "new_state": "running",
+    "queue": "default",
+    "job_class": "myapp.jobs.ProcessData",
+    "priority": 100
+  }
 }
 ```
 
 #### queue_stats
+
 ```json
 {
-    "event": "queue_stats",
-    "timestamp": "2025-11-18T10:30:05.000Z",
-    "data": {
-        "queue": "default",
-        "queued": 42,
-        "running": 5,
-        "waiting": 3
-    }
+  "event": "queue_stats",
+  "timestamp": "2025-11-18T10:30:05.000Z",
+  "data": {
+    "queue": "default",
+    "queued": 42,
+    "running": 5,
+    "waiting": 3
+  }
 }
 ```
 
 #### schedule_executed
+
 ```json
 {
-    "event": "schedule_executed",
-    "timestamp": "2025-11-18T10:30:10.000Z",
-    "data": {
-        "schedule_id": 10,
-        "schedule_name": "daily-cleanup",
-        "job_id": 12346,
-        "result": "success",
-        "next_run": "2025-11-19T02:00:00.000Z",
-        "duration_ms": 1234
-    }
+  "event": "schedule_executed",
+  "timestamp": "2025-11-18T10:30:10.000Z",
+  "data": {
+    "schedule_id": 10,
+    "schedule_name": "daily-cleanup",
+    "job_id": 12346,
+    "result": "success",
+    "next_run": "2025-11-19T02:00:00.000Z",
+    "duration_ms": 1234
+  }
 }
 ```
 
 #### queue_alert
+
 ```json
 {
-    "event": "queue_alert",
-    "timestamp": "2025-11-18T10:30:15.000Z",
-    "data": {
-        "queue": "default",
-        "depth": 1523,
-        "threshold": 1000,
-        "severity": "warning",
-        "message": "Queue 'default' has 1523 jobs (threshold: 1000)"
-    }
+  "event": "queue_alert",
+  "timestamp": "2025-11-18T10:30:15.000Z",
+  "data": {
+    "queue": "default",
+    "depth": 1523,
+    "threshold": 1000,
+    "severity": "warning",
+    "message": "Queue 'default' has 1523 jobs (threshold: 1000)"
+  }
 }
 ```
 
 ### Actions Sent
 
 #### subscribe
+
 ```json
 {
-    "action": "subscribe",
-    "channels": ["jobs", "queues:default", "schedules"]
+  "action": "subscribe",
+  "channels": ["jobs", "queues:default", "schedules"]
 }
 ```
 
 #### unsubscribe
+
 ```json
 {
-    "action": "unsubscribe",
-    "channels": ["queues:processing"]
+  "action": "unsubscribe",
+  "channels": ["queues:processing"]
 }
 ```
 
 #### cancel_job
+
 ```json
 {
-    "action": "cancel_job",
-    "job_id": 12345
+  "action": "cancel_job",
+  "job_id": 12345
 }
 ```
 
 #### retry_job
+
 ```json
 {
-    "action": "retry_job",
-    "job_id": 12345
+  "action": "retry_job",
+  "job_id": 12345
 }
 ```
 
 #### adjust_priority
+
 ```json
 {
-    "action": "adjust_priority",
-    "job_id": 12345,
-    "new_priority": 500
+  "action": "adjust_priority",
+  "job_id": 12345,
+  "new_priority": 500
 }
 ```
 
 #### get_stats
+
 ```json
 {
-    "action": "get_stats"
+  "action": "get_stats"
 }
 ```
 
@@ -300,17 +318,20 @@ Clients subscribe to specific channels to filter events:
 - **alerts:queues:{queue_name}**: Queue alert events
 
 Example subscription:
+
 ```javascript
-ws.send(JSON.stringify({
-    action: 'subscribe',
+ws.send(
+  JSON.stringify({
+    action: "subscribe",
     channels: [
-        'jobs',              // All jobs
-        'queues:default',    // Default queue only
-        'queues:processing', // Processing queue only
-        'schedules',         // Schedule events
-        'alerts:queues:default'  // Alerts for default queue
-    ]
-}));
+      "jobs", // All jobs
+      "queues:default", // Default queue only
+      "queues:processing", // Processing queue only
+      "schedules", // Schedule events
+      "alerts:queues:default", // Alerts for default queue
+    ],
+  }),
+);
 ```
 
 ---
@@ -341,19 +362,20 @@ curl http://localhost:8082/health
 ```
 
 Response:
+
 ```json
 {
-    "status": "healthy",
-    "stats": {
-        "total_connections": 42,
-        "current_connections": 5,
-        "messages_sent": 1234,
-        "messages_received": 567,
-        "events_received": 890,
-        "errors": 0
-    },
-    "notify_connection": true,
-    "timestamp": "2025-11-18T10:30:00.000Z"
+  "status": "healthy",
+  "stats": {
+    "total_connections": 42,
+    "current_connections": 5,
+    "messages_sent": 1234,
+    "messages_received": 567,
+    "events_received": 890,
+    "errors": 0
+  },
+  "notify_connection": true,
+  "timestamp": "2025-11-18T10:30:00.000Z"
 }
 ```
 
@@ -367,7 +389,7 @@ The dashboard HTML can be customized:
 
 ```javascript
 // In live-dashboard.html, line ~240
-const WS_URL = 'ws://your-server:8082/ws';
+const WS_URL = "ws://your-server:8082/ws";
 ```
 
 ### Change Colors
@@ -375,8 +397,8 @@ const WS_URL = 'ws://your-server:8082/ws';
 ```css
 /* Modify the <style> section */
 .badge.running {
-    background: #your-color;
-    color: #your-text-color;
+  background: #your-color;
+  color: #your-text-color;
 }
 ```
 
@@ -386,8 +408,8 @@ The dashboard is plain JavaScript - easy to extend:
 
 ```javascript
 // Add custom event handler
-if (event.event === 'your_custom_event') {
-    // Your logic here
+if (event.event === "your_custom_event") {
+  // Your logic here
 }
 ```
 
@@ -417,6 +439,7 @@ WantedBy=multi-user.target
 ```
 
 Enable and start:
+
 ```bash
 sudo systemctl enable pyjobby-websocket
 sudo systemctl start pyjobby-websocket
@@ -447,7 +470,7 @@ location /health {
 Use `wss://` (WebSocket Secure) in production:
 
 ```javascript
-const WS_URL = 'wss://your-domain.com/ws';
+const WS_URL = "wss://your-domain.com/ws";
 ```
 
 NGINX handles SSL termination, forwards to local WebSocket server.
@@ -459,11 +482,13 @@ NGINX handles SSL termination, forwards to local WebSocket server.
 ### WebSocket Won't Connect
 
 1. Check server is running:
+
    ```bash
    curl http://localhost:8082/health
    ```
 
 2. Check PostgreSQL connection:
+
    ```bash
    psql pyjobby -c "SELECT 1"
    ```
@@ -476,11 +501,13 @@ NGINX handles SSL termination, forwards to local WebSocket server.
 ### Not Receiving Updates
 
 1. Subscribe to channels:
+
    ```javascript
-   ws.send(JSON.stringify({action: 'subscribe', channels: ['jobs']}));
+   ws.send(JSON.stringify({ action: "subscribe", channels: ["jobs"] }));
    ```
 
 2. Check PostgreSQL NOTIFY working:
+
    ```bash
    # Terminal 1
    psql pyjobby -c "LISTEN job_state_change;"
@@ -508,62 +535,69 @@ NGINX handles SSL termination, forwards to local WebSocket server.
 ```html
 <!DOCTYPE html>
 <html>
-<body>
+  <body>
     <div id="jobs"></div>
     <script>
-        const ws = new WebSocket('ws://localhost:8082/ws');
+      const ws = new WebSocket("ws://localhost:8082/ws");
 
-        ws.onopen = () => {
-            ws.send(JSON.stringify({
-                action: 'subscribe',
-                channels: ['jobs']
-            }));
-        };
+      ws.onopen = () => {
+        ws.send(
+          JSON.stringify({
+            action: "subscribe",
+            channels: ["jobs"],
+          }),
+        );
+      };
 
-        ws.onmessage = (event) => {
-            const msg = JSON.parse(event.data);
-            if (msg.event === 'job_state_change') {
-                document.getElementById('jobs').innerHTML +=
-                    `<p>Job ${msg.data.job_id}: ${msg.data.new_state}</p>`;
-            }
-        };
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.event === "job_state_change") {
+          document.getElementById("jobs").innerHTML +=
+            `<p>Job ${msg.data.job_id}: ${msg.data.new_state}</p>`;
+        }
+      };
     </script>
-</body>
+  </body>
 </html>
 ```
 
 ### Node.js Client
 
 ```javascript
-const WebSocket = require('ws');
+const WebSocket = require("ws");
 
-const ws = new WebSocket('ws://localhost:8082/ws');
+const ws = new WebSocket("ws://localhost:8082/ws");
 
-ws.on('open', () => {
-    console.log('Connected');
+ws.on("open", () => {
+  console.log("Connected");
 
-    // Subscribe
-    ws.send(JSON.stringify({
-        action: 'subscribe',
-        channels: ['jobs', 'queues:default']
-    }));
+  // Subscribe
+  ws.send(
+    JSON.stringify({
+      action: "subscribe",
+      channels: ["jobs", "queues:default"],
+    }),
+  );
 });
 
-ws.on('message', (data) => {
-    const event = JSON.parse(data);
-    console.log('Event:', event.event, event.data);
+ws.on("message", (data) => {
+  const event = JSON.parse(data);
+  console.log("Event:", event.event, event.data);
 
-    // Auto-cancel slow jobs
-    if (event.event === 'job_state_change' &&
-        event.data.new_state === 'running') {
-
-        setTimeout(() => {
-            ws.send(JSON.stringify({
-                action: 'cancel_job',
-                job_id: event.data.job_id
-            }));
-        }, 60000); // Cancel after 1 minute
-    }
+  // Auto-cancel slow jobs
+  if (
+    event.event === "job_state_change" &&
+    event.data.new_state === "running"
+  ) {
+    setTimeout(() => {
+      ws.send(
+        JSON.stringify({
+          action: "cancel_job",
+          job_id: event.data.job_id,
+        }),
+      );
+    }, 60000); // Cancel after 1 minute
+  }
 });
 ```
 
@@ -615,6 +649,7 @@ asyncio.run(monitor())
 ✅ **Scalable**: Each WebSocket server listens independently
 
 **When you might need Redis:**
+
 - 10,000+ concurrent WebSocket connections
 - Cross-datacenter message distribution
 - Message persistence beyond PostgreSQL
