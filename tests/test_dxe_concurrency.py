@@ -628,13 +628,15 @@ async def test_max_concurrency_cap_holds_against_a_concurrent_claim(
     db_pool, db_params, unique_queue
 ):
     """The cap holds even when the competing claim is invisible, and without
-    ever blocking.
+    ever blocking indefinitely.
 
     Claim #1 runs inside an open transaction, so under READ COMMITTED claim
     #2 cannot see it and a plain count would admit a second job past a cap of
     1. claim_jorb serializes claims for a capped queue instead of counting
-    blind -- and it does so with a TRY lock, so claim #2 returns empty-handed
-    immediately rather than stalling behind the open transaction.
+    blind -- and the serialising lock is BOUNDED (claim_queue_lock's
+    lock_timeout), so claim #2 gives up and reports nothing claimable rather
+    than stalling behind the open transaction forever. The bound itself is
+    measured in tests/test_claim_contention.py.
     """
     await db_pool.execute(
         "INSERT INTO jorb_queue (name, max_concurrency) VALUES ($1, 1)", unique_queue
