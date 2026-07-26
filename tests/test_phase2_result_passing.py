@@ -19,9 +19,7 @@ from tests.utils.factories import create_job, get_job
 class EchoUpstreamJob(Job):
     """Returns whatever upstream result the worker injected at run time."""
 
-    async def task(
-        self, upstream_result: Any = None, **kwargs: Any
-    ) -> dict[str, Any]:
+    async def task(self, upstream_result: Any = None, **kwargs: Any) -> dict[str, Any]:
         return {"upstream": upstream_result}
 
 
@@ -126,9 +124,7 @@ class TestResultStorage:
             "UPDATE jorb SET run_epoch = 2 WHERE id = $1", job_id
         )
 
-        rows = await db_connection.fetch(
-            STMTS["finished"], job_id, {"stale": True}, 1
-        )
+        rows = await db_connection.fetch(STMTS["finished"], job_id, {"stale": True}, 1)
         assert rows == []
 
         job = await get_job(db_connection, job_id)

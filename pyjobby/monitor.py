@@ -79,7 +79,9 @@ async def handle_timed_out_job(
             retry_delay,
         )
 
-        logger.info(f"Job {job_id} requeued for retry in {retry_delay.total_seconds()}s")
+        logger.info(
+            f"Job {job_id} requeued for retry in {retry_delay.total_seconds()}s"
+        )
     else:
         reason = "max retries exceeded" if attempt >= max_retries else "on_timeout=fail"
 

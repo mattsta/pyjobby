@@ -8,7 +8,7 @@ Comprehensive tests for configurable retry strategies:
 - Fixed (legacy) backoff
 """
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import pytest
 

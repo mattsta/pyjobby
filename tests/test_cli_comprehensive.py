@@ -220,7 +220,6 @@ def mock_admin_api():
     # AdminAPI.worker_stats: registry-based aggregate counts.
     mock_api.worker_stats.return_value = {
         "live_workers": 2,
-        "active_workers": 2,  # compat alias
         "stale_workers": 0,
         "shutdown_workers": 1,
         "total_registered": 3,

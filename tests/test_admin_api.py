@@ -512,7 +512,6 @@ class TestWorkerManagement:
         assert beta not in stats["per_queue"]  # shut down: not live
         # and our contribution to the global aggregates
         assert stats["live_workers"] == before["live_workers"] + 2
-        assert stats["active_workers"] == stats["live_workers"]  # compat alias
         assert stats["shutdown_workers"] == before["shutdown_workers"] + 1
         assert stats["total_registered"] == before["total_registered"] + 3
 

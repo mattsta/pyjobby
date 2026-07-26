@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from pyjobby.admin_api import AdminAPI, JobInfo, QueueStats, WorkerInfo
+from pyjobby.admin_api import AdminAPI, JobInfo, QueueStats
 
 # =============================================================================
 # DATACLASS TESTS
@@ -110,68 +110,6 @@ class TestQueueStatsDataclass:
         assert data["finished"] == 100
         assert data["total"] == 115
         assert data["oldest_queued_age_seconds"] == 300.5
-
-
-class TestWorkerInfoDataclass:
-    """Test WorkerInfo dataclass."""
-
-    @pytest.mark.asyncio
-    async def test_from_record(self, db_pool):
-        """Test creating WorkerInfo from asyncpg Record."""
-        async with db_pool.acquire() as conn:
-            # Create a running job with worker info
-            job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (
-                    job_class, kwargs, queue, state, prio,
-                    worker_host, worker_pid, started
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-                RETURNING id
-            """,
-                "test.Job",
-                {},
-                "default",
-                "running",
-                100,
-                "worker-01",
-                12345,
-            )
-
-            # Fetch worker info
-            record = await conn.fetchrow(
-                """
-                SELECT worker_host, worker_pid, id as job_id,
-                       job_class, state, started as started_at
-                FROM jorb
-                WHERE id = $1
-            """,
-                job_id,
-            )
-
-            worker_info = WorkerInfo.from_record(record)
-
-            assert worker_info.worker_host == "worker-01"
-            assert worker_info.worker_pid == 12345
-            assert worker_info.job_id == job_id
-            assert worker_info.job_class == "test.Job"
-            assert worker_info.state == "running"
-
-    def test_to_dict_with_datetime(self):
-        """Test WorkerInfo.to_dict() serializes datetime."""
-        now = datetime.now(UTC)
-        worker_info = WorkerInfo(
-            worker_host="worker-01",
-            worker_pid=12345,
-            job_id=1,
-            job_class="test.Job",
-            state="running",
-            started_at=now,
-        )
-
-        data = worker_info.to_dict()
-
-        assert data["started_at"] == now.isoformat()
 
 
 # =============================================================================
@@ -786,7 +724,6 @@ class TestAdminAPIWorkerManagement:
         stats = await api.worker_stats()
 
         assert stats["live_workers"] == 2
-        assert stats["active_workers"] == 2  # compat alias
         assert stats["stale_workers"] == 1
         assert stats["total_registered"] == 3
         assert stats["per_queue"] == {"default": 2}
@@ -2476,7 +2413,7 @@ Test Classes: 7
 Total Tests: 50+
 
 Coverage Areas:
-✅ Data Classes (JobInfo, QueueStats, WorkerInfo)
+✅ Data Classes (JobInfo, QueueStats)
 ✅ Job Management (list, get, retry, cancel, delete)
 ✅ Queue Management (list, stats, clear)
 ✅ Worker Management (list, stats)

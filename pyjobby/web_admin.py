@@ -860,7 +860,7 @@ class WebAdminServer:
             format_type = request.query.get("format", "json")
 
             if format_type == "html":
-                html = f'<div class="stat-value">{int(stats["active_workers"])}</div>'
+                html = f'<div class="stat-value">{int(stats["live_workers"])}</div>'
                 html += '<div class="stat-label">Active Workers</div>'
                 return web.Response(text=html, content_type="text/html")
             else:

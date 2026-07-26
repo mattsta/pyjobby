@@ -107,28 +107,6 @@ class QueueStats:
         return asdict(self)
 
 
-@dataclass
-class WorkerInfo:
-    """Worker information"""
-
-    worker_host: str
-    worker_pid: int
-    job_id: int
-    job_class: str
-    state: str
-    started_at: datetime
-
-    @classmethod
-    def from_record(cls, record: asyncpg.Record) -> WorkerInfo:
-        return cls(**dict(record))
-
-    def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        if data["started_at"]:
-            data["started_at"] = data["started_at"].isoformat()
-        return data
-
-
 class AdminAPI:
     """
     Administrative API for managing pyjobby jobs, queues, and workers.
@@ -769,7 +747,6 @@ class AdminAPI:
 
         return {
             "live_workers": summary["live"] or 0,
-            "active_workers": summary["live"] or 0,  # compat alias
             "stale_workers": summary["stale"] or 0,
             "shutdown_workers": summary["shutdown"] or 0,
             "total_registered": summary["total_registered"] or 0,

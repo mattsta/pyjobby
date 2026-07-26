@@ -434,9 +434,7 @@ class TestRecoveryInvariants:
             recent_job_ids.append(job_id)
 
         # Recover with 5 minute grace
-        recovered = await sweep_unregistered_claims(
-            db_pool, claimed_grace_seconds=300
-        )
+        recovered = await sweep_unregistered_claims(db_pool, claimed_grace_seconds=300)
 
         # Invariant: Only old jobs should be recovered
         assert recovered == old_job_count

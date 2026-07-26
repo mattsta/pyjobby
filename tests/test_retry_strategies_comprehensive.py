@@ -351,10 +351,15 @@ class TestRetryStrategyIntegration:
 
         delays = [calculate_retry_from_job(job, i) for i in range(1, 6)]
 
-        # Delays should increase linearly (5, 10, 15, 20, 25)
+        # Delays increase linearly (5, 10, 15, 20, 25), each plus a jitter of
+        # 0-10% of the delay (capped at 5s) and floored to whole seconds
         for i, delay in enumerate(delays, 1):
             expected = 5 * i
-            assert expected <= delay.total_seconds() <= expected + 1
+            max_jitter = min(expected * 0.1, 5)
+            assert expected <= delay.total_seconds() <= expected + max_jitter
+
+        # ...and the progression is monotonic
+        assert delays == sorted(delays)
 
     def test_max_delay_prevents_infinite_growth(self):
         """Test that max_delay prevents unbounded growth"""

@@ -75,9 +75,7 @@ async def insert_job(
     )
 
 
-async def insert_worker(
-    pool, queue: str, *, last_seen_age_seconds: float = 0
-) -> int:
+async def insert_worker(pool, queue: str, *, last_seen_age_seconds: float = 0) -> int:
     """Insert a jorb_worker registry row with a heartbeat this old."""
     return await pool.fetchval(
         """
@@ -123,9 +121,7 @@ async def hand_claim(pool, job_id: int) -> int:
 class TestHandleTimedOutJob:
     """The per-job retry/dead-letter decision."""
 
-    async def test_retry_requeues_same_row_with_backoff(
-        self, db_pool, unique_queue
-    ):
+    async def test_retry_requeues_same_row_with_backoff(self, db_pool, unique_queue):
         job_id = await insert_job(
             db_pool,
             unique_queue,
@@ -155,7 +151,9 @@ class TestHandleTimedOutJob:
             timeout_at_offset_seconds=-10,
         )
 
-        await handle_timed_out_job(db_pool, job_id, "test.Job", {"on_timeout": "fail"}, 0)
+        await handle_timed_out_job(
+            db_pool, job_id, "test.Job", {"on_timeout": "fail"}, 0
+        )
 
         job = await get_job(db_pool, job_id)
         assert job["state"] == "crashed"  # terminal: the DLQ
@@ -243,9 +241,7 @@ class TestSweepTimedOutJobs:
         handled = await sweep_timed_out_jobs(db_pool, batch_size=2)
         assert handled == 2
 
-        states = [
-            (await get_job(db_pool, job_id))["state"] for job_id in ids
-        ]
+        states = [(await get_job(db_pool, job_id))["state"] for job_id in ids]
         assert states.count("queued") == 2
         assert states.count("running") == 1
 
@@ -322,17 +318,13 @@ class TestSweepDeadWorkers:
         assert requeued == 0
 
         assert (await get_job(db_pool, job_id))["state"] == "running"
-        worker = await db_pool.fetchrow(
-            "SELECT * FROM jorb_worker WHERE id = $1", live
-        )
+        worker = await db_pool.fetchrow("SELECT * FROM jorb_worker WHERE id = $1", live)
         assert worker["shutdown_at"] is None
 
     async def test_ignores_workers_already_shut_down(self, db_pool, unique_queue):
         """A gracefully-exited worker (shutdown_at set) is not rescanned; its
         terminal jobs stay put."""
-        retired = await insert_worker(
-            db_pool, unique_queue, last_seen_age_seconds=300
-        )
+        retired = await insert_worker(db_pool, unique_queue, last_seen_age_seconds=300)
         await db_pool.execute(
             "UPDATE jorb_worker SET shutdown_at = now() WHERE id = $1", retired
         )
@@ -385,9 +377,7 @@ class TestSweepUnregisteredClaims:
             job_id,
         )
 
-        requeued = await sweep_unregistered_claims(
-            db_pool, claimed_grace_seconds=300
-        )
+        requeued = await sweep_unregistered_claims(db_pool, claimed_grace_seconds=300)
         assert requeued == 1
 
         job = await get_job(db_pool, job_id)
@@ -397,9 +387,7 @@ class TestSweepUnregisteredClaims:
     async def test_leaves_fresh_claims_alone(self, db_pool, unique_queue):
         job_id = await insert_job(db_pool, unique_queue, state="claimed")
 
-        requeued = await sweep_unregistered_claims(
-            db_pool, claimed_grace_seconds=300
-        )
+        requeued = await sweep_unregistered_claims(db_pool, claimed_grace_seconds=300)
         assert requeued == 0
         assert (await get_job(db_pool, job_id))["state"] == "claimed"
 
@@ -417,9 +405,7 @@ class TestSweepUnregisteredClaims:
             job_id,
         )
 
-        requeued = await sweep_unregistered_claims(
-            db_pool, claimed_grace_seconds=300
-        )
+        requeued = await sweep_unregistered_claims(db_pool, claimed_grace_seconds=300)
         assert requeued == 0
         assert (await get_job(db_pool, job_id))["state"] == "claimed"
 
@@ -430,9 +416,7 @@ class TestSweepUnregisteredClaims:
 
 
 class TestEpochFencing:
-    async def test_monitor_requeue_fences_out_stale_finish(
-        self, db_pool, unique_queue
-    ):
+    async def test_monitor_requeue_fences_out_stale_finish(self, db_pool, unique_queue):
         """After the monitor requeues a timed-out job and a new attempt
         claims it, the ORIGINAL execution's finish must be a no-op."""
         job_id = await insert_job(db_pool, unique_queue)
@@ -474,9 +458,7 @@ class TestEpochFencing:
         assert job["state"] == "finished"
         assert job["result"] == {"from": "current-attempt"}
 
-    async def test_monitor_requeue_fences_out_stale_retry(
-        self, db_pool, unique_queue
-    ):
+    async def test_monitor_requeue_fences_out_stale_retry(self, db_pool, unique_queue):
         """A superseded attempt cannot push the job back to queued either
         (its retry statement is epoch-fenced exactly like its finish)."""
         job_id = await insert_job(db_pool, unique_queue)

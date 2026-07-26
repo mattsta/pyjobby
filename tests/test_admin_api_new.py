@@ -12,7 +12,6 @@ from pyjobby.admin_api import (
     AdminAPI,
     JobInfo,
     QueueStats,
-    WorkerInfo,
 )
 
 
@@ -90,40 +89,6 @@ class TestQueueStatsDataclass:
         assert stats_dict["queued"] == 5
         assert stats_dict["running"] == 2
         assert stats_dict["total"] == 7
-
-
-class TestWorkerInfoDataclass:
-    """Test WorkerInfo dataclass - covers lines 82-100."""
-
-    def test_worker_info_to_dict(self):
-        """Test WorkerInfo to_dict with datetime serialization."""
-        now = datetime.now(UTC)
-        worker = WorkerInfo(
-            worker_host="host1",
-            worker_pid=12345,
-            job_id=1,
-            job_class="TestJob",
-            state="running",
-            started_at=now,
-        )
-        worker_dict = worker.to_dict()
-
-        assert worker_dict["worker_host"] == "host1"
-        assert worker_dict["worker_pid"] == 12345
-        assert isinstance(worker_dict["started_at"], str)
-
-    def test_worker_info_to_dict_none_started_at(self):
-        """Test WorkerInfo to_dict with None started_at."""
-        worker = WorkerInfo(
-            worker_host="host1",
-            worker_pid=12345,
-            job_id=1,
-            job_class="TestJob",
-            state="claimed",
-            started_at=None,
-        )
-        worker_dict = worker.to_dict()
-        assert worker_dict["started_at"] is None
 
 
 class TestAdminAPIJobManagement:
@@ -841,7 +806,6 @@ class TestAdminAPIWorkerManagement:
             stats = await api.worker_stats()
 
             assert stats["live_workers"] >= 3
-            assert stats["active_workers"] == stats["live_workers"]  # alias
             assert stats["total_registered"] >= 3
             assert stats["per_queue"]["stats_queue"] == 3
 

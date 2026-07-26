@@ -726,7 +726,6 @@ class TestWorkersAPI:
 
         data = await resp.json()
         assert data["live_workers"] >= 1
-        assert data["active_workers"] == data["live_workers"]  # compat alias
         assert "stale_workers" in data
         assert "shutdown_workers" in data
         assert data["per_queue"][queue] == 1
