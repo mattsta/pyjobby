@@ -43,6 +43,11 @@ MAX_QUEUE_NAME_LENGTH = 255
 # `datetime.now(UTC) - timedelta(hours=N)` must stay inside datetime's range; a
 # century of history is far more than any dashboard window asks for.
 MAX_SINCE_HOURS = 24 * 365 * 100
+# Window the Prometheus scrape computes its rates over. Short on purpose:
+# rates exist to show a fleet falling behind, and a wide window averages the
+# incident away -- five minutes surfaces it within a scrape or two while
+# still smoothing the per-second jitter of an individual worker.
+PROM_RATE_WINDOW_SECONDS = 300
 
 _ID_RE = re.compile(r"^[0-9]+$")
 _INT_RE = re.compile(r"^[+-]?[0-9]+$")
@@ -601,21 +606,39 @@ class WebAdminServer:
                     f'state="{esc(r["state"])}"}} {r["n"]}'
                 )
 
-            oldest = await conn.fetch("""
-                SELECT queue,
-                       EXTRACT(EPOCH FROM (now() - MIN(created)))::float AS age
-                FROM jorb WHERE state = 'queued'
-                GROUP BY queue ORDER BY queue
-            """)
+            # Everything below comes from one AdminAPI.get_metrics() call so
+            # the scrape, the dashboard, and `pj-admin metrics` cannot drift
+            # apart -- and so the queries stay the indexed ones documented
+            # there. The window is short because these are rates: a 5-minute
+            # window responds to a fleet falling behind within a scrape or
+            # two, where the 24h default would average the incident away.
+            api = AdminAPI(conn)
+            m = await api.get_metrics(
+                since=db.utcnow() - timedelta(seconds=PROM_RATE_WINDOW_SECONDS)
+            )
+            backlog = m["backlog"]
+
             lines.append(
                 "# HELP pyjobby_queue_oldest_queued_seconds "
-                "Age of the oldest queued job per queue."
+                "How long the oldest CLAIMABLE job in the queue has been "
+                "ready and unclaimed (run_after gates claimability, so "
+                "jobs scheduled for the future are excluded)."
             )
             lines.append("# TYPE pyjobby_queue_oldest_queued_seconds gauge")
-            for r in oldest:
+            for qname, stats in backlog["per_queue"].items():
                 lines.append(
-                    f'pyjobby_queue_oldest_queued_seconds{{queue="{esc(r["queue"])}"}}'
-                    f" {r['age']}"
+                    f'pyjobby_queue_oldest_queued_seconds{{queue="{esc(qname)}"}}'
+                    f" {stats['oldest_age_seconds']}"
+                )
+
+            lines.append(
+                "# HELP pyjobby_backlog_depth Claimable jobs waiting per "
+                "queue (state queued and run_after already due)."
+            )
+            lines.append("# TYPE pyjobby_backlog_depth gauge")
+            for qname, stats in backlog["per_queue"].items():
+                lines.append(
+                    f'pyjobby_backlog_depth{{queue="{esc(qname)}"}} {stats["depth"]}'
                 )
 
             paused = await conn.fetch(
@@ -687,6 +710,111 @@ class WebAdminServer:
                         f'pyjobby_job_duration_seconds{{queue="{esc(r["queue"])}",'
                         f'quantile="{quantile}"}} {value}'
                     )
+
+            # Rates, all over the same PROM_RATE_WINDOW_SECONDS window so
+            # they can be compared to each other directly. Gauges rather
+            # than counters on purpose: these are computed from the job
+            # table, not accumulated in the process, so they do not survive
+            # a restart the way a counter must.
+            inflight = m["inflight"]
+            storage = m["storage"]
+            for metric, help_text, value in (
+                (
+                    "pyjobby_throughput_jobs_per_second",
+                    f"Jobs reaching a terminal state per second over the "
+                    f"last {PROM_RATE_WINDOW_SECONDS}s. Compare against "
+                    f"arrivals: sustained arrivals above this is the "
+                    f"definition of falling behind.",
+                    m["throughput_per_second"],
+                ),
+                (
+                    "pyjobby_arrival_jobs_per_second",
+                    f"Jobs created per second over the last "
+                    f"{PROM_RATE_WINDOW_SECONDS}s.",
+                    m["arrival_rate_per_second"],
+                ),
+                (
+                    "pyjobby_retry_attempts_per_second",
+                    f"Attempts beyond the first, per second, burned by jobs "
+                    f"that completed in the last {PROM_RATE_WINDOW_SECONDS}s.",
+                    m["retry_rate_per_second"],
+                ),
+                (
+                    "pyjobby_dlq_jobs_per_second",
+                    f"Jobs entering the dead letter queue (terminal "
+                    f"'crashed') per second over the last "
+                    f"{PROM_RATE_WINDOW_SECONDS}s.",
+                    m["dlq_growth_per_second"],
+                ),
+                (
+                    "pyjobby_jobs_inflight",
+                    "Jobs currently held by a worker (claimed or running).",
+                    inflight["inflight"],
+                ),
+                (
+                    "pyjobby_jobs_stuck",
+                    f"In-flight jobs with no state change for "
+                    f"{inflight['stuck_after_seconds']:.0f}s: busy is not "
+                    f"the same as wedged.",
+                    inflight["stuck"],
+                ),
+                (
+                    "pyjobby_inflight_oldest_age_seconds",
+                    "Age of the longest-held in-flight job.",
+                    inflight["oldest_age_seconds"],
+                ),
+                (
+                    "pyjobby_notify_queue_usage_ratio",
+                    "Fraction of PostgreSQL's shared async-NOTIFY queue in "
+                    "use. At 1.0 every transaction issuing a NOTIFY fails, "
+                    "which stops all enqueues and completions; the queue "
+                    "drains only as fast as the slowest listener.",
+                    m["notify_queue_usage"],
+                ),
+            ):
+                lines.append(f"# HELP {metric} {help_text}")
+                lines.append(f"# TYPE {metric} gauge")
+                lines.append(f"{metric} {value}")
+
+            # Footprint. At ~4M dead tuples an hour, whether autovacuum is
+            # keeping up is a survival question rather than a curiosity.
+            for metric, help_text, key in (
+                (
+                    "pyjobby_table_total_bytes",
+                    "Total on-disk size of the table including indexes and TOAST.",
+                    "total_bytes",
+                ),
+                (
+                    "pyjobby_table_bytes",
+                    "On-disk size of the table's own data.",
+                    "table_bytes",
+                ),
+                (
+                    "pyjobby_table_index_bytes",
+                    "On-disk size of the table's indexes.",
+                    "index_bytes",
+                ),
+                (
+                    "pyjobby_table_live_tuples",
+                    "Live tuples estimated by the statistics collector.",
+                    "live_tuples",
+                ),
+                (
+                    "pyjobby_table_dead_tuples",
+                    "Dead tuples awaiting vacuum.",
+                    "dead_tuples",
+                ),
+                (
+                    "pyjobby_table_dead_tuple_ratio",
+                    "Dead tuples as a fraction of all tuples: a ratio that "
+                    "climbs and stays there means autovacuum is losing.",
+                    "dead_tuple_ratio",
+                ),
+            ):
+                lines.append(f"# HELP {metric} {help_text}")
+                lines.append(f"# TYPE {metric} gauge")
+                for tname, stats in sorted(storage["tables"].items()):
+                    lines.append(f'{metric}{{table="{esc(tname)}"}} {stats[key]}')
 
         body = "\n".join(lines) + "\n"
         return web.Response(
@@ -1077,7 +1205,31 @@ class WebAdminServer:
             metrics = await api.get_metrics(since=since, queue=queue)
 
             if format_type == "html":
+                backlog = metrics["backlog"]
+                inflight = metrics["inflight"]
+                storage = metrics["storage"]
+                # Throughput sits next to arrivals because the comparison is
+                # the signal: either number alone says nothing about whether
+                # the fleet is keeping up.
                 html = '<div class="stats-grid">'
+                html += '<div class="stat-item">'
+                html += (
+                    f"<span>Throughput</span>"
+                    f"<span>{metrics['throughput_per_second']:.2f}/s</span>"
+                )
+                html += (
+                    f"<span>Arrivals</span>"
+                    f"<span>{metrics['arrival_rate_per_second']:.2f}/s</span>"
+                )
+                html += (
+                    f"<span>Retry Pressure</span>"
+                    f"<span>{metrics['retry_rate_per_second']:.2f}/s</span>"
+                )
+                html += (
+                    f"<span>DLQ Growth</span>"
+                    f"<span>{metrics['dlq_growth_per_second']:.4f}/s</span>"
+                )
+                html += "</div>"
                 html += '<div class="stat-item">'
                 html += f'<span>Finished</span><span class="badge finished">{int(metrics["finished_count"])}</span>'
                 html += "</div>"
@@ -1088,6 +1240,29 @@ class WebAdminServer:
                 html += f"<span>Avg Duration</span><span>{metrics['avg_duration_seconds']:.2f}s</span>"
                 html += f"<span>Avg Queue Wait</span><span>{metrics['avg_wait_seconds']:.2f}s</span>"
                 html += f"<span>Max Queue Wait</span><span>{metrics['max_wait_seconds']:.2f}s</span>"
+                html += "</div>"
+                html += '<div class="stat-item">'
+                html += f"<span>Backlog Depth</span><span>{backlog['depth']}</span>"
+                html += (
+                    f"<span>Oldest Ready</span>"
+                    f"<span>{backlog['oldest_age_seconds']:.1f}s</span>"
+                )
+                html += f"<span>In Flight</span><span>{inflight['inflight']}</span>"
+                html += f"<span>Stuck</span><span>{inflight['stuck']}</span>"
+                html += "</div>"
+                html += '<div class="stat-item">'
+                html += (
+                    f"<span>NOTIFY Queue</span>"
+                    f"<span>{metrics['notify_queue_usage']:.1%}</span>"
+                )
+                html += (
+                    f"<span>Dead Tuples</span>"
+                    f"<span>{storage['dead_tuple_ratio']:.1%}</span>"
+                )
+                html += (
+                    f"<span>Storage</span>"
+                    f"<span>{storage['total_bytes'] / (1024 * 1024):.1f} MB</span>"
+                )
                 html += "</div>"
                 html += "</div>"
                 return web.Response(text=html, content_type="text/html")

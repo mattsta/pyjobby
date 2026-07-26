@@ -1008,8 +1008,21 @@ class AdminAPI:
         * LEVELS (backlog, in-flight, footprint, NOTIFY usage) are instants,
           not window aggregates -- "how deep is it right now".
 
+        The window is applied through the two indexes the schema actually
+        keeps, because /metrics is scraped on a timer against a table with
+        hundreds of millions of rows and a scan here turns the monitoring
+        into the outage:
+
+        * completions are found by ``COALESCE(finished, updated)`` over the
+          terminal states, which is exactly `jorb_retention_idx`;
+        * arrivals are found by ``created``, which is `jorb_created_idx`.
+
+        Neither is `updated`: the schema deliberately does NOT index it
+        (every state transition rewrites it, so an index there taxes the
+        write path forever to speed up one read per scrape).
+
         Args:
-            since: Only include jobs updated since this time (default: last 24h)
+            since: Start of the reporting window (default: last 24h)
             queue: Filter by queue (optional)
             stuck_after_seconds: In-flight age past which a job counts as stuck
 
@@ -1019,53 +1032,38 @@ class AdminAPI:
         if since is None:
             since = db.utcnow() - timedelta(hours=24)
 
-        where_clauses = ["updated >= $1"]
         params: list[Any] = [since]
-        param_idx = 2
-
+        queue_sql = ""
         if queue:
-            where_clauses.append(f"queue = ${param_idx}")
             params.append(queue)
-            param_idx += 1
+            queue_sql = "AND queue = $2"
 
-        where_sql = "WHERE " + " AND ".join(where_clauses)
-
-        # Overall counts by state
-        state_counts = await self.conn.fetch(
-            f"""
-            SELECT state, COUNT(*) as count
-            FROM jorb
-            {where_sql}
-            GROUP BY state
-        """,
-            *params,
-        )
-
-        # Completion rate, plus the two latencies an operator acts on:
-        # how long jobs WAIT to be picked up (a capacity signal) versus how
-        # long they RUN once picked up (a code signal). Measuring either one
-        # as `updated - created` would blend them together -- along with the
+        # Completions: every job that REACHED a terminal state in the window.
+        #
+        # Terminal, not finished-only: a crash loop keeps the fleet perfectly
+        # busy while `finished` collapses, and calling that "throughput
+        # collapse" sends the operator to look for missing workers. What the
+        # arrival rate must be compared against is the rate at which work
+        # LEAVES the system, however it leaves.
+        #
+        # The two latencies are the ones an operator acts on separately: how
+        # long jobs WAIT to be picked up (a capacity signal) versus how long
+        # they RUN once picked up (a code signal). Measuring either as
+        # `updated - created` would blend them together -- along with the
         # backoff between every retry -- and hide which is the problem.
         #
-        # Arrivals are counted INSIDE this same window scan rather than by a
-        # second `created >= $1` query, and that is exact rather than an
-        # approximation: `updated` is only ever moved forward and starts life
-        # equal to `created`, so every job created in the window is
-        # necessarily also updated in it. There is no index on `created`, so
-        # asking separately would be the one sequential scan in this method.
+        # `run_count - 1` is the attempts a job burned beyond its first, so
+        # summing it over the window's completions is retry pressure in the
+        # same unit as everything else here: work per second the fleet did
+        # twice.
         completion_stats = await self.conn.fetchrow(
             f"""
             SELECT
+                COUNT(*) as terminal_count,
                 COUNT(*) FILTER (WHERE state = 'finished') as finished_count,
                 COUNT(*) FILTER (WHERE state = 'crashed') as crashed_count,
                 COUNT(*) FILTER (WHERE state = 'cancelled') as cancelled_count,
-                COUNT(*) FILTER (
-                    WHERE state IN ('finished', 'crashed', 'cancelled')
-                ) as terminal_count,
-                COUNT(*) FILTER (WHERE created >= $1) as arrival_count,
-                COUNT(*) FILTER (
-                    WHERE state = 'queued' AND error_count > 0
-                ) as retry_count,
+                COALESCE(SUM(GREATEST(run_count - 1, 0)), 0) as retry_count,
                 AVG(EXTRACT(EPOCH FROM (finished - started)))
                     FILTER (WHERE state = 'finished'
                             AND started IS NOT NULL) as avg_duration_seconds,
@@ -1074,12 +1072,29 @@ class AdminAPI:
                 MAX(EXTRACT(EPOCH FROM (claimed_at - run_after)))
                     FILTER (WHERE claimed_at IS NOT NULL) as max_wait_seconds
             FROM jorb
-            {where_sql}
+            WHERE state IN ('finished', 'crashed', 'cancelled')
+              AND COALESCE(finished, updated) >= $1 {queue_sql}
         """,
             *params,
         )
 
-        # Top error job classes
+        # Arrivals: the jobs that ENTERED the system in the window, grouped
+        # by where they are now. That cohort view is what makes the state
+        # counts actionable at a scrape interval ("of the million that
+        # arrived this hour, 40k are still queued") rather than a census of
+        # all history.
+        state_counts = await self.conn.fetch(
+            f"""
+            SELECT state, COUNT(*) as count
+            FROM jorb
+            WHERE created >= $1 {queue_sql}
+            GROUP BY state
+        """,
+            *params,
+        )
+
+        # Top error job classes, over the same completion window as the
+        # crash count they explain.
         top_errors = await self.conn.fetch(
             f"""
             SELECT
@@ -1087,7 +1102,8 @@ class AdminAPI:
                 COUNT(*) as error_count,
                 MAX(error_message) as latest_error
             FROM jorb
-            {where_sql} AND state = 'crashed'
+            WHERE state = 'crashed'
+              AND COALESCE(finished, updated) >= $1 {queue_sql}
             GROUP BY job_class
             ORDER BY error_count DESC
             LIMIT 10
@@ -1104,6 +1120,7 @@ class AdminAPI:
 
         period_end = db.utcnow()
         window_seconds = max((period_end - since).total_seconds(), 0.0)
+        arrival_count = sum(r["count"] for r in state_counts)
 
         return {
             "period_start": since.isoformat(),
@@ -1115,25 +1132,22 @@ class AdminAPI:
             "crashed_count": completion_stats["crashed_count"] or 0,
             "cancelled_count": completion_stats["cancelled_count"] or 0,
             # --- rates over `since`..now, per second ---
-            # Jobs REACHING a terminal state, which is the number to compare
-            # against arrivals; finished alone would call a crash loop
-            # "throughput collapse" when the fleet is in fact fully busy.
+            # Throughput against arrivals is THE question at a million jobs
+            # an hour: sustained arrivals above completions is the definition
+            # of falling behind, and neither number alone can say it.
             "terminal_count": completion_stats["terminal_count"] or 0,
             "throughput_per_second": _rate(
                 completion_stats["terminal_count"], window_seconds
             ),
-            "arrival_count": completion_stats["arrival_count"] or 0,
-            "arrival_rate_per_second": _rate(
-                completion_stats["arrival_count"], window_seconds
-            ),
-            # Jobs sitting re-queued after a failure. A job that burned
-            # several attempts inside the window counts once (the row records
-            # only its latest transition), so this is a floor on retry
-            # pressure, not an exact transition count -- see the module note
-            # on jorb_history.
-            "retry_count": completion_stats["retry_count"] or 0,
+            "arrival_count": arrival_count,
+            "arrival_rate_per_second": _rate(arrival_count, window_seconds),
+            # Attempts beyond the first, burned by jobs that completed in the
+            # window. Counted at completion because that is when the total is
+            # known; a job still cycling through retries lands in this number
+            # when it finally settles.
+            "retry_count": int(completion_stats["retry_count"] or 0),
             "retry_rate_per_second": _rate(
-                completion_stats["retry_count"], window_seconds
+                int(completion_stats["retry_count"] or 0), window_seconds
             ),
             # 'crashed' is terminal and IS the dead letter queue, so crashes
             # inside the window are exactly DLQ growth -- the earliest signal

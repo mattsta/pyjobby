@@ -520,16 +520,25 @@ class TestPrometheusMetrics:
 
     @pytest.mark.asyncio
     async def test_jobs_by_state_and_oldest_queued(self, web_admin_client, db_pool):
-        """Per-queue state gauges and oldest-queued age are exposed."""
+        """Per-queue state gauges, backlog depth, and oldest-ready age.
+
+        `run_after` is set alongside `created` because that is what an
+        enqueue does, and the backlog gauges are measured from `run_after`:
+        they answer "how long has the head of this queue been READY and
+        unclaimed", so a job deliberately scheduled for later has not been
+        waiting at all until it comes due.
+        """
         queue = unique_name("prom_q")
         async with db_pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO jorb (job_class, kwargs, queue, prio, state, created)
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state,
+                                  created, run_after)
                 VALUES ('PromJob', '{}', $1, 100, 'queued',
+                        now() - interval '120 seconds',
                         now() - interval '120 seconds'),
-                       ('PromJob', '{}', $1, 100, 'queued', now()),
-                       ('PromJob', '{}', $1, 100, 'crashed', now())
+                       ('PromJob', '{}', $1, 100, 'queued', now(), now()),
+                       ('PromJob', '{}', $1, 100, 'crashed', now(), now())
             """,
                 queue,
             )
@@ -540,6 +549,9 @@ class TestPrometheusMetrics:
         assert f'pyjobby_jobs_by_state{{queue="{queue}",state="queued"}} 2' in text
         assert f'pyjobby_jobs_by_state{{queue="{queue}",state="crashed"}} 1' in text
         assert "# TYPE pyjobby_jobs_by_state gauge" in text
+
+        # Only the two queued jobs are backlog; the crashed one is not.
+        assert f'pyjobby_backlog_depth{{queue="{queue}"}} 2' in text
 
         age_line = next(
             line

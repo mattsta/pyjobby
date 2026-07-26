@@ -34,6 +34,7 @@ pj-web = "pyjobby.web_admin:main"
 pj-scheduler = "pyjobby.scheduler:main"
 pj-ws = "pyjobby.websocket_server:main"
 pj-monitor = "pyjobby.monitor:cli"
+pj-bench = "pyjobby.bench:main"
 
 [dependency-groups]
 test = [

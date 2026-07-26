@@ -1183,6 +1183,24 @@ def dlq_retry(ctx: click.Context, job_id: int) -> None:
 # =========================================================================
 
 
+def _fmt_bytes(num: float) -> str:
+    """Byte count in the largest unit that keeps it readable."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(num) < 1024 or unit == "TB":
+            return f"{num:.0f}{unit}" if unit == "B" else f"{num:.1f}{unit}"
+        num /= 1024
+    return f"{num:.1f}TB"
+
+
+def _fmt_duration(seconds: float) -> str:
+    """A wait, in the coarsest unit that still reads honestly."""
+    if seconds < 120:
+        return f"{seconds:.0f}s"
+    if seconds < 7200:
+        return f"{seconds / 60:.1f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
 @cli.command()
 @click.option("--queue", "-q", help="Filter by queue")
 @click.option(
@@ -1215,8 +1233,29 @@ def metrics(
                     click.echo(f"Queue: {queue}")
                 click.echo("-" * 50)
 
+                # Throughput first and next to arrivals, because the
+                # comparison IS the answer: arrivals sustained above
+                # completions is what "falling behind" means, and neither
+                # number says it alone.
+                throughput = metrics_data["throughput_per_second"]
+                arrivals = metrics_data["arrival_rate_per_second"]
+                click.echo(f"Throughput:        {throughput:.2f} jobs/s (completed)")
+                click.echo(f"Arrivals:          {arrivals:.2f} jobs/s (created)")
+                verdict = "falling behind" if arrivals > throughput else "keeping up"
+                click.echo(
+                    f"Balance:           {arrivals - throughput:+.2f} jobs/s ({verdict})"
+                )
+                click.echo(
+                    f"Retry Pressure:    "
+                    f"{metrics_data['retry_rate_per_second']:.2f} attempts/s"
+                )
+                click.echo(
+                    f"DLQ Growth:        "
+                    f"{metrics_data['dlq_growth_per_second']:.4f} jobs/s"
+                )
                 click.echo(f"Finished:          {metrics_data['finished_count']}")
                 click.echo(f"Crashed:           {metrics_data['crashed_count']}")
+                click.echo(f"Cancelled:         {metrics_data['cancelled_count']}")
                 click.echo(
                     f"Avg Duration:      {metrics_data['avg_duration_seconds']:.2f}s"
                 )
@@ -1227,8 +1266,52 @@ def metrics(
                     f"Max Queue Wait:    {metrics_data['max_wait_seconds']:.2f}s"
                 )
 
+                backlog = metrics_data["backlog"]
+                inflight = metrics_data["inflight"]
+                click.echo(
+                    f"Backlog:           {backlog['depth']} claimable, "
+                    f"oldest ready {_fmt_duration(backlog['oldest_age_seconds'])}"
+                )
+                click.echo(
+                    f"In Flight:         {inflight['inflight']} "
+                    f"({inflight['stuck']} stuck > "
+                    f"{_fmt_duration(inflight['stuck_after_seconds'])}, "
+                    f"oldest {_fmt_duration(inflight['oldest_age_seconds'])})"
+                )
+
+                # The cliff: at 1.0 every NOTIFY-issuing transaction fails,
+                # which means no job can be enqueued or completed anywhere.
+                usage = metrics_data["notify_queue_usage"]
+                click.echo(f"NOTIFY Queue:      {usage:.1%} used")
+
+                storage = metrics_data["storage"]
+                click.echo(
+                    f"Dead Tuples:       {storage['dead_tuple_ratio']:.1%} of jorb"
+                )
+
+                if backlog.get("per_queue"):
+                    click.echo(f"\n{Colors.BOLD}Backlog by Queue:{Colors.ENDC}")
+                    for qname, stats in sorted(backlog["per_queue"].items()):
+                        click.echo(
+                            f"  {qname:20} depth {stats['depth']:<8} "
+                            f"oldest ready "
+                            f"{_fmt_duration(stats['oldest_age_seconds'])}"
+                        )
+
+                if storage.get("tables"):
+                    click.echo(f"\n{Colors.BOLD}Storage:{Colors.ENDC}")
+                    for tname, stats in sorted(storage["tables"].items()):
+                        click.echo(
+                            f"  {tname:14} {_fmt_bytes(stats['total_bytes']):>9} "
+                            f"total ({_fmt_bytes(stats['table_bytes'])} table + "
+                            f"{_fmt_bytes(stats['index_bytes'])} index), "
+                            f"dead {stats['dead_tuple_ratio']:.1%}"
+                        )
+
                 if metrics_data.get("state_counts"):
-                    click.echo(f"\n{Colors.BOLD}Jobs by State:{Colors.ENDC}")
+                    click.echo(
+                        f"\n{Colors.BOLD}Jobs Created in Window, by State:{Colors.ENDC}"
+                    )
                     for state, count in sorted(metrics_data["state_counts"].items()):
                         click.echo(f"  {state:12} {count}")
 
@@ -2400,6 +2483,55 @@ DOCTOR_REQUIRED_TRIGGERS = (
     "jorb_cancel_notify",
 )
 
+# Fill fractions of PostgreSQL's shared async-NOTIFY queue at which doctor
+# stops calling it healthy. The queue is server-wide and bounded, and it
+# drains only as fast as the SLOWEST connected listener -- so a single
+# listening session that has stopped consuming fills it for everyone. At 1.0
+# every transaction that issues a NOTIFY fails, and pyjobby issues one on
+# enqueue, on every state transition, and on completion: no job can be
+# enqueued or completed anywhere in the system.
+#
+# The thresholds are low on purpose. This is a cliff, not a gradient --
+# nothing degrades on the way up, so the only useful warning is an early one.
+DOCTOR_NOTIFY_WARN = 0.25
+DOCTOR_NOTIFY_FAIL = 0.5
+
+# What to actually DO about it, since the number alone tells an operator
+# nothing. Disabling the per-transition feed is safe; the enqueue and
+# completion channels are load-bearing (worker wakeups and result waiters)
+# and must stay on.
+DOCTOR_NOTIFY_REMEDY = (
+    "a listening session has stopped draining it -- find it with "
+    '"SELECT pid, state, query FROM pg_stat_activity WHERE wait_event = '
+    "'NotifyQueue' OR query ILIKE '%LISTEN%'\" and disconnect it, or cut "
+    "notification volume with "
+    "'ALTER TABLE jorb DISABLE TRIGGER job_state_change_notify' "
+    "(the dashboard feed; enqueue/done channels must stay enabled)"
+)
+
+
+def notify_queue_verdict(usage: float) -> tuple[str, str]:
+    """Grade a NOTIFY-queue fill fraction into (status, message).
+
+    Split out from `doctor` so the thresholds are testable: the queue is
+    server-wide and 8GB by default, so no test can honestly fill it, and a
+    check whose WARN and FAIL branches have never been executed is a check
+    that has not been written.
+    """
+    usage_pct = f"{usage:.1%} full"
+    if usage > DOCTOR_NOTIFY_FAIL:
+        return (
+            "FAIL",
+            f"{usage_pct} -- at 100% every enqueue and completion fails "
+            f"platform-wide; {DOCTOR_NOTIFY_REMEDY}",
+        )
+    if usage >= DOCTOR_NOTIFY_WARN:
+        return (
+            "WARN",
+            f"{usage_pct} and it should be near empty -- {DOCTOR_NOTIFY_REMEDY}",
+        )
+    return "PASS", usage_pct
+
 
 class _Doctor:
     """Accumulates PASS/WARN/FAIL check lines for `pj-admin doctor`."""
@@ -2448,7 +2580,8 @@ def doctor(ctx: click.Context, max_depth: int, max_age_minutes: int) -> None:
     """Run health checks against the job platform (exit 1 on any FAIL)
 
     Checks: database reachability, schema/migrations, NOTIFY triggers,
-    live workers, queue backlogs, the DLQ, and overdue schedules.
+    NOTIFY queue saturation, live workers, queue backlogs, the DLQ, and
+    overdue schedules.
     """
 
     async def _doctor() -> int:
@@ -2502,6 +2635,16 @@ def doctor(ctx: click.Context, max_depth: int, max_age_minutes: int) -> None:
                 f"all NOTIFY triggers present ({len(DOCTOR_REQUIRED_TRIGGERS)})",
                 f"missing NOTIFY triggers: {', '.join(missing)}",
             )
+
+            # NOTIFY queue saturation. Checked right after the triggers that
+            # fill it, and before anything about jobs, because when this one
+            # goes nothing else in the report can still be true: enqueue and
+            # completion both fail outright at 1.0.
+            notify_usage = float(
+                await conn.fetchval("SELECT pg_notification_queue_usage()") or 0.0
+            )
+            status, message = notify_queue_verdict(notify_usage)
+            doc.report(status, "notify-queue", message)
 
             # Live workers (heartbeats arrive every ~10s)
             live_workers = await conn.fetchval("""

@@ -299,16 +299,55 @@ def mock_admin_api():
     ]
 
     # AdminAPI.get_metrics return shape (fully JSON-serializable).
+    # Rates are per-second over `window_seconds`, levels are instants; see
+    # tests/test_metrics_saturation.py for what each one means and is worth.
     mock_api.get_metrics.return_value = {
         "period_start": (datetime.now() - timedelta(hours=24)).isoformat(),
         "period_end": datetime.now().isoformat(),
+        "window_seconds": 86400.0,
         "queue": None,
         "state_counts": {"finished": 950, "crashed": 50},
         "finished_count": 950,
         "crashed_count": 50,
+        "cancelled_count": 0,
+        "terminal_count": 1000,
+        "throughput_per_second": 1000 / 86400,
+        "arrival_count": 1200,
+        "arrival_rate_per_second": 1200 / 86400,
+        "retry_count": 120,
+        "retry_rate_per_second": 120 / 86400,
+        "dlq_growth_per_second": 50 / 86400,
         "avg_duration_seconds": 12.3,
         "avg_wait_seconds": 4.5,
         "max_wait_seconds": 31.0,
+        "backlog": {
+            "per_queue": {"default": {"depth": 200, "oldest_age_seconds": 95.0}},
+            "depth": 200,
+            "oldest_age_seconds": 95.0,
+        },
+        "inflight": {
+            "inflight": 40,
+            "stuck": 2,
+            "stuck_after_seconds": 300.0,
+            "oldest_age_seconds": 610.0,
+        },
+        "storage": {
+            "tables": {
+                "jorb": {
+                    "total_bytes": 7_110_656,
+                    "table_bytes": 2_383_872,
+                    "index_bytes": 4_726_784,
+                    "live_tuples": 20000,
+                    "dead_tuples": 1000,
+                    "dead_tuple_ratio": 1000 / 21000,
+                    "last_autovacuum": datetime.now().isoformat(),
+                    "last_autoanalyze": datetime.now().isoformat(),
+                },
+            },
+            "total_bytes": 7_110_656,
+            "dead_tuple_ratio": 1000 / 21000,
+        },
+        "notify_queue_usage": 0.0,
         "top_errors": [
             {
                 "job_class": "test.FailedJob",

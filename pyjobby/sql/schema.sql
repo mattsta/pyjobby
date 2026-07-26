@@ -107,8 +107,14 @@ CREATE INDEX jorb_timeout_idx ON jorb (timeout_at)
 -- dependency wakeups
 CREATE INDEX jorb_waitfor_job_idx   ON jorb (waitfor_job)   WHERE state = 'waiting';
 CREATE INDEX jorb_waitfor_group_idx ON jorb (waitfor_group) WHERE state = 'waiting';
-CREATE INDEX jorb_run_group_idx     ON jorb (run_group);
-CREATE INDEX jorb_uid_idx           ON jorb (uid);
+-- Partial like their neighbours, and for the same reason: run_group and uid
+-- are NULL on the overwhelming majority of jobs (only grouped work and
+-- multi-tenant callers set them), but a plain btree indexes NULLs too. That
+-- means an index entry written on every insert and maintained by every
+-- vacuum, for rows the index can never usefully answer a question about --
+-- pure write amplification on the hottest table in the system.
+CREATE INDEX jorb_run_group_idx ON jorb (run_group) WHERE run_group IS NOT NULL;
+CREATE INDEX jorb_uid_idx       ON jorb (uid)       WHERE uid IS NOT NULL;
 CREATE INDEX jorb_dag_idx           ON jorb (dag_id) WHERE dag_id IS NOT NULL;
 -- idempotent enqueue
 CREATE UNIQUE INDEX jorb_deadline_idx ON jorb (deadline_key, queue)

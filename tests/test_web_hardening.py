@@ -416,13 +416,40 @@ class TestStoredXSSProperties:
 METRIC_NAMES = {
     "pyjobby_jobs_by_state",
     "pyjobby_queue_oldest_queued_seconds",
+    "pyjobby_backlog_depth",
     "pyjobby_queue_paused",
     "pyjobby_workers_live",
     "pyjobby_jobs_started_total",
     "pyjobby_jobs_finished_total",
     "pyjobby_jobs_crashed_total",
     "pyjobby_job_duration_seconds",
+    # platform-health gauges (no queue label)
+    "pyjobby_throughput_jobs_per_second",
+    "pyjobby_arrival_jobs_per_second",
+    "pyjobby_retry_attempts_per_second",
+    "pyjobby_dlq_jobs_per_second",
+    "pyjobby_jobs_inflight",
+    "pyjobby_jobs_stuck",
+    "pyjobby_inflight_oldest_age_seconds",
+    "pyjobby_notify_queue_usage_ratio",
+    # footprint gauges (labelled by table, never by queue)
+    "pyjobby_table_total_bytes",
+    "pyjobby_table_bytes",
+    "pyjobby_table_index_bytes",
+    "pyjobby_table_live_tuples",
+    "pyjobby_table_dead_tuples",
+    "pyjobby_table_dead_tuple_ratio",
 }
+
+# Series that carry a queue label, and therefore multiply with the number of
+# distinct queue names. The hostile-label tests count them: a queue name is
+# attacker-controlled, so every one of these is a place a forged line could
+# appear.
+QUEUE_LABELLED_FOR_ONE_QUEUED_JOB = (
+    "pyjobby_backlog_depth",
+    "pyjobby_jobs_by_state",
+    "pyjobby_queue_oldest_queued_seconds",
+)
 
 # name{labels} value  — labels are a quoted-string soup we only split loosely,
 # because the point of the check is that no line can be forged at all.
@@ -490,21 +517,19 @@ class TestPrometheusExposition:
         assert f'queue="{prom_escape(nasty)}"' in body
 
         marked_lines = [ln for ln in body.split("\n") if marker in ln]
-        # Exactly two series mention this queue: jobs_by_state{queued} and
-        # queue_oldest_queued_seconds (no jorb_queue control row exists).
-        assert len(marked_lines) == 2, marked_lines
+        # Exactly the queue-labelled series mention this queue: the job is
+        # queued and due, so it is backlog as well as state (no jorb_queue
+        # control row exists, so the paused gauge does not appear).
+        assert len(marked_lines) == len(QUEUE_LABELLED_FOR_ONE_QUEUED_JOB), marked_lines
         names = sorted(ln.split("{", 1)[0] for ln in marked_lines)
-        assert names == [
-            "pyjobby_jobs_by_state",
-            "pyjobby_queue_oldest_queued_seconds",
-        ]
+        assert names == sorted(QUEUE_LABELLED_FOR_ONE_QUEUED_JOB)
         parse_exposition(body)
 
     @HYPOTHESIS_SETTINGS
     @given(queue=hostile_text)
     @pytest.mark.hypothesis
     @pytest.mark.asyncio
-    async def test_hostile_queue_name_yields_exactly_two_wellformed_lines(
+    async def test_hostile_queue_name_yields_exactly_the_expected_lines(
         self, web: Harness, db_pool: asyncpg.Pool, queue: str
     ):
         """Property: whatever the queue name, it contributes exactly the
@@ -526,10 +551,13 @@ class TestPrometheusExposition:
 
         parse_exposition(body)
         marked_lines = [ln for ln in body.split("\n") if marker in ln]
-        assert len(marked_lines) == 2, marked_lines
+        assert len(marked_lines) == len(QUEUE_LABELLED_FOR_ONE_QUEUED_JOB), marked_lines
         assert (
             f'pyjobby_jobs_by_state{{queue="{prom_escape(queue_value)}",'
             f'state="queued"}} 1'
+        ) in body
+        assert (
+            f'pyjobby_backlog_depth{{queue="{prom_escape(queue_value)}"}} 1'
         ) in body
 
     @pytest.mark.asyncio
@@ -606,6 +634,27 @@ class TestPrometheusExposition:
         assert f'pyjobby_queue_paused{{queue="{unique_queue}"}} 1' in body
         assert "pyjobby_workers_live 1" in body
 
+        # The platform-health gauges carry no queue label at all, so a
+        # hostile queue name can never reach them.
+        for unlabelled in (
+            "pyjobby_throughput_jobs_per_second",
+            "pyjobby_arrival_jobs_per_second",
+            "pyjobby_retry_attempts_per_second",
+            "pyjobby_dlq_jobs_per_second",
+            "pyjobby_jobs_inflight",
+            "pyjobby_jobs_stuck",
+            "pyjobby_inflight_oldest_age_seconds",
+            "pyjobby_notify_queue_usage_ratio",
+        ):
+            assert [s for s in samples if s[0] == unlabelled] == [(unlabelled, "")], (
+                f"{unlabelled} must be a single unlabelled series"
+            )
+
+        # Footprint gauges are labelled by table name, which is ours.
+        assert sorted(
+            labels for name, labels in samples if name == "pyjobby_table_total_bytes"
+        ) == ['table="jorb"', 'table="jorb_history"', 'table="jorb_step"']
+
     @pytest.mark.asyncio
     async def test_cardinality_fifty_queues_all_reported(
         self, web: Harness, db_pool: asyncpg.Pool, test_id: str
@@ -637,6 +686,7 @@ class TestPrometheusExposition:
         for q in queues:
             assert f'pyjobby_jobs_by_state{{queue="{q}",state="queued"}} 1' in body
         assert body.count("pyjobby_queue_oldest_queued_seconds{queue=") == 50
+        assert body.count("pyjobby_backlog_depth{queue=") == 50
 
 
 # =============================================================================
