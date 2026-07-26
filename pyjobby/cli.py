@@ -6,14 +6,17 @@ Command-line interface for managing jobs, queues, and workers.
 Built on top of the admin API for clean separation of concerns.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import sys
 from datetime import datetime, timedelta
 
-import asyncpg
+import asyncpg  # type: ignore[import-untyped]
 import click
 
+from . import db
 from .admin_api import AdminAPI
 from .configloader import load_config_from_file
 
@@ -78,16 +81,20 @@ def print_table(headers: list[str], rows: list[list[str]], max_width: int = 80) 
         click.echo(row_str)
 
 
-async def get_connection(config_path: str) -> asyncpg.Connection:
-    """Get database connection from config file"""
+async def get_connection(
+    config_path: str, dsn: str | None = None
+) -> asyncpg.Connection:
+    """Get database connection from a DSN (if given) or a config file"""
     try:
+        if dsn:
+            return await db.connect(dsn)
         config = load_config_from_file(config_path, keys=["db_params"])
         db_params = config.get("db_params")
         if not db_params:
             print_error(f"No db_params found in config file: {config_path}")
             print_error("Config file must define db_params dict")
             sys.exit(1)
-        conn = await asyncpg.connect(**db_params)
+        conn = await db.connect(**db_params)
         return conn
     except FileNotFoundError:
         print_error(f"Config file not found: {config_path}")
@@ -105,11 +112,18 @@ async def get_connection(config_path: str) -> asyncpg.Connection:
 
 @click.group()
 @click.option("--config", "-c", default="./pyjobby.conf.py", help="Config file path")
+@click.option(
+    "--dsn",
+    envvar="PYJOBBY_DSN",
+    default=None,
+    help="PostgreSQL DSN (overrides --config; also read from PYJOBBY_DSN)",
+)
 @click.pass_context
-def cli(ctx, config):
+def cli(ctx: click.Context, config: str, dsn: str | None) -> None:
     """Pyjobby job queue management CLI"""
     ctx.ensure_object(dict)
     ctx.obj["config"] = config
+    ctx.obj["dsn"] = dsn
 
 
 # =========================================================================
@@ -118,7 +132,7 @@ def cli(ctx, config):
 
 
 @cli.group()
-def jobs():
+def jobs() -> None:
     """Manage jobs"""
     pass
 
@@ -132,11 +146,20 @@ def jobs():
 @click.option("--offset", "-o", default=0, help="Offset for pagination")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def jobs_list(ctx, queue, state, job_class, uid, limit, offset, output_json):
+def jobs_list(
+    ctx: click.Context,
+    queue: str | None,
+    state: str | None,
+    job_class: str | None,
+    uid: int | None,
+    limit: int,
+    offset: int,
+    output_json: bool,
+) -> None:
     """List jobs with optional filtering"""
 
-    async def _list():
-        conn = await get_connection(ctx.obj["config"])
+    async def _list() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
             jobs = await api.list_jobs(
@@ -184,11 +207,11 @@ def jobs_list(ctx, queue, state, job_class, uid, limit, offset, output_json):
 @click.argument("job_id", type=int)
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def jobs_inspect(ctx, job_id, output_json):
+def jobs_inspect(ctx: click.Context, job_id: int, output_json: bool) -> None:
     """Show detailed information about a job"""
 
-    async def _inspect():
-        conn = await get_connection(ctx.obj["config"])
+    async def _inspect() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
             job = await api.get_job(job_id)
@@ -245,11 +268,11 @@ def jobs_inspect(ctx, job_id, output_json):
 @jobs.command("retry")
 @click.argument("job_ids", nargs=-1, type=int, required=True)
 @click.pass_context
-def jobs_retry(ctx, job_ids):
+def jobs_retry(ctx: click.Context, job_ids: tuple[int, ...]) -> None:
     """Retry one or more crashed jobs"""
 
-    async def _retry():
-        conn = await get_connection(ctx.obj["config"])
+    async def _retry() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
 
@@ -294,11 +317,11 @@ def jobs_retry(ctx, job_ids):
 @jobs.command("cancel")
 @click.argument("job_ids", nargs=-1, type=int, required=True)
 @click.pass_context
-def jobs_cancel(ctx, job_ids):
+def jobs_cancel(ctx: click.Context, job_ids: tuple[int, ...]) -> None:
     """Cancel one or more queued/waiting jobs"""
 
-    async def _cancel():
-        conn = await get_connection(ctx.obj["config"])
+    async def _cancel() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
 
@@ -337,16 +360,15 @@ def jobs_cancel(ctx, job_ids):
 @click.argument("job_id", type=int)
 @click.option("--force", "-f", is_flag=True, help="Skip confirmation")
 @click.pass_context
-def jobs_delete(ctx, job_id, force):
+def jobs_delete(ctx: click.Context, job_id: int, force: bool) -> None:
     """Delete a job (permanent!)"""
 
-    async def _delete():
-        if not force:
-            if not click.confirm(f"Delete job {job_id}? This is permanent"):
-                click.echo("Cancelled")
-                return
+    async def _delete() -> None:
+        if not force and not click.confirm(f"Delete job {job_id}? This is permanent"):
+            click.echo("Cancelled")
+            return
 
-        conn = await get_connection(ctx.obj["config"])
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
             deleted = await api.delete_job(job_id)
@@ -369,18 +391,18 @@ def jobs_delete(ctx, job_id, force):
 
 
 @cli.group()
-def queues():
+def queues() -> None:
     """Manage queues"""
     pass
 
 
 @queues.command("list")
 @click.pass_context
-def queues_list(ctx):
+def queues_list(ctx: click.Context) -> None:
     """List all queues"""
 
-    async def _list():
-        conn = await get_connection(ctx.obj["config"])
+    async def _list() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
             queues = await api.list_queues()
@@ -403,11 +425,11 @@ def queues_list(ctx):
 @click.option("--queue", "-q", help="Specific queue (default: all)")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def queues_stats(ctx, queue, output_json):
+def queues_stats(ctx: click.Context, queue: str | None, output_json: bool) -> None:
     """Show queue statistics"""
 
-    async def _stats():
-        conn = await get_connection(ctx.obj["config"])
+    async def _stats() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
             stats = await api.queue_stats(queue=queue)
@@ -465,10 +487,16 @@ def queues_stats(ctx, queue, output_json):
 @click.option("--older-than-days", type=int, help="Only clear jobs older than N days")
 @click.option("--force", "-f", is_flag=True, help="Skip confirmation")
 @click.pass_context
-def queues_clear(ctx, queue, state, older_than_days, force):
+def queues_clear(
+    ctx: click.Context,
+    queue: str,
+    state: str | None,
+    older_than_days: int | None,
+    force: bool,
+) -> None:
     """Clear (delete) jobs from a queue"""
 
-    async def _clear():
+    async def _clear() -> None:
         # Build description
         desc = f"queue '{queue}'"
         if state:
@@ -476,12 +504,13 @@ def queues_clear(ctx, queue, state, older_than_days, force):
         if older_than_days:
             desc += f" older than {older_than_days} days"
 
-        if not force:
-            if not click.confirm(f"Delete all jobs in {desc}? This is permanent"):
-                click.echo("Cancelled")
-                return
+        if not force and not click.confirm(
+            f"Delete all jobs in {desc}? This is permanent"
+        ):
+            click.echo("Cancelled")
+            return
 
-        conn = await get_connection(ctx.obj["config"])
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
             count = await api.clear_queue(
@@ -502,7 +531,7 @@ def queues_clear(ctx, queue, state, older_than_days, force):
 
 
 @cli.group()
-def workers():
+def workers() -> None:
     """Manage workers"""
     pass
 
@@ -510,11 +539,11 @@ def workers():
 @workers.command("list")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def workers_list(ctx, output_json):
+def workers_list(ctx: click.Context, output_json: bool) -> None:
     """List active workers"""
 
-    async def _list():
-        conn = await get_connection(ctx.obj["config"])
+    async def _list() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
             workers = await api.list_workers()
@@ -550,11 +579,11 @@ def workers_list(ctx, output_json):
 @workers.command("stats")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def workers_stats(ctx, output_json):
+def workers_stats(ctx: click.Context, output_json: bool) -> None:
     """Show worker statistics"""
 
-    async def _stats():
-        conn = await get_connection(ctx.obj["config"])
+    async def _stats() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
             stats = await api.worker_stats()
@@ -593,7 +622,7 @@ def workers_stats(ctx, output_json):
 
 
 @cli.group()
-def dlq():
+def dlq() -> None:
     """Manage Dead Letter Queue"""
     pass
 
@@ -602,11 +631,11 @@ def dlq():
 @click.option("--limit", "-l", default=100, help="Max results (default: 100)")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def dlq_list(ctx, limit, output_json):
+def dlq_list(ctx: click.Context, limit: int, output_json: bool) -> None:
     """List jobs in Dead Letter Queue"""
 
-    async def _list():
-        conn = await get_connection(ctx.obj["config"])
+    async def _list() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
             jobs = await api.list_dlq(limit=limit)
@@ -647,11 +676,11 @@ def dlq_list(ctx, limit, output_json):
 @dlq.command("retry")
 @click.argument("job_id", type=int)
 @click.pass_context
-def dlq_retry(ctx, job_id):
+def dlq_retry(ctx: click.Context, job_id: int) -> None:
     """Retry a job from Dead Letter Queue"""
 
-    async def _retry():
-        conn = await get_connection(ctx.obj["config"])
+    async def _retry() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
             result = await api.retry_from_dlq(job_id)
@@ -682,11 +711,13 @@ def dlq_retry(ctx, job_id):
 )
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def metrics(ctx, queue, since_hours, output_json):
+def metrics(
+    ctx: click.Context, queue: str | None, since_hours: int, output_json: bool
+) -> None:
     """Show system metrics"""
 
-    async def _metrics():
-        conn = await get_connection(ctx.obj["config"])
+    async def _metrics() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
             since = datetime.utcnow() - timedelta(hours=since_hours)
@@ -733,7 +764,7 @@ def metrics(ctx, queue, since_hours, output_json):
 
 
 @cli.group()
-def schedule():
+def schedule() -> None:
     """Manage recurring schedules"""
     pass
 
@@ -744,11 +775,17 @@ def schedule():
 @click.option("--limit", "-l", default=100, help="Max results (default: 100)")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def schedule_list(ctx, enabled, queue, limit, output_json):
+def schedule_list(
+    ctx: click.Context,
+    enabled: bool | None,
+    queue: str | None,
+    limit: int,
+    output_json: bool,
+) -> None:
     """List recurring schedules"""
 
-    async def _list():
-        conn = await get_connection(ctx.obj["config"])
+    async def _list() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
             schedules = await api.list_schedules(
@@ -802,11 +839,11 @@ def schedule_list(ctx, enabled, queue, limit, output_json):
 @click.argument("name_or_id")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def schedule_show(ctx, name_or_id, output_json):
+def schedule_show(ctx: click.Context, name_or_id: str, output_json: bool) -> None:
     """Show schedule details"""
 
-    async def _show():
-        conn = await get_connection(ctx.obj["config"])
+    async def _show() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
 
@@ -901,22 +938,22 @@ def schedule_show(ctx, name_or_id, output_json):
 @click.option("--disabled", is_flag=True, help="Create schedule in disabled state")
 @click.pass_context
 def schedule_add(
-    ctx,
-    name,
-    job_class,
-    cron_expr,
-    queue,
-    kwargs,
-    prio,
-    capability,
-    timezone,
-    max_concurrent,
-    jitter,
-    backpressure,
-    circuit_breaker,
-    description,
-    disabled,
-):
+    ctx: click.Context,
+    name: str,
+    job_class: str,
+    cron_expr: str,
+    queue: str,
+    kwargs: str | None,
+    prio: int,
+    capability: str | None,
+    timezone: str,
+    max_concurrent: int,
+    jitter: int,
+    backpressure: int,
+    circuit_breaker: int,
+    description: str | None,
+    disabled: bool,
+) -> None:
     """Create new recurring schedule
 
     Examples:
@@ -925,8 +962,8 @@ def schedule_add(
         pj-admin schedule add sync SyncJob "*/5 * * * *" --jitter 60 --max-concurrent 3
     """
 
-    async def _add():
-        conn = await get_connection(ctx.obj["config"])
+    async def _add() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
 
@@ -974,15 +1011,16 @@ def schedule_add(
 @schedule.command("enable")
 @click.argument("name_or_id")
 @click.pass_context
-def schedule_enable(ctx, name_or_id):
+def schedule_enable(ctx: click.Context, name_or_id: str) -> None:
     """Enable a disabled schedule"""
 
-    async def _enable():
-        conn = await get_connection(ctx.obj["config"])
+    async def _enable() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
 
             # Try as ID first, then as name
+            schedule_id: int | None
             try:
                 schedule_id = int(name_or_id)
                 sched = await api.get_schedule(schedule_id=schedule_id)
@@ -993,6 +1031,8 @@ def schedule_enable(ctx, name_or_id):
             if not sched:
                 print_error(f"Schedule not found: {name_or_id}")
                 return
+
+            assert schedule_id is not None
 
             await api.enable_schedule(schedule_id)
             print_success(f"✓ Schedule enabled: {sched['name']}")
@@ -1008,15 +1048,16 @@ def schedule_enable(ctx, name_or_id):
 @schedule.command("disable")
 @click.argument("name_or_id")
 @click.pass_context
-def schedule_disable(ctx, name_or_id):
+def schedule_disable(ctx: click.Context, name_or_id: str) -> None:
     """Disable an enabled schedule"""
 
-    async def _disable():
-        conn = await get_connection(ctx.obj["config"])
+    async def _disable() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
 
             # Try as ID first, then as name
+            schedule_id: int | None
             try:
                 schedule_id = int(name_or_id)
                 sched = await api.get_schedule(schedule_id=schedule_id)
@@ -1027,6 +1068,8 @@ def schedule_disable(ctx, name_or_id):
             if not sched:
                 print_error(f"Schedule not found: {name_or_id}")
                 return
+
+            assert schedule_id is not None
 
             await api.disable_schedule(schedule_id)
             print_success(f"✓ Schedule disabled: {sched['name']}")
@@ -1043,15 +1086,16 @@ def schedule_disable(ctx, name_or_id):
 @click.argument("name_or_id")
 @click.confirmation_option(prompt="Are you sure you want to delete this schedule?")
 @click.pass_context
-def schedule_delete(ctx, name_or_id):
+def schedule_delete(ctx: click.Context, name_or_id: str) -> None:
     """Delete a recurring schedule"""
 
-    async def _delete():
-        conn = await get_connection(ctx.obj["config"])
+    async def _delete() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
 
             # Try as ID first, then as name
+            schedule_id: int | None
             try:
                 schedule_id = int(name_or_id)
                 sched = await api.get_schedule(schedule_id=schedule_id)
@@ -1062,6 +1106,8 @@ def schedule_delete(ctx, name_or_id):
             if not sched:
                 print_error(f"Schedule not found: {name_or_id}")
                 return
+
+            assert schedule_id is not None
 
             await api.delete_schedule(schedule_id)
             print_success(f"✓ Schedule deleted: {sched['name']}")
@@ -1080,15 +1126,22 @@ def schedule_delete(ctx, name_or_id):
 @click.option("--limit", "-l", default=50, help="Max results (default: 50)")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def schedule_history(ctx, name_or_id, result, limit, output_json):
+def schedule_history(
+    ctx: click.Context,
+    name_or_id: str,
+    result: str | None,
+    limit: int,
+    output_json: bool,
+) -> None:
     """Show schedule execution history"""
 
-    async def _history():
-        conn = await get_connection(ctx.obj["config"])
+    async def _history() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
 
             # Try as ID first, then as name
+            schedule_id: int | None
             try:
                 schedule_id = int(name_or_id)
                 sched = await api.get_schedule(schedule_id=schedule_id)
@@ -1099,6 +1152,8 @@ def schedule_history(ctx, name_or_id, result, limit, output_json):
             if not sched:
                 print_error(f"Schedule not found: {name_or_id}")
                 return
+
+            assert schedule_id is not None
 
             history = await api.get_schedule_history(
                 schedule_id=schedule_id, result_filter=result, limit=limit
@@ -1153,11 +1208,11 @@ def schedule_history(ctx, name_or_id, result, limit, output_json):
 @schedule.command("stats")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def schedule_stats(ctx, output_json):
+def schedule_stats(ctx: click.Context, output_json: bool) -> None:
     """Show execution statistics for all schedules"""
 
-    async def _stats():
-        conn = await get_connection(ctx.obj["config"])
+    async def _stats() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
             stats = await api.get_schedule_stats()
@@ -1226,7 +1281,7 @@ def schedule_stats(ctx, output_json):
 
 
 @cli.group()
-def dag():
+def dag() -> None:
     """Manage DAGs (Directed Acyclic Graphs)"""
     pass
 
@@ -1235,11 +1290,11 @@ def dag():
 @click.option("--limit", "-l", default=50, help="Max results (default: 50)")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def dag_list(ctx, limit, output_json):
+def dag_list(ctx: click.Context, limit: int, output_json: bool) -> None:
     """List DAGs"""
 
-    async def _list():
-        conn = await get_connection(ctx.obj["config"])
+    async def _list() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             # Get DAGs with their status
             dags = await conn.fetch(
@@ -1320,11 +1375,11 @@ def dag_list(ctx, limit, output_json):
 @click.argument("dag_id", type=int)
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def dag_show(ctx, dag_id, output_json):
+def dag_show(ctx: click.Context, dag_id: int, output_json: bool) -> None:
     """Show DAG details and job status"""
 
-    async def _show():
-        conn = await get_connection(ctx.obj["config"])
+    async def _show() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             # Get DAG info
             dag = await conn.fetchrow(
@@ -1428,11 +1483,11 @@ def dag_show(ctx, dag_id, output_json):
 @dag.command("visualize")
 @click.argument("dag_id", type=int)
 @click.pass_context
-def dag_visualize(ctx, dag_id):
+def dag_visualize(ctx: click.Context, dag_id: int) -> None:
     """Visualize DAG structure (ASCII art)"""
 
-    async def _visualize():
-        conn = await get_connection(ctx.obj["config"])
+    async def _visualize() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             # Get DAG dependencies
             deps = await conn.fetch(
@@ -1530,18 +1585,22 @@ def dag_visualize(ctx, dag_id):
 )
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def jobs_retry_stats(ctx, queue, since_hours, output_json):
+def jobs_retry_stats(
+    ctx: click.Context, queue: str | None, since_hours: int, output_json: bool
+) -> None:
     """Show retry statistics (Phase 2)"""
 
-    async def _retry_stats():
-        conn = await get_connection(ctx.obj["config"])
+    async def _retry_stats() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             # Build WHERE clause
             where_clauses = ["error_count > 0"]
             params = []
 
             if since_hours:
-                where_clauses.append("created > NOW() - $1::interval")
+                where_clauses.append(
+                    "created > TIMEZONE('utc', clock_timestamp()) - $1::interval"
+                )
                 params.append(f"{since_hours} hours")
 
             if queue:
@@ -1653,18 +1712,22 @@ def jobs_retry_stats(ctx, queue, since_hours, output_json):
 )
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def jobs_timeout_stats(ctx, queue, since_hours, output_json):
+def jobs_timeout_stats(
+    ctx: click.Context, queue: str | None, since_hours: int, output_json: bool
+) -> None:
     """Show timeout statistics (Phase 2)"""
 
-    async def _timeout_stats():
-        conn = await get_connection(ctx.obj["config"])
+    async def _timeout_stats() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             # Build WHERE clause
             where_clauses = ["admin_data ? 'timeout_seconds'"]
             params = []
 
             if since_hours:
-                where_clauses.append("created > NOW() - $1::interval")
+                where_clauses.append(
+                    "created > TIMEZONE('utc', clock_timestamp()) - $1::interval"
+                )
                 params.append(f"{since_hours} hours")
 
             if queue:
@@ -1775,6 +1838,60 @@ def jobs_timeout_stats(ctx, queue, since_hours, output_json):
             await conn.close()
 
     asyncio.run(_timeout_stats())
+
+
+# =========================================================================
+# Database Schema Commands
+# =========================================================================
+
+
+@cli.group("db")
+def db_group() -> None:
+    """Manage the database schema (install / migrate / status)"""
+    pass
+
+
+@db_group.command("migrate")
+@click.pass_context
+def db_migrate(ctx: click.Context) -> None:
+    """Install the base schema if missing, then apply pending migrations"""
+
+    async def _migrate() -> None:
+        from . import migrations
+
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        try:
+            applied = await migrations.migrate(conn)
+            if applied:
+                print_success(f"Applied migrations: {applied}")
+            else:
+                print_success("Database schema is up to date")
+        finally:
+            await conn.close()
+
+    asyncio.run(_migrate())
+
+
+@db_group.command("status")
+@click.pass_context
+def db_status(ctx: click.Context) -> None:
+    """Show applied vs pending schema migrations"""
+
+    async def _status() -> None:
+        from . import migrations
+
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        try:
+            info = await migrations.status(conn)
+            click.echo(
+                f"Base schema installed: {'yes' if info['base_schema_installed'] else 'no'}"
+            )
+            click.echo(f"Applied migrations:    {info['applied'] or 'none'}")
+            click.echo(f"Pending migrations:    {info['pending'] or 'none'}")
+        finally:
+            await conn.close()
+
+    asyncio.run(_status())
 
 
 if __name__ == "__main__":

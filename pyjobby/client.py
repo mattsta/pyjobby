@@ -11,8 +11,7 @@ Features:
 - Connection pooling for high performance
 - Support for all job features (scheduling, pipelines, priorities, deadlines)
 - Batch operations for high throughput
-- Context manager support
-- Both sync and async interfaces
+- Async context manager support
 
 Example:
     async with JobClient.from_config('./pyjobby.conf.py') as client:
@@ -36,47 +35,29 @@ Example:
         ])
 """
 
+from __future__ import annotations
+
 import json
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any
+from datetime import UTC, datetime
+from types import TracebackType
+from typing import TYPE_CHECKING, Any
 
-import asyncpg
+import asyncpg  # type: ignore[import-untyped]
 
+from . import db
 
-@dataclass
-class JobOptions:
-    """
-    Options for job creation.
-
-    Attributes:
-        queue: Queue name (default: 'default')
-        priority: Job priority, higher = more urgent (default: 100)
-        run_after: When to run (default: now)
-        capability: Required worker capability (default: None)
-        uid: User/tenant ID (default: None)
-        run_group: Group ID for pipeline tracking (default: None)
-        waitfor_job: Wait for this job to finish first (default: None)
-        waitfor_group: Wait for all jobs in this group (default: None)
-        deadline_key: Idempotency key (default: None)
-        admin_data: Metadata dict (default: None)
-    """
-
-    queue: str = "default"
-    priority: int = 100
-    run_after: datetime | None = None
-    capability: str | None = None
-    uid: int | None = None
-    run_group: int | None = None
-    waitfor_job: int | None = None
-    waitfor_group: int | None = None
-    deadline_key: str | None = None
-    admin_data: dict[str, Any] | None = None
+if TYPE_CHECKING:
+    from .dag import DAGBuilder
 
 
 @dataclass
 class JobInfo:
-    """Information about an enqueued job"""
+    """Lightweight job summary returned by JobClient.get_job().
+
+    (The admin API has its own, richer JobInfo covering every jorb column
+    with ISO-serialized datetimes — that one is for operations tooling;
+    this one is the minimal client-facing view.)"""
 
     id: int
     job_class: str
@@ -128,7 +109,7 @@ class JobClient:
         password: str | None = None,
         min_size: int = 5,
         max_size: int = 20,
-        **kwargs,
+        **kwargs: Any,
     ) -> JobClient:
         """
         Create client with new connection pool.
@@ -154,7 +135,7 @@ class JobClient:
                 password='secret'
             )
         """
-        pool = await asyncpg.create_pool(
+        pool = await db.create_pool(
             host=host,
             port=port,
             database=database,
@@ -189,9 +170,7 @@ class JobClient:
         config = load_config_from_file(config_path, keys=["db_params"])
         db_params = config.get("db_params", {})
 
-        pool = await asyncpg.create_pool(
-            min_size=min_size, max_size=max_size, **db_params
-        )
+        pool = await db.create_pool(min_size=min_size, max_size=max_size, **db_params)
         return cls(pool)
 
     async def close(self) -> None:
@@ -204,7 +183,12 @@ class JobClient:
         """Context manager entry"""
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         """Context manager exit"""
         await self.close()
 
@@ -227,7 +211,7 @@ class JobClient:
         deadline_key: str | None = None,
         admin_data: dict[str, Any] | None = None,
         # Phase 2: Result Storage & Passing
-        save_result: bool = False,
+        save_result: bool = True,
         use_result_from: int | None = None,
         # Phase 2: Retry Strategies
         retry_strategy: str = "exponential",
@@ -245,7 +229,8 @@ class JobClient:
         Args:
             job_class: Python class path (e.g., 'myapp.jobs.SendEmail')
             queue: Queue name (default: 'default')
-            priority: Priority (higher = more urgent, default: 100)
+            priority: Priority — LOWER numbers are more urgent; workers only
+                claim jobs with priority <= their own ceiling (default: 100)
             run_after: When to run (default: now)
             capability: Required worker capability (default: None)
             uid: User/tenant ID (default: None)
@@ -254,8 +239,11 @@ class JobClient:
             waitfor_group: Wait for all jobs in this group (default: None)
             deadline_key: Idempotency key (default: None)
             admin_data: Metadata dict (default: None)
-            save_result: Store job result in database (Phase 2, default: False)
-            use_result_from: Inject result from this job ID into kwargs (Phase 2)
+            save_result: Store job result in database (default: True; pass
+                False to discard results of large/uninteresting jobs)
+            use_result_from: Inject the (run-time) result of this job ID into
+                this job's kwargs as 'upstream_result' when it executes.
+                Combine with waitfor_job so the upstream has finished first.
             retry_strategy: 'exponential', 'linear', 'fibonacci', 'fixed' (Phase 2)
             max_retries: Maximum retry attempts (Phase 2, default: 10)
             initial_retry_delay: Starting retry delay in seconds (Phase 2, default: 1)
@@ -282,10 +270,10 @@ class JobClient:
                 report_type='daily'
             )
 
-            # High priority job
+            # High priority job (lower number = claimed first)
             job_id = await client.enqueue(
                 'myapp.jobs.UrgentTask',
-                priority=500,
+                priority=1,
                 task_id=123
             )
 
@@ -320,44 +308,42 @@ class JobClient:
         if waitfor_job and waitfor_group:
             raise ValueError("Cannot specify both waitfor_job and waitfor_group")
 
-        # Phase 2: Fetch upstream result if requested
-        if use_result_from:
-            async with self.pool.acquire() as conn:
-                upstream = await conn.fetchrow(
-                    "SELECT result FROM jorb WHERE id = $1", use_result_from
-                )
-                if upstream and upstream["result"]:
-                    kwargs["upstream_result"] = upstream["result"]
-
         # Default run_after to now if not specified
         if run_after is None:
-            run_after = datetime.utcnow()
+            run_after = datetime.now(UTC).replace(tzinfo=None)
 
         # Determine initial state
         state = "waiting" if waitfor_job or waitfor_group else "queued"
 
         # Phase 2: Build admin_data with Phase 2 features
-        if admin_data is None:
-            admin_data = {}
+        # (copy so we never mutate the caller's dict)
+        admin_data = dict(admin_data) if admin_data else {}
 
-        # Add save_result flag if requested
-        if save_result:
-            admin_data["save_result"] = True
+        # Results are saved by default; record only an explicit opt-out
+        if not save_result:
+            admin_data["save_result"] = False
 
-        # Add retry strategy configuration
-        admin_data["retry_strategy"] = retry_strategy
-        admin_data["max_retries"] = max_retries
-        admin_data["initial_retry_delay"] = initial_retry_delay
-        admin_data["max_retry_delay"] = max_retry_delay
+        # Phase 2: result passing is resolved by the WORKER at execution time
+        # (the upstream job usually hasn't run yet when we enqueue), so only
+        # record which job's result to inject.
+        if use_result_from:
+            admin_data["use_result_from"] = use_result_from
+
+        # Add retry strategy configuration without clobbering any values the
+        # caller already put in admin_data explicitly
+        admin_data.setdefault("retry_strategy", retry_strategy)
+        admin_data.setdefault("max_retries", max_retries)
+        admin_data.setdefault("initial_retry_delay", initial_retry_delay)
+        admin_data.setdefault("max_retry_delay", max_retry_delay)
 
         # Add timeout configuration if specified
         if timeout_seconds:
             admin_data["timeout_seconds"] = timeout_seconds
-            admin_data["on_timeout"] = on_timeout
+            admin_data.setdefault("on_timeout", on_timeout)
 
         # Execute INSERT
         async with self.pool.acquire() as conn:
-            job_id = await conn.fetchval(
+            job_id: int = await conn.fetchval(
                 """
                 INSERT INTO jorb (
                     job_class, kwargs, queue, prio, run_after,
@@ -425,7 +411,7 @@ class JobClient:
             return []
 
         if run_after is None:
-            run_after = datetime.utcnow()
+            run_after = datetime.now(UTC).replace(tzinfo=None)
 
         # Prepare values for batch insert
         values = []
@@ -462,7 +448,7 @@ class JobClient:
                     $2::text[],
                     $3::text[],
                     $4::int[],
-                    $5::timestamptz[],
+                    $5::timestamp[],
                     $6::bigint[]
                 ) AS t(job_class, kwargs, queue, prio, run_after, run_group)
                 RETURNING id
@@ -526,7 +512,7 @@ class JobClient:
                 print("Job cancelled")
         """
         async with self.pool.acquire() as conn:
-            result = await conn.execute(
+            result: str = await conn.execute(
                 """
                 UPDATE jorb
                 SET state = 'cancelled'
@@ -554,24 +540,8 @@ class JobClient:
                 print(f"Created retry job: {new_job_id}")
         """
         async with self.pool.acquire() as conn:
-            new_job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (
-                    job_class, kwargs, queue, prio, uid, capability,
-                    run_after, run_group, admin_data, state
-                )
-                SELECT
-                    job_class, kwargs, queue, prio, uid, capability,
-                    TIMEZONE('utc', clock_timestamp()) as run_after,
-                    run_group,
-                    (COALESCE(admin_data::text::jsonb, '{}'::jsonb) || jsonb_build_object('retry_of', $1::bigint))::json as admin_data,
-                    'queued' as state
-                FROM jorb
-                WHERE id = $1::bigint
-                  AND state IN ('crashed', 'finished')
-                RETURNING id
-            """,
-                job_id,
+            new_job_id = await db.create_retry_job(
+                conn, job_id, allowed_states=("crashed", "finished")
             )
 
         return new_job_id
@@ -595,7 +565,7 @@ class JobClient:
             print(f"Queue has {depth} jobs waiting")
         """
         async with self.pool.acquire() as conn:
-            return await conn.fetchval(
+            depth: int = await conn.fetchval(
                 """
                 SELECT COUNT(*)
                 FROM jorb
@@ -604,6 +574,7 @@ class JobClient:
             """,
                 queue,
             )
+            return depth
 
     async def queue_stats(self, queue: str = "default") -> dict[str, int]:
         """
@@ -796,7 +767,7 @@ class JobClient:
                 print("Job deleted")
         """
         async with self.pool.acquire() as conn:
-            result = await conn.execute(
+            result: str = await conn.execute(
                 """
                 DELETE FROM jorb
                 WHERE id = $1
@@ -823,7 +794,7 @@ class JobClient:
                 print("Priority updated")
         """
         async with self.pool.acquire() as conn:
-            result = await conn.execute(
+            result: str = await conn.execute(
                 """
                 UPDATE jorb
                 SET prio = $2
@@ -868,7 +839,7 @@ class JobClient:
         """
         # Build WHERE clause
         where_clauses = []
-        params = []
+        params: list[Any] = []
         param_num = 1
 
         if queue:
@@ -954,7 +925,7 @@ class JobClient:
             )
         """
         where_clauses = []
-        params = []
+        params: list[Any] = []
         param_num = 1
 
         if job_class:
@@ -1033,7 +1004,7 @@ class JobClient:
                 print(f"Job {job['id']} failed: {job['error']}")
         """
         where = "state = 'crashed'"
-        params = []
+        params: list[Any] = []
 
         if queue:
             where += " AND queue = $1"
@@ -1136,28 +1107,18 @@ class JobClient:
         if not job_ids:
             return []
 
+        # one shared retry statement per job (see db.build_retry_sql) so
+        # bulk-created retry rows are identical to every other retry path
+        new_ids = []
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                INSERT INTO jorb (
-                    job_class, kwargs, queue, prio, uid, capability,
-                    run_after, run_group, admin_data, state
+            for job_id in job_ids:
+                new_id = await db.create_retry_job(
+                    conn, job_id, allowed_states=("crashed", "finished")
                 )
-                SELECT
-                    job_class, kwargs, queue, prio, uid, capability,
-                    TIMEZONE('utc', clock_timestamp()) as run_after,
-                    run_group,
-                    (COALESCE(admin_data::text::jsonb, '{}'::jsonb) || jsonb_build_object('retry_of', id))::json as admin_data,
-                    'queued' as state
-                FROM jorb
-                WHERE id = ANY($1::bigint[])
-                  AND state IN ('crashed', 'finished')
-                RETURNING id
-            """,
-                job_ids,
-            )
+                if new_id is not None:
+                    new_ids.append(new_id)
 
-        return [row["id"] for row in rows]
+        return new_ids
 
     async def bulk_delete(self, job_ids: list[int]) -> int:
         """
@@ -1340,7 +1301,7 @@ class JobClient:
     # Phase 2: DAG Support
     # =========================================================================
 
-    def dag(self, name: str | None = None, **common_options) -> DAGBuilder:
+    def dag(self, name: str | None = None, **common_options: Any) -> DAGBuilder:
         """
         Create a DAG (Directed Acyclic Graph) builder.
 
@@ -1459,7 +1420,7 @@ class JobClient:
         stages: list[tuple[str, dict, bool]],
         queue: str = "default",
         priority: int = 100,
-        **common_options,
+        **common_options: Any,
     ) -> list[int]:
         """
         Create a linear pipeline where each stage can receive the previous stage's result.

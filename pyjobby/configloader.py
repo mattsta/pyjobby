@@ -1,14 +1,21 @@
+from __future__ import annotations
+
 # Adapted from:
 # https://github.com/benoitc/gunicorn/blob/d1f0f11b7b7d00f74dc22ead8e62d322eb128431/gunicorn/app/base.py
-
 # This file is part of gunicorn released under the MIT license.
 import importlib.machinery
 import importlib.util
 import os
 import sys
-import traceback
 from collections.abc import Iterable
 from typing import Any
+
+
+class ConfigError(RuntimeError):
+    """Raised when a config file cannot be loaded or executed.
+
+    Subclasses RuntimeError so callers catching RuntimeError keep working.
+    Library code raises; CLI entry points decide whether to exit."""
 
 
 def chdir_addpath(path: str) -> None:
@@ -37,14 +44,12 @@ def get_config_from_filename(filename: str) -> dict[str, Any]:
                 module_name, filename, loader=loader_
             )
 
+        assert spec is not None
         mod = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = mod
         spec.loader.exec_module(mod)  # type: ignore
-    except Exception:
-        print(f"Failed to read config file: {filename}", file=sys.stderr)
-        traceback.print_exc()
-        sys.stderr.flush()
-        sys.exit(1)
+    except Exception as e:
+        raise ConfigError(f"Failed to read config file: {filename}: {e}") from e
 
     return vars(mod)
 

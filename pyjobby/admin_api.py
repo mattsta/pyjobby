@@ -8,11 +8,15 @@ Designed to be used by both CLI tools and web interfaces.
 All methods are async and return structured data (dicts/lists).
 """
 
+from __future__ import annotations
+
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-import asyncpg
+import asyncpg  # type: ignore[import-untyped]
+
+from . import db
 
 
 @dataclass
@@ -165,7 +169,7 @@ class AdminAPI:
         """
         # Build WHERE clauses dynamically
         where_clauses = []
-        params = []
+        params: list[Any] = []
         param_idx = 1
 
         if queue:
@@ -256,29 +260,9 @@ class AdminAPI:
                 f"can only retry crashed or cancelled jobs"
             )
 
-        # Create retry job using same logic as automatic retry
-        new_job_id = await self.conn.fetchval(
-            """
-            INSERT INTO jorb (
-                job_class, kwargs, queue, prio, uid, capability,
-                run_after, run_group, admin_data, state, error_count
-            )
-            SELECT
-                job_class, kwargs, queue, prio, uid, capability,
-                TIMEZONE('utc', clock_timestamp()) as run_after,
-                run_group,
-                jsonb_set(
-                    COALESCE(admin_data::jsonb, '{}'::jsonb),
-                    '{parent_job_id}',
-                    to_jsonb($1::bigint)
-                )::json,
-                'queued' as state,
-                0 as error_count
-            FROM jorb
-            WHERE id = $1
-            RETURNING id
-        """,
-            job_id,
+        # Create retry job using the shared retry statement (db module)
+        new_job_id = await db.create_retry_job(
+            self.conn, job_id, allowed_states=("crashed", "cancelled")
         )
 
         return {
@@ -379,7 +363,7 @@ class AdminAPI:
         Returns:
             True if deleted, False if not found
         """
-        result = await self.conn.execute("DELETE FROM jorb WHERE id = $1", job_id)
+        result: str = await self.conn.execute("DELETE FROM jorb WHERE id = $1", job_id)
         # asyncpg returns "DELETE N" where N is number of rows deleted
         return result == "DELETE 1"
 
@@ -403,7 +387,7 @@ class AdminAPI:
             Number of jobs deleted
         """
         where_clauses = []
-        params = []
+        params: list[Any] = []
         param_idx = 1
 
         if queue:
@@ -476,7 +460,7 @@ class AdminAPI:
                 state,
                 COUNT(*) as count,
                 MIN(CASE WHEN state = 'queued'
-                    THEN EXTRACT(EPOCH FROM (NOW() - created))
+                    THEN EXTRACT(EPOCH FROM (TIMEZONE('utc', clock_timestamp()) - created))
                     ELSE NULL END) as oldest_queued_age_seconds
             FROM jorb
             {where_sql}
@@ -750,30 +734,23 @@ class AdminAPI:
         if job["state"] != "crashed":
             raise ValueError(f"Job {job_id} is not in DLQ (state: {job['state']})")
 
-        # Create retry job with error_count reset to 0
-        new_job_id = await self.conn.fetchval(
-            """
-            INSERT INTO jorb (
-                job_class, kwargs, queue, prio, uid, capability,
-                run_after, run_group, admin_data, state, error_count
-            )
-            SELECT
-                job_class, kwargs, queue, prio, uid, capability,
-                TIMEZONE('utc', clock_timestamp()) as run_after,
-                run_group,
-                jsonb_set(
-                    COALESCE(admin_data::jsonb, '{}'::jsonb),
-                    '{dlq_retry_from}',
-                    to_jsonb($1::bigint)
-                )::json,
-                'queued' as state,
-                0 as error_count
-            FROM jorb
-            WHERE id = $1
-            RETURNING id
-        """,
-            job_id,
+        # Create retry job with error_count reset to 0 using the shared
+        # retry statement, then stamp the DLQ provenance marker on the copy
+        new_job_id = await db.create_retry_job(
+            self.conn, job_id, allowed_states=("crashed",)
         )
+        if new_job_id is not None:
+            await self.conn.execute(
+                """
+                UPDATE jorb
+                SET admin_data = jsonb_set(
+                    COALESCE(admin_data::text::jsonb, '{}'::jsonb),
+                    '{dlq_retry_from}', to_jsonb($2::bigint))::json
+                WHERE id = $1
+                """,
+                new_job_id,
+                job_id,
+            )
 
         return {
             "original_job_id": job_id,
@@ -805,7 +782,7 @@ class AdminAPI:
             List of schedule dictionaries
         """
         where_clauses = []
-        params = []
+        params: list[Any] = []
         param_idx = 1
 
         if enabled is not None:
@@ -898,8 +875,8 @@ class AdminAPI:
         Returns:
             Created schedule dictionary
         """
-        import pytz
-        from croniter import croniter
+        import pytz  # type: ignore[import-untyped]
+        from croniter import croniter  # type: ignore[import-untyped]
 
         # Validate cron expression
         try:
@@ -1014,8 +991,9 @@ class AdminAPI:
             params.append(value)
             param_idx += 1
 
-        # Always update 'updated' timestamp
-        set_clauses.append(f"updated = NOW()")
+        # Always update 'updated' timestamp (jorb_schedule.updated is
+        # timestamptz, so NOW() is the correct value here)
+        set_clauses.append("updated = NOW()")
 
         params.append(schedule_id)
 
@@ -1100,7 +1078,7 @@ class AdminAPI:
             List of execution log dictionaries
         """
         where_clauses = ["schedule_id = $1"]
-        params = [schedule_id]
+        params: list[Any] = [schedule_id]
         param_idx = 2
 
         if result_filter:

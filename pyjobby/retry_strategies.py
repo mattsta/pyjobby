@@ -5,12 +5,14 @@ Provides configurable retry backoff strategies to replace fixed retry intervals.
 Supports exponential, linear, fibonacci, and fixed (legacy) strategies.
 """
 
+from __future__ import annotations
+
 import datetime
 import random
-from enum import Enum
+from enum import StrEnum
 
 
-class RetryStrategy(str, Enum):
+class RetryStrategy(StrEnum):
     """Retry backoff strategies"""
 
     FIXED = "fixed"  # Fixed interval (legacy behavior)
@@ -49,6 +51,7 @@ def calculate_retry_delay(
     Fibonacci: 1, 1, 2, 3, 5, 8, 13, 21...
     Fixed (legacy): quadratic with jitter
     """
+    delay: float
     if strategy == "fixed":
         # Legacy behavior: quadratic with jitter
         delay = 2 * (error_count**2) + random.randint(1, 5)

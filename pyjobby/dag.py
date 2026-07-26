@@ -18,12 +18,17 @@ Example:
     job_ids = await dag.execute(client)
 """
 
+from __future__ import annotations
+
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import asyncpg
+import asyncpg  # type: ignore[import-untyped]
 from loguru import logger
+
+if TYPE_CHECKING:
+    from .client import JobClient
 
 
 @dataclass
@@ -37,10 +42,10 @@ class DAGNode:
     node_id: str = ""  # Internal unique ID
     _job_options: dict[str, Any] = field(default_factory=dict)
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return hash(self.node_id)
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, DAGNode):
             return False
         return self.node_id == other.node_id
@@ -58,7 +63,7 @@ class DAGBuilder:
     - Named DAGs for monitoring
     """
 
-    def __init__(self, name: str | None = None, **common_options):
+    def __init__(self, name: str | None = None, **common_options: Any):
         """
         Create a new DAG builder.
 
@@ -75,7 +80,7 @@ class DAGBuilder:
         job_class: str,
         kwargs: dict[str, Any] | None = None,
         depends_on: list[DAGNode] | None = None,
-        **options,
+        **options: Any,
     ) -> DAGNode:
         """
         Add a job to the DAG.
@@ -193,7 +198,7 @@ class DAGBuilder:
 
         return levels
 
-    async def execute(self, client) -> dict[DAGNode, int]:
+    async def execute(self, client: JobClient) -> dict[DAGNode, int]:
         """
         Execute the DAG using the provided client.
 
@@ -320,7 +325,7 @@ class DAGBuilder:
 # Convenience functions
 
 
-async def execute_dag(client, dag: DAGBuilder) -> dict[DAGNode, int]:
+async def execute_dag(client: JobClient, dag: DAGBuilder) -> dict[DAGNode, int]:
     """Execute a DAG. Shortcut for dag.execute(client)."""
     return await dag.execute(client)
 
