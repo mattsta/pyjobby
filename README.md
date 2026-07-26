@@ -336,21 +336,32 @@ pj-admin jobs retry-stats --queue default --since-hours 48
 pj-admin jobs timeout-stats --json
 ```
 
-See [docs/PHASE2_USER_GUIDE.md](docs/PHASE2_USER_GUIDE.md) for complete Phase 2 documentation.
+### Documentation
 
-### ✅ Complete Documentation
+Start here:
+
+- **[DXE.md](docs/DXE.md)** — the durable execution engine: what a step
+  guarantees, how "never run completed work twice" is enforced, fencing, and
+  how checkpoints are retained
+- **[SCALE.md](docs/SCALE.md)** — measured behaviour at a million jobs/hour:
+  what breaks first, what holds, and how to reproduce every number
+- [OPERATIONS.md](docs/OPERATIONS.md) — running it: queue controls, retry vs
+  re-run, reading the latency numbers
+
+Reference:
 
 - [CLIENT_LIBRARY.md](docs/CLIENT_LIBRARY.md) - Client API reference with examples
 - [EXAMPLES.md](docs/EXAMPLES.md) - Real-world usage patterns
 - [ADMIN_TOOLS.md](docs/ADMIN_TOOLS.md) - CLI, Web UI, and Admin API
 - [RECURRING_SCHEDULER.md](docs/RECURRING_SCHEDULER.md) - Cron scheduling guide
-- **[PHASE2_USER_GUIDE.md](docs/PHASE2_USER_GUIDE.md) - Advanced job patterns (NEW!)**
 - [WEBSOCKET_DASHBOARD.md](docs/WEBSOCKET_DASHBOARD.md) - Realtime websocket dashboard
 - [ARCHITECTURE_CAPABILITIES.md](docs/ARCHITECTURE_CAPABILITIES.md) - System design
+- [TESTING.md](docs/TESTING.md) - How the suite is structured, and why coverage
+  is a diagnostic rather than a target
 
 ### ✅ Testing
 
-- The test suite is roughly 1,120 tests, run against a **real PostgreSQL** instance (not mocks)
+- The test suite is roughly 1,650 tests, run against a **real PostgreSQL** instance (not mocks)
 - Covers core job lifecycle, result storage, retries, timeouts, DAGs, the scheduler, and the admin tools
 - Includes direct SQL function testing and Hypothesis property-based tests for retry strategies, timeout enforcement, and DAG algorithms
 
