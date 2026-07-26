@@ -83,17 +83,73 @@ def build_requeue_sql(allowed_states: tuple[str, ...] = ("crashed",)) -> str:
             RETURNING id"""
 
 
+#: States a RETRY may start from. Retry means "this job did not succeed;
+#: run it again", so a job that already finished is deliberately excluded —
+#: re-running successful work risks duplicate side effects and must be an
+#: explicit decision (see ``rerun_job``).
+RETRYABLE_STATES: tuple[str, ...] = ("crashed", "cancelled")
+
+#: States a RE-RUN may start from: any terminal state, including success.
+#: This is the operator's "do it again anyway" verb.
+RERUNNABLE_STATES: tuple[str, ...] = ("crashed", "cancelled", "finished")
+
+
+async def retry_job(
+    conn: asyncpg.Connection | asyncpg.Pool,
+    job_id: int,
+    *,
+    delay: datetime.timedelta | None = None,
+    reset_errors: bool = True,
+) -> int | None:
+    """Retry a job that did not succeed (crashed or cancelled).
+
+    THE retry verb for every surface — client, admin API, CLI, websocket —
+    so no surface can be more permissive than another. Returns the job id,
+    or None if the job was not in a retryable state.
+    """
+    return await requeue_job(
+        conn,
+        job_id,
+        delay=delay,
+        reset_errors=reset_errors,
+        allowed_states=RETRYABLE_STATES,
+    )
+
+
+async def rerun_job(
+    conn: asyncpg.Connection | asyncpg.Pool,
+    job_id: int,
+    *,
+    delay: datetime.timedelta | None = None,
+    reset_errors: bool = True,
+) -> int | None:
+    """Run a terminal job again, INCLUDING one that already finished.
+
+    Separate from :func:`retry_job` on purpose: re-running successful work
+    repeats its side effects, so callers must ask for it by name.
+    """
+    return await requeue_job(
+        conn,
+        job_id,
+        delay=delay,
+        reset_errors=reset_errors,
+        allowed_states=RERUNNABLE_STATES,
+    )
+
+
 async def requeue_job(
     conn: asyncpg.Connection | asyncpg.Pool,
     job_id: int,
     *,
     delay: datetime.timedelta | None = None,
     reset_errors: bool = True,
-    allowed_states: tuple[str, ...] = ("crashed", "cancelled", "finished"),
+    allowed_states: tuple[str, ...] = RETRYABLE_STATES,
 ) -> int | None:
-    """Requeue ``job_id`` for another run (the retry/re-run primitive shared
-    by the admin API, client library, and websocket server). Returns the job
-    id, or None if it wasn't in an allowed state."""
+    """Low-level requeue used by :func:`retry_job` and :func:`rerun_job`,
+    and by the monitor (which requeues in-flight states). Prefer the named
+    verbs; pass ``allowed_states`` only for a genuinely different guard.
+
+    Returns the job id, or None if it wasn't in an allowed state."""
     if delay is None:
         delay = datetime.timedelta(0)
     requeued: int | None = await conn.fetchval(

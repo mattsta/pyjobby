@@ -60,6 +60,7 @@ class JobInfo:
     run_epoch: int = 0
     cancel_requested: bool = False
     claimed_by: int | None = None
+    claimed_at: datetime | None = None
 
     @classmethod
     def from_record(cls, record: asyncpg.Record) -> JobInfo:
@@ -71,6 +72,7 @@ class JobInfo:
         data = asdict(self)
         # Convert datetimes to ISO strings for JSON serialization
         for key in [
+            "claimed_at",
             "run_after",
             "created",
             "updated",
@@ -256,7 +258,7 @@ class AdminAPI:
                 f"can only retry crashed or cancelled jobs"
             )
 
-        await db.requeue_job(self.conn, job_id, allowed_states=("crashed", "cancelled"))
+        await db.retry_job(self.conn, job_id)
 
         return {"job_id": job_id, "status": "requeued"}
 
@@ -900,7 +902,7 @@ class AdminAPI:
             raise ValueError(f"Job {job_id} is not in DLQ (state: {job['state']})")
 
         await db.requeue_job(
-            self.conn, job_id, reset_errors=True, allowed_states=("crashed",)
+            self.conn, job_id, reset_errors=True, allowed_states=("crashed",)  # DLQ is crashed by definition
         )
 
         return {"job_id": job_id, "status": "requeued_from_dlq"}
@@ -1004,7 +1006,7 @@ class AdminAPI:
                 await self.conn.execute(
                     "DELETE FROM jorb_step WHERE job_id = $1", job_id
                 )
-            requeued = await db.requeue_job(self.conn, job_id, reset_errors=True)
+            requeued = await db.rerun_job(self.conn, job_id, reset_errors=True)
             if requeued is None:
                 raise ValueError(
                     f"Job {job_id} is in state '{job['state']}' and cannot "

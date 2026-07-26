@@ -712,9 +712,7 @@ class JobClient:
                 print("Job requeued")
         """
         async with self.pool.acquire() as conn:
-            requeued = await db.requeue_job(
-                conn, job_id, allowed_states=("crashed", "cancelled", "finished")
-            )
+            requeued = await db.retry_job(conn, job_id)
 
         return requeued
 
@@ -1511,9 +1509,7 @@ class JobClient:
         requeued_ids = []
         async with self.pool.acquire() as conn:
             for job_id in job_ids:
-                requeued = await db.requeue_job(
-                    conn, job_id, allowed_states=("crashed", "cancelled", "finished")
-                )
+                requeued = await db.retry_job(conn, job_id)
                 if requeued is not None:
                     requeued_ids.append(requeued)
 
