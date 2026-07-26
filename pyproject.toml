@@ -1,15 +1,17 @@
 [project]
 name = "pyjobby"
-version = "1.2.3"
-description = "PostgreSQL Job Consumer Platform"
+version = "2.0.0"
+description = "PostgreSQL job platform with a durable execution engine (DXE)"
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "Matt Stancliff", email = "matt@genges.com" }]
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Topic :: System :: Distributed Computing",
     "Framework :: AsyncIO",
