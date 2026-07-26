@@ -547,8 +547,15 @@ class TestPrometheusMetrics:
         text = await resp.text()
 
         assert f'pyjobby_jobs_by_state{{queue="{queue}",state="queued"}} 2' in text
-        assert f'pyjobby_jobs_by_state{{queue="{queue}",state="crashed"}} 1' in text
         assert "# TYPE pyjobby_jobs_by_state gauge" in text
+        # The crashed job is NOT in jobs_by_state: that gauge reports live
+        # states only, because the terminal ones grow with everything the
+        # installation has ever run. Terminal outcomes are reported over the
+        # scrape window instead.
+        assert f'pyjobby_jobs_by_state{{queue="{queue}",state="crashed"}}' not in text
+        assert (
+            f'pyjobby_jobs_terminal_recent{{queue="{queue}",state="crashed"}} 1' in text
+        )
 
         # Only the two queued jobs are backlog; the crashed one is not.
         assert f'pyjobby_backlog_depth{{queue="{queue}"}} 2' in text
@@ -587,8 +594,17 @@ class TestPrometheusMetrics:
         assert "pyjobby_workers_live 1" in text
 
     @pytest.mark.asyncio
-    async def test_history_counters(self, web_admin_client, db_pool):
-        """started/finished/crashed counters come from jorb_history events."""
+    async def test_outcome_gauges_come_from_the_job_table(
+        self, web_admin_client, db_pool
+    ):
+        """started/terminal counts are read from jorb over the scrape window.
+
+        They used to be `*_total` counters read by joining ALL of
+        jorb_history to ALL of jorb on every scrape. That query had no window
+        at all, and adding one would have made a counter that resets -- so
+        the series are gauges now, with names that say so. See
+        tests/test_metrics_scrape_cost.py for the full argument.
+        """
         queue = unique_name("prom_hist")
         async with db_pool.acquire() as conn:
             ok_id = await conn.fetchval(
@@ -607,19 +623,35 @@ class TestPrometheusMetrics:
             )
             for job_id, final in ((ok_id, "finished"), (bad_id, "crashed")):
                 await conn.execute(
-                    "UPDATE jorb SET state = 'running' WHERE id = $1", job_id
+                    "UPDATE jorb SET state = 'running', started = now() WHERE id = $1",
+                    job_id,
                 )
                 await conn.execute(
-                    f"UPDATE jorb SET state = '{final}' WHERE id = $1", job_id
+                    f"UPDATE jorb SET state = '{final}', finished = now() "
+                    f"WHERE id = $1",
+                    job_id,
                 )
 
         resp = await web_admin_client.get("/metrics")
         text = await resp.text()
 
-        assert f'pyjobby_jobs_started_total{{queue="{queue}"}} 2' in text
-        assert f'pyjobby_jobs_finished_total{{queue="{queue}"}} 1' in text
-        assert f'pyjobby_jobs_crashed_total{{queue="{queue}"}} 1' in text
-        assert "# TYPE pyjobby_jobs_started_total counter" in text
+        assert f'pyjobby_jobs_started_recent{{queue="{queue}"}} 2' in text
+        assert (
+            f'pyjobby_jobs_terminal_recent{{queue="{queue}",state="finished"}} 1'
+            in text
+        )
+        assert (
+            f'pyjobby_jobs_terminal_recent{{queue="{queue}",state="crashed"}} 1' in text
+        )
+        assert "# TYPE pyjobby_jobs_started_recent gauge" in text
+        assert "# TYPE pyjobby_jobs_terminal_recent gauge" in text
+        # The retired counters are gone, not renamed in place.
+        for retired in (
+            "pyjobby_jobs_started_total",
+            "pyjobby_jobs_finished_total",
+            "pyjobby_jobs_crashed_total",
+        ):
+            assert retired not in text
 
     @pytest.mark.asyncio
     async def test_duration_quantiles(self, web_admin_client, db_pool):

@@ -272,23 +272,31 @@ def bench_queue(kind: str) -> str:
     return f"pjbench_{kind}_{uuid.uuid4().hex[:8]}"
 
 
-async def existing_job_count(conn: asyncpg.Connection, limit: int) -> tuple[int, bool]:
-    """Count jobs, stopping at ``limit`` + 1 rows.
+#: Above this planner estimate, the guard reports the estimate instead of
+#: counting. An exact count(*) on a table with the volume this platform
+#: targets is itself a full scan, and a run that is about to be refused
+#: does not need the number to the row.
+EXACT_COUNT_CEILING = 1_000_000
 
-    An exact ``count(*)`` on a table with the volume this platform targets
-    is itself an expensive scan, so the probe is bounded: it returns the
-    exact count when the table is small and a planner estimate (flagged
-    approximate) when it is not.
+
+async def existing_job_count(conn: asyncpg.Connection) -> tuple[int, bool]:
+    """How many jobs are already here, and whether that is exact.
+
+    The planner's estimate decides which question to ask. Small table: an
+    exact ``count(*)``, because "already holds 5 jobs" is an actionable
+    message and "about 500" (a stale ``reltuples``) is a confusing one.
+    Large table: the estimate, flagged approximate, because counting it
+    would cost more than the benchmark.
     """
-    counted = await conn.fetchval(
-        "SELECT count(*) FROM (SELECT 1 FROM jorb LIMIT $1) probe", limit + 1
+    estimate = int(
+        await conn.fetchval(
+            "SELECT reltuples::bigint FROM pg_class WHERE oid = 'jorb'::regclass"
+        )
+        or 0
     )
-    if counted <= limit:
-        return int(counted), False
-    estimate = await conn.fetchval(
-        "SELECT reltuples::bigint FROM pg_class WHERE oid = 'jorb'::regclass"
-    )
-    return int(max(estimate or 0, counted)), True
+    if estimate > EXACT_COUNT_CEILING:
+        return estimate, True
+    return int(await conn.fetchval("SELECT count(*) FROM jorb")), False
 
 
 async def guard_busy_database(
@@ -301,7 +309,7 @@ async def guard_busy_database(
     adds load to whatever is using the database. ``--force`` overrides,
     deliberately loudly.
     """
-    count, approximate = await existing_job_count(conn, limit)
+    count, approximate = await existing_job_count(conn)
     report = {"existing_jobs": count, "approximate": approximate, "limit": limit}
     if count <= limit:
         return report
@@ -311,8 +319,7 @@ async def guard_busy_database(
             f"Database already holds {about}{count} jobs (limit {limit}).",
             "Benchmarking alongside real work measures the contention, not "
             "the platform, and adds load to a database in use.",
-            "Pass --force to run anyway, or --max-existing-jobs to raise the "
-            "limit.",
+            "Pass --force to run anyway, or --max-existing-jobs to raise the limit.",
         )
     print_warning(
         f"--force: running against a database that already holds "
@@ -327,11 +334,20 @@ async def cleanup_queue(conn: asyncpg.Connection, queue: str) -> dict[str, int]:
     Scoped to one queue name by design: ``jorb_history``, ``jorb_step``,
     ``jorb_event`` and ``jorb_mailbox`` rows follow via ON DELETE CASCADE,
     so deleting the job rows is the whole cleanup.
+
+    The three global tables this can reach — ``jorb_queue``, and the worker
+    registry rows the real processes ``pj-bench e2e`` starts register — are
+    both keyed by queue name, so they are removed by the same predicate and
+    no row belonging to anything else is ever in range.
     """
     jobs = int(await conn.fetchval("SELECT count(*) FROM jorb WHERE queue = $1", queue))
+    workers = int(
+        await conn.fetchval("SELECT count(*) FROM jorb_worker WHERE queue = $1", queue)
+    )
     await conn.execute("DELETE FROM jorb WHERE queue = $1", queue)
     await conn.execute("DELETE FROM jorb_queue WHERE name = $1", queue)
-    return {"jobs_deleted": jobs}
+    await conn.execute("DELETE FROM jorb_worker WHERE queue = $1", queue)
+    return {"jobs_deleted": jobs, "workers_deleted": workers}
 
 
 def percentile(values: Sequence[float], fraction: float) -> float:
@@ -904,22 +920,24 @@ async def run_claim(
 
         uncapped = modes["uncapped"]["claims_per_second"]["median"]
         capped = modes["capped"]["claims_per_second"]["median"]
-        result.update({
-            "benchmark": "claim",
-            "database": target.label,
-            "queue": queue,
-            "workers": workers,
-            "jobs": jobs,
-            "repeat": repeat,
-            "guard": guard,
-            "modes": modes,
-            "capped_throughput_ratio": (capped / uncapped) if uncapped else 0.0,
-            "claims_per_second": uncapped,
-            "target_rate": SCALE_TARGET_RATE,
-            "headroom_vs_target_rate": (
-                uncapped / SCALE_TARGET_RATE if uncapped else 0.0
-            ),
-        })
+        result.update(
+            {
+                "benchmark": "claim",
+                "database": target.label,
+                "queue": queue,
+                "workers": workers,
+                "jobs": jobs,
+                "repeat": repeat,
+                "guard": guard,
+                "modes": modes,
+                "capped_throughput_ratio": (capped / uncapped) if uncapped else 0.0,
+                "claims_per_second": uncapped,
+                "target_rate": SCALE_TARGET_RATE,
+                "headroom_vs_target_rate": (
+                    uncapped / SCALE_TARGET_RATE if uncapped else 0.0
+                ),
+            }
+        )
         return result
     finally:
         await pool.close()
@@ -1091,30 +1109,30 @@ async def run_e2e(
                 )
 
         rates = [r["jobs_per_second"] for r in rounds]
-        median_index = (
-            rates.index(statistics.median_low(rates)) if rates else 0
-        )
+        median_index = rates.index(statistics.median_low(rates)) if rates else 0
         representative = rounds[median_index] if rounds else {}
-        result.update({
-            "benchmark": "e2e",
-            "database": target.label,
-            "queue": queue,
-            "jobs": jobs,
-            "workers": workers,
-            "repeat": repeat,
-            "guard": guard,
-            "warmup": warmup_round,
-            "rounds": rounds,
-            "jobs_per_second": summarize(rates),
-            "completed": representative.get("completed", 0),
-            "timed_out": any(r["timed_out"] for r in rounds),
-            "enqueue_to_finished": representative.get("enqueue_to_finished", {}),
-            "claim_to_finished": representative.get("claim_to_finished", {}),
-            "target_rate": SCALE_TARGET_RATE,
-            "headroom_vs_target_rate": (
-                statistics.median(rates) / SCALE_TARGET_RATE if rates else 0.0
-            ),
-        })
+        result.update(
+            {
+                "benchmark": "e2e",
+                "database": target.label,
+                "queue": queue,
+                "jobs": jobs,
+                "workers": workers,
+                "repeat": repeat,
+                "guard": guard,
+                "warmup": warmup_round,
+                "rounds": rounds,
+                "jobs_per_second": summarize(rates),
+                "completed": representative.get("completed", 0),
+                "timed_out": any(r["timed_out"] for r in rounds),
+                "enqueue_to_finished": representative.get("enqueue_to_finished", {}),
+                "claim_to_finished": representative.get("claim_to_finished", {}),
+                "target_rate": SCALE_TARGET_RATE,
+                "headroom_vs_target_rate": (
+                    statistics.median(rates) / SCALE_TARGET_RATE if rates else 0.0
+                ),
+            }
+        )
         return result
     finally:
         result["cleanup"] = await cleanup_queue(conn, queue)
@@ -1179,7 +1197,9 @@ async def run_notify(
         for channel in NOTIFY_CHANNELS:
             await listener.add_listener(channel, make_handler(channel))
 
-        usage_before = float(await conn.fetchval("SELECT pg_notification_queue_usage()"))
+        usage_before = float(
+            await conn.fetchval("SELECT pg_notification_queue_usage()")
+        )
 
         usage_peak = usage_before
         for _ in range(lifecycles):
@@ -1227,49 +1247,52 @@ async def run_notify(
         per_lifecycle = total / lifecycles if lifecycles else 0.0
         firehose = counts["job_state_change"]
         load_bearing = sum(counts[c] for c in LOAD_BEARING_CHANNELS)
-        result.update({
-            "benchmark": "notify",
-            "database": target.label,
-            "queue": queue,
-            "lifecycles": lifecycles,
-            "guard": guard,
-            "per_channel": counts,
-            "per_channel_per_lifecycle": {
-                channel: (count / lifecycles if lifecycles else 0.0)
-                for channel, count in counts.items()
-            },
-            "foreign_notifications": {k: v for k, v in foreign.items() if v},
-            "total": total,
-            "per_lifecycle": per_lifecycle,
-            "history_rows_per_lifecycle": (
-                history_rows / lifecycles if lifecycles else 0.0
-            ),
-            "row_writes_per_lifecycle": float(SCALE_CLAIM_ROW_WRITES_PER_LIFECYCLE),
-            "firehose_share": (firehose / total) if total else 0.0,
-            "load_bearing_per_lifecycle": (
-                load_bearing / lifecycles if lifecycles else 0.0
-            ),
-            "target_rate": target_rate,
-            "projected_notifications_per_second": per_lifecycle * target_rate,
-            "projected_without_firehose_per_second": (
-                (total - firehose) / lifecycles * target_rate if lifecycles else 0.0
-            ),
-            "notify_queue_usage": {
-                "before": usage_before,
-                "peak": max(usage_before, usage_peak),
-                "after": usage_after,
-            },
-            "scale_md": {
-                "claimed_per_lifecycle": SCALE_CLAIM_NOTIFICATIONS_PER_LIFECYCLE,
-                "agrees": per_lifecycle == SCALE_CLAIM_NOTIFICATIONS_PER_LIFECYCLE,
-                "claimed_history_rows_per_lifecycle": (
-                    SCALE_CLAIM_HISTORY_ROWS_PER_LIFECYCLE
+        result.update(
+            {
+                "benchmark": "notify",
+                "database": target.label,
+                "queue": queue,
+                "lifecycles": lifecycles,
+                "guard": guard,
+                "per_channel": counts,
+                "per_channel_per_lifecycle": {
+                    channel: (count / lifecycles if lifecycles else 0.0)
+                    for channel, count in counts.items()
+                },
+                "foreign_notifications": {k: v for k, v in foreign.items() if v},
+                "total": total,
+                "per_lifecycle": per_lifecycle,
+                "history_rows_per_lifecycle": (
+                    history_rows / lifecycles if lifecycles else 0.0
                 ),
-                "history_agrees": (
-                    history_rows == lifecycles * SCALE_CLAIM_HISTORY_ROWS_PER_LIFECYCLE
+                "row_writes_per_lifecycle": float(SCALE_CLAIM_ROW_WRITES_PER_LIFECYCLE),
+                "firehose_share": (firehose / total) if total else 0.0,
+                "load_bearing_per_lifecycle": (
+                    load_bearing / lifecycles if lifecycles else 0.0
                 ),
-            },
-        })
+                "target_rate": target_rate,
+                "projected_notifications_per_second": per_lifecycle * target_rate,
+                "projected_without_firehose_per_second": (
+                    (total - firehose) / lifecycles * target_rate if lifecycles else 0.0
+                ),
+                "notify_queue_usage": {
+                    "before": usage_before,
+                    "peak": max(usage_before, usage_peak),
+                    "after": usage_after,
+                },
+                "scale_md": {
+                    "claimed_per_lifecycle": SCALE_CLAIM_NOTIFICATIONS_PER_LIFECYCLE,
+                    "agrees": per_lifecycle == SCALE_CLAIM_NOTIFICATIONS_PER_LIFECYCLE,
+                    "claimed_history_rows_per_lifecycle": (
+                        SCALE_CLAIM_HISTORY_ROWS_PER_LIFECYCLE
+                    ),
+                    "history_agrees": (
+                        history_rows
+                        == lifecycles * SCALE_CLAIM_HISTORY_ROWS_PER_LIFECYCLE
+                    ),
+                },
+            }
+        )
         return result
     finally:
         await listener.close()
@@ -1277,9 +1300,7 @@ async def run_notify(
         await conn.close()
 
 
-def _payload_is_ours(
-    channel: str, payload: str, queue: str, job_ids: set[int]
-) -> bool:
+def _payload_is_ours(channel: str, payload: str, queue: str, job_ids: set[int]) -> bool:
     """Attribute a notification to this run, or to other work.
 
     Every channel carries enough to tell: the wakeup channel carries the
@@ -1297,7 +1318,7 @@ def _payload_is_ours(
     except (ValueError, TypeError):
         return False
     if channel == "job_state_change":
-        return data.get("queue") == queue
+        return bool(data.get("queue") == queue)
     if channel == "jorb_done":
         return int(data.get("id", -1)) in job_ids
     if channel == "jorb_event":
@@ -1666,18 +1687,20 @@ async def run_plans(
             queries[query.key] = summary
 
         offenders = sorted(k for k, v in queries.items() if v["seq_scan_on_jorb"])
-        result.update({
-            "benchmark": "plans",
-            "database": target.label,
-            "queue": queue,
-            "seed_rows": seed,
-            "seeded": seeded,
-            "guard": guard,
-            "planner_settings": applied,
-            "queries": queries,
-            "seq_scan_offenders": offenders,
-            "healthy": not offenders,
-        })
+        result.update(
+            {
+                "benchmark": "plans",
+                "database": target.label,
+                "queue": queue,
+                "seed_rows": seed,
+                "seeded": seeded,
+                "guard": guard,
+                "planner_settings": applied,
+                "queries": queries,
+                "seq_scan_offenders": offenders,
+                "healthy": not offenders,
+            }
+        )
         return result
     finally:
         result["cleanup"] = await cleanup_queue(conn, queue)
@@ -1689,7 +1712,9 @@ async def run_plans(
 # =========================================================================
 
 
-def emit(result: dict[str, Any], output_json: bool, rows: Sequence[Sequence[str]]) -> None:
+def emit(
+    result: dict[str, Any], output_json: bool, rows: Sequence[Sequence[str]]
+) -> None:
     """Print JSON for machines or a table for people, never both.
 
     ``--json`` output has to stay parseable, so nothing else may be written
@@ -1700,9 +1725,7 @@ def emit(result: dict[str, Any], output_json: bool, rows: Sequence[Sequence[str]
         return
     # max_width is per-table, and these values are sentences: the default
     # 80 truncates an index name to nothing, which is the whole answer.
-    print_table(
-        ["metric", "value"], [[str(a), str(b)] for a, b in rows], max_width=220
-    )
+    print_table(["metric", "value"], [[str(a), str(b)] for a, b in rows], max_width=220)
 
 
 def fmt(value: Any, digits: int = 1) -> str:
@@ -1776,7 +1799,9 @@ def pick(ctx: click.Context, local: str | None, key: str) -> str | None:
 
 
 @click.group()
-@click.option("--config", "-c", default=None, help=f"Config file path [{DEFAULT_CONFIG}]")
+@click.option(
+    "--config", "-c", default=None, help=f"Config file path [{DEFAULT_CONFIG}]"
+)
 @click.option(
     "--dsn",
     envvar="PYJOBBY_DSN",
@@ -1901,7 +1926,8 @@ def enqueue_table(result: dict[str, Any]) -> list[list[str]]:
         ],
         [
             "  wakeup notify off ONLY",
-            pct(lock["wakeup_only_recovery_pct"]),
+            f"{pct(lock['wakeup_only_recovery_pct'])} — the only NOTIFY on the "
+            "INSERT path; removing it removes the commit lock",
         ],
         ["headroom vs 278/s", f"{result['headroom_vs_target_rate']:,.0f}x"],
     ]
@@ -2178,7 +2204,9 @@ def plans_cmd(
 @click.option(
     "--rows", default=20000, show_default=True, help="enqueue: bulk contrast rows"
 )
-@click.option("--concurrency", default=16, show_default=True, help="enqueue: connections")
+@click.option(
+    "--concurrency", default=16, show_default=True, help="enqueue: connections"
+)
 @click.option("--jobs-per-connection", default=100, show_default=True)
 @click.option("--claim-workers", default=8, show_default=True)
 @click.option("--claim-jobs", default=2000, show_default=True)

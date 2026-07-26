@@ -73,9 +73,19 @@ shape.
 
 ### The other per-job costs
 
-The history trigger is the dominant *non-NOTIFY* cost and is why `jorb_history`
-becomes the largest table in the system — but that is a storage and retention
-problem rather than a throughput one.
+The history trigger writes a row per transition, which is why `jorb_history`
+becomes the largest table in the system. That much is certain, and it is a
+storage and retention problem rather than a throughput one.
+
+What its *throughput* cost is remains **unmeasured under the production
+shape**. Isolating it in a bulk benchmark suggests it dominates the non-NOTIFY
+cost, but that is the same methodology that overstated enqueue headroom by 6×,
+so the figure is not quoted here and no design decision rests on it. `pj-bench
+enqueue` measures it concurrently, one transaction per job; that is the number
+to act on.
+
+This is deliberate: a plausible number measured the wrong way is more dangerous
+than no number, because it gets optimised against.
 
 ---
 
@@ -275,3 +285,43 @@ answers here before the harness existed:
 * **Bulk inserts amortise per-commit costs.** Measure one transaction per job.
 * **The NOTIFY commit lock only appears under concurrency.** A serial benchmark
   reports 3% for something that costs 62% in production.
+
+---
+
+## Design decisions on the write path
+
+These are recorded because each one is a place where the obvious improvement
+makes the platform slower, and someone will propose it again.
+
+### Cumulative per-queue counters: rejected
+
+Prometheus counters want `pyjobby_jobs_finished_total{queue}` — monotonic,
+per-queue, cumulative. The only O(1) source is an incrementally-maintained
+rollup row updated by the same trigger that writes history.
+
+That is exactly the wrong trade. At the reference workload it funnels ~1,100
+updates/second onto a handful of rows: every transition in a queue serialises
+on one tuple, on the write path, forever — to make a read cheaper that happens
+once per scrape. A sharded counter (`PRIMARY KEY (queue, event, shard)`) fixes
+the contention and adds a write per transition anyway.
+
+The endpoint instead exposes **windowed gauges** for per-queue traffic and one
+true counter, `pyjobby_jobs_enqueued_total`, sourced from the id sequence —
+O(1), catalog-only, and structurally immune to retention, because deleting rows
+does not un-issue their ids.
+
+Revisit only if someone genuinely needs `rate()` over per-queue crash events
+specifically. The write path is the scarcest resource in the system; a
+monitoring convenience does not get to spend it.
+
+### Recounting for counters: rejected, and it is a correctness bug
+
+A counter derived by recounting rows (`COUNT(*) FROM jorb_history WHERE
+event='finished'`) **decreases when retention prunes**. Prometheus reads a
+falling counter as a process restart and attributes the entire window's traffic
+to a reset — silently. The old `_total` metrics did exactly this.
+
+Counters were therefore **renamed** rather than re-typed in place, so a
+dashboard using `rate(pyjobby_jobs_crashed_total[5m])` breaks loudly with a
+missing series instead of quietly reporting garbage. A metric that lies is
+worse than one that is absent.

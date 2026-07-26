@@ -49,6 +49,109 @@ MAX_SINCE_HOURS = 24 * 365 * 100
 # still smoothing the per-second jitter of an individual worker.
 PROM_RATE_WINDOW_SECONDS = 300
 
+# =============================================================================
+# The statements /metrics issues against the job tables.
+#
+# They are constants rather than string literals inside the handler for one
+# reason: tests/test_metrics_scrape_cost.py EXPLAINs these exact strings, so
+# the plan it certifies is the plan a real scrape gets. A copy of the SQL
+# living in a test drifts the first time someone edits the handler, and the
+# way this endpoint fails is precisely by staying correct while getting
+# slower.
+#
+# The rule every statement here obeys: its cost must depend on how much work
+# is in flight or how much happened in the window -- never on how many jobs
+# the installation has run since it was built. At a million jobs an hour with
+# 30-day retention, "count everything" is hundreds of millions of rows, and
+# Prometheus asks every 15 seconds.
+# =============================================================================
+
+# Live states only, and deliberately so: `queued`, `claimed`, `running` and
+# `waiting` are all bounded by work in progress however big the table gets,
+# while the terminal states are bounded by nothing at all.
+#
+# Written as a union rather than `state IN (...)` because a single predicate
+# spanning four states matches none of the partial indexes and collapses
+# straight back into a sequential scan. Each arm is its own index:
+# jorb_claim_idx (index-only: queue is its leading column), jorb_inflight_idx,
+# and jorb_waitfor_*_idx.
+PROM_SQL_LIVE_STATES = """
+    SELECT queue, 'queued' AS state, COUNT(*) AS n
+      FROM jorb WHERE state = 'queued' GROUP BY queue
+    UNION ALL
+    SELECT queue, state::text, COUNT(*)
+      FROM jorb WHERE state IN ('claimed', 'running')
+     GROUP BY queue, state
+    UNION ALL
+    SELECT queue, 'waiting', COUNT(*)
+      FROM jorb WHERE state = 'waiting' GROUP BY queue
+     ORDER BY 1, 2
+"""
+
+# Terminal outcomes, over the window instead of over all of history. The
+# predicate is written as COALESCE(finished, updated) because that is the
+# expression `jorb_retention_idx` is built on -- for a job that reached a
+# terminal state the two are the same instant, and matching the index
+# expression is what keeps this off the heap of every job ever run.
+PROM_SQL_TERMINAL_RECENT = """
+    SELECT queue, state::text AS state, COUNT(*) AS n
+      FROM jorb
+     WHERE state IN ('finished', 'crashed', 'cancelled')
+       AND COALESCE(finished, updated) >= now() - $1::interval
+     GROUP BY queue, state
+     ORDER BY queue, state
+"""
+
+# Attempt starts, from `jorb.started` (written by the claimed -> running
+# transition) rather than from the matching jorb_history rows: history has no
+# index on time, so a window over it is a scan of the largest table in the
+# system. Rides jorb_started_idx.
+PROM_SQL_STARTED_RECENT = """
+    SELECT queue, COUNT(*) AS n
+      FROM jorb
+     WHERE started IS NOT NULL AND started >= now() - $1::interval
+     GROUP BY queue
+     ORDER BY queue
+"""
+
+# Duration quantiles. Same COALESCE(finished, updated) predicate for the same
+# reason -- filtering on bare `finished` matches no index, because the one
+# that exists is on the expression.
+PROM_SQL_DURATION_QUANTILES = """
+    SELECT queue,
+           percentile_cont(ARRAY[0.5, 0.9, 0.99]) WITHIN GROUP (
+               ORDER BY EXTRACT(EPOCH FROM (finished - started))
+           ) AS quantiles
+      FROM jorb
+     WHERE state = 'finished'
+       AND started IS NOT NULL
+       AND COALESCE(finished, updated) >= now() - $1::interval
+     GROUP BY queue
+     ORDER BY queue
+"""
+
+# The one true cumulative counter on this endpoint, and the only O(1) source
+# for one that exists without a schema change.
+#
+# A Prometheus counter promises it never decreases, and every rate() in every
+# dashboard is built on that promise. Counting rows cannot keep it: retention
+# deletes the rows, the recount drops, and rate() reads the drop as a counter
+# reset and loses the window's traffic. A sequence is immune -- deleting rows
+# does not un-issue their ids.
+PROM_SQL_ENQUEUED_TOTAL = """
+    SELECT COALESCE(
+        pg_sequence_last_value(pg_get_serial_sequence('jorb', 'id')), 0
+    ) AS n
+"""
+
+PROM_SQL_QUEUE_PAUSED = "SELECT name, paused FROM jorb_queue ORDER BY name"
+
+PROM_SQL_WORKERS_LIVE = """
+    SELECT COUNT(*) FROM jorb_worker
+     WHERE shutdown_at IS NULL
+       AND last_seen > now() - interval '60 seconds'
+"""
+
 _ID_RE = re.compile(r"^[0-9]+$")
 _INT_RE = re.compile(r"^[+-]?[0-9]+$")
 
@@ -590,21 +693,66 @@ class WebAdminServer:
         """Prometheus text exposition (text/plain; version 0.0.4)."""
         esc = self._prom_escape
         lines: list[str] = []
+        window = timedelta(seconds=PROM_RATE_WINDOW_SECONDS)
         pool = await self._get_pool()
         async with pool.acquire() as conn:
-            by_state = await conn.fetch("""
-                SELECT queue, state::text AS state, COUNT(*) AS n
-                FROM jorb GROUP BY queue, state ORDER BY queue, state
-            """)
+            live = await conn.fetch(PROM_SQL_LIVE_STATES)
             lines.append(
-                "# HELP pyjobby_jobs_by_state Number of jobs per queue and state."
+                "# HELP pyjobby_jobs_by_state Jobs per queue currently in a "
+                "LIVE state (queued, claimed, running, waiting). Terminal "
+                "states are NOT reported here: their count is every job the "
+                "installation has ever run and not yet aged out, which no "
+                "index can bound and no scrape can afford -- see "
+                "pyjobby_jobs_terminal_recent for terminal outcomes."
             )
             lines.append("# TYPE pyjobby_jobs_by_state gauge")
-            for r in by_state:
+            for r in live:
                 lines.append(
                     f'pyjobby_jobs_by_state{{queue="{esc(r["queue"])}",'
                     f'state="{esc(r["state"])}"}} {r["n"]}'
                 )
+
+            terminal = await conn.fetch(PROM_SQL_TERMINAL_RECENT, window)
+            lines.append(
+                f"# HELP pyjobby_jobs_terminal_recent Jobs per queue that "
+                f"reached a terminal state (finished, crashed, cancelled) in "
+                f"the last {PROM_RATE_WINDOW_SECONDS}s. A windowed count, so "
+                f"a gauge: it is not cumulative and rate() on it is "
+                f"meaningless."
+            )
+            lines.append("# TYPE pyjobby_jobs_terminal_recent gauge")
+            for r in terminal:
+                lines.append(
+                    f'pyjobby_jobs_terminal_recent{{queue="{esc(r["queue"])}",'
+                    f'state="{esc(r["state"])}"}} {r["n"]}'
+                )
+
+            started = await conn.fetch(PROM_SQL_STARTED_RECENT, window)
+            lines.append(
+                f"# HELP pyjobby_jobs_started_recent Jobs per queue whose "
+                f"current attempt started in the last "
+                f"{PROM_RATE_WINDOW_SECONDS}s, from jorb.started. A retry "
+                f"overwrites started, so a job that retried inside the window "
+                f"is counted once rather than once per attempt."
+            )
+            lines.append("# TYPE pyjobby_jobs_started_recent gauge")
+            for r in started:
+                lines.append(
+                    f'pyjobby_jobs_started_recent{{queue="{esc(r["queue"])}"}} {r["n"]}'
+                )
+
+            enqueued_total = await conn.fetchval(PROM_SQL_ENQUEUED_TOTAL)
+            lines.append(
+                "# HELP pyjobby_jobs_enqueued_total Cumulative jobs ever "
+                "enqueued, read from the job id sequence rather than counted. "
+                "Counting cannot back a counter here: retention deletes jobs, "
+                "so a recount falls and every rate() reads the fall as a "
+                "counter reset. An upper bound -- ids burned by rolled-back "
+                "enqueues are included -- and it resets only if the sequence "
+                "itself is reset."
+            )
+            lines.append("# TYPE pyjobby_jobs_enqueued_total counter")
+            lines.append(f"pyjobby_jobs_enqueued_total {enqueued_total}")
 
             # Everything below comes from one AdminAPI.get_metrics() call so
             # the scrape, the dashboard, and `pj-admin metrics` cannot drift
@@ -613,9 +761,7 @@ class WebAdminServer:
             # window responds to a fleet falling behind within a scrape or
             # two, where the 24h default would average the incident away.
             api = AdminAPI(conn)
-            m = await api.get_metrics(
-                since=db.utcnow() - timedelta(seconds=PROM_RATE_WINDOW_SECONDS)
-            )
+            m = await api.get_metrics(since=db.utcnow() - window)
             backlog = m["backlog"]
 
             lines.append(
@@ -641,9 +787,7 @@ class WebAdminServer:
                     f'pyjobby_backlog_depth{{queue="{esc(qname)}"}} {stats["depth"]}'
                 )
 
-            paused = await conn.fetch(
-                "SELECT name, paused FROM jorb_queue ORDER BY name"
-            )
+            paused = await conn.fetch(PROM_SQL_QUEUE_PAUSED)
             lines.append(
                 "# HELP pyjobby_queue_paused Whether the queue is paused (1) or not (0)."
             )
@@ -654,11 +798,7 @@ class WebAdminServer:
                     f" {1 if r['paused'] else 0}"
                 )
 
-            workers_live = await conn.fetchval("""
-                SELECT COUNT(*) FROM jorb_worker
-                WHERE shutdown_at IS NULL
-                  AND last_seen > now() - interval '60 seconds'
-            """)
+            workers_live = await conn.fetchval(PROM_SQL_WORKERS_LIVE)
             lines.append(
                 "# HELP pyjobby_workers_live Live workers "
                 "(registered, not shut down, recent heartbeat)."
@@ -666,38 +806,11 @@ class WebAdminServer:
             lines.append("# TYPE pyjobby_workers_live gauge")
             lines.append(f"pyjobby_workers_live {workers_live}")
 
-            events = await conn.fetch("""
-                SELECT j.queue, h.event, COUNT(*) AS n
-                FROM jorb_history h
-                JOIN jorb j ON j.id = h.job_id
-                WHERE h.event IN ('running', 'finished', 'crashed')
-                GROUP BY j.queue, h.event ORDER BY j.queue, h.event
-            """)
-            for event, metric, help_text in (
-                ("running", "pyjobby_jobs_started_total", "Job start events"),
-                ("finished", "pyjobby_jobs_finished_total", "Job finish events"),
-                ("crashed", "pyjobby_jobs_crashed_total", "Job crash events"),
-            ):
-                lines.append(f"# HELP {metric} {help_text} recorded in job history.")
-                lines.append(f"# TYPE {metric} counter")
-                for r in events:
-                    if r["event"] == event:
-                        lines.append(f'{metric}{{queue="{esc(r["queue"])}"}} {r["n"]}')
-
-            durations = await conn.fetch("""
-                SELECT queue,
-                       percentile_cont(ARRAY[0.5, 0.9, 0.99]) WITHIN GROUP (
-                           ORDER BY EXTRACT(EPOCH FROM (finished - started))
-                       ) AS quantiles
-                FROM jorb
-                WHERE state = 'finished'
-                  AND started IS NOT NULL AND finished IS NOT NULL
-                  AND finished > now() - interval '1 hour'
-                GROUP BY queue ORDER BY queue
-            """)
+            durations = await conn.fetch(PROM_SQL_DURATION_QUANTILES, window)
             lines.append(
-                "# HELP pyjobby_job_duration_seconds "
-                "Duration quantiles of jobs finished in the last hour."
+                f"# HELP pyjobby_job_duration_seconds "
+                f"Duration quantiles of jobs that finished in the last "
+                f"{PROM_RATE_WINDOW_SECONDS}s."
             )
             lines.append("# TYPE pyjobby_job_duration_seconds gauge")
             for r in durations:

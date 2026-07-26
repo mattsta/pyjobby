@@ -419,10 +419,13 @@ METRIC_NAMES = {
     "pyjobby_backlog_depth",
     "pyjobby_queue_paused",
     "pyjobby_workers_live",
-    "pyjobby_jobs_started_total",
-    "pyjobby_jobs_finished_total",
-    "pyjobby_jobs_crashed_total",
+    # windowed job-outcome gauges (see tests/test_metrics_scrape_cost.py for
+    # why the three *_total series they replaced could not stay counters)
+    "pyjobby_jobs_started_recent",
+    "pyjobby_jobs_terminal_recent",
     "pyjobby_job_duration_seconds",
+    # the one cumulative counter, sourced from the job id sequence
+    "pyjobby_jobs_enqueued_total",
     # platform-health gauges (no queue label)
     "pyjobby_throughput_jobs_per_second",
     "pyjobby_arrival_jobs_per_second",
@@ -645,6 +648,7 @@ class TestPrometheusExposition:
             "pyjobby_jobs_stuck",
             "pyjobby_inflight_oldest_age_seconds",
             "pyjobby_notify_queue_usage_ratio",
+            "pyjobby_jobs_enqueued_total",
         ):
             assert [s for s in samples if s[0] == unlabelled] == [(unlabelled, "")], (
                 f"{unlabelled} must be a single unlabelled series"
