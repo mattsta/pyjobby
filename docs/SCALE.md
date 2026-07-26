@@ -390,6 +390,31 @@ Revisit only if someone genuinely needs `rate()` over per-queue crash events
 specifically. The write path is the scarcest resource in the system; a
 monitoring convenience does not get to spend it.
 
+### A GIN index on tags: accepted, because it is partial
+
+`jorb.tags` carries a GIN index, which is the most expensive index type to
+maintain — so it was measured before it was kept, with the arms interleaved
+because the box was under load 45 and straight before/after runs were swinging
+2.5k–20k jobs/s for reasons unrelated to the change:
+
+| untagged enqueue | jobs/s |
+|---|---|
+| without `jorb_tags_idx` | 28,700 |
+| with `jorb_tags_idx` | 28,854 (1.005×) |
+
+Identical, and that is the whole argument. The index is partial
+(`WHERE tags <> '{}'`), so an enqueue that sets no tags never matches the
+predicate and never touches it. Tagged enqueue costs 0.93–1.04× — noise —
+including GIN's worst case of a distinct value per job, because `fastupdate`
+parks entries in the pending list and the merge becomes autovacuum's cost
+rather than the enqueuing transaction's.
+
+Contrast this with the rejected rollup below. Both are "an index/table to make
+a read cheaper". The difference is that this one charges nothing to jobs that
+do not use it, while the rollup charged every transition in a queue whether
+anyone read the counter or not. **That is the test to apply to the next
+proposal: not "is it cheap", but "who pays when it is unused".**
+
 ### Recounting for counters: rejected, and it is a correctness bug
 
 A counter derived by recounting rows (`COUNT(*) FROM jorb_history WHERE
