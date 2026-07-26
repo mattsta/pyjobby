@@ -34,6 +34,59 @@ So, in January 2021 I wrote `pyjobby` and this is all about it.
 
 Pyjobby has evolved from a simple job queue into a **production-ready job orchestration platform**:
 
+### ⚡ DXE: the Durable Execution Engine
+
+Jobs are durable workflows, not opaque function calls. Inside any job:
+
+```python
+from pyjobby import Job
+
+class ProcessOrder(Job):
+    async def task(self, order_id: int):
+        # Checkpointed steps: a completed step NEVER re-executes, even
+        # across retries, worker crashes, or host loss. A job that dies at
+        # step 3 resumes at step 3.
+        order = await self.step("load", self._load, order_id)
+        charge = await self.step("charge", self._charge, order)   # exactly once
+        await self.sleep(24 * 3600)          # durable: lives in the DB,
+                                             # holds no worker, survives restarts
+        await self.step("follow-up", self._follow_up, order)
+
+        await self.set_event("progress", {"stage": "done"})  # observable state
+        reply = await self.recv(topic="approvals", timeout=300)  # durable messaging
+        return {"charged": charge["id"]}
+```
+
+- **Steps** checkpoint into the database; retries fast-forward past
+  completed work and re-execute only what failed (your retry budget applies
+  to the *failing* step — an improvement over replay-the-recorded-error
+  designs).
+- **Durable sleeps** are rows, not processes — a million sleeping jobs cost
+  zero workers.
+- **Events** (`set_event` / `client.get_event`) publish live job state;
+  **mailboxes** (`send` / `recv`) give exactly-once job-to-job messaging.
+- **Cancellation reaches running jobs** (~1s via NOTIFY), cancelling the
+  task at its next await point; `self.cancelled` for sync loops.
+- Every attempt of every job is recorded in `jorb_history`; every
+  checkpoint in `jorb_step` (`pj-admin jobs history/steps ID`).
+- `run_epoch` fencing guarantees a superseded execution can never write
+  results or checkpoints.
+
+### ✅ Live queue controls & worker registry
+
+```bash
+pj-admin queues pause imports          # takes effect on the next claim
+pj-admin queues limits imports --max-concurrency 8 --rate-limit 100 --rate-period 60
+pj-admin workers list                  # real registry: idle workers visible,
+                                       # dead workers detected by heartbeat
+pj-admin doctor                        # executable health runbook
+```
+
+Pause, concurrency caps, and rate limits are enforced *inside* the claim
+statement — no worker restarts, no config deploys. Dead workers are
+detected by registry heartbeat and their jobs requeued globally by
+`pj-monitor` (jobs resume from their last completed step).
+
 ### ✅ Client Library (NEW!)
 
 Clean, high-performance Python client with:
@@ -215,9 +268,12 @@ await client.enqueue(
 # Also supports: 'linear', 'fibonacci', 'fixed'
 ```
 
-When a job crashes, the retry is enqueued as a **new job row** (the crashed
-row is preserved as an audit trail). Retry rows are stamped in `admin_data`
-with both `parent_job_id` and `retry_of` so you can trace the full chain.
+When a job crashes, the retry **requeues the same row** — the job keeps
+its id for life, `error_count` and `run_epoch` advance, and every attempt
+(with its error) is recorded in `jorb_history`
+(`pj-admin jobs history ID`). After `max_retries` attempts the job lands
+in the terminal `crashed` state, which **is** the dead letter queue. DXE
+jobs resume from their last completed step on every retry.
 
 **Job Timeout Enforcement**
 
@@ -230,12 +286,14 @@ await client.enqueue(
 )
 
 # Background monitor for safety
-pj-timeout-monitor --dsn postgresql://... --check-interval 10
+pj-monitor --dsn postgresql://... --check-interval 10
 ```
 
-`pj-timeout-monitor` does two things: it enforces `timeout_at` on running
-jobs, and it requeues jobs stuck in `claimed` whose worker died
-(`--claimed-grace`, default 300 seconds). It connects via `--dsn` (or the
+`pj-monitor` is the platform's reaper: it enforces `timeout_at` on running
+jobs, requeues in-flight jobs owned by workers whose registry heartbeat
+went stale (`--liveness-grace`, default 60s — this is how jobs on a dead
+host recover, on any host), and recovers unregistered stale claims
+(`--claimed-grace`, default 300s). It connects via `--dsn` (or the
 `PYJOBBY_DSN` environment variable) or `--config`.
 
 **DAG Support (Directed Acyclic Graphs)**
