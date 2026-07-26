@@ -12,7 +12,7 @@ import asyncio
 import json
 import sys
 from datetime import timedelta
-from typing import Any
+from typing import Any, NoReturn
 
 import asyncpg  # type: ignore[import-untyped]
 import click
@@ -20,6 +20,7 @@ import click
 from . import db
 from .admin_api import UNSET, AdminAPI, Unset
 from .configloader import load_config_from_file
+from .db import JobState
 
 
 # ANSI color codes for terminal output
@@ -82,28 +83,97 @@ def print_table(headers: list[str], rows: list[list[str]], max_width: int = 80) 
         click.echo(row_str)
 
 
+class ConfigProblem(SystemExit):
+    """The operator's configuration is wrong -- not the database.
+
+    A SystemExit subclass, so every caller that simply lets it propagate
+    exits exactly as before; callers that need to tell the two apart (the
+    doctor's per-subsystem report) can catch this specifically.
+    """
+
+
+class DatabaseProblem(SystemExit):
+    """The database could not be reached, or refused the operation."""
+
+
+def fail(
+    *messages: str, code: int = 1, problem: type[SystemExit] = SystemExit
+) -> NoReturn:
+    """Report an operator-facing failure and exit non-zero.
+
+    Every failure path goes through here so a command can never report a
+    problem while exiting 0 — scripts chaining `pj-admin ... && next-step`
+    depend on that.
+    """
+    for message in messages:
+        print_error(message)
+    raise problem(code)
+
+
+def report_cancel(result: dict[str, Any]) -> None:
+    """Report a cancellation truthfully.
+
+    db.cancel_job returns 'cancelled' when the job was stopped outright and
+    'cancel_requested' when the request still has to reach a worker; saying
+    "cancelled" for the second case tells operators a running job stopped
+    when it may not have.
+    """
+    if result["status"] == "cancel_requested":
+        print_warning(
+            f"Job {result['job_id']}: cancellation requested "
+            f"(running — the worker stops it at its next await point)"
+        )
+    else:
+        print_success(f"Job {result['job_id']} cancelled")
+
+
+def validate_state(state: str | None) -> str | None:
+    """Reject unknown job states before they reach the jorbstate enum."""
+    if state is None:
+        return None
+    valid = [s.value for s in JobState]
+    if state not in valid:
+        fail(f"Unknown job state: {state!r}", f"Valid states: {', '.join(valid)}")
+    return state
+
+
 async def get_connection(
     config_path: str, dsn: str | None = None
 ) -> asyncpg.Connection:
-    """Get database connection from a DSN (if given) or a config file"""
+    """Get database connection from a DSN (if given) or a config file.
+
+    Config problems and connection problems are reported distinctly: a
+    missing or malformed config file is not a database failure, and telling
+    an operator otherwise sends them debugging the wrong system.
+    """
+    db_params: dict[str, Any] | None = None
+
+    if not dsn:
+        try:
+            config = load_config_from_file(config_path, keys=["db_params"])
+        except RuntimeError as e:  # ConfigError: missing, unreadable, or bad
+            fail(
+                f"Could not load config file: {config_path}",
+                str(e),
+                "Use --config to point at a pyjobby conf file, or --dsn to "
+                "connect directly.",
+                problem=ConfigProblem,
+            )
+        db_params = config.get("db_params")
+        if not db_params:
+            fail(
+                f"No db_params found in config file: {config_path}",
+                "Config file must define a db_params dict",
+                problem=ConfigProblem,
+            )
+
     try:
         if dsn:
             return await db.connect(dsn)
-        config = load_config_from_file(config_path, keys=["db_params"])
-        db_params = config.get("db_params")
-        if not db_params:
-            print_error(f"No db_params found in config file: {config_path}")
-            print_error("Config file must define db_params dict")
-            sys.exit(1)
-        conn = await db.connect(**db_params)
-        return conn
-    except FileNotFoundError:
-        print_error(f"Config file not found: {config_path}")
-        print_error("Use --config to specify config file path")
-        sys.exit(1)
+        assert db_params is not None  # set above when no dsn was given
+        return await db.connect(**db_params)
     except Exception as e:
-        print_error(f"Failed to connect to database: {e}")
-        sys.exit(1)
+        fail(f"Failed to connect to database: {e}", problem=DatabaseProblem)
 
 
 # =========================================================================
@@ -160,6 +230,7 @@ def jobs_list(
     """List jobs with optional filtering"""
 
     async def _list() -> None:
+        validate_state(state)
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
@@ -300,7 +371,9 @@ def jobs_retry(ctx: click.Context, job_ids: tuple[int, ...]) -> None:
                 click.echo(f"\n{Colors.BOLD}Summary:{Colors.ENDC}")
                 print_success(f"  Retried: {success_count}")
                 if error_count:
-                    print_error(f"  Failed: {error_count}")
+                    # a bulk operation that could not do what was asked must
+                    # exit non-zero, exactly like the single-job form
+                    fail(f"  Failed: {error_count}")
 
         finally:
             await conn.close()
@@ -312,7 +385,13 @@ def jobs_retry(ctx: click.Context, job_ids: tuple[int, ...]) -> None:
 @click.argument("job_ids", nargs=-1, type=int, required=True)
 @click.pass_context
 def jobs_cancel(ctx: click.Context, job_ids: tuple[int, ...]) -> None:
-    """Cancel one or more queued/waiting jobs"""
+    """Cancel one or more jobs.
+
+    Queued and waiting jobs are cancelled immediately. A claimed or running
+    job gets a cancellation REQUEST delivered to its worker, which stops the
+    task at its next await point — reported distinctly, because a job whose
+    worker has died stays running with only the request recorded.
+    """
 
     async def _cancel() -> None:
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
@@ -323,10 +402,9 @@ def jobs_cancel(ctx: click.Context, job_ids: tuple[int, ...]) -> None:
                 # Single job
                 try:
                     result = await api.cancel_job(job_ids[0])
-                    print_success(f"Job {result['job_id']} cancelled")
                 except ValueError as e:
-                    print_error(str(e))
-                    sys.exit(1)
+                    fail(str(e))
+                report_cancel(result)
             else:
                 # Multiple jobs
                 results = await api.cancel_jobs(list(job_ids))
@@ -337,12 +415,12 @@ def jobs_cancel(ctx: click.Context, job_ids: tuple[int, ...]) -> None:
                     if result["status"] == "error":
                         print_error(f"Job {result['job_id']}: {result['error']}")
                     else:
-                        print_success(f"Job {result['job_id']} cancelled")
+                        report_cancel(result)
 
                 click.echo(f"\n{Colors.BOLD}Summary:{Colors.ENDC}")
                 print_success(f"  Cancelled: {success_count}")
                 if error_count:
-                    print_error(f"  Failed: {error_count}")
+                    fail(f"  Failed: {error_count}")
 
         finally:
             await conn.close()
@@ -671,6 +749,14 @@ def queues_clear(
     """Clear (delete) jobs from a queue"""
 
     async def _clear() -> None:
+        validate_state(state)
+        if not queue.strip():
+            fail(
+                "Queue name must not be empty",
+                "Refusing to run: an empty name filters nothing and would "
+                "target every job.",
+            )
+
         # Build description
         desc = f"queue '{queue}'"
         if state:
@@ -1100,7 +1186,10 @@ def dlq_retry(ctx: click.Context, job_id: int) -> None:
 @cli.command()
 @click.option("--queue", "-q", help="Filter by queue")
 @click.option(
-    "--since-hours", type=int, default=24, help="Hours to look back (default: 24)"
+    "--since-hours",
+    type=click.IntRange(min=1),
+    default=24,
+    help="Hours to look back (default: 24)",
 )
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
@@ -1248,8 +1337,7 @@ def schedule_show(ctx: click.Context, name_or_id: str, output_json: bool) -> Non
                 sched = await api.get_schedule(name=name_or_id)
 
             if not sched:
-                print_error(f"Schedule not found: {name_or_id}")
-                return
+                fail(f"Schedule not found: {name_or_id}")
 
             if output_json:
                 click.echo(json.dumps(sched, indent=2, default=str))
@@ -1357,6 +1445,7 @@ def schedule_add(
 
     async def _add() -> None:
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        problem: str | None = None
         try:
             api = AdminAPI(conn)
 
@@ -1366,8 +1455,7 @@ def schedule_add(
                 try:
                     job_kwargs = json.loads(kwargs)
                 except json.JSONDecodeError as e:
-                    print_error(f"Invalid JSON for kwargs: {e}")
-                    return
+                    fail(f"Invalid JSON for kwargs: {e}")
 
             sched = await api.create_schedule(
                 name=name,
@@ -1392,11 +1480,18 @@ def schedule_add(
             click.echo(f"  Queue:    {sched['queue']}")
 
         except ValueError as e:
-            print_error(str(e))
+            # invalid cron expression or unknown timezone
+            problem = str(e)
         except Exception as e:
-            print_error(f"Failed to create schedule: {e}")
+            # duplicate name, constraint violation, ...
+            problem = f"Failed to create schedule: {e}"
         finally:
             await conn.close()
+
+        # reported after the connection is released, so a failing add still
+        # exits non-zero without leaking the connection
+        if problem is not None:
+            fail(problem)
 
     asyncio.run(_add())
 
@@ -1422,8 +1517,7 @@ def schedule_enable(ctx: click.Context, name_or_id: str) -> None:
                 schedule_id = sched["id"] if sched else None
 
             if not sched:
-                print_error(f"Schedule not found: {name_or_id}")
-                return
+                fail(f"Schedule not found: {name_or_id}")
 
             assert schedule_id is not None
 
@@ -1459,8 +1553,7 @@ def schedule_disable(ctx: click.Context, name_or_id: str) -> None:
                 schedule_id = sched["id"] if sched else None
 
             if not sched:
-                print_error(f"Schedule not found: {name_or_id}")
-                return
+                fail(f"Schedule not found: {name_or_id}")
 
             assert schedule_id is not None
 
@@ -1497,8 +1590,7 @@ def schedule_delete(ctx: click.Context, name_or_id: str) -> None:
                 schedule_id = sched["id"] if sched else None
 
             if not sched:
-                print_error(f"Schedule not found: {name_or_id}")
-                return
+                fail(f"Schedule not found: {name_or_id}")
 
             assert schedule_id is not None
 
@@ -1543,8 +1635,7 @@ def schedule_history(
                 schedule_id = sched["id"] if sched else None
 
             if not sched:
-                print_error(f"Schedule not found: {name_or_id}")
-                return
+                fail(f"Schedule not found: {name_or_id}")
 
             assert schedule_id is not None
 
@@ -2001,7 +2092,10 @@ def dag_visualize(ctx: click.Context, dag_id: int) -> None:
 @jobs.command("retry-stats")
 @click.option("--queue", "-q", help="Filter by queue")
 @click.option(
-    "--since-hours", type=int, default=24, help="Hours to look back (default: 24)"
+    "--since-hours",
+    type=click.IntRange(min=1),
+    default=24,
+    help="Hours to look back (default: 24)",
 )
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
@@ -2143,7 +2237,10 @@ def jobs_retry_stats(
 @jobs.command("timeout-stats")
 @click.option("--queue", "-q", help="Filter by queue")
 @click.option(
-    "--since-hours", type=int, default=24, help="Hours to look back (default: 24)"
+    "--since-hours",
+    type=click.IntRange(min=1),
+    default=24,
+    help="Hours to look back (default: 24)",
 )
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
@@ -2349,6 +2446,11 @@ def doctor(ctx: click.Context, max_depth: int, max_age_minutes: int) -> None:
 
         try:
             conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        except ConfigProblem:
+            # get_connection printed the specific reason; blaming the database
+            # here would send the operator to debug the wrong system.
+            doc.report("FAIL", "config", "unusable")
+            return 1
         except SystemExit:
             doc.report("FAIL", "database", "unreachable")
             return 1
@@ -2481,6 +2583,14 @@ def db_migrate(ctx: click.Context) -> None:
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             applied = await migrations.migrate(conn)
+        except asyncpg.InsufficientPrivilegeError as e:
+            fail(
+                f"Not permitted to install the schema: {e}",
+                "The connecting role needs CREATE on the target schema.",
+            )
+        except asyncpg.PostgresError as e:
+            fail(f"Migration failed: {e}", "The database was left unchanged.")
+        else:
             if applied:
                 print_success(f"Applied migrations: {applied}")
             else:

@@ -160,6 +160,32 @@ class TestDoctorDatabaseReachability:
 
         assert parse_checks(result.output)["database"] == ("PASS", "connected")
 
+    async def test_missing_config_file_fails_with_the_config_reason(self, tmp_path):
+        """A config problem is reported AS a config problem.
+
+        Blaming the database for an unreadable config file sends the operator
+        to debug the wrong system, so the check line names config and the
+        reason names the file and points at --config/--dsn."""
+        missing = tmp_path / "absent.conf.py"
+
+        def _invoke():
+            return CliRunner().invoke(cli, ["--config", str(missing), "doctor"])
+
+        result = await asyncio.to_thread(_invoke)
+
+        assert result.exit_code == 1, result.output
+        checks = parse_checks(result.output)
+        assert checks["config"] == ("FAIL", "unusable")
+        assert "database" not in checks
+        assert list(checks) == ["config"]
+        assert f"Error: Could not load config file: {missing}" in result.stderr
+        assert f"Error: '{missing}' doesn't exist" in result.stderr
+        assert (
+            "Error: Use --config to point at a pyjobby conf file, or --dsn to "
+            "connect directly." in result.stderr
+        )
+        assert "Failed to connect to database" not in result.stderr
+
 
 # ============================================================================
 # Schema / migrations

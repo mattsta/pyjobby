@@ -7,9 +7,8 @@ Each test pins the EXIT CODE and the MESSAGE, because "it printed
 something red" is not a contract -- scripts and runbooks branch on the
 exit status.
 
-Where the CLI's real behavior is questionable (an error message with exit
-0, or a bare traceback) the test asserts what the code actually does and
-says so in a comment, so the behavior cannot change silently.
+Operator-facing failures print their message AND exit non-zero -- every
+one of them, so `pj-admin ... && next-step` is safe to write.
 """
 
 from __future__ import annotations
@@ -130,13 +129,16 @@ class TestConfigFile:
         result = await run_cli("--config", str(missing), "jobs", "list")
 
         assert result.exit_code == 1
-        # NOTE: the configloader raises RuntimeError("... doesn't exist"), not
-        # FileNotFoundError, so the CLI's friendlier "Config file not found /
-        # Use --config to specify config file path" branch is unreachable and
-        # a missing config is reported as a *database* failure instead.
-        assert result.stderr.startswith("Error: Failed to connect to database:")
-        assert f"'{missing}' doesn't exist" in result.stderr
-        assert "Config file not found" not in result.stderr
+        # A config problem is reported as a config problem: the operator is
+        # told which file could not be loaded, why, and how to point the CLI
+        # somewhere else. It is NOT misreported as a database failure.
+        assert result.stderr.startswith(f"Error: Could not load config file: {missing}")
+        assert f"Error: '{missing}' doesn't exist" in result.stderr
+        assert (
+            "Error: Use --config to point at a pyjobby conf file, or --dsn to "
+            "connect directly." in result.stderr
+        )
+        assert "Failed to connect to database" not in result.stderr
 
     async def test_config_without_db_params_exits_one(self, tmp_path):
         conf = tmp_path / "nodb.conf.py"
@@ -146,7 +148,8 @@ class TestConfigFile:
 
         assert result.exit_code == 1
         assert f"Error: No db_params found in config file: {conf}" in result.stderr
-        assert "Config file must define db_params dict" in result.stderr
+        assert "Error: Config file must define a db_params dict" in result.stderr
+        assert "Failed to connect to database" not in result.stderr
 
     async def test_config_with_empty_db_params_exits_one(self, tmp_path):
         conf = tmp_path / "empty.conf.py"
@@ -164,9 +167,13 @@ class TestConfigFile:
         result = await run_cli("--config", str(conf), "jobs", "list")
 
         assert result.exit_code == 1
-        assert "Error: Failed to connect to database:" in result.stderr
-        assert f"Failed to read config file: {conf}" in result.stderr
-        assert "bad config" in result.stderr
+        assert f"Error: Could not load config file: {conf}" in result.stderr
+        assert f"Error: Failed to read config file: {conf}: bad config" in result.stderr
+        assert (
+            "Error: Use --config to point at a pyjobby conf file, or --dsn to "
+            "connect directly." in result.stderr
+        )
+        assert "Failed to connect to database" not in result.stderr
 
     async def test_unreadable_config_file_exits_one(self, tmp_path):
         if os.geteuid() == 0:
@@ -180,9 +187,14 @@ class TestConfigFile:
             conf.chmod(0o600)
 
         assert result.exit_code == 1
-        assert "Error: Failed to connect to database:" in result.stderr
-        assert f"Failed to read config file: {conf}" in result.stderr
+        assert f"Error: Could not load config file: {conf}" in result.stderr
+        assert f"Error: Failed to read config file: {conf}:" in result.stderr
         assert "Permission denied" in result.stderr
+        assert (
+            "Error: Use --config to point at a pyjobby conf file, or --dsn to "
+            "connect directly." in result.stderr
+        )
+        assert "Failed to connect to database" not in result.stderr
 
     async def test_dsn_overrides_a_broken_config(self, tmp_path, dsn):
         """--dsn wins, so a stale config file cannot block an emergency."""
@@ -432,35 +444,52 @@ class TestJobsWrongState:
             "(must be crashed, cancelled, or finished)" in result.stderr
         )
 
-    async def test_bulk_retry_reports_each_failure_but_exits_zero(self, dsn):
+    async def test_bulk_retry_exits_one_when_every_job_failed(self, dsn):
+        """The bulk path exits non-zero exactly like the single-job form, so
+        `pj-admin jobs retry a b && next-step` cannot run after a failure."""
         a, b = MISSING_ID, MISSING_ID - 1
 
         result = await run_cli("--dsn", dsn, "jobs", "retry", str(a), str(b))
 
-        # NOTE: a single bad id exits 1, but the bulk path only prints a
-        # summary -- two failures out of two still exits 0.
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 1
         assert f"Error: Job {a}: Job {a} not found" in result.stderr
         assert f"Error: Job {b}: Job {b} not found" in result.stderr
         assert "Retried: 0" in result.output
-        assert "Failed: 2" in result.output
+        assert "Error:   Failed: 2" in result.stderr
+
+    async def test_bulk_retry_exits_zero_when_every_job_succeeded(
+        self, dsn, db_pool, unique_queue
+    ):
+        """Control case: the exit code tracks the failures, not the batch."""
+        a = await make_job(db_pool, unique_queue, "crashed", error_count=2)
+        b = await make_job(db_pool, unique_queue, "crashed", error_count=1)
+
+        result = await run_cli("--dsn", dsn, "jobs", "retry", str(a), str(b))
+
+        assert result.exit_code == 0, result.output
+        assert f"Job {a} requeued" in result.output
+        assert f"Job {b} requeued" in result.output
+        assert "Retried: 2" in result.output
+        assert "Failed" not in result.output + result.stderr
 
     async def test_bulk_cancel_mixes_success_and_failure(
         self, dsn, db_pool, unique_queue
     ):
+        """One bad id in the batch is still a failure: the per-job lines are
+        unchanged, but the command exits 1."""
         good = await make_job(db_pool, unique_queue, "queued")
         done = await make_job(db_pool, unique_queue, "finished")
 
         result = await run_cli("--dsn", dsn, "jobs", "cancel", str(good), str(done))
 
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 1
         assert f"Job {good} cancelled" in result.output
         assert (
             f"Error: Job {done}: Job {done} is in state 'finished' and cannot "
             "be cancelled" in result.stderr
         )
         assert "Cancelled: 1" in result.output
-        assert "Failed: 1" in result.output
+        assert "Error:   Failed: 1" in result.stderr
 
 
 # ============================================================================
@@ -469,25 +498,48 @@ class TestJobsWrongState:
 
 
 class TestJobsInvalidFilters:
-    async def test_unknown_state_filter_raises_a_database_error(self, dsn):
+    VALID_STATES = "queued, claimed, running, waiting, finished, crashed, cancelled"
+
+    async def test_unknown_state_filter_is_rejected_with_the_valid_states(self, dsn):
+        """A typo'd state never reaches the jorbstate enum: the operator gets
+        the name they typed back plus the list of states that do exist."""
         result = await run_cli("--dsn", dsn, "jobs", "list", "--state", "bogus")
 
-        # NOTE: the state is passed straight to the jorbstate enum, so a typo
-        # surfaces as an unhandled asyncpg error (exit 1, bare traceback)
-        # instead of "unknown state: bogus".
         assert result.exit_code == 1
-        assert isinstance(result.exception, asyncpg.InvalidTextRepresentationError)
-        assert 'invalid input value for enum jorbstate: "bogus"' in str(
-            result.exception
-        )
+        assert "Error: Unknown job state: 'bogus'" in result.stderr
+        assert f"Error: Valid states: {self.VALID_STATES}" in result.stderr
+        assert not isinstance(result.exception, asyncpg.InvalidTextRepresentationError)
+        assert "jorbstate" not in result.stderr
 
-    async def test_unknown_state_in_queues_clear_raises_too(self, dsn, unique_queue):
+    async def test_unknown_state_in_queues_clear_is_rejected_too(
+        self, dsn, unique_queue, db_pool
+    ):
+        """The same guard runs before `queues clear` deletes anything."""
+        job_id = await make_job(db_pool, unique_queue, "finished")
+
         result = await run_cli(
             "--dsn", dsn, "queues", "clear", unique_queue, "--state", "bogus", "--force"
         )
 
         assert result.exit_code == 1
-        assert isinstance(result.exception, asyncpg.InvalidTextRepresentationError)
+        assert "Error: Unknown job state: 'bogus'" in result.stderr
+        assert f"Error: Valid states: {self.VALID_STATES}" in result.stderr
+        assert not isinstance(result.exception, asyncpg.InvalidTextRepresentationError)
+        # rejected before any database work: the queue is untouched
+        assert await db_pool.fetchval("SELECT COUNT(*) FROM jorb WHERE id = $1", job_id)
+
+    @pytest.mark.parametrize(
+        "state",
+        ["queued", "claimed", "running", "waiting", "finished", "crashed", "cancelled"],
+    )
+    async def test_every_advertised_state_is_accepted(self, dsn, unique_queue, state):
+        """Control case: every state named in the rejection message works."""
+        result = await run_cli(
+            "--dsn", dsn, "jobs", "list", "--queue", unique_queue, "--state", state
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "No jobs found" in result.output
 
     async def test_unmatched_filters_are_not_an_error(self, dsn, unique_queue):
         result = await run_cli("--dsn", dsn, "jobs", "list", "--queue", unique_queue)
@@ -668,14 +720,25 @@ class TestQueues:
             is False
         )
 
-    async def test_clear_with_empty_queue_name_raises(self, dsn):
-        result = await run_cli("--dsn", dsn, "queues", "clear", "", "--force")
+    @pytest.mark.parametrize("name", ["", "   "])
+    async def test_clear_with_empty_queue_name_is_refused(
+        self, dsn, db_pool, unique_queue, name
+    ):
+        """An empty name filters nothing, so clearing it would delete every
+        job: refused up front with an explanation, not a bare ValueError."""
+        job_id = await make_job(db_pool, unique_queue, "finished")
 
-        # NOTE: an empty queue name falsifies every filter, and clear_queue's
-        # guard escapes as an unhandled ValueError (exit 1, bare traceback).
+        result = await run_cli("--dsn", dsn, "queues", "clear", name, "--force")
+
         assert result.exit_code == 1
-        assert isinstance(result.exception, ValueError)
-        assert "Must specify at least one filter" in str(result.exception)
+        assert "Error: Queue name must not be empty" in result.stderr
+        assert (
+            "Error: Refusing to run: an empty name filters nothing and would "
+            "target every job." in result.stderr
+        )
+        assert not isinstance(result.exception, ValueError)
+        # nothing was deleted
+        assert await db_pool.fetchval("SELECT COUNT(*) FROM jorb WHERE id = $1", job_id)
 
     async def test_clear_declined_at_the_prompt_deletes_nothing(
         self, dsn, db_pool, unique_queue
@@ -699,42 +762,41 @@ class TestQueues:
 
 
 class TestScheduleUnknownName:
-    """Unknown schedules print an error and exit 0.
+    """Unknown schedules print an error AND exit 1.
 
-    NOTE: every one of these commands reports "Schedule not found" on stderr
-    and then returns normally, so `pj-admin schedule show x && deploy` still
-    runs the deploy. The exit code is asserted as 0 because that is what the
-    code does today, not because it is right.
+    Every one of these commands reports "Schedule not found" on stderr and
+    exits non-zero, so `pj-admin schedule show x && deploy` stops before the
+    deploy instead of running it against a schedule that isn't there.
     """
 
     async def test_show_by_name(self, dsn):
         result = await run_cli("--dsn", dsn, "schedule", "show", "no_such_sched")
 
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 1
         assert "Error: Schedule not found: no_such_sched" in result.stderr
 
     async def test_show_by_id(self, dsn):
         result = await run_cli("--dsn", dsn, "schedule", "show", str(MISSING_ID))
 
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 1
         assert f"Error: Schedule not found: {MISSING_ID}" in result.stderr
 
     async def test_history(self, dsn):
         result = await run_cli("--dsn", dsn, "schedule", "history", "no_such_sched")
 
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 1
         assert "Error: Schedule not found: no_such_sched" in result.stderr
 
     async def test_enable(self, dsn):
         result = await run_cli("--dsn", dsn, "schedule", "enable", "no_such_sched")
 
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 1
         assert "Error: Schedule not found: no_such_sched" in result.stderr
 
     async def test_disable(self, dsn):
         result = await run_cli("--dsn", dsn, "schedule", "disable", "no_such_sched")
 
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 1
         assert "Error: Schedule not found: no_such_sched" in result.stderr
 
     async def test_delete_confirmed(self, dsn):
@@ -742,7 +804,7 @@ class TestScheduleUnknownName:
             "--dsn", dsn, "schedule", "delete", "no_such_sched", "--yes"
         )
 
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 1
         assert "Error: Schedule not found: no_such_sched" in result.stderr
 
     async def test_delete_without_confirmation_aborts(self, dsn, db_pool):
@@ -755,6 +817,13 @@ class TestScheduleUnknownName:
 
 
 class TestScheduleAddValidation:
+    """`schedule add` rejections.
+
+    Every rejection -- malformed --kwargs, invalid cron, unknown timezone,
+    duplicate name -- reports on stderr and exits 1, and leaves no schedule
+    behind. A provisioning script can rely on the exit status.
+    """
+
     async def _count(self, db_pool, name: str) -> int:
         return await db_pool.fetchval(
             "SELECT COUNT(*) FROM jorb_schedule WHERE name = $1", name
@@ -765,8 +834,7 @@ class TestScheduleAddValidation:
             "--dsn", dsn, "schedule", "add", test_id, "tests.dxe_jobs.OkJob", "nope"
         )
 
-        # NOTE: validation failures print an error but exit 0 (see above).
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 1, result.output
         assert "Error: Invalid cron expression or timezone:" in result.stderr
         assert "Exactly 5, 6 or 7 columns" in result.stderr
         assert await self._count(db_pool, test_id) == 0
@@ -782,7 +850,7 @@ class TestScheduleAddValidation:
             "0 99 * * *",
         )
 
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 1, result.output
         assert "Error: Invalid cron expression or timezone:" in result.stderr
         assert await self._count(db_pool, test_id) == 0
 
@@ -799,7 +867,7 @@ class TestScheduleAddValidation:
             "Mars/Phobos",
         )
 
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 1, result.output
         assert (
             "Error: Invalid cron expression or timezone: 'Mars/Phobos'" in result.stderr
         )
@@ -818,8 +886,10 @@ class TestScheduleAddValidation:
             "{bad json",
         )
 
-        assert result.exit_code == 0, result.output
+        # this branch DOES go through fail(): malformed JSON exits 1
+        assert result.exit_code == 1
         assert "Error: Invalid JSON for kwargs:" in result.stderr
+        assert "Expecting property name enclosed in double quotes" in result.stderr
         assert await self._count(db_pool, test_id) == 0
 
     async def test_duplicate_name(self, dsn, db_pool, test_id):
@@ -845,7 +915,7 @@ class TestScheduleAddValidation:
             "0 3 * * *",
         )
 
-        assert second.exit_code == 0, second.output
+        assert second.exit_code == 1, second.output
         assert "Error: Failed to create schedule:" in second.stderr
         assert "duplicate key value violates unique constraint" in second.stderr
         assert await self._count(db_pool, test_id) == 1
@@ -939,11 +1009,17 @@ class TestDbCommands:
 
         result = await run_cli("--dsn", dsn_for(db_params, name), "db", "migrate")
 
-        # NOTE: no operator-friendly message -- the asyncpg error escapes
-        # asyncio.run() as a traceback (exit 1).
+        # the privilege error is translated into an operator-facing message
+        # naming the missing grant -- no traceback escapes asyncio.run()
         assert result.exit_code == 1
-        assert isinstance(result.exception, asyncpg.InsufficientPrivilegeError)
-        assert "permission denied for schema public" in str(result.exception)
+        assert not isinstance(result.exception, asyncpg.InsufficientPrivilegeError)
+        assert "Error: Not permitted to install the schema:" in result.stderr
+        assert "permission denied for schema public" in result.stderr
+        assert (
+            "Error: The connecting role needs CREATE on the target schema."
+            in result.stderr
+        )
+        assert "Traceback" not in result.output
 
         # and the database is still empty afterwards
         check = await asyncpg.connect(**{**db_params, "database": name})
@@ -1052,24 +1128,40 @@ class TestFlagValidation:
 
         assert result.exit_code == 2
         assert (
-            "Error: Invalid value for '--since-hours': 'lots' is not a valid integer."
-            in result.stderr
+            "Error: Invalid value for '--since-hours': 'lots' is not a valid "
+            "integer range." in result.stderr
         )
 
-    async def test_negative_since_hours_is_accepted_and_matches_nothing(
-        self, dsn, db_pool, unique_queue
+    @pytest.mark.parametrize(
+        "command", [("metrics",), ("jobs", "retry-stats"), ("jobs", "timeout-stats")]
+    )
+    @pytest.mark.parametrize("value", ["-24", "0"])
+    async def test_non_positive_since_hours_is_rejected(
+        self, dsn, db_pool, unique_queue, command, value
     ):
-        """A sign typo is not rejected: the window simply looks into the future."""
+        """A sign typo is a usage error, not a window that silently looks into
+        the future and matches nothing."""
         await make_job(db_pool, unique_queue, "finished")
 
-        result = await run_cli(
-            "--dsn", dsn, "metrics", "--since-hours", "-24", "--json"
+        result = await run_cli("--dsn", dsn, *command, "--since-hours", value, "--json")
+
+        assert result.exit_code == 2
+        assert (
+            f"Error: Invalid value for '--since-hours': {value} is not in the "
+            "range x>=1." in result.stderr
         )
+        assert result.stdout == ""
+
+    async def test_positive_since_hours_still_works(self, dsn, db_pool, unique_queue):
+        """Control case: the range guard rejects the typo, not the flag."""
+        await make_job(db_pool, unique_queue, "finished")
+
+        result = await run_cli("--dsn", dsn, "metrics", "--since-hours", "24", "--json")
 
         assert result.exit_code == 0, result.output
         import json
 
-        assert json.loads(result.stdout)["finished_count"] == 0
+        assert json.loads(result.stdout)["finished_count"] == 1
 
 
 # ============================================================================
@@ -1125,11 +1217,13 @@ class TestStaleRegistryRows:
 
         result = await run_cli("--dsn", dsn, "jobs", "cancel", str(job_id))
 
+        # the request was accepted, so the exit code is still 0 ...
         assert result.exit_code == 0, result.output
-        # NOTE: the API returns status 'cancel_requested' here, but the CLI
-        # hardcodes "cancelled" -- the operator is told the job stopped when
-        # only a request was recorded.
-        assert f"Job {job_id} cancelled" in result.output
+        # ... but the wording never claims the job stopped: the API returned
+        # 'cancel_requested' and the operator is told exactly that.
+        assert f"Job {job_id}: cancellation requested" in result.output
+        assert "the worker stops it at its next await point" in result.output
+        assert f"Job {job_id} cancelled" not in result.output
         row = await db_pool.fetchrow(
             "SELECT state::text AS state, cancel_requested FROM jorb WHERE id = $1",
             job_id,
@@ -1137,3 +1231,21 @@ class TestStaleRegistryRows:
         # still running, only flagged: the dead worker will never act on it
         assert row["state"] == "running"
         assert row["cancel_requested"] is True
+
+    @pytest.mark.parametrize("state", ["queued", "waiting"])
+    async def test_cancel_of_an_unclaimed_job_reports_a_real_cancellation(
+        self, dsn, db_pool, unique_queue, state
+    ):
+        """Contrast case: nothing is holding a queued/waiting job, so it really
+        is cancelled and the CLI says so without the warning."""
+        job_id = await make_job(db_pool, unique_queue, state)
+
+        result = await run_cli("--dsn", dsn, "jobs", "cancel", str(job_id))
+
+        assert result.exit_code == 0, result.output
+        assert f"Job {job_id} cancelled" in result.output
+        assert "cancellation requested" not in result.output
+        assert (
+            await db_pool.fetchval("SELECT state::text FROM jorb WHERE id = $1", job_id)
+            == "cancelled"
+        )
