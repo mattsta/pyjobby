@@ -51,7 +51,7 @@ def available_migrations() -> list[Migration]:
     migrations_dir = _SQL_ROOT / "migrations"
     try:
         entries = list(migrations_dir.iterdir())
-    except FileNotFoundError, NotADirectoryError:
+    except (FileNotFoundError, NotADirectoryError):
         return []
 
     migrations = []

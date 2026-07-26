@@ -471,7 +471,7 @@ async def live_worker(db_params: dict[str, str], unique_queue: str):
     for system, task in started:
         try:
             await asyncio.wait_for(task, timeout=5)
-        except TimeoutError, asyncio.CancelledError:
+        except (TimeoutError, asyncio.CancelledError):
             task.cancel()
 
 
