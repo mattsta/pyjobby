@@ -1,0 +1,504 @@
+"""Every console script must start as a real process and do its job.
+
+These tests exist because coverage cannot see wiring: this platform once
+shipped `scheduler.py` at 97% coverage with no entry point at all (cron
+never fired) and `timeout_monitor.py` at 99% while being a complete no-op.
+Each test here launches the installed console script in its own process
+group and asserts an OBSERVABLE EFFECT in the database or over the network
+— never just that `--help` parses.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime, timedelta
+
+import aiohttp
+import pytest
+
+from .utils.processes import daemon, dsn_from, free_port, port_is_open, wait_until
+
+pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
+
+
+@pytest.fixture
+def dsn(db_params: dict) -> str:
+    return dsn_from(db_params)
+
+
+# ============================================================================
+# pj — the worker fleet launcher
+# ============================================================================
+
+
+class TestWorkerEntryPoint:
+    async def test_pj_executes_a_job_end_to_end(
+        self, db_pool, unique_queue, dsn, tmp_path
+    ):
+        """`pj` launches workers that claim and finish real jobs."""
+        job_id = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, kwargs, queue)
+               VALUES ('tests.dxe_jobs.OkJob', $1, $2) RETURNING id""",
+            {"x": 4},
+            unique_queue,
+        )
+
+        async with daemon(
+            "pj",
+            "--config",
+            str(write_config(tmp_path, dsn)),
+            "--queue",
+            unique_queue,
+            "--workers",
+            "1",
+            "--check-interval",
+            "1",
+        ):
+            row = await wait_until(
+                lambda: db_pool.fetchrow(
+                    "SELECT state, result FROM jorb WHERE id = $1 AND state = 'finished'",
+                    job_id,
+                ),
+                what="job finished by a pj-launched worker",
+            )
+        assert row["result"] == {"doubled": 8}
+
+    async def test_pj_registers_workers_in_the_registry(
+        self, db_pool, unique_queue, dsn, tmp_path
+    ):
+        """Launched workers appear in jorb_worker and deregister on shutdown."""
+        async with daemon(
+            "pj",
+            "--config",
+            str(write_config(tmp_path, dsn)),
+            "--queue",
+            unique_queue,
+            "--workers",
+            "2",
+            "--check-interval",
+            "1",
+        ):
+            workers = await wait_until(
+                lambda: db_pool.fetch(
+                    """SELECT * FROM jorb_worker
+                       WHERE queue = $1 AND shutdown_at IS NULL""",
+                    unique_queue,
+                ),
+                what="two workers registered",
+            )
+            assert len(workers) >= 1
+            assert all(w["pid"] for w in workers)
+
+        # after the group is reaped, the monitor would retire them; the
+        # graceful path marks shutdown_at itself
+        await wait_until(
+            lambda: db_pool.fetchval(
+                """SELECT count(*) = 0 FROM jorb_worker
+                   WHERE queue = $1 AND shutdown_at IS NULL""",
+                unique_queue,
+            ),
+            timeout=20,
+            what="workers deregistered after shutdown",
+        )
+
+
+# ============================================================================
+# pj-scheduler — the cron executor (this is the subsystem that had no runtime)
+# ============================================================================
+
+
+class TestSchedulerEntryPoint:
+    async def test_pj_scheduler_fires_a_due_schedule(
+        self, db_pool, unique_queue, dsn, tmp_path
+    ):
+        """A due schedule produces a job — the whole point of the daemon."""
+        schedule_id = await db_pool.fetchval(
+            """INSERT INTO jorb_schedule
+                   (name, job_class, kwargs, queue, cron_expr, next_run)
+               VALUES ($1, 'tests.dxe_jobs.OkJob', $2, $3, '* * * * *', $4)
+               RETURNING id""",
+            f"sched_{unique_queue}",
+            {"x": 1},
+            unique_queue,
+            datetime.now(UTC) - timedelta(minutes=1),
+        )
+
+        async with daemon(
+            "pj-scheduler",
+            "--config",
+            str(write_config(tmp_path, dsn)),
+            "--poll-interval",
+            "1",
+        ):
+            job = await wait_until(
+                lambda: db_pool.fetchrow(
+                    "SELECT * FROM jorb WHERE queue = $1", unique_queue
+                ),
+                what="scheduler enqueued a job for the due schedule",
+            )
+
+        assert job["job_class"] == "tests.dxe_jobs.OkJob"
+        assert job["admin_data"]["schedule_id"] == str(schedule_id)
+
+        # the schedule's bookkeeping advanced
+        sched = await db_pool.fetchrow(
+            "SELECT run_count, last_run, next_run FROM jorb_schedule WHERE id = $1",
+            schedule_id,
+        )
+        assert sched["run_count"] >= 1
+        assert sched["last_run"] is not None
+        assert sched["next_run"] > datetime.now(UTC) - timedelta(minutes=1)
+
+    async def test_pj_scheduler_leaves_disabled_schedules_alone(
+        self, db_pool, unique_queue, dsn, tmp_path
+    ):
+        await db_pool.execute(
+            """INSERT INTO jorb_schedule
+                   (name, job_class, queue, cron_expr, next_run, enabled)
+               VALUES ($1, 'tests.dxe_jobs.OkJob', $2, '* * * * *', $3, FALSE)""",
+            f"disabled_{unique_queue}",
+            unique_queue,
+            datetime.now(UTC) - timedelta(minutes=5),
+        )
+
+        async with daemon(
+            "pj-scheduler",
+            "--config",
+            str(write_config(tmp_path, dsn)),
+            "--poll-interval",
+            "1",
+            startup=2.0,
+        ):
+            count = await db_pool.fetchval(
+                "SELECT count(*) FROM jorb WHERE queue = $1", unique_queue
+            )
+        assert count == 0
+
+
+# ============================================================================
+# pj-monitor — the reaper (this is the subsystem that was a no-op)
+# ============================================================================
+
+
+class TestMonitorEntryPoint:
+    async def test_pj_monitor_reclaims_a_dead_workers_job(
+        self, db_pool, unique_queue, dsn
+    ):
+        """A stale-heartbeat worker's in-flight job is requeued by the daemon."""
+        worker_id = await db_pool.fetchval(
+            """INSERT INTO jorb_worker (host, pid, queue, last_seen)
+               VALUES ('gone-host', 999999, $1, $2) RETURNING id""",
+            unique_queue,
+            datetime.now(UTC) - timedelta(minutes=10),
+        )
+        job_id = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, queue, state, claimed_by, worker_host)
+               VALUES ('tests.dxe_jobs.OkJob', $1, 'running', $2, 'gone-host')
+               RETURNING id""",
+            unique_queue,
+            worker_id,
+        )
+
+        async with daemon(
+            "pj-monitor",
+            "--dsn",
+            dsn,
+            "--check-interval",
+            "1",
+            "--liveness-grace",
+            "5",
+        ):
+            await wait_until(
+                lambda: db_pool.fetchval(
+                    "SELECT state = 'queued' FROM jorb WHERE id = $1", job_id
+                ),
+                what="monitor requeued the dead worker's job",
+            )
+            # and retired the worker so it stops being rescanned
+            await wait_until(
+                lambda: db_pool.fetchval(
+                    "SELECT shutdown_at IS NOT NULL FROM jorb_worker WHERE id = $1",
+                    worker_id,
+                ),
+                what="monitor retired the stale worker",
+            )
+
+    async def test_pj_monitor_enforces_timeouts(self, db_pool, unique_queue, dsn):
+        """A running job past its deadline is retried by the daemon."""
+        job_id = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, queue, state, admin_data, timeout_at)
+               VALUES ('tests.dxe_jobs.SlowJob', $1, 'running', $2, $3)
+               RETURNING id""",
+            unique_queue,
+            {"timeout_seconds": 1, "on_timeout": "retry", "max_retries": 5},
+            datetime.now(UTC) - timedelta(seconds=30),
+        )
+
+        async with daemon("pj-monitor", "--dsn", dsn, "--check-interval", "1"):
+            row = await wait_until(
+                lambda: db_pool.fetchrow(
+                    """SELECT state, error_count, error_message FROM jorb
+                       WHERE id = $1 AND state = 'queued'""",
+                    job_id,
+                ),
+                what="monitor requeued the timed-out job",
+            )
+        assert row["error_count"] == 1
+        assert "Timeout" in row["error_message"]
+
+
+# ============================================================================
+# pj-web — admin UI + Prometheus metrics
+# ============================================================================
+
+
+class TestWebEntryPoint:
+    async def test_pj_web_serves_pages_and_metrics(
+        self, db_pool, unique_queue, dsn, tmp_path
+    ):
+        port = await free_port()
+        await db_pool.execute(
+            "INSERT INTO jorb (job_class, queue) VALUES ('tests.dxe_jobs.OkJob', $1)",
+            unique_queue,
+        )
+
+        async with daemon(
+            "pj-web",
+            str(write_config(tmp_path, dsn)),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ):
+            await wait_until(
+                lambda: port_is_open("127.0.0.1", port), what="pj-web listening"
+            )
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"http://127.0.0.1:{port}/") as resp:
+                    assert resp.status == 200
+                    assert "Pyjobby" in await resp.text()
+
+                async with session.get(f"http://127.0.0.1:{port}/metrics") as resp:
+                    assert resp.status == 200
+                    assert resp.headers["Content-Type"].startswith("text/plain")
+                    body = await resp.text()
+
+        # metrics reflect the real database, not a stub
+        assert "pyjobby_jobs_by_state" in body
+        assert unique_queue in body
+
+    async def test_pj_web_api_returns_live_data(
+        self, db_pool, unique_queue, dsn, tmp_path
+    ):
+        port = await free_port()
+        job_id = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, queue) VALUES ('tests.dxe_jobs.OkJob', $1)
+               RETURNING id""",
+            unique_queue,
+        )
+
+        async with daemon(
+            "pj-web",
+            str(write_config(tmp_path, dsn)),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ):
+            await wait_until(
+                lambda: port_is_open("127.0.0.1", port), what="pj-web listening"
+            )
+            async with aiohttp.ClientSession() as session:
+                url = f"http://127.0.0.1:{port}/api/jobs/{job_id}/history"
+                async with session.get(url) as resp:
+                    assert resp.status == 200
+                    history = json.loads(await resp.text())
+
+        assert [h["event"] for h in history] == ["enqueued"]
+
+
+# ============================================================================
+# pj-ws — realtime websocket dashboard
+# ============================================================================
+
+
+class TestWebsocketEntryPoint:
+    async def test_pj_ws_delivers_a_live_job_event(
+        self, db_pool, unique_queue, dsn, tmp_path
+    ):
+        """A state change in the database reaches a subscribed websocket."""
+        port = await free_port()
+
+        async with daemon(
+            "pj-ws",
+            str(write_config(tmp_path, dsn)),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ):
+            await wait_until(
+                lambda: port_is_open("127.0.0.1", port), what="pj-ws listening"
+            )
+
+            async with (
+                aiohttp.ClientSession() as session,
+                session.ws_connect(f"http://127.0.0.1:{port}/ws") as ws,
+            ):
+                welcome = await ws.receive_json(timeout=5)
+                assert welcome["event"] == "connected"
+
+                await ws.send_json({"action": "subscribe", "channels": ["jobs"]})
+                ack = await ws.receive_json(timeout=5)
+                assert ack["event"] == "subscribed"
+
+                # cause a real state transition; the NOTIFY must arrive
+                job_id = await db_pool.fetchval(
+                    """INSERT INTO jorb (job_class, queue)
+                           VALUES ('tests.dxe_jobs.OkJob', $1) RETURNING id""",
+                    unique_queue,
+                )
+                await db_pool.execute(
+                    "UPDATE jorb SET state = 'finished' WHERE id = $1", job_id
+                )
+
+                for _ in range(10):
+                    msg = await ws.receive_json(timeout=5)
+                    if msg.get("event") == "job_state_change":
+                        assert msg["data"]["id"] == job_id
+                        assert msg["data"]["new_state"] == "finished"
+                        break
+                else:
+                    pytest.fail("no job_state_change event delivered")
+
+    async def test_pj_ws_health_endpoint(self, dsn, tmp_path):
+        port = await free_port()
+        async with daemon(
+            "pj-ws",
+            str(write_config(tmp_path, dsn)),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ):
+            await wait_until(
+                lambda: port_is_open("127.0.0.1", port), what="pj-ws listening"
+            )
+            async with (
+                aiohttp.ClientSession() as session,
+                session.get(f"http://127.0.0.1:{port}/health") as resp,
+            ):
+                assert resp.status == 200
+                health = await resp.json()
+        assert health["status"] == "healthy"
+
+
+# ============================================================================
+# pj-admin db migrate — a fresh database becomes usable
+# ============================================================================
+
+
+class TestMigrateEntryPoint:
+    async def test_migrate_makes_a_fresh_database_usable(self, db_params):
+        """Install into a brand-new database and enqueue against it."""
+        import asyncpg
+
+        admin_dsn = (
+            f"postgresql://{db_params['user']}:{db_params['password']}"
+            f"@{db_params['host']}:{db_params['port']}/{db_params['database']}"
+        )
+        fresh_db = f"pyjobby_fresh_{datetime.now(UTC).strftime('%H%M%S%f')}"
+
+        # create the database from the current one (no superuser needed:
+        # the test role owns its own databases)
+        admin = await asyncpg.connect(admin_dsn)
+        try:
+            await admin.execute(f'CREATE DATABASE "{fresh_db}"')
+        finally:
+            await admin.close()
+
+        fresh_dsn = admin_dsn.rsplit("/", 1)[0] + f"/{fresh_db}"
+        try:
+            proc = await run_to_completion(
+                "pj-admin", "--dsn", fresh_dsn, "db", "migrate"
+            )
+            assert proc.returncode == 0, proc.stderr
+
+            conn = await asyncpg.connect(fresh_dsn)
+            try:
+                # the schema is complete enough to run the platform
+                job_id = await conn.fetchval(
+                    """INSERT INTO jorb (job_class, queue)
+                       VALUES ('tests.dxe_jobs.OkJob', 'default') RETURNING id"""
+                )
+                assert job_id is not None
+                # and the history trigger is installed
+                events = await conn.fetch(
+                    "SELECT event FROM jorb_history WHERE job_id = $1", job_id
+                )
+                assert [e["event"] for e in events] == ["enqueued"]
+
+                status = await run_to_completion(
+                    "pj-admin", "--dsn", fresh_dsn, "db", "status"
+                )
+                assert "Base schema installed: yes" in status.stdout
+            finally:
+                await conn.close()
+        finally:
+            admin = await asyncpg.connect(admin_dsn)
+            try:
+                await admin.execute(
+                    f'DROP DATABASE IF EXISTS "{fresh_db}" WITH (FORCE)'
+                )
+            finally:
+                await admin.close()
+
+
+# ============================================================================
+# helpers
+# ============================================================================
+
+
+def write_config(tmp_path, dsn: str) -> object:
+    """Write a pyjobby.conf.py pointing at `dsn` and return its path."""
+    from urllib.parse import unquote, urlparse
+
+    p = urlparse(dsn)
+    config = tmp_path / "pyjobby.conf.py"
+    config.write_text(
+        "db_params = {\n"
+        f"    'host': {p.hostname!r},\n"
+        f"    'port': {p.port or 5432!r},\n"
+        f"    'user': {unquote(p.username or '')!r},\n"
+        f"    'password': {unquote(p.password or '')!r},\n"
+        f"    'database': {(p.path or '').lstrip('/')!r},\n"
+        "}\n"
+        "web_listen = None\n"
+    )
+    return config
+
+
+async def run_to_completion(*args: str, timeout: float = 30):
+    """Run a console script to completion and return the finished process."""
+    import asyncio
+    import os
+    import subprocess
+    import sys
+
+    from .utils.processes import REPO_ROOT
+
+    bin_dir = os.path.join(REPO_ROOT, ".venv", "bin")
+    executable = os.path.join(bin_dir, args[0])
+    if not os.path.exists(executable):
+        executable = os.path.join(os.path.dirname(sys.executable), args[0])
+
+    def _run():
+        return subprocess.run(
+            [executable, *args[1:]],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+            timeout=timeout,
+        )
+
+    return await asyncio.to_thread(_run)
