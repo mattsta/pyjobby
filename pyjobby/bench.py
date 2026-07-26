@@ -1001,7 +1001,7 @@ async def run_claim(
     try:
         guard = await guard_busy_database(conn, limit=max_existing_jobs, force=force)
 
-        for mode in ("uncapped", "capped"):
+        async def arm(mode: str) -> None:
             await conn.execute("DELETE FROM jorb_queue WHERE name = $1", queue)
             if mode == "capped":
                 await conn.execute(
@@ -1009,12 +1009,29 @@ async def run_claim(
                     queue,
                     jobs + 1000,
                 )
-            rounds: list[dict[str, Any]] = []
-            if warmup:
-                await _claim_round(pool, conn, queue, min(jobs, 100), workers)
-            for _ in range(repeat):
-                rounds.append(await _claim_round(pool, conn, queue, jobs, workers))
 
+        # INTERLEAVED, not one mode then the other. Running every uncapped
+        # repeat before every capped one lands all of the machine's drift on
+        # whichever mode went last -- and the reported number is their RATIO,
+        # so the drift is indistinguishable from the effect being measured.
+        # This is not hypothetical: a run of this benchmark once moved the
+        # uncapped rate 15x on an unchanged schema, purely because the box
+        # picked up load between the two halves. Alternating rounds makes
+        # drift show up as spread in both modes instead of as a result in one.
+        by_mode: dict[str, list[dict[str, Any]]] = {"uncapped": [], "capped": []}
+        if warmup:
+            for mode in ("uncapped", "capped"):
+                await arm(mode)
+                await _claim_round(pool, conn, queue, min(jobs, 100), workers)
+        for _ in range(repeat):
+            for mode in ("uncapped", "capped"):
+                await arm(mode)
+                by_mode[mode].append(
+                    await _claim_round(pool, conn, queue, jobs, workers)
+                )
+
+        for mode in ("uncapped", "capped"):
+            rounds = by_mode[mode]
             rates = [r["claims_per_second"] for r in rounds]
             summary = summarize(rates)
             modes[mode] = {
@@ -2241,6 +2258,24 @@ def claim_cmd(
                 "capped advisory-lock misses",
                 f"{capped['empty_claims_with_work_available']:,} "
                 f"({capped['lock_miss_rate'] * 100:.1f}% of attempts)",
+            ],
+            [
+                "what the ratio is NOT",
+                "lock contention. A claimer that loses the lock holds nothing, "
+                "so its retries are wasted BESIDE the critical section; capped "
+                "throughput is 1/(critical section) under any lock strategy",
+            ],
+            [
+                "what a miss really costs",
+                "more than the round trip counted here: a real worker reads an "
+                "empty claim as 'queue empty', re-arms this queue's enqueue "
+                "notifications and parks for checkInterval (5s default). "
+                "See tests/test_claim_contention.py",
+            ],
+            [
+                "modes are interleaved",
+                "alternating rounds, so machine drift shows up as spread in "
+                "both rather than as a ratio",
             ],
         ],
     )
