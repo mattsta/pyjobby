@@ -15,6 +15,7 @@ says so in a comment, so the behavior cannot change silently.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from datetime import timedelta
 
@@ -100,10 +101,9 @@ async def scratch_db(db_params: dict):
         yield _make
     finally:
         for name in created:
-            try:
+            # best effort: a leaked scratch database must not fail the test
+            with contextlib.suppress(asyncpg.PostgresError):
                 await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-            except asyncpg.PostgresError:  # pragma: no cover - best effort cleanup
-                pass
         await admin.close()
 
 
@@ -134,7 +134,7 @@ class TestConfigFile:
         # FileNotFoundError, so the CLI's friendlier "Config file not found /
         # Use --config to specify config file path" branch is unreachable and
         # a missing config is reported as a *database* failure instead.
-        assert result.stderr.startswith("Error: Config file not found")
+        assert result.stderr.startswith("Error: Failed to connect to database:")
         assert f"'{missing}' doesn't exist" in result.stderr
         assert "Config file not found" not in result.stderr
 
@@ -384,9 +384,10 @@ class TestJobsWrongState:
             f"Error: Job {job_id} is in state '{state}' and cannot be cancelled"
             in result.stderr
         )
-        assert await db_pool.fetchval(
-            "SELECT state::text FROM jorb WHERE id = $1", job_id
-        ) == state
+        assert (
+            await db_pool.fetchval("SELECT state::text FROM jorb WHERE id = $1", job_id)
+            == state
+        )
 
     @pytest.mark.parametrize("state", ["queued", "running", "finished"])
     async def test_retry_non_retriable_state_exits_one(
@@ -476,7 +477,9 @@ class TestJobsInvalidFilters:
         # instead of "unknown state: bogus".
         assert result.exit_code == 1
         assert isinstance(result.exception, asyncpg.InvalidTextRepresentationError)
-        assert 'invalid input value for enum jorbstate: "bogus"' in str(result.exception)
+        assert 'invalid input value for enum jorbstate: "bogus"' in str(
+            result.exception
+        )
 
     async def test_unknown_state_in_queues_clear_raises_too(self, dsn, unique_queue):
         result = await run_cli(
@@ -514,9 +517,7 @@ class TestDlq:
         result = await run_cli("--dsn", dsn, "dlq", "retry", str(job_id))
 
         assert result.exit_code == 1
-        assert (
-            f"Error: Job {job_id} is not in DLQ (state: {state})" in result.stderr
-        )
+        assert f"Error: Job {job_id} is not in DLQ (state: {state})" in result.stderr
         assert (
             await db_pool.fetchval("SELECT state::text FROM jorb WHERE id = $1", job_id)
             == state
@@ -565,21 +566,19 @@ class TestQueues:
         result = await run_cli("--dsn", dsn, "queues", "show", unique_queue)
 
         assert result.exit_code == 0, result.output
-        assert (
-            f"Queue '{unique_queue}' has no jobs and no control row" in result.output
-        )
+        assert f"Queue '{unique_queue}' has no jobs and no control row" in result.output
 
     async def test_show_json_for_unknown_queue_is_all_empty(self, dsn, unique_queue):
         import json
 
-        result = await run_cli(
-            "--dsn", dsn, "queues", "show", unique_queue, "--json"
-        )
+        result = await run_cli("--dsn", dsn, "queues", "show", unique_queue, "--json")
 
         assert result.exit_code == 0, result.output
         assert json.loads(result.stdout) == {"control": None, "stats": []}
 
-    async def test_limits_for_unknown_queue_says_no_control_row(self, dsn, unique_queue):
+    async def test_limits_for_unknown_queue_says_no_control_row(
+        self, dsn, unique_queue
+    ):
         result = await run_cli("--dsn", dsn, "queues", "limits", unique_queue)
 
         assert result.exit_code == 0, result.output
@@ -599,7 +598,9 @@ class TestQueues:
             in result.stderr
         )
 
-    async def test_limits_rejects_non_integer_rate_limit(self, dsn, unique_queue, db_pool):
+    async def test_limits_rejects_non_integer_rate_limit(
+        self, dsn, unique_queue, db_pool
+    ):
         result = await run_cli(
             "--dsn", dsn, "queues", "limits", unique_queue, "--rate-limit", "5x"
         )
@@ -621,7 +622,7 @@ class TestQueues:
 
         assert result.exit_code == 2
         assert (
-            "Error: Invalid value for '--rate-period': 'abc' is not a valid FLOAT."
+            "Error: Invalid value for '--rate-period': 'abc' is not a valid float."
             in result.stderr
         )
 
@@ -750,7 +751,7 @@ class TestScheduleUnknownName:
         )
 
         assert result.exit_code == 1
-        assert "Aborted!!!" in result.output
+        assert "Aborted!" in result.output
 
 
 class TestScheduleAddValidation:
@@ -772,7 +773,13 @@ class TestScheduleAddValidation:
 
     async def test_cron_with_out_of_range_field(self, dsn, db_pool, test_id):
         result = await run_cli(
-            "--dsn", dsn, "schedule", "add", test_id, "tests.dxe_jobs.OkJob", "0 99 * * *"
+            "--dsn",
+            dsn,
+            "schedule",
+            "add",
+            test_id,
+            "tests.dxe_jobs.OkJob",
+            "0 99 * * *",
         )
 
         assert result.exit_code == 0, result.output
@@ -794,8 +801,7 @@ class TestScheduleAddValidation:
 
         assert result.exit_code == 0, result.output
         assert (
-            "Error: Invalid cron expression or timezone: 'Mars/Phobos'"
-            in result.stderr
+            "Error: Invalid cron expression or timezone: 'Mars/Phobos'" in result.stderr
         )
         assert await self._count(db_pool, test_id) == 0
 
@@ -841,7 +847,7 @@ class TestScheduleAddValidation:
 
         assert second.exit_code == 0, second.output
         assert "Error: Failed to create schedule:" in second.stderr
-        assert 'duplicate key value violates unique constraint' in second.stderr
+        assert "duplicate key value violates unique constraint" in second.stderr
         assert await self._count(db_pool, test_id) == 1
 
     async def test_non_integer_priority_is_a_click_error(self, dsn, test_id):
@@ -867,8 +873,9 @@ class TestScheduleAddValidation:
         result = await run_cli("--dsn", dsn, "schedule", "list", "--enabled", "maybe")
 
         assert result.exit_code == 2
-        assert "Error: Invalid value for '--enabled': 'maybe' is not a valid boolean." in (
-            result.stderr
+        assert (
+            "Error: Invalid value for '--enabled': 'maybe' is not a valid boolean."
+            in (result.stderr)
         )
 
 
@@ -934,7 +941,7 @@ class TestDbCommands:
 
         # NOTE: no operator-friendly message -- the asyncpg error escapes
         # asyncio.run() as a traceback (exit 1).
-        assert result.exit_code == 3
+        assert result.exit_code == 1
         assert isinstance(result.exception, asyncpg.InsufficientPrivilegeError)
         assert "permission denied for schema public" in str(result.exception)
 
@@ -1119,6 +1126,9 @@ class TestStaleRegistryRows:
         result = await run_cli("--dsn", dsn, "jobs", "cancel", str(job_id))
 
         assert result.exit_code == 0, result.output
+        # NOTE: the API returns status 'cancel_requested' here, but the CLI
+        # hardcodes "cancelled" -- the operator is told the job stopped when
+        # only a request was recorded.
         assert f"Job {job_id} cancelled" in result.output
         row = await db_pool.fetchrow(
             "SELECT state::text AS state, cancel_requested FROM jorb WHERE id = $1",
@@ -1126,4 +1136,4 @@ class TestStaleRegistryRows:
         )
         # still running, only flagged: the dead worker will never act on it
         assert row["state"] == "running"
-        assert row["cancel_requested"] is False
+        assert row["cancel_requested"] is True

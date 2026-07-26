@@ -276,6 +276,9 @@ class JobSystem:
     max_retries: int = 10  # Maximum attempts before terminal 'crashed'
     default_timeout: int = 3600  # Default job timeout in seconds (1 hour)
     heartbeat_interval: float = 10.0  # seconds between registry heartbeats
+    # re-import a job's module when its source changes (development loop);
+    # off by default so production never re-executes module code per job
+    reload_jobs: bool = False
     # pid of the launcher process that forked us; when set, the worker stops
     # if that process dies (prevents orphaned workers polling forever after
     # their launcher is killed). 0 disables the check (direct/embedded use).
@@ -299,6 +302,10 @@ class JobSystem:
     _hb_task: asyncio.Task[None] | None = None
     # optional per-worker HTTP listener
     _web_runner: web.ServerRunner | None = None
+    # resolved job classes (importing per job is a real cost; see
+    # resolve_job_class) and the source mtimes --reload watches
+    _class_cache: dict[str, type[Job]] = field(default_factory=dict)
+    _class_mtimes: dict[str, float] = field(default_factory=dict)
 
     async def ex(self, op: str, *args: Any) -> list[asyncpg.Record]:
         """Execute prepared statement ``op`` with *args, reconnecting (and
@@ -426,19 +433,18 @@ class JobSystem:
     # ------------------------------------------------------------------
 
     async def webHandler(self, request: web.Request) -> web.Response:
+        """Dispatch ``/<dotted.class.Name>`` to that job class's web().
+
+        Only classes explicitly listed in ``web_listen["paths"]`` are
+        reachable — the dotted name comes from the URL, so an unrestricted
+        lookup would let a caller import and invoke arbitrary code.
+        """
         assert self.webPort
-        launcher = request.path.split("/")[1]
-        result: web.Response
-        if launcher in self.webPort["paths"]:
-            ran = self.classForKlassFromName(launcher).web(request)
-            if asyncio.iscoroutine(ran):
-                result = await ran
-            else:
-                result = ran
+        requested = request.path.lstrip("/")
+        if requested not in self.webPort["paths"]:
+            return web.Response(status=404, text="not so fast!")
 
-            return result
-
-        return web.Response(text="not so fast!")
+        return await self.resolve_job_class(requested).web(request)
 
     async def _start_web_listener(self) -> None:
         if not (self.webPort and "sites" in self.webPort):
@@ -466,22 +472,62 @@ class JobSystem:
                 ),
             )
 
+    def resolve_job_class(self, klassName: str) -> type[Job]:
+        """Resolve a dotted job-class path to a class object.
+
+        Classes are resolved once and cached: importing is a filesystem
+        stat + compile + module execution, and doing that per job costs
+        throughput and re-runs arbitrary module-level code every time.
+
+        With ``reload_jobs`` (the ``--reload`` dev flag) the module is
+        re-imported only when its source file changes on disk, so an edit
+        takes effect on the next job without paying import cost — or
+        re-executing module side effects — on every job.
+        """
+        cached = self._class_cache.get(klassName)
+        module_name = ".".join(klassName.split(".")[:-1])
+
+        def source_mtime() -> float:
+            module = sys.modules.get(module_name)
+            source = getattr(module, "__file__", None) if module else None
+            if source and os.path.exists(source):
+                return os.path.getmtime(source)
+            return 0.0
+
+        if (
+            self.reload_jobs
+            and cached is not None
+            and source_mtime() > self._class_mtimes.get(klassName, 0.0)
+        ):
+            logger.info(f"Reloading changed job module {module_name}")
+            importlib.reload(sys.modules[module_name])
+            cached = None
+
+        if cached is None:
+            located = pydoc.locate(klassName)
+            if not located:
+                raise FileNotFoundError(
+                    f"Job class not found: {klassName}; search path: {sys.path}"
+                )
+            if not (isinstance(located, type) and issubclass(located, Job)):
+                raise TypeError(
+                    f"{klassName} is not a pyjobby Job subclass (got {located!r})"
+                )
+            cached = located
+            self._class_cache[klassName] = cached
+            # baseline AFTER importing: before the import the module is not
+            # in sys.modules, so its mtime would read as 0 and the very next
+            # lookup would look "changed"
+            if self.reload_jobs:
+                self._class_mtimes[klassName] = source_mtime()
+
+        return cached
+
     def classForKlassFromName(
         self, klassName: str, job: dict[str, Any] | None = None
-    ) -> Any:
-        # reload worker module on each run to catch any worker code changes
-        klass_mod = pydoc.locate(".".join(klassName.split(".")[:-1]))
-        importlib.reload(klass_mod)  # type: ignore
-
-        klassi = pydoc.locate(klassName)
-
-        if not klassi:
-            raise FileNotFoundError(
-                f"Job class not found: {klassName}; search path: {sys.path}"
-            )
-
-        klass = klassi(s=self, job=job)  # type: ignore
-        return klass
+    ) -> Job:
+        """Instantiate the job class named by a dotted path."""
+        return self.resolve_job_class(klassName)(s=self, job=job or {})
 
     # ------------------------------------------------------------------
     # the main loop
@@ -847,6 +893,22 @@ class Job:
         Subclasses can override 'run' if it needs to be async."""
         return self.task(**self.job["kwargs"])
 
+    @classmethod
+    async def web(cls, request: web.Request) -> web.Response:
+        """Handle a direct HTTP invocation of this job class.
+
+        Opt-in extension point for the per-worker HTTP listener
+        (``web_listen`` in the config): a job class listed under
+        ``web_listen["paths"]`` is reachable at ``/<dotted.class.Name>`` and
+        must override this to serve the request. Jobs that do not override
+        it return 501, which is why this is a real method rather than an
+        assumption the handler makes about arbitrary classes.
+        """
+        return web.Response(
+            status=501,
+            text=f"{cls.__module__}.{cls.__qualname__} does not implement web()",
+        )
+
     # ------------------------------------------------------------------
     # DXE: durable execution primitives
     # ------------------------------------------------------------------
@@ -1104,6 +1166,7 @@ def runAndDone(
     max_retries: int = 10,
     default_timeout: int = 3600,
     check_interval: float = 5,
+    reload_jobs: bool = False,
 ) -> None:
     """Run the JobSystem for this worker process"""
     configure_worker_logging()
@@ -1118,6 +1181,7 @@ def runAndDone(
         webPort=web_listen,
         max_retries=max_retries,
         default_timeout=default_timeout,
+        reload_jobs=reload_jobs,
         _launcher_pid=launcher_pid,
     )
 
@@ -1177,6 +1241,14 @@ def runAndDone(
     show_default=True,
 )
 @click.option(
+    "--reload",
+    "reload_jobs",
+    is_flag=True,
+    help="re-import a job's module when its source changes (development "
+    "loop; off by default so production never re-executes module code "
+    "on every job)",
+)
+@click.option(
     "-v",
     is_flag=True,
     help="show version then exit",
@@ -1196,6 +1268,7 @@ def workit(
     max_retries: int,
     default_timeout: int,
     check_interval: float,
+    reload_jobs: bool,
     v: bool,
     config: str,
 ) -> None:
@@ -1245,6 +1318,7 @@ def workit(
                 max_retries,
                 default_timeout,
                 check_interval,
+                reload_jobs,
             ),
         )
         p.start()

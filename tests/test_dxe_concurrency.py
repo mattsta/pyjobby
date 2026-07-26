@@ -520,7 +520,11 @@ async def test_cancel_during_durable_sleep_is_immediate_and_keeps_checkpoint(
     after = await db_pool.fetchrow(
         "SELECT state, run_count, run_epoch FROM jorb WHERE id = $1", job_id
     )
-    assert (after["state"], after["run_count"], after["run_epoch"]) == ("cancelled", 1, 1)
+    assert (after["state"], after["run_count"], after["run_epoch"]) == (
+        "cancelled",
+        1,
+        1,
+    )
     assert await history_events(db_pool, job_id) == [
         "enqueued",
         "claimed",
@@ -832,7 +836,8 @@ async def test_four_concurrent_timeout_sweeps_handle_a_job_exactly_once(
     assert claimed["id"] == job_id
     await db_pool.execute(STMTS["run"], job_id, claimed["run_epoch"])
     await db_pool.execute(
-        "UPDATE jorb SET timeout_at = now() - interval '5 seconds' WHERE id = $1", job_id
+        "UPDATE jorb SET timeout_at = now() - interval '5 seconds' WHERE id = $1",
+        job_id,
     )
 
     handled = await asyncio.gather(*[sweep_timed_out_jobs(db_pool) for _ in range(4)])

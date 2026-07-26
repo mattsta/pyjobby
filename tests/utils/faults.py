@@ -27,6 +27,8 @@ import contextlib
 import os
 import signal
 import subprocess
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -114,29 +116,39 @@ async def effect_counts_per_job(
 # ---------------------------------------------------------------------------
 
 
-async def backend_pids(pool: asyncpg.Pool, application_name: str) -> list[int]:
-    """Server-side pids of every backend opened under ``application_name``.
-
-    Workers are given a unique application_name by the tests (through their
-    connection parameters), which is the only reliable way to pick a specific
-    worker's connections out of pg_stat_activity."""
+async def backend_pids(pool: asyncpg.Pool) -> set[int]:
+    """Server-side pids of every other backend on this test database."""
     rows = await pool.fetch(
         """SELECT pid FROM pg_stat_activity
-           WHERE application_name = $1 AND pid <> pg_backend_pid()
-           ORDER BY pid""",
-        application_name,
+           WHERE datname = current_database() AND pid <> pg_backend_pid()"""
     )
-    return [r["pid"] for r in rows]
+    return {r["pid"] for r in rows}
+
+
+@asynccontextmanager
+async def new_backends(pool: asyncpg.Pool) -> AsyncIterator[list[int]]:
+    """Collect the backends that appear while the block runs.
+
+    Diffing pg_stat_activity around a worker's startup identifies exactly
+    that worker's connections — no application_name plumbing required, and it
+    fails loudly (the caller asserts the count) if anything else connects at
+    the same time. The yielded list is filled in when the block exits.
+    """
+    before = await backend_pids(pool)
+    found: list[int] = []
+    try:
+        yield found
+    finally:
+        found.extend(sorted(await backend_pids(pool) - before))
 
 
 async def kill_backends(
-    pool: asyncpg.Pool, application_name: str, timeout: float = 10.0
+    pool: asyncpg.Pool, pids: list[int] | set[int], timeout: float = 10.0
 ) -> int:
-    """Terminate every backend of ``application_name``; returns how many died.
+    """Terminate the given backends; returns how many actually died.
 
-    Waits until the pids are gone from pg_stat_activity so the caller knows
-    the failure has actually landed."""
-    pids = await backend_pids(pool, application_name)
+    Waits until they are gone from pg_stat_activity, so when this returns the
+    failure has really landed on the victim process."""
     killed = 0
     for pid in pids:
         if await pool.fetchval("SELECT pg_terminate_backend($1)", pid):
@@ -144,16 +156,10 @@ async def kill_backends(
 
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        if not set(await backend_pids(pool, application_name)) & set(pids):
+        if not await backend_pids(pool) & set(pids):
             return killed
         await asyncio.sleep(0.05)
-    raise AssertionError(f"backends {pids} still present after {timeout}s")
-
-
-def unique_application_name(test_id: str) -> str:
-    """A pg application_name that identifies exactly one test's worker."""
-    # pg truncates application_name at NAMEDATALEN-1 (63) bytes
-    return f"pyjobby-fault-{test_id}"[:63]
+    raise AssertionError(f"backends {sorted(pids)} still present after {timeout}s")
 
 
 # ---------------------------------------------------------------------------

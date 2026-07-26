@@ -20,6 +20,7 @@ There is no --json mode on doctor, so assertions are made on the parsed
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
@@ -105,10 +106,9 @@ async def scratch_db(db_params: dict):
         yield _make
     finally:
         for name in created:
-            try:
+            # best effort: a leaked scratch database must not fail the test
+            with contextlib.suppress(asyncpg.PostgresError):
                 await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-            except asyncpg.PostgresError:  # pragma: no cover - best effort cleanup
-                pass
         await admin.close()
 
 
@@ -431,9 +431,7 @@ class TestDoctorQueueBacklog:
     async def test_age_threshold_is_respected_on_both_sides(
         self, dsn, db_pool, unique_queue
     ):
-        await insert_queued(
-            db_pool, unique_queue, run_after_age=timedelta(minutes=90)
-        )
+        await insert_queued(db_pool, unique_queue, run_after_age=timedelta(minutes=90))
         key = f"queue {unique_queue}"
 
         under = await run_doctor(dsn, "--max-age-minutes", "91")
@@ -454,9 +452,7 @@ class TestDoctorQueueBacklog:
         self, dsn, db_pool, unique_queue
     ):
         """A delayed/retry-waiting job must not report a negative age."""
-        await insert_queued(
-            db_pool, unique_queue, run_after_age=timedelta(minutes=-10)
-        )
+        await insert_queued(db_pool, unique_queue, run_after_age=timedelta(minutes=-10))
 
         result = await run_doctor(dsn, "--max-age-minutes", "1")
 

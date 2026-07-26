@@ -9,6 +9,8 @@ backoff, job class loading, and connection-loss recovery.
 
 import asyncio
 import contextlib
+import os
+import time
 from datetime import UTC, datetime, timedelta
 
 import asyncpg
@@ -655,3 +657,115 @@ class TestJobSystemErrorHandling:
             assert not isinstance(system.stmts["get"], MockPreparedStatement)
         finally:
             await system.cxn.close()
+
+
+class TestJobClassResolution:
+    """Job classes are resolved once and cached; reload is opt-in.
+
+    Importing is a filesystem stat + compile + module execution. Doing that
+    per job costs throughput and re-runs arbitrary module-level code every
+    time (which is how a module containing test decorators could break a
+    test run mid-flight)."""
+
+    async def test_class_is_cached_between_lookups(self, db_params, worker_params):
+        async with prepared_system(db_params, worker_params) as system:
+            first = system.resolve_job_class("tests.dxe_jobs.OkJob")
+            second = system.resolve_job_class("tests.dxe_jobs.OkJob")
+
+            # same object: the module was not re-imported
+            assert first is second
+            assert system._class_cache["tests.dxe_jobs.OkJob"] is first
+
+    async def test_default_worker_does_not_reload_modules(
+        self, db_params, worker_params
+    ):
+        async with prepared_system(db_params, worker_params) as system:
+            assert system.reload_jobs is False
+            before = system.resolve_job_class("tests.dxe_jobs.OkJob")
+            # a second resolution must not produce a NEW class object, which
+            # is what importlib.reload() would do
+            assert system.resolve_job_class("tests.dxe_jobs.OkJob") is before
+
+    async def test_unknown_class_raises_file_not_found(self, db_params, worker_params):
+        async with prepared_system(db_params, worker_params) as system:
+            with pytest.raises(FileNotFoundError, match="nope.NotAJob"):
+                system.resolve_job_class("nope.NotAJob")
+
+    async def test_non_job_class_is_rejected(self, db_params, worker_params):
+        """A dotted path that resolves to something other than a Job is a
+        configuration error, not something to instantiate blindly."""
+        async with prepared_system(db_params, worker_params) as system:
+            with pytest.raises(TypeError, match="not a pyjobby Job subclass"):
+                system.resolve_job_class("json.JSONDecoder")
+
+    async def test_reload_flag_reimports_only_on_source_change(
+        self, db_params, worker_params, tmp_path, monkeypatch
+    ):
+        """With --reload, an edited module is re-imported on next lookup."""
+        import sys as _sys
+
+        module_dir = tmp_path
+        module_file = module_dir / "reloadable_jobs.py"
+        module_file.write_text(
+            "from pyjobby.pj import Job\n\n\n"
+            "class Reloadable(Job):\n"
+            "    marker = 'first'\n\n"
+            "    def task(self):\n"
+            "        return self.marker\n"
+        )
+        monkeypatch.syspath_prepend(str(module_dir))
+        _sys.modules.pop("reloadable_jobs", None)
+
+        async with prepared_system(
+            db_params, {**worker_params, "reload_jobs": True}
+        ) as system:
+            first = system.resolve_job_class("reloadable_jobs.Reloadable")
+            assert first.marker == "first"
+
+            # unchanged source: no re-import, same class object
+            assert system.resolve_job_class("reloadable_jobs.Reloadable") is first
+
+            # edit it (bump mtime explicitly; filesystem resolution varies)
+            module_file.write_text(
+                "from pyjobby.pj import Job\n\n\n"
+                "class Reloadable(Job):\n"
+                "    marker = 'second'\n\n"
+                "    def task(self):\n"
+                "        return self.marker\n"
+            )
+            os.utime(module_file, (time.time() + 10, time.time() + 10))
+
+            reloaded = system.resolve_job_class("reloadable_jobs.Reloadable")
+            assert reloaded.marker == "second"
+            assert reloaded is not first
+
+        _sys.modules.pop("reloadable_jobs", None)
+
+
+class TestJobWebExtensionPoint:
+    """The per-worker HTTP listener dispatches to Job.web()."""
+
+    async def test_job_without_web_returns_not_implemented(self, db_params):
+        from pyjobby.pj import Job
+
+        response = await Job.web(None)  # type: ignore[arg-type]
+        assert response.status == 501
+        assert "does not implement web()" in response.text
+
+    async def test_handler_rejects_classes_not_listed_in_config(
+        self, db_params, worker_params
+    ):
+        """Only classes in web_listen['paths'] are reachable: the dotted
+        name comes from the URL, so an open lookup would let a caller
+        import and invoke arbitrary code."""
+        from unittest.mock import Mock
+
+        system = JobSystem(
+            dsn=db_params,
+            **{**worker_params, "webPort": {"paths": {"tests.dxe_jobs.OkJob"}}},
+        )
+        request = Mock()
+        request.path = "/os.system"
+
+        response = await system.webHandler(request)
+        assert response.status == 404
