@@ -762,7 +762,6 @@ asyncio.run(monitor())
 - [CLIENT_LIBRARY.md](CLIENT_LIBRARY.md) - Python client for job submission
 - [ADMIN_TOOLS.md](ADMIN_TOOLS.md) - CLI and Admin API
 - [RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md) - Cron-based scheduling
-- [INTERACTIVE_DASHBOARD.md](INTERACTIVE_DASHBOARD.md) - Full architecture design
 
 ---
 
