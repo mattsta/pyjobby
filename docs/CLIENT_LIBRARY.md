@@ -147,6 +147,8 @@ Enqueue a single job.
 - `waitfor_group` (int): Wait for all jobs in this group (default: None)
 - `deadline_key` (str): Idempotency key to prevent duplicates (default: None)
 - `admin_data` (dict): Metadata for tracking (default: None)
+- `tags` (dict): Your own labels — customer, region, batch — that you can
+  filter jobs by later (default: None). See [Job Tags](#8-job-tags).
 - `**kwargs`: Job arguments passed to job class
 
 **Returns:** Job ID (int)
@@ -201,6 +203,13 @@ job_id = await client.enqueue(
         "user_agent": request.headers.get("User-Agent"),
         "ip_address": request.remote_addr,
     },
+    data_id=123,
+)
+
+# Job labelled for later filtering
+job_id = await client.enqueue(
+    "myapp.jobs.ProcessData",
+    tags={"customer": "acme", "region": "eu-west-1", "batch": 42},
     data_id=123,
 )
 ```
@@ -540,6 +549,59 @@ await client.enqueue(
 # Geolocation-specific
 await client.enqueue("myapp.jobs.SyncData", capability="us-west", region="us-west-1")
 ```
+
+### 8. Job Tags
+
+Find jobs by something *your application* means — which customer, which
+region, which nightly batch — rather than by queue and job class.
+
+```python
+job_id = await client.enqueue(
+    "myapp.jobs.GenerateReport",
+    tags={"customer": "acme", "region": "eu-west-1", "batch": 42},
+    report_type="monthly",
+)
+
+# Every job for one customer, whatever else it is tagged with
+jobs = await client.search_jobs(tags={"customer": "acme"})
+
+# Narrow it: several pairs mean AND
+jobs = await client.search_jobs(tags={"customer": "acme", "region": "eu-west-1"})
+```
+
+From the command line:
+
+```bash
+pj-admin jobs list --tag customer=acme
+pj-admin jobs list --tag customer=acme --tag region=eu-west-1
+pj-admin jobs list --tag batch=42          # matches the NUMBER 42
+pj-admin jobs list --tag 'batch="42"'      # matches the STRING "42"
+```
+
+**Tags are not `admin_data`.** `admin_data` is pyjobby's own execution
+config — retry strategy, timeout, schedule bookkeeping — and it is not
+indexed, because nobody filters on it and indexing it would tax every
+enqueue to make no query faster. `tags` is yours, and it *is* indexed.
+
+**Tags are not `uid`.** `uid` is a single BIGINT, so it answers "which
+tenant" and nothing else. Reach for it when integer tenancy is the whole
+question: it is narrower, cheaper, and already there. Reach for `tags` when
+you need more than one dimension, or a value that is not an integer.
+
+Rules, all enforced at enqueue time with a `ValueError`:
+
+- keys are non-empty strings;
+- values are strings, numbers, booleans or `None` — no nested objects or
+  arrays, because they cannot be expressed as `--tag key=value` and a tag
+  you cannot filter by is not a tag;
+- matching is **containment**: asking for `{"customer": "acme"}` finds a job
+  tagged with customer *and* region *and* batch. Extra tags never disqualify
+  a job.
+
+Tagging costs the write path nothing measurable — the index is partial
+(`WHERE tags <> '{}'`), so an untagged job never touches it, and a tagged
+enqueue measures within noise of an untagged one. `tests/test_job_tags.py`
+holds the measurement.
 
 ---
 

@@ -101,6 +101,7 @@ def mock_admin_api():
         "error_count": 0,
         "capability": None,
         "uid": None,
+        "tags": {},
         "run_group": None,
         "waitfor_job": None,
         "waitfor_group": None,

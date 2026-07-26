@@ -37,6 +37,7 @@ CREATE TABLE jorb (
     admin_data      JSONB       NOT NULL DEFAULT '{}',
     result          JSONB,
     uid             BIGINT,               -- multi-tenancy tag
+    tags            JSONB       NOT NULL DEFAULT '{}',  -- caller's own labels
 
     -- dependency edges
     run_group       BIGINT,
@@ -78,6 +79,7 @@ COMMENT ON COLUMN jorb.prio IS 'Lower numbers are more urgent; workers claim job
 COMMENT ON COLUMN jorb.claimed_at IS 'When this attempt was admitted by a worker. Rate limits count admissions, not execution starts: started is written after the claim commits, so counting it lets a claim miss the claim before it.';
 COMMENT ON COLUMN jorb.run_epoch IS 'Fencing token, NOT an attempt counter (that is run_count). Advances whenever the job enters an attempt (claim) or is abandoned by one (retry/requeue), so a superseded execution may not write results or checkpoints.';
 COMMENT ON COLUMN jorb.awaited IS 'Someone has waited on this job (wait_for_result/get_event). Set by the waiter BEFORE it looks at the state, and never cleared: it is the demand signal that switches the jorb_done and jorb_event notifications on for this job, and it costs one HOT update per job that is ever awaited.';
+COMMENT ON COLUMN jorb.tags IS 'The CALLER''s labels (customer, region, batch), flat key -> scalar, for filtering jobs by something the application means. Deliberately NOT admin_data: that column is the platform''s own execution config (max_retries, timeout_seconds, save_result, schedule metadata), which nobody filters on, so indexing it would tax every enqueue to make no query faster.';
 COMMENT ON COLUMN jorb.waitfor_group IS 'Becomes queued only when ALL jobs with run_group = this value are finished.';
 COMMENT ON COLUMN jorb.waitfor_job IS 'Becomes queued only when the job with this id is finished.';
 
@@ -120,6 +122,31 @@ CREATE INDEX jorb_waitfor_group_idx ON jorb (waitfor_group) WHERE state = 'waiti
 CREATE INDEX jorb_run_group_idx ON jorb (run_group) WHERE run_group IS NOT NULL;
 CREATE INDEX jorb_uid_idx       ON jorb (uid)       WHERE uid IS NOT NULL;
 CREATE INDEX jorb_dag_idx           ON jorb (dag_id) WHERE dag_id IS NOT NULL;
+-- Caller-supplied labels, and partial for exactly the reason the three above
+-- are: almost every job sets no tags at all, and a plain GIN index would
+-- still store an entry for each of them -- an object with no keys yields no
+-- keys to index, so GIN records it as an empty item purely so that a full
+-- index scan can find the row again. That is write amplification on the
+-- hottest table in the system in exchange for nothing.
+--
+-- The predicate keeps the untagged enqueue path -- the hot one -- out of the
+-- index entirely, and that is measured, not assumed. At 16 concurrent
+-- connections with one transaction per job, untagged enqueue is unchanged by
+-- this index existing (28.7k vs 28.9k jobs/s, medians of nine interleaved
+-- pj-bench pairs, which is noise on a shared box). Enqueue WITH tags
+-- populated measures 0.93-1.04x of untagged even when every job carries a
+-- DISTINCT tag value, GIN's pessimal case: fastupdate parks new entries in
+-- the pending list and the merge is autovacuum's problem, not the enqueuing
+-- transaction's. tests/test_job_tags.py holds both measurements, and asserts
+-- the index does not grow at all when 10,000 untagged jobs are inserted.
+--
+-- THE COST OF PARTIAL, which every caller has to pay attention to: a query
+-- may use a partial index only when its own clauses IMPLY the predicate, and
+-- PostgreSQL proves that syntactically. It cannot derive `tags <> '{}'` from
+-- `tags @> '{"customer":"acme"}'`, so a filter that omits the predicate is
+-- correct and sequentially scans the table. Every tag filter in this codebase
+-- is therefore built by client.tags_filter_sql, which emits both clauses.
+CREATE INDEX jorb_tags_idx ON jorb USING GIN (tags) WHERE tags <> '{}';
 -- idempotent enqueue
 CREATE UNIQUE INDEX jorb_deadline_idx ON jorb (deadline_key, queue)
     WHERE state = 'queued' AND deadline_key IS NOT NULL;

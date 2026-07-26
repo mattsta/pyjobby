@@ -127,6 +127,42 @@ def report_cancel(result: dict[str, Any]) -> None:
         print_success(f"Job {result['job_id']} cancelled")
 
 
+def parse_tags(pairs: tuple[str, ...]) -> dict[str, Any] | None:
+    """Turn repeated `--tag key=value` arguments into a tags filter.
+
+    Values go through JSON first so a tag stored as a number or a boolean is
+    reachable from a shell (`--tag batch=7` finds 7, not "7"), and anything
+    JSON does not recognise stays the plain string it looked like
+    (`--tag region=us-east-1`). A value that must be the *string* "7" is
+    written the way JSON writes it: `--tag 'batch="7"'`.
+
+    Every malformed form exits non-zero via fail(): a filter the operator
+    mistyped must not quietly widen to "all jobs" and report success.
+    """
+    if not pairs:
+        return None
+
+    tags: dict[str, Any] = {}
+    for pair in pairs:
+        key, sep, raw = pair.partition("=")
+        if not sep or not key:
+            fail(
+                f"Malformed --tag {pair!r}: expected key=value",
+                "Examples: --tag customer=acme --tag region=us-east-1 --tag batch=7",
+            )
+        try:
+            value: Any = json.loads(raw)
+        except ValueError:
+            value = raw  # a bare word, which is the common case
+        if isinstance(value, dict | list):
+            fail(
+                f"Malformed --tag {pair!r}: tag values must be a string, "
+                "number, boolean or null, not an object or an array",
+            )
+        tags[key] = value
+    return tags
+
+
 def validate_state(state: str | None) -> str | None:
     """Reject unknown job states before they reach the jorbstate enum."""
     if state is None:
@@ -213,6 +249,16 @@ def jobs() -> None:
 @click.option("--state", "-s", help="Filter by state (queued, running, etc.)")
 @click.option("--job-class", help="Filter by job class (supports patterns)")
 @click.option("--uid", type=int, help="Filter by user ID")
+@click.option(
+    "--tag",
+    "tag_pairs",
+    multiple=True,
+    metavar="KEY=VALUE",
+    help="Filter by a job tag; repeat for AND. Matches jobs CONTAINING the "
+    "pair, so extra tags on the job are fine. Values are read as JSON when "
+    "they look like it (batch=7 matches the number 7; write batch='\"7\"' "
+    "for the string).",
+)
 @click.option("--limit", "-l", default=50, help="Max results (default: 50)")
 @click.option("--offset", "-o", default=0, help="Offset for pagination")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
@@ -223,6 +269,7 @@ def jobs_list(
     state: str | None,
     job_class: str | None,
     uid: int | None,
+    tag_pairs: tuple[str, ...],
     limit: int,
     offset: int,
     output_json: bool,
@@ -231,6 +278,10 @@ def jobs_list(
 
     async def _list() -> None:
         validate_state(state)
+        # Parsed BEFORE connecting: a mistyped filter is the operator's
+        # problem, and reporting it should not depend on the database being
+        # reachable.
+        tags = parse_tags(tag_pairs)
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
@@ -239,6 +290,7 @@ def jobs_list(
                 state=state,
                 job_class=job_class,
                 uid=uid,
+                tags=tags,
                 limit=limit,
                 offset=offset,
             )
@@ -311,6 +363,8 @@ def jobs_inspect(ctx: click.Context, job_id: int, output_json: bool) -> None:
                     click.echo(f"Capability:      {job['capability']}")
                 if job["uid"]:
                     click.echo(f"User ID:         {job['uid']}")
+                if job["tags"]:
+                    click.echo(f"Tags:            {json.dumps(job['tags'])}")
                 if job["worker_host"]:
                     click.echo(
                         f"Worker:          {job['worker_host']}:{job['worker_pid']}"

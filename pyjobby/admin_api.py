@@ -17,6 +17,7 @@ from typing import Any
 import asyncpg  # type: ignore[import-untyped]
 
 from . import db
+from .client import tags_filter_sql, validate_tags
 from .cron import next_cron_run
 
 
@@ -65,6 +66,8 @@ class JobInfo:
     error_count: int
     capability: str | None = None
     uid: int | None = None
+    # the caller's own labels (customer/tenant/region/batch); '{}' when unset
+    tags: dict | None = None
     run_group: int | None = None
     waitfor_job: int | None = None
     waitfor_group: int | None = None
@@ -179,6 +182,7 @@ class AdminAPI:
         state: str | None = None,
         job_class: str | None = None,
         uid: int | None = None,
+        tags: dict[str, Any] | None = None,
         limit: int = 50,
         offset: int = 0,
         order_by: str = "created",
@@ -192,6 +196,10 @@ class AdminAPI:
             state: Filter by job state (queued, claimed, running, etc.)
             job_class: Filter by job class name (supports LIKE patterns)
             uid: Filter by user ID
+            tags: Match jobs whose tags CONTAIN every pair given. Extra tags
+                on the job do not disqualify it, so `{'region': 'eu'}` finds
+                a job tagged region+customer+batch. Answered by the partial
+                GIN index on jorb.tags.
             limit: Maximum number of results (default: 50)
             offset: Offset for pagination (default: 0)
             order_by: Column to order by (default: created)
@@ -223,6 +231,14 @@ class AdminAPI:
         if uid is not None:
             where_clauses.append(f"uid = ${param_idx}")
             params.append(uid)
+            param_idx += 1
+
+        if tags:
+            # Shared with the client library so the two filters cannot drift
+            # into one being indexed and the other not; tags_filter_sql
+            # explains why it is two clauses and not one.
+            where_clauses.append(tags_filter_sql(param_idx))
+            params.append(validate_tags(tags))
             param_idx += 1
 
         where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""

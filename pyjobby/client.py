@@ -86,11 +86,64 @@ _ENQUEUE_SQL = """
         job_class, kwargs, queue, prio, run_after,
         capability, uid, run_group,
         waitfor_job, waitfor_group,
-        deadline_key, admin_data, state
+        deadline_key, admin_data, tags, state
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
     RETURNING id
 """
+
+# What a tag value may be. Tags exist to be FILTERED on, and filtering goes
+# through `tags @> '{"key": value}'` against a GIN index, so a value has to be
+# something a caller can write down in a query -- and, one layer out, in a
+# `pj-admin jobs list --tag key=value` argument. Containment against a nested
+# object or an array is a different question with different (surprising)
+# semantics, so those are refused at the door instead of being accepted and
+# then silently unfilterable.
+_TAG_VALUE_TYPES = (str, int, float, bool, type(None))
+
+
+def validate_tags(tags: dict[str, Any] | None) -> dict[str, Any]:
+    """Check caller-supplied tags and return a copy safe to store.
+
+    Copied rather than used in place for the same reason admin_data is: the
+    row we build must not be a live view of a dict the caller still holds.
+    """
+    if not tags:
+        return {}
+    if not isinstance(tags, dict):
+        raise ValueError(f"tags must be a dict, got {type(tags).__name__}")
+    for key, value in tags.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"tag keys must be non-empty strings, got {key!r}")
+        if not isinstance(value, _TAG_VALUE_TYPES):
+            raise ValueError(
+                f"tag {key!r} has value of type {type(value).__name__}; tag "
+                "values must be a string, number, boolean or None (nested "
+                "objects and arrays cannot be filtered with --tag key=value)"
+            )
+    return dict(tags)
+
+
+def tags_filter_sql(param: int) -> str:
+    """The WHERE fragment for "job carries these tags", built to be INDEXED.
+
+    Two clauses, and neither is optional:
+
+    * `tags @> $n` is containment, which is the operator the GIN index
+      supports. The obvious-looking `tags->>'k' = 'v'` is not indexable by
+      it and reads the whole table.
+    * `tags <> '{}'` looks redundant beside it and is not. `jorb_tags_idx`
+      is PARTIAL on that predicate, and PostgreSQL uses a partial index only
+      when the query's clauses IMPLY the predicate -- an implication it
+      proves syntactically. It cannot derive "these tags are not empty" from
+      "these tags contain customer=acme", so a query without this clause is
+      still correct and falls back to a sequential scan: measured at 20,000
+      rows as a Seq Scan discarding 19,980 of them.
+
+    Shared by JobClient.search_jobs and AdminAPI.list_jobs so the two cannot
+    drift into one being indexed and the other not.
+    """
+    return f"tags <> '{{}}' AND tags @> ${param}"
 
 
 @dataclass
@@ -317,6 +370,7 @@ class JobClient:
         waitfor_group: int | None = None,
         deadline_key: str | None = None,
         admin_data: dict[str, Any] | None = None,
+        tags: dict[str, Any] | None = None,
         # Phase 2: Result Storage & Passing
         save_result: bool = True,
         use_result_from: int | None = None,
@@ -346,6 +400,11 @@ class JobClient:
             waitfor_group: Wait for all jobs in this group (default: None)
             deadline_key: Idempotency key (default: None)
             admin_data: Metadata dict (default: None)
+            tags: The caller's OWN labels — customer, tenant, region, batch —
+                as a flat dict of string keys to scalar values, filterable
+                later via search_jobs(tags=...) / `pj-admin jobs list --tag`.
+                Distinct from admin_data, which is the platform's execution
+                config (retries, timeouts) and is not indexed (default: None)
             save_result: Store job result in database (default: True; pass
                 False to discard results of large/uninteresting jobs)
             use_result_from: Inject the (run-time) result of this job ID into
@@ -364,7 +423,8 @@ class JobClient:
 
         Raises:
             asyncpg.UniqueViolationError: If deadline_key already exists
-            ValueError: If both waitfor_job and waitfor_group specified
+            ValueError: If both waitfor_job and waitfor_group specified, or
+                if tags are not a flat dict of string keys to scalar values
 
         Examples:
             # Simple job
@@ -425,6 +485,7 @@ class JobClient:
                 waitfor_group=waitfor_group,
                 deadline_key=deadline_key,
                 admin_data=admin_data,
+                tags=tags,
                 save_result=save_result,
                 use_result_from=use_result_from,
                 retry_strategy=retry_strategy,
@@ -486,6 +547,7 @@ class JobClient:
         waitfor_group: int | None = None,
         deadline_key: str | None = None,
         admin_data: dict[str, Any] | None = None,
+        tags: dict[str, Any] | None = None,
         save_result: bool = True,
         use_result_from: int | None = None,
         retry_strategy: str = "exponential",
@@ -511,6 +573,11 @@ class JobClient:
 
         # Build admin_data (copy so we never mutate the caller's dict)
         admin_data = dict(admin_data) if admin_data else {}
+
+        # The caller's own labels stay in their own column: admin_data below
+        # is about to be filled with retry/timeout bookkeeping nobody filters
+        # on, and mixing the two is what makes the index unaffordable.
+        job_tags = validate_tags(tags)
 
         # Results are saved by default; record only an explicit opt-out
         if not save_result:
@@ -547,6 +614,7 @@ class JobClient:
             waitfor_group,
             deadline_key,
             admin_data,  # Dict - custom codec handles conversion
+            job_tags,  # Dict - custom codec handles conversion
             state,
         ]
 
@@ -1343,6 +1411,7 @@ class JobClient:
         uid: int | None = None,
         run_group: int | None = None,
         capability: str | None = None,
+        tags: dict[str, Any] | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         """
@@ -1357,6 +1426,9 @@ class JobClient:
             uid: Filter by user/tenant ID
             run_group: Filter by run group
             capability: Filter by required capability
+            tags: Match jobs whose tags CONTAIN all of these pairs; extra
+                tags on the job do not disqualify it. Answered by the
+                partial GIN index on jorb.tags.
             limit: Maximum number of results (default: 100)
 
         Returns:
@@ -1412,6 +1484,13 @@ class JobClient:
         if capability:
             where_clauses.append(f"capability = ${param_num}")
             params.append(capability)
+            param_num += 1
+
+        if tags:
+            # Containment, not equality, so a caller asking for one tag is
+            # not defeated by a job that carries three (see tags_filter_sql).
+            where_clauses.append(tags_filter_sql(param_num))
+            params.append(validate_tags(tags))
             param_num += 1
 
         where_sql = " AND ".join(where_clauses) if where_clauses else "TRUE"
