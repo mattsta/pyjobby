@@ -75,13 +75,12 @@ class RetryableAPICall(Job):
             # Simulate API call
             import aiohttp
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=25)
-                ) as response:
-                    response.raise_for_status()
-                    data = await response.json()
-                    return {"status": "success", "data": data}
+            async with aiohttp.ClientSession() as session, session.get(
+                url, timeout=aiohttp.ClientTimeout(total=25)
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
+                return {"status": "success", "data": data}
 
         except aiohttp.ClientResponseError as e:
             if e.status >= 500:
@@ -282,3 +281,75 @@ Features demonstrated:
 - DatabaseTransactionJob: Atomic database operations
 - CachedResourceJob: Worker-local resource caching
     """)
+
+
+# ============================================================================
+# DXE: Durable Execution Engine examples
+# ============================================================================
+
+
+class DurablePipelineJob(Job):
+    """A multi-step workflow with checkpointed steps.
+
+    If this job crashes at any point (worker death, host loss, exception),
+    the retry resumes from the failed step — completed steps return their
+    recorded outputs without re-executing. Step outputs must be
+    JSON-serializable and the step SEQUENCE must be deterministic (vary
+    behavior inside a step, not which steps run).
+    """
+
+    async def task(self, order_id: int):
+        order = await self.step("load-order", self._load_order, order_id)
+        charge = await self.step("charge-card", self._charge, order)
+        await self.step("send-receipt", self._send_receipt, order, charge)
+        return {"order": order_id, "charge_id": charge["id"]}
+
+    async def _load_order(self, order_id: int):
+        return {"id": order_id, "amount_cents": 4200}
+
+    async def _charge(self, order):
+        # this side effect happens EXACTLY once across all retries,
+        # because a completed step never re-executes
+        return {"id": f"ch_{order['id']}", "amount": order["amount_cents"]}
+
+    async def _send_receipt(self, order, charge):
+        print(f"receipt for order {order['id']}: charge {charge['id']}")
+        return True
+
+
+class DripCampaignJob(Job):
+    """Durable sleep: waits hold NO worker and survive restarts."""
+
+    async def task(self, user_id: int):
+        await self.step("send-welcome", lambda: f"welcome -> {user_id}")
+        await self.sleep(3 * 24 * 3600)  # three days, in the database
+        await self.step("send-tips", lambda: f"tips -> {user_id}")
+        await self.sleep(4 * 24 * 3600)
+        await self.step("send-follow-up", lambda: f"follow-up -> {user_id}")
+        return "campaign-complete"
+
+
+class ProgressReportingJob(Job):
+    """Publish progress events that clients can read/await:
+
+        value = await client.get_event(job_id, "progress")
+    """
+
+    async def task(self, items: int = 1000):
+        for done in range(0, items, 100):
+            if self.cancelled:  # cooperative cancellation check
+                return {"stopped_at": done}
+            await self.set_event("progress", {"done": done, "total": items})
+            await asyncio.sleep(0.01)  # ... real work here ...
+        await self.set_event("progress", {"done": items, "total": items})
+        return {"processed": items}
+
+
+class CoordinatorJob(Job):
+    """Durable messaging: coordinate with another running job."""
+
+    async def task(self, worker_job_id: int):
+        # exactly-once send (it is a checkpointed step under the hood)
+        await self.send(worker_job_id, {"cmd": "start-phase-2"}, topic="control")
+        reply = await self.recv(topic="control-replies", timeout=300)
+        return {"reply": reply}

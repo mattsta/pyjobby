@@ -24,19 +24,40 @@ try:
 except metadata.PackageNotFoundError:
     __version__ = "dev"
 
-from .client import JobClient, JobInfo
+from .client import (
+    JobCancelledError,
+    JobClient,
+    JobError,
+    JobFailedError,
+    JobHandle,
+    JobInfo,
+    SyncJobClient,
+)
 from .dag import DAGBuilder
 from .db import JobState
+from .dxe import DXEError, NondeterminismError, StaleExecutionError
 from .pj import Job, JobSystem
+from .registry import JobRegistry, job, registry
 from .retry_strategies import RetryStrategy
 
 __all__ = [
     "DAGBuilder",
+    "DXEError",
     "Job",
+    "JobCancelledError",
     "JobClient",
+    "JobError",
+    "JobFailedError",
+    "JobHandle",
     "JobInfo",
+    "JobRegistry",
     "JobState",
     "JobSystem",
+    "NondeterminismError",
     "RetryStrategy",
+    "StaleExecutionError",
+    "SyncJobClient",
     "__version__",
+    "job",
+    "registry",
 ]
