@@ -4,7 +4,7 @@ Using LIVE database operations with NO MOCKS for maximum correctness guarantees!
 """
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import asyncpg
 import pytest
@@ -25,7 +25,7 @@ class TestJobInfoDataclass:
 
     def test_job_info_creation(self):
         """Test JobInfo creation."""
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         info = JobInfo(
             id=123,
             job_class="TestJob",
@@ -119,7 +119,7 @@ class TestJobClientEnqueue:
     async def test_enqueue_with_run_after(self, db_pool):
         """Test enqueueing with scheduled time."""
         client = JobClient(db_pool)
-        future_time = datetime.utcnow() + timedelta(hours=1)
+        future_time = datetime.now(UTC) + timedelta(hours=1)
 
         job_id = await client.enqueue("ScheduledJob", run_after=future_time)
 
@@ -272,10 +272,10 @@ class TestJobClientJobManagement:
         # Create job
         job_id = await client.enqueue("CancelTestJob")
 
-        # Cancel
+        # Cancel: queued jobs are cancelled immediately
         result = await client.cancel_job(job_id)
 
-        assert result is True
+        assert result == "cancelled"
 
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow("SELECT state FROM jorb WHERE id = $1", job_id)
@@ -288,7 +288,7 @@ class TestJobClientJobManagement:
 
         result = await client.cancel_job(-99999)
 
-        assert result is False
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_retry_job(self, db_pool):
@@ -299,20 +299,21 @@ class TestJobClientJobManagement:
         job_id = await client.enqueue("RetryTestJob")
         async with db_pool.acquire() as conn:
             await conn.execute(
-                "UPDATE jorb SET state = 'crashed' WHERE id = $1", job_id
+                "UPDATE jorb SET state = 'crashed', error_count = 3, "
+                "error_message = 'boom' WHERE id = $1",
+                job_id,
             )
 
-        # Retry
-        new_job_id = await client.retry_job(job_id)
+        # Retry requeues the SAME row: job identity is stable across retries
+        requeued_id = await client.retry_job(job_id)
 
-        assert new_job_id is not None
-        assert new_job_id != job_id
+        assert requeued_id == job_id
 
         async with db_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT admin_data FROM jorb WHERE id = $1", new_job_id
-            )
-            assert row["admin_data"]["retry_of"] == job_id
+            row = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+            assert row["state"] == "queued"
+            assert row["error_count"] == 0
+            assert row["error_message"] is None
 
 
 class TestJobClientQueueOperations:

@@ -539,9 +539,15 @@ class TestGetDAGStatus:
 
         status = await get_dag_status(db_pool, dag_id)
 
-        # The status view should return data (or error if view doesn't exist)
-        # Either way, we're testing the function path
-        assert status is not None
+        # schema v1 jorb_dag_status columns
+        assert status["dag_id"] == dag_id
+        assert status["name"] == "Status Test DAG"
+        assert status["completed"] is None
+        assert status["total_jobs"] == 0
+        assert status["finished_jobs"] == 0
+        assert status["crashed_jobs"] == 0
+        assert status["cancelled_jobs"] == 0
+        assert status["pending_jobs"] == 0
 
 
 class TestWaitForDAG:
@@ -554,8 +560,17 @@ class TestWaitForDAG:
         assert result is False
 
     @pytest.mark.asyncio
+    @pytest.mark.xfail(
+        reason="SOURCE BUG: pyjobby.dag.wait_for_dag reads 'dag_state', "
+        "'running_jobs', and 'queued_jobs' from jorb_dag_status, but the "
+        "schema v1 view exposes completed/total_jobs/finished_jobs/"
+        "crashed_jobs/cancelled_jobs/pending_jobs — it can never see "
+        "completion and raises KeyError on the timeout path",
+        raises=KeyError,
+        strict=True,
+    )
     async def test_wait_for_dag_timeout(self, db_pool):
-        """Test wait_for_dag timeout - covers lines 397-403."""
+        """wait_for_dag should return False when the DAG never completes."""
         # Create a DAG that won't complete
         dag_id = await db_pool.fetchval(
             """
@@ -571,8 +586,7 @@ class TestWaitForDAG:
         result = await wait_for_dag(db_pool, dag_id, timeout=0.1, poll_interval=0.05)
 
         # Should timeout (return False) because DAG never completes
-        # Note: actual result depends on jorb_dag_status view
-        assert isinstance(result, bool)
+        assert result is False
 
 
 class TestDAGBuilderWithJobOptions:

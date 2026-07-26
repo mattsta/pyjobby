@@ -4,7 +4,7 @@ Phase 2: Timeout Enforcement Tests
 Comprehensive tests for job timeout enforcement:
 - Database timeout tracking (timeout_at column)
 - Worker-side timeout via asyncio.wait_for()
-- Background timeout monitor
+- Background monitor handler (pyjobby.monitor)
 - Timeout actions (retry/fail)
 """
 
@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from pyjobby.timeout_monitor import handle_timed_out_job
+from pyjobby.monitor import handle_timed_out_job
 from tests.utils.factories import create_job, get_job
 
 
@@ -83,7 +83,7 @@ class TestTimeoutConfiguration:
             RETURNING id
         """,
             "test.Job",
-            "{}",
+            {},
             "default",
             admin_data,
         )
@@ -104,7 +104,7 @@ class TestTimeoutConfiguration:
             RETURNING id
         """,
             "test.Job",
-            "{}",
+            {},
             "default",
             admin_data,
         )
@@ -124,7 +124,7 @@ class TestTimeoutConfiguration:
             RETURNING id
         """,
             "test.Job",
-            "{}",
+            {},
             "default",
             admin_data,
         )
@@ -182,8 +182,8 @@ class TestTimeoutTracking:
             job_id,
         )
 
-        # Mark as finished (should clear timeout_at)
-        await db_connection.execute(STMTS["finished"], job_id, {"status": "success"})
+        # Mark as finished (should clear timeout_at); epoch 0 = fresh row
+        await db_connection.execute(STMTS["finished"], job_id, {"status": "success"}, 0)
 
         job = await get_job(db_connection, job_id)
         assert job["state"] == "finished"
@@ -206,9 +206,9 @@ class TestTimeoutTracking:
             job_id,
         )
 
-        # Mark as crashed
+        # Mark as crashed (terminal DLQ); epoch 0 = fresh row
         await db_connection.execute(
-            STMTS["crash"], job_id, "Test error", "Test backtrace"
+            STMTS["crashed"], job_id, "Test error", "Test backtrace", 0
         )
 
         job = await get_job(db_connection, job_id)
@@ -252,32 +252,9 @@ class TestTimeoutDetection:
         assert len(timed_out) == 1
         assert timed_out[0]["id"] == job_id
 
-    @pytest.mark.asyncio
-    async def test_check_timed_out_jobs_function(self, db_connection):
-        """Test SQL function for checking timed-out jobs."""
-        # Create timed-out job
-        job_id = await create_job(
-            db_connection,
-            job_class="test.SlowJob",
-            state="running",
-            admin_data={"timeout_seconds": 30},
-        )
-
-        timeout_at = datetime.now(UTC) - timedelta(seconds=10)
-        await db_connection.execute(
-            """
-            UPDATE jorb SET timeout_at = $1 WHERE id = $2
-        """,
-            timeout_at,
-            job_id,
-        )
-
-        # Call function
-        result = await db_connection.fetch("SELECT * FROM check_timed_out_jobs()")
-
-        assert len(result) > 0
-        assert result[0]["job_id"] == job_id
-        assert result[0]["overdue_seconds"] > 0
+    # NOTE: schema v1 removed the check_timed_out_jobs() SQL function; the
+    # equivalent sweep is pyjobby.monitor.sweep_timed_out_jobs (covered in
+    # tests/test_monitor.py).
 
 
 class TestTimeoutMonitorHandler:
@@ -296,7 +273,7 @@ class TestTimeoutMonitorHandler:
                 RETURNING id
             """,
                 "test.Job",
-                "{}",
+                {},
                 "default",
                 admin_data,
                 "running",
@@ -344,7 +321,7 @@ class TestTimeoutMonitorHandler:
                 RETURNING id
             """,
                 "test.Job",
-                "{}",
+                {},
                 "default",
                 admin_data,
                 "running",
@@ -375,7 +352,7 @@ class TestTimeoutMonitorHandler:
                 RETURNING id
             """,
                 "test.Job",
-                "{}",
+                {},
                 "default",
                 admin_data,
                 "running",
@@ -400,43 +377,9 @@ class TestTimeoutMonitorHandler:
         await db_pool.execute("DELETE FROM jorb WHERE id = $1", job_id)
 
 
-class TestTimeoutView:
-    """Test timeout violations view."""
-
-    @pytest.mark.asyncio
-    async def test_timeout_violations_view(self, db_connection):
-        """Test jorb_timeout_violations view."""
-        # Create timed-out job
-        job_id = await create_job(
-            db_connection,
-            job_class="test.SlowJob",
-            state="running",
-            admin_data={"timeout_seconds": 60, "on_timeout": "retry"},
-        )
-
-        timeout_at = datetime.now(UTC) - timedelta(minutes=2)
-        await db_connection.execute(
-            """
-            UPDATE jorb SET timeout_at = $1, started = NOW() - INTERVAL '5 minutes'
-            WHERE id = $2
-        """,
-            timeout_at,
-            job_id,
-        )
-
-        # Query view
-        violations = await db_connection.fetch("""
-            SELECT * FROM jorb_timeout_violations
-        """)
-
-        assert len(violations) > 0
-        found = False
-        for v in violations:
-            if v["id"] == job_id:
-                found = True
-                assert v["timeout_action"] == "retry"
-                assert v["overdue_by"].total_seconds() > 0
-        assert found
+# NOTE: schema v1 removed the jorb_timeout_violations view; overdue jobs are
+# found with a plain query on timeout_at (see TestTimeoutDetection) and acted
+# on by pyjobby.monitor.sweep_timed_out_jobs.
 
 
 class TestTimeoutIntegration:
@@ -455,7 +398,7 @@ class TestTimeoutIntegration:
             RETURNING id
         """,
             "test.Job",
-            "{}",
+            {},
             "default",
             admin_data,
             "queued",
@@ -477,7 +420,7 @@ class TestTimeoutIntegration:
         # 2. Job completes before timeout - clear timeout_at
         from pyjobby.pj import STMTS
 
-        await db_connection.execute(STMTS["finished"], job_id, {"status": "success"})
+        await db_connection.execute(STMTS["finished"], job_id, {"status": "success"}, 0)
 
         job = await get_job(db_connection, job_id)
         assert job["state"] == "finished"
@@ -496,7 +439,7 @@ class TestTimeoutIntegration:
             RETURNING id
         """,
             "test.FastJob",
-            "{}",
+            {},
             "default",
             {"timeout_seconds": 10, "on_timeout": "retry"},
             "running",
@@ -517,7 +460,7 @@ class TestTimeoutIntegration:
             RETURNING id
         """,
             "test.SlowJob",
-            "{}",
+            {},
             "default",
             {"timeout_seconds": 600, "on_timeout": "fail"},
             "running",
@@ -538,9 +481,9 @@ class TestTimeoutIntegration:
             RETURNING id
         """,
             "test.NoTimeoutJob",
-            "{}",
+            {},
             "default",
-            "{}",
+            {},
             "running",
         )
         jobs.append(job3)
@@ -592,7 +535,7 @@ class TestTimeoutEdgeCases:
             RETURNING id
         """,
             "test.Job",
-            "{}",
+            {},
             "default",
             admin_data,
             "running",
@@ -633,7 +576,7 @@ class TestTimeoutEdgeCases:
             RETURNING id
         """,
             "test.Job",
-            "{}",
+            {},
             "default",
             admin_data,
             "running",

@@ -995,7 +995,11 @@ class TestSchedulerWorker:
 
     @pytest.mark.asyncio
     async def test_execute_schedule_with_jitter(self, db_pool, worker, client):
-        """Test execute_schedule applies jitter - covers lines 665-673."""
+        """Jitter offsets the created job's run_after, never by sleeping.
+
+        Schema v1 applies jitter to when the job may START; the scheduler
+        loop itself must not block (one jittery schedule would otherwise
+        stall every schedule behind it)."""
         # Create schedule with jitter_seconds > 0
         async with db_pool.acquire() as conn:
             schedule_id = await conn.fetchval(
@@ -1023,26 +1027,29 @@ class TestSchedulerWorker:
             )
 
         schedule_dict = dict(schedule)
+        scheduled_time = schedule_dict["next_run"]
 
         import time
 
         start_time = time.time()
-
-        # Execute schedule (should apply jitter which means sleep 0-5 seconds)
         result = await worker.execute_schedule(schedule_dict)
-
         elapsed = time.time() - start_time
 
-        # Verify jitter was applied (some delay should occur)
-        # Jitter is random 0-5 seconds, so we just verify successful execution
         assert result.result == "success"
         assert result.job_id is not None
+        assert 0 <= result.jitter_applied <= 5
 
-        # Verify job was created
+        # The scheduler did NOT sleep out the jitter
+        assert elapsed < 1.0, f"execute_schedule slept {elapsed:.2f}s applying jitter"
+
+        # The jitter landed on the job's run_after instead
         async with db_pool.acquire() as conn:
             job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", result.job_id)
             assert job is not None
             assert job["job_class"] == "test.Job"
+            assert job["run_after"] == scheduled_time + timedelta(
+                seconds=result.jitter_applied
+            )
 
     @pytest.mark.asyncio
     async def test_execute_schedule_duplicate_with_transaction_error(
@@ -1074,12 +1081,10 @@ class TestSchedulerWorker:
                 "SELECT * FROM jorb_schedule WHERE id = $1", schedule_id
             )
 
-            # Pre-create a job with the deadline_key that would be generated
-            # Deadline key format is: "schedule:{schedule_id}:{date}"
-            scheduled_time = datetime.now(UTC)
-            deadline_key = (
-                f"schedule:{schedule_id}:{scheduled_time.strftime('%Y-%m-%d:%H')}"
-            )
+            # Pre-create a job carrying the exact deadline_key the scheduler
+            # will generate for this run (schedule:{id}:{next_run.isoformat()})
+            scheduled_time = schedule["next_run"]
+            deadline_key = f"schedule:{schedule_id}:{scheduled_time.isoformat()}"
 
             await conn.execute(
                 """
@@ -1098,18 +1103,20 @@ class TestSchedulerWorker:
 
         schedule_dict = dict(schedule)
 
-        # Execute schedule with the scheduled_time that matches our pre-created job
-        # This should trigger UniqueViolationError and then the InFailedSQLTransactionError path
-        # Temporarily modify the scheduled time on the schedule to match
+        # The queued row already owns this deadline_key, so the INSERT hits the
+        # jorb_deadline_idx unique index and the run is skipped as a duplicate
         result = await worker.execute_schedule(schedule_dict)
 
-        # Should return skipped due to duplicate
-        # Note: In actual execution, the duplicate might still create a job because
-        # the deadlin key check happens at INSERT time. This test verifies the error handling.
-        assert result.result in [
-            "skipped",
-            "success",
-        ]  # Could be either depending on timing
+        assert result.result == "skipped"
+        assert result.skip_reason == "duplicate"
+        assert result.job_id is None
+
+        # ...and no second job was created for this schedule run
+        async with db_pool.acquire() as conn:
+            job_count = await conn.fetchval(
+                "SELECT count(*) FROM jorb WHERE deadline_key = $1", deadline_key
+            )
+        assert job_count == 1
 
     @pytest.mark.asyncio
     async def test_execute_schedule_with_exception(self, db_pool, worker, monkeypatch):
@@ -1444,6 +1451,58 @@ class TestSchedulerMainLoop:
             # Verify metrics were tracked
             assert worker.executions_total >= 1
             assert worker.successes_total >= 1
+
+    async def test_concurrent_schedulers_run_a_due_schedule_once(self, db_pool):
+        """Two scheduler instances must not double-fire one due schedule.
+
+        run() re-locks each due row inside a transaction with FOR UPDATE
+        SKIP LOCKED and re-checks due-ness, so the loser skips the row; the
+        deadline_key unique index is the belt-and-braces behind that."""
+        import asyncio
+
+        job_class = f"test.Concurrent_{uuid.uuid4().hex[:8]}"
+
+        async with db_pool.acquire() as conn_a, db_pool.acquire() as conn_b:
+            manager = ScheduleManager(conn_a)
+            schedule_id = await manager.create_schedule(
+                name=f"concurrent-loop-{uuid.uuid4().hex[:8]}",
+                job_class=job_class,
+                cron_expr="* * * * *",
+            )
+            await conn_a.execute(
+                "UPDATE jorb_schedule SET next_run = $1 WHERE id = $2",
+                datetime.now(UTC) - timedelta(minutes=1),
+                schedule_id,
+            )
+
+            worker_a = SchedulerWorker(conn_a, poll_interval=0.1)
+            worker_b = SchedulerWorker(conn_b, poll_interval=0.1)
+
+            tasks = [
+                asyncio.create_task(worker_a.run()),
+                asyncio.create_task(worker_b.run()),
+            ]
+            await asyncio.sleep(0.8)
+            worker_a.stop()
+            worker_b.stop()
+            for task in tasks:
+                try:
+                    await asyncio.wait_for(task, timeout=2.0)
+                except TimeoutError:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+            job_count = await conn_a.fetchval(
+                "SELECT count(*) FROM jorb WHERE job_class = $1", job_class
+            )
+            assert job_count == 1, f"schedule fired {job_count} times, expected 1"
+
+            schedule = await conn_a.fetchrow(
+                "SELECT * FROM jorb_schedule WHERE id = $1", schedule_id
+            )
+            assert schedule["run_count"] == 1
+            assert schedule["next_run"] > datetime.now(UTC)
 
     async def test_run_loop_handles_exceptions_gracefully(self, db_pool):
         """Test run() loop handles exceptions in schedule execution - covers exception paths."""

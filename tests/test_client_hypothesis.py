@@ -13,7 +13,6 @@ All tests use:
 """
 
 import asyncio
-import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -82,7 +81,7 @@ async def job_client(db_pool):
 
 
 async def claim_and_finish_job(conn, queue="default"):
-    """Claim a job and mark it as finished."""
+    """Claim a job and mark it as finished (v1: 6-arg claim, epoch fencing)."""
     claimed = await conn.fetchrow(
         STMTS["claim"],
         12345,  # worker_pid
@@ -90,11 +89,13 @@ async def claim_and_finish_job(conn, queue="default"):
         queue,
         [],  # capabilities
         1000,  # max_priority
+        None,  # claimed_by (no jorb_worker registry row in these tests)
     )
     if claimed:
-        await conn.execute(STMTS["run"], claimed["id"])
+        epoch = claimed["run_epoch"]
+        await conn.execute(STMTS["run"], claimed["id"], epoch)
         await conn.execute(
-            STMTS["finished"], claimed["id"], json.dumps({"result": "success"})
+            STMTS["finished"], claimed["id"], {"result": "success"}, epoch
         )
     return claimed
 
@@ -135,7 +136,7 @@ class TestEnqueueProperties:
         # CONSUMER: Worker can claim the job
         async with db_pool.acquire() as conn:
             claimed = await conn.fetchrow(
-                STMTS["claim"], 12345, "test-worker", queue, [], 1000
+                STMTS["claim"], 12345, "test-worker", queue, [], 1000, None
             )
 
             assert claimed is not None
@@ -177,6 +178,7 @@ class TestEnqueueProperties:
                     "default",
                     [],
                     10000,  # High enough to claim all
+                    None,
                 )
                 if claimed:
                     claimed_priorities.append(claimed["prio"])
@@ -196,9 +198,7 @@ class TestEnqueueProperties:
     @given(delay_seconds=st.integers(min_value=1, max_value=10))
     async def test_enqueue_respects_run_after(self, db_pool, job_client, delay_seconds):
         """Property: Jobs with run_after are not claimable until specified time."""
-        future_time = datetime.now(UTC).replace(tzinfo=None) + timedelta(
-            seconds=delay_seconds
-        )
+        future_time = datetime.now(UTC) + timedelta(seconds=delay_seconds)
 
         # PRODUCER: Enqueue job for future
         job_id = await job_client.enqueue(
@@ -208,14 +208,14 @@ class TestEnqueueProperties:
         # CONSUMER: Cannot claim immediately
         async with db_pool.acquire() as conn:
             claimed_early = await conn.fetchrow(
-                STMTS["claim"], 12345, "test-worker", "default", [], 1000
+                STMTS["claim"], 12345, "test-worker", "default", [], 1000, None
             )
             assert claimed_early is None  # Too early
 
             # Verify job exists but is not ready
             job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
             assert job["state"] == "queued"
-            assert job["run_after"] > datetime.now(UTC).replace(tzinfo=None)
+            assert job["run_after"] > datetime.now(UTC)
 
             # Cleanup: Delete job created in this example
             await conn.execute("DELETE FROM jorb WHERE id = $1", job_id)
@@ -259,6 +259,7 @@ class TestBatchEnqueueProperties:
                     "default",
                     [],
                     1000,
+                    None,
                 )
                 if not claimed:
                     break
@@ -290,7 +291,7 @@ class TestBatchEnqueueProperties:
             claimed_priorities = []
             for _ in range(batch_size):
                 claimed = await conn.fetchrow(
-                    STMTS["claim"], 12345, "test-worker", "default", [], 10000
+                    STMTS["claim"], 12345, "test-worker", "default", [], 10000, None
                 )
                 if claimed:
                     claimed_priorities.append(claimed["prio"])
@@ -339,18 +340,20 @@ class TestDependencyProperties:
             for expected_index in range(chain_length):
                 # Claim next available job
                 claimed = await conn.fetchrow(
-                    STMTS["claim"], 12345, "test-worker", "default", [], 1000
+                    STMTS["claim"], 12345, "test-worker", "default", [], 1000, None
                 )
 
                 assert claimed is not None
                 executed_order.append(claimed["id"])
 
                 # Finish job to release next in chain
-                await conn.execute(STMTS["run"], claimed["id"])
+                epoch = claimed["run_epoch"]
+                await conn.execute(STMTS["run"], claimed["id"], epoch)
                 await conn.execute(
                     STMTS["finished"],
                     claimed["id"],
-                    json.dumps({"step": expected_index}),
+                    {"step": expected_index},
+                    epoch,
                 )
 
                 # Release waiting jobs
@@ -408,6 +411,7 @@ class TestQueueIsolationProperties:
                     "queue1",  # Only claim from queue1
                     [],
                     1000,
+                    None,
                 )
                 if claimed:
                     queue1_claimed.append(claimed["id"])
@@ -481,7 +485,7 @@ class TestConcurrentOperationProperties:
             claimed_count = 0
             for _ in range(total_jobs):
                 claimed = await conn.fetchrow(
-                    STMTS["claim"], 12345, "test-worker", "default", [], 1000
+                    STMTS["claim"], 12345, "test-worker", "default", [], 1000, None
                 )
                 if claimed:
                     claimed_count += 1
@@ -528,6 +532,7 @@ class TestConcurrentOperationProperties:
                     "default",
                     [],
                     1000,
+                    None,
                 )
                 if claimed:
                     async with claim_lock:
@@ -572,24 +577,23 @@ class TestStateTransitionProperties:
             assert job["state"] == "queued"
             assert job["run_count"] == 0
 
-            # Claim job: queued -> claimed
+            # Claim job: queued -> claimed (run_epoch is the fencing token)
             await conn.execute(
-                STMTS["claim"], 12345, "test-worker", "default", [], 1000
+                STMTS["claim"], 12345, "test-worker", "default", [], 1000, None
             )
             job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
             assert job["state"] == "claimed"
             assert job["run_count"] == 1
+            epoch = job["run_epoch"]
 
             # Mark running: claimed -> running
-            await conn.execute(STMTS["run"], job_id)
+            await conn.execute(STMTS["run"], job_id, epoch)
             job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
             assert job["state"] == "running"
             assert job["started"] is not None
 
             # Mark finished: running -> finished
-            await conn.execute(
-                STMTS["finished"], job_id, json.dumps({"result": "success"})
-            )
+            await conn.execute(STMTS["finished"], job_id, {"result": "success"}, epoch)
             job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
             assert job["state"] == "finished"
             assert job["finished"] is not None
@@ -625,7 +629,19 @@ class TestResultStorageProperties:
             ),
             values=st.one_of(
                 st.integers(min_value=-(2**63), max_value=2**63 - 1),
-                st.floats(allow_nan=False, allow_infinity=False),
+                # jsonb stores numbers as PostgreSQL `numeric` (exact
+                # decimal), NOT as IEEE-754 binary. A float of huge
+                # magnitude is written as its ~17-significant-digit decimal
+                # form, which is not its exact binary value, so it comes
+                # back as an int that is unequal to the original float.
+                # That is a jsonb property, not a pyjobby bug; this
+                # property covers the magnitudes where jsonb is exact.
+                st.floats(
+                    allow_nan=False,
+                    allow_infinity=False,
+                    min_value=-1e6,
+                    max_value=1e6,
+                ),
                 st.text(
                     alphabet=st.characters(
                         exclude_characters="\x00", exclude_categories=["Cs"]
@@ -650,18 +666,14 @@ class TestResultStorageProperties:
 
             # Store custom result
             await conn.execute(
-                "UPDATE jorb SET result = $2::json WHERE id = $1",
+                "UPDATE jorb SET result = $2 WHERE id = $1",
                 claimed["id"],
-                json.dumps(result_data),
+                result_data,
             )
 
             # Retrieve and verify
             job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", claimed["id"])
-            stored_result = (
-                json.loads(job["result"])
-                if isinstance(job["result"], str)
-                else job["result"]
-            )
+            stored_result = job["result"]
 
             assert stored_result == result_data
 

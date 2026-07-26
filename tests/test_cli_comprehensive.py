@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from click.testing import CliRunner
 
+from pyjobby.admin_api import AdminAPI, Unset
 from pyjobby.cli import cli
 
 
@@ -58,7 +59,9 @@ def mock_admin_api():
     schedule rows keep datetime objects (the CLI calls .strftime on them
     and JSON-serializes with default=str).
     """
-    mock_api = AsyncMock()
+    # spec=AdminAPI: a test that mocks a method the real AdminAPI does not
+    # have now fails loudly instead of passing vacuously.
+    mock_api = AsyncMock(spec=AdminAPI)
 
     # Setup default mock return values
     mock_api.list_jobs.return_value = [
@@ -112,16 +115,15 @@ def mock_admin_api():
         "finished": None,
         "timeout_at": None,
         "dag_id": None,
+        "run_epoch": 0,
+        "cancel_requested": False,
+        "claimed_by": None,
     }
 
-    mock_api.retry_job.return_value = {
-        "original_job_id": 1,
-        "new_job_id": 11,
-        "status": "retry_queued",
-    }
+    mock_api.retry_job.return_value = {"job_id": 1, "status": "requeued"}
     mock_api.retry_jobs.return_value = [
-        {"original_job_id": 1, "new_job_id": 11, "status": "retry_queued"},
-        {"original_job_id": 2, "new_job_id": 12, "status": "retry_queued"},
+        {"job_id": 1, "status": "requeued"},
+        {"job_id": 2, "status": "requeued"},
     ]
     mock_api.cancel_job.return_value = {"job_id": 1, "status": "cancelled"}
     mock_api.cancel_jobs.return_value = [
@@ -131,7 +133,31 @@ def mock_admin_api():
     mock_api.delete_jobs.return_value = 5
     mock_api.clear_queue.return_value = 5
 
-    mock_api.list_queues.return_value = ["default", "high", "low"]
+    # AdminAPI.list_queues returns per-queue dicts with the jorb_queue
+    # control fields alongside (defaults when no control row exists).
+    mock_api.list_queues.return_value = [
+        {
+            "name": "default",
+            "paused": False,
+            "max_concurrency": None,
+            "rate_limit": None,
+            "rate_period_seconds": 60.0,
+        },
+        {
+            "name": "high",
+            "paused": True,
+            "max_concurrency": 4,
+            "rate_limit": 10,
+            "rate_period_seconds": 60.0,
+        },
+        {
+            "name": "low",
+            "paused": False,
+            "max_concurrency": None,
+            "rate_limit": None,
+            "rate_period_seconds": 60.0,
+        },
+    ]
 
     # AdminAPI.queue_stats returns a LIST of per-queue stat dicts
     # (QueueStats.to_dict()), all values JSON-serializable.
@@ -147,47 +173,58 @@ def mock_admin_api():
             "cancelled": 0,
             "total": 118,
             "oldest_queued_age_seconds": 7200.0,
+            "paused": False,
+            "max_concurrency": None,
+            "rate_limit": None,
+            "rate_period_seconds": 60.0,
         },
     ]
 
-    # AdminAPI.list_workers returns WorkerInfo.to_dict() rows.
+    # AdminAPI.list_workers returns jorb_worker registry rows: liveness,
+    # heartbeat age, and the currently claimed job (datetimes as ISO strings).
     mock_api.list_workers.return_value = [
         {
-            "worker_host": "host1",
-            "worker_pid": 1234,
-            "job_id": 1,
-            "job_class": "test.Job",
-            "state": "running",
-            "started_at": datetime.now().isoformat(),
+            "id": 1,
+            "host": "host1",
+            "pid": 1234,
+            "queue": "default",
+            "capabilities": ["test"],
+            "version": None,
+            "started": datetime.now().isoformat(),
+            "last_seen": datetime.now().isoformat(),
+            "shutdown_at": None,
+            "last_seen_age_seconds": 3.0,
+            "live": True,
+            "current_job_id": 1,
+            "current_job_class": "test.Job",
+            "current_job_state": "running",
         },
         {
-            "worker_host": "host2",
-            "worker_pid": 5678,
-            "job_id": 2,
-            "job_class": "test.Job2",
-            "state": "running",
-            "started_at": datetime.now().isoformat(),
+            "id": 2,
+            "host": "host2",
+            "pid": 5678,
+            "queue": "default",
+            "capabilities": ["test"],
+            "version": None,
+            "started": datetime.now().isoformat(),
+            "last_seen": datetime.now().isoformat(),
+            "shutdown_at": None,
+            "last_seen_age_seconds": 8.0,
+            "live": True,
+            "current_job_id": None,
+            "current_job_class": None,
+            "current_job_state": None,
         },
     ]
 
-    # AdminAPI.worker_stats: oldest_job_started is an ISO string
-    # (the CLI slices it with [:19]).
+    # AdminAPI.worker_stats: registry-based aggregate counts.
     mock_api.worker_stats.return_value = {
-        "active_workers": 2,
-        "workers": [
-            {
-                "host": "host1",
-                "pid": 1234,
-                "job_count": 3,
-                "oldest_job_started": datetime.now().isoformat(),
-            },
-            {
-                "host": "host2",
-                "pid": 5678,
-                "job_count": 1,
-                "oldest_job_started": None,
-            },
-        ],
+        "live_workers": 2,
+        "active_workers": 2,  # compat alias
+        "stale_workers": 0,
+        "shutdown_workers": 1,
+        "total_registered": 3,
+        "per_queue": {"default": 2},
     }
 
     mock_api.list_dlq.return_value = [
@@ -202,10 +239,65 @@ def mock_admin_api():
     ]
 
     mock_api.retry_from_dlq.return_value = {
-        "original_job_id": 10,
-        "new_job_id": 20,
-        "status": "retry_queued_from_dlq",
+        "job_id": 10,
+        "status": "requeued_from_dlq",
     }
+
+    # Queue control plane and requeue/history/steps surfaces.
+    _control = {
+        "name": "default",
+        "paused": False,
+        "max_concurrency": None,
+        "rate_limit": None,
+        "rate_period_seconds": 60.0,
+        "created": datetime.now().isoformat(),
+        "updated": datetime.now().isoformat(),
+    }
+    mock_api.pause_queue.return_value = {**_control, "paused": True}
+    mock_api.resume_queue.return_value = _control
+    mock_api.get_queue_control.return_value = _control
+    mock_api.set_queue_control.return_value = _control
+
+    mock_api.requeue_job.return_value = {
+        "job_id": 1,
+        "status": "requeued",
+        "fresh": False,
+    }
+    mock_api.get_job_history.return_value = [
+        {
+            "id": 1,
+            "job_id": 1,
+            "at": datetime.now().isoformat(),
+            "event": "enqueued",
+            "detail": {"queue": "default", "job_class": "test.Job"},
+        },
+        {
+            "id": 2,
+            "job_id": 1,
+            "at": datetime.now().isoformat(),
+            "event": "claimed",
+            "detail": {
+                "from": "queued",
+                "run_epoch": 1,
+                "error_count": 0,
+                "worker_host": "host1",
+                "worker_pid": 1234,
+            },
+        },
+    ]
+    mock_api.get_job_steps.return_value = [
+        {
+            "job_id": 1,
+            "step_seq": 1,
+            "name": "fetch",
+            "output": {"n": 7},
+            "error": None,
+            "run_epoch": 1,
+            "started": datetime.now().isoformat(),
+            "finished": datetime.now().isoformat(),
+            "duration_seconds": 0.05,
+        },
+    ]
 
     # AdminAPI.get_metrics return shape (fully JSON-serializable).
     mock_api.get_metrics.return_value = {
@@ -421,6 +513,69 @@ class TestJobsCommands:
             # The CLI deletes a single job via delete_job
             mock_admin_api.delete_job.assert_called_once_with(1)
 
+    def test_jobs_retry_single_uses_retry_job(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        """A single job id goes through retry_job and reports 'requeued'."""
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "jobs", "retry", "1"]
+            )
+
+            assert result.exit_code == 0
+            assert "requeued" in result.output
+            mock_admin_api.retry_job.assert_called_once_with(1)
+
+    def test_jobs_requeue(self, cli_runner, mock_admin_api, mock_db_params):
+        """Test jobs requeue command (resume with checkpoints by default)."""
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "jobs", "requeue", "1"]
+            )
+
+            assert result.exit_code == 0
+            assert "resume with checkpoints" in result.output
+            mock_admin_api.requeue_job.assert_called_once_with(1, fresh=False)
+
+    def test_jobs_requeue_fresh(self, cli_runner, mock_admin_api, mock_db_params):
+        """Test jobs requeue --fresh wipes checkpoints."""
+        mock_admin_api.requeue_job.return_value = {
+            "job_id": 1,
+            "status": "requeued",
+            "fresh": True,
+        }
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "jobs", "requeue", "1", "--fresh"]
+            )
+
+            assert result.exit_code == 0
+            assert "fresh restart" in result.output
+            mock_admin_api.requeue_job.assert_called_once_with(1, fresh=True)
+
+    def test_jobs_history(self, cli_runner, mock_admin_api, mock_db_params):
+        """Test jobs history command."""
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "jobs", "history", "1"]
+            )
+
+            assert result.exit_code == 0
+            assert "enqueued" in result.output
+            assert "claimed" in result.output
+            mock_admin_api.get_job_history.assert_called_once_with(1)
+
+    def test_jobs_steps(self, cli_runner, mock_admin_api, mock_db_params):
+        """Test jobs steps command."""
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "jobs", "steps", "1"]
+            )
+
+            assert result.exit_code == 0
+            assert "fetch" in result.output
+            mock_admin_api.get_job_steps.assert_called_once_with(1)
+
 
 # ============================================================================
 # Test Queue Commands
@@ -475,6 +630,124 @@ class TestQueuesCommands:
             assert result.exit_code == 0
             # The CLI clears queues via clear_queue
             mock_admin_api.clear_queue.assert_called_once()
+
+    def test_queues_pause(self, cli_runner, mock_admin_api, mock_db_params):
+        """Test queues pause command."""
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "queues", "pause", "default"]
+            )
+
+            assert result.exit_code == 0
+            assert "paused" in result.output
+            mock_admin_api.pause_queue.assert_called_once_with("default")
+
+    def test_queues_resume(self, cli_runner, mock_admin_api, mock_db_params):
+        """Test queues resume command."""
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "queues", "resume", "default"]
+            )
+
+            assert result.exit_code == 0
+            assert "resumed" in result.output
+            mock_admin_api.resume_queue.assert_called_once_with("default")
+
+    def test_queues_limits_show_current(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        """queues limits with no options shows the current control row."""
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "queues", "limits", "default"]
+            )
+
+            assert result.exit_code == 0
+            mock_admin_api.get_queue_control.assert_called_once_with("default")
+            mock_admin_api.set_queue_control.assert_not_called()
+
+    def test_queues_limits_set(self, cli_runner, mock_admin_api, mock_db_params):
+        """queues limits with options updates the control row."""
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli,
+                [
+                    "--config",
+                    "test.py",
+                    "queues",
+                    "limits",
+                    "default",
+                    "--max-concurrency",
+                    "4",
+                ],
+            )
+
+            assert result.exit_code == 0
+            mock_admin_api.set_queue_control.assert_called_once()
+            args, kwargs = mock_admin_api.set_queue_control.call_args
+            assert args == ("default",)
+            assert kwargs["max_concurrency"] == 4
+            # Options NOT passed must arrive as the UNSET sentinel so the
+            # UPDATE leaves those columns alone -- None would CLEAR them.
+            assert isinstance(kwargs["rate_limit"], Unset)
+            assert kwargs["rate_period_seconds"] is None
+
+    def test_queues_limits_clear_uses_none_not_unset(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        """'--max-concurrency none' explicitly CLEARS the limit (None)."""
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli,
+                [
+                    "--config",
+                    "test.py",
+                    "queues",
+                    "limits",
+                    "default",
+                    "--max-concurrency",
+                    "none",
+                ],
+            )
+
+            assert result.exit_code == 0
+            _, kwargs = mock_admin_api.set_queue_control.call_args
+            # None (clear), distinct from UNSET (leave alone)
+            assert kwargs["max_concurrency"] is None
+            assert not isinstance(kwargs["max_concurrency"], Unset)
+            assert isinstance(kwargs["rate_limit"], Unset)
+
+    def test_queues_limits_rejects_non_integer(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        """A non-integer, non-'none' limit exits 2 without touching the DB."""
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli,
+                [
+                    "--config",
+                    "test.py",
+                    "queues",
+                    "limits",
+                    "default",
+                    "--max-concurrency",
+                    "lots",
+                ],
+            )
+
+            assert result.exit_code == 2
+            mock_admin_api.set_queue_control.assert_not_called()
+
+    def test_queues_show(self, cli_runner, mock_admin_api, mock_db_params):
+        """Test queues show command."""
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "queues", "show", "default"]
+            )
+
+            assert result.exit_code == 0
+            mock_admin_api.get_queue_control.assert_called_once_with("default")
+            mock_admin_api.queue_stats.assert_called_once_with(queue="default")
 
 
 # ============================================================================

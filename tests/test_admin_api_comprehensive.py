@@ -6,7 +6,7 @@ Tests the administrative API for managing jobs, queues, workers, and schedules.
 Coverage Target: 85%+
 """
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -159,7 +159,7 @@ class TestWorkerInfoDataclass:
 
     def test_to_dict_with_datetime(self):
         """Test WorkerInfo.to_dict() serializes datetime."""
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         worker_info = WorkerInfo(
             worker_host="worker-01",
             worker_pid=12345,
@@ -369,24 +369,17 @@ class TestAdminAPIJobManagement:
 
         result = await api.retry_job(job_id)
 
-        assert result is not None
-        assert "new_job_id" in result
-        assert result["original_job_id"] == job_id
-        new_job_id = result["new_job_id"]
-        assert new_job_id != job_id
+        assert result == {"job_id": job_id, "status": "requeued"}
 
-        # Verify new job
+        # The SAME row is requeued: identity is stable, errors reset
         async with db_pool.acquire() as conn:
-            new_job = await conn.fetchrow(
-                "SELECT * FROM jorb WHERE id = $1", new_job_id
-            )
+            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
 
-            assert new_job["state"] == "queued"
-            assert new_job["job_class"] == "test.Job"
-            assert new_job["kwargs"] == {"arg": "value"}
-            assert new_job["admin_data"] is not None
-            # admin_data should contain parent_job_id
-            assert "parent_job_id" in new_job["admin_data"]
+            assert job["state"] == "queued"
+            assert job["job_class"] == "test.Job"
+            assert job["kwargs"] == {"arg": "value"}
+            assert job["error_count"] == 0
+            assert job["error_message"] is None
 
     @pytest.mark.asyncio
     async def test_retry_job_invalid_state(self, db_pool):
@@ -444,8 +437,8 @@ class TestAdminAPIJobManagement:
             assert state == "cancelled"
 
     @pytest.mark.asyncio
-    async def test_cancel_job_running_fails(self, db_pool):
-        """Test cancelling a running job fails."""
+    async def test_cancel_job_running_requests_cancellation(self, db_pool):
+        """Cancelling a running job delivers a cancellation request."""
         api = AdminAPI(db_pool)
 
         async with db_pool.acquire() as conn:
@@ -462,8 +455,15 @@ class TestAdminAPIJobManagement:
                 100,
             )
 
-        with pytest.raises(ValueError, match="can only cancel queued or waiting jobs"):
-            await api.cancel_job(job_id)
+        result = await api.cancel_job(job_id)
+        assert result == {"job_id": job_id, "status": "cancel_requested"}
+
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT state, cancel_requested FROM jorb WHERE id = $1", job_id
+            )
+            assert row["state"] == "running"
+            assert row["cancel_requested"] is True
 
     @pytest.mark.asyncio
     async def test_delete_job(self, db_pool):
@@ -537,8 +537,9 @@ class TestAdminAPIQueueManagement:
 
         queues = await api.list_queues()
 
-        assert "queue_a" in queues
-        assert "queue_b" in queues
+        names = [q["name"] for q in queues]
+        assert "queue_a" in names
+        assert "queue_b" in names
 
     @pytest.mark.asyncio
     async def test_queue_stats_single_queue(self, db_pool):
@@ -682,147 +683,113 @@ class TestAdminAPIQueueManagement:
 
 
 class TestAdminAPIWorkerManagement:
-    """Test AdminAPI worker management methods."""
+    """Test AdminAPI worker management methods (jorb_worker registry)."""
 
     @pytest.mark.asyncio
     async def test_list_workers_active(self, db_pool):
-        """Test listing active workers."""
+        """Registered workers are listed with liveness and current job."""
         api = AdminAPI(db_pool)
 
         async with db_pool.acquire() as conn:
-            # Create running jobs with worker info
+            w1 = await conn.fetchval(
+                """
+                INSERT INTO jorb_worker (host, pid, queue, capabilities)
+                VALUES ('worker-01', 12345, 'default', '{test}')
+                RETURNING id
+                """
+            )
             await conn.execute(
                 """
-                INSERT INTO jorb (
-                    job_class, kwargs, queue, state, prio,
-                    worker_host, worker_pid, started
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-            """,
-                "test.Job1",
-                {},
-                "default",
-                "running",
-                100,
-                "worker-01",
-                12345,
+                INSERT INTO jorb_worker (host, pid, queue, capabilities)
+                VALUES ('worker-02', 23456, 'default', '{test}')
+                """
             )
 
+            # worker-01 currently runs a job
             await conn.execute(
                 """
-                INSERT INTO jorb (
-                    job_class, kwargs, queue, state, prio,
-                    worker_host, worker_pid, started
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-            """,
-                "test.Job2",
-                {},
-                "default",
-                "claimed",
-                100,
-                "worker-02",
-                23456,
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio,
+                                  claimed_by, worker_host, worker_pid, started)
+                VALUES ('test.Job1', '{}', 'default', 'running', 100,
+                        $1, 'worker-01', 12345, NOW())
+                """,
+                w1,
             )
 
         workers = await api.list_workers()
 
         assert len(workers) >= 2
-        assert all(isinstance(w, dict) for w in workers)
 
-        worker_hosts = {w["worker_host"] for w in workers}
-        assert "worker-01" in worker_hosts
-        assert "worker-02" in worker_hosts
+        by_host = {w["host"]: w for w in workers}
+        # Registry identity comes straight from jorb_worker
+        assert by_host["worker-01"]["pid"] == 12345
+        assert by_host["worker-01"]["queue"] == "default"
+        assert by_host["worker-01"]["live"] is True
+        assert by_host["worker-01"]["current_job_class"] == "test.Job1"
+        assert by_host["worker-02"]["current_job_id"] is None
 
     @pytest.mark.asyncio
-    async def test_list_workers_excludes_finished(self, db_pool):
-        """Test list_workers excludes finished jobs."""
+    async def test_list_workers_excludes_long_shutdown(self, db_pool):
+        """Workers shut down beyond the window are not listed."""
         api = AdminAPI(db_pool)
 
         async with db_pool.acquire() as conn:
-            # Create a finished job with worker info
             await conn.execute(
                 """
-                INSERT INTO jorb (
-                    job_class, kwargs, queue, state, prio,
-                    worker_host, worker_pid, started, finished
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-            """,
-                "test.Job",
-                {},
-                "default",
-                "finished",
-                100,
-                "worker-finished",
-                99999,
+                INSERT INTO jorb_worker (host, pid, queue, capabilities,
+                                         shutdown_at)
+                VALUES ('worker-gone', 99999, 'default', '{test}',
+                        NOW() - INTERVAL '2 days')
+                """
+            )
+            await conn.execute(
+                """
+                INSERT INTO jorb_worker (host, pid, queue, capabilities,
+                                         shutdown_at)
+                VALUES ('worker-recent', 99998, 'default', '{test}',
+                        NOW() - INTERVAL '1 minute')
+                """
             )
 
         workers = await api.list_workers()
 
-        # Finished worker should not appear
-        worker_hosts = {w["worker_host"] for w in workers}
-        assert "worker-finished" not in worker_hosts
+        worker_hosts = {w["host"] for w in workers}
+        # Long-dead workers disappear; recently-shut-down ones still show
+        assert "worker-gone" not in worker_hosts
+        assert "worker-recent" in worker_hosts
+        recent = next(w for w in workers if w["host"] == "worker-recent")
+        assert recent["live"] is False
 
     @pytest.mark.asyncio
     async def test_worker_stats(self, db_pool):
-        """Test worker statistics aggregation."""
+        """Test registry-based worker statistics aggregation."""
         api = AdminAPI(db_pool)
 
         async with db_pool.acquire() as conn:
-            # Create multiple jobs for same worker
+            # Two live workers, one stale (old heartbeat)
             await conn.execute(
                 """
-                INSERT INTO jorb (
-                    job_class, kwargs, queue, state, prio,
-                    worker_host, worker_pid, started
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() - INTERVAL '5 minutes')
-            """,
-                "test.Job1",
-                {},
-                "default",
-                "running",
-                100,
-                "worker-01",
-                12345,
+                INSERT INTO jorb_worker (host, pid, queue, capabilities)
+                VALUES ('worker-01', 12345, 'default', '{test}'),
+                       ('worker-02', 12346, 'default', '{test}')
+                """
             )
-
             await conn.execute(
                 """
-                INSERT INTO jorb (
-                    job_class, kwargs, queue, state, prio,
-                    worker_host, worker_pid, started
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() - INTERVAL '10 minutes')
-            """,
-                "test.Job2",
-                {},
-                "default",
-                "running",
-                100,
-                "worker-01",
-                12345,
+                INSERT INTO jorb_worker (host, pid, queue, capabilities,
+                                         last_seen)
+                VALUES ('worker-stale', 12347, 'default', '{test}',
+                        NOW() - INTERVAL '10 minutes')
+                """
             )
 
         stats = await api.worker_stats()
 
-        assert stats["active_workers"] >= 1
-        assert "workers" in stats
-        assert len(stats["workers"]) >= 1
-
-        # Should have at least one worker with 2 jobs
-        found_worker = False
-        for worker in stats["workers"]:
-            if (
-                worker["host"] == "worker-01"
-                and worker["pid"] == 12345
-                and worker["job_count"] >= 2
-            ):
-                found_worker = True
-                break
-
-        assert found_worker
+        assert stats["live_workers"] == 2
+        assert stats["active_workers"] == 2  # compat alias
+        assert stats["stale_workers"] == 1
+        assert stats["total_registered"] == 3
+        assert stats["per_queue"] == {"default": 2}
 
 
 # =============================================================================
@@ -880,7 +847,7 @@ class TestAdminAPIMetrics:
         """Test get_metrics with custom time range."""
         api = AdminAPI(db_pool)
 
-        since = datetime.utcnow() - timedelta(hours=1)
+        since = datetime.now(UTC) - timedelta(hours=1)
 
         async with db_pool.acquire() as conn:
             # Create a recent job
@@ -970,7 +937,8 @@ class TestAdminAPIDLQ:
                 "Persistent error",
             )
 
-            # Create a non-DLQ job (low error count)
+            # Also crashed, but with a LOW error count: v1 has no error-count
+            # heuristic, so this is in the DLQ just the same
             await conn.execute(
                 """
                 INSERT INTO jorb (
@@ -989,12 +957,12 @@ class TestAdminAPIDLQ:
 
         dlq_jobs = await api.list_dlq(limit=100)
 
-        # Should include DLQ job
+        # The DLQ is exactly the crashed jobs: BOTH are in it (no
+        # error-count heuristic)
         dlq_classes = {job["job_class"] for job in dlq_jobs}
         assert "test.DLQJob" in dlq_classes
-
-        # All jobs should have error_count >= 10
-        assert all(job["error_count"] >= 10 for job in dlq_jobs)
+        assert "test.RegularJob" in dlq_classes
+        assert all(job["state"] == "crashed" for job in dlq_jobs)
 
     @pytest.mark.asyncio
     async def test_retry_from_dlq(self, db_pool):
@@ -1023,20 +991,16 @@ class TestAdminAPIDLQ:
 
         result = await api.retry_from_dlq(job_id)
 
-        assert result is not None
-        assert "new_job_id" in result
-        new_job_id = result["new_job_id"]
-        assert new_job_id != job_id
+        assert result == {"job_id": job_id, "status": "requeued_from_dlq"}
 
-        # Verify new job has dlq_retry_from in admin_data
+        # The same row is requeued with its error budget reset
         async with db_pool.acquire() as conn:
-            new_job = await conn.fetchrow(
-                "SELECT * FROM jorb WHERE id = $1", new_job_id
-            )
+            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
 
-            assert new_job["state"] == "queued"
-            assert new_job["admin_data"] is not None
-            assert "dlq_retry_from" in new_job["admin_data"]
+            assert job["state"] == "queued"
+            assert job["error_count"] == 0
+            assert job["error_message"] is None
+            assert job["kwargs"] == {"arg": "value"}
 
     @pytest.mark.asyncio
     async def test_retry_from_dlq_not_crashed_fails(self, db_pool):
@@ -2066,11 +2030,11 @@ class TestAdminAPIErrorPaths:
 
     @pytest.mark.asyncio
     async def test_cancel_job_wrong_state(self, db_pool):
-        """Test cancel_job with job in uncancellable state."""
+        """Test cancel_job with a terminal (uncancellable) job."""
         api = AdminAPI(db_pool)
 
         async with db_pool.acquire() as conn:
-            # Create job in 'running' state (not queued/waiting)
+            # Terminal states cannot be cancelled
             job_id = await conn.fetchval(
                 """
                 INSERT INTO jorb (job_class, kwargs, queue, state, prio)
@@ -2080,12 +2044,12 @@ class TestAdminAPIErrorPaths:
                 "test.Job",
                 {},
                 "default",
-                "running",
+                "finished",
                 100,
             )
 
-        # Should raise ValueError for wrong state
-        with pytest.raises(ValueError, match="can only cancel queued or waiting jobs"):
+        # Should raise ValueError for terminal state
+        with pytest.raises(ValueError, match="cannot be cancelled"):
             await api.cancel_job(job_id)
 
     @pytest.mark.asyncio
@@ -2113,10 +2077,9 @@ class TestAdminAPIErrorPaths:
         results = await api.retry_jobs([valid_id, 999999, 999998])
 
         assert len(results) == 3
-        # First should succeed
-        assert results[0]["status"] == "retry_queued"
-        assert "new_job_id" in results[0]
-        # Second and third should be errors (covering lines 288-289)
+        # First should succeed (same-row requeue)
+        assert results[0] == {"job_id": valid_id, "status": "requeued"}
+        # Second and third should be errors
         assert results[1]["status"] == "error"
         assert "not found" in results[1]["error"].lower()
         assert results[2]["status"] == "error"
@@ -2189,30 +2152,27 @@ class TestAdminAPIErrorPaths:
                 100,
             )
 
-        # Bulk cancel with mix of valid IDs (queued, waiting), invalid ID, and non-cancellable states
+        # Bulk cancel with a mix of cancellable, running, invalid, and
+        # terminal jobs
         results = await api.cancel_jobs([job1, job2, 999999, job3, job4])
 
         assert len(results) == 5
 
-        # job1 (queued) should succeed
-        assert results[0]["status"] == "cancelled"
-        assert results[0]["job_id"] == job1
+        # job1 (queued) is cancelled immediately
+        assert results[0] == {"job_id": job1, "status": "cancelled"}
 
-        # job2 (waiting) should succeed
-        assert results[1]["status"] == "cancelled"
-        assert results[1]["job_id"] == job2
+        # job2 (waiting) is cancelled immediately
+        assert results[1] == {"job_id": job2, "status": "cancelled"}
 
-        # 999999 (invalid) should error - covers lines 351-356
+        # 999999 (invalid) errors
         assert results[2]["status"] == "error"
         assert results[2]["job_id"] == 999999
         assert "error" in results[2]
 
-        # job3 (running) should error - can't cancel running jobs
-        assert results[3]["status"] == "error"
-        assert results[3]["job_id"] == job3
-        assert "error" in results[3]
+        # job3 (running) gets a cancellation request delivered
+        assert results[3] == {"job_id": job3, "status": "cancel_requested"}
 
-        # job4 (finished) should error - can't cancel finished jobs
+        # job4 (finished) is terminal: error
         assert results[4]["status"] == "error"
         assert results[4]["job_id"] == job4
         assert "error" in results[4]

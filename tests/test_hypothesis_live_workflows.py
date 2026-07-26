@@ -84,9 +84,17 @@ def run_worker_process(
     queue: str,
     db_params: dict,
     duration_seconds: int = 10,
-    enable_recovery: bool = True,
+    job_sleep_seconds: float = 0,
 ):
-    """Run a single worker process for specified duration."""
+    """Run a single worker process for specified duration.
+
+    A simplified worker loop matching the schema v1 statements: it registers
+    in jorb_worker (so the monitor's dead-worker sweep can reclaim its jobs
+    if it dies), claims with its registry id, and drives the epoch-fenced
+    run/finished/crashed statements.
+
+    ``job_sleep_seconds`` holds each job in 'running' for that long, so a
+    test can kill the process while it demonstrably owns work."""
 
     def signal_handler(signum, frame):
         """Handle shutdown signal."""
@@ -103,8 +111,6 @@ def run_worker_process(
             capabilities=("test",),
             workerId=worker_id,
             checkInterval=1,  # Check frequently for tests
-            enable_recovery=enable_recovery,
-            recovery_timeout=5,  # 5 seconds for tests
         )
 
         # Connect to DB (shared factory registers both json AND jsonb codecs)
@@ -112,8 +118,18 @@ def run_worker_process(
 
         worker.cxn = await pjdb.connect(**db_params)
 
-        # Prepare statements
-        from pyjobby.pj import STMTS
+        # Register in the worker registry (as the real worker loop does)
+        from pyjobby import __version__
+        from pyjobby.pj import STMTS, WORKER_REGISTER_SQL
+
+        registry_id = await worker.cxn.fetchval(
+            WORKER_REGISTER_SQL,
+            worker.node,
+            worker.pid,
+            queue,
+            list(worker.capabilities),
+            __version__,
+        )
 
         worker.stmts = {}
         for name, stmt in STMTS.items():
@@ -130,23 +146,27 @@ def run_worker_process(
                 worker.qname,
                 worker.capabilities,
                 worker.prio,
+                registry_id,
             )
 
             if jobs:
                 job = jobs[0]
+                epoch = job["run_epoch"]
                 try:
                     # Mark as running
-                    await worker.ex("run", job["id"])
+                    await worker.ex("run", job["id"], epoch)
 
                     # Execute job (simplified - no class loading for speed)
+                    if job_sleep_seconds:
+                        await asyncio.sleep(job_sleep_seconds)
                     result = {"status": "success", "job_id": job["id"]}
 
                     # Mark as finished
-                    await worker.ex("finished", job["id"], result)
+                    await worker.ex("finished", job["id"], result, epoch)
 
                 except Exception as e:
-                    # Mark as crashed
-                    await worker.ex("crash", job["id"], str(e), "")
+                    # Mark as crashed (terminal DLQ)
+                    await worker.ex("crashed", job["id"], str(e), "", epoch)
             else:
                 # Sleep if no jobs
                 await asyncio.sleep(0.1)
@@ -472,13 +492,18 @@ class TestLiveProducerConsumerWorkflows:
     )
     async def test_worker_crash_and_recovery(self, db_params, job_count: int):
         """
-        Property: If workers crash, jobs should be recovered and processed.
+        Property: If a worker crashes, its in-flight jobs are reclaimed and
+        finished by another worker.
 
-        Tests the recovery mechanism under real conditions.
+        Schema v1 moved recovery out of the worker: a killed worker never
+        deregisters, so its ``jorb_worker.last_seen`` goes stale and the
+        monitor's dead-worker sweep requeues everything it was holding.
         """
         from pyjobby import db as pjdb
+        from pyjobby.monitor import sweep_dead_workers
 
         conn = await pjdb.connect(**db_params)
+        pool = await pjdb.create_pool(**db_params, min_size=1, max_size=2)
 
         try:
             # Create jobs
@@ -489,30 +514,59 @@ class TestLiveProducerConsumerWorkflows:
                 )
                 job_ids.append(job_id)
 
-            # Start a worker
+            # Start a worker that holds each job long enough to still own one
+            # when we kill it
             worker1 = multiprocessing.Process(
                 daemon=True,
                 target=run_worker_process,
-                args=(1, "test", db_params, 3),  # Short duration
+                args=(1, "test", db_params, 30, 10),
             )
             worker1.start()
 
-            # Let it claim some jobs
+            # Let it register and claim some jobs
             await asyncio.sleep(2)
 
-            # KILL the worker (simulate crash)
+            # KILL the worker (simulate crash) — no graceful deregistration
             if worker1.is_alive():
                 worker1.kill()
                 worker1.join()
 
-            # Wait for recovery timeout (jobs should be abandoned)
-            await asyncio.sleep(7)  # Recovery timeout is 5 seconds
+            # Let the dead worker's heartbeat age past the liveness grace
+            await asyncio.sleep(2)
 
-            # Start a new worker with recovery enabled
+            in_flight = await conn.fetchval(
+                """SELECT count(*) FROM jorb
+                   WHERE id = ANY($1::bigint[])
+                     AND state IN ('claimed', 'running')""",
+                job_ids,
+            )
+            assert in_flight >= 1, "worker died without owning any job"
+
+            # The monitor sweep reclaims exactly the orphaned in-flight jobs
+            requeued = await sweep_dead_workers(pool, liveness_grace_seconds=1)
+            assert requeued == in_flight, (
+                f"sweep requeued {requeued} jobs, {in_flight} were orphaned"
+            )
+
+            still_stuck = await conn.fetchval(
+                """SELECT count(*) FROM jorb
+                   WHERE id = ANY($1::bigint[])
+                     AND state IN ('claimed', 'running')""",
+                job_ids,
+            )
+            assert still_stuck == 0, "orphaned jobs left in claimed/running"
+
+            # The crashed worker is retired from the registry
+            live_workers = await conn.fetchval(
+                "SELECT count(*) FROM jorb_worker WHERE shutdown_at IS NULL"
+            )
+            assert live_workers == 0
+
+            # A fresh worker picks the requeued jobs back up
             worker2 = multiprocessing.Process(
                 daemon=True,
                 target=run_worker_process,
-                args=(2, "test", db_params, 15, True),  # enable_recovery=True
+                args=(2, "test", db_params, 15),
             )
             worker2.start()
 
@@ -533,14 +587,14 @@ class TestLiveProducerConsumerWorkflows:
             assert completed, "Not all jobs completed after crash recovery"
 
             states = await get_job_states(conn, job_ids)
-            finished_count = states.get("finished", 0)
-
-            # Most should succeed (some may have been mid-execution during crash)
-            success_rate = finished_count / job_count
-            assert success_rate >= 0.7, f"Success rate after crash: {success_rate:.1%}"
+            assert states.get("finished", 0) == job_count, (
+                f"expected every job finished after recovery, got {states}"
+            )
 
         finally:
+            await pool.close()
             await conn.execute("DELETE FROM jorb")
+            await conn.execute("DELETE FROM jorb_worker")
             await conn.close()
 
 

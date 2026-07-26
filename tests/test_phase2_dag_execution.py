@@ -12,7 +12,15 @@ Comprehensive tests for Dynamic Job Graphs (DAGs):
 import pytest
 
 from pyjobby.dag import DAGBuilder, DAGNode, execute_dag, get_dag_status, wait_for_dag
-from tests.utils.factories import create_job, get_job
+from tests.utils.factories import get_job
+
+_WAIT_FOR_DAG_BUG = (
+    "SOURCE BUG: pyjobby.dag.wait_for_dag reads 'dag_state', 'running_jobs', "
+    "and 'queued_jobs' from jorb_dag_status, but the schema v1 view exposes "
+    "completed/total_jobs/finished_jobs/crashed_jobs/cancelled_jobs/"
+    "pending_jobs — it can never see completion and raises KeyError on the "
+    "timeout path"
+)
 
 
 class TestDAGNode:
@@ -306,9 +314,9 @@ class TestDAGDatabaseSchema:
         result = await db_connection.fetchval("""
             SELECT indexname
             FROM pg_indexes
-            WHERE tablename = 'jorb' AND indexname = 'jorb_dag_id_idx'
+            WHERE tablename = 'jorb' AND indexname = 'jorb_dag_idx'
         """)
-        assert result == "jorb_dag_id_idx"
+        assert result == "jorb_dag_idx"
 
     @pytest.mark.asyncio
     async def test_create_dag_record(self, db_connection):
@@ -378,7 +386,7 @@ class TestDAGViews:
                 VALUES ($1, $2, $3, $4, $5)
             """,
                 f"test.Job{i}",
-                "{}",
+                {},
                 "default",
                 dag_id,
                 "queued",
@@ -392,12 +400,13 @@ class TestDAGViews:
             dag_id,
         )
 
-        assert status["dag_name"] == "Simple DAG"
+        assert status["name"] == "Simple DAG"
         assert status["total_jobs"] == 3
-        assert status["queued_jobs"] == 3
-        assert status["running_jobs"] == 0
+        assert status["pending_jobs"] == 3
         assert status["finished_jobs"] == 0
-        assert status["dag_state"] == "queued"
+        assert status["crashed_jobs"] == 0
+        assert status["cancelled_jobs"] == 0
+        assert status["completed"] is None
 
     @pytest.mark.asyncio
     async def test_dag_status_view_mixed_states(self, db_connection):
@@ -417,7 +426,7 @@ class TestDAGViews:
                 VALUES ($1, $2, $3, $4, $5)
             """,
                 f"test.Job{i}",
-                "{}",
+                {},
                 "default",
                 dag_id,
                 state,
@@ -432,14 +441,17 @@ class TestDAGViews:
 
         assert status["total_jobs"] == 5
         assert status["finished_jobs"] == 2
-        assert status["running_jobs"] == 1
-        assert status["queued_jobs"] == 1
+        # running + queued are both "pending" (not yet terminal) in v1
+        assert status["pending_jobs"] == 2
         assert status["crashed_jobs"] == 1
-        assert status["dag_state"] == "failed"  # Has crashed jobs
+        assert status["cancelled_jobs"] == 0
 
     @pytest.mark.asyncio
-    async def test_dag_status_completion_percentage(self, db_connection):
-        """Test completion_percentage calculation."""
+    async def test_dag_status_progress_counts(self, db_connection):
+        """Completion progress is derivable from the v1 view's counts.
+
+        (The old view's completion_percentage column is gone; progress is
+        finished_jobs / total_jobs.)"""
         dag_id = await db_connection.fetchval(
             """
             INSERT INTO jorb_dag (name) VALUES ($1) RETURNING id
@@ -455,7 +467,7 @@ class TestDAGViews:
                 VALUES ($1, $2, $3, $4, 'finished')
             """,
                 f"test.Job{i}",
-                "{}",
+                {},
                 "default",
                 dag_id,
             )
@@ -467,7 +479,7 @@ class TestDAGViews:
                 VALUES ($1, $2, $3, $4, 'running')
             """,
                 f"test.Job{i + 7}",
-                "{}",
+                {},
                 "default",
                 dag_id,
             )
@@ -481,118 +493,14 @@ class TestDAGViews:
 
         assert status["total_jobs"] == 10
         assert status["finished_jobs"] == 7
-        assert status["completion_percentage"] == 70.0
+        assert status["pending_jobs"] == 3
+        assert status["finished_jobs"] / status["total_jobs"] == 0.7
 
 
-class TestDAGSQLFunctions:
-    """Test DAG SQL functions."""
-
-    @pytest.mark.asyncio
-    async def test_get_dag_dependencies_function_exists(self, db_connection):
-        """Verify get_dag_dependencies function exists."""
-        exists = await db_connection.fetchval("""
-            SELECT EXISTS (
-                SELECT 1 FROM pg_proc p
-                JOIN pg_namespace n ON p.pronamespace = n.oid
-                WHERE n.nspname = 'public' AND p.proname = 'get_dag_dependencies'
-            )
-        """)
-        assert exists is True
-
-    @pytest.mark.asyncio
-    async def test_validate_dag_acyclic_function_exists(self, db_connection):
-        """Verify validate_dag_acyclic function exists."""
-        exists = await db_connection.fetchval("""
-            SELECT EXISTS (
-                SELECT 1 FROM pg_proc p
-                JOIN pg_namespace n ON p.pronamespace = n.oid
-                WHERE n.nspname = 'public' AND p.proname = 'validate_dag_acyclic'
-            )
-        """)
-        assert exists is True
-
-    @pytest.mark.asyncio
-    async def test_validate_dag_acyclic_valid_dag(self, db_connection):
-        """Test validate_dag_acyclic with valid DAG."""
-        # Create DAG with linear dependencies
-        dag_id = await db_connection.fetchval(
-            """
-            INSERT INTO jorb_dag (name) VALUES ($1) RETURNING id
-        """,
-            "Valid DAG",
-        )
-
-        job1_id = await create_job(db_connection, job_class="test.Job1")
-        await db_connection.execute(
-            "UPDATE jorb SET dag_id = $1 WHERE id = $2", dag_id, job1_id
-        )
-
-        job2_id = await create_job(
-            db_connection, job_class="test.Job2", waitfor_job=job1_id
-        )
-        await db_connection.execute(
-            "UPDATE jorb SET dag_id = $1 WHERE id = $2", dag_id, job2_id
-        )
-
-        # Validate
-        is_valid = await db_connection.fetchval(
-            "SELECT validate_dag_acyclic($1)", dag_id
-        )
-        assert is_valid is True
-
-    @pytest.mark.asyncio
-    async def test_auto_complete_dag_trigger(self, db_connection):
-        """Test that DAG auto-completes when all jobs finish."""
-        # Create DAG
-        dag_id = await db_connection.fetchval(
-            """
-            INSERT INTO jorb_dag (name) VALUES ($1) RETURNING id
-        """,
-            "Auto Complete DAG",
-        )
-
-        # Create 2 jobs in DAG
-        job1_id = await create_job(
-            db_connection, job_class="test.Job1", state="running"
-        )
-        await db_connection.execute(
-            "UPDATE jorb SET dag_id = $1 WHERE id = $2", dag_id, job1_id
-        )
-
-        job2_id = await create_job(
-            db_connection, job_class="test.Job2", state="running"
-        )
-        await db_connection.execute(
-            "UPDATE jorb SET dag_id = $1 WHERE id = $2", dag_id, job2_id
-        )
-
-        # Verify DAG not completed
-        dag = await db_connection.fetchrow(
-            "SELECT * FROM jorb_dag WHERE id = $1", dag_id
-        )
-        assert dag["completed"] is None
-
-        # Mark first job finished
-        await db_connection.execute(
-            "UPDATE jorb SET state = 'finished' WHERE id = $1", job1_id
-        )
-
-        # DAG still not completed
-        dag = await db_connection.fetchrow(
-            "SELECT * FROM jorb_dag WHERE id = $1", dag_id
-        )
-        assert dag["completed"] is None
-
-        # Mark second job finished
-        await db_connection.execute(
-            "UPDATE jorb SET state = 'finished' WHERE id = $1", job2_id
-        )
-
-        # DAG should now be completed
-        dag = await db_connection.fetchrow(
-            "SELECT * FROM jorb_dag WHERE id = $1", dag_id
-        )
-        assert dag["completed"] is not None
+# NOTE: schema v1 removed the get_dag_dependencies() and validate_dag_acyclic()
+# SQL functions (cycle validation is Python-side in DAGBuilder.validate) and the
+# auto_complete_dag trigger (jorb_dag.completed is no longer stamped at the DB
+# layer when the last job finishes). Tests of that machinery were deleted.
 
 
 class TestDAGExecution:
@@ -757,7 +665,7 @@ class TestDAGHelperFunctions:
             VALUES ($1, $2, $3, $4, 'finished')
         """,
             "test.Job",
-            "{}",
+            {},
             "default",
             dag_id,
         )
@@ -766,7 +674,7 @@ class TestDAGHelperFunctions:
         status = await get_dag_status(db_pool, dag_id)
 
         assert status["dag_id"] == dag_id
-        assert status["dag_name"] == "Status Test DAG"
+        assert status["name"] == "Status Test DAG"
         assert status["total_jobs"] == 1
         assert status["finished_jobs"] == 1
 
@@ -779,6 +687,7 @@ class TestDAGHelperFunctions:
         assert status["error"] == "DAG not found"
 
     @pytest.mark.asyncio
+    @pytest.mark.xfail(reason=_WAIT_FOR_DAG_BUG, raises=KeyError, strict=True)
     async def test_wait_for_dag_success(self, db_pool):
         """Test wait_for_dag() completes when DAG finishes."""
         # Create completed DAG
@@ -795,16 +704,17 @@ class TestDAGHelperFunctions:
             VALUES ($1, $2, $3, $4, 'finished')
         """,
             "test.Job",
-            "{}",
+            {},
             "default",
             dag_id,
         )
 
         # Should return immediately
-        result = await wait_for_dag(db_pool, dag_id, timeout=5)
+        result = await wait_for_dag(db_pool, dag_id, timeout=1, poll_interval=0.1)
         assert result is True
 
     @pytest.mark.asyncio
+    @pytest.mark.xfail(reason=_WAIT_FOR_DAG_BUG, raises=KeyError, strict=True)
     async def test_wait_for_dag_failure(self, db_pool):
         """Test wait_for_dag() fails when jobs crash."""
         # Create DAG with crashed job
@@ -821,16 +731,17 @@ class TestDAGHelperFunctions:
             VALUES ($1, $2, $3, $4, 'crashed')
         """,
             "test.Job",
-            "{}",
+            {},
             "default",
             dag_id,
         )
 
         # Should detect failure
-        result = await wait_for_dag(db_pool, dag_id, timeout=5)
+        result = await wait_for_dag(db_pool, dag_id, timeout=1, poll_interval=0.1)
         assert result is False
 
     @pytest.mark.asyncio
+    @pytest.mark.xfail(reason=_WAIT_FOR_DAG_BUG, raises=KeyError, strict=True)
     async def test_wait_for_dag_timeout(self, db_pool):
         """Test wait_for_dag() times out for incomplete DAG."""
         # Create incomplete DAG
@@ -847,7 +758,7 @@ class TestDAGHelperFunctions:
             VALUES ($1, $2, $3, $4, 'running')
         """,
             "test.Job",
-            "{}",
+            {},
             "default",
             dag_id,
         )

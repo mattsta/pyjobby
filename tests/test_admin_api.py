@@ -4,6 +4,8 @@ Tests for Admin API
 Tests all administrative operations for job, queue, and worker management.
 """
 
+from datetime import UTC, datetime
+
 import pytest
 
 from pyjobby.admin_api import AdminAPI
@@ -19,7 +21,9 @@ async def create_test_job(conn, **kwargs):
     """Helper to create a test job"""
     defaults = {
         "job_class": "job.test.TestJob",
-        "kwargs": "{}",
+        # jsonb params take dicts directly (orjson codec); kwargs/admin_data
+        # are NOT NULL DEFAULT '{}' in schema v1
+        "kwargs": {},
         "queue": "default",
         "state": "queued",
         "prio": 100,
@@ -28,8 +32,9 @@ async def create_test_job(conn, **kwargs):
 
     return await conn.fetchval(
         """
-        INSERT INTO jorb (job_class, kwargs, queue, state, prio, uid, error_count)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO jorb (job_class, kwargs, queue, state, prio, uid,
+                          error_count, error_message)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         RETURNING id
     """,
         defaults["job_class"],
@@ -39,6 +44,7 @@ async def create_test_job(conn, **kwargs):
         defaults["prio"],
         defaults.get("uid"),
         defaults.get("error_count", 0),
+        defaults.get("error_message"),
     )
 
 
@@ -144,25 +150,27 @@ class TestJobManagement:
         assert job is None
 
     async def test_retry_job_crashed(self, admin_api, db_connection):
-        """Test retrying a crashed job"""
+        """Test retrying a crashed job requeues the SAME row"""
         # Create crashed job
         job_id = await create_test_job(
-            db_connection, state="crashed", error_count=3, job_class="job.test.FailJob"
+            db_connection,
+            state="crashed",
+            error_count=3,
+            error_message="boom",
+            job_class="job.test.FailJob",
         )
 
         # Retry job
         result = await admin_api.retry_job(job_id)
 
-        assert result["original_job_id"] == job_id
-        assert result["new_job_id"] != job_id
-        assert result["status"] == "retry_queued"
+        assert result == {"job_id": job_id, "status": "requeued"}
 
-        # Check new job was created
-        new_job = await admin_api.get_job(result["new_job_id"])
-        assert new_job["state"] == "queued"
-        assert new_job["job_class"] == "job.test.FailJob"
-        assert new_job["error_count"] == 0
-        assert new_job["admin_data"]["parent_job_id"] == job_id
+        # The same row is requeued with its error budget reset
+        job = await admin_api.get_job(job_id)
+        assert job["state"] == "queued"
+        assert job["job_class"] == "job.test.FailJob"
+        assert job["error_count"] == 0
+        assert job["error_message"] is None
 
     async def test_retry_job_not_retriable(self, admin_api, db_connection):
         """Test retrying a job in non-retriable state"""
@@ -190,9 +198,8 @@ class TestJobManagement:
         results = await admin_api.retry_jobs(job_ids)
 
         assert len(results) == 3
-        for result in results:
-            assert result["status"] == "retry_queued"
-            assert result["new_job_id"] != result["original_job_id"]
+        for result, job_id in zip(results, job_ids):
+            assert result == {"job_id": job_id, "status": "requeued"}
 
     async def test_cancel_job(self, admin_api, db_connection):
         """Test cancelling a queued job"""
@@ -219,13 +226,27 @@ class TestJobManagement:
 
         assert result["status"] == "cancelled"
 
-    async def test_cancel_job_not_cancellable(self, admin_api, db_connection):
-        """Test cancelling a job in non-cancellable state"""
+    async def test_cancel_running_job_requests_cancellation(
+        self, admin_api, db_connection
+    ):
+        """Running jobs ARE cancellable now: a cancel request is delivered"""
         # Create running job
         job_id = await create_test_job(db_connection, state="running")
 
-        # Attempt cancel
-        with pytest.raises(ValueError, match="can only cancel queued or waiting"):
+        result = await admin_api.cancel_job(job_id)
+
+        assert result == {"job_id": job_id, "status": "cancel_requested"}
+
+        # The row stays running with cancel_requested set for its worker
+        job = await admin_api.get_job(job_id)
+        assert job["state"] == "running"
+        assert job["cancel_requested"] is True
+
+    async def test_cancel_job_terminal_raises(self, admin_api, db_connection):
+        """Terminal jobs cannot be cancelled"""
+        job_id = await create_test_job(db_connection, state="finished")
+
+        with pytest.raises(ValueError, match="cannot be cancelled"):
             await admin_api.cancel_job(job_id)
 
     async def test_cancel_jobs_bulk(self, admin_api, db_connection):
@@ -234,18 +255,24 @@ class TestJobManagement:
         queued_id = await create_test_job(db_connection, state="queued")
         waiting_id = await create_test_job(db_connection, state="waiting")
         running_id = await create_test_job(db_connection, state="running")
+        finished_id = await create_test_job(db_connection, state="finished")
 
         # Bulk cancel
-        results = await admin_api.cancel_jobs([queued_id, waiting_id, running_id])
+        results = await admin_api.cancel_jobs(
+            [queued_id, waiting_id, running_id, finished_id]
+        )
 
-        assert len(results) == 3
+        assert len(results) == 4
 
-        # First two should succeed
+        # Queued/waiting are cancelled immediately
         assert results[0]["status"] == "cancelled"
         assert results[1]["status"] == "cancelled"
 
-        # Third should fail
-        assert results[2]["status"] == "error"
+        # Running gets a cancellation request delivered to its worker
+        assert results[2]["status"] == "cancel_requested"
+
+        # Terminal jobs fail
+        assert results[3]["status"] == "error"
 
     async def test_delete_job(self, admin_api, db_connection):
         """Test deleting a job"""
@@ -305,12 +332,18 @@ class TestQueueManagement:
         await create_test_job(db_connection, queue="priority")
         await create_test_job(db_connection, queue="batch")
 
-        # List queues
+        # List queues: rows carry the jorb_queue control fields alongside
         queues = await admin_api.list_queues()
 
-        assert "default" in queues
-        assert "priority" in queues
-        assert "batch" in queues
+        names = [q["name"] for q in queues]
+        assert "default" in names
+        assert "priority" in names
+        assert "batch" in names
+        # No control rows exist, so every queue shows unpaused defaults
+        for q in queues:
+            assert q["paused"] is False
+            assert q["max_concurrency"] is None
+            assert q["rate_limit"] is None
 
     async def test_queue_stats_all(self, admin_api, db_connection):
         """Test getting stats for all queues"""
@@ -390,85 +423,74 @@ class TestQueueManagement:
         assert len(jobs) == 1
 
 
+async def register_worker(conn, host, pid, queue="default", **kwargs):
+    """Insert a jorb_worker registry row (what list_workers reads now)."""
+    return await conn.fetchval(
+        """
+        INSERT INTO jorb_worker (host, pid, queue, capabilities, shutdown_at)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id
+        """,
+        host,
+        pid,
+        queue,
+        list(kwargs.get("capabilities", ["test"])),
+        kwargs.get("shutdown_at"),
+    )
+
+
 class TestWorkerManagement:
-    """Tests for worker management API"""
+    """Tests for the registry-based worker management API"""
 
     async def test_list_workers_empty(self, admin_api):
-        """Test listing workers when none active"""
+        """Test listing workers when none registered"""
         workers = await admin_api.list_workers()
-        assert isinstance(workers, list)
+        assert workers == []
 
-    async def test_list_workers_active(self, admin_api, db_connection):
-        """Test listing active workers"""
-        # Create claimed/running jobs
+    async def test_list_workers_registered(self, admin_api, db_connection):
+        """Workers come from the jorb_worker registry, with claimed job"""
+        w1 = await register_worker(db_connection, "worker-1", 12345)
+        await register_worker(db_connection, "worker-2", 67890)
+
+        # Give worker-1 a claimed job so its current job shows up
         await db_connection.execute(
             """
-            INSERT INTO jorb (job_class, kwargs, queue, state, worker_host, worker_pid)
-            VALUES ($1, $2, $3, $4, $5, $6)
-        """,
-            "job.test.TestJob",
-            "{}",
-            "default",
-            "claimed",
-            "worker-1",
-            12345,
+            INSERT INTO jorb (job_class, queue, state, claimed_by,
+                              worker_host, worker_pid)
+            VALUES ('job.test.TestJob', 'default', 'running', $1,
+                    'worker-1', 12345)
+            """,
+            w1,
         )
 
-        await db_connection.execute(
-            """
-            INSERT INTO jorb (job_class, kwargs, queue, state, worker_host, worker_pid)
-            VALUES ($1, $2, $3, $4, $5, $6)
-        """,
-            "job.test.TestJob",
-            "{}",
-            "default",
-            "running",
-            "worker-2",
-            67890,
-        )
-
-        # List workers
         workers = await admin_api.list_workers()
 
-        assert len(workers) >= 2
-        hosts = [w["worker_host"] for w in workers]
-        assert "worker-1" in hosts
-        assert "worker-2" in hosts
+        assert len(workers) == 2
+        by_host = {w["host"]: w for w in workers}
+        assert by_host["worker-1"]["pid"] == 12345
+        assert by_host["worker-1"]["live"] is True
+        assert by_host["worker-1"]["current_job_class"] == "job.test.TestJob"
+        assert by_host["worker-2"]["current_job_id"] is None
 
     async def test_worker_stats(self, admin_api, db_connection):
-        """Test worker statistics"""
-        # Create jobs for workers
-        await db_connection.execute(
-            """
-            INSERT INTO jorb (job_class, kwargs, queue, state, worker_host, worker_pid)
-            VALUES ($1, $2, $3, $4, $5, $6)
-        """,
-            "job.test.TestJob",
-            "{}",
-            "default",
-            "running",
-            "worker-1",
-            100,
+        """Registry-based aggregate worker statistics"""
+        await register_worker(db_connection, "worker-1", 100, queue="alpha")
+        await register_worker(db_connection, "worker-2", 200, queue="alpha")
+        await register_worker(
+            db_connection,
+            "worker-3",
+            300,
+            queue="beta",
+            shutdown_at=datetime.now(UTC),
         )
 
-        await db_connection.execute(
-            """
-            INSERT INTO jorb (job_class, kwargs, queue, state, worker_host, worker_pid)
-            VALUES ($1, $2, $3, $4, $5, $6)
-        """,
-            "job.test.TestJob",
-            "{}",
-            "default",
-            "running",
-            "worker-1",
-            100,
-        )
-
-        # Get stats
         stats = await admin_api.worker_stats()
 
-        assert stats["active_workers"] >= 1
-        assert len(stats["workers"]) >= 1
+        assert stats["live_workers"] == 2
+        assert stats["active_workers"] == 2  # compat alias
+        assert stats["shutdown_workers"] == 1
+        assert stats["total_registered"] == 3
+        assert stats["per_queue"] == {"alpha": 2}
 
 
 class TestMetrics:
@@ -528,39 +550,39 @@ class TestDeadLetterQueue:
     """Tests for Dead Letter Queue API"""
 
     async def test_list_dlq(self, admin_api, db_connection):
-        """Test listing DLQ jobs"""
-        # Create permanently failed job (error_count >= 10)
-        await create_test_job(
+        """The DLQ is exactly the crashed jobs: no error-count heuristic"""
+        crashed_high = await create_test_job(
             db_connection,
             state="crashed",
             error_count=10,
             job_class="job.test.PermanentFail",
         )
+        crashed_low = await create_test_job(
+            db_connection, state="crashed", error_count=3
+        )
+        queued_id = await create_test_job(db_connection, state="queued")
 
-        # Create regular crashed job
-        await create_test_job(db_connection, state="crashed", error_count=3)
-
-        # List DLQ
+        # List DLQ: every crashed job is in it, regardless of error_count
         dlq_jobs = await admin_api.list_dlq()
 
-        assert len(dlq_jobs) >= 1
-        assert all(j["error_count"] >= 10 for j in dlq_jobs)
+        dlq_ids = {j["id"] for j in dlq_jobs}
+        assert crashed_high in dlq_ids
+        assert crashed_low in dlq_ids
+        assert queued_id not in dlq_ids
         assert all(j["state"] == "crashed" for j in dlq_jobs)
 
     async def test_retry_from_dlq(self, admin_api, db_connection):
-        """Test retrying job from DLQ"""
+        """Test retrying job from DLQ requeues the same row with errors reset"""
         # Create DLQ job
         job_id = await create_test_job(db_connection, state="crashed", error_count=10)
 
         # Retry from DLQ
         result = await admin_api.retry_from_dlq(job_id)
 
-        assert result["original_job_id"] == job_id
-        assert result["new_job_id"] != job_id
-        assert result["status"] == "retry_queued_from_dlq"
+        assert result == {"job_id": job_id, "status": "requeued_from_dlq"}
 
-        # Check new job has reset error_count
-        new_job = await admin_api.get_job(result["new_job_id"])
-        assert new_job["error_count"] == 0
-        assert new_job["state"] == "queued"
-        assert new_job["admin_data"]["dlq_retry_from"] == job_id
+        # The same row is requeued with a fresh error budget
+        job = await admin_api.get_job(job_id)
+        assert job["error_count"] == 0
+        assert job["error_message"] is None
+        assert job["state"] == "queued"

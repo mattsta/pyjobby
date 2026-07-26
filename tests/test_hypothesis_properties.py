@@ -24,7 +24,7 @@ Each test runs 100+ examples by default to find edge cases.
 """
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import asyncpg
 import pytest
@@ -135,7 +135,10 @@ class TestProducerConsumerInvariants:
     ):
         """Property: All created jobs in 'queued' state should eventually be claimable."""
 
-        # Create N jobs
+        # Create N jobs (run_after in the past: inside the test transaction
+        # now() is frozen at transaction start, so a wall-clock run_after
+        # would not be claimable yet)
+        claimable_at = datetime.now(UTC) - timedelta(minutes=5)
         job_ids = []
         for i in range(job_count):
             job_id = await create_job(
@@ -143,6 +146,7 @@ class TestProducerConsumerInvariants:
                 state="queued",
                 queue=queue,
                 prio=prio + i,  # Vary priority slightly
+                run_after=claimable_at,
             )
             job_ids.append(job_id)
 
@@ -156,6 +160,7 @@ class TestProducerConsumerInvariants:
                 queue,
                 [None],  # capabilities - accept jobs with no capability
                 prio + job_count,  # max priority
+                None,  # claimed_by (unregistered worker)
             )
             if result:
                 claimed.append(result[0]["id"])
@@ -176,10 +181,13 @@ class TestProducerConsumerInvariants:
     async def test_no_duplicate_claims(self, db_connection, job_count: int, queue: str):
         """Property: Each job should be claimed at most once (SKIP LOCKED ensures this)."""
 
-        # Create N jobs
+        # Create N jobs (run_after backdated past the frozen transaction now())
+        claimable_at = datetime.now(UTC) - timedelta(minutes=5)
         job_ids = []
         for _ in range(job_count):
-            job_id = await create_job(db_connection, state="queued", queue=queue)
+            job_id = await create_job(
+                db_connection, state="queued", queue=queue, run_after=claimable_at
+            )
             job_ids.append(job_id)
 
         # Simulate multiple workers trying to claim simultaneously
@@ -194,6 +202,7 @@ class TestProducerConsumerInvariants:
                 queue,
                 [None],
                 10000,
+                None,  # claimed_by (unregistered worker)
             )
             if result:
                 claimed_jobs.append(result[0]["id"])
@@ -230,15 +239,15 @@ class TestProducerConsumerInvariants:
             )
             job_ids.append(job_id)
 
-        # Mark some as finished, some as crashed
+        # Mark some as finished, some as crashed (epoch 0 = fresh rows)
         for i, job_id in enumerate(job_ids):
             if i < finish_count:
                 await db_connection.execute(
-                    STMTS["finished"], job_id, {"status": "success"}
+                    STMTS["finished"], job_id, {"status": "success"}, 0
                 )
             else:
                 await db_connection.execute(
-                    STMTS["crash"], job_id, "Error", "Traceback"
+                    STMTS["crashed"], job_id, "Error", "Traceback", 0
                 )
 
         # Invariant: All jobs should be in terminal states
@@ -327,7 +336,12 @@ class TestConcurrentProducers:
 
 @pytest.mark.hypothesis
 class TestRecoveryInvariants:
-    """Property tests for job recovery after worker crashes."""
+    """Property tests for reclaiming jobs abandoned by dead workers.
+
+    Schema v1 removed the worker-side 'recover-abandoned' statement; the
+    equivalent primitive is the monitor's unregistered-claim sweep
+    (pyjobby.monitor.sweep_unregistered_claims), which requeues 'claimed'
+    jobs with no registry reference once they age past a grace period."""
 
     @settings(
         max_examples=500,
@@ -339,18 +353,20 @@ class TestRecoveryInvariants:
         recovery_timeout_minutes=st.integers(min_value=1, max_value=60),  # Wider range
     )
     async def test_recovery_returns_abandoned_jobs(
-        self, db_connection, crashed_job_count: int, recovery_timeout_minutes: int
+        self, db_pool, crashed_job_count: int, recovery_timeout_minutes: int
     ):
-        """Property: Jobs from crashed workers older than timeout should be recovered."""
+        """Property: Claims from dead workers older than the grace period
+        should be requeued."""
+        from pyjobby.monitor import sweep_unregistered_claims
 
-        # Create claimed jobs from a "crashed" worker
+        # Create claimed jobs from a "crashed" (never registered) worker
         job_ids = []
-        old_time = datetime.utcnow() - timedelta(minutes=recovery_timeout_minutes + 5)
+        old_time = datetime.now(UTC) - timedelta(minutes=recovery_timeout_minutes + 5)
 
         for _ in range(crashed_job_count):
-            job_id = await create_job(db_connection, state="queued")
-            # Claim it as crashed worker
-            await db_connection.execute(
+            job_id = await create_job(db_pool, state="queued")
+            # Claim it as the crashed worker (no jorb_worker registration)
+            await db_pool.execute(
                 """UPDATE jorb SET state = 'claimed', worker_host = 'crashed-worker',
                    worker_pid = 99999, updated = $1 WHERE id = $2""",
                 old_time,
@@ -358,21 +374,23 @@ class TestRecoveryInvariants:
             )
             job_ids.append(job_id)
 
-        # Recover abandoned jobs
-        recovery_interval = timedelta(minutes=recovery_timeout_minutes)
-        recovered = await db_connection.fetch(
-            STMTS["recover-abandoned"], "crashed-worker", recovery_interval
+        # Recover abandoned claims
+        recovered = await sweep_unregistered_claims(
+            db_pool,
+            claimed_grace_seconds=recovery_timeout_minutes * 60,
+            batch_size=crashed_job_count,
         )
 
         # Invariant: All jobs should be recovered
-        recovered_ids = [r["id"] for r in recovered]
-        assert len(recovered_ids) == crashed_job_count
-        assert set(recovered_ids) == set(job_ids)
+        assert recovered == crashed_job_count
 
         # Invariant: All recovered jobs should be queued again
         for job_id in job_ids:
-            job = await get_job(db_connection, job_id)
+            job = await get_job(db_pool, job_id)
             assert job["state"] == "queued"
+
+        # keep hypothesis examples independent of each other
+        await db_pool.execute("DELETE FROM jorb WHERE id = ANY($1)", job_ids)
 
     @settings(
         max_examples=500,
@@ -384,18 +402,17 @@ class TestRecoveryInvariants:
         recent_job_count=st.integers(min_value=1, max_value=15),  # More jobs
     )
     async def test_recovery_respects_timeout(
-        self, db_connection, old_job_count: int, recent_job_count: int
+        self, db_pool, old_job_count: int, recent_job_count: int
     ):
-        """Property: Only jobs older than recovery timeout should be recovered."""
-
-        recovery_timeout = timedelta(minutes=5)
+        """Property: Only claims older than the grace period are requeued."""
+        from pyjobby.monitor import sweep_unregistered_claims
 
         # Create old jobs (should be recovered)
         old_job_ids = []
-        old_time = datetime.utcnow() - timedelta(minutes=10)
+        old_time = datetime.now(UTC) - timedelta(minutes=10)
         for _ in range(old_job_count):
-            job_id = await create_job(db_connection, state="queued")
-            await db_connection.execute(
+            job_id = await create_job(db_pool, state="queued")
+            await db_pool.execute(
                 """UPDATE jorb SET state = 'claimed', worker_host = 'worker-1',
                    updated = $1 WHERE id = $2""",
                 old_time,
@@ -405,10 +422,10 @@ class TestRecoveryInvariants:
 
         # Create recent jobs (should NOT be recovered)
         recent_job_ids = []
-        recent_time = datetime.utcnow() - timedelta(minutes=2)
+        recent_time = datetime.now(UTC) - timedelta(minutes=2)
         for _ in range(recent_job_count):
-            job_id = await create_job(db_connection, state="queued")
-            await db_connection.execute(
+            job_id = await create_job(db_pool, state="queued")
+            await db_pool.execute(
                 """UPDATE jorb SET state = 'claimed', worker_host = 'worker-1',
                    updated = $1 WHERE id = $2""",
                 recent_time,
@@ -416,20 +433,27 @@ class TestRecoveryInvariants:
             )
             recent_job_ids.append(job_id)
 
-        # Recover with 5 minute timeout
-        recovered = await db_connection.fetch(
-            STMTS["recover-abandoned"], "worker-1", recovery_timeout
+        # Recover with 5 minute grace
+        recovered = await sweep_unregistered_claims(
+            db_pool, claimed_grace_seconds=300
         )
-        recovered_ids = [r["id"] for r in recovered]
 
         # Invariant: Only old jobs should be recovered
-        assert len(recovered_ids) == old_job_count
-        assert set(recovered_ids) == set(old_job_ids)
+        assert recovered == old_job_count
+        for job_id in old_job_ids:
+            job = await get_job(db_pool, job_id)
+            assert job["state"] == "queued"
 
         # Invariant: Recent jobs should still be claimed
         for job_id in recent_job_ids:
-            job = await get_job(db_connection, job_id)
+            job = await get_job(db_pool, job_id)
             assert job["state"] == "claimed"
+
+        # keep hypothesis examples independent of each other (a leftover
+        # "recent" claim would age past the grace in a later example)
+        await db_pool.execute(
+            "DELETE FROM jorb WHERE id = ANY($1)", old_job_ids + recent_job_ids
+        )
 
 
 # ============================================================================
@@ -459,10 +483,18 @@ class TestPriorityOrdering:
     ):
         """Property: Jobs should be claimed in priority order (lower number first)."""
 
-        # Create jobs with different priorities
+        # Create jobs with different priorities (run_after backdated past the
+        # frozen transaction now())
         queue = "test"
+        claimable_at = datetime.now(UTC) - timedelta(minutes=5)
         for prio in priorities:
-            await create_job(db_connection, state="queued", queue=queue, prio=prio)
+            await create_job(
+                db_connection,
+                state="queued",
+                queue=queue,
+                prio=prio,
+                run_after=claimable_at,
+            )
 
         # Claim jobs one by one
         claimed_priorities = []
@@ -474,6 +506,7 @@ class TestPriorityOrdering:
                 queue,
                 [None],
                 max(priorities),  # Accept up to max priority
+                None,  # claimed_by (unregistered worker)
             )
             if result:
                 claimed_priorities.append(result[0]["prio"])
@@ -491,9 +524,6 @@ class TestPriorityOrdering:
 class TestCapabilityMatching:
     """Property tests for capability-based job routing."""
 
-    @pytest.mark.skip(
-        reason="Capability matching test needs refinement - core functionality tested elsewhere"
-    )
     @settings(
         max_examples=30,
         deadline=None,
@@ -504,46 +534,77 @@ class TestCapabilityMatching:
         job_count=st.integers(min_value=1, max_value=5),
     )
     async def test_worker_only_claims_matching_capability(
-        self, db_connection, required_capability: str, job_count: int
+        self, db_connection, unique_queue: str, required_capability: str, job_count: int
     ):
-        """Property: Workers only claim jobs matching their capabilities."""
+        """Property: Workers claim jobs whose capability they advertise (or
+        that require none), and never jobs demanding a capability they lack."""
 
-        # Create jobs with specific capability requirement
+        # hypothesis reuses the function-scoped connection across examples;
+        # start each one from an empty queue
+        await db_connection.execute("DELETE FROM jorb WHERE queue = $1", unique_queue)
+
+        other_capability = next(
+            c for c in ("cpu", "gpu", "disk", "network") if c != required_capability
+        )
+        # run_after backdated past the frozen transaction now()
+        claimable_at = datetime.now(UTC) - timedelta(minutes=5)
+
+        # Jobs requiring the worker's capability
         matching_job_ids = []
         for _ in range(job_count):
             job_id = await create_job(
-                db_connection, state="queued", capability=required_capability
+                db_connection,
+                state="queued",
+                queue=unique_queue,
+                capability=required_capability,
+                run_after=claimable_at,
             )
             matching_job_ids.append(job_id)
 
-        # Create jobs with NO capability requirement (should also be claimable)
+        # Jobs with NO capability requirement (any worker may claim)
         no_cap_job_ids = []
         for _ in range(job_count):
             job_id = await create_job(
                 db_connection,
                 state="queued",
-                capability=None,  # No capability - any worker can claim
+                queue=unique_queue,
+                capability=None,
+                run_after=claimable_at,
             )
             no_cap_job_ids.append(job_id)
 
-        # Worker with matching capability tries to claim
+        # Jobs demanding a capability this worker does NOT advertise
+        unmatched_job_ids = []
+        for _ in range(job_count):
+            job_id = await create_job(
+                db_connection,
+                state="queued",
+                queue=unique_queue,
+                capability=other_capability,
+                run_after=claimable_at,
+            )
+            unmatched_job_ids.append(job_id)
+
+        # Worker with matching capability drains what it can
         claimed = []
-        for _ in range(job_count * 2):  # Try to claim all
+        for _ in range(job_count * 3):
             result = await db_connection.fetch(
                 STMTS["claim"],
                 12345,
                 "test-host",
-                "default",
-                [required_capability],  # Worker capabilities
+                unique_queue,
+                [required_capability],  # worker capabilities
                 10000,
+                None,  # claimed_by (unregistered worker)
             )
             if result:
                 claimed.append(result[0]["id"])
 
-        # Invariant: Worker should claim both matching capability jobs AND no-capability jobs
-        # (because workers can claim jobs with matching capability OR NULL capability)
-        assert len(claimed) == job_count * 2
+        # Invariant: matching-capability AND no-capability jobs are claimed...
         assert set(claimed) == set(matching_job_ids + no_cap_job_ids)
+        # ...and jobs needing a capability the worker lacks are left queued
+        for job_id in unmatched_job_ids:
+            assert (await get_job(db_connection, job_id))["state"] == "queued"
 
 
 # ============================================================================
@@ -586,12 +647,12 @@ class TestDependencyResolution:
                 job = await get_job(db_connection, child_id)
                 assert job["state"] == "waiting"
 
-            # Claim and finish parent
+            # Claim and finish parent (epoch 0 = fresh row)
             await db_connection.execute(
                 """UPDATE jorb SET state = 'claimed' WHERE id = $1""", parent_id
             )
             await db_connection.execute(
-                STMTS["finished"], parent_id, {"status": "success"}
+                STMTS["finished"], parent_id, {"status": "success"}, 0
             )
 
             # Trigger dependency resolution

@@ -99,7 +99,12 @@ async def job_client(db_pool):
 
 
 async def claim_job(conn, queue="default", capabilities=None, max_priority=1000):
-    """Claim a job using the actual worker STMTS."""
+    """Claim a job using the actual worker STMTS.
+
+    The v1 claim statement takes 6 parameters: pid, host, queue,
+    capabilities, priority ceiling, and the jorb_worker registry id
+    (None for tests that hand-claim without registering a worker).
+    """
     if capabilities is None:
         capabilities = []
 
@@ -110,27 +115,38 @@ async def claim_job(conn, queue="default", capabilities=None, max_priority=1000)
         queue,
         capabilities,
         max_priority,
+        None,  # claimed_by (jorb_worker.id; no registry row in these tests)
     )
     return claimed
 
 
+async def _run_epoch(conn, job_id) -> int:
+    """Current run_epoch — the fencing token the v1 statements require."""
+    return await conn.fetchval("SELECT run_epoch FROM jorb WHERE id = $1", job_id)
+
+
 async def mark_running(conn, job_id, timeout_seconds=None):
-    """Mark job as running using actual worker STMTS."""
-    await conn.execute(STMTS["run"], job_id)
+    """Mark job as running using actual worker STMTS (epoch-fenced)."""
+    epoch = await _run_epoch(conn, job_id)
+    await conn.execute(STMTS["run"], job_id, epoch)
 
     # Set timeout if specified
     if timeout_seconds:
-        await conn.execute(STMTS["set-timeout"], job_id, f"{timeout_seconds} seconds")
+        await conn.execute(
+            STMTS["set-timeout"], job_id, timedelta(seconds=timeout_seconds), epoch
+        )
 
 
 async def mark_finished(conn, job_id, result: dict):
-    """Mark job as finished using actual worker STMTS."""
-    await conn.execute(STMTS["finished"], job_id, json.dumps(result))
+    """Mark job as finished using actual worker STMTS (epoch-fenced)."""
+    epoch = await _run_epoch(conn, job_id)
+    await conn.execute(STMTS["finished"], job_id, result, epoch)
 
 
 async def mark_error(conn, job_id, error_message: str, error_backtrace: str = ""):
-    """Mark job as crashed using actual worker STMTS."""
-    await conn.execute(STMTS["crash"], job_id, error_message, error_backtrace)
+    """Mark job as crashed (terminal DLQ) using actual worker STMTS."""
+    epoch = await _run_epoch(conn, job_id)
+    await conn.execute(STMTS["crashed"], job_id, error_message, error_backtrace, epoch)
 
 
 async def execute_job(conn, job_row):
@@ -346,9 +362,9 @@ class TestProducerConsumerIntegration:
             )
             job2_kwargs["upstream_result"] = result1
             await conn.execute(
-                "UPDATE jorb SET kwargs = $2::json WHERE id = $1",
+                "UPDATE jorb SET kwargs = $2 WHERE id = $1",
                 job2_id,
-                json.dumps(job2_kwargs),
+                job2_kwargs,
             )
 
             claimed2 = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job2_id)
@@ -374,9 +390,9 @@ class TestProducerConsumerIntegration:
             )
             job3_kwargs["upstream_result"] = result2
             await conn.execute(
-                "UPDATE jorb SET kwargs = $2::json WHERE id = $1",
+                "UPDATE jorb SET kwargs = $2 WHERE id = $1",
                 job3_id,
-                json.dumps(job3_kwargs),
+                job3_kwargs,
             )
 
             claimed3 = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job3_id)
@@ -442,6 +458,7 @@ class TestProducerConsumerIntegration:
                     "default",
                     [],
                     1000,
+                    None,
                 )
                 if claimed:
                     claimed_jobs.append(claimed["id"])
@@ -522,9 +539,9 @@ class TestDAGIntegration:
             )
             job2_kwargs["upstream_result"] = result1
             await conn.execute(
-                "UPDATE jorb SET kwargs = $2::json WHERE id = $1",
+                "UPDATE jorb SET kwargs = $2 WHERE id = $1",
                 job2_id,
-                json.dumps(job2_kwargs),
+                job2_kwargs,
             )
 
             # Execute Job2
@@ -550,9 +567,9 @@ class TestDAGIntegration:
             )
             job3_kwargs["upstream_result"] = result2
             await conn.execute(
-                "UPDATE jorb SET kwargs = $2::json WHERE id = $1",
+                "UPDATE jorb SET kwargs = $2 WHERE id = $1",
                 job3_id,
-                json.dumps(job3_kwargs),
+                job3_kwargs,
             )
 
             # Execute Job3
@@ -567,8 +584,9 @@ class TestDAGIntegration:
             dag_status = await conn.fetchrow(
                 "SELECT * FROM jorb_dag_status WHERE dag_id = $1", dag_id
             )
+            assert dag_status["total_jobs"] == 3
             assert dag_status["finished_jobs"] == 3
-            assert dag_status["dag_state"] == "complete"
+            assert dag_status["pending_jobs"] == 0
 
     async def test_dag_parallel_branches(self, db_pool, job_client):
         """Test: Parallel DAG branches can be processed concurrently."""
@@ -636,9 +654,7 @@ class TestAdvancedClientFeatures:
     async def test_scheduled_job_execution(self, db_pool, job_client):
         """Test: Scheduled job runs at specified time."""
         # PRODUCER: Schedule job for future
-        future_time = datetime.now(UTC).replace(tzinfo=None) + timedelta(
-            seconds=2
-        )
+        future_time = datetime.now(UTC) + timedelta(seconds=2)
         job_id = await job_client.enqueue(
             "tests.test_client_worker_integration.SimpleTestJob",
             run_after=future_time,
@@ -676,6 +692,7 @@ class TestAdvancedClientFeatures:
                 "default",
                 ["cpu"],  # Only has CPU capability
                 1000,
+                None,
             )
             assert claimed_no_gpu is None
 
@@ -687,6 +704,7 @@ class TestAdvancedClientFeatures:
                 "default",
                 ["cpu", "gpu"],  # Has GPU capability
                 1000,
+                None,
             )
             assert claimed_with_gpu is not None
             assert claimed_with_gpu["id"] == job_id

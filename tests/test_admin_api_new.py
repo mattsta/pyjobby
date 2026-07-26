@@ -4,7 +4,7 @@ Using LIVE database operations with NO MOCKS for maximum correctness guarantees!
 """
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -97,7 +97,7 @@ class TestWorkerInfoDataclass:
 
     def test_worker_info_to_dict(self):
         """Test WorkerInfo to_dict with datetime serialization."""
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         worker = WorkerInfo(
             worker_host="host1",
             worker_pid=12345,
@@ -340,14 +340,13 @@ class TestAdminAPIJobManagement:
 
             result = await api.retry_job(job_id)
 
-            assert result["original_job_id"] == job_id
-            assert "new_job_id" in result
-            assert result["status"] == "retry_queued"
+            assert result == {"job_id": job_id, "status": "requeued"}
 
-            # Verify new job was created
-            new_job = await api.get_job(result["new_job_id"])
-            assert new_job["state"] == "queued"
-            assert new_job["job_class"] == "CrashedJob"
+            # The SAME row is requeued (job ids are stable across retries)
+            job = await api.get_job(job_id)
+            assert job["state"] == "queued"
+            assert job["job_class"] == "CrashedJob"
+            assert job["error_count"] == 0
 
     @pytest.mark.asyncio
     async def test_retry_job_not_found(self, db_pool):
@@ -396,8 +395,8 @@ class TestAdminAPIJobManagement:
             results = await api.retry_jobs(job_ids)
 
             assert len(results) == 3
-            for result in results:
-                assert result["status"] == "retry_queued"
+            for result, job_id in zip(results, job_ids):
+                assert result == {"job_id": job_id, "status": "requeued"}
 
     @pytest.mark.asyncio
     async def test_retry_jobs_partial_failure(self, db_pool):
@@ -420,7 +419,7 @@ class TestAdminAPIJobManagement:
 
             assert len(results) == 2
             # First should succeed
-            assert results[0]["status"] == "retry_queued"
+            assert results[0] == {"job_id": crashed_id, "status": "requeued"}
             # Second should fail
             assert results[1]["status"] == "error"
 
@@ -471,8 +470,8 @@ class TestAdminAPIJobManagement:
             assert "not found" in str(excinfo.value)
 
     @pytest.mark.asyncio
-    async def test_cancel_job_not_cancellable(self, db_pool):
-        """Test cancelling job in non-cancellable state raises ValueError."""
+    async def test_cancel_running_job_requests_cancellation(self, db_pool):
+        """Running jobs are cancellable now: cancel_requested is delivered."""
         async with db_pool.acquire() as conn:
             api = AdminAPI(conn)
 
@@ -482,9 +481,28 @@ class TestAdminAPIJobManagement:
                 RETURNING id
             """)
 
+            result = await api.cancel_job(job_id)
+            assert result == {"job_id": job_id, "status": "cancel_requested"}
+
+            job = await api.get_job(job_id)
+            assert job["state"] == "running"
+            assert job["cancel_requested"] is True
+
+    @pytest.mark.asyncio
+    async def test_cancel_job_terminal_raises(self, db_pool):
+        """Terminal jobs cannot be cancelled."""
+        async with db_pool.acquire() as conn:
+            api = AdminAPI(conn)
+
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                VALUES ('DoneJob', '{}', 'test', 100, 'finished')
+                RETURNING id
+            """)
+
             with pytest.raises(ValueError) as excinfo:
                 await api.cancel_job(job_id)
-            assert "running" in str(excinfo.value)
+            assert "cannot be cancelled" in str(excinfo.value)
 
     @pytest.mark.asyncio
     async def test_cancel_jobs_bulk(self, db_pool):
@@ -597,8 +615,9 @@ class TestAdminAPIQueueManagement:
             )
 
             queues = await api.list_queues()
-            assert queue1 in queues
-            assert queue2 in queues
+            names = [q["name"] for q in queues]
+            assert queue1 in names
+            assert queue2 in names
 
     @pytest.mark.asyncio
     async def test_queue_stats(self, db_pool):
@@ -741,78 +760,90 @@ class TestAdminAPIQueueManagement:
 
 
 class TestAdminAPIWorkerManagement:
-    """Test AdminAPI worker management methods - covers lines 542-603."""
+    """Test AdminAPI worker management methods (jorb_worker registry)."""
 
     @pytest.mark.asyncio
     async def test_list_workers(self, db_pool):
-        """Test listing active workers."""
+        """Workers come from the registry, joined with their claimed job."""
         async with db_pool.acquire() as conn:
             api = AdminAPI(conn)
 
-            # Create a running job (simulates active worker)
-            await conn.execute("""
-                INSERT INTO jorb (job_class, kwargs, queue, prio, state, worker_host, worker_pid)
-                VALUES ('WorkerJob', '{}', 'test', 100, 'running', 'host1', 12345)
+            worker_id = await conn.fetchval("""
+                INSERT INTO jorb_worker (host, pid, queue, capabilities)
+                VALUES ('host1', 12345, 'test', '{test}')
+                RETURNING id
             """)
+
+            # Give the worker a running job (claimed_by links them)
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state,
+                                  claimed_by, worker_host, worker_pid)
+                VALUES ('WorkerJob', '{}', 'test', 100, 'running',
+                        $1, 'host1', 12345)
+            """,
+                worker_id,
+            )
 
             workers = await api.list_workers()
 
             worker = next(
-                (
-                    w
-                    for w in workers
-                    if w["worker_host"] == "host1" and w["worker_pid"] == 12345
-                ),
+                (w for w in workers if w["host"] == "host1" and w["pid"] == 12345),
                 None,
             )
             assert worker is not None
-            assert worker["job_class"] == "WorkerJob"
-            assert worker["state"] == "running"
+            assert worker["live"] is True
+            assert worker["current_job_class"] == "WorkerJob"
+            assert worker["current_job_state"] == "running"
 
     @pytest.mark.asyncio
     async def test_list_workers_includes_claimed(self, db_pool):
-        """Test list_workers includes claimed jobs."""
+        """The joined current job may be in 'claimed' state."""
         async with db_pool.acquire() as conn:
             api = AdminAPI(conn)
 
-            await conn.execute("""
-                INSERT INTO jorb (job_class, kwargs, queue, prio, state, worker_host, worker_pid)
-                VALUES ('ClaimedJob', '{}', 'test', 100, 'claimed', 'host2', 54321)
+            worker_id = await conn.fetchval("""
+                INSERT INTO jorb_worker (host, pid, queue, capabilities)
+                VALUES ('host2', 54321, 'test', '{test}')
+                RETURNING id
             """)
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state,
+                                  claimed_by, worker_host, worker_pid)
+                VALUES ('ClaimedJob', '{}', 'test', 100, 'claimed',
+                        $1, 'host2', 54321)
+            """,
+                worker_id,
+            )
 
             workers = await api.list_workers()
 
-            worker = next((w for w in workers if w["worker_pid"] == 54321), None)
+            worker = next((w for w in workers if w["pid"] == 54321), None)
             assert worker is not None
-            assert worker["state"] == "claimed"
+            assert worker["current_job_state"] == "claimed"
 
     @pytest.mark.asyncio
     async def test_worker_stats(self, db_pool):
-        """Test getting worker statistics."""
+        """Test getting registry-based worker statistics."""
         async with db_pool.acquire() as conn:
             api = AdminAPI(conn)
 
-            # Create multiple jobs for same worker
-            for i in range(3):
+            for pid in (99991, 99992, 99993):
                 await conn.execute(
                     """
-                    INSERT INTO jorb (job_class, kwargs, queue, prio, state, worker_host, worker_pid)
-                    VALUES ($1, '{}', 'test', 100, 'running', 'stats_host', 99999)
+                    INSERT INTO jorb_worker (host, pid, queue, capabilities)
+                    VALUES ('stats_host', $1, 'stats_queue', '{test}')
                 """,
-                    f"StatsJob{i}",
+                    pid,
                 )
 
             stats = await api.worker_stats()
 
-            assert "active_workers" in stats
-            assert "workers" in stats
-
-            # Find our test worker
-            worker = next(
-                (w for w in stats["workers"] if w["host"] == "stats_host"), None
-            )
-            if worker:
-                assert worker["job_count"] >= 3  # May have more from other tests
+            assert stats["live_workers"] >= 3
+            assert stats["active_workers"] == stats["live_workers"]  # alias
+            assert stats["total_registered"] >= 3
+            assert stats["per_queue"]["stats_queue"] == 3
 
 
 class TestAdminAPIMetrics:
@@ -857,9 +888,9 @@ class TestAdminAPIMetrics:
 
             metrics = await api.get_metrics()
 
-            # Should have period_start ~24 hours ago
+            # Should have period_start ~24 hours ago (aware UTC ISO string)
             period_start = datetime.fromisoformat(metrics["period_start"])
-            assert datetime.utcnow() - period_start < timedelta(hours=25)
+            assert datetime.now(UTC) - period_start < timedelta(hours=25)
 
 
 class TestAdminAPIDLQ:
@@ -871,7 +902,7 @@ class TestAdminAPIDLQ:
         async with db_pool.acquire() as conn:
             api = AdminAPI(conn)
 
-            # Create a DLQ job (crashed with high error_count)
+            # Any crashed job is in the DLQ ('crashed' is terminal)
             job_id = await conn.fetchval("""
                 INSERT INTO jorb (job_class, kwargs, queue, prio, state, error_count)
                 VALUES ('DLQJob', '{}', 'test', 100, 'crashed', 15)
@@ -884,24 +915,31 @@ class TestAdminAPIDLQ:
             assert job_id in dlq_ids
 
     @pytest.mark.asyncio
-    async def test_list_dlq_excludes_low_error_count(self, db_pool):
-        """Test DLQ excludes jobs with low error count."""
+    async def test_list_dlq_is_exactly_crashed_state(self, db_pool):
+        """The DLQ has no error-count heuristic: every crashed job is in it,
+        and no non-crashed job is."""
         async with db_pool.acquire() as conn:
             api = AdminAPI(conn)
 
-            job_id = await conn.fetchval("""
+            low_error_crashed = await conn.fetchval("""
                 INSERT INTO jorb (job_class, kwargs, queue, prio, state, error_count)
                 VALUES ('LowErrorJob', '{}', 'test', 100, 'crashed', 5)
+                RETURNING id
+            """)
+            queued_job = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state, error_count)
+                VALUES ('QueuedJob', '{}', 'test', 100, 'queued', 15)
                 RETURNING id
             """)
 
             dlq_jobs = await api.list_dlq()
             dlq_ids = [j["id"] for j in dlq_jobs]
-            assert job_id not in dlq_ids
+            assert low_error_crashed in dlq_ids
+            assert queued_job not in dlq_ids
 
     @pytest.mark.asyncio
     async def test_retry_from_dlq(self, db_pool):
-        """Test retrying a job from DLQ."""
+        """Test retrying a job from DLQ requeues the same row, errors reset."""
         async with db_pool.acquire() as conn:
             api = AdminAPI(conn)
 
@@ -913,13 +951,12 @@ class TestAdminAPIDLQ:
 
             result = await api.retry_from_dlq(job_id)
 
-            assert result["original_job_id"] == job_id
-            assert "new_job_id" in result
-            assert result["status"] == "retry_queued_from_dlq"
+            assert result == {"job_id": job_id, "status": "requeued_from_dlq"}
 
-            # Verify new job has error_count reset
-            new_job = await api.get_job(result["new_job_id"])
-            assert new_job["error_count"] == 0
+            # The same row is queued again with the error budget reset
+            job = await api.get_job(job_id)
+            assert job["state"] == "queued"
+            assert job["error_count"] == 0
 
     @pytest.mark.asyncio
     async def test_retry_from_dlq_not_found(self, db_pool):

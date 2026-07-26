@@ -13,12 +13,50 @@ Tests cover:
 """
 
 import json
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from pyjobby.client import JobClient
-from pyjobby.pj import STMTS
+
+# =============================================================================
+# State helpers
+# =============================================================================
+#
+# These management tests exercise listing/searching/purging, not the claim
+# path, so they force jobs into target states directly (all timestamps are
+# timestamptz; plain now() in SQL is correct).
+
+
+async def force_finish(conn, job_id: int, result: dict) -> None:
+    """Put a job into terminal 'finished' with a stored result."""
+    await conn.execute(
+        """
+        UPDATE jorb
+        SET state = 'finished', result = $2, run_count = run_count + 1,
+            started = now(), finished = now(), updated = now()
+        WHERE id = $1
+        """,
+        job_id,
+        result,
+    )
+
+
+async def force_crash(conn, job_id: int, error: str, backtrace: str = "") -> None:
+    """Put a job into terminal 'crashed' (the DLQ)."""
+    await conn.execute(
+        """
+        UPDATE jorb
+        SET state = 'crashed', error_message = $2, error_backtrace = $3,
+            error_count = error_count + 1, run_count = run_count + 1,
+            started = now(), finished = now(), updated = now()
+        WHERE id = $1
+        """,
+        job_id,
+        error,
+        backtrace,
+    )
+
 
 # =============================================================================
 # Test Fixtures
@@ -66,13 +104,8 @@ async def setup_test_jobs(db_pool, job_client):
             "test.FinishedJob", queue="default", priority=400 + i, data=f"finished_{i}"
         )
         async with db_pool.acquire() as conn:
-            # Claim, run, and finish the job
-            await conn.execute(STMTS["claim"], 12345, "worker", "default", [], 1000)
-            await conn.execute(STMTS["run"], job_id)
-            await conn.execute(
-                STMTS["finished"],
-                job_id,
-                json.dumps({"result": f"completed_{i}", "value": i * 10}),
+            await force_finish(
+                conn, job_id, {"result": f"completed_{i}", "value": i * 10}
             )
         job_ids.append(("default", "finished", job_id))
 
@@ -82,9 +115,7 @@ async def setup_test_jobs(db_pool, job_client):
             "test.CrashedJob", queue="processing", priority=500 + i, data=f"crashed_{i}"
         )
         async with db_pool.acquire() as conn:
-            await conn.execute(STMTS["claim"], 12345, "worker", "processing", [], 1000)
-            await conn.execute(STMTS["run"], job_id)
-            await conn.execute(STMTS["crash"], job_id, f"Error {i}", f"Traceback {i}")
+            await force_crash(conn, job_id, f"Error {i}", f"Traceback {i}")
         job_ids.append(("processing", "crashed", job_id))
 
     # Create some waiting jobs
@@ -223,14 +254,14 @@ class TestJobSearch:
 
     async def test_search_by_created_after(self, db_pool, job_client, setup_test_jobs):
         """Test searching by creation time."""
-        cutoff = datetime.now() - timedelta(minutes=1)
+        cutoff = datetime.now(UTC) - timedelta(minutes=1)
         jobs = await job_client.search_jobs(created_after=cutoff)
 
         assert all(job["created"] >= cutoff for job in jobs)
 
     async def test_search_by_created_before(self, db_pool, job_client, setup_test_jobs):
         """Test searching before a specific time."""
-        cutoff = datetime.now() + timedelta(minutes=1)
+        cutoff = datetime.now(UTC) + timedelta(minutes=1)
         jobs = await job_client.search_jobs(created_before=cutoff)
 
         assert all(job["created"] <= cutoff for job in jobs)
@@ -426,10 +457,12 @@ class TestJobPriorityUpdate:
         """Test that updating priority of running job fails."""
         job_id = await job_client.enqueue("test.Job", priority=100)
 
-        # Claim and run the job
+        # Force the job into 'running'
         async with db_pool.acquire() as conn:
-            await conn.execute(STMTS["claim"], 12345, "worker", "default", [], 1000)
-            await conn.execute(STMTS["run"], job_id)
+            await conn.execute(
+                "UPDATE jorb SET state = 'running', started = now() WHERE id = $1",
+                job_id,
+            )
 
         # Try to update priority (should fail)
         updated = await job_client.update_job_priority(job_id, 500)
@@ -481,13 +514,7 @@ class TestQueueManagement:
         for i in range(3):
             job_id = await job_client.enqueue("test.Job", queue="purge_test2")
             async with db_pool.acquire() as conn:
-                await conn.execute(
-                    STMTS["claim"], 12345, "worker", "purge_test2", [], 1000
-                )
-                await conn.execute(STMTS["run"], job_id)
-                await conn.execute(
-                    STMTS["finished"], job_id, json.dumps({"done": True})
-                )
+                await force_finish(conn, job_id, {"done": True})
 
         # Purge only finished jobs
         deleted = await job_client.purge_queue("purge_test2", states=["finished"])
@@ -590,49 +617,27 @@ class TestBulkOperations:
         assert cancelled == 0
 
     async def test_bulk_retry(self, db_pool, job_client):
-        """Test retrying multiple failed jobs."""
+        """Test retrying multiple failed jobs requeues the SAME rows."""
         # Create and crash some jobs
         original_job_ids = []
         for i in range(5):
             job_id = await job_client.enqueue("test.Job", data=f"retry_{i}")
             async with db_pool.acquire() as conn:
-                await conn.execute(STMTS["claim"], 12345, "worker", "default", [], 1000)
-                await conn.execute(STMTS["run"], job_id)
-                await conn.execute(
-                    STMTS["crash"], job_id, "Test error", "Test traceback"
-                )
+                await force_crash(conn, job_id, "Test error", "Test traceback")
             original_job_ids.append(job_id)
 
-        # Retry all jobs
-        new_job_ids = await job_client.bulk_retry(original_job_ids)
-        assert len(new_job_ids) == 5
+        # Retry all jobs: bulk_retry returns the requeued ids (identical to
+        # the originals — retries keep one row per job for life)
+        requeued_ids = await job_client.bulk_retry(original_job_ids)
+        assert requeued_ids == original_job_ids
 
-        # Verify new jobs are queued
-        for new_job_id in new_job_ids:
-            job = await job_client.get_job_full(new_job_id)
+        # Verify the same rows are queued again with errors reset
+        for job_id in requeued_ids:
+            job = await job_client.get_job_full(job_id)
             assert job["state"] == "queued"
-            # Check admin_data has retry_of
-            admin_data_raw = job["admin_data"]
-
-            # Handle different formats admin_data might be in
-            if isinstance(admin_data_raw, str):
-                admin_data = json.loads(admin_data_raw)
-            elif isinstance(admin_data_raw, list):
-                # PostgreSQL might return array - look for retry_of in any element
-                found_retry_of = False
-                for item in admin_data_raw:
-                    if isinstance(item, dict) and "retry_of" in item:
-                        found_retry_of = True
-                        break
-                assert found_retry_of, (
-                    f"retry_of not found in admin_data list: {admin_data_raw}"
-                )
-                continue
-            else:
-                admin_data = admin_data_raw
-
-            if isinstance(admin_data, dict):
-                assert "retry_of" in admin_data
+            assert job["error_count"] == 0
+            assert job["error_message"] is None
+            assert job["result"] is None
 
     async def test_bulk_retry_empty_list(self, db_pool, job_client):
         """Test bulk retry with empty list."""
@@ -731,13 +736,7 @@ class TestManagementWorkflows:
                 "test.FailedJob", queue=queue_name, data=f"fail_{i}"
             )
             async with db_pool.acquire() as conn:
-                await conn.execute(
-                    STMTS["claim"], 12345, "worker", queue_name, [], 1000
-                )
-                await conn.execute(STMTS["run"], job_id)
-                await conn.execute(
-                    STMTS["crash"], job_id, "Simulated failure", "Stack trace"
-                )
+                await force_crash(conn, job_id, "Simulated failure", "Stack trace")
             original_ids.append(job_id)
 
         # Find failed jobs
@@ -745,13 +744,13 @@ class TestManagementWorkflows:
         failed_ids = [job["id"] for job in failed if job["id"] in original_ids]
         assert len(failed_ids) == 3
 
-        # Retry them
-        new_job_ids = await job_client.bulk_retry(failed_ids)
-        assert len(new_job_ids) == 3
+        # Retry them: the same rows are requeued (stable job ids)
+        requeued_ids = await job_client.bulk_retry(failed_ids)
+        assert sorted(requeued_ids) == sorted(original_ids)
 
-        # Verify new jobs are queued
-        for new_id in new_job_ids:
-            job = await job_client.get_job(new_id)
+        # Verify the jobs are queued again in their original queue
+        for job_id in requeued_ids:
+            job = await job_client.get_job(job_id)
             assert job.state == "queued"
             assert job.queue == queue_name
 
@@ -782,13 +781,7 @@ class TestManagementWorkflows:
                 "test.Job", queue=queue_name, data=f"cleanup_{i}"
             )
             async with db_pool.acquire() as conn:
-                await conn.execute(
-                    STMTS["claim"], 12345, "worker", queue_name, [], 1000
-                )
-                await conn.execute(STMTS["run"], job_id)
-                await conn.execute(
-                    STMTS["finished"], job_id, json.dumps({"done": True})
-                )
+                await force_finish(conn, job_id, {"done": True})
 
         # Get queue stats before cleanup
         stats_before = await job_client.queue_stats(queue_name)

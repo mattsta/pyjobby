@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 import pytest
 
 from pyjobby.client import JobClient
+from pyjobby.dag import DAGBuilder
 from tests.utils.factories import get_job
 
 
@@ -213,7 +214,7 @@ class TestLatencyBenchmarks:
             """,
                 job_id,
                 state,
-                datetime.now(),
+                datetime.now(UTC),
             )
 
             latency = (time.time() - start) * 1000
@@ -447,61 +448,44 @@ class TestLargeDAGBenchmarks:
             f"Parallel DAG creation too slow: {throughput:.1f} jobs/sec"
         )
 
-    @pytest.mark.asyncio
-    async def test_dag_validation_performance(self, db_pool):
-        """Benchmark: DAG cycle validation on large DAG."""
-        # Create DAG with 50 jobs
-        dag_id = await db_pool.fetchval(
-            """
-            INSERT INTO jorb_dag (name, created)
-            VALUES ($1, $2)
-            RETURNING id
-        """,
-            "Validation Test DAG",
-            datetime.now(UTC),
-        )
+    def test_dag_validation_performance(self):
+        """Benchmark: DAG cycle validation on large DAG.
 
+        Schema v1 has no ``validate_dag_acyclic()`` SQL function: cycle
+        detection is pre-flight, client side, in ``DAGBuilder.validate()``
+        (plus ``topological_sort()``), so that is what gets benchmarked.
+        """
         num_jobs = 50
 
-        # Create linear chain (no cycles)
-        prev_job_id = None
+        # Linear chain (no cycles)
+        dag = DAGBuilder(name="Validation Test DAG", queue="dag_test")
+        prev = None
         for i in range(num_jobs):
-            job_id = await db_pool.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, dag_id, waitfor_job)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id
-            """,
-                "test.Job",
-                {"i": i},
-                "dag_test",
-                "queued",
-                dag_id,
-                prev_job_id,
-            )
-            prev_job_id = job_id
+            prev = dag.add("test.Job", {"i": i}, depends_on=[prev] if prev else None)
+
+        assert len(dag.nodes) == num_jobs
 
         # Benchmark validation
         num_validations = 10
         start_time = time.time()
 
         for _ in range(num_validations):
-            is_valid = await db_pool.fetchval(
-                """
-                SELECT validate_dag_acyclic($1)
-            """,
-                dag_id,
-            )
-            assert is_valid is True
+            dag.validate()  # raises ValueError on a cycle
+            levels = dag.topological_sort()
+            assert len(levels) == num_jobs  # strictly linear: one node per level
 
         elapsed = time.time() - start_time
         avg_validation = (elapsed / num_validations) * 1000  # ms
 
         print(f"\n📊 DAG validation ({num_jobs} jobs): {avg_validation:.2f}ms average")
 
-        # Cleanup
-        await db_pool.execute("DELETE FROM jorb WHERE dag_id = $1", dag_id)
-        await db_pool.execute("DELETE FROM jorb_dag WHERE id = $1", dag_id)
+        # A real cycle is still detected (validation is not a no-op)
+        cyclic = DAGBuilder(name="Cyclic DAG")
+        a = cyclic.add("test.A")
+        b = cyclic.add("test.B", depends_on=[a])
+        a.depends_on.append(b)
+        with pytest.raises(ValueError, match="cycle"):
+            cyclic.validate()
 
         # Expectation: Validation should be fast (< 100ms for 50 jobs)
         assert avg_validation < 100, f"DAG validation too slow: {avg_validation:.2f}ms"
@@ -537,10 +521,9 @@ class TestConnectionPoolingBenchmarks:
                 f"\n📊 Connection pool (load={load}): {throughput:.1f} queries/sec ({elapsed:.3f}s)"
             )
 
+            # Every acquired connection answered with a real row count
             assert len(results) == load
-
-        # Pool should handle all loads efficiently
-        assert True  # If we got here, pool handled the load
+            assert all(isinstance(r, int) and r >= 0 for r in results)
 
     @pytest.mark.asyncio
     async def test_connection_pool_saturation(self, db_pool):

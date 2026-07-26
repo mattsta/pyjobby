@@ -7,7 +7,7 @@ the majority of real-world usage patterns.
 Coverage Target: Most critical client methods (enqueue, batch, get, cancel, stats)
 """
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -61,7 +61,7 @@ class TestJobEnqueue:
     @pytest.mark.asyncio
     async def test_enqueue_with_delay(self, client):
         """Test enqueueing with delayed execution."""
-        run_after = datetime.utcnow() + timedelta(hours=1)
+        run_after = datetime.now(UTC) + timedelta(hours=1)
         job_id = await client.enqueue("test.Job", run_after=run_after)
 
         async with client.pool.acquire() as conn:
@@ -175,8 +175,8 @@ class TestJobCancel:
         """Test cancelling a queued job."""
         job_id = await client.enqueue("test.Job")
 
-        success = await client.cancel_job(job_id)
-        assert success is True
+        outcome = await client.cancel_job(job_id)
+        assert outcome == "cancelled"
 
         # Verify state changed
         job = await client.get_job(job_id)
@@ -184,9 +184,9 @@ class TestJobCancel:
 
     @pytest.mark.asyncio
     async def test_cancel_nonexistent_job(self, client):
-        """Test cancelling non-existent job returns False."""
-        success = await client.cancel_job(999999)
-        assert success is False
+        """Test cancelling non-existent job returns None."""
+        outcome = await client.cancel_job(999999)
+        assert outcome is None
 
 
 # =============================================================================

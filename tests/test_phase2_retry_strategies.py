@@ -201,7 +201,7 @@ class TestAdminDataRetryConfig:
             RETURNING id
         """,
             "test.Job",
-            "{}",
+            {},
             "default",
             admin_data,
         )
@@ -229,7 +229,9 @@ class TestRetryStrategiesIntegration:
 
     @pytest.mark.asyncio
     async def test_job_retry_with_exponential_strategy(self, db_connection):
-        """Test job retry with exponential backoff."""
+        """A retry requeues the SAME row with the strategy's backoff."""
+        from pyjobby.pj import STMTS
+
         admin_data = {
             "retry_strategy": "exponential",
             "max_retries": 5,
@@ -237,7 +239,7 @@ class TestRetryStrategiesIntegration:
             "max_retry_delay": 60,
         }
 
-        # Create job that will fail and retry
+        # Create job as if it were mid-execution on its first attempt
         job_id = await db_connection.fetchval(
             """
             INSERT INTO jorb (job_class, kwargs, queue, admin_data, state)
@@ -245,51 +247,33 @@ class TestRetryStrategiesIntegration:
             RETURNING id
         """,
             "test.FailingJob",
-            "{}",
+            {},
             "default",
             admin_data,
-            "queued",
+            "running",
         )
 
-        # Simulate first failure
-        await db_connection.execute(
-            """
-            UPDATE jorb
-            SET state = 'crashed',
-                error_count = 1,
-                error_message = 'Test failure'
-            WHERE id = $1
-        """,
-            job_id,
-        )
-
-        # Create retry job (this is what the worker would do)
+        # The worker's retry statement: same row back to 'queued' with backoff
         job = await get_job(db_connection, job_id)
-        retry_delay = calculate_retry_from_job(job, error_count=1)
+        retry_delay = calculate_retry_from_job(dict(job), error_count=1)
 
-        retry_id = await db_connection.fetchval(
-            """
-            INSERT INTO jorb (
-                job_class, kwargs, queue, admin_data, state, error_count,
-                run_after
-            )
-            SELECT
-                job_class, kwargs, queue, admin_data, 'queued', $2,
-                TIMEZONE('utc', clock_timestamp()) + $3::interval
-            FROM jorb
-            WHERE id = $1
-            RETURNING id
-        """,
+        await db_connection.execute(
+            STMTS["retry"],
             job_id,
-            1,
             retry_delay,
+            "Test failure",
+            "Traceback: test",
+            0,  # current run_epoch (fencing token)
         )
 
-        retry_job = await get_job(db_connection, retry_id)
+        retry_job = await get_job(db_connection, job_id)
+        assert retry_job["id"] == job_id  # SAME row, no retry-copy
         assert retry_job["error_count"] == 1
         assert retry_job["state"] == "queued"
-        # run_after should be ~1 second from now
-        assert retry_job["run_after"] > datetime.utcnow()
+        assert retry_job["error_message"] == "Test failure"
+        # run_after should be ~1 second past the transaction's now()
+        db_now = await db_connection.fetchval("SELECT now()")
+        assert retry_job["run_after"] > db_now
 
     @pytest.mark.asyncio
     async def test_max_retries_enforcement(self, db_connection):
@@ -303,7 +287,7 @@ class TestRetryStrategiesIntegration:
             RETURNING id
         """,
             "test.Job",
-            "{}",
+            {},
             "default",
             admin_data,
             "crashed",
@@ -332,7 +316,7 @@ class TestRetryStrategiesIntegration:
                 RETURNING id
             """,
                 "test.Job",
-                "{}",
+                {},
                 "default",
                 admin_data,
             )

@@ -2,15 +2,27 @@
 Phase 2: Job Result Storage and Passing Tests
 
 Comprehensive tests for result storage and passing between jobs in pipelines.
-Tests both database storage and automatic result injection.
+Tests both database storage and the worker's RUN-time result injection
+(admin_data.use_result_from -> kwargs['upstream_result']).
 """
 
 from datetime import datetime
+from typing import Any
 
-import asyncpg
 import pytest
 
+from pyjobby.pj import Job
+from tests.conftest import wait_for_job_state
 from tests.utils.factories import create_job, get_job
+
+
+class EchoUpstreamJob(Job):
+    """Returns whatever upstream result the worker injected at run time."""
+
+    async def task(
+        self, upstream_result: Any = None, **kwargs: Any
+    ) -> dict[str, Any]:
+        return {"upstream": upstream_result}
 
 
 class TestResultStorage:
@@ -26,15 +38,8 @@ class TestResultStorage:
         """)
         assert result == "result"
 
-    @pytest.mark.asyncio
-    async def test_result_index_exists(self, db_connection):
-        """Verify sparse index on result column exists."""
-        result = await db_connection.fetchval("""
-            SELECT indexname
-            FROM pg_indexes
-            WHERE tablename = 'jorb' AND indexname = 'jorb_result_exists_idx'
-        """)
-        assert result == "jorb_result_exists_idx"
+    # NOTE: schema v1 removed the jorb_result_exists_idx sparse index and the
+    # 10MB result-size CHECK constraint; tests of both were deleted.
 
     @pytest.mark.asyncio
     async def test_store_simple_result(self, db_connection):
@@ -95,92 +100,103 @@ class TestResultStorage:
         assert job["result"]["stats"]["processed"] == 100
 
     @pytest.mark.asyncio
-    async def test_result_size_limit(self, db_connection):
-        """Test that oversized results are rejected (10MB limit)."""
-        job_id = await create_job(db_connection, job_class="test.Job")
-
-        # Create a result larger than 10MB
-        large_result = {"data": "x" * (11 * 1024 * 1024)}  # 11MB of 'x'
-
-        with pytest.raises(asyncpg.exceptions.CheckViolationError):
-            await db_connection.execute(
-                """
-                UPDATE jorb
-                SET result = $1, state = 'finished'
-                WHERE id = $2
-            """,
-                large_result,
-                job_id,
-            )
-
-    @pytest.mark.asyncio
     async def test_result_with_finished_statement(self, db_connection):
-        """Test result storage using the finished statement."""
+        """Test result storage using the (epoch-fenced) finished statement."""
         from pyjobby.pj import STMTS
 
         job_id = await create_job(db_connection, job_class="test.Job", state="claimed")
 
         result = {"status": "completed", "value": 123}
-        await db_connection.execute(STMTS["finished"], job_id, result)
+        # $3 is the fencing epoch; a fresh row is at run_epoch 0
+        await db_connection.execute(STMTS["finished"], job_id, result, 0)
 
         job = await get_job(db_connection, job_id)
         assert job["state"] == "finished"
         assert job["result"] is not None
         assert job["result"]["value"] == 123
 
+    @pytest.mark.asyncio
+    async def test_finished_statement_is_epoch_fenced(self, db_connection):
+        """A stale epoch cannot write a result (fencing token no-ops it)."""
+        from pyjobby.pj import STMTS
+
+        job_id = await create_job(db_connection, job_class="test.Job", state="claimed")
+        # simulate a newer claim having bumped the epoch
+        await db_connection.execute(
+            "UPDATE jorb SET run_epoch = 2 WHERE id = $1", job_id
+        )
+
+        rows = await db_connection.fetch(
+            STMTS["finished"], job_id, {"stale": True}, 1
+        )
+        assert rows == []
+
+        job = await get_job(db_connection, job_id)
+        assert job["state"] == "claimed"
+        assert job["result"] is None
+
 
 class TestResultPassing:
-    """Test automatic result passing between jobs."""
+    """Test the worker's RUN-time result injection between jobs."""
 
     @pytest.mark.asyncio
-    async def test_upstream_result_injection(self, db_connection):
-        """Test that upstream result is injected into downstream kwargs."""
-        # Create upstream job with result
-        upstream_id = await create_job(db_connection, job_class="test.Upstream")
-        upstream_result = {"data": "from_upstream", "count": 42}
-        await db_connection.execute(
-            """
-            UPDATE jorb
-            SET result = $1, state = 'finished'
-            WHERE id = $2
-        """,
-            upstream_result,
-            upstream_id,
+    async def test_upstream_result_injected_at_run_time(
+        self, live_worker, unique_queue, db_pool
+    ):
+        """The worker injects kwargs['upstream_result'] from the job named in
+        admin_data.use_result_from when the downstream job runs."""
+        await live_worker()
+
+        # upstream runs first and stores a result
+        upstream_id = await db_pool.fetchval(
+            "INSERT INTO jorb (job_class, kwargs, queue) VALUES ($1,$2,$3) RETURNING id",
+            "tests.dxe_jobs.OkJob",
+            {"x": 21},
+            unique_queue,
+        )
+        upstream = await wait_for_job_state(db_pool, upstream_id, ("finished",))
+        assert upstream["result"] == {"doubled": 42}
+
+        # downstream references the upstream job via admin_data.use_result_from
+        downstream_id = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, kwargs, queue, admin_data)
+               VALUES ($1,$2,$3,$4) RETURNING id""",
+            "tests.test_phase2_result_passing.EchoUpstreamJob",
+            {"param": "value"},
+            unique_queue,
+            {"use_result_from": upstream_id},
         )
 
-        # Create downstream job referencing upstream
-        downstream_kwargs = {"param": "value"}
-        downstream_id = await db_connection.fetchval(
-            """
-            INSERT INTO jorb (job_class, kwargs, queue, state, waitfor_job)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id
-        """,
-            "test.Downstream",
-            downstream_kwargs,
-            "default",
-            "waiting",
-            upstream_id,
+        downstream = await wait_for_job_state(db_pool, downstream_id, ("finished",))
+        assert downstream["result"] == {"upstream": {"doubled": 42}}
+
+    @pytest.mark.asyncio
+    async def test_no_injection_when_upstream_unfinished(
+        self, live_worker, unique_queue, db_pool
+    ):
+        """No upstream_result is injected if the referenced job is not
+        finished (the task just sees its plain kwargs)."""
+        await live_worker()
+
+        # an upstream that never runs (parked on an unrelated queue)
+        upstream_id = await db_pool.fetchval(
+            "INSERT INTO jorb (job_class, kwargs, queue) VALUES ($1,$2,$3) RETURNING id",
+            "tests.dxe_jobs.OkJob",
+            {"x": 1},
+            f"{unique_queue}_parked",
         )
 
-        # Simulate client.enqueue with use_result_from
-        # In real usage, client would inject upstream_result into kwargs
-        upstream_job = await get_job(db_connection, upstream_id)
-        if upstream_job["result"]:
-            downstream_kwargs["upstream_result"] = upstream_job["result"]
-            await db_connection.execute(
-                """
-                UPDATE jorb SET kwargs = $1 WHERE id = $2
-            """,
-                downstream_kwargs,
-                downstream_id,
-            )
+        downstream_id = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, kwargs, queue, admin_data)
+               VALUES ($1,$2,$3,$4) RETURNING id""",
+            "tests.test_phase2_result_passing.EchoUpstreamJob",
+            {},
+            unique_queue,
+            {"use_result_from": upstream_id},
+        )
 
-        # Verify downstream has upstream result
-        downstream_job = await get_job(db_connection, downstream_id)
-        assert "upstream_result" in downstream_job["kwargs"]
-        assert downstream_job["kwargs"]["upstream_result"]["data"] == "from_upstream"
-        assert downstream_job["kwargs"]["upstream_result"]["count"] == 42
+        downstream = await wait_for_job_state(db_pool, downstream_id, ("finished",))
+        assert downstream["result"] == {"upstream": None}
 
     @pytest.mark.asyncio
     async def test_result_passing_in_chain(self, db_connection):
@@ -270,12 +286,13 @@ class TestResultPassing:
 
 
 class TestAdminDataSaveResult:
-    """Test save_result flag in admin_data."""
+    """Test save_result semantics: results are saved by default; an explicit
+    save_result=False in admin_data discards the result."""
 
     @pytest.mark.asyncio
     async def test_save_result_flag_in_admin_data(self, db_connection):
         """Test that save_result flag can be stored in admin_data."""
-        admin_data = {"save_result": True, "other_meta": "value"}
+        admin_data = {"save_result": False, "other_meta": "value"}
         job_id = await db_connection.fetchval(
             """
             INSERT INTO jorb (job_class, kwargs, queue, admin_data)
@@ -283,27 +300,49 @@ class TestAdminDataSaveResult:
             RETURNING id
         """,
             "test.Job",
-            "{}",
+            {},
             "default",
             admin_data,
         )
 
         job = await get_job(db_connection, job_id)
         assert job["admin_data"] is not None
-        assert job["admin_data"]["save_result"] is True
+        assert job["admin_data"]["save_result"] is False
 
     @pytest.mark.asyncio
-    async def test_save_result_defaults_to_false(self, db_connection):
-        """Test that save_result defaults to false (no flag in admin_data)."""
-        job_id = await create_job(db_connection, job_class="test.Job")
-        job = await get_job(db_connection, job_id)
+    async def test_result_saved_by_default(self, live_worker, unique_queue, db_pool):
+        """Without a save_result flag the worker stores the task's result."""
+        await live_worker()
 
-        # admin_data may be None or empty
-        if job["admin_data"]:
-            assert job["admin_data"].get("save_result", False) is False
-        else:
-            # No admin_data means save_result is False
-            assert True
+        job_id = await db_pool.fetchval(
+            "INSERT INTO jorb (job_class, kwargs, queue) VALUES ($1,$2,$3) RETURNING id",
+            "tests.dxe_jobs.OkJob",
+            {"x": 3},
+            unique_queue,
+        )
+
+        row = await wait_for_job_state(db_pool, job_id, ("finished",))
+        assert row["result"] == {"doubled": 6}
+
+    @pytest.mark.asyncio
+    async def test_save_result_false_discards_result(
+        self, live_worker, unique_queue, db_pool
+    ):
+        """An explicit save_result=False discards the task's return value."""
+        await live_worker()
+
+        job_id = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, kwargs, queue, admin_data)
+               VALUES ($1,$2,$3,$4) RETURNING id""",
+            "tests.dxe_jobs.OkJob",
+            {"x": 3},
+            unique_queue,
+            {"save_result": False},
+        )
+
+        row = await wait_for_job_state(db_pool, job_id, ("finished",))
+        assert row["state"] == "finished"
+        assert row["result"] is None
 
 
 class TestPipelinePatterns:
