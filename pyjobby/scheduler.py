@@ -681,7 +681,7 @@ class SchedulerWorker:
                 schedule, scheduled_time, jitter_seconds=jitter
             )
 
-            if job_id:
+            if job_id is not None:
                 # Success!
                 await self.manager.record_execution_success(schedule["id"])
 

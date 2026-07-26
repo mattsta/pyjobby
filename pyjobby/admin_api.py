@@ -1077,12 +1077,17 @@ class AdminAPI:
 
         Returns:
             Schedule dictionary or None if not found
+
+        Raises:
+            ValueError: If neither lookup key was given. "Not given" means
+            None -- an id of 0 or an empty name is a lookup that finds
+            nothing, not a missing argument.
         """
-        if schedule_id:
+        if schedule_id is not None:
             record = await self.conn.fetchrow(
                 "SELECT * FROM jorb_schedule WHERE id = $1", schedule_id
             )
-        elif name:
+        elif name is not None:
             record = await self.conn.fetchrow(
                 "SELECT * FROM jorb_schedule WHERE name = $1", name
             )

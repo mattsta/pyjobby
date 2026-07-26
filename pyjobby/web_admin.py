@@ -245,11 +245,7 @@ class WebAdminServer:
     @staticmethod
     async def _schedule_or_404(api: AdminAPI, schedule_id: int) -> dict[str, Any]:
         """Return the schedule row, or raise 404."""
-        # AdminAPI.get_schedule treats a falsy id as "no lookup key given", so
-        # id 0 (never a real bigserial value) is answered as missing here.
-        schedule = (
-            await api.get_schedule(schedule_id=schedule_id) if schedule_id else None
-        )
+        schedule = await api.get_schedule(schedule_id=schedule_id)
         if not schedule:
             raise _api_error(web.HTTPNotFound, f"Schedule {schedule_id} not found")
         return schedule
