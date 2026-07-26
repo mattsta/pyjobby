@@ -130,6 +130,26 @@ class BlockingStepJob(Job):
         return {"slept": block}
 
 
+class SwallowsItsBudgetJob(Job):
+    """A step that catches its budget's cancellation and returns a value.
+
+    The step-level twin of the job-level escape pinned in
+    ``tests/test_job_timeout_escapes.py``: ``asyncio.timeout`` raises nothing
+    when the body swallows its ``CancelledError``, so the blown budget would
+    otherwise be checkpointed as a completed step.
+    """
+
+    async def task(self) -> str:
+        return await self.step("swallow", self._swallow, timeout=0.3)
+
+    async def _swallow(self) -> str:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            return "pretend it worked"
+        return "unreachable"
+
+
 class LooseBudgetJob(Job):
     """Declares a step budget far looser than the job's own deadline."""
 
@@ -623,6 +643,48 @@ async def test_a_blocking_synchronous_step_is_not_interrupted(
         None,
     )
     assert step["seconds"] >= 0.6  # it really did overrun, uninterrupted
+
+
+async def test_a_step_cannot_swallow_its_budget_into_a_checkpoint(
+    live_worker, unique_queue, db_pool
+):
+    """A step that catches its budget's cancellation still blew its budget.
+
+    ``asyncio.timeout`` raises nothing when its body swallows the
+    ``CancelledError``, so this step's invented return value used to be
+    checkpointed as a completed step — and, being a *completed* step, it
+    would then fast-forward on every later attempt, making the lie permanent.
+    The budget's scope is asked whether its timer fired instead, so the step
+    is recorded as the timeout it was and re-executes on the retry.
+
+    Note what this does *not* change: the blocking synchronous step above
+    starves the timer that would have to have fired, so it never trips this
+    and its result still stands.
+    """
+    await live_worker()
+
+    job_id = await enqueue(
+        db_pool,
+        unique_queue,
+        "tests.test_dxe_step_timeouts.SwallowsItsBudgetJob",
+        {},
+        {"max_retries": 1},  # one attempt, straight to the DLQ
+    )
+
+    row = await wait_for_job_state(db_pool, job_id, ("crashed",), timeout=20)
+    assert row["result"] is None
+    assert row["error_message"] == "step 'swallow' exceeded its 0.3s timeout"
+    assert row["error_count"] == 1
+
+    assert await steps_of(db_pool, job_id) == [
+        (
+            1,
+            "swallow",
+            None,
+            "StepTimeoutError: step 'swallow' exceeded its 0.3s timeout",
+            1,
+        )
+    ]
 
 
 # ============================================================================

@@ -92,6 +92,55 @@ is the **operator** cancel signal (`pj-admin jobs cancel`) and is *not* set
 by a timeout: a long synchronous loop that wants to stop itself early has to
 watch its own clock.
 
+**A job cannot report success past its own deadline.** Catching the
+cancellation to clean up and re-raising is correct and unchanged. Catching it
+and *returning a value* used to store that value as a success — for an
+attempt the worker had already given up on, and terminally, so the monitor
+could never correct it. The worker now refuses that result and records the
+timeout, applying `on_timeout` exactly as if the cancellation had propagated.
+This is keyed on the deadline's timer having fired while the job was still
+running, not on a clock read taken afterwards, so a job that finishes just
+inside its deadline is still a success no matter how long the worker then
+takes to store it. An *exception* raised after the deadline is still recorded
+as that exception (message and traceback intact), which means it follows
+`max_retries` rather than `on_timeout`.
+
+## Abandoned job threads: when a worker stops claiming on purpose
+
+Every job's `run()` is called in a thread from the worker's **own** pool,
+sized by `--job-threads` (default 8). A timed-out synchronous job leaves its
+thread running — nothing can stop it — so those threads accumulate on a
+worker whose jobs keep blocking past their deadlines.
+
+A worker runs one job at a time, so between jobs *every live job thread is an
+abandoned one*. When they fill the pool the worker **stops claiming and says
+so**, at ERROR, immediately and then every 30s until it recovers:
+
+```
+[q:1000] NOT CLAIMING: 8 abandoned job thread(s) fill this worker's pool of 8.
+Timed-out synchronous jobs cannot be stopped; this worker resumes when they
+finish. Refusing for 0s so far — if this persists, that job class blocks far
+past its timeout and needs a shorter one, an interruptible implementation, or
+its own worker.
+```
+
+It resumes (with a `Claiming again after Ns` warning) as soon as one thread
+finishes. Nothing is claimed and abandoned to do this, so no job's retry
+budget is spent on the worker's condition: the queue simply backs up where
+other workers can drain it.
+
+The dedicated pool matters on its own — job threads used to share asyncio's
+default executor with the worker's own `getaddrinfo`, so a runaway job class
+could break the worker's reconnects. Now it can only exhaust the budget that
+exists for running jobs.
+
+**If you see it:** that queue's job class blocks far past its timeout. Fix it
+with a shorter timeout, an interruptible (async, or self-clock-watching)
+implementation, or a dedicated queue and worker for it. Raising
+`--job-threads` buys tolerance for more simultaneously-abandoned threads; it
+does not make them stoppable. Ending the process is still the only thing that
+does — and note that those threads also delay the process's own exit.
+
 ## Queue controls (live; no restarts)
 
 ```bash
@@ -128,9 +177,10 @@ code fix, `pj-admin dlq retry ID` (fresh attempt budget).
 
 **Nothing is being claimed.** In order: `pj-admin doctor`;
 `pj-admin queues show NAME` (paused? limits hit?); `pj-admin workers list`
-(any live workers on that queue?); remember jobs with `prio` above the
-workers' ceiling (default 1000) or `capability` no worker advertises are
-invisible to those workers.
+(any live workers on that queue?); the workers' own logs for
+`NOT CLAIMING` (abandoned job threads — see above); remember jobs with
+`prio` above the workers' ceiling (default 1000) or `capability` no worker
+advertises are invisible to those workers.
 
 **The scheduler missed fires** (was down at fire time). Missed ticks are
 skipped, not backfilled; `next_run` advances from now. Check

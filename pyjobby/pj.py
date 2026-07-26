@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import datetime
 import importlib
 import inspect
@@ -40,6 +41,8 @@ import signal
 import sys
 import time
 import traceback
+from concurrent.futures import Future as ThreadFuture
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from multiprocessing import Process
 from typing import Any, ClassVar, Final
@@ -280,6 +283,12 @@ class JobSystem:
     max_retries: int = 10  # Maximum attempts before terminal 'crashed'
     default_timeout: int = 3600  # Default job timeout in seconds (1 hour)
     heartbeat_interval: float = 10.0  # seconds between registry heartbeats
+    # Size of this worker's own job-thread pool, and therefore the number of
+    # ABANDONED job threads it tolerates before it stops claiming and says so.
+    # A worker runs one job at a time, so anything above 1 is headroom for
+    # timed-out synchronous jobs whose threads cannot be stopped. See
+    # _too_many_abandoned_threads.
+    job_threads: int = 8
     # re-import a job's module when its source changes (development loop);
     # off by default so production never re-executes module code per job
     reload_jobs: bool = False
@@ -313,6 +322,14 @@ class JobSystem:
     # resolve_job_class) and the source mtimes --reload watches
     _class_cache: dict[str, type[Job]] = field(default_factory=dict)
     _class_mtimes: dict[str, float] = field(default_factory=dict)
+    # this worker's OWN thread pool for running job code, plus the futures of
+    # every thread it has started (see _live_job_threads)
+    _threads: ThreadPoolExecutor | None = None
+    _job_threads: list[ThreadFuture[Any]] = field(default_factory=list)
+    # monotonic instant this worker started refusing to claim, and when it
+    # last said so (see _too_many_abandoned_threads)
+    _refusing_since: float | None = None
+    _refusal_logged: float = 0.0
 
     async def ex(self, op: str, *args: Any) -> list[asyncpg.Record]:
         """Execute prepared statement ``op`` with *args, reconnecting (and
@@ -453,6 +470,95 @@ class JobSystem:
             return
         await self.ex("worker-idle", self.worker_id, idle)
         self._idle = idle
+
+    # ------------------------------------------------------------------
+    # job threads: the pool, and what happens when abandoned ones pile up
+    # ------------------------------------------------------------------
+
+    def _thread_pool(self) -> ThreadPoolExecutor:
+        """This worker's OWN pool for running job code.
+
+        Job code used to go to the event loop's *default* executor, which is
+        shared with everything else asyncio runs in a thread — most notably
+        ``getaddrinfo`` for every reconnect. Abandoned job threads filling
+        that pool therefore took the worker's own I/O down with them. A
+        dedicated pool means a runaway job class can only exhaust the budget
+        that exists for running jobs, and makes that budget a number the
+        platform chose (``job_threads``) rather than an interpreter default.
+
+        Built on first use so constructing a JobSystem starts no threads."""
+        if self._threads is None:
+            self._threads = ThreadPoolExecutor(
+                max_workers=self.job_threads,
+                thread_name_prefix=f"pyjobby-job-{self.qname}",
+            )
+        return self._threads
+
+    def _live_job_threads(self) -> int:
+        """How many job threads are still running.
+
+        Called from the event loop only. ``Future.done()`` is the exact
+        signal — a thread's future completes when the thread returns, whether
+        or not anybody is still waiting on it — so this needs no locking and
+        no callbacks, and pruning here keeps the list from growing for the
+        life of the worker."""
+        self._job_threads = [t for t in self._job_threads if not t.done()]
+        return len(self._job_threads)
+
+    def _too_many_abandoned_threads(self) -> bool:
+        """Should this worker refuse to claim, because timed-out synchronous
+        jobs have filled its thread pool?
+
+        A timed-out synchronous ``task()`` is recorded and abandoned, but
+        **nothing can stop its thread** — it keeps a pool slot until the work
+        it is doing finishes on its own. Called between jobs, every live job
+        thread is therefore an abandoned one, and once they fill the pool the
+        next ``submit()`` would simply queue: the worker would go on claiming
+        jobs that never start, hold them in ``running`` until the monitor
+        swept them, and look healthy the whole time. A worker that stops
+        working without failing is the worst shape of outage.
+
+        So it claims only while the pool still has a free slot — the job it
+        would claim needs exactly one, so a claimed job never queues behind an
+        abandoned thread — and when they have taken every slot it says so at
+        ERROR, immediately and every 30s until it recovers. Nothing is claimed
+        and abandoned to do it, so no job's retry budget is spent on this
+        worker's condition: the queue simply backs up, visibly, for other
+        workers to drain."""
+        live = self._live_job_threads()
+        if live < self.job_threads:
+            if self._refusing_since is not None:
+                logger.warning(
+                    "[{}:{}] Claiming again after {:.1f}s; {} abandoned job "
+                    "thread(s) left",
+                    self.qname,
+                    self.prio,
+                    time.monotonic() - self._refusing_since,
+                    live,
+                )
+                self._refusing_since = None
+            return False
+
+        now = time.monotonic()
+        if self._refusing_since is None:
+            self._refusing_since = now
+            self._refusal_logged = now - 30  # log immediately below
+        if now - self._refusal_logged >= 30:
+            self._refusal_logged = now
+            logger.error(
+                "[{}:{}] NOT CLAIMING: {} abandoned job thread(s) fill this "
+                "worker's pool of {}. Timed-out synchronous jobs cannot be "
+                "stopped; this worker resumes when they finish. Refusing for "
+                "{:.0f}s so far — if this persists, that job class blocks far "
+                "past its timeout and needs a shorter one, an interruptible "
+                "implementation, or its own worker.",
+                self.qname,
+                self.prio,
+                live,
+                self.job_threads,
+                now - self._refusing_since,
+            )
+        return True
 
     async def _deregister_worker(self) -> None:
         if self._hb_task is not None:
@@ -629,6 +735,16 @@ class JobSystem:
                     prev_status = now
                     prev_processed = self.processed
 
+                if self._too_many_abandoned_threads():
+                    # Abandoned threads from timed-out synchronous jobs fill
+                    # the pool; claiming now would admit a job that cannot
+                    # start. Withdraw the wakeup demand too — a parked worker
+                    # that will not claim must not be the reason an enqueue
+                    # pays for a notification.
+                    await self._set_idle(False)
+                    sleepytime = True
+                    continue
+
                 claim_args = (
                     self.pid,
                     self.node,
@@ -665,6 +781,12 @@ class JobSystem:
             await self._deregister_worker()
             if self.cxn is not None:
                 await self.cxn.close()
+            if self._threads is not None:
+                # drop anything queued but not started; a thread already
+                # running is abandoned work that nothing can interrupt, so
+                # we do not wait for it — the process exit does.
+                self._threads.shutdown(wait=False, cancel_futures=True)
+                self._threads = None
 
     # ------------------------------------------------------------------
     # per-job orchestration
@@ -825,6 +947,30 @@ class JobSystem:
         Reaching the deadline raises ``dxe.JobTimeout``, which is the worker
         saying it observed the overrun; a ``TimeoutError`` from job code
         inside the scope is left alone as the ordinary failure it is.
+
+        **A job cannot swallow its own deadline into a success.** Catching the
+        cancellation and returning normally is inherited ``wait_for``
+        behaviour, and it produced a *false success*: a stored result for an
+        attempt the worker had already given up on, terminal on its own so the
+        monitor's sweep could never see it either. So a normal return from an
+        expired scope is refused and reported as the timeout it was, with the
+        operator's ``on_timeout`` applied exactly as if the cancellation had
+        propagated.
+
+        The test is ``bounded.expired()`` — *did this scope's timer fire while
+        the job was still inside it* — and never a clock read taken after the
+        job finished. That distinction is what makes spurious timeouts
+        impossible: ``__aexit__`` cancels the timer handler, so a job that
+        returns even a microsecond before its deadline leaves the scope
+        ENTERED and is a success no matter how long the worker then takes to
+        record it. Only a job that was actually cancelled, and chose to
+        continue anyway, can reach the refusal.
+
+        An exception raised out of an expired scope is left alone: the job
+        reported a failure and that failure is what gets recorded, with its
+        own message and traceback. Relabelling it would also break the
+        control-flow signals (``DurableSleep``, ``StaleExecutionError``) that
+        legitimately unwind through this scope.
         """
         deadline = klass._dxe_deadline
         if deadline is None or not job_timeout:  # set together, absent together
@@ -832,11 +978,21 @@ class JobSystem:
 
         try:
             async with asyncio.timeout(deadline - time.monotonic()) as bounded:
-                return await self._resolve(klass)
+                result = await self._resolve(klass)
         except TimeoutError as expired:
             if not bounded.expired():
                 raise  # job code's own deadline, not the job's
             raise dxe.JobTimeout(job_timeout) from expired
+
+        if bounded.expired():
+            # cancelled at the deadline, caught it, and returned anyway
+            logger.warning(
+                "[job {}] caught its own timeout cancellation and returned; "
+                "recording the timeout instead of that result",
+                klass.job.get("id"),
+            )
+            raise dxe.JobTimeout(job_timeout)
+        return result
 
     async def _resolve(self, klass: Job) -> Any:
         """Reduce whatever ``run()`` produces to the job's stored result.
@@ -846,8 +1002,16 @@ class JobSystem:
         deadline) stays responsive either way, and an async task pays only
         for creating its coroutine off-loop. A cancelled sync job's thread
         keeps running to completion in the background — nothing can interrupt
-        it — but its result is abandoned."""
-        staged = await asyncio.to_thread(klass.run)
+        it — but its result is abandoned.
+
+        The thread comes from this worker's own pool rather than the loop's
+        default executor, and its future is kept so those abandoned threads
+        can be counted: see ``_thread_pool`` and
+        ``_too_many_abandoned_threads`` for what the worker does when they
+        pile up. The context copy is what ``asyncio.to_thread`` did for us."""
+        thread = self._thread_pool().submit(contextvars.copy_context().run, klass.run)
+        self._job_threads.append(thread)
+        staged = await asyncio.wrap_future(thread)
         if asyncio.iscoroutine(staged):
             staged = await staged
         if inspect.isasyncgen(staged):
@@ -1131,7 +1295,15 @@ class Job:
         invented into a failure. ``self.cancelled`` remains pollable from such
         a loop, but it reports an *operator* cancel request, not an expiring
         budget — a synchronous loop that wants to bound itself must watch its
-        own clock."""
+        own clock.
+
+        A coroutine that *catches* its budget's cancellation and returns
+        anyway does not get that value checkpointed as a completed step: the
+        same refusal the job's own deadline makes in ``_execute``, for the
+        same reason. It is keyed on this scope's timer having fired, not on a
+        clock read, so a step that finishes just inside its budget is
+        untouched — and a blocking sync ``fn`` never trips it at all, because
+        it starves the timer it would have to have fired."""
         budget = self._dxe_budget(timeout)
         began = time.monotonic()
 
@@ -1148,6 +1320,16 @@ class Job:
             if not bounded.expired():
                 raise  # fn's OWN timeout, not this step's budget: don't relabel
             raise dxe.StepTimeoutError(name, budget) from expired
+
+        if bounded.expired():
+            # fn caught this budget's cancellation and returned anyway
+            logger.warning(
+                "[job {}] step '{}' caught its own budget's cancellation and "
+                "returned; recording the step timeout instead of that result",
+                self.job["id"],
+                name,
+            )
+            raise dxe.StepTimeoutError(name, budget)
 
         elapsed = time.monotonic() - began
         if elapsed > budget:
@@ -1524,6 +1706,7 @@ def runAndDone(
     default_timeout: int = 3600,
     check_interval: float = 5,
     reload_jobs: bool = False,
+    job_threads: int = 8,
 ) -> None:
     """Run the JobSystem for this worker process"""
     configure_worker_logging()
@@ -1539,6 +1722,7 @@ def runAndDone(
         max_retries=max_retries,
         default_timeout=default_timeout,
         reload_jobs=reload_jobs,
+        job_threads=job_threads,
         _launcher_pid=launcher_pid,
     )
 
@@ -1598,6 +1782,14 @@ def runAndDone(
     show_default=True,
 )
 @click.option(
+    "--job-threads",
+    default=8,
+    help="Size of this worker's job-thread pool, and so how many ABANDONED "
+    "threads (from timed-out synchronous jobs, which cannot be stopped) it "
+    "tolerates before it stops claiming and logs that it is doing so",
+    show_default=True,
+)
+@click.option(
     "--reload",
     "reload_jobs",
     is_flag=True,
@@ -1625,6 +1817,7 @@ def workit(
     max_retries: int,
     default_timeout: int,
     check_interval: float,
+    job_threads: int,
     reload_jobs: bool,
     v: bool,
     config: str,
@@ -1676,6 +1869,7 @@ def workit(
                 default_timeout,
                 check_interval,
                 reload_jobs,
+                job_threads,
             ),
         )
         p.start()

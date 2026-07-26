@@ -270,7 +270,42 @@ A wholly synchronous `task()` — no steps, no `await` — is a different case:
 the worker calls `run()` in a thread, so the event loop and the deadline's
 timer stay alive. The job is timed out on time and the worker moves on; what
 the deadline cannot do is stop the thread, which runs to completion in the
-background with its result discarded. See `docs/OPERATIONS.md`.
+background with its result discarded. That thread is not free, and what a
+worker does when abandoned threads pile up is in `docs/OPERATIONS.md`.
+
+### Catching the cancellation does not turn it into a success
+
+Catching `CancelledError` to release something and **re-raising** is correct,
+supported, and unchanged: the cancellation propagates and the timeout is
+reported exactly as it always was.
+
+Catching it and **returning normally** is refused. `asyncio.timeout` raises
+nothing when its body swallows the cancellation, so a job could report a
+result for an attempt the worker had already given up on — terminal under its
+own power, so the monitor's out-of-process sweep could not correct it either.
+Both scopes now refuse that:
+
+* the job's deadline reports `JobTimeout` and applies the job's `on_timeout`
+  policy, exactly as if the cancellation had propagated;
+* a step's budget records `StepTimeoutError` against that step, and the step
+  re-executes on the retry instead of fast-forwarding a value it invented.
+
+**This cannot produce a spurious timeout.** The question asked is *did this
+scope's timer fire while the job was still inside it* (`Timeout.expired()`),
+never *what time is it now compared to the deadline*. Leaving the scope
+cancels the timer, so a job that returns even a microsecond before its
+deadline is a success however long the worker then takes to store it, and a
+blocking synchronous call never trips it at all — it starves the timer that
+would have had to fire. Only work that was genuinely cancelled and chose to
+continue anyway can reach the refusal.
+
+An **exception** raised after the deadline is left as that exception, with its
+own message and traceback: the job reported a failure, nothing false was
+claimed, and relabelling would break the control-flow signals (`DurableSleep`,
+`StaleExecutionError`) that legitimately unwind through the same scope. The
+consequence worth knowing: a job that swallows its cancellation and then
+raises something else is recorded as that error and follows `max_retries`, not
+`on_timeout`.
 
 ---
 
