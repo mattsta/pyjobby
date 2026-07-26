@@ -2497,16 +2497,19 @@ DOCTOR_NOTIFY_WARN = 0.25
 DOCTOR_NOTIFY_FAIL = 0.5
 
 # What to actually DO about it, since the number alone tells an operator
-# nothing. Disabling the per-transition feed is safe; the enqueue and
-# completion channels are load-bearing (worker wakeups and result waiters)
-# and must stay on.
+# nothing. There is no volume lever left to pull: the per-transition dashboard
+# feed that used to be the obvious thing to disable is gone (the websocket
+# server polls aggregates instead), and every remaining channel is gated on a
+# consumer that has registered demand -- so what is in the queue is what
+# somebody asked for, and all of it is load-bearing. That makes this check
+# purely a consumer problem: something LISTENed and stopped reading.
 DOCTOR_NOTIFY_REMEDY = (
     "a listening session has stopped draining it -- find it with "
     '"SELECT pid, state, query FROM pg_stat_activity WHERE wait_event = '
-    "'NotifyQueue' OR query ILIKE '%LISTEN%'\" and disconnect it, or cut "
-    "notification volume with "
-    "'ALTER TABLE jorb DISABLE TRIGGER job_state_change_notify' "
-    "(the dashboard feed; enqueue/done channels must stay enabled)"
+    "'NotifyQueue' OR query ILIKE '%LISTEN%'\" and disconnect it. There is no "
+    "volume to trim: every remaining channel is demand-gated, so anything in "
+    "the queue has a consumer waiting for it (enqueue/done/cancel/event are "
+    "all load-bearing and must stay enabled)"
 )
 
 

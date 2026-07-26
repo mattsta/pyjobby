@@ -781,6 +781,17 @@ class JobClient:
             for waiter in self._event_waiters.get((data["job_id"], data["key"]), ()):
                 waiter.set()
 
+    # Registering demand for the gated notification channels. jorb_done and
+    # jorb_event are only emitted for a job somebody is waiting on, so
+    # waiting means SAYING SO FIRST — this is the client half of the
+    # ordering argument written out in sql/schema.sql. `AND NOT awaited`
+    # makes every registration after the first a no-op at the server, and
+    # the flag is deliberately never withdrawn: it is a per-job latch that
+    # dies with the row, not a refcount to leak.
+    _REGISTER_DEMAND_SQL = (
+        "UPDATE jorb SET awaited = TRUE WHERE id = $1 AND NOT awaited"
+    )
+
     async def _poll_until(
         self,
         waiters: dict[Any, list[asyncio.Event]],
@@ -788,6 +799,7 @@ class JobClient:
         check: Callable[[], Awaitable[Any]],
         timeout: float | None,
         what: str,
+        job_id: int,
     ) -> Any:
         """Run `check` until it returns something other than _PENDING.
 
@@ -795,12 +807,20 @@ class JobClient:
         a 2s fallback poll), or plain-sleep when no listener is configured.
         The check ALWAYS runs once before any waiting — the condition may
         already hold.
+
+        Demand for `job_id` is registered before that first check and only
+        when a listener exists: a pure-polling client depends on no
+        notification, so it asks for none.
         """
         loop = asyncio.get_running_loop()
         deadline = None if timeout is None else loop.time() + timeout
 
         waiter: asyncio.Event | None = None
         if await self._ensure_listener():
+            # BEFORE the first check, never after: a terminal state reached
+            # between the check and the registration would be one this
+            # client is neither told about nor has already seen.
+            await self.pool.execute(self._REGISTER_DEMAND_SQL, job_id)
             waiter = asyncio.Event()
             waiters.setdefault(key, []).append(waiter)
 
@@ -882,7 +902,12 @@ class JobClient:
             return _PENDING
 
         return await self._poll_until(
-            self._done_waiters, job_id, check, timeout, f"job {job_id} to finish"
+            self._done_waiters,
+            job_id,
+            check,
+            timeout,
+            f"job {job_id} to finish",
+            job_id=job_id,
         )
 
     async def get_event(
@@ -925,6 +950,7 @@ class JobClient:
             check,
             timeout,
             f"event {key!r} on job {job_id}",
+            job_id=job_id,
         )
 
     async def send_message(
@@ -933,9 +959,10 @@ class JobClient:
         """
         Send a durable message to a job's mailbox.
 
-        Plain INSERT into jorb_mailbox (the NOTIFY trigger wakes the
-        receiving job's `recv()`). External senders are not replayed on
-        retry, so no checkpointing is needed on this side.
+        Plain INSERT into jorb_mailbox; the receiving job's `recv()` polls
+        for it (there is no mailbox NOTIFY — see sql/schema.sql). External
+        senders are not replayed on retry, so no checkpointing is needed on
+        this side.
 
         Args:
             dest_job_id: Receiving job's ID

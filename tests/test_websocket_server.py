@@ -164,14 +164,18 @@ class TestBroadcastChannels:
     """Test channel subscription and broadcasting - covers lines 162-175."""
 
     @pytest.mark.asyncio
-    async def test_determine_broadcast_channel_job_state(self, db_params):
-        """Test determining broadcast channel for job state changes."""
+    async def test_determine_broadcast_channel_job_done(self, db_params):
+        """A jorb_done notification goes to the watchers of THAT job only.
+
+        There is no per-transition channel to fan out any more: the whole
+        system view is polled (see tests/test_ws_snapshot.py), and the only
+        per-job push is the demand-gated completion of a watched job."""
         server = WebSocketServer(db_params)
 
-        data = {"queue": "default", "id": 123}
-        channel = server.determine_broadcast_channel("job_state_change", data)
+        data = {"id": 123, "state": "finished"}
+        channel = server.determine_broadcast_channel("jorb_done", data)
 
-        assert channel == "queues:default"
+        assert channel == "job:123"
 
     @pytest.mark.asyncio
     async def test_determine_broadcast_channel_schedule(self, db_params):
@@ -192,11 +196,11 @@ class TestMessageProcessing:
         """Test processing notification payload."""
         server = WebSocketServer(db_params)
 
-        # Process a job state change notification
-        payload = json.dumps({"id": 123, "queue": "default", "state": "running"})
+        # Process a job completion notification
+        payload = json.dumps({"id": 123, "state": "finished"})
 
         # This should not raise
-        await server.process_notification("job_state_change", payload)
+        await server.process_notification("jorb_done", payload)
 
         # Stats should be updated
         assert server.stats["events_received"] == 1
@@ -307,14 +311,14 @@ class TestHandleNotification:
         server.process_notification = mock_process
 
         # Call handle_notification
-        payload = json.dumps({"id": 1, "queue": "test", "state": "running"})
-        server.handle_notification(None, 123, "job_state_change", payload)
+        payload = json.dumps({"id": 1, "state": "finished"})
+        server.handle_notification(None, 123, "jorb_done", payload)
 
         # Wait for task to complete
         await asyncio.sleep(0.1)
 
         assert len(called) == 1
-        assert called[0][0] == "job_state_change"
+        assert called[0][0] == "jorb_done"
 
 
 class TestProcessNotificationErrors:
@@ -326,7 +330,7 @@ class TestProcessNotificationErrors:
         server = WebSocketServer(db_params)
 
         # Process invalid JSON
-        await server.process_notification("job_state_change", "not valid json")
+        await server.process_notification("jorb_done", "not valid json")
 
         # Error should be recorded in stats
         assert server.stats["errors"] == 1
@@ -518,8 +522,8 @@ class TestNotificationTaskTracking:
         """Tasks are held in the set while running, discarded when done."""
         server = WebSocketServer(db_params)
 
-        payload = json.dumps({"id": 1, "queue": "test", "state": "running"})
-        server.handle_notification(None, 123, "job_state_change", payload)
+        payload = json.dumps({"id": 1, "state": "finished"})
+        server.handle_notification(None, 123, "jorb_done", payload)
 
         assert len(server._notification_tasks) == 1
 
@@ -538,8 +542,8 @@ class TestNotificationTaskTracking:
             object() for _ in range(server.max_pending_notifications)
         }
 
-        payload = json.dumps({"id": 1, "queue": "test", "state": "running"})
-        server.handle_notification(None, 123, "job_state_change", payload)
+        payload = json.dumps({"id": 1, "state": "finished"})
+        server.handle_notification(None, 123, "jorb_done", payload)
 
         # Nothing added, nothing processed
         assert len(server._notification_tasks) == server.max_pending_notifications
@@ -719,7 +723,7 @@ class TestStatsControlPlane:
         assert data["workers_live"] == 0
 
     @pytest.mark.asyncio
-    async def test_collect_queue_stats(self, db_params, db_pool):
+    async def test_collect_snapshot(self, db_params, db_pool):
         """Broadcast stats carry depths, paused flag, and worker count."""
         server = WebSocketServer(db_params)
         await server.init_db_pool()
@@ -745,7 +749,7 @@ class TestStatsControlPlane:
                     VALUES ('ws_host', 8765, 'default')
                 """)
 
-            stats = await server.collect_queue_stats()
+            stats = (await server.collect_snapshot())["queues"]
 
             busy = stats[busy_queue]
             assert busy["queued"] == 1

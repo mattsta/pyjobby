@@ -326,7 +326,13 @@ class TestWebsocketEntryPoint:
     async def test_pj_ws_delivers_a_live_job_event(
         self, db_pool, unique_queue, dsn, tmp_path
     ):
-        """A state change in the database reaches a subscribed websocket."""
+        """Database state reaches a subscribed websocket, through the daemon.
+
+        It arrives as an aggregate snapshot on an interval, not as a message
+        per transition: the per-transition channel was deleted (see
+        tests/test_ws_snapshot.py for why and for what replaced it). The
+        interval is turned down here so the test does not wait a full second.
+        """
         port = await free_port()
 
         async with daemon(
@@ -336,6 +342,8 @@ class TestWebsocketEntryPoint:
             "127.0.0.1",
             "--port",
             str(port),
+            "--snapshot-interval",
+            "0.1",
         ):
             await wait_until(
                 lambda: port_is_open("127.0.0.1", port), what="pj-ws listening"
@@ -352,24 +360,25 @@ class TestWebsocketEntryPoint:
                 ack = await ws.receive_json(timeout=5)
                 assert ack["event"] == "subscribed"
 
-                # cause a real state transition; the NOTIFY must arrive
-                job_id = await db_pool.fetchval(
-                    """INSERT INTO jorb (job_class, queue)
-                           VALUES ('tests.dxe_jobs.OkJob', $1) RETURNING id""",
+                # real rows in a real queue; the snapshot must report them
+                await db_pool.execute(
+                    """INSERT INTO jorb (job_class, queue, state)
+                       VALUES ('tests.dxe_jobs.OkJob', $1, 'queued'),
+                              ('tests.dxe_jobs.OkJob', $1, 'running')""",
                     unique_queue,
                 )
-                await db_pool.execute(
-                    "UPDATE jorb SET state = 'finished' WHERE id = $1", job_id
-                )
 
-                for _ in range(10):
+                for _ in range(20):
                     msg = await ws.receive_json(timeout=5)
-                    if msg.get("event") == "job_state_change":
-                        assert msg["data"]["id"] == job_id
-                        assert msg["data"]["new_state"] == "finished"
+                    if msg.get("event") != "dashboard":
+                        continue
+                    stats = msg["data"]["queues"].get(unique_queue)
+                    if stats and stats["running"] == 1:
+                        assert stats["queued"] == 1
+                        assert stats["backlog"] == 1
                         break
                 else:
-                    pytest.fail("no job_state_change event delivered")
+                    pytest.fail("no dashboard snapshot delivered")
 
     async def test_pj_ws_health_endpoint(self, dsn, tmp_path):
         port = await free_port()

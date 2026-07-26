@@ -14,7 +14,12 @@ Design notes:
 * Workers register in jorb_worker and heartbeat last_seen on a dedicated
   connection; the monitor requeues jobs owned by workers that stop beating.
 * Idle workers sleep on LISTEN jorb_enqueued and wake the moment work
-  arrives; polling remains the fallback for run_after-delayed jobs.
+  arrives; polling remains the fallback for run_after-delayed jobs. The
+  wakeup is DEMAND-GATED: enqueueing only notifies when some worker on
+  that queue has published jorb_worker.idle, so a busy fleet -- which is
+  never asleep -- costs the enqueue path nothing. A worker publishes idle
+  BEFORE its last claim attempt, which is what makes it impossible for a
+  job to be both unseen and unannounced (see _set_idle and sql/schema.sql).
 * Cancellation of running jobs: operators set cancel_requested, the
   jorb_cancel NOTIFY reaches the executing worker, and the job's task is
   cancelled at the next await point.
@@ -230,12 +235,26 @@ STMTS["set-event"] = dxe.SET_EVENT_SQL
 STMTS["send"] = dxe.SEND_SQL
 STMTS["recv"] = dxe.RECV_SQL
 
+# Publish (or withdraw) this worker's demand for jorb_enqueued wakeups.
+# `idle IS DISTINCT FROM $2` makes a redundant call a no-op at the server:
+# the flag must be written on the busy<->parked TRANSITION only, or the fix
+# would have traded one NOTIFY per enqueue for one UPDATE per poll.
+STMTS["worker-idle"] = """UPDATE jorb_worker
+              SET idle = $2
+              WHERE id = $1
+                AND idle IS DISTINCT FROM $2"""
+
 # Worker registry (executed on the heartbeat connection, not prepared).
 WORKER_REGISTER_SQL = """INSERT INTO jorb_worker
         (host, pid, queue, capabilities, version)
         VALUES ($1, $2, $3, $4, $5) RETURNING id"""
 WORKER_HEARTBEAT_SQL = "UPDATE jorb_worker SET last_seen = now() WHERE id = $1"
-WORKER_SHUTDOWN_SQL = "UPDATE jorb_worker SET shutdown_at = now() WHERE id = $1"
+# Retiring clears idle in the same statement: a worker that exits while
+# marked idle would otherwise keep this queue's notifications switched on
+# for every enqueue until the monitor swept it.
+WORKER_SHUTDOWN_SQL = (
+    "UPDATE jorb_worker SET shutdown_at = now(), idle = FALSE WHERE id = $1"
+)
 
 
 @dataclass
@@ -278,6 +297,9 @@ class JobSystem:
     errors: int = 0
     # wakeup + cancellation coordination
     _wake: asyncio.Event = field(default_factory=asyncio.Event)
+    # last value published to jorb_worker.idle, tracked in memory so the
+    # flag is written only when it changes (see _set_idle)
+    _idle: bool = False
     _current_job_id: int | None = None
     _exec_task: asyncio.Task[Any] | None = None
     _cancel_current: bool = False
@@ -319,7 +341,11 @@ class JobSystem:
         await self._listen()
 
     async def _listen(self) -> None:
-        """LISTEN for enqueue wakeups and cancellation requests."""
+        """LISTEN for enqueue wakeups and cancellation requests.
+
+        ``jorb_enqueued`` only arrives while this worker has published
+        ``jorb_worker.idle`` (see _set_idle); LISTENing costs nothing when
+        nothing is sent, and the poll in run() covers a missed wakeup."""
 
         def _on_enqueue(conn: Any, pid: int, channel: str, payload: str) -> None:
             if payload == self.qname:
@@ -394,6 +420,39 @@ class JobSystem:
                 with contextlib.suppress(Exception):
                     self._hb_cxn = await db.connect(**self.dsn)
             await asyncio.sleep(self.heartbeat_interval)
+
+    async def _set_idle(self, idle: bool) -> None:
+        """Publish (or withdraw) this worker's demand for enqueue wakeups.
+
+        ``jorb_enqueued`` is only notified when some worker on the queue has
+        this flag set (see sql/schema.sql), so this IS the subscription. The
+        ordering around it is the correctness argument, and it is the reason
+        run() publishes idle BEFORE its last claim rather than after:
+
+            set idle = TRUE  ->  claim  ->  got a job? clear idle and run it
+                                        ->  got nothing? sleep on the wakeup
+
+        An enqueue whose gate runs after this commit sees us and notifies us.
+        An enqueue that committed before the following claim's snapshot is
+        found by that claim. There is no order in which a job is both unseen
+        and unannounced, apart from the sub-millisecond gap between an
+        enqueue's WAL flush and its visibility -- which the unconditional
+        poll every ``checkInterval`` covers. A missed wakeup costs latency,
+        never a lost job.
+
+        The write happens only on the busy<->parked transition (tracked here
+        and again in the WHERE clause), so a busy worker never writes it and
+        a parked worker writes it once.
+        """
+        if self._idle == idle:
+            return
+        if self.worker_id is None:
+            # unregistered (registry was unavailable at startup): there is no
+            # row to publish demand on, so this worker relies on its poll.
+            self._idle = idle
+            return
+        await self.ex("worker-idle", self.worker_id, idle)
+        self._idle = idle
 
     async def _deregister_worker(self) -> None:
         if self._hb_task is not None:
@@ -570,8 +629,7 @@ class JobSystem:
                     prev_status = now
                     prev_processed = self.processed
 
-                jobs = await self.ex(
-                    "claim",
+                claim_args = (
                     self.pid,
                     self.node,
                     self.qname,
@@ -579,11 +637,24 @@ class JobSystem:
                     self.prio,
                     self.worker_id,
                 )
+                jobs = await self.ex("claim", *claim_args)
+
+                if not jobs and not self._idle:
+                    # About to park. Publish the demand that switches this
+                    # queue's enqueue notifications back on, and only THEN
+                    # look again -- an enqueue that raced us either sees the
+                    # flag and wakes us, or is already visible to this second
+                    # claim. Doing it in the other order loses the wakeup.
+                    await self._set_idle(True)
+                    jobs = await self.ex("claim", *claim_args)
 
                 if not jobs:
                     sleepytime = True
                     continue
 
+                # working again: withdraw the demand so enqueues stop paying
+                # the notification (a no-op when we never parked)
+                await self._set_idle(False)
                 sleepytime = False
                 # dict copy so kwargs can be augmented before running
                 await self._process(dict(jobs[0]))

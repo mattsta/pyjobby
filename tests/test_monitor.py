@@ -920,24 +920,34 @@ class TestSweepCompletedCheckpoints:
         assert (await get_job(db_pool, live))["state"] == state
 
     async def test_batch_size_bounds_one_sweep(self, db_pool, unique_queue):
-        """Counts are exact; which of one job's checkpoints goes first is not.
+        """``batch_size`` bounds the JOBS a sweep takes, not their rows.
 
-        The sweep is ordered by the job's terminal timestamp so it can ride
-        jorb_retention_idx, and every checkpoint of a single job ties on that
-        — so identity is asserted as a shrinking subset, not a sequence."""
-        job = await insert_terminal_job(db_pool, unique_queue, days_ago=3)
-        seqs = await add_checkpoints(db_pool, job, 5)
+        A job's checkpoints always go together: the sweep finds its victims
+        by walking jorb_retention_idx (which is on the JOB's terminal time)
+        and then deletes by job id, so there is no cheap way to stop
+        half-way through one job and no reason to want one. Splitting a
+        batch mid-job would also mean a second index-driven lookup on
+        jorb_step for every batch, which is the cost this sweep was
+        rewritten to stop paying."""
+        jobs = [
+            await insert_terminal_job(db_pool, unique_queue, days_ago=3 + n)
+            for n in range(3)
+        ]
+        for job in jobs:
+            await add_checkpoints(db_pool, job, 2)
 
-        for expected, remaining in ((2, 3), (2, 1), (1, 0), (0, 0)):
+        # two jobs per batch, two checkpoints each
+        for expected, remaining in ((4, 2), (2, 0), (0, 0)):
             deleted = await sweep_completed_checkpoints(
                 db_pool, checkpoint_retention_days=1, batch_size=2
             )
-            left = await step_seqs(db_pool, job)
-            assert (deleted, len(left)) == (expected, remaining)
-            assert set(left) <= set(seqs)
+            left = 0
+            for job in jobs:
+                left += len(await step_seqs(db_pool, job))
+            assert (deleted, left) == (expected, remaining)
 
-        # the job row itself was never in scope
-        assert await job_ids(db_pool) == [job]
+        # the job rows themselves were never in scope
+        assert await job_ids(db_pool) == sorted(jobs)
 
     async def test_checkpoints_of_the_longest_dead_job_go_first(
         self, db_pool, unique_queue

@@ -8,8 +8,12 @@ Live, interactive dashboard for monitoring and managing pyjobby jobs in real-tim
 
 ## 🎯 Features
 
-- **Real-Time Updates**: Job state changes broadcast instantly via WebSocket
-- **Live Queue Statistics**: Queue depth and stats updated every 5 seconds
+- **Live Aggregates**: A whole-system snapshot (depths, backlog age, in-flight,
+  recent outcomes, worker count) pushed once per second — **one database query
+  per interval, shared by every connected dashboard**, and none at all while
+  nobody is subscribed
+- **Per-Job Watches**: Follow one specific job to completion, on a channel the
+  database only emits *because* you asked for that job
 - **Interactive Management**: Cancel, retry, and adjust job priorities from the UI
 - **Pure PostgreSQL**: Uses LISTEN/NOTIFY - no Redis or external message broker needed
 - **Clean Frontend**: Pure HTML/CSS/JavaScript - no framework bloat
@@ -22,36 +26,59 @@ Live, interactive dashboard for monitoring and managing pyjobby jobs in real-tim
 
 ```
 PostgreSQL Database
-    ↓
-Triggers (on job state changes)
-    ↓
-NOTIFY (PostgreSQL pub/sub)
-    ↓
-WebSocket Server (asyncpg listener)
-    ↓
+    |
+    |-- polled once per --snapshot-interval, ONLY while somebody is subscribed
+    |   (one index-backed aggregate query, shared by all clients)
+    |
+    '-- NOTIFY jorb_done, gated on jorb.awaited
+        (fires only for jobs a client explicitly watched)
+    |
+    v
+WebSocket Server (asyncpg pool + one LISTEN connection)
+    |
+    v
 WebSocket Clients (browsers)
 ```
 
-**Key Point**: Each WebSocket server listens directly to PostgreSQL via asyncpg's LISTEN functionality. No Redis needed for message distribution!
+**Key Point**: the dashboard feed is a **poll of aggregates**, not a push of
+transitions.
+
+There used to be a `job_state_change` NOTIFY carrying every single state
+transition. It was deleted. Two reasons:
+
+- **It was the platform's biggest write-path cost.** Committing a transaction
+  that issued a NOTIFY takes a global exclusive lock held through fsync, so
+  notifying commits serialise. The lock is taken per COMMIT, not per
+  notification, so one ungated channel cost as much as all of them — deleting
+  it measured **2.6-2.9x** on the completion path (12,019 -> 31,591 jobs/s on
+  one run, 11,917 -> 35,191 on another; 16 concurrent connections, one
+  transaction per job, median of 5; see `tests/test_notify_gating.py`).
+- **Nobody could consume it.** At a million jobs an hour it was ~830 messages
+  per second of individual transitions. A dashboard wants aggregates.
+
+It could not simply be demand-gated like the other channels, because a browser
+has no polling fallback: a gate would have silently *dropped* dashboard events
+instead of delaying them. So the consumer got a different mechanism, which is
+the one documented below.
 
 ---
 
 ## 📦 Components
 
-### 1. Database Triggers (`priv/migrations/004_add_realtime_events.sql`)
+### 1. Database Triggers (`pyjobby/sql/schema.sql`)
 
-PostgreSQL triggers that send NOTIFY events:
+Every NOTIFY in the platform goes through one trigger function, `jorb_notify()`,
+which declares each channel's topic, demand gate and payload in one place. The
+two this server listens on:
 
-- **job_state_change**: Fires when job state changes (queued → running → finished, etc.)
-- **schedule_executed**: Fires when scheduled job completes
-- **queue_alert**: Fires when queue depth exceeds threshold (1000 jobs)
-- **job_created**: Fires for 20% of new jobs (sampled to avoid spam)
+- **jorb_done**: a job reached a terminal state. **Demand-gated** on
+  `jorb.awaited`, so it is emitted only for jobs somebody is waiting on — which
+  is exactly what `watch_job` registers.
+- **schedule_executed**: a scheduled job ran. Ungated, and affordable because
+  it fires at cron rate on `jorb_schedule_log`, not on any hot path.
 
-**Install**:
-
-```bash
-psql pyjobby < priv/migrations/004_add_realtime_events.sql
-```
+There is deliberately **no per-transition channel**. Do not add one back; see
+the note in `schema.sql` above the `jorb_notify()` function for the cost.
 
 ### 2. WebSocket Server (`pyjobby/websocket_server.py`)
 
@@ -100,16 +127,19 @@ open frontend/live-dashboard.html
 
 ## 🚀 Quick Start
 
-### Step 1: Apply Database Migration
+### Step 1: Create the Schema
 
 ```bash
-psql pyjobby < priv/migrations/004_add_realtime_events.sql
+pj-admin init ./pyjobby.conf.py
 ```
+
+The notification triggers this server relies on ship in
+`pyjobby/sql/schema.sql`; there is nothing extra to install.
 
 ### Step 2: Start WebSocket Server
 
 ```bash
-python -m pyjobby.websocket_server ./pyjobby.conf.py
+pj-ws ./pyjobby.conf.py --snapshot-interval 1.0
 ```
 
 You should see:
@@ -183,24 +213,74 @@ ws.onopen = () => {
 }
 ```
 
-#### job_state_change
+#### dashboard
+
+The aggregate snapshot, on the `jobs` channel, once per `--snapshot-interval`.
+Counts are per queue and fleet-wide; ages are in seconds; `backlog` counts only
+*claimable* work, so a job deliberately scheduled for next week is `queued` but
+is not backlog.
 
 ```json
 {
-  "event": "job_state_change",
+  "event": "dashboard",
   "timestamp": "2025-11-18T10:30:01.000Z",
   "data": {
-    "job_id": 12345,
-    "old_state": "queued",
-    "new_state": "running",
-    "queue": "default",
-    "job_class": "myapp.jobs.ProcessData",
-    "priority": 100
+    "interval_seconds": 1.0,
+    "window_seconds": 60.0,
+    "workers_live": 12,
+    "totals": {
+      "queued": 431, "claimed": 8, "running": 24, "waiting": 3,
+      "backlog": 402, "scheduled": 29, "oldest_backlog_age_seconds": 37.2,
+      "oldest_inflight_age_seconds": 4.1,
+      "finished": 1893, "crashed": 4, "cancelled": 0
+    },
+    "queues": {
+      "default": {
+        "queued": 431, "claimed": 8, "running": 24, "waiting": 3,
+        "backlog": 402, "scheduled": 29, "oldest_backlog_age_seconds": 37.2,
+        "oldest_inflight_age_seconds": 4.1,
+        "finished": 1893, "crashed": 4, "cancelled": 0,
+        "paused": false, "workers_live": 12
+      }
+    }
   }
 }
 ```
 
+`finished` / `crashed` / `cancelled` are counts over the last
+`window_seconds`, not over all of history.
+
+#### watching / unwatched
+
+The reply to `watch_job` / `unwatch_job`. The `state` in a `watching` reply is
+the job's state at the moment the watch was registered — if it is already
+terminal, no `jorb_done` is coming and none is owed.
+
+```json
+{
+  "event": "watching",
+  "timestamp": "2025-11-18T10:30:01.000Z",
+  "data": { "job_id": 12345, "channel": "job:12345", "state": "running" }
+}
+```
+
+#### jorb_done
+
+A watched job reached a terminal state.
+
+```json
+{
+  "event": "jorb_done",
+  "timestamp": "2025-11-18T10:30:09.000Z",
+  "data": { "id": 12345, "state": "finished" }
+}
+```
+
 #### queue_stats
+
+One queue's slice of the same snapshot, on `queues:{queue_name}`. Same fields
+as a `dashboard` entry, plus the queue name — it is cut from the same query,
+not fetched separately.
 
 ```json
 {
@@ -208,12 +288,18 @@ ws.onopen = () => {
   "timestamp": "2025-11-18T10:30:05.000Z",
   "data": {
     "queue": "default",
-    "queued": 42,
-    "running": 5,
-    "waiting": 3
+    "queued": 42, "claimed": 2, "running": 5, "waiting": 3,
+    "backlog": 40, "scheduled": 2,
+    "oldest_backlog_age_seconds": 12.4,
+    "oldest_inflight_age_seconds": 3.0,
+    "finished": 190, "crashed": 1, "cancelled": 0,
+    "paused": false, "workers_live": 12
   }
 }
 ```
+
+`queued` = `backlog` + `scheduled`: backlog is claimable *now*, scheduled is
+queued with a `run_after` in the future.
 
 #### schedule_executed
 
@@ -268,6 +354,33 @@ ws.onopen = () => {
 }
 ```
 
+#### watch_job
+
+Follow one specific job to its terminal state. This is the per-job primitive —
+there is no feed of every transition to filter.
+
+Registering a watch sets `jorb.awaited` on that row, which is the demand gate
+`jorb_done` is built on: the database emits a completion notification *because*
+you asked, and emits nothing for jobs nobody watched. The `watching` reply
+carries the job's current state, so watching an already-finished job answers
+immediately instead of hanging.
+
+```json
+{
+  "action": "watch_job",
+  "job_id": 12345
+}
+```
+
+#### unwatch_job
+
+```json
+{
+  "action": "unwatch_job",
+  "job_id": 12345
+}
+```
+
 #### cancel_job
 
 ```json
@@ -310,10 +423,15 @@ ws.onopen = () => {
 
 Clients subscribe to specific channels to filter events:
 
-- **jobs**: All job events
-- **queues:{queue_name}**: Events for specific queue (e.g., `queues:default`)
-- **schedules**: Schedule execution events
-- **alerts:queues:{queue_name}**: Queue alert events
+- **jobs**: the whole-system aggregate snapshot (`dashboard` events)
+- **queues:{queue_name}**: that queue's slice of the same snapshot
+  (`queue_stats` events) — fed from the same single query, so a per-queue
+  dashboard costs no extra database work
+- **schedules**: schedule execution events
+- **alerts:queues:{queue_name}**: queue alert events
+- **job:{job_id}**: created by `watch_job`; carries that job's completion.
+  Subscribing to it by name does nothing useful — the notification only exists
+  because `watch_job` registered demand for it.
 
 Example subscription:
 
@@ -336,11 +454,17 @@ ws.send(
 
 ## ⚡ Performance
 
-- **Latency**: Sub-second from database event to client update
-- **Throughput**: 1000+ events/second
-- **Connections**: 1000+ concurrent WebSocket clients per server
-- **Overhead**: Minimal - triggers fire only on actual changes
-- **Sampling**: Queue alerts and job creation sampled to avoid spam
+- **Database cost of the feed**: one index-backed query per
+  `--snapshot-interval`, **independent of the number of connected dashboards
+  and independent of job throughput**, and zero while nobody is subscribed.
+  That bound is the whole reason the per-transition feed was deleted; it is
+  asserted, exactly, in `tests/test_ws_snapshot.py`.
+- **Latency**: bounded by the snapshot interval (default 1s) for aggregates;
+  sub-second push for a watched job's completion.
+- **Connections**: 1000+ concurrent WebSocket clients per server — they share
+  one snapshot, so the database does not notice them.
+- **Overhead of a watch**: one row flag per watched job, one notification per
+  watched job's completion.
 
 ---
 
@@ -493,7 +617,7 @@ NGINX handles SSL termination, forwards to local WebSocket server.
 
 3. Check migration applied:
    ```bash
-   psql pyjobby -c "SELECT trigger_name FROM information_schema.triggers WHERE trigger_name LIKE 'job_%'"
+   psql pyjobby -c "SELECT trigger_name FROM information_schema.triggers WHERE trigger_name LIKE 'jorb_%'"
    ```
 
 ### Not Receiving Updates
@@ -504,24 +628,32 @@ NGINX handles SSL termination, forwards to local WebSocket server.
    ws.send(JSON.stringify({ action: "subscribe", channels: ["jobs"] }));
    ```
 
-2. Check PostgreSQL NOTIFY working:
+2. Remember that snapshots are **only** produced while somebody is
+   subscribed. A server with no subscribers issues no queries and sends
+   nothing — that is the design, not a fault.
+
+3. Check PostgreSQL NOTIFY is working, using the channel that still exists:
 
    ```bash
    # Terminal 1
-   psql pyjobby -c "LISTEN job_state_change;"
+   psql pyjobby -c "LISTEN jorb_done;"
 
-   # Terminal 2 - trigger a job state change
-   psql pyjobby -c "UPDATE jorb SET state='running' WHERE id=123;"
+   # Terminal 2 — register demand, then finish the job
+   psql pyjobby -c "UPDATE jorb SET awaited=TRUE WHERE id=123;"
+   psql pyjobby -c "UPDATE jorb SET state='finished' WHERE id=123;"
 
    # Terminal 1 should show NOTIFY
    ```
 
-3. Check server logs for errors
+   Without the first UPDATE nothing is sent, and that is correct: the channel
+   is demand-gated.
+
+4. Check server logs for errors
 
 ### High Memory Usage
 
 - Limit max subscriptions per client (default: 100)
-- Reduce periodic stats interval (default: 5 seconds)
+- Raise `--snapshot-interval` (default: 1 second)
 - Limit job list size in frontend (default: 100 jobs)
 
 ---
@@ -549,9 +681,11 @@ NGINX handles SSL termination, forwards to local WebSocket server.
 
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
-        if (msg.event === "job_state_change") {
-          document.getElementById("jobs").innerHTML +=
-            `<p>Job ${msg.data.job_id}: ${msg.data.new_state}</p>`;
+        if (msg.event === "dashboard") {
+          const t = msg.data.totals;
+          document.getElementById("jobs").textContent =
+            `${t.running} running, ${t.backlog} waiting ` +
+            `(head of queue ${t.oldest_backlog_age_seconds.toFixed(0)}s old)`;
         }
       };
     </script>
@@ -582,19 +716,14 @@ ws.on("message", (data) => {
   const event = JSON.parse(data);
   console.log("Event:", event.event, event.data);
 
-  // Auto-cancel slow jobs
-  if (
-    event.event === "job_state_change" &&
-    event.data.new_state === "running"
-  ) {
-    setTimeout(() => {
-      ws.send(
-        JSON.stringify({
-          action: "cancel_job",
-          job_id: event.data.job_id,
-        }),
-      );
-    }, 60000); // Cancel after 1 minute
+  // Alert when the fleet falls behind. Aggregates, not individual jobs:
+  // there is no per-transition feed to filter, by design.
+  if (event.event === "dashboard") {
+    for (const [queue, stats] of Object.entries(event.data.queues)) {
+      if (stats.oldest_backlog_age_seconds > 300) {
+        console.warn(`${queue} head of queue is ${stats.oldest_backlog_age_seconds}s old`);
+      }
+    }
   }
 });
 ```

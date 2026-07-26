@@ -725,9 +725,14 @@ class TestUnauthenticatedMutationBoundary:
     * ``get_stats`` — read every queue name, its paused flag and its
       concurrency/rate limits, the live worker count, and the server's own
       counters. Information disclosure of the whole topology.
-    * ``subscribe`` — receive the live ``job_state_change`` feed for any queue,
-      including job ids, job classes and state transitions belonging to other
-      tenants.
+    * ``subscribe`` — receive the aggregate dashboard snapshot, including
+      every queue name, its depth, backlog age, paused flag and recent
+      outcome counts, for every tenant.
+    * ``watch_job`` — follow ANY job id to its terminal state, and in doing so
+      WRITE ``jorb.awaited`` on another tenant's row. That write is the only
+      database mutation on the read-ish surface; it is idempotent, invisible
+      to job semantics, and its sole effect is to make that job's completion
+      emit a notification.
 
     It cannot: create jobs, delete jobs or rows, pause/resume queues, or touch
     schedules — those actions simply do not exist in the dispatcher (asserted
@@ -920,41 +925,71 @@ class TestUnauthenticatedMutationBoundary:
         assert set(data["client"]) == {"connected_at", "channels", "action_count"}
 
     @pytest.mark.asyncio
-    async def test_subscribe_streams_another_tenants_job_transitions(
+    async def test_subscribe_streams_another_tenants_queue_depths(
         self, ws_factory, db_pool, unique_queue
     ):
-        """End-to-end through PostgreSQL LISTEN/NOTIFY: an anonymous
-        subscriber to `queues:<victim>` sees every state change on that queue,
-        with job ids and job classes."""
-        h = await ws_factory(notify=True)
+        """An anonymous subscriber to `queues:<victim>` receives that queue's
+        depths, backlog age and paused flag on every poll interval.
+
+        This is what the deleted per-transition firehose became: aggregates,
+        not job ids and job classes. The disclosure is narrower than it was —
+        queue *names* and *volumes* rather than individual jobs — but it is
+        still every tenant's, to anyone who can open a socket.
+        """
+        h = await ws_factory(snapshot_interval=0.05)
         ws = await h.connect()
 
-        # Job state changes fan out to queues:<queue> (and to 'jobs').
         reply = await ask(
             ws, {"action": "subscribe", "channels": [f"queues:{unique_queue}"]}
         )
         assert reply["event"] == "subscribed"
         assert reply["data"]["channels"] == [f"queues:{unique_queue}"]
 
-        job_id = await make_job(
-            db_pool, unique_queue, "queued", job_class="VictimJob", uid=555
-        )
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE jorb SET state = 'running' WHERE id = $1", job_id
-            )
+        await make_job(db_pool, unique_queue, "queued", job_class="VictimJob", uid=555)
 
-        event = await recv(ws, timeout=10.0)
-        assert event["event"] == "job_state_change"
-        assert event["data"]["id"] == job_id
+        feed = asyncio.create_task(h.server.snapshot_broadcast())
+        try:
+            event = await recv(ws, timeout=10.0)
+        finally:
+            feed.cancel()
+
+        assert event["event"] == "queue_stats"
         assert event["data"]["queue"] == unique_queue
-        assert event["data"]["job_class"] == "VictimJob"
-        assert event["data"]["old_state"] == "queued"
-        assert event["data"]["new_state"] == "running"
+        assert event["data"]["queued"] == 1
+        assert event["data"]["backlog"] == 1
+        assert event["data"]["paused"] is False
+
+    @pytest.mark.asyncio
+    async def test_watch_job_marks_another_tenants_row_awaited(
+        self, ws_factory, db_pool, unique_queue
+    ):
+        """`watch_job` is the only per-job feed, and it WRITES to get it.
+
+        Registering the watch sets `jorb.awaited` on the target row — that
+        flag is the demand gate `jorb_done_notify` tests, so without the write
+        there would be no notification at all. Anyone can do it to any job.
+        """
+        h = await ws_factory()
+        ws = await h.connect()
+        job_id = await make_job(db_pool, unique_queue, "running", uid=777)
+
+        reply = await ask(ws, {"action": "watch_job", "job_id": job_id})
+        assert reply["event"] == "watching"
+        assert reply["data"] == {
+            "job_id": job_id,
+            "channel": f"job:{job_id}",
+            "state": "running",
+        }
+
+        async with db_pool.acquire() as conn:
+            assert (
+                await conn.fetchval("SELECT awaited FROM jorb WHERE id = $1", job_id)
+                is True
+            )
 
     @pytest.mark.asyncio
     async def test_no_other_actions_exist(self, ws_factory, db_pool):
-        """The reachable action set is exactly five verbs. Anything else — job
+        """The reachable action set is exactly eight verbs. Anything else — job
         creation, deletion, queue control, schedule management, SQL — is not
         dispatched, and nothing is written to the database while trying."""
         h = await ws_factory(max_actions_per_second=10_000)
@@ -998,6 +1033,8 @@ class TestUnauthenticatedMutationBoundary:
         assert dispatched == {
             "subscribe",
             "unsubscribe",
+            "watch_job",
+            "unwatch_job",
             "cancel_job",
             "retry_job",
             "adjust_priority",
@@ -1031,9 +1068,9 @@ class TestNotificationTaskBounding:
 
         server.process_notification = parked  # type: ignore[method-assign]
 
-        payloads = [json.dumps({"id": i, "queue": "q"}) for i in range(70)]
+        payloads = [json.dumps({"id": i, "state": "finished"}) for i in range(70)]
         for payload in payloads:
-            server.handle_notification(None, 1, "job_state_change", payload)
+            server.handle_notification(None, 1, "jorb_done", payload)
             # Tasks cannot start until we await, so the set fills up.
         assert len(server._notification_tasks) == 50
 
@@ -1057,7 +1094,7 @@ class TestNotificationTaskBounding:
 
         for i in range(200):
             server.handle_notification(
-                None, 1, "job_state_change", json.dumps({"id": i, "queue": "q"})
+                None, 1, "jorb_done", json.dumps({"id": i, "state": "finished"})
             )
         assert len(server._notification_tasks) == 200
 
@@ -1085,7 +1122,7 @@ class TestNotificationTaskBounding:
         server.process_notification = parked  # type: ignore[method-assign]
         for i in range(20):
             server.handle_notification(
-                None, 1, "job_state_change", json.dumps({"id": i, "queue": "q"})
+                None, 1, "jorb_done", json.dumps({"id": i, "state": "finished"})
             )
         assert len(server._notification_tasks) == 5
         gate.set()
@@ -1097,7 +1134,7 @@ class TestNotificationTaskBounding:
 
         server.process_notification = original  # type: ignore[method-assign]
         server.handle_notification(
-            None, 1, "job_state_change", json.dumps({"id": 999, "queue": "q"})
+            None, 1, "jorb_done", json.dumps({"id": 999, "state": "finished"})
         )
         await wait_until(
             lambda: asyncio.sleep(0, result=not server._notification_tasks),

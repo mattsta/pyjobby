@@ -56,15 +56,39 @@ Measured here, 16 concurrent connections, one transaction per job:
 
 | | jobs/s |
 |---|---|
-| as shipped (all channels) | 11,326 |
+| as shipped when this was measured (all channels) | 11,326 |
 | `job_state_change` firehose disabled | 11,668 |
 | all `NOTIFY` triggers disabled | **28,790** |
 
 **The cost is per-COMMIT, not per-notification.** Disabling the transition
-firehose — 3 of the 5 notifications per job — recovers only **3%**, because one
-`NOTIFY` in a transaction takes the same global lock as three. Reducing
-notification *volume* does not raise the ceiling; only removing `NOTIFY` from
-the commit path does.
+firehose alone — 3 of the 5 notifications per job — recovered only **3%**,
+because one `NOTIFY` in a transaction takes the same global lock as three.
+Reducing notification *volume* does not raise the ceiling; only removing
+`NOTIFY` from the commit path does.
+
+**What was done about it.** Every channel is now emitted only when a consumer
+has registered demand for it, so a job nobody is watching notifies nobody — and
+the last ungated channel, `job_state_change`, was **deleted** rather than
+gated, because its consumer (the websocket dashboard) is push-only and a gate
+would have dropped its events rather than delayed them. That consumer now polls
+aggregates instead: one index-backed query per interval, shared by every
+connected dashboard, independent of job throughput.
+
+Measured on the completion path, 16 concurrent connections, one transaction per
+job, median of 5 (`tests/test_notify_gating.py`, which rebuilds the deleted
+trigger so the "before" stays measurable):
+
+| | jobs/s |
+|---|---|
+| before: a client waiting, firehose on | 11,917 |
+| before: fire and forget, firehose on | 12,193 |
+| after: `job_state_change` deleted | **35,191** |
+
+Gating the completion channel alone bought 1.02x; deleting the firehose as
+well bought **2.9x**. Repeat runs land between 2.6x and 2.9x — the benchmark
+is a median of 5 interleaved rounds, not a single ordered pass, precisely so
+that drift shows up as noise rather than as a result. Same lesson, now paid for: it is the number of
+*notifying commits* that matters, not the number of notifications.
 
 This is the single most important thing to understand before tuning: it is
 invisible to a serial benchmark (3% there) and invisible to a bulk benchmark,
@@ -158,23 +182,21 @@ At 1,390 notifications/second there is no margin for a slow consumer, so this is
 monitored (`notify_queue_usage` metric, and a `doctor` check that WARNs well
 before the cliff) rather than assumed away.
 
-Of the five notifications per job, three are `job_state_change` — an unfiltered
-per-transition firehose with no queue filter, broadcast to every listener. No
-consumer can use ~830 messages/second of individual state transitions; a
-dashboard wants aggregates. It can be turned off without touching the
-load-bearing channels:
+The three notifications per job that used to be `job_state_change` — an
+unfiltered per-transition firehose, no queue filter, broadcast to every
+listener — are gone. No consumer could use ~830 messages/second of individual
+state transitions, and a dashboard wants aggregates, so the channel was deleted
+and the dashboard now polls (see [Why NOTIFY sets the
+ceiling](#why-notify-sets-the-ceiling)).
 
-```sql
-ALTER TABLE jorb DISABLE TRIGGER job_state_change_notify;
-```
-
-Do this to stop drowning your listeners and to slow the queue filling — **not
-to gain write throughput.** It buys 3% (see [Why NOTIFY sets the
-ceiling](#why-notify-sets-the-ceiling)); the ceiling is per-commit, so the only
-way through it is taking `NOTIFY` out of the commit path entirely.
-
-`jorb_enqueued` (worker wakeup) and `jorb_done` (result waiters) are
-load-bearing and must stay on.
+What remains is gated on demand, which means the notification rate now scales
+with how many consumers are actually parked rather than with job throughput:
+`jorb_enqueued` fires only when a worker is idle on that queue, `jorb_done` and
+`jorb_event` only when a client is waiting, `jorb_cancel` only for a running
+job. Under load — the regime that fills the queue — almost nobody is parked, so
+almost nothing is sent. There is no longer a channel to turn off for relief;
+the levers are the consumer side (find the listener that stopped draining) and
+the `notify_queue_usage` metric that warns before the cliff.
 
 ### 4. Vacuum pressure
 

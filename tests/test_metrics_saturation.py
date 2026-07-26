@@ -600,8 +600,13 @@ class TestNotifyQueueSaturation:
             _, message = notify_queue_verdict(usage)
             assert "listening session has stopped draining" in message
             assert "pg_stat_activity" in message
-            assert "DISABLE TRIGGER job_state_change_notify" in message
-            assert "enqueue/done channels must stay enabled" in message
+            # No "disable this trigger" lever is offered any more, and that is
+            # the point: the per-transition feed was deleted and every
+            # remaining channel is demand-gated, so there is no notification
+            # volume left that nobody asked for.
+            assert "DISABLE TRIGGER" not in message
+            assert "every remaining channel is demand-gated" in message
+            assert "load-bearing and must stay enabled" in message
 
 
 # =============================================================================

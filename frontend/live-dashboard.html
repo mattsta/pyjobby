@@ -322,14 +322,14 @@
 
     <div class="container">
         <div class="panel">
-            <h2>Live Jobs</h2>
+            <h2>Live Queues</h2>
             <div class="controls">
                 <button class="primary" onclick="subscribe()">Subscribe to Updates</button>
-                <button class="secondary" onclick="clearJobs()">Clear List</button>
+                <button class="secondary" onclick="clearJobs()">Clear</button>
             </div>
             <div class="job-list" id="jobList">
                 <p style="text-align: center; color: #a0aec0; padding: 40px;">
-                    Waiting for job updates...
+                    Waiting for the first snapshot...
                 </p>
             </div>
         </div>
@@ -367,8 +367,11 @@
         let ws = null;
         let reconnectTimeout = null;
         let eventCount = 0;
-        const jobs = new Map();
-        const maxJobs = 100;
+        // Latest snapshot, keyed by queue name. There is no per-job list:
+        // the server pushes aggregates, and a client that needs a specific
+        // job asks for that job with the `watch_job` action.
+        const queues = new Map();
+        let workersLive = 0;
 
         // Configuration
         const WS_URL = 'ws://localhost:8082/ws';
@@ -423,8 +426,8 @@
                     log('Server version: ' + message.data.version);
                     break;
 
-                case 'job_state_change':
-                    handleJobStateChange(message.data);
+                case 'dashboard':
+                    handleDashboard(message.data);
                     break;
 
                 case 'queue_stats':
@@ -453,27 +456,27 @@
             }
         }
 
-        // Handle job state change (NOTIFY payload carries `id`, not `job_id`)
-        function handleJobStateChange(data) {
-            const job = {
-                id: data.id ?? data.job_id,
-                job_class: data.job_class || 'Unknown',
-                queue: data.queue || 'default',
-                state: data.new_state || data.state,
-                error_count: data.error_count || 0,
-                timestamp: new Date().toLocaleTimeString()
-            };
-
-            jobs.set(job.id, job);
-
-            // Keep only last N jobs
-            if (jobs.size > maxJobs) {
-                const firstKey = jobs.keys().next().value;
-                jobs.delete(firstKey);
+        // Handle the aggregate snapshot.
+        //
+        // This replaced a per-transition feed. The old dashboard rendered a
+        // scrolling list of individual state changes, which at real load is
+        // ~830 messages a second -- unreadable by a human, and unaffordable
+        // for the database, because every one of those notifications took a
+        // global commit lock on a worker transaction. The server now polls
+        // aggregates once per interval, one query for every connected
+        // dashboard, and this renders the result.
+        function handleDashboard(data) {
+            queues.clear();
+            for (const [name, stats] of Object.entries(data.queues)) {
+                queues.set(name, stats);
             }
+            workersLive = data.workers_live;
 
-            renderJobs();
-            updateActiveJobs();
+            document.getElementById('queueDepth').textContent = data.totals.backlog;
+            document.getElementById('activeJobs').textContent =
+                data.totals.running + data.totals.claimed;
+
+            renderQueues();
         }
 
         // Handle queue statistics (includes paused flag + live worker count)
@@ -558,51 +561,48 @@
             log(`Retrying job ${jobId}...`);
         }
 
-        // Render job list
-        function renderJobs() {
+        // Render one row per queue from the latest snapshot.
+        function renderQueues() {
             const jobList = document.getElementById('jobList');
-            const jobArray = Array.from(jobs.values()).reverse();
+            const rows = Array.from(queues.entries()).sort();
 
-            if (jobArray.length === 0) {
-                jobList.innerHTML = '<p style="text-align: center; color: #a0aec0; padding: 40px;">No jobs yet</p>';
+            if (rows.length === 0) {
+                jobList.innerHTML = '<p style="text-align: center; color: #a0aec0; padding: 40px;">No queues yet</p>';
                 return;
             }
 
-            jobList.innerHTML = jobArray.map(job => `
+            const header = `<div class="job-item"><div class="job-header">
+                <div><span class="job-id">fleet</span></div>
+                <div>${workersLive} live worker${workersLive === 1 ? '' : 's'}</div>
+            </div></div>`;
+
+            jobList.innerHTML = header + rows.map(([name, q]) => `
                 <div class="job-item">
                     <div class="job-header">
                         <div>
-                            <span class="job-id">#${job.id}</span>
-                            <span class="badge ${job.state}">${job.state}</span>
+                            <span class="job-id">${name}</span>
+                            ${q.paused ? '<span class="badge paused">paused</span>' : ''}
                         </div>
-                        <div>${job.timestamp}</div>
+                        <div>${q.oldest_backlog_age_seconds.toFixed(0)}s at head</div>
                     </div>
-                    <div class="job-class">${job.job_class}</div>
                     <div style="font-size: 12px; color: #a0aec0; margin-top: 5px;">
-                        Queue: ${job.queue} | Errors: ${job.error_count}
+                        queued ${q.queued} (backlog ${q.backlog}) |
+                        claimed ${q.claimed} | running ${q.running} |
+                        waiting ${q.waiting}
                     </div>
-                    <div class="actions">
-                        <button class="action-btn secondary" onclick="cancelJob(${job.id})" ${['queued', 'waiting', 'claimed', 'running'].includes(job.state) ? '' : 'disabled'}>Cancel</button>
-                        <button class="action-btn secondary" onclick="retryJob(${job.id})" ${['crashed', 'cancelled', 'finished'].includes(job.state) ? '' : 'disabled'}>Retry</button>
+                    <div style="font-size: 12px; color: #a0aec0; margin-top: 5px;">
+                        last minute: ${q.finished} finished, ${q.crashed} crashed,
+                        ${q.cancelled} cancelled
                     </div>
                 </div>
             `).join('');
         }
 
-        // Update active jobs count
-        function updateActiveJobs() {
-            const active = Array.from(jobs.values())
-                .filter(j => j.state === 'running' || j.state === 'queued' || j.state === 'waiting')
-                .length;
-            document.getElementById('activeJobs').textContent = active;
-        }
-
-        // Clear job list
+        // Clear the rendered snapshot (the next poll refills it)
         function clearJobs() {
-            jobs.clear();
-            renderJobs();
-            updateActiveJobs();
-            log('Job list cleared');
+            queues.clear();
+            renderQueues();
+            log('Snapshot cleared');
         }
 
         // Update connection status

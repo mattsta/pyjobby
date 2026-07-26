@@ -2,20 +2,51 @@
 """
 WebSocket Server for Real-Time Job Monitoring
 
-Pure PostgreSQL LISTEN/NOTIFY implementation - NO Redis, NO external dependencies!
+Pure PostgreSQL implementation - NO Redis, NO external dependencies!
 
-Provides live updates for:
-- Job state changes
-- Queue statistics
-- Schedule executions
-- Alerts and notifications
+WHAT THIS SERVER PUSHES, AND WHY IT IS SHAPED THIS WAY
+
+There used to be a ``job_state_change`` NOTIFY: one message per job state
+transition, ungated, broadcast to every listener. It is gone, and this module
+is where its replacement lives. Two independent reasons killed it:
+
+* **Cost.** Committing a transaction that issued a NOTIFY takes a GLOBAL
+  exclusive lock held through fsync, so notifying commits serialise against
+  each other. The lock is per COMMIT, so ONE ungated channel costs as much as
+  seven -- every other channel in the schema is demand-gated, which made this
+  one the entire remaining bill. Deleting it is worth 2.6-2.9x on the
+  completion path (measured across runs; tests/test_notify_gating.py rebuilds
+  the deleted trigger so the "before" number stays measurable).
+* **Usefulness.** At the reference workload (1M jobs/hour) it is ~830
+  individual transitions per second. No dashboard renders that and no human
+  reads it. A dashboard wants aggregates.
+
+It could not simply be *gated* like the others: a gate trades a notification
+for the consumer's polling fallback, and this consumer -- a browser -- has no
+fallback, so gating would have silently DROPPED dashboard events rather than
+delaying them.
+
+So the push became a **poll of aggregates**, driven here:
+
+* one query per :data:`DEFAULT_SNAPSHOT_INTERVAL`, shared by every subscribed
+  client. Database cost is O(1) in the number of dashboards AND O(1) in job
+  throughput, instead of O(transitions) as before.
+* nothing runs at all while nobody is subscribed. The demand principle that
+  governs the schema's notification gates governs this loop too.
+* the statement is index-backed and bounded by work in flight, never by table
+  size -- see :data:`SNAPSHOT_SQL`.
+
+A client that genuinely needs per-job updates asks for THAT JOB (``watch_job``)
+rather than tailing every transition; that rides ``jorb_done``, which is gated
+on ``jorb.awaited`` and therefore costs a notification only for jobs somebody
+actually asked about.
 
 Features:
-- Direct PostgreSQL LISTEN/NOTIFY (no Redis needed!)
+- Aggregate dashboard snapshots on an interval, one query for all clients
+- Per-job watches over the demand-gated ``jorb_done`` channel
 - Channel-based subscriptions
 - Interactive job management (cancel, retry, priority adjust)
 - Connection pooling and rate limiting
-- Automatic reconnection handling
 - Multiple WebSocket servers can run independently
 """
 
@@ -27,7 +58,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import aiohttp
@@ -64,6 +95,132 @@ MAX_BIGINT = 2**63 - 1
 MIN_INT32 = -(2**31)
 MAX_INT32 = 2**31 - 1
 
+# =============================================================================
+# The aggregate snapshot: what replaced the per-transition firehose
+# =============================================================================
+
+#: Channel a client subscribes to for the whole-system aggregate snapshot.
+#: It keeps the name the per-transition feed used, because it answers the same
+#: question ("what is happening across all jobs") with a shape a dashboard can
+#: actually render.
+SNAPSHOT_CHANNEL = "jobs"
+#: Prefix of the per-queue channels that receive the per-queue slice of the
+#: same snapshot.
+QUEUE_CHANNEL_PREFIX = "queues:"
+#: Prefix of the per-job channels created by ``watch_job``.
+JOB_CHANNEL_PREFIX = "job:"
+
+#: Seconds between snapshots. A dashboard does not need faster, and this is
+#: the whole database cost of the feed: one query per interval however many
+#: dashboards are open and however many jobs are running. The old firehose
+#: had no such bound -- it cost one NOTIFY per transition, forever upward.
+DEFAULT_SNAPSHOT_INTERVAL = 1.0
+#: How far back the snapshot's terminal-outcome counts look. Recent outcomes,
+#: not all of history: "count everything" is hundreds of millions of rows at
+#: the reference workload, and this runs every second.
+DEFAULT_SNAPSHOT_WINDOW_SECONDS = 60.0
+
+#: The ONE statement a snapshot issues.
+#:
+#: Every arm is an index-backed shape lifted from code that was already
+#: measured for exactly this purpose, so the plan is known rather than hoped
+#: for (tests/test_ws_snapshot.py EXPLAINs this exact string and fails on a
+#: sequential scan):
+#:
+#:   backlog   admin_api.backlog_stats  -- jorb_claim_idx, index-only. Depth
+#:                                         AND head-of-queue age; claimable
+#:                                         only, so work scheduled for next
+#:                                         week is not reported as backlog.
+#:   scheduled the complement of that predicate on the same index: queued but
+#:                                         not yet due. backlog + scheduled is
+#:                                         every queued job, which is what
+#:                                         PROM_SQL_LIVE_STATES arm 1 counts --
+#:                                         split in two here because BOTH
+#:                                         halves then carry an index
+#:                                         condition, and a bare index-only
+#:                                         scan with no condition is exactly
+#:                                         the shape a planner abandons for a
+#:                                         sequential scan.
+#:   inflight  admin_api.inflight_stats -- jorb_inflight_idx, index-only, and
+#:                                         bounded by the worker fleet.
+#:   waiting   PROM_SQL_LIVE_STATES arm 3 -- jorb_waitfor_*_idx.
+#:   recent    web_admin.PROM_SQL_TERMINAL_RECENT -- the COALESCE(finished,
+#:                                         updated) predicate is what
+#:                                         jorb_retention_idx is BUILT on;
+#:                                         filtering bare `finished` matches
+#:                                         no index and reads the heap of
+#:                                         every job ever run.
+#:   queue     web_admin.PROM_SQL_QUEUE_PAUSED -- control rows, so a paused
+#:                                         queue with nothing pending still
+#:                                         appears.
+#:   workers   web_admin.PROM_SQL_WORKERS_LIVE -- jorb_worker_live_idx.
+#:
+#: Written as a UNION ALL rather than one grouped scan for the reason spelled
+#: out over PROM_SQL_LIVE_STATES: a single predicate spanning several states
+#: matches none of the partial indexes and collapses into a sequential scan.
+#: Each arm gets its own index; the union is what keeps them.
+SNAPSHOT_SQL = """
+    SELECT 'backlog'::text AS kind, queue, 'queued'::text AS state,
+           COUNT(*)::bigint AS n,
+           EXTRACT(EPOCH FROM (now() - MIN(run_after)))::float8 AS age
+      FROM jorb WHERE state = 'queued' AND run_after <= now()
+     GROUP BY queue
+    UNION ALL
+    SELECT 'scheduled', queue, 'scheduled', COUNT(*)::bigint, NULL::float8
+      FROM jorb WHERE state = 'queued' AND run_after > now()
+     GROUP BY queue
+    UNION ALL
+    SELECT 'inflight', queue, state::text, COUNT(*)::bigint,
+           EXTRACT(EPOCH FROM (now() - MIN(updated)))::float8
+      FROM jorb WHERE state IN ('claimed', 'running')
+     GROUP BY queue, state
+    UNION ALL
+    SELECT 'live', queue, 'waiting', COUNT(*)::bigint, NULL::float8
+      FROM jorb WHERE state = 'waiting'
+     GROUP BY queue
+    UNION ALL
+    SELECT 'recent', queue, state::text, COUNT(*)::bigint, NULL::float8
+      FROM jorb
+     WHERE state IN ('finished', 'crashed', 'cancelled')
+       AND COALESCE(finished, updated) >= now() - $1::interval
+     GROUP BY queue, state
+    UNION ALL
+    SELECT 'queue', name, NULL::text,
+           (CASE WHEN paused THEN 1 ELSE 0 END)::bigint, NULL::float8
+      FROM jorb_queue
+    UNION ALL
+    SELECT 'workers', NULL::text, NULL::text, COUNT(*)::bigint, NULL::float8
+      FROM jorb_worker
+     WHERE shutdown_at IS NULL AND last_seen > now() - interval '60 seconds'
+"""
+
+#: Registers a client's interest in one specific job and reports that job's
+#: state in the same round trip.
+#:
+#: ORDER MATTERS, and it is the same argument the schema makes over
+#: jorb_done_notify: demand (``awaited``) is set on the VERY ROW whose state
+#: change would notify, so the two writers take the same row lock and
+#: PostgreSQL orders them. Either the worker's terminal UPDATE sees
+#: ``awaited`` and notifies us, or it committed first and the ``state`` this
+#: statement returns is already terminal -- in which case the reply tells the
+#: client so and no notification is owed. There is no third case, so a watch
+#: can never hang waiting for an event that already happened.
+#:
+#: The UPDATE is conditional on ``NOT awaited`` so a re-watch is not a row
+#: write; the CTE's outer read still answers from the pre-update snapshot,
+#: where ``state`` is whatever it already was. NULL means no such job.
+WATCH_JOB_SQL = """
+    WITH registered AS (
+        UPDATE jorb SET awaited = TRUE
+         WHERE id = $1 AND NOT awaited
+     RETURNING state::text AS state
+    )
+    SELECT COALESCE(
+        (SELECT state FROM registered),
+        (SELECT state::text FROM jorb WHERE id = $1)
+    ) AS state
+"""
+
 
 class InvalidMessage(ValueError):
     """A client message rejected by validation.
@@ -99,10 +256,14 @@ class WebSocketServer:
         db_params: dict[str, Any],
         max_subscriptions: int = 100,
         max_actions_per_second: int = 10,
+        snapshot_interval: float = DEFAULT_SNAPSHOT_INTERVAL,
+        snapshot_window_seconds: float = DEFAULT_SNAPSHOT_WINDOW_SECONDS,
     ):
         self.db_params = db_params
         self.max_subscriptions = max_subscriptions
         self.max_actions_per_second = max_actions_per_second
+        self.snapshot_interval = snapshot_interval
+        self.snapshot_window = timedelta(seconds=snapshot_window_seconds)
 
         # Client management
         self.clients: dict[web.WebSocketResponse, ClientConnection] = {}
@@ -117,13 +278,17 @@ class WebSocketServer:
         self._notification_tasks: set[asyncio.Task] = set()
         self.max_pending_notifications = 1000
 
-        # Statistics
+        # Statistics. `snapshot_queries` is the feed's entire database cost,
+        # counted where it is incurred: it must stay flat while nobody is
+        # subscribed and must not scale with the number of subscribers, and
+        # tests/test_ws_snapshot.py asserts exactly that against this counter.
         self.stats = {
             "total_connections": 0,
             "current_connections": 0,
             "messages_sent": 0,
             "messages_received": 0,
             "events_received": 0,
+            "snapshot_queries": 0,
             "errors": 0,
         }
 
@@ -140,10 +305,12 @@ class WebSocketServer:
         if not self.notify_conn or self.notify_conn.is_closed():
             self.notify_conn = await db.connect(**self.db_params)
 
-            # Set up listeners for all event channels
-            await self.notify_conn.add_listener(
-                "job_state_change", self.handle_notification
-            )
+            # Every channel this server LISTENs on. There is deliberately no
+            # per-transition channel here: the whole-system view is polled
+            # (see SNAPSHOT_SQL), and the only per-job push is jorb_done,
+            # which the schema gates on jorb.awaited -- so it fires only for
+            # jobs a watch_job actually asked about.
+            await self.notify_conn.add_listener("jorb_done", self.handle_notification)
             await self.notify_conn.add_listener(
                 "schedule_executed", self.handle_notification
             )
@@ -194,10 +361,6 @@ class WebSocketServer:
             # Broadcast to subscribers
             await self.broadcast_event(broadcast_channel, event)
 
-            # Also broadcast to 'jobs' channel for all job events
-            if channel == "job_state_change":
-                await self.broadcast_event("jobs", event)
-
             self.stats["events_received"] += 1
 
         except json.JSONDecodeError as e:
@@ -209,9 +372,11 @@ class WebSocketServer:
 
     def determine_broadcast_channel(self, event_type: str, data: dict[str, Any]) -> str:
         """Determine which WebSocket channel to broadcast on"""
-        if event_type == "job_state_change":
-            queue = data.get("queue", "default")
-            return f"queues:{queue}"
+        if event_type == "jorb_done":
+            # Delivered only to the clients that asked for THIS job. The
+            # notification exists at all only because one of them registered
+            # demand on the row (see WATCH_JOB_SQL).
+            return f"{JOB_CHANNEL_PREFIX}{data.get('id')}"
 
         elif event_type == "schedule_executed":
             return "schedules"
@@ -275,11 +440,13 @@ class WebSocketServer:
             logger.error(f"WebSocket error: {e}")
             self.stats["errors"] += 1
         finally:
-            # Cleanup. Channel names are attacker-chosen, so an empty channel
-            # must lose its dict *key* too: leaving the key behind lets a
-            # client subscribe-disconnect-repeat until self.subscriptions
-            # exhausts memory.
+            # Cleanup. detach() is what keeps a disconnect from leaking an
+            # empty, attacker-named channel key (see its docstring); the
+            # sweep over self.subscriptions catches anything broadcast_event
+            # already half-removed while reaping this client.
             self.clients.pop(ws, None)
+            for channel in list(client.channels):
+                self.detach(ws, client, channel)
             for channel, channel_subs in list(self.subscriptions.items()):
                 channel_subs.discard(ws)
                 if not channel_subs:
@@ -396,7 +563,13 @@ class WebSocketServer:
         """
         if action in ("subscribe", "unsubscribe"):
             data["channels"] = self.validate_channels(data.get("channels", []))
-        if action in ("cancel_job", "retry_job", "adjust_priority"):
+        if action in (
+            "cancel_job",
+            "retry_job",
+            "adjust_priority",
+            "watch_job",
+            "unwatch_job",
+        ):
             data["job_id"] = self.validate_job_id(data.get("job_id"))
         if action == "adjust_priority":
             data["new_priority"] = self.validate_priority(data.get("new_priority"))
@@ -427,6 +600,12 @@ class WebSocketServer:
 
         elif action == "unsubscribe":
             await self.handle_unsubscribe(ws, client, data)
+
+        elif action == "watch_job":
+            await self.handle_watch_job(ws, client, data)
+
+        elif action == "unwatch_job":
+            await self.handle_unwatch_job(ws, client, data)
 
         elif action == "cancel_job":
             await self.handle_cancel_job(ws, client, data)
@@ -459,9 +638,7 @@ class WebSocketServer:
 
         # Subscribe to channels
         for channel in channels:
-            if channel not in client.channels:
-                client.channels.add(channel)
-                self.subscriptions.setdefault(channel, set()).add(ws)
+            self.attach(ws, client, channel)
 
         await self.send_to_client(
             ws,
@@ -482,15 +659,7 @@ class WebSocketServer:
         channels = data.get("channels", [])
 
         for channel in channels:
-            if channel in client.channels:
-                client.channels.discard(channel)
-                subscribers = self.subscriptions.get(channel)
-                if subscribers is not None:
-                    subscribers.discard(ws)
-                    # Drop the key with the last subscriber: an empty set left
-                    # behind is unbounded, attacker-controlled memory.
-                    if not subscribers:
-                        del self.subscriptions[channel]
+            self.detach(ws, client, channel)
 
         await self.send_to_client(
             ws,
@@ -498,6 +667,103 @@ class WebSocketServer:
                 "event": "unsubscribed",
                 "timestamp": datetime.now(UTC).isoformat(),
                 "data": {"channels": channels},
+            },
+        )
+
+    def attach(
+        self, ws: web.WebSocketResponse, client: ClientConnection, channel: str
+    ) -> None:
+        """Record that `client` wants `channel`. The one place demand is
+        registered, so every feed reads it the same way."""
+        if channel not in client.channels:
+            client.channels.add(channel)
+            self.subscriptions.setdefault(channel, set()).add(ws)
+
+    def detach(
+        self, ws: web.WebSocketResponse, client: ClientConnection, channel: str
+    ) -> None:
+        """Withdraw `client`'s interest in `channel`.
+
+        Channel names are attacker-chosen, so the last subscriber must take
+        the dict KEY with it: an empty set left behind is unbounded,
+        attacker-controlled memory. Every removal path goes through here.
+        """
+        client.channels.discard(channel)
+        subscribers = self.subscriptions.get(channel)
+        if subscribers is not None:
+            subscribers.discard(ws)
+            if not subscribers:
+                del self.subscriptions[channel]
+
+    async def handle_watch_job(
+        self, ws: web.WebSocketResponse, client: ClientConnection, data: dict[str, Any]
+    ) -> None:
+        """Follow ONE job to its terminal state (job_id validated upstream).
+
+        This is the per-job primitive that replaced tailing every transition.
+        It is bounded by what the client asked for -- one job, one row of
+        demand, one notification -- where the old feed was bounded by nothing
+        and cost a NOTIFY per transition of every job in the system.
+
+        Registering the watch sets `jorb.awaited`, which is precisely the gate
+        `jorb_done_notify` tests, so the notification exists only because
+        somebody is watching. The reply carries the job's CURRENT state, which
+        is what makes the watch race-free: see WATCH_JOB_SQL.
+        """
+        job_id = data["job_id"]
+        channel = f"{JOB_CHANNEL_PREFIX}{job_id}"
+
+        if channel not in client.channels and (
+            len(client.channels) >= self.max_subscriptions
+        ):
+            await self.send_error(
+                ws, f"Max subscriptions exceeded ({self.max_subscriptions})"
+            )
+            return
+
+        assert self.db_pool is not None
+        try:
+            state = await self.db_pool.fetchval(WATCH_JOB_SQL, job_id)
+        except Exception as e:
+            logger.error(f"Error watching job: {e}")
+            await self.send_error(ws, f"Failed to watch job: {str(e)}")
+            self.stats["errors"] += 1
+            return
+
+        if state is None:
+            await self.send_error(ws, f"Job {job_id} not found")
+            return
+
+        self.attach(ws, client, channel)
+        await self.send_to_client(
+            ws,
+            {
+                "event": "watching",
+                "timestamp": datetime.now(UTC).isoformat(),
+                "data": {"job_id": job_id, "channel": channel, "state": state},
+            },
+        )
+
+    async def handle_unwatch_job(
+        self, ws: web.WebSocketResponse, client: ClientConnection, data: dict[str, Any]
+    ) -> None:
+        """Stop following one job (job_id validated upstream).
+
+        `jorb.awaited` is deliberately NOT cleared. It is a latch, exactly as
+        it is for JobClient.wait_for_result: clearing it would race a terminal
+        UPDATE that has already read the row and decided to notify, and the
+        cost of leaving it set is one extra notification for one job that is
+        about to finish anyway.
+        """
+        job_id = data["job_id"]
+        channel = f"{JOB_CHANNEL_PREFIX}{job_id}"
+        self.detach(ws, client, channel)
+        await self.send_to_client(
+            ws,
+            {
+                "event": "unwatched",
+                "timestamp": datetime.now(UTC).isoformat(),
+                "data": {"job_id": job_id, "channel": channel},
             },
         )
 
@@ -724,72 +990,146 @@ class WebSocketServer:
             },
         )
 
-    async def collect_queue_stats(self) -> dict[str, dict[str, Any]]:
+    @staticmethod
+    def empty_queue_stats() -> dict[str, Any]:
+        """The zero row of the snapshot: every counter a queue can report.
+
+        Materialised for every queue that appears at all, so a consumer never
+        has to distinguish "absent" from "zero" -- a queue that just drained
+        must read as 0, not vanish.
         """
-        Collect per-queue stats for broadcasting: pending depths by state,
-        the paused flag from jorb_queue, and the live worker count from the
-        registry. Paused queues appear even when they have no pending jobs.
+        return {
+            "queued": 0,
+            "claimed": 0,
+            "running": 0,
+            "waiting": 0,
+            "backlog": 0,
+            "scheduled": 0,
+            "oldest_backlog_age_seconds": 0.0,
+            "oldest_inflight_age_seconds": 0.0,
+            "finished": 0,
+            "crashed": 0,
+            "cancelled": 0,
+            "paused": False,
+        }
+
+    def snapshot_demand(self) -> bool:
+        """Is anybody subscribed to something a snapshot would feed?
+
+        The gate on the poll loop, and the same principle the schema's NOTIFY
+        gates use: no registered demand, no work. `subscriptions` drops a
+        channel's key with its last subscriber (see detach), so a present key
+        IS a live subscriber.
+        """
+        return SNAPSHOT_CHANNEL in self.subscriptions or any(
+            channel.startswith(QUEUE_CHANNEL_PREFIX) for channel in self.subscriptions
+        )
+
+    async def collect_snapshot(self) -> dict[str, Any]:
+        """The aggregate a dashboard actually renders, in ONE query.
+
+        One query for ALL subscribers, not one per subscriber: the database
+        cost of the dashboard feed is a constant per interval, independent of
+        how many browsers are open and independent of how many jobs per
+        second the platform is running.
         """
         assert self.db_pool is not None
-        async with self.db_pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT
-                    queue,
-                    state::text AS state,
-                    COUNT(*) as count
-                FROM jorb
-                WHERE state IN ('queued', 'claimed', 'running', 'waiting')
-                GROUP BY queue, state
-            """)
+        rows = await self.db_pool.fetch(SNAPSHOT_SQL, self.snapshot_window)
+        self.stats["snapshot_queries"] += 1
 
-        controls = await self.get_queue_controls()
-        workers_live = await self.get_live_worker_count()
+        queues: dict[str, dict[str, Any]] = {}
+        workers_live = 0
 
-        queue_stats: dict[str, dict[str, Any]] = {}
-
-        def _empty() -> dict[str, Any]:
-            return {"queued": 0, "claimed": 0, "running": 0, "waiting": 0}
+        def bucket(name: str) -> dict[str, Any]:
+            return queues.setdefault(name, self.empty_queue_stats())
 
         for row in rows:
-            stats = queue_stats.setdefault(row["queue"], _empty())
-            stats[row["state"]] = row["count"]
+            kind, queue, state = row["kind"], row["queue"], row["state"]
+            count, age = row["n"], row["age"]
+            if kind == "workers":
+                workers_live = count
+                continue
+            stats = bucket(queue)
+            if kind == "queue":
+                stats["paused"] = bool(count)
+            elif kind == "backlog":
+                stats["backlog"] = count
+                stats["queued"] += count
+                stats["oldest_backlog_age_seconds"] = max(float(age or 0.0), 0.0)
+            elif kind == "scheduled":
+                # queued, but deliberately not due yet: counted as queued,
+                # excluded from backlog, because a job scheduled for next week
+                # is not the fleet falling behind.
+                stats["scheduled"] = count
+                stats["queued"] += count
+            elif kind == "inflight":
+                stats[state] = count
+                stats["oldest_inflight_age_seconds"] = max(
+                    stats["oldest_inflight_age_seconds"], float(age or 0.0)
+                )
+            else:  # 'live' and 'recent' are plain per-state counts
+                stats[state] = count
 
-        # Control rows surface even for queues with nothing pending
-        for name in controls:
-            queue_stats.setdefault(name, _empty())
-
-        for name, stats in queue_stats.items():
-            stats["paused"] = controls.get(name, {}).get("paused", False)
+        for stats in queues.values():
             stats["workers_live"] = workers_live
 
-        return queue_stats
+        totals = self.empty_queue_stats()
+        del totals["paused"]
+        for stats in queues.values():
+            for key, value in stats.items():
+                if key.startswith("oldest_"):
+                    totals[key] = max(totals[key], value)
+                elif key in totals:
+                    totals[key] += value
 
-    async def periodic_stats_broadcast(self) -> None:
-        """Periodically broadcast queue statistics"""
+        return {
+            "interval_seconds": self.snapshot_interval,
+            "window_seconds": self.snapshot_window.total_seconds(),
+            "workers_live": workers_live,
+            "totals": totals,
+            "queues": queues,
+        }
+
+    async def broadcast_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Fan one snapshot out to everything that asked for part of it."""
+        timestamp = datetime.now(UTC).isoformat()
+        await self.broadcast_event(
+            SNAPSHOT_CHANNEL,
+            {"event": "dashboard", "timestamp": timestamp, "data": snapshot},
+        )
+        for queue, stats in snapshot["queues"].items():
+            await self.broadcast_event(
+                f"{QUEUE_CHANNEL_PREFIX}{queue}",
+                {
+                    "event": "queue_stats",
+                    "timestamp": timestamp,
+                    "data": {"queue": queue, **stats},
+                },
+            )
+
+    async def snapshot_broadcast(self) -> None:
+        """Poll aggregates on an interval and push them to subscribers.
+
+        This loop IS the replacement for the deleted job_state_change
+        firehose. Two properties make it affordable where the firehose was
+        not, and both are asserted in tests/test_ws_snapshot.py:
+
+        * it does nothing at all when nobody is subscribed, and
+        * it issues one query per interval however many clients are attached.
+        """
         while True:
             try:
-                await asyncio.sleep(5)  # Every 5 seconds
+                await asyncio.sleep(self.snapshot_interval)
 
-                if not self.db_pool:
+                if not self.db_pool or not self.snapshot_demand():
                     continue
 
-                queue_stats = await self.collect_queue_stats()
-
-                # Broadcast to subscribers
-                for queue, stats in queue_stats.items():
-                    await self.broadcast_event(
-                        f"queues:{queue}",
-                        {
-                            "event": "queue_stats",
-                            "timestamp": datetime.now(UTC).isoformat(),
-                            "data": {"queue": queue, **stats},
-                        },
-                    )
+                await self.broadcast_snapshot(await self.collect_snapshot())
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in periodic stats broadcast: {e}")
+                logger.error(f"Error in snapshot broadcast: {e}")
                 self.stats["errors"] += 1
 
     async def start(self, host: str = "127.0.0.1", port: int = 8082) -> None:
@@ -817,8 +1157,8 @@ class WebSocketServer:
 
         app.router.add_get("/health", health_check)
 
-        # Start periodic stats broadcasting
-        stats_task = asyncio.create_task(self.periodic_stats_broadcast())
+        # Start the aggregate snapshot feed (idle until somebody subscribes)
+        stats_task = asyncio.create_task(self.snapshot_broadcast())
 
         # Start server
         runner = web.AppRunner(app)
@@ -842,9 +1182,14 @@ class WebSocketServer:
                 await self.db_pool.close()
 
 
-async def serve(db_params: dict[str, Any], host: str, port: int) -> None:
+async def serve(
+    db_params: dict[str, Any],
+    host: str,
+    port: int,
+    snapshot_interval: float = DEFAULT_SNAPSHOT_INTERVAL,
+) -> None:
     """Create and run a WebSocketServer until interrupted."""
-    server = WebSocketServer(db_params=db_params)
+    server = WebSocketServer(db_params=db_params, snapshot_interval=snapshot_interval)
     try:
         await server.start(host=host, port=port)
     except KeyboardInterrupt:
@@ -865,7 +1210,16 @@ def main() -> None:
         "websocket API is unauthenticated, so front it with a proxy first)",
     )
     @click.option("--port", default=8082, show_default=True, help="Bind port")
-    def cli(config: str, host: str, port: int) -> None:
+    @click.option(
+        "--snapshot-interval",
+        default=DEFAULT_SNAPSHOT_INTERVAL,
+        show_default=True,
+        type=float,
+        help="Seconds between aggregate dashboard snapshots. This is the "
+        "feed's whole database cost: one query per interval, shared by every "
+        "connected dashboard, and none at all while nobody is subscribed",
+    )
+    def cli(config: str, host: str, port: int, snapshot_interval: float) -> None:
         """Run the realtime websocket dashboard server."""
         from .configloader import load_config_from_file
 
@@ -874,7 +1228,10 @@ def main() -> None:
         if not db_params:
             raise click.ClickException(f"No db_params found in config: {config}")
 
-        asyncio.run(serve(db_params, host, port))
+        if snapshot_interval <= 0:
+            raise click.ClickException("--snapshot-interval must be positive")
+
+        asyncio.run(serve(db_params, host, port, snapshot_interval))
 
     cli()
 

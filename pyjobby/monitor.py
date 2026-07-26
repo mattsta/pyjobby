@@ -54,6 +54,195 @@ from loguru import logger
 
 from . import db
 
+# =========================================================================
+# The sweep statements
+# =========================================================================
+# Every sweep's SQL is a module constant, in the style of pj.py's STMTS,
+# for one reason: `pj-bench plans` is the CI gate that asserts these queries
+# still use their indexes, and to measure a statement it has to have the
+# statement. When they lived inline in the function bodies the benchmark
+# kept its own COPY of each one -- and a copy drifts, silently, until the
+# gate is certifying a query nobody executes. That is the exact failure the
+# gate exists to prevent, so the monitor and the benchmark now read the same
+# string.
+#
+# The `_TERMINAL_STATES_SQL` interpolation below is a module constant, never
+# user input; see its own comment for why the states are inlined rather than
+# bound.
+
+#: The states a job never leaves. Only these are ever eligible for deletion:
+#: a queued/claimed/running/waiting job is live work however old it looks
+#: (a job parked on a dependency can legitimately outlive any window).
+TERMINAL_STATES = ("finished", "crashed", "cancelled")
+
+#: The same list inlined into SQL, because ``jorb_retention_idx`` is PARTIAL
+#: on exactly this predicate. A bound ``state = ANY($1)`` reads fine under the
+#: custom plan of the first few executions and then silently falls off the
+#: index: asyncpg prepares its statements, and once PostgreSQL switches to a
+#: GENERIC plan it can no longer prove an unknown parameter implies the index
+#: predicate. Measured on 20k terminal rows with nothing expired -- generic
+#: plan, bound states: Seq Scan + Sort, 617 buffers; literal states: Index
+#: Scan, 2 buffers. Interpolating a module constant is not user input.
+_TERMINAL_STATES_SQL = ", ".join(f"'{state}'" for state in TERMINAL_STATES)
+
+#: Running jobs past their deadline. ($1 batch size)
+SWEEP_TIMED_OUT_SQL = """
+    SELECT id, job_class, timeout_at, admin_data, error_count
+    FROM jorb
+    WHERE state = 'running'
+      AND timeout_at IS NOT NULL
+      AND timeout_at < now()
+    FOR UPDATE SKIP LOCKED
+    LIMIT $1
+"""
+
+#: In-flight jobs of workers whose heartbeat went stale. ($1 grace, $2 batch)
+SWEEP_DEAD_WORKER_JOBS_SQL = """
+    WITH doomed AS MATERIALIZED (
+        SELECT j.id FROM jorb j
+        JOIN jorb_worker w ON w.id = j.claimed_by
+        WHERE j.state IN ('claimed', 'running')
+          AND w.last_seen < now() - $1::interval
+        FOR UPDATE OF j SKIP LOCKED
+        LIMIT $2
+    )
+    UPDATE jorb
+    SET state = 'queued',
+        run_epoch = run_epoch + 1,
+        run_after = now(),
+        timeout_at = NULL,
+        updated = now()
+    FROM doomed
+    WHERE jorb.id = doomed.id
+      AND jorb.state IN ('claimed', 'running')
+    RETURNING jorb.id, jorb.job_class, jorb.worker_host, jorb.claimed_by
+"""
+
+#: Retire the workers themselves. ($1 grace)
+#:
+#: `idle = FALSE` is not cosmetic: an idle worker is a live subscription to
+#: its queue's jorb_enqueued notifications (sql/schema.sql), so a worker that
+#: died while parked would keep every enqueue on that queue paying the NOTIFY
+#: commit lock forever. This sweep is what bounds that to the liveness grace.
+#: Costing an occasional needless notification is fine; leaking one
+#: permanently is not.
+RETIRE_DEAD_WORKERS_SQL = """
+    UPDATE jorb_worker
+    SET shutdown_at = now(),
+        idle = FALSE
+    WHERE shutdown_at IS NULL
+      AND last_seen < now() - $1::interval
+"""
+
+#: Jobs stuck in 'claimed' with no registry reference. ($1 grace, $2 batch)
+SWEEP_UNREGISTERED_CLAIMS_SQL = """
+    WITH doomed AS MATERIALIZED (
+        SELECT id FROM jorb
+        WHERE state = 'claimed'
+          AND claimed_by IS NULL
+          AND updated < now() - $1::interval
+        FOR UPDATE SKIP LOCKED
+        LIMIT $2
+    )
+    UPDATE jorb
+    SET state = 'queued',
+        run_epoch = run_epoch + 1,
+        run_after = now(),
+        timeout_at = NULL,
+        updated = now()
+    FROM doomed
+    WHERE jorb.id = doomed.id
+      AND jorb.state = 'claimed'
+    RETURNING jorb.id, jorb.job_class, jorb.worker_host
+"""
+
+#: Terminal jobs whose retention window elapsed. ($1 retention, $2 batch)
+SWEEP_EXPIRED_JOBS_SQL = f"""
+    SELECT j.id
+    FROM jorb j
+    WHERE j.state IN ({_TERMINAL_STATES_SQL})
+      AND COALESCE(j.finished, j.updated) < now() - $1::interval
+      AND NOT EXISTS (
+          SELECT 1 FROM jorb w
+          WHERE w.state = 'waiting' AND w.waitfor_job = j.id
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM jorb w
+          WHERE w.state = 'waiting' AND w.waitfor_group = j.run_group
+      )
+    ORDER BY COALESCE(j.finished, j.updated)
+    FOR UPDATE OF j SKIP LOCKED
+    LIMIT $2
+"""  # noqa: S608 - interpolates a module constant, never input
+
+DELETE_EXPIRED_JOBS_SQL = "DELETE FROM jorb WHERE id = ANY($1::bigint[])"
+
+#: Jobs whose checkpoints have aged out. ($1 retention, $2 batch)
+#:
+#: Deliberately the same TWO-STATEMENT shape as sweep_expired_jobs: probe for
+#: victims by index, then delete them by key. The obvious single statement --
+#: jorb_step JOIN jorb, filtered on the job's retention expression -- planned
+#: as a merge join that walks jorb_pkey and discards every row it reads:
+#: measured at a 20,000-row seed, 20,000 rows removed by filter and 534-1,194
+#: buffers touched to delete nothing, growing with the table forever. That is
+#: NOT a sequential scan, so a seq-scan check passes it happily; the number
+#: that catches it is rows-removed-by-filter.
+#:
+#: This probe walks jorb_retention_idx oldest-first under a range predicate,
+#: so when nothing has expired it reads the two buffers it takes to say so.
+#:
+#: The "has any checkpoint" test is what keeps the sweep making PROGRESS:
+#: most terminal jobs have no checkpoints at all (only DXE jobs write them),
+#: and a batch taken in retention order without it would usually be
+#: all-stepless, delete nothing, and convince the drain loop it was caught up
+#: while the real backlog sat behind it.
+#:
+#: That test is a SCALAR SUBQUERY and not the EXISTS it reads like, for a
+#: measured reason: PostgreSQL flattens an EXISTS sublink into a semi-join,
+#: the planner then costs a hash semi-join against the whole of jorb_step,
+#: and paying for that hash makes a sequential scan of jorb look free --
+#: straight back to 20,001 rows discarded. A scalar subquery is not
+#: flattenable, so it stays a per-row primary-key probe on top of the
+#: index-driven scan, which is the plan this sweep needs.
+SWEEP_CHECKPOINT_JOBS_SQL = f"""
+    SELECT j.id
+    FROM jorb j
+    WHERE j.state IN ({_TERMINAL_STATES_SQL})
+      AND COALESCE(j.finished, j.updated) < now() - $1::interval
+      AND (SELECT s.job_id FROM jorb_step s
+            WHERE s.job_id = j.id LIMIT 1) IS NOT NULL
+    ORDER BY COALESCE(j.finished, j.updated)
+    LIMIT $2
+"""  # noqa: S608 - interpolates a module constant, never input
+
+#: ...and the delete, by the primary key's leading column. Bounded by the
+#: probe's batch, and never executed at all when the probe came back empty --
+#: which is the steady state, and the reason this is two statements and not a
+#: CTE: a CTE's second stage is PLANNED against jorb_step's whole-table
+#: statistics and hash-joins it even when the first stage returns nothing
+#: (measured: 1,006 buffers to delete zero rows, growing with jorb_step).
+DELETE_CHECKPOINTS_SQL = """
+    DELETE FROM jorb_step
+    WHERE job_id = ANY($1::bigint[])
+    RETURNING job_id, step_seq
+"""
+
+#: Consumed mailbox messages past the window. ($1 retention, $2 batch)
+SWEEP_MAILBOX_SQL = """
+    WITH doomed AS MATERIALIZED (
+        SELECT id FROM jorb_mailbox
+        WHERE consumed_at IS NOT NULL
+          AND consumed_at < now() - $1::interval
+        ORDER BY consumed_at
+        FOR UPDATE SKIP LOCKED
+        LIMIT $2
+    )
+    DELETE FROM jorb_mailbox m
+    USING doomed d
+    WHERE m.id = d.id
+    RETURNING m.id
+"""
+
 
 async def handle_timed_out_job(
     conn: asyncpg.Pool | asyncpg.Connection,
@@ -134,18 +323,7 @@ async def sweep_timed_out_jobs(pool: asyncpg.Pool, batch_size: int = 100) -> int
     concurrently is serialized against us (its epoch-fenced update then
     no-ops)."""
     async with pool.acquire() as conn, conn.transaction():
-        timed_out = await conn.fetch(
-            """
-            SELECT id, job_class, timeout_at, admin_data, error_count
-            FROM jorb
-            WHERE state = 'running'
-              AND timeout_at IS NOT NULL
-              AND timeout_at < now()
-            FOR UPDATE SKIP LOCKED
-            LIMIT $1
-            """,
-            batch_size,
-        )
+        timed_out = await conn.fetch(SWEEP_TIMED_OUT_SQL, batch_size)
 
         for job in timed_out:
             await handle_timed_out_job(
@@ -177,30 +355,7 @@ async def sweep_dead_workers(
     Single atomic statements; safe with concurrent monitor instances."""
     grace = datetime.timedelta(seconds=liveness_grace_seconds)
 
-    requeued = await pool.fetch(
-        """
-        WITH doomed AS MATERIALIZED (
-            SELECT j.id FROM jorb j
-            JOIN jorb_worker w ON w.id = j.claimed_by
-            WHERE j.state IN ('claimed', 'running')
-              AND w.last_seen < now() - $1::interval
-            FOR UPDATE OF j SKIP LOCKED
-            LIMIT $2
-        )
-        UPDATE jorb
-        SET state = 'queued',
-            run_epoch = run_epoch + 1,
-            run_after = now(),
-            timeout_at = NULL,
-            updated = now()
-        FROM doomed
-        WHERE jorb.id = doomed.id
-          AND jorb.state IN ('claimed', 'running')
-        RETURNING jorb.id, jorb.job_class, jorb.worker_host, jorb.claimed_by
-        """,
-        grace,
-        batch_size,
-    )
+    requeued = await pool.fetch(SWEEP_DEAD_WORKER_JOBS_SQL, grace, batch_size)
 
     for row in requeued:
         logger.warning(
@@ -208,17 +363,10 @@ async def sweep_dead_workers(
             f"{row['claimed_by']} on {row['worker_host']}"
         )
 
-    # retire workers that stopped heartbeating so they aren't rescanned
-    # (and so the operator surface shows them as gone, not alive)
-    retired = await pool.execute(
-        """
-        UPDATE jorb_worker
-        SET shutdown_at = now()
-        WHERE shutdown_at IS NULL
-          AND last_seen < now() - $1::interval
-        """,
-        grace,
-    )
+    # retire workers that stopped heartbeating so they aren't rescanned (and
+    # so the operator surface shows them as gone, not alive); see
+    # RETIRE_DEAD_WORKERS_SQL for why it also clears idle
+    retired = await pool.execute(RETIRE_DEAD_WORKERS_SQL, grace)
     if retired != "UPDATE 0":
         logger.warning(f"Retired stale workers from registry: {retired}")
 
@@ -236,30 +384,7 @@ async def sweep_unregistered_claims(
     unavailable and then died: nothing heartbeats for it, so age is the only
     signal. A healthy worker moves claimed -> running almost immediately."""
     grace = datetime.timedelta(seconds=claimed_grace_seconds)
-    requeued = await pool.fetch(
-        """
-        WITH doomed AS MATERIALIZED (
-            SELECT id FROM jorb
-            WHERE state = 'claimed'
-              AND claimed_by IS NULL
-              AND updated < now() - $1::interval
-            FOR UPDATE SKIP LOCKED
-            LIMIT $2
-        )
-        UPDATE jorb
-        SET state = 'queued',
-            run_epoch = run_epoch + 1,
-            run_after = now(),
-            timeout_at = NULL,
-            updated = now()
-        FROM doomed
-        WHERE jorb.id = doomed.id
-          AND jorb.state = 'claimed'
-        RETURNING jorb.id, jorb.job_class, jorb.worker_host
-        """,
-        grace,
-        batch_size,
-    )
+    requeued = await pool.fetch(SWEEP_UNREGISTERED_CLAIMS_SQL, grace, batch_size)
 
     for row in requeued:
         logger.warning(
@@ -268,22 +393,6 @@ async def sweep_unregistered_claims(
         )
 
     return len(requeued)
-
-
-#: The states a job never leaves. Only these are ever eligible for deletion:
-#: a queued/claimed/running/waiting job is live work however old it looks
-#: (a job parked on a dependency can legitimately outlive any window).
-TERMINAL_STATES = ("finished", "crashed", "cancelled")
-
-#: The same list inlined into SQL, because ``jorb_retention_idx`` is PARTIAL
-#: on exactly this predicate. A bound ``state = ANY($1)`` reads fine under the
-#: custom plan of the first few executions and then silently falls off the
-#: index: asyncpg prepares its statements, and once PostgreSQL switches to a
-#: GENERIC plan it can no longer prove an unknown parameter implies the index
-#: predicate. Measured on 20k terminal rows with nothing expired -- generic
-#: plan, bound states: Seq Scan + Sort, 617 buffers; literal states: Index
-#: Scan, 2 buffers. Interpolating a module constant is not user input.
-_TERMINAL_STATES_SQL = ", ".join(f"'{state}'" for state in TERMINAL_STATES)
 
 
 async def sweep_expired_jobs(
@@ -323,32 +432,12 @@ async def sweep_expired_jobs(
     retention = datetime.timedelta(days=retention_days)
 
     async with pool.acquire() as conn, conn.transaction():
-        expired = await conn.fetch(
-            f"""
-            SELECT j.id
-            FROM jorb j
-            WHERE j.state IN ({_TERMINAL_STATES_SQL})
-              AND COALESCE(j.finished, j.updated) < now() - $1::interval
-              AND NOT EXISTS (
-                  SELECT 1 FROM jorb w
-                  WHERE w.state = 'waiting' AND w.waitfor_job = j.id
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM jorb w
-                  WHERE w.state = 'waiting' AND w.waitfor_group = j.run_group
-              )
-            ORDER BY COALESCE(j.finished, j.updated)
-            FOR UPDATE OF j SKIP LOCKED
-            LIMIT $2
-            """,  # noqa: S608 - interpolates a module constant, never input
-            retention,
-            batch_size,
-        )
+        expired = await conn.fetch(SWEEP_EXPIRED_JOBS_SQL, retention, batch_size)
         if not expired:
             return 0
 
         job_ids = [row["id"] for row in expired]
-        await conn.execute("DELETE FROM jorb WHERE id = ANY($1::bigint[])", job_ids)
+        await conn.execute(DELETE_EXPIRED_JOBS_SQL, job_ids)
 
     return len(job_ids)
 
@@ -377,36 +466,42 @@ async def sweep_completed_checkpoints(
     records when to wake; deleting it would silently re-run completed steps.
     So state is the gate and age only decides among terminal jobs.
 
-    ``FOR UPDATE OF s`` locks the checkpoint rows and not the jobs: a worker
-    writing to a live job must never queue behind retention.
+    Probe, then delete by key — the same two-statement shape as
+    ``sweep_expired_jobs``, and for the same reason: it is the only shape
+    whose plan is actually DRIVEN by ``jorb_retention_idx``, oldest
+    terminated first. The single-statement join form was not. It planned as
+    a merge join walking ``jorb_pkey`` and discarding every row it read —
+    measured at a 20,000-row seed as 20,000 rows removed by filter and
+    534–1,194 buffers to delete nothing, growing with the table forever,
+    which is exactly the pathology the retention index exists to prevent. An
+    index scan that throws away everything it reads is not a sequential scan
+    and costs the same, so the number to watch is rows-removed-by-filter,
+    not the access method. ``tests/test_scale_plans.py`` asserts both, on
+    these very constants rather than on a copy of them.
 
-    Driven from ``jorb_retention_idx`` in oldest-terminated-first order — the
-    job side is what has an index worth using, and ordering by ``s.job_id``
-    instead would trade it for a full scan of jorb_step. The batch boundary
-    within one job is therefore unordered; nothing depends on which of a
-    doomed job's checkpoints go first. Returns the number of rows deleted."""
+    ``batch_size`` bounds the JOBS taken per call, not their rows: the probe
+    rides an index on the JOB's terminal time, so a job is the unit it can
+    stop on, and all of a doomed job's checkpoints go together. Splitting a
+    batch mid-job would need a second index-driven lookup into jorb_step per
+    batch, which is the cost this was rewritten to stop paying. ``_drain``
+    still terminates on it — a short batch means fewer than ``batch_size``
+    jobs were available, and every job in a batch contributes at least one
+    row.
+
+    No job row is locked: a worker writing to a live job must never queue
+    behind retention, and a terminal job has no writer to protect from
+    anyway. Concurrent monitors converge on the same batch and the second
+    one finds the rows already gone. Returns the number of rows deleted."""
     retention = datetime.timedelta(days=checkpoint_retention_days)
 
-    deleted = await pool.fetch(
-        f"""
-        WITH doomed AS MATERIALIZED (
-            SELECT s.job_id, s.step_seq
-            FROM jorb_step s
-            JOIN jorb j ON j.id = s.job_id
-            WHERE j.state IN ({_TERMINAL_STATES_SQL})
-              AND COALESCE(j.finished, j.updated) < now() - $1::interval
-            ORDER BY COALESCE(j.finished, j.updated)
-            FOR UPDATE OF s SKIP LOCKED
-            LIMIT $2
+    async with pool.acquire() as conn, conn.transaction():
+        doomed = await conn.fetch(SWEEP_CHECKPOINT_JOBS_SQL, retention, batch_size)
+        if not doomed:
+            return 0
+
+        deleted = await conn.fetch(
+            DELETE_CHECKPOINTS_SQL, [row["id"] for row in doomed]
         )
-        DELETE FROM jorb_step s
-        USING doomed d
-        WHERE s.job_id = d.job_id AND s.step_seq = d.step_seq
-        RETURNING s.job_id, s.step_seq
-        """,  # noqa: S608 - interpolates a module constant, never input
-        retention,
-        batch_size,
-    )
 
     return len(deleted)
 
@@ -439,24 +534,7 @@ async def sweep_consumed_mailbox(
     Single atomic statement; safe with concurrent monitor instances."""
     retention = datetime.timedelta(days=retention_days)
 
-    deleted = await pool.fetch(
-        """
-        WITH doomed AS MATERIALIZED (
-            SELECT id FROM jorb_mailbox
-            WHERE consumed_at IS NOT NULL
-              AND consumed_at < now() - $1::interval
-            ORDER BY consumed_at
-            FOR UPDATE SKIP LOCKED
-            LIMIT $2
-        )
-        DELETE FROM jorb_mailbox m
-        USING doomed d
-        WHERE m.id = d.id
-        RETURNING m.id
-        """,
-        retention,
-        batch_size,
-    )
+    deleted = await pool.fetch(SWEEP_MAILBOX_SQL, retention, batch_size)
 
     return len(deleted)
 
