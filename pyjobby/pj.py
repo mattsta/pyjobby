@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import asyncio
 import contextlib
 import datetime
@@ -21,10 +23,10 @@ from typing import (
 
 import asyncpg  # type: ignore
 import click
-import orjson
 from aiohttp import web
 from loguru import logger
 
+from . import db
 from .configloader import load_config_from_file
 
 fmt = (
@@ -36,8 +38,13 @@ fmt = (
 )
 
 
-logger.remove()
-logger.add(sys.stderr, level="INFO", format=fmt)
+def configure_worker_logging() -> None:
+    """Install the worker's terminal log format.
+
+    Called from the worker entry points only — importing this module must
+    never reconfigure the process-global loguru sinks."""
+    logger.remove()
+    logger.add(sys.stderr, level="INFO", format=fmt)
 
 
 def cleanupLogLengths(record: dict[str, Any]) -> None:
@@ -85,6 +92,18 @@ logger = logger.patch(cleanupLogLengths)  # type: ignore
 STMTS: dict[str, str] = {}
 
 
+def _pid_alive(pid: int) -> bool:
+    """True if a process with this pid exists on this host."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # exists, owned by someone else
+        return True
+    return True
+
+
 # For alternative "in-memory lock without writing the update back to claim"
 # appoach, see que project lib/que/poller.rb for their CTE and server-side
 # SQL function for taking advisory locks without needing to update rows while
@@ -114,24 +133,35 @@ STMTS["get"] = """SELECT * FROM jorb
                      WHERE id = $1
                         AND state = 'claimed'"""
 
+# Fetch an upstream job's stored result for run-time result passing
+# (admin_data.use_result_from).
+STMTS["get-result"] = """SELECT state, result FROM jorb WHERE id = $1"""
+
+# NOTE on time conventions: the original jorb columns (created, updated,
+# run_after) are `timestamp without time zone` storing naive UTC, so they use
+# TIMEZONE('utc', clock_timestamp()). The columns added later by migrations
+# (started, finished, timeout_at) are TIMESTAMPTZ, so they use plain
+# clock_timestamp() — applying TIMEZONE('utc', ...) to those would store the
+# wrong instant on any server not running in UTC.
 STMTS["finished"] = """UPDATE jorb
               SET state = 'finished',
                   result = $2,
-                  finished = TIMEZONE('utc', clock_timestamp()),
+                  finished = clock_timestamp(),
                   timeout_at = NULL,
                   updated = TIMEZONE('utc', clock_timestamp())
               WHERE id = $1
+                AND state IN ('claimed', 'running')
           RETURNING *"""
 
 STMTS["run"] = """UPDATE jorb
               SET state = 'running',
-                  started = TIMEZONE('utc', clock_timestamp()),
+                  started = clock_timestamp(),
                   updated = TIMEZONE('utc', clock_timestamp())
               WHERE id = $1
           RETURNING *"""
 
 STMTS["set-timeout"] = """UPDATE jorb
-              SET timeout_at = TIMEZONE('utc', clock_timestamp()) + $2::interval
+              SET timeout_at = clock_timestamp() + $2::interval
               WHERE id = $1"""
 
 # Phase 2 improvement: Crashed jobs create retry jobs (see create-retry below)
@@ -142,9 +172,10 @@ STMTS["crash"] = """UPDATE jorb
                 error_backtrace = $3,
                 error_count = error_count + 1,
                 timeout_at = NULL,
-                finished = TIMEZONE('utc', clock_timestamp()),
+                finished = clock_timestamp(),
                 updated = TIMEZONE('utc', clock_timestamp())
               WHERE id = $1
+                AND state IN ('claimed', 'running')
           RETURNING *"""
 
 STMTS["reschedule"] = """UPDATE jorb
@@ -211,22 +242,27 @@ STMTS["recover-abandoned"] = """UPDATE jorb
                 AND updated < TIMEZONE('utc', clock_timestamp()) - $2::interval
               RETURNING id, job_class, state as old_state"""
 
-# Create a retry job (new row) instead of modifying the crashed job
-# This preserves the crashed job as audit trail and creates clean retry
-STMTS["create-retry"] = """INSERT INTO jorb (
-                job_class, kwargs, queue, prio, uid, capability,
-                run_after, run_group, admin_data, state, error_count
-            )
-            SELECT
-                job_class, kwargs, queue, prio, uid, capability,
-                TIMEZONE('utc', clock_timestamp()) + $2::interval as run_after,
-                run_group,
-                jsonb_set(COALESCE(admin_data::jsonb, '{}'::jsonb), '{parent_job_id}', to_jsonb($1::bigint))::json,
-                'queued' as state,
-                $3 as error_count
-            FROM jorb
-            WHERE id = $1
-            RETURNING id"""
+# In-flight jobs claimed by this host, used for pid-liveness recovery on startup.
+STMTS["list-in-flight-for-host"] = """SELECT id, worker_pid, job_class, state
+              FROM jorb
+              WHERE worker_host = $1
+                AND state IN ('claimed', 'running')"""
+
+# Requeue a specific set of jobs whose worker process is known to be dead.
+STMTS["requeue-ids"] = """UPDATE jorb
+              SET state = 'queued',
+                  run_after = TIMEZONE('utc', clock_timestamp()),
+                  timeout_at = NULL,
+                  updated = TIMEZONE('utc', clock_timestamp())
+              WHERE id = ANY($1::bigint[])
+                AND state IN ('claimed', 'running')
+              RETURNING id, job_class, state as old_state"""
+
+# Create a retry job (new row) instead of modifying the crashed job.
+# This preserves the crashed job as audit trail and creates a clean retry.
+# The SQL is shared with the client/admin/websocket retry paths (db module)
+# so every retry row looks identical no matter which component created it.
+STMTS["create-retry"] = db.build_retry_sql(allowed_states=("crashed",))
 
 # Cancel a queued or waiting job
 # Only jobs not yet claimed can be cancelled
@@ -252,7 +288,7 @@ class JobSystem:
     qname: str
     capabilities: tuple[str]
     workerId: int
-    checkInterval: int = 5  # seconds
+    checkInterval: float = 5  # seconds
     webPort: dict[str, list[dict[str, Any]] | set[str]] | None = None
     prio: int = 1000
     stop: bool = False
@@ -266,6 +302,10 @@ class JobSystem:
     recovery_timeout: int = (
         300  # Time in seconds before job is considered abandoned (5 minutes)
     )
+    # pid of the launcher process that forked us; when set, the worker stops
+    # if that process dies (prevents orphaned workers polling forever after
+    # their launcher is killed). 0 disables the check (direct/embedded use).
+    _launcher_pid: int = 0
 
     async def ex(self, op: str, *args: Any) -> list[asyncpg.Record]:
         """Execute 'op' from prepared statement dict with *args.
@@ -278,10 +318,49 @@ class JobSystem:
         while True:
             try:
                 return await self.stmts[op].fetch(*args)  # type: ignore
-            except asyncpg.InterfaceError:
-                # if disconnect detected, just attempt to reconnect forever
+            except (asyncpg.InterfaceError, asyncpg.PostgresConnectionError) as e:
+                if self.stop:
+                    raise
+                logger.warning(
+                    f"Database connection lost during '{op}' ({e}); reconnecting..."
+                )
                 await asyncio.sleep(0.5)
-                continue
+                await self._reconnect()
+
+    async def _listen_for_enqueues(self) -> None:
+        """LISTEN for jobs entering 'queued' in our queue (wakeup channel)."""
+
+        def _on_enqueue(
+            conn: Any, pid: int, channel: str, payload: str
+        ) -> None:  # pragma: no cover - trivial
+            if payload == self.qname:
+                self._wake.set()
+
+        try:
+            await self.cxn.add_listener("jorb_enqueued", _on_enqueue)
+        except asyncpg.PostgresError as e:
+            logger.warning(f"Could not LISTEN for enqueue wakeups ({e}); polling only")
+
+    async def _reconnect(self) -> None:
+        """Re-establish the worker connection and re-prepare all statements.
+
+        Retries until the database is reachable again (workers are long-lived
+        daemons: losing the database is expected to be a transient condition)."""
+        with contextlib.suppress(Exception):
+            await self.cxn.close()
+
+        while not self.stop:
+            try:
+                self.cxn: asyncpg.Connection = await db.connect(**self.dsn)
+                self.stmts: dict[str, asyncpg.PreparedStatement] = {
+                    name: await self.cxn.prepare(stmt) for name, stmt in STMTS.items()
+                }
+                await self._listen_for_enqueues()
+                logger.info("Database connection re-established")
+                return
+            except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as e:
+                logger.warning(f"Reconnect attempt failed ({e}); retrying...")
+                await asyncio.sleep(1.0)
 
     def shutdown(self, signum: int, frame: Any) -> None:
         """Request graceful shutdown - stop processing new jobs but finish current job."""
@@ -301,12 +380,27 @@ class JobSystem:
             return []
 
         try:
-            # Convert recovery_timeout seconds to timedelta for PostgreSQL interval
+            # Precise path: any in-flight job on this host whose worker process
+            # no longer exists is definitely abandoned — requeue immediately.
+            in_flight = await self.ex("list-in-flight-for-host", self.node)
+            dead_ids = [
+                row["id"]
+                for row in in_flight
+                if row["worker_pid"] and not _pid_alive(row["worker_pid"])
+            ]
+            recovered = []
+            if dead_ids:
+                recovered = list(await self.ex("requeue-ids", dead_ids))
+
+            # Fallback path: rows without a recorded pid can only be recovered
+            # by age, using the configured recovery timeout.
             from datetime import timedelta
 
             recovery_interval = timedelta(seconds=self.recovery_timeout)
-
-            recovered = await self.ex("recover-abandoned", self.node, recovery_interval)
+            if any(not row["worker_pid"] for row in in_flight):
+                recovered.extend(
+                    await self.ex("recover-abandoned", self.node, recovery_interval)
+                )
 
             if recovered:
                 logger.warning(
@@ -402,24 +496,19 @@ class JobSystem:
         #       Also though, moving to the advisory lock mechanism would fix the
         #       claimed-but-crashed problem because a crash would just release
         #       the row again.
-        self.cxn = await asyncpg.connect(**self.dsn)
+        self.cxn = await db.connect(**self.dsn)
 
-        # tell asyncpg we want to use orjson for json types
-        # orjson.dumps returns bytes, but asyncpg expects str for text types
-        def orjson_encoder(obj: Any) -> str:
-            return orjson.dumps(obj).decode("utf-8")
-
-        await self.cxn.set_type_codec(
-            "json", encoder=orjson_encoder, decoder=orjson.loads, schema="pg_catalog"
-        )
-        await self.cxn.set_type_codec(
-            "jsonb", encoder=orjson_encoder, decoder=orjson.loads, schema="pg_catalog"
-        )
+        # Wake immediately when work arrives in our queue instead of waiting
+        # for the next poll tick (migration 009's jorb_enqueued trigger).
+        # Polling remains the fallback for run_after-delayed jobs and for
+        # databases without the trigger installed.
+        self._wake: asyncio.Event = asyncio.Event()
+        await self._listen_for_enqueues()
 
         # even though the asyncpg adapter will cache statements as they are run,
         # manually preparing all statements before use also validates all SQL is
         # well-formed on startup before any execution attempts.
-        self.stmts: dict[str, asyncpg.PreparedStatement] = {}
+        self.stmts = {}
         for name, stmt in STMTS.items():
             self.stmts[name] = await self.cxn.prepare(stmt)
 
@@ -445,11 +534,29 @@ class JobSystem:
 
             diff = now - prev
             if sleepytime and diff < self.checkInterval:
-                # also adds jitter to the sleep interval so workers never get
-                # trapped into only checking for new work in lockstep.
-                await asyncio.sleep(
-                    self.checkInterval - diff + random.randint(0, 1000) / 1000
-                )
+                # Sleep until either the poll interval elapses (with jitter so
+                # workers never check for work in lockstep) or a NOTIFY says a
+                # job just entered our queue — whichever comes first.
+                self._wake.clear()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._wake.wait(),
+                        timeout=self.checkInterval
+                        - diff
+                        + random.randint(0, 1000) / 1000,
+                    )
+                # a shutdown may have been requested mid-sleep: never claim
+                # new work after stop is set (graceful shutdown means finish
+                # the current job only, not "take one more")
+                if self.stop:
+                    continue
+
+                # orphan check: if our launcher process died (we were
+                # reparented), stop instead of polling headless forever
+                if self._launcher_pid and os.getppid() != self._launcher_pid:
+                    logger.warning("Launcher process died; worker stopping")
+                    self.stop = True
+                    continue
 
             # record time of the current job check
             prev = time.perf_counter()
@@ -471,13 +578,16 @@ class JobSystem:
                 sleepytime = True
                 continue
 
-            # here we ONLY have one job of 'jobs' because of LIMIT 1 in "claim"
-            job = jobs[0]
+            # here we ONLY have one job of 'jobs' because of LIMIT 1 in
+            # "claim" (dict copy so kwargs can be augmented before running)
+            job = dict(jobs[0])
 
             # don't sleep for next check, we may have a run of jobs
             sleepytime = False
 
             processed += 1
+            # reset so exception handlers never see the previous job's class
+            klass = None
             try:
                 jid = job["id"]
                 jname = job["job_class"].split(".")[-1]
@@ -491,10 +601,22 @@ class JobSystem:
                     job["capability"],
                 )
 
+                # Phase 2: run-time result passing — inject the upstream
+                # job's stored result into kwargs before the task runs
+                admin_data = job.get("admin_data") or {}
+                if isinstance(admin_data, dict) and admin_data.get("use_result_from"):
+                    upstream = await self.ex(
+                        "get-result", admin_data["use_result_from"]
+                    )
+                    if upstream and upstream[0]["state"] == "finished":
+                        job["kwargs"] = {
+                            **(job.get("kwargs") or {}),
+                            "upstream_result": upstream[0]["result"],
+                        }
+
                 klass = self.classForKlassFromName(job["job_class"], job=job)
 
                 # Phase 2: Extract timeout from admin_data or use class attribute or default
-                admin_data = job.get("admin_data") or {}
                 job_timeout = (
                     admin_data.get("timeout_seconds")
                     if isinstance(admin_data, dict)
@@ -511,11 +633,21 @@ class JobSystem:
                         datetime.timedelta(seconds=job_timeout),
                     )
 
-                # if job is async, .run() returns a coroutine we need to await.
-                # else, if task is not async, .run() runs the job itself.
-                # ignore type check because the exception will catch if bad
+                # transition claimed -> running and record `started`; the
+                # timeout monitor, duration metrics, and DAG timeline all key
+                # off this state.
+                await self.ex("run", job["id"])
+
+                # .run() executes synchronous tasks to completion, so call it
+                # in a thread: the event loop stays responsive and sync tasks
+                # honor job_timeout too. Async tasks just create their
+                # coroutine/generator in the thread, which is cheap and safe.
+                # (A timed-out sync task's thread keeps running to completion
+                # in the background; only its result is abandoned.)
                 startJobTime = time.perf_counter()
-                resultStageA = klass.run()  # type: ignore
+                resultStageA = await asyncio.wait_for(
+                    asyncio.to_thread(klass.run), timeout=job_timeout or None
+                )
 
                 if asyncio.iscoroutine(resultStageA):
                     # Apply timeout to async jobs
@@ -528,18 +660,15 @@ class JobSystem:
 
                     # Check if the awaited result is an async generator
                     if inspect.isasyncgen(result):
+                        collected_inner = result
 
-                        async def collect_gen():
-                            return [x async for x in result]
+                        async def collect_gen() -> list[Any]:
+                            return [x async for x in collected_inner]
 
-                        if job_timeout:
-                            # Note: timeout already consumed by outer wait_for, this is for generator collection
-                            result = await collect_gen()
-                        else:
-                            result = await collect_gen()
+                        result = await collect_gen()
                 elif inspect.isasyncgen(resultStageA):
                     # Apply timeout to async generator jobs (direct return, not from async function)
-                    async def collect_with_timeout():
+                    async def collect_with_timeout() -> list[Any]:
                         return [x async for x in resultStageA]
 
                     if job_timeout:
@@ -556,7 +685,13 @@ class JobSystem:
                     f"[job {jid}] Completed {jname} in {totalJobTime * 1000:.2f} ms"
                 )
 
-                # record job completion back to database
+                # record job completion back to database (honoring an
+                # explicit save_result=False opt-out)
+                if (
+                    isinstance(admin_data, dict)
+                    and admin_data.get("save_result") is False
+                ):
+                    result = None
                 await self.ex("finished", job["id"], result)
 
                 # check for any new jobs next down the run tree...
@@ -575,7 +710,7 @@ class JobSystem:
                     if nextFromGroup:
                         nextJobIds = [x["id"] for x in nextFromGroup]
                         logger.info(
-                            f"[job {jid}:{jname}; group {hex(gid)[2:]}] Triggered scheduling of {nextJobIds}"
+                            f"[job {jid}:{jname}; group {gid:x}] Triggered scheduling of {nextJobIds}"
                         )
             except TimeoutError as e:
                 # Phase 2: Handle timeouts based on on_timeout configuration
@@ -603,13 +738,11 @@ class JobSystem:
 
                 # Retry or fail based on on_timeout configuration
                 current_error_count = job.get("error_count", 0) + 1
-                if (
-                    on_timeout == "retry"
-                    and klass
-                    and current_error_count < max_retries
-                ):
-                    rescheduleFor = await klass.rescheduleBackoff(
-                        job, current_error_count
+                if on_timeout == "retry" and current_error_count < max_retries:
+                    # fall back to base Job backoff if the class never loaded
+                    rescheduleFor = await (klass or Job).rescheduleBackoff(
+                        job,  # type: ignore[arg-type]
+                        current_error_count,
                     )
                     retry_job_id = await self.stmts["create-retry"].fetchval(
                         job["id"], rescheduleFor, current_error_count
@@ -662,9 +795,11 @@ class JobSystem:
                 # Phase 2: Create NEW retry job using configurable retry strategy
                 # This preserves the crashed job as audit trail
                 current_error_count = job.get("error_count", 0) + 1
-                if klass and current_error_count < max_retries:
-                    rescheduleFor = await klass.rescheduleBackoff(
-                        job, current_error_count
+                if current_error_count < max_retries:
+                    # fall back to base Job backoff if the class never loaded
+                    rescheduleFor = await (klass or Job).rescheduleBackoff(
+                        job,  # type: ignore[arg-type]
+                        current_error_count,
                     )
 
                     # Create a NEW job for retry (separate row)
@@ -721,15 +856,23 @@ class Job:
         Subclasses can override 'run' if it needs to be async."""
         return self.task(**self.job["kwargs"])
 
-    @classmethod
     async def rescheduleBackoff(
-        cls, job: dict, attempt: int | None = None
+        self,
+        job: dict | int | None = None,
+        attempt: int | None = None,
     ) -> datetime.timedelta:
         """Calculate retry delay using configurable retry strategy from admin_data.
 
         Returns a timedelta for when the job should be retried.
 
         If no 'attempt' count is given, use the current job's error_count.
+
+        Accepted call shapes (all seen in the wild; all supported):
+            instance.rescheduleBackoff()               # uses self.job
+            instance.rescheduleBackoff(attempt=3)
+            instance.rescheduleBackoff(3)              # attempt positionally
+            instance.rescheduleBackoff(job_dict, 3)
+            Job.rescheduleBackoff(job_dict, attempt=1) # legacy classmethod style
 
         Supports Phase 2 retry strategies:
         - exponential (default): 1s, 2s, 4s, 8s, 16s...
@@ -742,6 +885,19 @@ class Job:
         """
         from .retry_strategies import calculate_retry_from_job
 
+        # normalize the accepted call shapes into (job, attempt)
+        if isinstance(job, int) and attempt is None:
+            job, attempt = None, job
+        if job is None:
+            if isinstance(self, Job):
+                job = self.job
+            elif hasattr(self, "get"):
+                # legacy Job.rescheduleBackoff(job_dict, ...) class-style call
+                job = self
+            else:
+                job = {}
+
+        assert not isinstance(job, int)
         if attempt is None:
             attempt = job.get("error_count", 0)
 
@@ -755,7 +911,7 @@ class Job:
         self,
         relative: int,
         unit: str = "seconds",
-        deltas: dict[str, int] = {},  # or provide units as key=interval
+        deltas: dict[str, int] | None = None,  # or provide units as key=interval
     ) -> datetime.timedelta:
         """Schedule event at [relative] [unit] duration into the future from now.
 
@@ -793,19 +949,24 @@ def runAndDone(
     default_timeout: int = 3600,
     recovery_timeout: int = 300,
     enable_recovery: bool = True,
+    check_interval: float = 5,
 ) -> None:
     """Run the JobSystem for this worker process"""
+    configure_worker_logging()
+    # our parent right now IS the launcher; if it dies we should too
+    launcher_pid = os.getppid()
     runner = JobSystem(
         dsn=db_params,
         qname=qname,
         capabilities=caps,
         workerId=n,
-        checkInterval=5,
+        checkInterval=check_interval,
         webPort=web_listen,
         max_retries=max_retries,
         default_timeout=default_timeout,
         recovery_timeout=recovery_timeout,
         enable_recovery=enable_recovery,
+        _launcher_pid=launcher_pid,
     )
 
     signal.signal(signal.SIGTERM, runner.shutdown)
@@ -813,7 +974,7 @@ def runAndDone(
         asyncio.run(runner.run())
     except KeyboardInterrupt:
         return
-    except:
+    except Exception:
         logger.exception("what went wrong now?")
 
 
@@ -869,6 +1030,12 @@ def runAndDone(
     help="Disable abandoned job recovery on startup",
 )
 @click.option(
+    "--check-interval",
+    default=5.0,
+    help="Seconds between job polls when idle (LISTEN/NOTIFY wakes workers sooner)",
+    show_default=True,
+)
+@click.option(
     "-v",
     is_flag=True,
     help="show version then exit",
@@ -889,6 +1056,7 @@ def workit(
     default_timeout: int,
     recovery_timeout: int,
     no_recovery: bool,
+    check_interval: float,
     v: bool,
     config: str,
 ) -> None:
@@ -898,11 +1066,17 @@ def workit(
         print(localver)
         sys.exit(0)
 
+    configure_worker_logging()
+
     if not os.path.isfile(config):
         logger.error("Config file not found! Requested: {}", config)
         sys.exit(1)
 
-    loadedConfig = load_config_from_file(config, {"db_params", "web_listen"})
+    try:
+        loadedConfig = load_config_from_file(config, {"db_params", "web_listen"})
+    except RuntimeError as e:
+        logger.error("Failed to load config {}: {}", config, e)
+        sys.exit(1)
 
     # If queue requests are less than total worker count,
     # pad out the queue workers with default listeners up to
@@ -940,6 +1114,7 @@ def workit(
                 default_timeout,
                 recovery_timeout,
                 not no_recovery,  # enable_recovery is opposite of no_recovery flag
+                check_interval,
             ),
         )
         p.start()
@@ -956,7 +1131,7 @@ def workit(
         try:
             for p in launched:
                 os.kill(p.pid, signum)  # type: ignore
-        except:
+        except OSError:
             pass
 
     signal.signal(signal.SIGTERM, signalBroadcast)
@@ -970,58 +1145,3 @@ def workit(
 
 if __name__ == "__main__":
     workit()
-
-    # Test basic asyncpg usage and how it bridges SQL syntax interop to python
-    async def zooper() -> None:
-        loadedConfig = load_config_from_file("conf.py", {"db_params", "web_listen"})
-        cxn = await asyncpg.connect(**loadedConfig["db_params"])
-        import datetime
-
-        # interval syntax check
-        # (and also checking limit values can be supplied by param)
-        i = datetime.timedelta(seconds=300)
-        got = await cxn.fetch(
-            "SELECT TIMEZONE('utc', CURRENT_TIMESTAMP) + $1::interval LIMIT $2", i, 5
-        )
-        logger.info(got)
-        logger.info(got[0])
-        logger.info(got[0][0])
-        logger.info(got[0]["?column?"])  # anonymous column name in the output
-
-        got = await cxn.fetch(
-            "CREATE TEMP TABLE zooper(a bigserial primary key, b text, c text)"
-        )
-        logger.info(got)
-
-        got = await cxn.fetch("CREATE UNIQUE INDEX zooper_idx ON zooper (b, c)")
-        logger.info(got)
-
-        got = await cxn.fetch("INSERT INTO zooper (b, c) VALUES ('hi', 'there')")
-        logger.info(got)
-
-        try:
-            got = await cxn.fetch("INSERT INTO zooper (b, c) VALUES ('hi', 'there')")
-            logger.info(got)
-        except asyncpg.exceptions.UniqueViolationError:
-            logger.info("Duplicate insert conflicted as expected!")
-
-        got = await cxn.fetch("SELECT * FROM zooper WHERE b = any($1::text[])", [])
-        logger.info("Any query as empty: {}", got)
-        got = await cxn.fetch("SELECT * FROM zooper WHERE b = any($1::text[])", [None])
-        logger.info("Any query as none: {}", got)
-        got = await cxn.fetch(
-            "SELECT * FROM zooper WHERE b = any($1::text[])",
-            ["asdfg", "jkl", "there", "hi"],
-        )
-        logger.info("Any query as actual: {}", got)
-
-        got = await cxn.fetch("INSERT INTO zooper (b, c) VALUES (NULL, 'there')")
-        got = await cxn.fetch("SELECT * FROM zooper WHERE b = any($1::text[])", [None])
-        logger.info("Any query as none with null: {}", got)
-
-        got = await cxn.fetch(
-            "SELECT * FROM zooper WHERE b = ANY($1::text[]) OR b is NULL", [None]
-        )
-        logger.info("Any query as none with null OR: {}", got)
-
-    asyncio.run(zooper())

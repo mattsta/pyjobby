@@ -9,14 +9,18 @@ Monitors and enforces job timeouts. This is a safety mechanism for cases where:
 Runs as a separate process, checks every 10 seconds.
 """
 
+from __future__ import annotations
+
 import asyncio
 
-import asyncpg
+import asyncpg  # type: ignore[import-untyped]
 from loguru import logger
+
+from . import db
 
 
 async def handle_timed_out_job(
-    pool: asyncpg.Pool,
+    pool: asyncpg.Pool | asyncpg.Connection,
     job_id: int,
     job_class: str,
     admin_data: dict | None,
@@ -26,7 +30,7 @@ async def handle_timed_out_job(
     Handle a job that has exceeded its timeout.
 
     Args:
-        pool: Database connection pool
+        pool: Database connection or pool to execute against
         job_id: ID of timed-out job
         job_class: Job class name
         admin_data: Job's admin_data (can be dict or JSON string)
@@ -59,8 +63,10 @@ async def handle_timed_out_job(
                 timeout_at = NULL,
                 error_count = error_count + 1,
                 error_message = $2,
-                run_after = NOW() + $3::interval
+                run_after = TIMEZONE('utc', clock_timestamp()) + $3::interval,
+                updated = TIMEZONE('utc', clock_timestamp())
             WHERE id = $1
+              AND state = 'running'
             """,
             job_id,
             "Timeout exceeded - retrying",
@@ -84,8 +90,11 @@ async def handle_timed_out_job(
             SET state = 'crashed',
                 timeout_at = NULL,
                 error_count = error_count + 1,
-                error_message = $2
+                error_message = $2,
+                finished = clock_timestamp(),
+                updated = TIMEZONE('utc', clock_timestamp())
             WHERE id = $1
+              AND state = 'running'
             """,
             job_id,
             f"Timeout exceeded - marked as failed ({reason})",
@@ -94,50 +103,109 @@ async def handle_timed_out_job(
         logger.error(f"Job {job_id} marked as crashed: {reason}")
 
 
+async def sweep_timed_out_jobs(pool: asyncpg.Pool, batch_size: int = 100) -> int:
+    """Find running jobs past their deadline and retry/fail them.
+
+    The SELECT ... FOR UPDATE SKIP LOCKED and the per-job updates run inside
+    one transaction so the row locks are actually held while handling the
+    jobs — multiple monitor instances cannot double-process a job, and a
+    worker finishing a job concurrently is serialized against us (the state
+    guards in the UPDATEs then make the late writer a no-op).
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        timed_out = await conn.fetch(
+            """
+                SELECT id, job_class, timeout_at, admin_data, error_count
+                FROM jorb
+                WHERE state = 'running'
+                  AND timeout_at IS NOT NULL
+                  AND timeout_at < NOW()
+                FOR UPDATE SKIP LOCKED
+                LIMIT $1
+                """,
+            batch_size,
+        )
+
+        for job in timed_out:
+            await handle_timed_out_job(
+                conn,
+                job["id"],
+                job["job_class"],
+                job["admin_data"],
+                job["error_count"],
+            )
+
+    return len(timed_out)
+
+
+async def sweep_stale_claimed_jobs(
+    pool: asyncpg.Pool, claimed_grace_seconds: int = 300, batch_size: int = 100
+) -> int:
+    """Requeue jobs stuck in 'claimed' whose worker died before starting them.
+
+    A healthy worker moves a job claimed -> running almost immediately, so a
+    job sitting in 'claimed' long past that window belonged to a worker that
+    died (on any host — this is the global safety net; workers additionally
+    recover their own host's jobs by pid-liveness at startup).
+
+    Single atomic UPDATE, so concurrent monitor instances are safe.
+    """
+    import datetime
+
+    grace = datetime.timedelta(seconds=claimed_grace_seconds)
+    requeued = await pool.fetch(
+        """
+        UPDATE jorb
+        SET state = 'queued',
+            run_after = TIMEZONE('utc', clock_timestamp()),
+            timeout_at = NULL,
+            updated = TIMEZONE('utc', clock_timestamp())
+        WHERE id IN (
+            SELECT id FROM jorb
+            WHERE state = 'claimed'
+              AND updated < TIMEZONE('utc', clock_timestamp()) - $1::interval
+            FOR UPDATE SKIP LOCKED
+            LIMIT $2
+        )
+          AND state = 'claimed'
+        RETURNING id, job_class, worker_host
+        """,
+        grace,
+        batch_size,
+    )
+
+    for row in requeued:
+        logger.warning(
+            f"Requeued stale claimed job {row['id']} ({row['job_class']}) "
+            f"abandoned by worker on {row['worker_host']}"
+        )
+
+    return len(requeued)
+
+
 async def timeout_monitor(
-    dsn: str, check_interval: int = 10, batch_size: int = 100
+    dsn: str,
+    check_interval: int = 10,
+    batch_size: int = 100,
+    claimed_grace_seconds: int = 300,
 ) -> None:
     """
-    Monitor and enforce job timeouts.
+    Monitor and enforce job timeouts, and reap jobs abandoned by dead workers.
 
-    Checks every check_interval seconds for jobs that have exceeded their
-    timeout_at deadline.
+    Every check_interval seconds:
+    1. running jobs past timeout_at are retried or failed per their
+       on_timeout configuration;
+    2. jobs stuck in 'claimed' longer than claimed_grace_seconds are
+       requeued (their worker died between claiming and starting).
 
     Args:
         dsn: PostgreSQL connection string
         check_interval: How often to check for timeouts (seconds)
         batch_size: Maximum jobs to process per check
+        claimed_grace_seconds: Age before a 'claimed' job counts as abandoned
     """
 
-    # Custom codec init function
-    async def init_connection(conn):
-        try:
-            import orjson
-
-            def orjson_encoder(obj):
-                return orjson.dumps(obj).decode("utf-8")
-
-            def orjson_decoder(s):
-                return orjson.loads(s)
-
-            await conn.set_type_codec(
-                "json",
-                encoder=orjson_encoder,
-                decoder=orjson_decoder,
-                schema="pg_catalog",
-                format="text",
-            )
-            await conn.set_type_codec(
-                "jsonb",
-                encoder=orjson_encoder,
-                decoder=orjson_decoder,
-                schema="pg_catalog",
-                format="text",
-            )
-        except ImportError:
-            pass
-
-    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2, init=init_connection)
+    pool = await db.create_pool(dsn, min_size=1, max_size=2)
 
     logger.info(
         f"Timeout monitor started (check every {check_interval}s, batch size {batch_size})"
@@ -146,33 +214,11 @@ async def timeout_monitor(
     try:
         while True:
             try:
-                # Find jobs that exceeded timeout
-                timed_out = await pool.fetch(
-                    """
-                    SELECT id, job_class, timeout_at, admin_data, error_count
-                    FROM jorb
-                    WHERE state = 'running'
-                      AND timeout_at IS NOT NULL
-                      AND timeout_at < NOW()
-                    FOR UPDATE SKIP LOCKED
-                    LIMIT $1
-                    """,
-                    batch_size,
-                )
+                handled = await sweep_timed_out_jobs(pool, batch_size)
+                if handled:
+                    logger.info(f"Timeout monitor: Handled {handled} timed-out jobs")
 
-                for job in timed_out:
-                    await handle_timed_out_job(
-                        pool,
-                        job["id"],
-                        job["job_class"],
-                        job["admin_data"],
-                        job["error_count"],
-                    )
-
-                if timed_out:
-                    logger.info(
-                        f"Timeout monitor: Handled {len(timed_out)} timed-out jobs"
-                    )
+                await sweep_stale_claimed_jobs(pool, claimed_grace_seconds, batch_size)
 
             except Exception as e:
                 import traceback
@@ -219,18 +265,31 @@ def cli() -> None:
     @click.option(
         "--check-interval", default=10, help="Check interval in seconds (default: 10)"
     )
-    def main(dsn: str, config: str, check_interval: int) -> None:
+    @click.option(
+        "--claimed-grace",
+        default=300,
+        help="Seconds before a 'claimed' job counts as abandoned (default: 300)",
+    )
+    def main(dsn: str, config: str, check_interval: int, claimed_grace: int) -> None:
         """Start pyjobby timeout monitor process."""
         import asyncio
 
         if not dsn:
             if config:
+                from urllib.parse import quote
+
                 from .configloader import load_config_from_file
 
                 cfg = load_config_from_file(config, keys=["db_params"])
                 db_params = cfg.get("db_params", {})
-                # Build DSN from params
-                dsn = f"postgresql://{db_params.get('user')}:{db_params.get('password')}@{db_params.get('host')}:{db_params.get('port', 5432)}/{db_params.get('database')}"
+                # Build DSN from params (URL-encode credentials)
+                user = quote(str(db_params.get("user", "")), safe="")
+                password = quote(str(db_params.get("password", "")), safe="")
+                dsn = (
+                    f"postgresql://{user}:{password}"
+                    f"@{db_params.get('host')}:{db_params.get('port', 5432)}"
+                    f"/{db_params.get('database')}"
+                )
             else:
                 click.echo("Error: Must provide --dsn or --config", err=True)
                 sys.exit(1)
@@ -240,7 +299,13 @@ def cli() -> None:
             f"DSN: {dsn.split('@')[1] if '@' in dsn else dsn}"
         )  # Don't show password
 
-        asyncio.run(timeout_monitor(dsn, check_interval=check_interval))
+        asyncio.run(
+            timeout_monitor(
+                dsn,
+                check_interval=check_interval,
+                claimed_grace_seconds=claimed_grace,
+            )
+        )
 
     main()
 
