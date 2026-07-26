@@ -89,6 +89,16 @@ CREATE INDEX jorb_started_idx ON jorb (queue, started)
 -- reaper scans
 CREATE INDEX jorb_inflight_idx ON jorb (state, updated)
     WHERE state IN ('claimed', 'running');
+-- retention: the sweep asks "which terminal jobs aged out?" every cycle, and
+-- once it has caught up the honest answer is usually "none". Without this it
+-- reads the whole terminal backlog to say so -- measured at 300k rows that is
+-- already a full scan, and a busy install keeps orders of magnitude more.
+-- Indexed on the expression the sweep actually filters by.
+CREATE INDEX jorb_retention_idx ON jorb (COALESCE(finished, updated))
+    WHERE state IN ('finished', 'crashed', 'cancelled');
+-- reporting windows (`WHERE updated >= $1`): /metrics is scraped on a timer,
+-- so an unindexed scan here turns the dashboard into the outage.
+CREATE INDEX jorb_updated_idx ON jorb (updated);
 CREATE INDEX jorb_timeout_idx ON jorb (timeout_at)
     WHERE state = 'running' AND timeout_at IS NOT NULL;
 -- dependency wakeups
@@ -347,6 +357,13 @@ CREATE TABLE jorb_dependencies (
     depends_on BIGINT NOT NULL REFERENCES jorb (id) ON DELETE CASCADE,
     PRIMARY KEY (job_id, depends_on)
 );
+
+-- The primary key leads with job_id, so THAT cascade is indexed; depends_on
+-- is a second foreign key to the same table and Postgres indexes neither
+-- automatically. Without this, deleting a job sequentially scans this table
+-- looking for edges that point at it -- once per deleted job, which is
+-- exactly what retention does in bulk.
+CREATE INDEX jorb_dependencies_depends_on_idx ON jorb_dependencies (depends_on);
 
 ALTER TABLE jorb ADD CONSTRAINT jorb_dag_fk
     FOREIGN KEY (dag_id) REFERENCES jorb_dag (id) ON DELETE SET NULL;

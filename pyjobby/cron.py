@@ -46,6 +46,31 @@ def validate_cron(expr: str) -> None:
         raise ValueError(f"malformed cron expression {expr!r}")
 
 
+def is_wall_clock_anchored(expr: str) -> bool:
+    """True when ``expr`` names specific hours rather than an interval.
+
+    This is the distinction that decides what a schedule MEANS when a
+    daylight-saving transition repeats an hour:
+
+    * ``30 1 * * *`` names 01:30. It means "once a day, at half past one",
+      and it must fire once on the day 01:30 happens twice.
+    * ``0 * * * *`` and ``0 */2 * * *`` name an interval. They mean "every
+      hour" / "every two hours" of REAL time, so both passes through the
+      repeated hour are genuine -- skipping one would leave a two-hour gap.
+
+    The hour field decides it: a wildcard or a step is an interval, anything
+    that enumerates hours is anchored to the wall clock. (This is the rule
+    vixie cron settled on for the same reason.)
+    """
+    fields = expr.split()
+    if len(fields) < 5:
+        return False
+    # 6- and 7-column forms append seconds and year, so the hour is always
+    # the second field -- the layout croniter uses by default.
+    hour = fields[1]
+    return "*" not in hour
+
+
 def next_cron_run(expr: str, timezone: str, after: datetime | None = None) -> datetime:
     """When ``expr`` next fires in ``timezone``, strictly after ``after``.
 
@@ -56,9 +81,18 @@ def next_cron_run(expr: str, timezone: str, after: datetime | None = None) -> da
     Validation happens up front so a bad expression or zone fails where it
     was entered, rather than at fire time -- an unevaluatable schedule is a
     schedule that silently never runs.
+
+    On the day a zone falls back, a wall-clock-anchored schedule skips the
+    SECOND pass through the repeated hour: `fold=1` marks that instant as a
+    replay of a wall-clock time the schedule has already fired at, and firing
+    again would run a daily job twice and duplicate its side effects. Interval
+    schedules keep both passes -- see :func:`is_wall_clock_anchored`.
     """
     tz = resolve_timezone(timezone)
     validate_cron(expr)
     moment = after.astimezone(tz) if after is not None else datetime.now(tz)
-    fire: datetime = croniter(expr, moment).get_next(datetime)
+    it = croniter(expr, moment)
+    fire: datetime = it.get_next(datetime)
+    if fire.fold == 1 and is_wall_clock_anchored(expr):
+        fire = it.get_next(datetime)
     return fire

@@ -15,20 +15,36 @@ dies on what it does at a transition, and both directions are surprising.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
 from croniter import croniter
+
+from pyjobby.cron import is_wall_clock_anchored, next_cron_run
 
 NY = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 
 
 def fires(expr: str, start: datetime, count: int) -> list[datetime]:
-    """The next `count` fire times strictly after `start`."""
+    """The next `count` fire times strictly after `start`, straight from
+    croniter -- used to pin the RAW library behavior."""
     it = croniter(expr, start)
     return [it.get_next(datetime) for _ in range(count)]
+
+
+def series(expr: str, start: datetime, count: int) -> list[datetime]:
+    """The next `count` fire times through pyjobby's own entry point.
+
+    This is what a schedule actually does: the scheduler recomputes from the
+    instant it last fired, so the sequence is chained, not iterated.
+    """
+    out, cur = [], start
+    for _ in range(count):
+        cur = next_cron_run(expr, "America/New_York", after=cur)
+        out.append(cur)
+    return out
 
 
 class TestFieldLayout:
@@ -132,6 +148,60 @@ class TestDaylightSavingTransitions:
         # and the schedule returns to its normal time immediately after
         assert result[1] == datetime(2027, 3, 15, 2, 30, tzinfo=NY)
         assert result[2] == datetime(2027, 3, 16, 2, 30, tzinfo=NY)
+
+    def test_a_daily_schedule_fires_ONCE_on_fall_back_day(self):
+        """The defect this rule exists to prevent: a daily job running twice.
+
+        `30 1 * * *` means "once a day, at half past one". On the day 01:30
+        happens twice, firing at both would run the job twice and duplicate
+        every side effect it has -- a second invoice, a second email, a second
+        charge. It fires once, and resumes normally the next day.
+        """
+        day_before = datetime(2027, 11, 6, 3, 0, tzinfo=NY)
+
+        result = series("30 1 * * *", day_before, 3)
+
+        assert result == [
+            datetime(2027, 11, 7, 1, 30, tzinfo=NY),  # EDT, the first pass
+            datetime(2027, 11, 8, 1, 30, tzinfo=NY),
+            datetime(2027, 11, 9, 1, 30, tzinfo=NY),
+        ]
+        # one fire on the transition day, not two
+        assert [f for f in result if f.date() == date(2027, 11, 7)] == [result[0]]
+        assert result[0].utcoffset().total_seconds() == -4 * 3600
+
+    @pytest.mark.parametrize(
+        "expr,anchored",
+        [
+            ("30 1 * * *", True),  # a named hour
+            ("0 2,14 * * *", True),  # several named hours
+            ("30 1 * * * 15", True),  # 6-column form: hour is still field 2
+            ("0 * * * *", False),  # every hour
+            ("*/15 * * * *", False),  # every 15 minutes
+            ("0 */2 * * *", False),  # every 2 hours
+        ],
+    )
+    def test_which_schedules_are_wall_clock_anchored(self, expr, anchored):
+        """The hour field decides whether a schedule means a time or a rate."""
+        assert is_wall_clock_anchored(expr) is anchored
+
+    def test_an_interval_schedule_keeps_both_passes(self):
+        """An interval means real elapsed time, so both passes are genuine.
+
+        Skipping one would leave a two-hour gap in an hourly schedule -- the
+        opposite mistake from the daily double-fire.
+        """
+        before = datetime(2027, 11, 7, 0, 5, tzinfo=NY)
+
+        result = series("0 * * * *", before, 4)
+
+        # 01:00 appears twice, once at each offset
+        assert [f.utcoffset().total_seconds() / 3600 for f in result[:2]] == [-4, -5]
+        assert result[0].replace(tzinfo=None) == result[1].replace(tzinfo=None)
+        # and the cadence is exactly one hour of real time throughout
+        utc = [f.astimezone(UTC) for f in result]
+        gaps = [(b - a).total_seconds() for a, b in zip(utc, utc[1:], strict=False)]
+        assert gaps == [3600.0, 3600.0, 3600.0]
 
     def test_fall_back_yields_the_repeated_hour_twice(self):
         """On 2027-11-07 America/New_York repeats 01:00-02:00.
