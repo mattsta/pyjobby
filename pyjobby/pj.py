@@ -623,8 +623,18 @@ class JobSystem:
             # run-time result passing: inject the upstream job's stored
             # result into kwargs before the task runs
             if admin_data.get("use_result_from"):
-                upstream = await self.ex("get-result", admin_data["use_result_from"])
-                if upstream and upstream[0]["state"] == "finished":
+                upstream_id = admin_data["use_result_from"]
+                upstream = await self.ex("get-result", upstream_id)
+                if not upstream:
+                    # The job this one was told to read is gone -- retention
+                    # deleted it, or an operator did. Running anyway would
+                    # silently produce a result computed WITHOUT the upstream
+                    # input, which is a wrong answer rather than a failure.
+                    raise LookupError(
+                        f"job {jid} reads its input from job {upstream_id}, "
+                        f"which no longer exists"
+                    )
+                if upstream[0]["state"] == "finished":
                     job["kwargs"] = {
                         **(job.get("kwargs") or {}),
                         "upstream_result": upstream[0]["result"],

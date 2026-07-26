@@ -292,6 +292,13 @@ CREATE TABLE jorb_mailbox (
 CREATE INDEX jorb_mailbox_pending_idx ON jorb_mailbox (dest_job_id, topic, id)
     WHERE consumed_at IS NULL;
 
+-- Retention drives off consumed messages, every cycle, forever. A long-lived
+-- job reads mail for months, so the job-scoped cascade never reaches them and
+-- this is the only thing that does -- unindexed it would scan the whole
+-- mailbox each pass and get slower forever.
+CREATE INDEX jorb_mailbox_consumed_idx ON jorb_mailbox (consumed_at)
+    WHERE consumed_at IS NOT NULL;
+
 -- ============================================================================
 -- Transition history (first-class audit; retries keep one job id)
 -- ============================================================================

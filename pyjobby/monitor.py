@@ -431,12 +431,10 @@ async def sweep_consumed_mailbox(
     bounding the delete and the batch overruns (observed: batch_size=2
     deleting 5 rows). MATERIALIZED forces exactly one evaluation.
 
-    Ordered by id, which here IS the index order worth having: jorb_mailbox
-    carries only its primary key and a pending-only partial index, so the pkey
-    is the sole ordered access path over consumed rows. Ordering by
-    ``consumed_at`` instead would sort the whole consumed backlog on every
-    call for no benefit — and id is insertion order, so oldest-first anyway.
-    (jorb_mailbox has no index on consumed_at; adding one is a schema change.)
+    Ordered by ``consumed_at``, which jorb_mailbox_consumed_idx provides
+    directly: the probe walks the index in order and stops at the batch size,
+    with no sort even when a large backlog matches. Ordering by id instead
+    would have to sort every matching row first, which is the cost that grows.
 
     Single atomic statement; safe with concurrent monitor instances."""
     retention = datetime.timedelta(days=retention_days)
@@ -447,7 +445,7 @@ async def sweep_consumed_mailbox(
             SELECT id FROM jorb_mailbox
             WHERE consumed_at IS NOT NULL
               AND consumed_at < now() - $1::interval
-            ORDER BY id
+            ORDER BY consumed_at
             FOR UPDATE SKIP LOCKED
             LIMIT $2
         )

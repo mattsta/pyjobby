@@ -9,9 +9,13 @@ Covers every sweep the monitor daemon performs:
   heartbeat went stale are requeued and the workers retired
 - unregistered-claim reclaim: 'claimed' jobs with no registry reference are
   requeued after a grace period
-- retention: terminal jobs past the window are deleted with every child row;
-  live work is never deleted at any age, and the whole thing stays off until
-  an operator asks for it
+- job retention: terminal jobs past the window are deleted with every child
+  row; live work is never deleted at any age; on by default, with 0 as the
+  keep-forever escape hatch
+- checkpoint retention: the jorb_step rows of terminal jobs go on their own,
+  much shorter window while the job row stays — two lifetimes, not one
+- draining: one retention cycle clears a multi-batch backlog, stops on its
+  time budget, and says which of the two it did
 - run_epoch fencing: a monitor requeue makes the superseded execution's
   completion a no-op
 - the ``monitor()`` loop wires the sweeps together and keeps each one's
@@ -21,13 +25,16 @@ Covers every sweep the monitor daemon performs:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import inspect
 
 import pytest
+from loguru import logger
 
 from pyjobby import monitor as monitor_module
 from pyjobby.monitor import (
+    _drain,
     handle_timed_out_job,
     monitor,
     sweep_completed_checkpoints,
@@ -212,6 +219,20 @@ async def child_counts(pool, job_id: int) -> dict[str, int]:
             "SELECT count(*) FROM jorb_history WHERE job_id = $1", job_id
         ),
     }
+
+
+@contextlib.contextmanager
+def captured_logs(level: str):
+    """Collect the monitor's loguru messages at or above ``level``.
+
+    What retention reports is part of its contract: an operator has to be able
+    to tell "nothing to delete" from "gave up with a backlog left"."""
+    messages: list[str] = []
+    handler_id = logger.add(messages.append, level=level, format="{message}")
+    try:
+        yield messages
+    finally:
+        logger.remove(handler_id)
 
 
 async def wait_until(predicate, *, timeout: float = 10) -> None:
@@ -976,6 +997,101 @@ class TestSweepCompletedCheckpoints:
         assert await job_ids(db_pool) == [job]
 
 
+class TestRetentionDrain:
+    """One retention cycle drains its backlog instead of taking one bite.
+
+    batch_size per check_interval is a fixed deletion rate. Any platform
+    ingesting faster than it outruns retention permanently — the operator
+    surface says retention is on while the table grows forever."""
+
+    async def test_one_cycle_clears_a_multi_batch_backlog(self, db_pool, unique_queue):
+        ids = [
+            await insert_terminal_job(db_pool, unique_queue, days_ago=30 + n)
+            for n in range(5)
+        ]
+
+        deleted = await _drain(
+            "expired jobs",
+            lambda: sweep_expired_jobs(db_pool, retention_days=7, batch_size=2),
+            batch_size=2,
+            max_seconds=5.0,
+        )
+
+        # all five in ONE cycle, not two per cycle
+        assert deleted == len(ids)
+        assert await job_ids(db_pool) == []
+
+    async def test_a_caught_up_cycle_reports_the_count(self, db_pool, unique_queue):
+        await insert_terminal_job(db_pool, unique_queue, days_ago=30)
+        await insert_terminal_job(db_pool, unique_queue, days_ago=31)
+
+        with captured_logs("INFO") as messages:
+            deleted = await _drain(
+                "expired jobs",
+                lambda: sweep_expired_jobs(db_pool, retention_days=7, batch_size=10),
+                batch_size=10,
+                max_seconds=5.0,
+            )
+
+        assert deleted == 2
+        assert [m for m in messages if "caught up" in m] == [
+            "Retention expired jobs: deleted 2, caught up\n"
+        ]
+
+    async def test_an_empty_cycle_says_nothing(self, db_pool, unique_queue):
+        await insert_terminal_job(db_pool, unique_queue, days_ago=1)
+
+        with captured_logs("INFO") as messages:
+            deleted = await _drain(
+                "expired jobs",
+                lambda: sweep_expired_jobs(db_pool, retention_days=7, batch_size=10),
+                batch_size=10,
+                max_seconds=5.0,
+            )
+
+        assert deleted == 0
+        assert messages == []
+
+    async def test_the_time_budget_stops_the_cycle_and_warns(self):
+        """Falling behind must be loud: silence reads exactly like caught up.
+
+        The fake sweep always returns a full batch, so there is always more to
+        do; a spent budget is the only thing that can end the cycle."""
+        calls = []
+
+        async def endless_sweep() -> int:
+            calls.append(1)
+            return 2
+
+        with captured_logs("WARNING") as messages:
+            deleted = await _drain(
+                "expired jobs", endless_sweep, batch_size=2, max_seconds=0.0
+            )
+
+        # exactly one batch, then it yields the cycle
+        assert (deleted, len(calls)) == (2, 1)
+        assert len(messages) == 1
+        assert "deleted 2" in messages[0]
+        assert "falling behind" in messages[0]
+
+    async def test_the_budget_still_allows_several_batches(self):
+        calls = []
+
+        async def endless_sweep() -> int:
+            calls.append(1)
+            await asyncio.sleep(0.01)
+            return 2
+
+        with captured_logs("WARNING") as messages:
+            deleted = await _drain(
+                "expired jobs", endless_sweep, batch_size=2, max_seconds=0.1
+            )
+
+        assert len(calls) >= 3  # many batches within one cycle's budget
+        assert deleted == 2 * len(calls)
+        assert len(messages) == 1
+
+
 class TestSweepConsumedMailbox:
     """Consumed messages of jobs that are still alive: the cascade cannot
     reach them because the job never goes away."""
@@ -1386,6 +1502,53 @@ class TestMonitorLoop:
         try:
             await wait_until(lambda: len(attempts) >= 2, timeout=10)
             await wait_for_job_state(db_pool, orphaned, ("queued",), timeout=10)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    async def test_saturated_retention_does_not_starve_the_latency_sweeps(
+        self, db_pool, unique_queue, db_params, monkeypatch
+    ):
+        """Retention that can NEVER catch up must still yield every cycle.
+
+        The fake sweep always returns a full batch, so the drain loop only
+        ever ends on its time budget. Timeout enforcement and dead-worker
+        recovery decide how long a stuck job stays stuck; they must keep
+        running behind an unbounded backlog, and the cycle must keep turning
+        (retention is re-entered, not stuck in one drain forever)."""
+        batches = []
+
+        async def endless_sweep(pool, days, batch_size):
+            batches.append(1)
+            await asyncio.sleep(0.01)
+            return batch_size
+
+        monkeypatch.setattr(monitor_module, "sweep_expired_jobs", endless_sweep)
+
+        timed_out = await insert_job(
+            db_pool, unique_queue, state="running", timeout_at_offset_seconds=-5
+        )
+        dead_worker = await insert_worker(
+            db_pool, unique_queue, last_seen_age_seconds=300
+        )
+        orphaned = await insert_job(
+            db_pool, unique_queue, state="running", claimed_by=dead_worker
+        )
+
+        task = asyncio.create_task(
+            monitor(
+                dsn_from(db_params),
+                check_interval=0.1,
+                liveness_grace_seconds=60,
+                retention_batch_size=5,
+                retention_max_seconds=0.05,
+            )
+        )
+        try:
+            await wait_for_job_state(db_pool, timed_out, ("queued",), timeout=10)
+            await wait_for_job_state(db_pool, orphaned, ("queued",), timeout=10)
+            await wait_until(lambda: len(batches) >= 4, timeout=10)
         finally:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):

@@ -140,6 +140,49 @@ class TestMetricsScanPlan:
         assert "jorb_created_idx" in plan, plan
 
 
+class TestMailboxSweepPlan:
+    """The mailbox sweep is the only thing that reaps a live job's read mail.
+
+    `recv` marks a message consumed but never deletes it, and the job-scoped
+    cascade cannot reach a job that is still alive -- so a durable workflow
+    running for months accumulates every message it has read. This sweep runs
+    every cycle forever, which makes its plan matter as much as retention's.
+    """
+
+    async def test_consumed_probe_uses_the_index(self, db_pool, unique_queue):
+        job_id = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, kwargs, queue, state)
+               VALUES ('scale.Job', '{}', $1, 'running') RETURNING id""",
+            unique_queue,
+        )
+        await db_pool.execute(
+            """
+            INSERT INTO jorb_mailbox (dest_job_id, topic, message, consumed_at)
+            SELECT $1, 't', '{}',
+                   CASE WHEN i % 10 = 0 THEN NULL
+                        ELSE now() - (i % 30) * interval '1 day' END
+            FROM generate_series(1, 20000) i
+            """,
+            job_id,
+        )
+        await db_pool.execute("ANALYZE jorb_mailbox")
+
+        plan = await plan_for(
+            db_pool,
+            """
+            SELECT id FROM jorb_mailbox
+             WHERE consumed_at IS NOT NULL
+               AND consumed_at < now() - $1::interval
+             ORDER BY consumed_at LIMIT 1000
+            """,
+            datetime.timedelta(days=3650),
+        )
+
+        assert "jorb_mailbox_consumed_idx" in plan, plan
+        # index order means the batch needs no sort, however big the backlog
+        assert "Sort" not in plan, plan
+
+
 class TestCascadeIndexes:
     """Deleting a job must not scan its child tables to find their rows.
 
