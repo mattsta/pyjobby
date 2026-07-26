@@ -62,16 +62,35 @@ class StepTimeoutError(Exception):
     must be recorded — naming the step that hung is half the point of having
     per-step budgets at all.
 
-    Deliberately **not** a ``TimeoutError`` either: the worker reads a bare
-    TimeoutError out of a task as the *job* timeout, reports it as "Job timed
-    out after Ns", and applies the job's ``on_timeout`` policy to it. A step
-    that blew its own budget is an ordinary step failure and takes the
-    ordinary retry path.
+    Deliberately **not** a ``TimeoutError`` either, and distinct from
+    ``JobTimeout``: a step that blew its own budget is an ordinary step
+    failure taking the ordinary retry path, not the job running out of the
+    time its operator configured.
     """
 
     def __init__(self, name: str, timeout: float) -> None:
         super().__init__(f"step '{name}' exceeded its {timeout:g}s timeout")
         self.name = name
+        self.timeout = timeout
+
+
+class JobTimeout(Exception):  # noqa: N818 - names the deadline, not a fault kind
+    """The job's own in-process deadline expired.
+
+    Raised only by the worker, from the single ``asyncio.timeout`` scope that
+    wraps a whole execution — never by job code. That makes "this job ran out
+    of its configured time" something the worker *observed*, so the
+    ``on_timeout`` policy is applied to exactly the deadline the operator set.
+
+    Job code raises ``TimeoutError`` on its own account all the time (an inner
+    ``asyncio.timeout``, an HTTP client's deadline). Telling those two apart
+    by comparing clocks against the job's deadline works only while the
+    deadline has visible slack around it — which is precisely what a single,
+    exact ceiling removes. A distinct type needs no slack.
+    """
+
+    def __init__(self, timeout: float) -> None:
+        super().__init__(f"Job timed out after {timeout:g}s")
         self.timeout = timeout
 
 

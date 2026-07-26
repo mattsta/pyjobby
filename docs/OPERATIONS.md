@@ -61,6 +61,37 @@ waiting -> queued                                  (dependency satisfied)
 * **Durable sleeps** hold no worker: a sleeping job is simply `queued` with
   a future `run_after`.
 
+## Timeouts
+
+A job's timeout is `admin_data.timeout_seconds`, else the job class's
+`timeout`, else the worker's `--default-timeout` (3600s). `0` disables it.
+It is **one** number, enforced in two places:
+
+* **In-process, by the worker.** A single deadline wraps the whole
+  execution, so a job configured for N seconds stops being run at N seconds
+  — not at 2N because it spent time producing its coroutine, and not
+  indefinitely because it streamed its results from an async generator.
+  Reaching it applies `on_timeout` (`retry`, the default, or `fail`).
+* **Out-of-process, by the monitor.** `jorb.timeout_at` is written when the
+  job starts running and cleared by every terminal transition; the monitor
+  sweeps rows past it and applies the same `on_timeout` policy. This is the
+  backstop for everything the worker cannot enforce itself — a killed
+  worker, a lost database connection, or a job that blocks so hard it
+  cannot be interrupted.
+
+**What the in-process deadline can actually interrupt.** It is delivered as
+a cancellation at an await point, so async code is genuinely stopped where
+it is suspended, `finally` blocks and all. A *synchronous* `task()` runs in
+a worker thread: the deadline still fires on time and the job is recorded as
+timed out, but nothing stops the thread — it runs to completion in the
+background and its result is discarded. Synchronous code called **inline**
+from an async `task()` is worse: it blocks the event loop and starves the
+timer, so its deadline is advisory until it returns. For both, the monitor
+(or ending the process) is what bounds the rest. Note that `self.cancelled`
+is the **operator** cancel signal (`pj-admin jobs cancel`) and is *not* set
+by a timeout: a long synchronous loop that wants to stop itself early has to
+watch its own clock.
+
 ## Queue controls (live; no restarts)
 
 ```bash

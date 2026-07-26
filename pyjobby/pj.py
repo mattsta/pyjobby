@@ -678,9 +678,6 @@ class JobSystem:
         jname = job["job_class"].split(".")[-1]
         admin_data = job.get("admin_data") or {}
         klass: Job | None = None
-        # monotonic instant THIS job's timeout fires; the only thing that
-        # tells a TimeoutError we produced from one job code raised
-        job_deadline: float | None = None
 
         logger.info(
             "[job {}] Running {} ({}, {}, {})",
@@ -742,11 +739,12 @@ class JobSystem:
             await self.ex("run", jid, epoch)
 
             start_counter = time.perf_counter()
-            # DXE: the job's deadline is the ceiling every per-step budget is
-            # measured against (see Job._dxe_budget). Monotonic, in-process,
-            # and the same instant _execute starts counting from.
-            job_deadline = time.monotonic() + job_timeout if job_timeout else None
-            klass._dxe_deadline = job_deadline
+            # DXE: ONE deadline for this job. It is what _execute enforces and
+            # the ceiling every per-step budget is measured against (see
+            # Job._dxe_budget) — monotonic, in-process, set once.
+            klass._dxe_deadline = (
+                time.monotonic() + job_timeout if job_timeout else None
+            )
             self._exec_task = asyncio.create_task(self._execute(klass, job_timeout))
             result = await self._exec_task
 
@@ -764,6 +762,18 @@ class JobSystem:
             # again after wake_at
             logger.info(f"[job {jid}] Durable sleep until {sleep.wake_at}")
 
+        except dxe.JobTimeout as expired:
+            # the worker's own deadline, observed rather than inferred: only
+            # _execute's scope raises this, so the operator's on_timeout
+            # policy is applied to exactly the deadline they configured
+            await self._handle_failure(
+                job,
+                klass,
+                error=str(expired),
+                backtrace="Timeout error - job exceeded maximum execution time",
+                timed_out=True,
+            )
+
         except dxe.StaleExecutionError:
             # a newer attempt owns the row (monitor/operator requeue while
             # we ran); abandon quietly — our writes were fenced out anyway
@@ -777,74 +787,71 @@ class JobSystem:
             self.errors += 1
 
         except Exception as e:
-            # A TimeoutError here is the job's own deadline ONLY if that
-            # deadline has actually passed. Job code raises TimeoutError on
-            # its own account all the time (a step's inner deadline, an HTTP
-            # client); reporting that as the job timeout would misname the
-            # failure and apply the operator's on_timeout policy to something
-            # they never configured, so it takes the ordinary failure path.
-            if (
-                isinstance(e, TimeoutError)
-                and job_deadline is not None
-                and time.monotonic() >= job_deadline
-            ):
-                await self._handle_failure(
-                    job,
-                    klass,
-                    error=f"Job timed out after {job_timeout}s",
-                    backtrace="Timeout error - job exceeded maximum execution time",
-                    timed_out=True,
-                )
-            else:
-                _, _, exc_traceback = sys.exc_info()
-                logger.exception(
-                    "[job {}:{}] Error in {}: {}", jid, jname, job["job_class"], e
-                )
-                await self._handle_failure(
-                    job,
-                    klass,
-                    error=str(e),
-                    backtrace="Traceback:\n"
-                    + "".join(traceback.format_tb(exc_traceback)),
-                    timed_out=False,
-                )
+            # Includes a bare TimeoutError from job code (a step's inner
+            # deadline, an HTTP client). That is an ordinary failure: calling
+            # it the job timeout would misname it and apply the operator's
+            # on_timeout policy to a deadline they never configured.
+            _, _, exc_traceback = sys.exc_info()
+            logger.exception(
+                "[job {}:{}] Error in {}: {}", jid, jname, job["job_class"], e
+            )
+            await self._handle_failure(
+                job,
+                klass,
+                error=str(e),
+                backtrace="Traceback:\n" + "".join(traceback.format_tb(exc_traceback)),
+                timed_out=False,
+            )
         finally:
             self._current_job_id = None
             self._exec_task = None
 
     async def _execute(self, klass: Job, job_timeout: float | None) -> Any:
-        """Run the job's task under its timeout, whatever shape it takes.
+        """Run the job's task under its ONE deadline.
 
-        .run() executes synchronous tasks to completion, so it goes to a
-        thread: the event loop stays responsive and sync tasks honor
-        job_timeout too. Async tasks just create their coroutine/generator
-        in the thread, which is cheap and safe. (A timed-out sync task's
-        thread keeps running in the background; only its result is
-        abandoned.)"""
-        staged = await asyncio.wait_for(
-            asyncio.to_thread(klass.run), timeout=job_timeout or None
-        )
+        ``Job._dxe_deadline`` is the whole answer to "when does this job run
+        out of time" — the same instant every per-step budget is measured
+        against (see ``Job._dxe_budget``). ``job_timeout`` is carried here
+        only to name the failure; the deadline is what enforces it.
 
+        Resolving a job takes several stages — ``run()`` may be synchronous,
+        what it returns may be a coroutine, and what *that* returns may be an
+        async generator still to be drained — and every stage is job code on
+        the job's clock. Bounding them separately gave each stage its own
+        full timeout, so a job that spent real time staging ran for up to
+        twice its configured ceiling and an async generator was drained with
+        no ceiling at all. One scope around all of it, instead.
+
+        Reaching the deadline raises ``dxe.JobTimeout``, which is the worker
+        saying it observed the overrun; a ``TimeoutError`` from job code
+        inside the scope is left alone as the ordinary failure it is.
+        """
+        deadline = klass._dxe_deadline
+        if deadline is None or not job_timeout:  # set together, absent together
+            return await self._resolve(klass)
+
+        try:
+            async with asyncio.timeout(deadline - time.monotonic()) as bounded:
+                return await self._resolve(klass)
+        except TimeoutError as expired:
+            if not bounded.expired():
+                raise  # job code's own deadline, not the job's
+            raise dxe.JobTimeout(job_timeout) from expired
+
+    async def _resolve(self, klass: Job) -> Any:
+        """Reduce whatever ``run()`` produces to the job's stored result.
+
+        ``run()`` goes to a thread because it may be synchronous and run the
+        task to completion there: the event loop (and the timer enforcing the
+        deadline) stays responsive either way, and an async task pays only
+        for creating its coroutine off-loop. A cancelled sync job's thread
+        keeps running to completion in the background — nothing can interrupt
+        it — but its result is abandoned."""
+        staged = await asyncio.to_thread(klass.run)
         if asyncio.iscoroutine(staged):
-            if job_timeout:
-                result = await asyncio.wait_for(staged, timeout=job_timeout)
-            else:
-                result = await staged
-
-            if inspect.isasyncgen(result):
-                inner = result
-                result = [x async for x in inner]
-            return result
-
+            staged = await staged
         if inspect.isasyncgen(staged):
-
-            async def collect() -> list[Any]:
-                return [x async for x in staged]
-
-            if job_timeout:
-                return await asyncio.wait_for(collect(), timeout=job_timeout)
-            return await collect()
-
+            return [x async for x in staged]
         return staged
 
     async def _wake_dependents(self, job: dict[str, Any]) -> None:
@@ -1121,8 +1128,10 @@ class Job:
         a function that never yields to the event loop has none. A sync
         ``fn`` that overruns therefore runs to completion and, if it
         succeeded, is recorded as a success — the overrun is logged, not
-        invented into a failure. ``self.cancelled`` remains the cooperative
-        signal a long synchronous loop can poll."""
+        invented into a failure. ``self.cancelled`` remains pollable from such
+        a loop, but it reports an *operator* cancel request, not an expiring
+        budget — a synchronous loop that wants to bound itself must watch its
+        own clock."""
         budget = self._dxe_budget(timeout)
         began = time.monotonic()
 

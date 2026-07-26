@@ -237,6 +237,16 @@ the work is split into steps, reported as a job timeout with the job's
 as two different failures. A step that declares more time than the job has
 left logs a warning saying so.
 
+The job's deadline is one `asyncio.timeout` around the **whole** execution —
+calling `run()`, awaiting whatever coroutine it returned, and draining an
+async generator are all inside it, so "N seconds" means N seconds of the job,
+once, whatever shape the job takes. It therefore fires wherever the job
+happens to be, including inside a `step()` the composition rule left unarmed.
+When it does, the completed prefix stays checkpointed (the retry still
+fast-forwards it) and the interrupted step records **nothing**: the job ran
+out of time around that step, which is not the same claim as that step having
+been tried and failed.
+
 ### What a timeout can and cannot interrupt
 
 A timeout is delivered as a **cancellation at an await point**.
@@ -251,9 +261,16 @@ A timeout is delivered as a **cancellation at an await point**.
   budget nor the job's in-process deadline can touch it. It runs to
   completion, and if it succeeded its result is recorded as a success — a step
   whose work actually finished is not retroactively failed to enforce a bound
-  that was never enforceable. The overrun is logged. For long synchronous
-  loops the cooperative signal is `self.cancelled`, which the loop must poll
-  itself; only killing the process stops a blocking call.
+  that was never enforceable. The overrun is logged. Nothing but killing the
+  process stops a blocking call — and note that `self.cancelled` is the
+  **operator** cancel signal, not a timeout signal, so a long synchronous
+  loop that wants to bound itself has to watch its own clock.
+
+A wholly synchronous `task()` — no steps, no `await` — is a different case:
+the worker calls `run()` in a thread, so the event loop and the deadline's
+timer stay alive. The job is timed out on time and the worker moves on; what
+the deadline cannot do is stop the thread, which runs to completion in the
+background with its result discarded. See `docs/OPERATIONS.md`.
 
 ---
 
@@ -362,11 +379,14 @@ step the old attempts completed.
 10. **A per-step budget never outlives the job's deadline**, and only the
     tighter of the two is ever armed — a blown step budget is a step failure
     on the ordinary retry path, not a job verdict.
+11. **A job's in-process ceiling is its configured timeout, once**, whatever
+    shape its `run()` takes.
 
 These are enforced by tests, not just asserted here: see
 `tests/test_dxe_primitives.py`, `tests/test_dxe_transactions.py`,
-`tests/test_dxe_step_timeouts.py`, `tests/test_dxe_faults.py`,
-`tests/test_dxe_concurrency.py`, and `tests/test_invariants.py`.
+`tests/test_dxe_step_timeouts.py`, `tests/test_job_timeout_ceiling.py`,
+`tests/test_dxe_faults.py`, `tests/test_dxe_concurrency.py`, and
+`tests/test_invariants.py`.
 
 The at-least-once/exactly-once distinction in particular is proved by fault
 injection rather than argued: `test_kill_between_the_write_and_the_checkpoint`

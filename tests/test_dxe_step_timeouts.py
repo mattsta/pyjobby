@@ -141,6 +141,27 @@ class LooseBudgetJob(Job):
         await asyncio.sleep(30)
 
 
+class HandsOffToTheJobDeadlineJob(Job):
+    """A step inside its budget, then one the job has no room left for.
+
+    ``first`` runs under the armed 1.5s class budget with the job's 2s
+    deadline still 2s away. By the time ``second`` starts, the job has ~1s
+    left — tighter than the budget — so nothing is armed for it and the
+    job's own deadline is what fires.
+    """
+
+    step_timeout: ClassVar[float] = 1.5
+
+    async def task(self) -> str:
+        await self.step("first", self._nap, 1.0)
+        await self.step("second", self._nap, 30)
+        return "unreachable"
+
+    async def _nap(self, nap: float) -> dict[str, float]:
+        await asyncio.sleep(nap)
+        return {"napped": nap}
+
+
 class OwnTimeoutJob(Job):
     """A step that raises a ``TimeoutError`` of its own, well inside budget."""
 
@@ -514,6 +535,49 @@ async def test_the_job_deadline_still_fires_under_a_looser_step_budget(
 
     # the whole task was cancelled, so no step got to record anything
     assert await steps_of(db_pool, job_id) == []
+
+
+async def test_the_job_deadline_fires_inside_a_step_it_left_unarmed(
+    live_worker, unique_queue, db_pool
+):
+    """The handover: the job's one deadline reaches *into* a running step.
+
+    The job-level timeout is a single ``asyncio.timeout`` around the whole
+    execution, so it fires wherever the job happens to be — including inside
+    ``step()``. Two things have to hold when it does. The completed prefix
+    stays recorded, so the retry path still fast-forwards it. And the step it
+    interrupted records *nothing*: the cancellation is not a step failure, and
+    inventing a checkpoint for it would claim the step was tried and failed
+    when the job simply ran out of time around it.
+
+    The step that gets interrupted is always one the composition rule left
+    unarmed (a budget is installed only while it is strictly tighter than the
+    job's remaining time), which is why the two bounds cannot both report this
+    single overrun.
+    """
+    await live_worker()
+
+    job_id = await enqueue(
+        db_pool,
+        unique_queue,
+        "tests.test_dxe_step_timeouts.HandsOffToTheJobDeadlineJob",
+        {},
+        {
+            "max_retries": 5,
+            "initial_retry_delay": 0,
+            "timeout_seconds": 2,
+            "on_timeout": "fail",
+        },
+    )
+
+    row = await wait_for_job_state(db_pool, job_id, ("crashed",), timeout=20)
+    assert row["error_message"] == "Job timed out after 2s"
+    assert row["error_count"] == 1  # on_timeout=fail: terminal on attempt 1
+
+    # the prefix survives; the interrupted step recorded nothing at all
+    assert await steps_of(db_pool, job_id) == [
+        (1, "first", {"napped": 1.0}, None, 1),
+    ]
 
 
 # ============================================================================
