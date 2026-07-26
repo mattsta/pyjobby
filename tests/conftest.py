@@ -575,7 +575,6 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "slow: slow running tests")
     config.addinivalue_line("markers", "integration: integration tests")
     config.addinivalue_line("markers", "concurrency: concurrency tests")
-    config.addinivalue_line("markers", "performance: performance benchmarks")
     config.addinivalue_line("markers", "e2e: end-to-end producer/consumer tests")
     config.addinivalue_line(
         "markers", "hypothesis: property-based tests using Hypothesis"

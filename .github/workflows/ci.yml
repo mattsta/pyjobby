@@ -66,6 +66,9 @@ jobs:
             --cov-report=term-missing:skip-covered \
             --cov-report=xml
 
+      - name: Query plans (the gate that catches a lost index)
+        run: uv run pj-bench --dsn "$PYJOBBY_TEST_DSN" plans --force
+
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v4

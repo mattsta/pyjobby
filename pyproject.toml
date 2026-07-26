@@ -62,6 +62,15 @@ addopts = [
     "-ra",
     "--strict-markers",
     "--strict-config",
+    # Throughput assertions cannot share a machine with the rest of the
+    # suite. Run under `-n 4`, they measure the contention between xdist
+    # workers rather than the code -- the notify-gate benchmark reported
+    # 1.24x for a change that measures 2.63x on an idle box. A performance
+    # test that fails because the machine is busy trains everyone to ignore
+    # performance tests. Run them deliberately, alone:
+    #     poetry run pytest -m performance -p no:xdist
+    "-m",
+    "not performance",
 ]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
@@ -69,6 +78,7 @@ markers = [
     "concurrency: marks tests as concurrency tests",
     "stress: marks tests as stress tests (high load scenarios)",
     "hypothesis: marks tests as property-based tests using Hypothesis",
+    "performance: throughput measurements; excluded by default, see addopts",
 ]
 timeout = 300
 filterwarnings = [
