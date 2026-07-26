@@ -4,10 +4,14 @@ Reference workload throughout: **1,000,000 jobs/hour** — about 278/second
 sustained. Every number below was measured on this schema, not estimated. Where
 something is a projection from a smaller measurement, it says so.
 
-The short version: write throughput has **~43× headroom** at this target, but
-less than a naive benchmark suggests, and the limit is `NOTIFY` rather than the
-writes themselves. What breaks first is everything that has to read or retain
-the *accumulated* table.
+The short version: write throughput has **~125× headroom** at this target
+(34,671 jobs/s measured in production shape). It used to be ~43×, and the
+difference was `NOTIFY` — see [Why NOTIFY set the
+ceiling](#why-notify-set-the-ceiling), which is worth reading before tuning
+anything, because the fix is the opposite of the obvious one.
+
+What breaks first is now unambiguously everything that has to read or retain
+the *accumulated* table, not the writes.
 
 Every number here is reproducible with `pj-bench` — see [Reproducing
 these numbers](#reproducing-these-numbers). They are not hand-measurements.
@@ -20,7 +24,7 @@ these numbers](#reproducing-these-numbers). They are not hand-measurements.
 |---|---|---|
 | `jorb` row writes (insert + claim + run + terminal) | 4 | ~1,100 writes/s |
 | `jorb_history` rows (trigger, one per transition) | 4 | ~1,100 inserts/s, **96M rows/day** |
-| Notifications emitted | 5 | **~1,390/s** |
+| Notifications emitted | **0** unobserved, 1–2 observed | ~0/s (was ~1,390/s) |
 | `jorb_step` rows | 1 per `step()` call | workload-dependent |
 
 ### Measuring enqueue honestly
@@ -32,17 +36,21 @@ transaction**, and many clients do so **concurrently**.
 ```
 one bulk transaction, 20k rows                     68,105 rows/s   ← misleading
 serial, one transaction per job                     5,979 jobs/s
-16 concurrent connections, one transaction each    11,326 jobs/s   ← production shape
+16 concurrent connections, one transaction each    34,671 jobs/s   ← production shape
 ```
 
 The bulk number is the one a careless benchmark reports, and it is meaningless:
 a single transaction pays the per-commit costs **once**, amortised across 20,000
-rows.
+rows. It barely moved when the real ceiling was lifted, which is the clearest
+proof that it was measuring the wrong thing all along.
 
-Against a 278/s requirement, 11,326/s is **~43× headroom** — comfortable, but
-not the 240× the bulk figure implies.
+Against a 278/s requirement, 34,671/s is **~125× headroom**.
 
-### Why NOTIFY sets the ceiling
+That figure was **11,326/s** before the notification work below — so the same
+benchmark, on the same schema, reported a third of the truth while a single
+`NOTIFY` remained on the commit path.
+
+### Why NOTIFY set the ceiling
 
 Committing a transaction that calls `NOTIFY` requires Postgres to take a
 **global exclusive lock**, held until the commit completes and reaches disk.
@@ -178,16 +186,19 @@ The queue drains only as fast as the **slowest connected listener**. So a single
 wedged dashboard that stops reading fills it, and an observability client takes
 down job processing. Everything is fine until it is a total outage.
 
-At 1,390 notifications/second there is no margin for a slow consumer, so this is
-monitored (`notify_queue_usage` metric, and a `doctor` check that WARNs well
-before the cliff) rather than assumed away.
+This is far less pressing than it was: at ~1,390 notifications/second there was
+no margin for a slow consumer at all, and an unobserved job now emits none. But
+the cliff is a property of Postgres, not of pyjobby, and one wedged listener on
+a busy install can still reach it — so it stays monitored (`notify_queue_usage`
+metric, and a `doctor` check that WARNs well before the edge) rather than
+assumed away.
 
 The three notifications per job that used to be `job_state_change` — an
 unfiltered per-transition firehose, no queue filter, broadcast to every
 listener — are gone. No consumer could use ~830 messages/second of individual
 state transitions, and a dashboard wants aggregates, so the channel was deleted
 and the dashboard now polls (see [Why NOTIFY sets the
-ceiling](#why-notify-sets-the-ceiling)).
+ceiling](#why-notify-set-the-ceiling)).
 
 What remains is gated on demand, which means the notification rate now scales
 with how many consumers are actually parked rather than with job throughput:
@@ -269,12 +280,20 @@ window than the job row. See [DXE.md](DXE.md#retention).
 
 1. Set `--retention-days` deliberately. It is on by default; the default is
    unlikely to match your storage budget.
-2. Tune autovacuum for `jorb` and `jorb_history` per table.
-3. Decide about the transition firehose. If nothing consumes individual
-   transitions, disable that trigger.
-4. Alert on `notify_queue_usage`, backlog age (not depth), and completions/sec
-   versus arrivals/sec. Those three catch almost everything.
-5. Watch that retention reports "caught up" rather than "out of budget".
+2. Autovacuum is already tuned per table in the schema — verify it survived if
+   you have customised `jorb`.
+3. Alert on `notify_queue_usage`, backlog age (**not** depth), and
+   completions/sec versus arrivals/sec. Those three catch almost everything.
+4. Watch that retention reports "caught up" rather than "out of budget".
+5. Run `pj-bench plans` in CI. It is the only item here that catches a problem
+   *before* it reaches production.
+
+Nothing on this list asks you to disable a notification channel. That used to
+be step 3, and it was wrong: the channels that remain are gated on demand, so
+they cost nothing when nobody is waiting, and the one that could not be gated
+is gone. If you find yourself reaching for `ALTER TABLE ... DISABLE TRIGGER`,
+measure with `pj-bench notify` first — the answer for an unobserved job should
+be zero.
 
 ---
 
