@@ -44,7 +44,7 @@ import click
 from aiohttp import web
 from loguru import logger
 
-from . import db
+from . import db, dxe
 from .configloader import load_config_from_file
 
 fmt = (
@@ -237,6 +237,13 @@ STMTS["enqueue-next-self-finished"] = """ UPDATE jorb
                 FOR UPDATE SKIP LOCKED
             )
             RETURNING *"""
+
+# DXE primitives (see pyjobby/dxe.py for semantics)
+STMTS["load-steps"] = dxe.LOAD_STEPS_SQL
+STMTS["record-step"] = dxe.RECORD_STEP_SQL
+STMTS["set-event"] = dxe.SET_EVENT_SQL
+STMTS["send"] = dxe.SEND_SQL
+STMTS["recv"] = dxe.RECV_SQL
 
 # Worker registry (executed on the heartbeat connection, not prepared).
 WORKER_REGISTER_SQL = """INSERT INTO jorb_worker
@@ -579,6 +586,11 @@ class JobSystem:
 
             klass = self.classForKlassFromName(job["job_class"], job=job)
 
+            # DXE: bind previously recorded checkpoints so completed steps
+            # fast-forward instead of re-executing on this attempt
+            checkpoints = await self.ex("load-steps", jid)
+            klass._dxe_bind(checkpoints, epoch)
+
             # timeout: admin_data override > class attribute > worker default
             job_timeout = admin_data.get("timeout_seconds")
             if job_timeout is None:
@@ -606,6 +618,17 @@ class JobSystem:
                 result = None
             await self.ex("finished", jid, result, epoch)
             await self._wake_dependents(job)
+
+        except dxe.DurableSleep as sleep:
+            # the job checkpointed a sleep and rescheduled itself; nothing
+            # terminal to record — it resumes past this point when claimed
+            # again after wake_at
+            logger.info(f"[job {jid}] Durable sleep until {sleep.wake_at}")
+
+        except dxe.StaleExecutionError:
+            # a newer attempt owns the row (monitor/operator requeue while
+            # we ran); abandon quietly — our writes were fenced out anyway
+            logger.warning(f"[job {jid}] Superseded mid-run; abandoning stale attempt")
 
         except asyncio.CancelledError:
             if not self._cancel_current:
@@ -751,8 +774,19 @@ class JobSystem:
 class Job:
     """Parent class of all jobs run by JobSystem.
 
-    User jobs subclass Job and override the task() method to
-    run operations as needed."""
+    User jobs subclass Job and override the task() method. Inside task()
+    the DXE (Durable Execution Engine) primitives are available:
+
+        await self.step("name", fn, *args)   # checkpointed: never re-runs
+                                             # once succeeded, even across
+                                             # retries and worker crashes
+        await self.sleep(3600)               # durable sleep: survives
+                                             # restarts, resumes past here
+        await self.set_event("progress", {"pct": 50})   # publish to waiters
+        await self.send(other_job_id, {"go": True})     # durable message
+        msg = await self.recv(timeout=60)               # await a message
+        if self.cancelled: ...               # cooperative cancel check
+    """
 
     s: JobSystem
     job: dict[str, Any]
@@ -771,6 +805,206 @@ class Job:
 
         Subclasses can override 'run' if it needs to be async."""
         return self.task(**self.job["kwargs"])
+
+    # ------------------------------------------------------------------
+    # DXE: durable execution primitives
+    # ------------------------------------------------------------------
+
+    def _dxe_bind(self, checkpoints: list[Any], epoch: int) -> None:
+        """Called by the worker before execution: attach recorded
+        checkpoints and this attempt's fencing epoch."""
+        self._dxe_steps: dict[int, Any] = {row["step_seq"]: row for row in checkpoints}
+        self._dxe_seq: int = 0
+        self._dxe_epoch: int = epoch
+
+    def _dxe_next_seq(self) -> int:
+        if not hasattr(self, "_dxe_seq"):
+            # constructed outside the worker (tests, direct use): bind empty
+            self._dxe_bind([], self.job.get("run_epoch", 0))
+        self._dxe_seq += 1
+        return self._dxe_seq
+
+    @property
+    def cancelled(self) -> bool:
+        """True once cancellation of this job has been requested (poll this
+        from long sync loops; async code is cancelled at await points)."""
+        return bool(getattr(self.s, "_cancel_current", False))
+
+    async def step(self, name: str, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        """Execute ``fn(*args, **kwargs)`` as a durable, checkpointed step.
+
+        On success the return value (must be JSON-serializable) is recorded;
+        any later attempt of this job returns the recorded value without
+        re-executing. On failure the error is recorded for observability
+        and the exception propagates into the job's normal retry path — the
+        next attempt fast-forwards every completed step and re-executes
+        only from the failure onward.
+        """
+        seq = self._dxe_next_seq()
+        prior = self._dxe_steps.get(seq)
+        if prior is not None:
+            if prior["name"] != name:
+                raise dxe.NondeterminismError(
+                    f"step {seq} was '{prior['name']}' on a previous attempt "
+                    f"but is '{name}' now — job code must be deterministic "
+                    f"outside steps"
+                )
+            if prior["error"] is None:
+                logger.debug(f"[job {self.job['id']}] step {seq} '{name}' replayed")
+                return prior["output"]
+            # recorded failure: fall through and re-execute this step
+
+        started = db.utcnow()
+        try:
+            result = fn(*args, **kwargs)
+            if asyncio.iscoroutine(result):
+                result = await result
+        except dxe.DXEError:
+            raise
+        except Exception as e:
+            recorded = await self.s.ex(
+                "record-step",
+                self.job["id"],
+                seq,
+                name,
+                None,
+                f"{type(e).__name__}: {e}",
+                self._dxe_epoch,
+                started,
+            )
+            if not recorded:
+                raise dxe.StaleExecutionError(
+                    f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
+                ) from e
+            raise
+
+        recorded = await self.s.ex(
+            "record-step",
+            self.job["id"],
+            seq,
+            name,
+            result,
+            None,
+            self._dxe_epoch,
+            started,
+        )
+        if not recorded:
+            raise dxe.StaleExecutionError(
+                f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
+            )
+        return result
+
+    async def sleep(self, seconds: float) -> None:
+        """Durable sleep: checkpoint a wake time, reschedule this job for
+        it, and unwind. When the job is claimed again after the wake time,
+        execution fast-forwards straight past this sleep.
+
+        Survives worker restarts and host failures — the sleep lives in the
+        database, not in a process."""
+        seq = self._dxe_next_seq()
+        prior = self._dxe_steps.get(seq)
+        name = "dxe.sleep"
+
+        if prior is not None:
+            if prior["name"] != name:
+                raise dxe.NondeterminismError(
+                    f"step {seq} was '{prior['name']}' on a previous attempt "
+                    f"but is a sleep now"
+                )
+            wake_at = datetime.datetime.fromisoformat(prior["output"]["wake_at"])
+            remaining = (wake_at - db.utcnow()).total_seconds()
+            if remaining <= 0:
+                return  # slept enough on a previous attempt; continue
+            # woken early (operator requeue): go back to sleep for the rest
+            await self.s.ex(
+                "reschedule", self.job["id"], datetime.timedelta(seconds=remaining)
+            )
+            raise dxe.DurableSleep(wake_at)
+
+        wake_at = db.utcnow() + datetime.timedelta(seconds=seconds)
+        recorded = await self.s.ex(
+            "record-step",
+            self.job["id"],
+            seq,
+            name,
+            {"wake_at": wake_at.isoformat()},
+            None,
+            self._dxe_epoch,
+            db.utcnow(),
+        )
+        if not recorded:
+            raise dxe.StaleExecutionError(
+                f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
+            )
+        await self.s.ex(
+            "reschedule", self.job["id"], datetime.timedelta(seconds=seconds)
+        )
+        raise dxe.DurableSleep(wake_at)
+
+    async def set_event(self, key: str, value: Any) -> None:
+        """Publish a key/value event on this job (idempotent upsert).
+        Clients and other jobs read it with get_event; waiters are woken
+        via NOTIFY."""
+        await self.s.ex("set-event", self.job["id"], key, value)
+
+    async def send(self, dest_job_id: int, message: Any, topic: str | None = None) -> None:
+        """Send a durable message to another job's mailbox — exactly once
+        across retries (the send is a checkpointed step)."""
+
+        async def _do_send() -> int | None:
+            rows = await self.s.ex("send", dest_job_id, topic, message)
+            return rows[0]["id"] if rows else None
+
+        await self.step(f"dxe.send:{dest_job_id}:{topic or ''}", _do_send)
+
+    async def recv(
+        self,
+        topic: str | None = None,
+        timeout: float = 60,
+        poll_interval: float = 0.25,
+    ) -> Any | None:
+        """Await one durable message for this job (oldest first), or None on
+        timeout. The consumed message is checkpointed, so a retry of this
+        job sees the same message again instead of consuming a second one."""
+        seq = self._dxe_next_seq()
+        prior = self._dxe_steps.get(seq)
+        name = f"dxe.recv:{topic or ''}"
+
+        if prior is not None:
+            if prior["name"] != name:
+                raise dxe.NondeterminismError(
+                    f"step {seq} was '{prior['name']}' on a previous attempt "
+                    f"but is a recv now"
+                )
+            if prior["error"] is None:
+                return prior["output"]
+
+        deadline = db.utcnow() + datetime.timedelta(seconds=timeout)
+        message: Any | None = None
+        while True:
+            rows = await self.s.ex("recv", self.job["id"], topic)
+            if rows:
+                message = rows[0]["message"]
+                break
+            if db.utcnow() >= deadline:
+                break
+            await asyncio.sleep(poll_interval)
+
+        recorded = await self.s.ex(
+            "record-step",
+            self.job["id"],
+            seq,
+            name,
+            message,
+            None,
+            self._dxe_epoch,
+            db.utcnow(),
+        )
+        if not recorded:
+            raise dxe.StaleExecutionError(
+                f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
+            )
+        return message
 
     async def rescheduleBackoff(
         self,

@@ -131,12 +131,16 @@ async def _cleanup_database(db_params: dict[str, str]) -> None:
     """
     conn = await asyncpg.connect(**db_params)
     try:
-        # Delete in correct order to respect foreign keys
+        # Delete in correct order to respect foreign keys.
+        # (jorb_step / jorb_event / jorb_mailbox cascade from jorb.)
         await conn.execute("DELETE FROM jorb_schedule_log")
         await conn.execute("DELETE FROM jorb_dependencies")
         await conn.execute("DELETE FROM jorb_dag")
         await conn.execute("DELETE FROM jorb_schedule")
         await conn.execute("DELETE FROM jorb")
+        await conn.execute("DELETE FROM jorb_history")
+        await conn.execute("DELETE FROM jorb_worker")
+        await conn.execute("DELETE FROM jorb_queue")
     finally:
         await conn.close()
 
@@ -287,8 +291,6 @@ def worker_params(unique_queue: str) -> dict:
         "prio": 1000,
         "max_retries": 10,
         "default_timeout": 3600,
-        "enable_recovery": True,
-        "recovery_timeout": 300,
     }
 
 
@@ -398,8 +400,6 @@ async def create_isolated_job_system(db_params: dict[str, str], db_pool: asyncpg
             webPort=None,
             max_retries=kwargs.get("max_retries", 10),
             default_timeout=kwargs.get("default_timeout", 3600),
-            recovery_timeout=kwargs.get("recovery_timeout", 300),
-            enable_recovery=kwargs.get("enable_recovery", True),
         )
 
         # Connect and prepare statements
@@ -420,6 +420,80 @@ async def create_isolated_job_system(db_params: dict[str, str], db_pool: asyncpg
         system.stop = True
         if system.cxn and not system.cxn.is_closed():
             await system.cxn.close()
+
+
+# ============================================================================
+# Live Worker Fixture (DXE)
+# ============================================================================
+
+
+@pytest_asyncio.fixture
+async def live_worker(db_params: dict[str, str], unique_queue: str):
+    """A fully running JobSystem worker on this test's unique queue.
+
+    Runs the REAL worker loop (registry, heartbeat, LISTEN wakeups, DXE
+    checkpoint binding) as an asyncio task inside the test process. Yields
+    a factory so tests needing several workers can start more on the same
+    queue; all workers stop and deregister at teardown.
+
+    Usage:
+        async def test_x(live_worker, unique_queue, db_connection):
+            worker = await live_worker()          # first worker
+            other = await live_worker()           # optional second worker
+    """
+    from pyjobby.pj import JobSystem
+
+    started: list[tuple[JobSystem, asyncio.Task]] = []
+
+    async def _start(**overrides) -> JobSystem:
+        params: dict = {
+            "qname": unique_queue,
+            "capabilities": ("test",),
+            "workerId": len(started),
+            "checkInterval": 0.2,
+        }
+        params.update(overrides)
+        system = JobSystem(dsn=db_params, **params)
+        task = asyncio.create_task(system.run())
+        started.append((system, task))
+        # give the worker a beat to connect, register, and LISTEN
+        await asyncio.sleep(0.4)
+        return system
+
+    yield _start
+
+    for system, task in started:
+        system.stop = True
+    for system, task in started:
+        try:
+            await asyncio.wait_for(task, timeout=5)
+        except (TimeoutError, asyncio.CancelledError):
+            task.cancel()
+
+
+async def wait_for_job_state(
+    conn: asyncpg.Connection,
+    job_id: int,
+    states: tuple[str, ...],
+    timeout: float = 10.0,
+    interval: float = 0.1,
+):
+    """Poll until the job reaches one of `states`; returns the full row.
+
+    Reusable helper for any test that drives real workers."""
+    import time as _time
+
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        row = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+        if row and row["state"] in states:
+            return row
+        await asyncio.sleep(interval)
+    row = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+    raise AssertionError(
+        f"job {job_id} never reached {states} within {timeout}s "
+        f"(state: {row['state'] if row else 'MISSING'})"
+    )
 
 
 # ============================================================================
