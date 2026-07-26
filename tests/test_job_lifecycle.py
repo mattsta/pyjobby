@@ -247,6 +247,11 @@ class TestRetryMechanism:
         retry_ids = []
 
         for i in range(5):
+            # follow the real lifecycle: only crashed jobs can be retried
+            # (the shared retry statement is state-guarded)
+            await db_connection.execute(
+                "UPDATE jorb SET state = 'crashed' WHERE id = $1", current_id
+            )
             result = await db_connection.fetchrow(
                 STMTS["create-retry"], current_id, timedelta(minutes=(i + 1) * 5), i + 1
             )

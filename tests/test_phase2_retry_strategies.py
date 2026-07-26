@@ -275,7 +275,7 @@ class TestRetryStrategiesIntegration:
             )
             SELECT
                 job_class, kwargs, queue, admin_data, 'queued', $2,
-                NOW() + $3::interval
+                TIMEZONE('utc', clock_timestamp()) + $3::interval
             FROM jorb
             WHERE id = $1
             RETURNING id

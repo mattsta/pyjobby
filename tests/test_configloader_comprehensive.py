@@ -41,7 +41,8 @@ class TestChdirAddpath:
             chdir_addpath(str(test_dir))
 
             # Verify directory changed
-            assert os.getcwd() == str(test_dir)
+            # (realpath: macOS tempdirs live behind the /var symlink)
+            assert os.path.realpath(os.getcwd()) == os.path.realpath(str(test_dir))
 
             # Verify path added to sys.path
             assert str(test_dir) in sys.path
@@ -127,11 +128,10 @@ VALID_VAR = "test"
 this is invalid python syntax!!!
 """)
 
-        # Should call sys.exit(1) on syntax error
-        with pytest.raises(SystemExit) as exc_info:
+        # Should raise ConfigError (a RuntimeError) on syntax error;
+        # library code must never sys.exit()
+        with pytest.raises(RuntimeError, match="Failed to read config file"):
             get_config_from_filename(str(config_file))
-
-        assert exc_info.value.code == 1
 
 
 # =============================================================================

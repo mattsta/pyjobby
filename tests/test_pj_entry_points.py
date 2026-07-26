@@ -9,6 +9,7 @@ Coverage Target: Cover lines 319-322, 349-356, 362-364, 496-501, 813-832, 910-98
 
 import asyncio
 import contextlib
+import subprocess
 import os
 import signal
 import sys
@@ -24,6 +25,32 @@ from pyjobby.pj import STMTS, Job, JobSystem, workit
 # ============================================================================
 # Test runAndDone Function - covers lines 813-832
 # ============================================================================
+
+
+
+def run_workit_briefly(args: list[str], cwd: str, timeout: float = 2) -> None:
+    """Launch `python -m pyjobby.pj <args>` in its own process group and kill
+    the WHOLE group after `timeout`.
+
+    subprocess.run(timeout=...) only kills the direct child; the workit
+    launcher's multiprocessing worker children would leak and keep claiming
+    jobs from later tests. A process-group kill reaps every descendant."""
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "pyjobby.pj", *args],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        cwd=cwd,
+        start_new_session=True,
+    )
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pass  # expected - we only exercise startup
+    finally:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
 
 
 class TestRunAndDoneFunction:
@@ -666,7 +693,6 @@ class TestWorkitCLIWithConfig:
     def test_workit_loads_config_and_exits_quickly(self):
         """Test workit loads config successfully - covers lines 920-941."""
         import os
-        import subprocess
 
         # Get path to config file
         config_path = os.path.join(
@@ -675,24 +701,15 @@ class TestWorkitCLIWithConfig:
 
         # Run workit with a very short timeout to just test config loading
         # Use --workers=1 for minimal spawning
-        try:
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "pyjobby.pj",
-                    "--config",
-                    config_path,
-                    "--workers",
-                    "1",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=2,
-                cwd=os.path.dirname(os.path.dirname(__file__)),
-            )
-        except subprocess.TimeoutExpired:
-            pass  # Expected - we just want to test startup
+        run_workit_briefly(
+            [
+                "--config",
+                config_path,
+                "--workers",
+                "1",
+            ],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+        )
 
         # Process will be killed by timeout, which is expected
         # We just want to verify it starts correctly
@@ -700,130 +717,91 @@ class TestWorkitCLIWithConfig:
     def test_workit_with_multiple_queues(self):
         """Test workit with multiple queue options - covers queue padding logic."""
         import os
-        import subprocess
 
         config_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "pyjobby.conf.py"
         )
 
         # Run with multiple queues
-        try:
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "pyjobby.pj",
-                    "--config",
-                    config_path,
-                    "--queue",
-                    "high",
-                    "--queue",
-                    "low",
-                    "--workers",
-                    "3",
-                ],  # More workers than queues to test padding
-                capture_output=True,
-                text=True,
-                timeout=2,
-                cwd=os.path.dirname(os.path.dirname(__file__)),
-            )
-        except subprocess.TimeoutExpired:
-            pass  # Expected - we just want to test startup
+        # (more workers than queues to test padding)
+        run_workit_briefly(
+            [
+                "--config",
+                config_path,
+                "--queue",
+                "high",
+                "--queue",
+                "low",
+                "--workers",
+                "3",
+            ],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+        )
 
     def test_workit_with_capabilities(self):
         """Test workit with capability options."""
         import os
-        import subprocess
 
         config_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "pyjobby.conf.py"
         )
 
         # Run with capabilities
-        try:
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "pyjobby.pj",
-                    "--config",
-                    config_path,
-                    "--cap",
-                    "gpu",
-                    "--cap",
-                    "memory-16g",
-                    "--workers",
-                    "1",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=2,
-                cwd=os.path.dirname(os.path.dirname(__file__)),
-            )
-        except subprocess.TimeoutExpired:
-            pass  # Expected
+        run_workit_briefly(
+            [
+                "--config",
+                config_path,
+                "--cap",
+                "gpu",
+                "--cap",
+                "memory-16g",
+                "--workers",
+                "1",
+            ],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+        )
 
     def test_workit_with_path_option(self):
         """Test workit with path option - covers line 939-941."""
         import os
-        import subprocess
 
         config_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "pyjobby.conf.py"
         )
 
         # Run with extra paths
-        try:
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "pyjobby.pj",
-                    "--config",
-                    config_path,
-                    "--path",
-                    "/tmp",
-                    "--path",
-                    "/var",
-                    "--workers",
-                    "1",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=2,
-                cwd=os.path.dirname(os.path.dirname(__file__)),
-            )
-        except subprocess.TimeoutExpired:
-            pass  # Expected
+        run_workit_briefly(
+            [
+                "--config",
+                config_path,
+                "--path",
+                "/tmp",
+                "--path",
+                "/var",
+                "--workers",
+                "1",
+            ],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+        )
 
     def test_workit_no_recovery_flag_passed(self):
         """Test workit with --no-recovery flag - covers line 957."""
         import os
-        import subprocess
 
         config_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "pyjobby.conf.py"
         )
 
-        try:
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "pyjobby.pj",
-                    "--config",
-                    config_path,
-                    "--no-recovery",
-                    "--workers",
-                    "1",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=2,
-                cwd=os.path.dirname(os.path.dirname(__file__)),
-            )
-        except subprocess.TimeoutExpired:
-            pass  # Expected
+        run_workit_briefly(
+            [
+                "--config",
+                config_path,
+                "--no-recovery",
+                "--workers",
+                "1",
+            ],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+        )
 
 
 # ============================================================================

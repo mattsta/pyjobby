@@ -636,7 +636,9 @@ class TestAdvancedClientFeatures:
     async def test_scheduled_job_execution(self, db_pool, job_client):
         """Test: Scheduled job runs at specified time."""
         # PRODUCER: Schedule job for future
-        future_time = datetime.now() + timedelta(seconds=2)
+        future_time = datetime.now(UTC).replace(tzinfo=None) + timedelta(
+            seconds=2
+        )
         job_id = await job_client.enqueue(
             "tests.test_client_worker_integration.SimpleTestJob",
             run_after=future_time,

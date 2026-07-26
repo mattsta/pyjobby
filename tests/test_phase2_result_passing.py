@@ -205,7 +205,7 @@ class TestResultPassing:
         await db_connection.execute(
             """
             UPDATE jorb
-            SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1))
+            SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1::jsonb))
             WHERE id = $2
         """,
             job1["result"],
@@ -235,7 +235,7 @@ class TestResultPassing:
         await db_connection.execute(
             """
             UPDATE jorb
-            SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1))
+            SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1::jsonb))
             WHERE id = $2
         """,
             job2["result"],
@@ -339,7 +339,7 @@ class TestPipelinePatterns:
         await db_connection.execute(
             """
             UPDATE jorb
-            SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1)),
+            SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1::jsonb)),
                 admin_data = $2
             WHERE id = $3
         """,
@@ -369,7 +369,7 @@ class TestPipelinePatterns:
         await db_connection.execute(
             """
             UPDATE jorb
-            SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1))
+            SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1::jsonb))
             WHERE id = $2
         """,
             process_job["result"],
@@ -409,7 +409,7 @@ class TestPipelinePatterns:
             await db_connection.execute(
                 """
                 UPDATE jorb
-                SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1))
+                SET kwargs = jsonb_set(kwargs, '{upstream_result}', to_jsonb($1::jsonb))
                 WHERE id = $2
             """,
                 upstream["result"],

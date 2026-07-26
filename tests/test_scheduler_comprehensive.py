@@ -13,7 +13,7 @@ Tests all aspects of recurring job scheduling:
 
 import contextlib
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
@@ -332,7 +332,7 @@ class TestScheduleSafetyManager:
                 100,
                 10,
                 5,
-                datetime.utcnow(),
+                datetime.now(UTC),
             )
             return schedule_id
 
@@ -624,7 +624,7 @@ class TestSchedulerWorker:
                 "future-schedule",
                 "test.Job",
                 "* * * * *",
-                datetime.utcnow() + timedelta(hours=1),
+                datetime.now(UTC) + timedelta(hours=1),
                 True,
             )
 
@@ -646,7 +646,7 @@ class TestSchedulerWorker:
                 "due-schedule",
                 "test.Job",
                 "* * * * *",
-                datetime.utcnow() - timedelta(minutes=1),
+                datetime.now(UTC) - timedelta(minutes=1),
                 True,
             )
 
@@ -669,7 +669,7 @@ class TestSchedulerWorker:
                 "disabled-schedule",
                 "test.Job",
                 "* * * * *",
-                datetime.utcnow() - timedelta(minutes=1),
+                datetime.now(UTC) - timedelta(minutes=1),
                 False,
             )
 
@@ -693,7 +693,7 @@ class TestSchedulerWorker:
                 "test-schedule",
                 "test.TestJob",
                 "* * * * *",
-                datetime.utcnow(),
+                datetime.now(UTC),
                 True,
                 "test_queue",
                 500,
@@ -702,7 +702,7 @@ class TestSchedulerWorker:
 
             schedule_dict = dict(schedule)
 
-        scheduled_time = datetime.utcnow()
+        scheduled_time = datetime.now(UTC)
         job_id = await worker.create_scheduled_job(schedule_dict, scheduled_time)
 
         assert job_id is not None
@@ -732,13 +732,13 @@ class TestSchedulerWorker:
                 "dup-test",
                 "test.Job",
                 "* * * * *",
-                datetime.utcnow(),
+                datetime.now(UTC),
                 True,
             )
 
             schedule_dict = dict(schedule)
 
-        scheduled_time = datetime.utcnow()
+        scheduled_time = datetime.now(UTC)
 
         # Create first job
         job_id1 = await worker.create_scheduled_job(schedule_dict, scheduled_time)
@@ -763,7 +763,7 @@ class TestSchedulerWorker:
                 f"log-test-{uuid.uuid4().hex[:8]}",
                 "test.Job",
                 "* * * * *",
-                datetime.utcnow(),
+                datetime.now(UTC),
                 True,
             )
 
@@ -772,7 +772,7 @@ class TestSchedulerWorker:
         # Create a real job for the log entry
         job_id = await client.enqueue("test.Job")
 
-        scheduled_time = datetime.utcnow()
+        scheduled_time = datetime.now(UTC)
         result = ScheduleExecutionResult(
             result="success",
             job_id=job_id,
@@ -818,7 +818,7 @@ class TestSchedulerWorker:
                 "exec-success",
                 "test.Job",
                 "* * * * *",
-                datetime.utcnow(),
+                datetime.now(UTC),
                 True,
                 10,
                 0,
@@ -849,7 +849,7 @@ class TestSchedulerWorker:
                 "circuit-breaker",
                 "test.Job",
                 "* * * * *",
-                datetime.utcnow(),
+                datetime.now(UTC),
                 True,
                 5,
                 5,
@@ -880,7 +880,7 @@ class TestSchedulerWorker:
                 schedule_name,
                 "test.Job",
                 "* * * * *",
-                datetime.utcnow(),
+                datetime.now(UTC),
                 True,
                 2,
                 5,
@@ -923,7 +923,7 @@ class TestSchedulerWorker:
                 schedule_name,
                 "test.Job",
                 "* * * * *",
-                datetime.utcnow(),
+                datetime.now(UTC),
                 True,
                 queue_name,
                 5,
@@ -971,7 +971,7 @@ class TestSchedulerWorker:
                 "metrics-test",
                 "test.Job",
                 "* * * * *",
-                datetime.utcnow(),
+                datetime.now(UTC),
                 True,
                 5,
             )
@@ -1010,7 +1010,7 @@ class TestSchedulerWorker:
                 "jitter-schedule",
                 "test.Job",
                 "* * * * *",
-                datetime.utcnow(),
+                datetime.now(UTC),
                 True,
                 "default",
                 100,
@@ -1063,7 +1063,7 @@ class TestSchedulerWorker:
                 "duplicate-schedule",
                 "test.Job",
                 "* * * * *",
-                datetime.utcnow(),
+                datetime.now(UTC),
                 True,
                 "default",
                 100,
@@ -1076,7 +1076,7 @@ class TestSchedulerWorker:
 
             # Pre-create a job with the deadline_key that would be generated
             # Deadline key format is: "schedule:{schedule_id}:{date}"
-            scheduled_time = datetime.utcnow()
+            scheduled_time = datetime.now(UTC)
             deadline_key = (
                 f"schedule:{schedule_id}:{scheduled_time.strftime('%Y-%m-%d:%H')}"
             )
@@ -1128,7 +1128,7 @@ class TestSchedulerWorker:
                 "exception-schedule",
                 "test.Job",
                 "* * * * *",
-                datetime.utcnow(),
+                datetime.now(UTC),
                 True,
                 "default",
                 100,
@@ -1195,7 +1195,7 @@ class TestSchedulerIntegration:
                 SET next_run = $1
                 WHERE id = $2
             """,
-                datetime.utcnow() - timedelta(minutes=1),
+                datetime.now(UTC) - timedelta(minutes=1),
                 schedule_id,
             )
 
@@ -1248,7 +1248,7 @@ class TestSchedulerIntegration:
                     SET next_run = $1
                     WHERE id = $2
                 """,
-                    datetime.utcnow() - timedelta(minutes=1),
+                    datetime.now(UTC) - timedelta(minutes=1),
                     schedule_id,
                 )
 
@@ -1326,7 +1326,7 @@ class TestSchedulerEdgeCases:
                 SET next_run = $1
                 WHERE id = $2
             """,
-                datetime.utcnow() - timedelta(minutes=1),
+                datetime.now(UTC) - timedelta(minutes=1),
                 schedule_id,
             )
 
@@ -1400,7 +1400,7 @@ class TestSchedulerMainLoop:
                 SET next_run = $1
                 WHERE id = $2
             """,
-                datetime.utcnow() - timedelta(minutes=1),
+                datetime.now(UTC) - timedelta(minutes=1),
                 schedule_id,
             )
 
@@ -1466,7 +1466,7 @@ class TestSchedulerMainLoop:
                 SET next_run = $1
                 WHERE id = $2
             """,
-                datetime.utcnow() - timedelta(minutes=1),
+                datetime.now(UTC) - timedelta(minutes=1),
                 schedule_id,
             )
 
@@ -1528,7 +1528,7 @@ class TestSchedulerMainLoop:
                     SET next_run = $1
                     WHERE id = $2
                 """,
-                    datetime.utcnow() - timedelta(minutes=1),
+                    datetime.now(UTC) - timedelta(minutes=1),
                     schedule_id,
                 )
 
@@ -1641,7 +1641,7 @@ class TestSchedulerMainLoop:
             )
             await conn.execute(
                 "UPDATE jorb_schedule SET next_run = $1 WHERE id = $2",
-                datetime.utcnow() - timedelta(minutes=1),
+                datetime.now(UTC) - timedelta(minutes=1),
                 success_sched_id,
             )
 
@@ -1654,7 +1654,7 @@ class TestSchedulerMainLoop:
                 UPDATE jorb_schedule SET max_concurrent_jobs = 1, next_run = $1
                 WHERE id = $2
             """,
-                datetime.utcnow() - timedelta(minutes=1),
+                datetime.now(UTC) - timedelta(minutes=1),
                 skip_sched_id,
             )
 
@@ -1678,7 +1678,7 @@ class TestSchedulerMainLoop:
             )
             await conn.execute(
                 "UPDATE jorb_schedule SET next_run = $1 WHERE id = $2",
-                datetime.utcnow() - timedelta(minutes=1),
+                datetime.now(UTC) - timedelta(minutes=1),
                 fail_sched_id,
             )
 
@@ -1687,10 +1687,10 @@ class TestSchedulerMainLoop:
             # Inject failure for the fail-test schedule only
             original_create = worker.create_scheduled_job
 
-            async def selective_failure(schedule, scheduled_time):
+            async def selective_failure(schedule, scheduled_time, **kwargs):
                 if schedule["name"] == "fail-test":
                     raise RuntimeError("Simulated failure for testing")
-                return await original_create(schedule, scheduled_time)
+                return await original_create(schedule, scheduled_time, **kwargs)
 
             monkeypatch.setattr(worker, "create_scheduled_job", selective_failure)
 
@@ -1742,7 +1742,7 @@ class TestSchedulerMainLoop:
             )
             await conn.execute(
                 "UPDATE jorb_schedule SET next_run = $1 WHERE id = $2",
-                datetime.utcnow() - timedelta(minutes=1),
+                datetime.now(UTC) - timedelta(minutes=1),
                 schedule_id,
             )
             schedule = await conn.fetchrow(

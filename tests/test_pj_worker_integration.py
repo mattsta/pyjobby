@@ -152,7 +152,7 @@ class TestJobPollingAndClaiming:
                 DELETE FROM jorb
                 WHERE state = 'queued'
                 AND queue = 'default'
-                AND (run_after IS NULL OR run_after <= NOW())
+                AND (run_after IS NULL OR run_after <= TIMEZONE('utc', clock_timestamp()))
             """)
 
             # Create a job
@@ -180,7 +180,7 @@ class TestJobPollingAndClaiming:
                     SELECT id FROM jorb
                     WHERE state = 'queued'
                     AND queue = ANY($1::text[])
-                    AND (run_after IS NULL OR run_after <= NOW())
+                    AND (run_after IS NULL OR run_after <= TIMEZONE('utc', clock_timestamp()))
                     ORDER BY prio DESC, id ASC
                     LIMIT 1
                     FOR UPDATE SKIP LOCKED
@@ -714,7 +714,7 @@ class TestRunAfterScheduling:
                 DELETE FROM jorb
                 WHERE state = 'queued'
                 AND queue = 'default'
-                AND (run_after IS NULL OR run_after <= NOW())
+                AND (run_after IS NULL OR run_after <= TIMEZONE('utc', clock_timestamp()))
             """)
 
             # Create job with future run_after
@@ -722,7 +722,7 @@ class TestRunAfterScheduling:
                 """
                 INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
                                  run_after)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), NOW() + INTERVAL '1 hour')
+                VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), TIMEZONE('utc', clock_timestamp()) + INTERVAL '1 hour')
                 RETURNING id
             """,
                 "test_pj_worker_integration.SimpleTestJob",
@@ -740,7 +740,7 @@ class TestRunAfterScheduling:
                     SELECT id FROM jorb
                     WHERE state = 'queued'
                     AND queue = 'default'
-                    AND (run_after IS NULL OR run_after <= NOW())
+                    AND (run_after IS NULL OR run_after <= TIMEZONE('utc', clock_timestamp()))
                     ORDER BY prio DESC, id ASC
                     LIMIT 1
                     FOR UPDATE SKIP LOCKED
@@ -763,7 +763,7 @@ class TestRunAfterScheduling:
                 DELETE FROM jorb
                 WHERE state = 'queued'
                 AND queue = 'default'
-                AND (run_after IS NULL OR run_after <= NOW())
+                AND (run_after IS NULL OR run_after <= TIMEZONE('utc', clock_timestamp()))
             """)
 
             # Create job with past run_after
@@ -771,7 +771,7 @@ class TestRunAfterScheduling:
                 """
                 INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
                                  run_after)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), NOW() - INTERVAL '1 second')
+                VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), TIMEZONE('utc', clock_timestamp()) - INTERVAL '1 second')
                 RETURNING id
             """,
                 "test_pj_worker_integration.SimpleTestJob",
@@ -789,7 +789,7 @@ class TestRunAfterScheduling:
                     SELECT id FROM jorb
                     WHERE state = 'queued'
                     AND queue = 'default'
-                    AND (run_after IS NULL OR run_after <= NOW())
+                    AND (run_after IS NULL OR run_after <= TIMEZONE('utc', clock_timestamp()))
                     ORDER BY prio DESC, id ASC
                     LIMIT 1
                     FOR UPDATE SKIP LOCKED

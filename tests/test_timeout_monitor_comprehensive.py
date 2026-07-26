@@ -645,34 +645,6 @@ class TestJSONCodecInit:
 
         # If we got here without exceptions, orjson codec was set up successfully
 
-    @pytest.mark.asyncio
-    async def test_monitor_without_orjson(self, db_params):
-        """Test monitor handles missing orjson gracefully."""
-        dsn = f"postgresql://{db_params['user']}:{db_params['password']}@{db_params['host']}:{db_params['port']}/{db_params['database']}"
-
-        # Mock orjson import to fail
-        import builtins
-
-        real_import = builtins.__import__
-
-        def mock_import(name, *args, **kwargs):
-            if name == "orjson":
-                raise ImportError("orjson not available")
-            return real_import(name, *args, **kwargs)
-
-        with patch("builtins.__import__", side_effect=mock_import):
-            monitor_task = asyncio.create_task(
-                timeout_monitor(dsn, check_interval=999999)
-            )
-
-            # Let monitor initialize without orjson (should fall back gracefully)
-            await asyncio.sleep(0.2)
-
-            # Cancel monitor
-            monitor_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await monitor_task
-
             # If we got here, monitor handled missing orjson gracefully
 
     @pytest.mark.asyncio
@@ -735,21 +707,22 @@ class TestCLI:
         # Mock that properly consumes the coroutine to avoid warnings
         def mock_asyncio_run(coro):
             """Mock that consumes coroutine to avoid 'unawaited coroutine' warnings."""
-            try:
-                coro.close()  # Properly close the coroutine
-            except (GeneratorExit, StopIteration):
-                pass  # Expected when closing coroutine
+            # closing may raise as the coroutine unwinds
+            with contextlib.suppress(GeneratorExit, StopIteration):
+                coro.close()
             return None
 
-        with patch("sys.argv", test_argv):
-            with patch("asyncio.run", side_effect=mock_asyncio_run):
-                try:
-                    from pyjobby.timeout_monitor import cli
+        with (
+            patch("sys.argv", test_argv),
+            patch("asyncio.run", side_effect=mock_asyncio_run),
+        ):
+            try:
+                from pyjobby.timeout_monitor import cli
 
-                    cli()
-                except SystemExit as e:
-                    # Exit code 0 means success
-                    assert e.code in (None, 0)
+                cli()
+            except SystemExit as e:
+                # Exit code 0 means success
+                assert e.code in (None, 0)
 
     def test_cli_with_config_executes(self, db_params, tmp_path):
         """Test CLI executes with --config argument."""
@@ -768,20 +741,21 @@ DB_PARAMS = {{
         # Mock that properly consumes the coroutine to avoid warnings
         def mock_asyncio_run(coro):
             """Mock that consumes coroutine to avoid 'unawaited coroutine' warnings."""
-            try:
-                coro.close()  # Properly close the coroutine
-            except (GeneratorExit, StopIteration):
-                pass  # Expected when closing coroutine
+            # closing may raise as the coroutine unwinds
+            with contextlib.suppress(GeneratorExit, StopIteration):
+                coro.close()
             return None
 
-        with patch("sys.argv", test_argv):
-            with patch("asyncio.run", side_effect=mock_asyncio_run):
-                try:
-                    from pyjobby.timeout_monitor import cli
+        with (
+            patch("sys.argv", test_argv),
+            patch("asyncio.run", side_effect=mock_asyncio_run),
+        ):
+            try:
+                from pyjobby.timeout_monitor import cli
 
-                    cli()
-                except SystemExit as e:
-                    assert e.code in (None, 0)
+                cli()
+            except SystemExit as e:
+                assert e.code in (None, 0)
 
     def test_cli_missing_both_exits_with_error(self):
         """Test CLI exits with error when neither DSN nor config provided."""

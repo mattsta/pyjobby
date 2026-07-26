@@ -14,7 +14,7 @@ All tests use:
 
 import asyncio
 import json
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from hypothesis import HealthCheck, assume, given, settings
@@ -33,8 +33,20 @@ def job_kwargs_strategy(draw):
     """Generate valid job kwargs dictionaries."""
     return {
         "test_id": draw(st.integers(min_value=0, max_value=10000)),
-        "message": draw(st.text(min_size=0, max_size=100)),
-        "value": draw(st.floats(allow_nan=False, allow_infinity=False) | st.integers()),
+        "message": draw(
+            st.text(
+                alphabet=st.characters(
+                    exclude_characters="\x00", exclude_categories=["Cs"]
+                ),
+                min_size=0,
+                max_size=100,
+            )
+        ),
+        "value": draw(
+            st.floats(allow_nan=False, allow_infinity=False)
+            # orjson (and therefore jsonb kwargs) only supports 64-bit ints
+            | st.integers(min_value=-(2**63), max_value=2**63 - 1)
+        ),
         "flag": draw(st.booleans()),
     }
 
@@ -184,7 +196,9 @@ class TestEnqueueProperties:
     @given(delay_seconds=st.integers(min_value=1, max_value=10))
     async def test_enqueue_respects_run_after(self, db_pool, job_client, delay_seconds):
         """Property: Jobs with run_after are not claimable until specified time."""
-        future_time = datetime.now() + timedelta(seconds=delay_seconds)
+        future_time = datetime.now(UTC).replace(tzinfo=None) + timedelta(
+            seconds=delay_seconds
+        )
 
         # PRODUCER: Enqueue job for future
         job_id = await job_client.enqueue(
@@ -201,7 +215,7 @@ class TestEnqueueProperties:
             # Verify job exists but is not ready
             job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
             assert job["state"] == "queued"
-            assert job["run_after"] > datetime.now()
+            assert job["run_after"] > datetime.now(UTC).replace(tzinfo=None)
 
             # Cleanup: Delete job created in this example
             await conn.execute("DELETE FROM jorb WHERE id = $1", job_id)
@@ -602,11 +616,22 @@ class TestResultStorageProperties:
     )
     @given(
         result_data=st.dictionaries(
-            keys=st.text(min_size=1, max_size=20),
+            keys=st.text(
+                alphabet=st.characters(
+                    exclude_characters="\x00", exclude_categories=["Cs"]
+                ),
+                min_size=1,
+                max_size=20,
+            ),
             values=st.one_of(
-                st.integers(),
+                st.integers(min_value=-(2**63), max_value=2**63 - 1),
                 st.floats(allow_nan=False, allow_infinity=False),
-                st.text(max_size=100),
+                st.text(
+                    alphabet=st.characters(
+                        exclude_characters="\x00", exclude_categories=["Cs"]
+                    ),
+                    max_size=100,
+                ),
                 st.booleans(),
             ),
             min_size=1,

@@ -131,7 +131,7 @@ class TestRetryDelayProperties:
         # Remove None values (simulate missing keys)
         admin_data = {k: v for k, v in config_data.items() if v is not None}
 
-        config = get_retry_config(admin_data if admin_data else None)
+        config = get_retry_config(admin_data or None)
 
         # Must have all required keys
         assert "retry_strategy" in config
@@ -261,7 +261,15 @@ class TestDAGProperties:
         # Should not raise
         dag.validate()
 
-    @given(job_class=st.text(min_size=1, max_size=50))
+    @given(
+        job_class=st.text(
+            alphabet=st.characters(
+                exclude_characters="\x00", exclude_categories=["Cs"]
+            ),
+            min_size=1,
+            max_size=50,
+        )
+    )
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
     def test_dag_node_equality_is_by_id(self, job_class):
         """Property: DAG nodes are equal only if they have same node_id."""
@@ -277,7 +285,13 @@ class TestDAGProperties:
     @given(
         common_opts=st.fixed_dictionaries(
             {
-                "queue": st.text(min_size=1, max_size=20),
+                "queue": st.text(
+                    alphabet=st.characters(
+                        exclude_characters="\x00", exclude_categories=["Cs"]
+                    ),
+                    min_size=1,
+                    max_size=20,
+                ),
                 "priority": st.integers(min_value=1, max_value=1000),
             }
         )
@@ -297,7 +311,16 @@ class TestDAGProperties:
 
     @given(
         node_count=st.integers(min_value=1, max_value=20),
-        name=st.one_of(st.none(), st.text(min_size=1, max_size=50)),
+        name=st.one_of(
+            st.none(),
+            st.text(
+                alphabet=st.characters(
+                    exclude_characters="\x00", exclude_categories=["Cs"]
+                ),
+                min_size=1,
+                max_size=50,
+            ),
+        ),
     )
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
     def test_dag_visualize_does_not_crash(self, node_count, name):
@@ -355,12 +378,25 @@ class TestResultStorageProperties:
                 st.booleans(),
                 st.integers(min_value=-1000000, max_value=1000000),
                 st.floats(allow_nan=False, allow_infinity=False),
-                st.text(max_size=100),
+                st.text(
+                    alphabet=st.characters(
+                        exclude_characters="\x00", exclude_categories=["Cs"]
+                    ),
+                    max_size=100,
+                ),
             ),
             lambda children: st.one_of(
                 st.lists(children, max_size=10),
                 st.dictionaries(
-                    st.text(min_size=1, max_size=20), children, max_size=10
+                    st.text(
+                        alphabet=st.characters(
+                            exclude_characters="\x00", exclude_categories=["Cs"]
+                        ),
+                        min_size=1,
+                        max_size=20,
+                    ),
+                    children,
+                    max_size=10,
                 ),
             ),
             max_leaves=20,
@@ -433,7 +469,15 @@ class TestEdgeCases:
         delay = calculate_retry_delay(100, "exponential", 1, max_delay)
         assert delay.total_seconds() <= max_delay * 1.3  # Account for jitter
 
-    @given(strategy=st.text(min_size=1, max_size=50))
+    @given(
+        strategy=st.text(
+            alphabet=st.characters(
+                exclude_characters="\x00", exclude_categories=["Cs"]
+            ),
+            min_size=1,
+            max_size=50,
+        )
+    )
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
     def test_unknown_strategy_does_not_crash(self, strategy):
         """Property: Unknown retry strategy should fall back gracefully."""

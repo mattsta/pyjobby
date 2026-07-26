@@ -12,6 +12,7 @@ This architecture supports concurrent test execution.
 """
 
 import asyncio
+import contextlib
 import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -22,7 +23,7 @@ import pytest
 import pytest_asyncio
 
 # Path to schema file
-SCHEMA_PATH = Path(__file__).parent.parent / "priv" / "schema.sql"
+SCHEMA_PATH = Path(__file__).parent.parent / "pyjobby" / "sql" / "schema.sql"
 
 # Get database connection from environment or use default
 DEFAULT_TEST_DSN = (
@@ -160,39 +161,10 @@ async def ensure_clean_database(request, db_params: dict[str, str]):
         yield
         return
 
-    # Sequential mode: clean database for isolation
-    test_file = str(request.fspath)
-
-    # List of test files that use db_pool (need cleanup)
-    pool_test_files = [
-        "test_concurrency",
-        "test_e2e_producer_consumer",
-        "test_performance_benchmarks",
-        "test_client_worker_integration",
-        "test_client_hypothesis",
-        "test_client_management",
-        "test_dag_comprehensive",
-        "test_scheduler_comprehensive",
-        "test_admin_api_comprehensive",
-        "test_admin_api_new",
-        "test_pj_worker_run_loop",
-        "test_pj_worker_integration",
-        "test_pj_dag_continuation",
-        "test_pj_entry_points",
-        "test_websocket_server",
-        "test_web_admin",
-        "test_timeout_monitor",
-        "test_scheduler",
-        "test_client",
-        "test_dag",
-        "test_retry_strategies",
-    ]
-
-    needs_cleanup = any(pf in test_file for pf in pool_test_files)
-
-    if needs_cleanup:
-        # Clean BEFORE the test runs
-        await _cleanup_database(db_params)
+    # Sequential mode: clean database before every test for isolation.
+    # (DELETEs on empty tables are cheap; an allowlist of "files that need
+    # cleanup" proved fragile — any file left off it inherited leftover rows.)
+    await _cleanup_database(db_params)
 
     yield
     # NOTE: No post-test cleanup - reduces connections by 50%
@@ -205,29 +177,11 @@ async def ensure_clean_database(request, db_params: dict[str, str]):
 
 
 async def _configure_json_codec(conn: asyncpg.Connection) -> None:
-    """Configure orjson codec for JSON/JSONB types."""
-    import orjson
+    """Configure orjson codec for JSON/JSONB types (same codecs production
+    connections get from pyjobby.db)."""
+    from pyjobby.db import register_json_codecs
 
-    def orjson_encoder(obj):
-        return orjson.dumps(obj).decode("utf-8")
-
-    def orjson_decoder(s):
-        return orjson.loads(s)
-
-    await conn.set_type_codec(
-        "json",
-        encoder=orjson_encoder,
-        decoder=orjson_decoder,
-        schema="pg_catalog",
-        format="text",
-    )
-    await conn.set_type_codec(
-        "jsonb",
-        encoder=orjson_encoder,
-        decoder=orjson_decoder,
-        schema="pg_catalog",
-        format="text",
-    )
+    await register_json_codecs(conn)
 
 
 # ============================================================================
@@ -248,10 +202,9 @@ async def db_connection(db_params: dict[str, str]) -> AsyncIterator[asyncpg.Conn
     """
     conn = await asyncpg.connect(**db_params)
 
-    try:
+    # orjson not available -> default JSON codec
+    with contextlib.suppress(ImportError):
         await _configure_json_codec(conn)
-    except ImportError:
-        pass  # orjson not available, use default JSON codec
 
     # Start transaction for test isolation
     transaction = conn.transaction()

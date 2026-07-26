@@ -6,7 +6,7 @@ Using LIVE database operations with NO MOCKS for maximum correctness guarantees!
 import asyncio
 import json
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 from aiohttp import web
@@ -77,16 +77,13 @@ class TestClientConnection:
             ws=ws,
             channels={"jobs", "queues:default"},
             connected_at=1234567890.0,
-            last_action=1234567890.0,
-            action_count=0,
         )
 
         assert conn.ws is None
         assert "jobs" in conn.channels
         assert "queues:default" in conn.channels
         assert conn.connected_at == 1234567890.0
-        assert conn.last_action == 1234567890.0
-        assert conn.action_count == 0
+        assert len(conn.action_times) == 0
         assert conn.uid is None
 
     def test_client_connection_with_uid(self):
@@ -95,8 +92,6 @@ class TestClientConnection:
             ws=None,
             channels=set(),
             connected_at=0.0,
-            last_action=0.0,
-            action_count=0,
             uid=12345,
         )
 
@@ -279,7 +274,7 @@ class TestServerStart:
                     "notify_connection": not server.notify_conn.is_closed()
                     if server.notify_conn
                     else False,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                 }
             )
 
@@ -431,6 +426,111 @@ class TestHandleGetStats:
         # Verify method exists
         assert hasattr(server, "handle_get_stats")
         assert asyncio.iscoroutinefunction(server.handle_get_stats)
+
+
+class FakeWS:
+    """Minimal stand-in for a WebSocketResponse capturing sent events."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send_json(self, event):
+        self.sent.append(event)
+
+
+class TestRateLimiting:
+    """Test sliding-window per-client action rate limiting."""
+
+    @pytest.mark.asyncio
+    async def test_burst_over_limit_rejected(self, db_params):
+        """More than max_actions_per_second in one burst gets rejected."""
+        import time
+
+        server = WebSocketServer(db_params)
+        ws = FakeWS()
+        client = ClientConnection(ws=ws, channels=set(), connected_at=time.time())
+
+        for _ in range(server.max_actions_per_second):
+            await server.handle_message(ws, client, {"action": "get_stats"})
+
+        assert all(e["event"] == "stats" for e in ws.sent)
+
+        # 11th action within the same second must be rejected
+        await server.handle_message(ws, client, {"action": "get_stats"})
+        assert ws.sent[-1]["event"] == "error"
+        assert "Rate limit" in ws.sent[-1]["data"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_burst_pause_burst_still_limited(self, db_params):
+        """A full window in the last second blocks even after earlier pauses."""
+        import time
+
+        server = WebSocketServer(db_params)
+        ws = FakeWS()
+        client = ClientConnection(ws=ws, channels=set(), connected_at=time.time())
+
+        # Simulate 10 actions performed 0.5s ago (still inside the window)
+        now = time.time()
+        client.action_times.extend([now - 0.5] * server.max_actions_per_second)
+
+        await server.handle_message(ws, client, {"action": "get_stats"})
+        assert ws.sent[-1]["event"] == "error"
+        assert "Rate limit" in ws.sent[-1]["data"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_old_actions_expire_from_window(self, db_params):
+        """Actions older than 1s are pruned and no longer count."""
+        import time
+
+        server = WebSocketServer(db_params)
+        ws = FakeWS()
+        client = ClientConnection(ws=ws, channels=set(), connected_at=time.time())
+
+        # Actions from >1s ago must not count against the limit
+        now = time.time()
+        client.action_times.extend([now - 1.5] * server.max_actions_per_second)
+
+        await server.handle_message(ws, client, {"action": "get_stats"})
+        assert ws.sent[-1]["event"] == "stats"
+        # Expired entries pruned; only the new action remains
+        assert len(client.action_times) == 1
+
+
+class TestNotificationTaskTracking:
+    """Test that fire-and-forget notification tasks are tracked and bounded."""
+
+    @pytest.mark.asyncio
+    async def test_task_tracked_then_discarded(self, db_params):
+        """Tasks are held in the set while running, discarded when done."""
+        server = WebSocketServer(db_params)
+
+        payload = json.dumps({"id": 1, "queue": "test", "state": "running"})
+        server.handle_notification(None, 123, "job_state_change", payload)
+
+        assert len(server._notification_tasks) == 1
+
+        await asyncio.sleep(0.1)
+
+        assert len(server._notification_tasks) == 0
+        assert server.stats["events_received"] == 1
+
+    @pytest.mark.asyncio
+    async def test_notification_dropped_when_over_cap(self, db_params):
+        """Notifications are dropped when too many tasks are pending."""
+        server = WebSocketServer(db_params)
+
+        # Simulate a full backlog of pending tasks
+        server._notification_tasks = {
+            object() for _ in range(server.max_pending_notifications)
+        }
+
+        payload = json.dumps({"id": 1, "queue": "test", "state": "running"})
+        server.handle_notification(None, 123, "job_state_change", payload)
+
+        # Nothing added, nothing processed
+        assert len(server._notification_tasks) == server.max_pending_notifications
+        await asyncio.sleep(0.05)
+        assert server.stats["events_received"] == 0
 
 
 class TestNotifyConnectionListen:

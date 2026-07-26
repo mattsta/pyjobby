@@ -5,7 +5,7 @@ Using LIVE database operations with NO MOCKS for maximum correctness guarantees!
 
 import asyncio
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -365,7 +365,7 @@ class TestSchedulerWorkerIntegration:
                 "capability": None,
             }
             worker = SchedulerWorker(conn)
-            job_id = await worker.create_scheduled_job(schedule, datetime.utcnow())
+            job_id = await worker.create_scheduled_job(schedule, datetime.now(UTC))
             assert job_id is not None
             row = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
             assert row["job_class"] == "TestJob"
@@ -384,7 +384,7 @@ class TestSchedulerWorkerIntegration:
                 "capability": None,
             }
             worker = SchedulerWorker(conn)
-            scheduled_time = datetime.utcnow()
+            scheduled_time = datetime.now(UTC)
             job_id1 = await worker.create_scheduled_job(schedule, scheduled_time)
             job_id2 = await worker.create_scheduled_job(schedule, scheduled_time)
             assert job_id1 is not None
@@ -412,7 +412,7 @@ class TestSchedulerWorkerIntegration:
                 duration_ms=150,
             )
             worker = SchedulerWorker(conn)
-            await worker.log_execution(schedule, datetime.utcnow(), result)
+            await worker.log_execution(schedule, datetime.now(UTC), result)
             row = await conn.fetchrow(
                 "SELECT * FROM jorb_schedule_log WHERE schedule_id = $1", schedule_id
             )

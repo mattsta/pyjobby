@@ -282,26 +282,13 @@ class TestConcurrentProducers:
                 created.append(job_id)
             return created
 
-        # Helper to setup JSON codec
-        def orjson_encoder(obj):
-            import orjson
+        # Create connections for each producer (shared factory registers
+        # both json AND jsonb codecs)
+        from pyjobby import db as pjdb
 
-            return orjson.dumps(obj).decode("utf-8")
-
-        # Create connections for each producer
         connections = []
         for _ in range(producer_count):
-            conn = await asyncpg.connect(**db_params)
-            # Setup JSON codec
-            import orjson
-
-            await conn.set_type_codec(
-                "json",
-                encoder=orjson_encoder,
-                decoder=orjson.loads,
-                schema="pg_catalog",
-            )
-            connections.append(conn)
+            connections.append(await pjdb.connect(**db_params))
 
         try:
             # Run producers concurrently

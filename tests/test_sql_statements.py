@@ -540,6 +540,11 @@ class TestSQLStatementIntegration:
 
         # Create 3 retries
         for i in range(3):
+            # follow the real lifecycle: only crashed jobs can be retried
+            # (the shared retry statement is state-guarded)
+            await db_connection.execute(
+                "UPDATE jorb SET state = 'crashed' WHERE id = $1", retry_chain[-1]
+            )
             result = await db_connection.fetchrow(
                 STMTS["create-retry"],
                 retry_chain[-1],

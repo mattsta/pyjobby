@@ -130,7 +130,15 @@ class TestRetryStrategyEdgeCases:
                         "max_retry_delay",
                     ]
                 ),
-                values=st.one_of(st.integers(), st.text(max_size=20)),
+                values=st.one_of(
+                    st.integers(),
+                    st.text(
+                        alphabet=st.characters(
+                            exclude_characters="\x00", exclude_categories=["Cs"]
+                        ),
+                        max_size=20,
+                    ),
+                ),
             ),
         )
     )
@@ -151,11 +159,22 @@ class TestResultStorageEdgeCases:
 
     @given(
         result_data=st.dictionaries(
-            keys=st.text(min_size=1, max_size=100),
+            keys=st.text(
+                alphabet=st.characters(
+                    exclude_characters="\x00", exclude_categories=["Cs"]
+                ),
+                min_size=1,
+                max_size=100,
+            ),
             values=st.one_of(
                 st.integers(),
                 st.floats(allow_nan=False, allow_infinity=False),
-                st.text(max_size=1000),
+                st.text(
+                    alphabet=st.characters(
+                        exclude_characters="\x00", exclude_categories=["Cs"]
+                    ),
+                    max_size=1000,
+                ),
                 st.booleans(),
                 st.none(),
             ),
@@ -401,10 +420,21 @@ class TestAdminDataValidation:
 
     @given(
         admin_data=st.dictionaries(
-            keys=st.text(min_size=1, max_size=50),
+            keys=st.text(
+                alphabet=st.characters(
+                    exclude_characters="\x00", exclude_categories=["Cs"]
+                ),
+                min_size=1,
+                max_size=50,
+            ),
             values=st.one_of(
                 st.integers(),
-                st.text(max_size=100),
+                st.text(
+                    alphabet=st.characters(
+                        exclude_characters="\x00", exclude_categories=["Cs"]
+                    ),
+                    max_size=100,
+                ),
                 st.booleans(),
                 st.floats(allow_nan=False, allow_infinity=False),
             ),
@@ -475,7 +505,13 @@ class TestQueueOperationsProperties:
 
     @given(
         job_counts=st.dictionaries(
-            keys=st.text(min_size=1, max_size=20),
+            keys=st.text(
+                alphabet=st.characters(
+                    exclude_characters="\x00", exclude_categories=["Cs"]
+                ),
+                min_size=1,
+                max_size=20,
+            ),
             values=st.integers(min_value=0, max_value=1000),
             min_size=1,
             max_size=10,

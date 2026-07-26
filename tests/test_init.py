@@ -25,9 +25,12 @@ class TestVersionDetection:
         # This is tricky because the module is already imported
 
         # Instead, let's test the logic by importing the module code
+        from importlib import metadata
+
         with patch("importlib.metadata.version") as mock_version:
-            # Make metadata.version() raise an exception
-            mock_version.side_effect = Exception("Package not found")
+            # The fallback catches the specific PackageNotFoundError (not
+            # arbitrary exceptions — library code must not swallow those)
+            mock_version.side_effect = metadata.PackageNotFoundError("pyjobby")
 
             # Re-import the module to trigger the fallback
             import importlib

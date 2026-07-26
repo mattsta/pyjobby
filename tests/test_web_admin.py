@@ -25,16 +25,17 @@ class TestWebAdminServerInit:
         server = WebAdminServer(db_params)
 
         assert server.db_params == db_params
-        assert server.host == "0.0.0.0"
+        assert server.host == "127.0.0.1"
         assert server.port == 8081
         assert server.app is not None
+        assert server.pool is None  # Pool is created lazily on first use
 
     def test_init_custom_host_port(self):
         """Test server initialization with custom host/port."""
         db_params = {"host": "localhost", "port": 5432}
-        server = WebAdminServer(db_params, host="127.0.0.1", port=9000)
+        server = WebAdminServer(db_params, host="0.0.0.0", port=9000)
 
-        assert server.host == "127.0.0.1"
+        assert server.host == "0.0.0.0"
         assert server.port == 9000
 
     def test_routes_setup(self):
@@ -586,3 +587,90 @@ class TestSchedulesAPI:
 
         data = await resp.json()
         assert isinstance(data, list)
+
+
+class TestHTMLEscaping:
+    """DB-sourced values must be HTML-escaped in HTML fragments (stored XSS)."""
+
+    @pytest.mark.asyncio
+    async def test_jobs_html_escapes_job_class(self, web_admin_client, db_pool):
+        """Malicious job_class/queue values must not appear unescaped."""
+        queue = unique_name("xss_queue")
+        payload = '<script>alert("xss")</script>'
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                VALUES ($1, '{}', $2, 100, 'queued')
+            """,
+                payload,
+                queue,
+            )
+
+        resp = await web_admin_client.get(f"/api/jobs?format=html&queue={queue}")
+        assert resp.status == 200
+        text = await resp.text()
+
+        assert payload not in text
+        assert "&lt;script&gt;" in text
+
+    @pytest.mark.asyncio
+    async def test_schedules_html_escapes_name_and_description(
+        self, web_admin_client, db_pool
+    ):
+        """Malicious schedule name/description must not appear unescaped."""
+        name = f"<script>bad</script>{unique_name('xss')}"
+        description = '<img src=x onerror="alert(1)">'
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb_schedule
+                    (name, job_class, cron_expr, queue, description, next_run)
+                VALUES ($1, 'XssJob', '0 * * * *', 'test', $2,
+                        NOW() + INTERVAL '1 hour')
+            """,
+                name,
+                description,
+            )
+
+        resp = await web_admin_client.get("/api/schedules?format=html")
+        assert resp.status == 200
+        text = await resp.text()
+
+        assert "<script>bad</script>" not in text
+        assert description not in text
+        assert "&lt;script&gt;bad&lt;/script&gt;" in text
+
+
+class TestConnectionPool:
+    """Handlers share one lazily-created connection pool."""
+
+    @pytest.mark.asyncio
+    async def test_pool_created_lazily_and_reused(self, db_params, aiohttp_client):
+        """The pool is created on first request and reused afterwards."""
+        server = WebAdminServer(db_params)
+        client = await aiohttp_client(server.app)
+
+        assert server.pool is None
+
+        resp = await client.get("/api/jobs")
+        assert resp.status == 200
+        pool_after_first = server.pool
+        assert pool_after_first is not None
+
+        resp = await client.get("/api/workers/stats")
+        assert resp.status == 200
+        assert server.pool is pool_after_first
+
+    @pytest.mark.asyncio
+    async def test_pool_closed_on_cleanup(self, db_params, aiohttp_client):
+        """App cleanup closes the pool."""
+        server = WebAdminServer(db_params)
+        client = await aiohttp_client(server.app)
+
+        resp = await client.get("/api/jobs")
+        assert resp.status == 200
+        assert server.pool is not None
+
+        await client.close()
+        assert server.pool is None

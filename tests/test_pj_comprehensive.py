@@ -7,6 +7,9 @@ timeout handling, retry logic, and recovery mechanisms.
 Coverage Target: 90%+
 """
 
+import subprocess
+import sys
+
 import asyncpg
 import pytest
 
@@ -110,6 +113,13 @@ class TestJobRecovery:
         # Create JobSystem first to get its node name
         system = JobSystem(dsn=db_params, **worker_params)
 
+        # A pid guaranteed to be dead: spawn a short-lived process and reap it.
+        # Recovery only requeues jobs whose recorded worker process no longer
+        # exists (pid-liveness), so a live pid must NOT be recovered.
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        dead_pid = proc.pid
+
         # Create an abandoned job with this worker's host (but old timestamp)
         async with db_pool.acquire() as conn:
             job_id = await conn.fetchval(
@@ -127,7 +137,7 @@ class TestJobRecovery:
                 "claimed",
                 100,
                 system.node,
-                system.pid,
+                dead_pid,
             )
 
         # Set up connection and test recovery
@@ -1248,29 +1258,28 @@ class TestJobSystemErrorHandling:
         )
         await conn.close()
 
-        # Mock statement fetch to raise InterfaceError then succeed
+        # Mock statement fetch to raise InterfaceError; ex() must then
+        # RECONNECT (fresh connection, statements re-prepared from STMTS)
+        # and retry the operation against the real database.
         call_count = 0
-        original_stmt = system.stmts["get"]
 
         class MockPreparedStatement:
             async def fetch(self, *args):
                 nonlocal call_count
                 call_count += 1
-                if call_count == 1:
-                    # First call raises InterfaceError
-                    raise asyncpg.InterfaceError("Connection lost")
-                # Second call succeeds
-                return await original_stmt.fetch(*args)
+                raise asyncpg.InterfaceError("Connection lost")
 
         system.stmts["get"] = MockPreparedStatement()
 
-        # This should retry after InterfaceError and eventually succeed
-        # Note: The retry logic in ex() sleeps 0.5s between attempts
         result = await system.ex("get", job_id)
 
-        # Verify it was called twice (once failed, once succeeded)
-        # This proves the retry logic in lines 318-321 works
-        assert call_count == 2
+        # The broken statement was tried exactly once, then replaced by a
+        # freshly prepared statement during reconnect (job is 'queued' so the
+        # 'get' statement, which filters on state='claimed', returns no rows —
+        # the point is that ex() recovered and completed the query).
+        assert call_count == 1
+        assert result == []
+        assert not isinstance(system.stmts["get"], MockPreparedStatement)
 
         await system.cxn.close()
 

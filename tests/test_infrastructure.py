@@ -83,7 +83,8 @@ async def test_test_isolation_second(db_connection):
 async def test_job_system_fixture(job_system):
     """Test that the job_system fixture works."""
     assert job_system is not None
-    assert job_system.qname == "test_queue"
+    # fixture assigns a unique per-test queue name for isolation
+    assert job_system.qname.startswith("q_")
     assert job_system.cxn is not None
     assert job_system.stmts is not None
 

@@ -26,7 +26,8 @@ class TestChdirAddpath:
         original_dir = os.getcwd()
         with tempfile.TemporaryDirectory() as tmpdir:
             chdir_addpath(tmpdir)
-            assert os.getcwd() == tmpdir
+            # realpath: macOS tempdirs live behind the /var -> /private/var symlink
+            assert os.path.realpath(os.getcwd()) == os.path.realpath(tmpdir)
             assert tmpdir in sys.path
             # Restore original directory
             os.chdir(original_dir)

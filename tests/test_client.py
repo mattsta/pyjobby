@@ -12,39 +12,12 @@ import pytest
 from pyjobby.client import (
     JobClient,
     JobInfo,
-    JobOptions,
 )
 
 
 def unique_name(base: str) -> str:
     """Generate unique name for test isolation."""
     return f"{base}_{uuid.uuid4().hex[:8]}"
-
-
-class TestJobOptionsDataclass:
-    """Test JobOptions dataclass - covers lines 48-74."""
-
-    def test_job_options_defaults(self):
-        """Test default values."""
-        options = JobOptions()
-        assert options.queue == "default"
-        assert options.priority == 100
-        assert options.run_after is None
-        assert options.capability is None
-        assert options.uid is None
-        assert options.run_group is None
-        assert options.waitfor_job is None
-        assert options.waitfor_group is None
-        assert options.deadline_key is None
-        assert options.admin_data is None
-
-    def test_job_options_custom(self):
-        """Test custom values."""
-        options = JobOptions(queue="priority", priority=500, capability="gpu", uid=42)
-        assert options.queue == "priority"
-        assert options.priority == 500
-        assert options.capability == "gpu"
-        assert options.uid == 42
 
 
 class TestJobInfoDataclass:

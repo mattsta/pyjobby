@@ -12,6 +12,7 @@ Coverage Target: Drive pj.py from 44% to 70%+
 import asyncio
 import contextlib
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 
@@ -209,10 +210,8 @@ class TestWorkerRunLoop:
         # Stop the worker
         system.stop = True
 
-        try:
+        with contextlib.suppress(TimeoutError):  # expected when worker stops
             await worker_task
-        except TimeoutError:
-            pass  # Expected when worker stops
 
         # Verify job was processed
         async with db_pool.acquire() as conn:
@@ -1172,9 +1171,13 @@ class TestJobReschedule:
             job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
 
             # Job finishes because it returned a result after calling reschedule()
-            # (reschedule() doesn't prevent job completion, it just updates run_after)
-            assert job["state"] == "finished", f"Job should finish, got: {job['state']}"
-            assert job["result"] == "rescheduled_for_300_seconds"
+            # reschedule() puts the job back in 'queued' with a future
+            # run_after; the worker's finished-update is state-guarded so it
+            # does NOT cancel the self-requested reschedule.
+            assert job["state"] == "queued", (
+                f"Job should stay queued for its reschedule, got: {job['state']}"
+            )
+            assert job["run_after"] > datetime.now(UTC).replace(tzinfo=None)
 
     @pytest.mark.asyncio
     async def test_job_reschedule_with_deltas(self, db_pool, db_params):
@@ -1222,9 +1225,12 @@ class TestJobReschedule:
         async with db_pool.acquire() as conn:
             job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
 
-            # Job finishes because it returned a result after calling reschedule()
-            assert job["state"] == "finished", f"Job should finish, got: {job['state']}"
-            assert job["result"] == "rescheduled_with_deltas"
+            # reschedule() wins over normal completion: the job stays queued
+            # for its future run instead of being stamped finished.
+            assert job["state"] == "queued", (
+                f"Job should stay queued for its reschedule, got: {job['state']}"
+            )
+            assert job["run_after"] > datetime.now(UTC).replace(tzinfo=None)
 
 
 # ============================================================================

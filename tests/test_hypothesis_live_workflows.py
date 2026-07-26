@@ -107,20 +107,10 @@ def run_worker_process(
             recovery_timeout=5,  # 5 seconds for tests
         )
 
-        # Connect to DB
-        worker.cxn = await asyncpg.connect(**db_params)
+        # Connect to DB (shared factory registers both json AND jsonb codecs)
+        from pyjobby import db as pjdb
 
-        # Setup JSON codec
-        def orjson_encoder(obj):
-            import orjson
-
-            return orjson.dumps(obj).decode("utf-8")
-
-        import orjson
-
-        await worker.cxn.set_type_codec(
-            "json", encoder=orjson_encoder, decoder=orjson.loads, schema="pg_catalog"
-        )
+        worker.cxn = await pjdb.connect(**db_params)
 
         # Prepare statements
         from pyjobby.pj import STMTS
@@ -243,24 +233,11 @@ class TestLiveProducerConsumerWorkflows:
         """
         assume(job_count >= worker_count)  # Ensure enough work
 
-        conn = await asyncpg.connect(**db_params)
+        from pyjobby import db as pjdb
+
+        conn = await pjdb.connect(**db_params)
 
         try:
-            # Setup JSON codec
-            def orjson_encoder(obj):
-                import orjson
-
-                return orjson.dumps(obj).decode("utf-8")
-
-            import orjson
-
-            await conn.set_type_codec(
-                "json",
-                encoder=orjson_encoder,
-                decoder=orjson.loads,
-                schema="pg_catalog",
-            )
-
             # Create jobs
             job_ids = []
             for i in range(job_count):
@@ -276,6 +253,7 @@ class TestLiveProducerConsumerWorkflows:
             workers = []
             for i in range(worker_count):
                 p = multiprocessing.Process(
+                    daemon=True,
                     target=run_worker_process,
                     args=(i, "test", db_params, 15),  # Run for 15 seconds
                 )
@@ -339,24 +317,11 @@ class TestLiveProducerConsumerWorkflows:
 
         This tests the SKIP LOCKED mechanism.
         """
-        conn = await asyncpg.connect(**db_params)
+        from pyjobby import db as pjdb
+
+        conn = await pjdb.connect(**db_params)
 
         try:
-            # Setup codec
-            def orjson_encoder(obj):
-                import orjson
-
-                return orjson.dumps(obj).decode("utf-8")
-
-            import orjson
-
-            await conn.set_type_codec(
-                "json",
-                encoder=orjson_encoder,
-                decoder=orjson.loads,
-                schema="pg_catalog",
-            )
-
             # Create jobs with unique markers
             job_ids = []
             for i in range(job_count):
@@ -373,7 +338,9 @@ class TestLiveProducerConsumerWorkflows:
             workers = []
             for i in range(worker_count):
                 p = multiprocessing.Process(
-                    target=run_worker_process, args=(i, "test", db_params, 10)
+                    daemon=True,
+                    target=run_worker_process,
+                    args=(i, "test", db_params, 10),
                 )
                 p.start()
                 workers.append(p)
@@ -427,29 +394,17 @@ class TestLiveProducerConsumerWorkflows:
 
         Tests producer-consumer pattern with jobs arriving over time.
         """
-        conn = await asyncpg.connect(**db_params)
+        from pyjobby import db as pjdb
+
+        conn = await pjdb.connect(**db_params)
 
         try:
-            # Setup codec
-            def orjson_encoder(obj):
-                import orjson
-
-                return orjson.dumps(obj).decode("utf-8")
-
-            import orjson
-
-            await conn.set_type_codec(
-                "json",
-                encoder=orjson_encoder,
-                decoder=orjson.loads,
-                schema="pg_catalog",
-            )
-
             # Start workers first
             worker_count = 2
             workers = []
             for i in range(worker_count):
                 p = multiprocessing.Process(
+                    daemon=True,
                     target=run_worker_process,
                     args=(i, "test", db_params, 20),  # Run longer
                 )
@@ -521,24 +476,11 @@ class TestLiveProducerConsumerWorkflows:
 
         Tests the recovery mechanism under real conditions.
         """
-        conn = await asyncpg.connect(**db_params)
+        from pyjobby import db as pjdb
+
+        conn = await pjdb.connect(**db_params)
 
         try:
-            # Setup codec
-            def orjson_encoder(obj):
-                import orjson
-
-                return orjson.dumps(obj).decode("utf-8")
-
-            import orjson
-
-            await conn.set_type_codec(
-                "json",
-                encoder=orjson_encoder,
-                decoder=orjson.loads,
-                schema="pg_catalog",
-            )
-
             # Create jobs
             job_ids = []
             for i in range(job_count):
@@ -549,6 +491,7 @@ class TestLiveProducerConsumerWorkflows:
 
             # Start a worker
             worker1 = multiprocessing.Process(
+                daemon=True,
                 target=run_worker_process,
                 args=(1, "test", db_params, 3),  # Short duration
             )
@@ -567,6 +510,7 @@ class TestLiveProducerConsumerWorkflows:
 
             # Start a new worker with recovery enabled
             worker2 = multiprocessing.Process(
+                daemon=True,
                 target=run_worker_process,
                 args=(2, "test", db_params, 15, True),  # enable_recovery=True
             )
@@ -627,24 +571,11 @@ class TestLivePriorityAndCapability:
         """
         Property: High priority jobs should be processed before low priority jobs.
         """
-        conn = await asyncpg.connect(**db_params)
+        from pyjobby import db as pjdb
+
+        conn = await pjdb.connect(**db_params)
 
         try:
-            # Setup codec
-            def orjson_encoder(obj):
-                import orjson
-
-                return orjson.dumps(obj).decode("utf-8")
-
-            import orjson
-
-            await conn.set_type_codec(
-                "json",
-                encoder=orjson_encoder,
-                decoder=orjson.loads,
-                schema="pg_catalog",
-            )
-
             # Create high priority jobs
             high_prio_ids = []
             for i in range(high_prio_count):
@@ -671,7 +602,7 @@ class TestLivePriorityAndCapability:
 
             # Start ONE worker (to enforce ordering)
             worker = multiprocessing.Process(
-                target=run_worker_process, args=(1, "test", db_params, 15)
+                daemon=True, target=run_worker_process, args=(1, "test", db_params, 15)
             )
             worker.start()
 
