@@ -4,7 +4,7 @@ Tests for Admin API
 Tests all administrative operations for job, queue, and worker management.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -442,15 +442,29 @@ async def register_worker(conn, host, pid, queue="default", **kwargs):
 class TestWorkerManagement:
     """Tests for the registry-based worker management API"""
 
-    async def test_list_workers_empty(self, admin_api):
-        """Test listing workers when none registered"""
-        workers = await admin_api.list_workers()
-        assert workers == []
+    async def test_list_workers_excludes_long_gone(
+        self, admin_api, db_connection, test_id
+    ):
+        """Workers shut down beyond the retention window drop off the list.
 
-    async def test_list_workers_registered(self, admin_api, db_connection):
+        (Asserted against THIS test's own hosts: the registry is global, so
+        a concurrent test session's workers may also be present.)"""
+        await register_worker(
+            db_connection,
+            f"{test_id}-ancient",
+            1,
+            shutdown_at=datetime.now(UTC) - timedelta(hours=48),
+        )
+
+        workers = await admin_api.list_workers()
+
+        assert [w for w in workers if w["host"].startswith(test_id)] == []
+
+    async def test_list_workers_registered(self, admin_api, db_connection, test_id):
         """Workers come from the jorb_worker registry, with claimed job"""
-        w1 = await register_worker(db_connection, "worker-1", 12345)
-        await register_worker(db_connection, "worker-2", 67890)
+        host1, host2 = f"{test_id}-worker-1", f"{test_id}-worker-2"
+        w1 = await register_worker(db_connection, host1, 12345)
+        await register_worker(db_connection, host2, 67890)
 
         # Give worker-1 a claimed job so its current job shows up
         await db_connection.execute(
@@ -465,32 +479,42 @@ class TestWorkerManagement:
 
         workers = await admin_api.list_workers()
 
-        assert len(workers) == 2
-        by_host = {w["host"]: w for w in workers}
-        assert by_host["worker-1"]["pid"] == 12345
-        assert by_host["worker-1"]["live"] is True
-        assert by_host["worker-1"]["current_job_class"] == "job.test.TestJob"
-        assert by_host["worker-2"]["current_job_id"] is None
+        mine = [w for w in workers if w["host"].startswith(test_id)]
+        assert len(mine) == 2
+        by_host = {w["host"]: w for w in mine}
+        assert by_host[host1]["pid"] == 12345
+        assert by_host[host1]["live"] is True
+        assert by_host[host1]["current_job_class"] == "job.test.TestJob"
+        assert by_host[host2]["current_job_id"] is None
 
-    async def test_worker_stats(self, admin_api, db_connection):
-        """Registry-based aggregate worker statistics"""
-        await register_worker(db_connection, "worker-1", 100, queue="alpha")
-        await register_worker(db_connection, "worker-2", 200, queue="alpha")
+    async def test_worker_stats(self, admin_api, db_connection, test_id):
+        """Registry-based aggregate worker statistics.
+
+        Queue names are test-scoped so the per-queue counts are exact even
+        when another session has its own workers registered."""
+        alpha, beta = f"{test_id}-alpha", f"{test_id}-beta"
+        before = await admin_api.worker_stats()
+
+        await register_worker(db_connection, f"{test_id}-w1", 100, queue=alpha)
+        await register_worker(db_connection, f"{test_id}-w2", 200, queue=alpha)
         await register_worker(
             db_connection,
-            "worker-3",
+            f"{test_id}-w3",
             300,
-            queue="beta",
+            queue=beta,
             shutdown_at=datetime.now(UTC),
         )
 
         stats = await admin_api.worker_stats()
 
-        assert stats["live_workers"] == 2
-        assert stats["active_workers"] == 2  # compat alias
-        assert stats["shutdown_workers"] == 1
-        assert stats["total_registered"] == 3
-        assert stats["per_queue"] == {"alpha": 2}
+        # exact for our own queues
+        assert stats["per_queue"][alpha] == 2
+        assert beta not in stats["per_queue"]  # shut down: not live
+        # and our contribution to the global aggregates
+        assert stats["live_workers"] == before["live_workers"] + 2
+        assert stats["active_workers"] == stats["live_workers"]  # compat alias
+        assert stats["shutdown_workers"] == before["shutdown_workers"] + 1
+        assert stats["total_registered"] == before["total_registered"] + 3
 
 
 class TestMetrics:

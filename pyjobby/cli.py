@@ -12,6 +12,7 @@ import asyncio
 import json
 import sys
 from datetime import timedelta
+from typing import Any
 
 import asyncpg  # type: ignore[import-untyped]
 import click
@@ -2154,17 +2155,18 @@ def jobs_timeout_stats(
     async def _timeout_stats() -> None:
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
-            # Build WHERE clause
+            # Build WHERE clause (positional params numbered as appended;
+            # asyncpg binds intervals from timedelta, never from a string)
             where_clauses = ["admin_data ? 'timeout_seconds'"]
-            params = []
+            params: list[Any] = []
 
             if since_hours:
-                where_clauses.append("created > now() - $1::interval")
-                params.append(f"{since_hours} hours")
+                params.append(timedelta(hours=since_hours))
+                where_clauses.append(f"created > now() - ${len(params)}::interval")
 
             if queue:
-                where_clauses.append("queue = $2" if since_hours else "queue = $1")
                 params.append(queue)
+                where_clauses.append(f"queue = ${len(params)}")
 
             where_str = " AND ".join(where_clauses)
 
