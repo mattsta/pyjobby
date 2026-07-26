@@ -29,7 +29,8 @@ from pyjobby.monitor import (
     sweep_unregistered_claims,
 )
 from pyjobby.pj import STMTS
-from tests.conftest import TEST_DSN, wait_for_job_state
+from tests.conftest import wait_for_job_state
+from tests.utils.processes import dsn_from
 
 pytestmark = pytest.mark.asyncio
 
@@ -490,7 +491,7 @@ class TestEpochFencing:
 
 
 class TestMonitorLoop:
-    async def test_loop_runs_all_sweeps(self, db_pool, unique_queue):
+    async def test_loop_runs_all_sweeps(self, db_pool, unique_queue, db_params):
         """monitor() repeatedly sweeps timeouts, dead workers, and
         unregistered claims until cancelled."""
         timed_out = await insert_job(
@@ -510,7 +511,10 @@ class TestMonitorLoop:
 
         task = asyncio.create_task(
             monitor(
-                TEST_DSN,
+                # this session's database, not the base DSN: under xdist each
+                # worker owns its own database and the monitor must sweep the
+                # one holding this test's rows
+                dsn_from(db_params),
                 check_interval=0.1,
                 liveness_grace_seconds=60,
                 claimed_grace_seconds=300,

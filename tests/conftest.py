@@ -97,21 +97,11 @@ def event_loop() -> Iterator[asyncio.AbstractEventLoop]:
 # ============================================================================
 
 
-@pytest.fixture(scope="session")
-def db_params() -> dict[str, str | int]:
-    """
-    Get database connection parameters for the test database.
-
-    Honors the PYJOBBY_TEST_DSN environment variable (so parallel test
-    sessions can each point at their own database); falls back to the
-    default local test database.
-
-    Returns:
-        dict: Connection parameters for asyncpg
-    """
+def _dsn_params(dsn: str) -> dict[str, str | int]:
+    """asyncpg connection kwargs from a DSN string."""
     from urllib.parse import unquote, urlparse
 
-    parsed = urlparse(TEST_DSN)
+    parsed = urlparse(dsn)
     return {
         "host": parsed.hostname or "localhost",
         "port": parsed.port or 5432,
@@ -119,6 +109,56 @@ def db_params() -> dict[str, str | int]:
         "password": unquote(parsed.password or "pyjobby_test_password"),
         "database": (parsed.path or "/pyjobby_test").lstrip("/"),
     }
+
+
+def _create_worker_database(base: dict[str, str | int], name: str) -> None:
+    """Create `name` (if absent) and install the schema into it.
+
+    Synchronous on purpose: this runs once per xdist worker during session
+    setup, before any event loop exists.
+    """
+    import asyncio
+
+    from pyjobby import db as pjdb
+    from pyjobby import migrations
+
+    async def _setup() -> None:
+        admin = await asyncpg.connect(**base)
+        try:
+            exists = await admin.fetchval(
+                "SELECT 1 FROM pg_database WHERE datname = $1", name
+            )
+            if not exists:
+                await admin.execute(f'CREATE DATABASE "{name}"')
+        finally:
+            await admin.close()
+
+        conn = await pjdb.connect(**{**base, "database": name})
+        try:
+            await migrations.migrate(conn)
+        finally:
+            await conn.close()
+
+    asyncio.run(_setup())
+
+
+@pytest.fixture(scope="session")
+def db_params(worker_id: str) -> dict[str, str | int]:
+    """Connection parameters for THIS test session's database.
+
+    Sequential runs use PYJOBBY_TEST_DSN as-is. Under pytest-xdist each
+    worker gets its own database (`<base>_gw0`, `_gw1`, ...), created and
+    migrated on demand, because jorb_worker/jorb_queue and the aggregate
+    views are global tables: workers sharing one database would see each
+    other's rows and truncate each other's data mid-test.
+    """
+    base = _dsn_params(TEST_DSN)
+    if worker_id == "master":
+        return base
+
+    per_worker = f"{base['database']}_{worker_id}"
+    _create_worker_database(base, per_worker)
+    return {**base, "database": per_worker}
 
 
 # ============================================================================
@@ -150,33 +190,19 @@ async def _cleanup_database(db_params: dict[str, str]) -> None:
 
 
 @pytest_asyncio.fixture(autouse=True, scope="function")
-async def ensure_clean_database(request, db_params: dict[str, str]):
+async def ensure_clean_database(db_params: dict[str, str]):
+    """Clean the session's database before every test.
+
+    Unconditional: each xdist worker owns its own database (see db_params),
+    so cleanup is always safe and tests may assert exact global counts
+    (worker registry, queue controls, aggregate views) without racing a
+    sibling worker.
     """
-    Ensure database is clean BEFORE each test runs.
-
-    For sequential execution: Clean database before each test
-    For parallel execution: Skip cleanup, rely on unique names per test
-
-    This fixture detects if running under pytest-xdist and adjusts behavior.
-    """
-    # Check if running with pytest-xdist (parallel)
-    # If PYTEST_XDIST_WORKER is set, we're in a worker process
-    is_parallel = os.environ.get("PYTEST_XDIST_WORKER") is not None
-
-    if is_parallel:
-        # In parallel mode, DON'T clean the whole database
-        # Tests should use unique names (test_id, unique_queue fixtures)
-        yield
-        return
-
-    # Sequential mode: clean database before every test for isolation.
-    # (DELETEs on empty tables are cheap; an allowlist of "files that need
-    # cleanup" proved fragile — any file left off it inherited leftover rows.)
     await _cleanup_database(db_params)
 
     yield
-    # NOTE: No post-test cleanup - reduces connections by 50%
-    # Pre-test cleanup is sufficient for isolation
+    # No post-test cleanup: pre-test cleanup is sufficient and halves the
+    # connection churn.
 
 
 # ============================================================================

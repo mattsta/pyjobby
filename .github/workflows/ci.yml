@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYJOBBY_TEST_DSN: postgresql://pyjobby_test:pyjobby_test_password@localhost:5432/pyjobby_test
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: pyjobby_test
+          POSTGRES_PASSWORD: pyjobby_test_password
+          POSTGRES_DB: pyjobby_test
+        ports:
+          - 5432:5432
+        # the suite creates one database per xdist worker, so the test role
+        # needs CREATEDB — it is the superuser here, which covers it
+        options: >-
+          --health-cmd "pg_isready -U pyjobby_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies (locked)
+        run: uv sync --locked --group dev
+
+      - name: Lint
+        run: |
+          uv run ruff check pyjobby/ tests/
+          uv run ruff format --check pyjobby/ tests/
+
+      - name: Type check
+        run: uv run mypy pyjobby/
+
+      - name: Install schema
+        run: uv run pj-admin --dsn "$PYJOBBY_TEST_DSN" db migrate
+
+      - name: Verify a fresh install is usable
+        run: uv run pj-admin --dsn "$PYJOBBY_TEST_DSN" doctor
+
+      - name: Tests (parallel, with coverage floor)
+        run: |
+          uv run pytest -n auto --timeout=300 \
+            --cov=pyjobby \
+            --cov-report=term-missing:skip-covered \
+            --cov-report=xml
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build wheel and sdist
+        run: uv build
+
+      - name: Verify the wheel ships its SQL
+        run: |
+          python - <<'PY'
+          import glob, zipfile, sys
+          wheel = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          sql = [n for n in names if n.startswith("pyjobby/sql/")]
+          assert any(n.endswith("schema.sql") for n in sql), sql
+          print(f"{wheel}: {len(sql)} SQL file(s) packaged")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

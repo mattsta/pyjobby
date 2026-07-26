@@ -21,9 +21,15 @@ PYJOBBY_TEST_DSN="postgresql://pyjobby_test:pyjobby_test_password@localhost:5432
   poetry run pytest tests/test_dxe_core.py -q --no-cov
 ```
 
-Parallel sessions (several agents, or `-n auto`) need separate databases —
-`jorb_worker`, `jorb_queue`, and the aggregate views are global tables, so
-sessions sharing one database will see each other's rows.
+Under `pytest-xdist` each worker automatically gets its own database
+(`pyjobby_test_gw0`, `_gw1`, …), created and migrated on first use. That
+isolation is required, not an optimization: `jorb_worker`, `jorb_queue`,
+and the aggregate views are global tables, so workers sharing one database
+would see each other's rows and truncate each other's data mid-test. It
+also lets tests assert exact global counts.
+
+Separate *sessions* (e.g. several agents running suites at once) still need
+distinct `PYJOBBY_TEST_DSN` values for the same reason.
 
 ## Shared test infrastructure
 
@@ -36,7 +42,18 @@ one-off scaffolding:
 | `wait_for_job_state(conn, id, states)` | poll a job to a target state with a useful failure message |
 | `tests/dxe_jobs.py` | shared job classes (`OkJob`, `FailJob`, `SlowJob`, `StepPipelineJob`, `SleeperJob`, `PingJob`, `PongJob`) resolved by dotted path like production jobs |
 | `tests/utils/factories.py` | v1-safe row builders (aware UTC, non-NULL jsonb) |
+| `tests/utils/processes.py` | launch real console scripts (`daemon`, `wait_until`, `free_port`, `port_is_open`) and reap their process groups |
 | `unique_queue` / `test_id` fixtures | per-test namespacing so tests never collide on shared tables |
+
+## CI
+
+`.github/workflows/ci.yml` runs on every push and pull request against a
+PostgreSQL 18 service container: `ruff check` + `ruff format --check`,
+`mypy`, `pj-admin db migrate` followed by `pj-admin doctor` (proving a
+fresh install is actually usable), then the suite with `-n auto` and the
+coverage floor. A second job builds the wheel and asserts the packaged SQL
+is present — the schema shipping inside the wheel is what makes
+`pj-admin db migrate` work for an installed package.
 
 ## Coverage is a diagnostic, not a target
 
