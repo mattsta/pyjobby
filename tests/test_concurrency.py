@@ -1,68 +1,52 @@
 """
-Concurrency and race condition tests.
+Concurrency and race condition tests (schema v1).
 
 Tests concurrent access patterns, race conditions, and database
-locking behavior under high contention scenarios.
+locking behavior under high contention scenarios. Uses real
+(non-transactional) connections so SKIP LOCKED and epoch fencing are
+exercised exactly as production sees them.
 """
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
-import asyncpg
-import orjson
 import pytest
 
-from tests.utils.factories import (
-    count_jobs_by_state,
-    create_job,
-    create_job_batch,
-    get_job,
-)
+from pyjobby import db
+from pyjobby.pj import STMTS
+from tests.utils.factories import create_job, create_job_batch, get_job
 
 pytestmark = pytest.mark.asyncio
 
 
-async def setup_json_codec(conn: asyncpg.Connection):
-    """Configure orjson codec for a connection."""
-
-    def orjson_encoder(obj):
-        return orjson.dumps(obj).decode("utf-8")
-
-    await conn.set_type_codec(
-        "json",
-        encoder=orjson_encoder,
-        decoder=orjson.loads,
-        schema="pg_catalog",
-    )
-    await conn.set_type_codec(
-        "jsonb",
-        encoder=orjson_encoder,
-        decoder=orjson.loads,
-        schema="pg_catalog",
-    )
-
-
 async def connect_with_codec(db_params):
-    """Create a connection with JSON codec configured."""
-    conn = await asyncpg.connect(**db_params)
-    await setup_json_codec(conn)
-    return conn
+    """Create a connection with pyjobby's JSON codecs configured."""
+    return await db.connect(**db_params)
+
+
+async def claim(conn, queue, *, pid=1, host="worker", caps=("test",), prio=1000):
+    """Claim the next job on `queue` (schema v1 six-argument claim)."""
+    return await conn.fetchrow(STMTS["claim"], pid, host, queue, list(caps), prio, None)
+
+
+async def count_state(conn, queue: str, state: str) -> int:
+    return await conn.fetchval(
+        "SELECT count(*) FROM jorb WHERE queue = $1 AND state = $2", queue, state
+    )
 
 
 class TestConcurrentJobClaiming:
     """Test concurrent job claiming scenarios."""
 
-    async def test_multiple_workers_claim_different_jobs(self, db_params):
+    async def test_multiple_workers_claim_different_jobs(self, db_params, unique_queue):
         """Test that multiple workers can claim different jobs without conflicts."""
-        # Create multiple jobs
         conn = await connect_with_codec(db_params)
         try:
-            job_ids = await create_job_batch(conn, count=20, state="queued")
-            await conn.close()
+            job_ids = await create_job_batch(
+                conn, count=20, queue=unique_queue, state="queued"
+            )
         finally:
-            pass
-
-        from pyjobby.pj import STMTS
+            await conn.close()
 
         # Simulate 5 workers claiming jobs concurrently
         async def worker_claim(worker_id: int) -> list[int]:
@@ -71,14 +55,12 @@ class TestConcurrentJobClaiming:
             claimed = []
 
             try:
-                for attempt in range(10):  # Try to claim up to 10 jobs
-                    result = await conn.fetchrow(
-                        STMTS["claim"],
-                        worker_id,
-                        f"worker-{worker_id}",
-                        "test_queue",
-                        ["test"],
-                        1000,
+                for _attempt in range(10):  # Try to claim up to 10 jobs
+                    result = await claim(
+                        conn,
+                        unique_queue,
+                        pid=worker_id,
+                        host=f"worker-{worker_id}",
                     )
                     if result:
                         claimed.append(result["id"])
@@ -109,29 +91,19 @@ class TestConcurrentJobClaiming:
         # All claimed IDs should be from our original batch
         assert set(all_claimed) == set(job_ids)
 
-    async def test_skip_locked_prevents_double_claims(self, db_params):
+    async def test_skip_locked_prevents_double_claims(self, db_params, unique_queue):
         """Test that FOR UPDATE SKIP LOCKED prevents double claims."""
         conn = await connect_with_codec(db_params)
-        job_id = await create_job(conn, state="queued")
+        await create_job(conn, queue=unique_queue, state="queued")
         await conn.close()
-
-        from pyjobby.pj import STMTS
-
-        claim_results = []
 
         async def attempt_claim(worker_id: int):
             """Try to claim the same job."""
             conn = await connect_with_codec(db_params)
             try:
-                result = await conn.fetchrow(
-                    STMTS["claim"],
-                    worker_id,
-                    f"worker-{worker_id}",
-                    "test_queue",
-                    ["test"],
-                    1000,
+                return await claim(
+                    conn, unique_queue, pid=worker_id, host=f"worker-{worker_id}"
                 )
-                return result
             finally:
                 await conn.close()
 
@@ -141,26 +113,27 @@ class TestConcurrentJobClaiming:
         # Only one should succeed
         successful_claims = [r for r in results if r is not None]
         assert len(successful_claims) == 1
+        assert successful_claims[0]["run_epoch"] == 1
 
         # The rest should be None
         failed_claims = [r for r in results if r is None]
         assert len(failed_claims) == 9
 
-    async def test_concurrent_claims_different_queues(self, db_params):
+    async def test_concurrent_claims_different_queues(self, db_params, unique_queue):
         """Test concurrent claims from different queues don't interfere."""
+        queue_a = f"{unique_queue}_a"
+        queue_b = f"{unique_queue}_b"
         conn = await connect_with_codec(db_params)
 
         # Create jobs in different queues
         queue_a_jobs = []
         queue_b_jobs = []
 
-        for i in range(10):
-            queue_a_jobs.append(await create_job(conn, queue="queue_a", state="queued"))
-            queue_b_jobs.append(await create_job(conn, queue="queue_b", state="queued"))
+        for _ in range(10):
+            queue_a_jobs.append(await create_job(conn, queue=queue_a, state="queued"))
+            queue_b_jobs.append(await create_job(conn, queue=queue_b, state="queued"))
 
         await conn.close()
-
-        from pyjobby.pj import STMTS
 
         async def claim_from_queue(queue_name: str, worker_id: int):
             """Claim all jobs from a specific queue."""
@@ -169,13 +142,11 @@ class TestConcurrentJobClaiming:
 
             try:
                 while True:
-                    result = await conn.fetchrow(
-                        STMTS["claim"],
-                        worker_id,
-                        f"worker-{queue_name}-{worker_id}",
+                    result = await claim(
+                        conn,
                         queue_name,
-                        ["test"],
-                        1000,
+                        pid=worker_id,
+                        host=f"worker-{queue_name}-{worker_id}",
                     )
                     if result:
                         claimed.append(result["id"])
@@ -189,7 +160,7 @@ class TestConcurrentJobClaiming:
 
         # Workers claim from both queues concurrently
         queue_a_results, queue_b_results = await asyncio.gather(
-            claim_from_queue("queue_a", 1), claim_from_queue("queue_b", 2)
+            claim_from_queue(queue_a, 1), claim_from_queue(queue_b, 2)
         )
 
         # Each queue should have all its jobs claimed
@@ -203,19 +174,19 @@ class TestConcurrentJobClaiming:
 class TestConcurrentStateTransitions:
     """Test concurrent state transitions and updates."""
 
-    async def test_concurrent_finish_operations(self, db_params):
-        """Test multiple jobs finishing concurrently."""
+    async def test_concurrent_finish_operations(self, db_params, unique_queue):
+        """Test multiple jobs finishing concurrently (epoch-fenced)."""
         conn = await connect_with_codec(db_params)
 
-        # Create and claim multiple jobs
+        # Create and claim multiple jobs (claiming sets run_epoch = 1)
         job_ids = []
-        for i in range(10):
-            job_id = await create_job(conn, state="running")
-            job_ids.append(job_id)
+        for _ in range(10):
+            await create_job(conn, queue=unique_queue, state="queued")
+        for _ in range(10):
+            claimed = await claim(conn, unique_queue)
+            job_ids.append(claimed["id"])
 
         await conn.close()
-
-        from pyjobby.pj import STMTS
 
         async def finish_job(job_id: int):
             """Mark a job as finished."""
@@ -225,6 +196,7 @@ class TestConcurrentStateTransitions:
                     STMTS["finished"],
                     job_id,
                     {"status": "success", "result": f"job-{job_id}"},
+                    1,  # the epoch our claim owns
                 )
                 return result["id"]
             finally:
@@ -238,33 +210,34 @@ class TestConcurrentStateTransitions:
 
         # Verify all are finished
         conn = await connect_with_codec(db_params)
-        finished_count = await count_jobs_by_state(conn, "finished")
+        finished_count = await count_state(conn, unique_queue, "finished")
         await conn.close()
 
-        assert finished_count >= 10
+        assert finished_count == 10
 
-    async def test_concurrent_crash_operations(self, db_params):
-        """Test multiple jobs crashing concurrently."""
+    async def test_concurrent_crashed_operations(self, db_params, unique_queue):
+        """Test multiple jobs dead-lettering concurrently."""
         conn = await connect_with_codec(db_params)
 
         job_ids = []
-        for i in range(10):
-            job_id = await create_job(conn, state="running")
-            job_ids.append(job_id)
+        for _ in range(10):
+            await create_job(conn, queue=unique_queue, state="queued")
+        for _ in range(10):
+            claimed = await claim(conn, unique_queue)
+            job_ids.append(claimed["id"])
 
         await conn.close()
 
-        from pyjobby.pj import STMTS
-
         async def crash_job(job_id: int, error_num: int):
-            """Mark a job as crashed."""
+            """Mark a job as terminally crashed."""
             conn = await connect_with_codec(db_params)
             try:
                 await conn.execute(
-                    STMTS["crash"],
+                    STMTS["crashed"],
                     job_id,
                     f"Error {error_num}",
                     f"Traceback for error {error_num}",
+                    1,
                 )
                 return job_id
             finally:
@@ -277,86 +250,88 @@ class TestConcurrentStateTransitions:
 
         assert len(crashed_ids) == 10
 
-        # Verify all crashed
+        # Verify all crashed (the DLQ is WHERE state = 'crashed')
         conn = await connect_with_codec(db_params)
-        crashed_count = await count_jobs_by_state(conn, "crashed")
+        crashed_count = await count_state(conn, unique_queue, "crashed")
         await conn.close()
 
-        assert crashed_count >= 10
+        assert crashed_count == 10
 
 
-class TestConcurrentRetryCreation:
-    """Test concurrent retry job creation."""
+class TestConcurrentRetries:
+    """Test concurrent same-row retry requeues."""
 
-    async def test_concurrent_retry_creation(self, db_params):
-        """Test creating retries for multiple jobs concurrently."""
+    async def test_concurrent_retry_requeues(self, db_params, unique_queue):
+        """Retrying many claimed jobs concurrently requeues each SAME row."""
         conn = await connect_with_codec(db_params)
 
-        # Create crashed jobs
-        crashed_ids = []
-        for i in range(10):
-            job_id = await create_job(conn, state="crashed")
-            crashed_ids.append(job_id)
+        job_ids = []
+        for _ in range(10):
+            await create_job(conn, queue=unique_queue, state="queued")
+        for _ in range(10):
+            claimed = await claim(conn, unique_queue)
+            job_ids.append(claimed["id"])
 
         await conn.close()
 
-        from pyjobby.pj import STMTS
-
-        async def create_retry(original_id: int, delay_minutes: int):
-            """Create a retry job."""
+        async def retry_job(job_id: int, delay_minutes: int):
+            """Requeue the same row with backoff."""
             conn = await connect_with_codec(db_params)
             try:
                 result = await conn.fetchrow(
-                    STMTS["create-retry"],
-                    original_id,
+                    STMTS["retry"],
+                    job_id,
                     timedelta(minutes=delay_minutes),
+                    "transient",
+                    "trace",
                     1,
                 )
                 return result["id"]
             finally:
                 await conn.close()
 
-        # Create retries concurrently
-        retry_ids = await asyncio.gather(
-            *[create_retry(cid, i + 1) for i, cid in enumerate(crashed_ids)]
+        # Retry concurrently
+        retried_ids = await asyncio.gather(
+            *[retry_job(jid, i + 1) for i, jid in enumerate(job_ids)]
         )
 
-        # All retries should be created
-        assert len(retry_ids) == 10
-        assert len(set(retry_ids)) == 10  # All unique
+        # Same rows came back — no copies were created
+        assert set(retried_ids) == set(job_ids)
 
-        # Verify retry jobs exist and reference originals
         conn = await connect_with_codec(db_params)
-        for original_id, retry_id in zip(crashed_ids, retry_ids):
-            retry_job = await get_job(conn, retry_id)
-            assert retry_job["state"] == "queued"
-            assert retry_job["admin_data"]["parent_job_id"] == original_id
-
+        total = await conn.fetchval(
+            "SELECT count(*) FROM jorb WHERE queue = $1", unique_queue
+        )
+        assert total == 10
+        for job_id in job_ids:
+            job = await get_job(conn, job_id)
+            assert job["state"] == "queued"
+            assert job["error_count"] == 1
         await conn.close()
 
 
 class TestConcurrentDependencyResolution:
     """Test concurrent dependency resolution."""
 
-    async def test_concurrent_waitfor_job_resolution(self, db_params):
+    async def test_concurrent_waitfor_job_resolution(self, db_params, unique_queue):
         """Test resolving multiple waitfor_job dependencies concurrently."""
         conn = await connect_with_codec(db_params)
 
         # Create parent jobs
         parent_ids = []
-        for i in range(5):
-            parent_id = await create_job(conn, state="finished")
+        for _ in range(5):
+            parent_id = await create_job(conn, queue=unique_queue, state="finished")
             parent_ids.append(parent_id)
 
         # Create child jobs waiting for parents
         child_ids = []
         for parent_id in parent_ids:
-            child_id = await create_job(conn, waitfor_job=parent_id, state="waiting")
+            child_id = await create_job(
+                conn, queue=unique_queue, waitfor_job=parent_id, state="waiting"
+            )
             child_ids.append(child_id)
 
         await conn.close()
-
-        from pyjobby.pj import STMTS
 
         async def resolve_dependency(parent_id: int):
             """Trigger dependency resolution for a parent job."""
@@ -372,8 +347,8 @@ class TestConcurrentDependencyResolution:
         # Resolve all dependencies concurrently
         results = await asyncio.gather(*[resolve_dependency(pid) for pid in parent_ids])
 
-        # Each should have resolved 1 dependency
-        assert all(r >= 0 for r in results)
+        # Each should have resolved exactly 1 dependency
+        assert results == [1] * 5
 
         # Verify all children are queued
         conn = await connect_with_codec(db_params)
@@ -382,7 +357,7 @@ class TestConcurrentDependencyResolution:
             assert child["state"] == "queued"
         await conn.close()
 
-    async def test_concurrent_waitfor_group_resolution(self, db_params):
+    async def test_concurrent_waitfor_group_resolution(self, db_params, unique_queue):
         """Test resolving multiple waitfor_group dependencies concurrently."""
         conn = await connect_with_codec(db_params)
 
@@ -392,17 +367,19 @@ class TestConcurrentDependencyResolution:
             group_id = 10000 + group_num
 
             # Create jobs in group
-            for i in range(3):
-                await create_job(conn, run_group=group_id, state="finished")
+            for _ in range(3):
+                await create_job(
+                    conn, queue=unique_queue, run_group=group_id, state="finished"
+                )
 
             # Create waiter for group
-            waiter_id = await create_job(conn, waitfor_group=group_id, state="waiting")
+            waiter_id = await create_job(
+                conn, queue=unique_queue, waitfor_group=group_id, state="waiting"
+            )
 
             groups.append((group_id, waiter_id))
 
         await conn.close()
-
-        from pyjobby.pj import STMTS
 
         async def resolve_group(group_id: int):
             """Resolve group dependency."""
@@ -416,95 +393,70 @@ class TestConcurrentDependencyResolution:
                 await conn.close()
 
         # Resolve all groups concurrently
-        results = await asyncio.gather(*[resolve_group(gid) for gid, _ in groups])
+        await asyncio.gather(*[resolve_group(gid) for gid, _ in groups])
 
         # Verify all waiters are queued
         conn = await connect_with_codec(db_params)
-        for group_id, waiter_id in groups:
+        for _group_id, waiter_id in groups:
             waiter = await get_job(conn, waiter_id)
             assert waiter["state"] == "queued"
         await conn.close()
 
 
-class TestConcurrentRecovery:
-    """Test concurrent recovery operations."""
+class TestConcurrentEpochFencing:
+    """Epoch fencing under concurrency: exactly one attempt owns the row."""
 
-    async def test_concurrent_worker_recovery(self, db_params):
-        """Test recovering jobs from multiple workers concurrently."""
+    async def test_stale_epoch_writers_lose(self, db_params, unique_queue):
+        """After a requeue+reclaim, writers holding the old epoch are no-ops."""
         conn = await connect_with_codec(db_params)
+        job_id = await create_job(conn, queue=unique_queue, state="queued")
 
-        # Create jobs claimed by different workers
-        worker_jobs = {}
-        for worker_num in range(5):
-            worker_host = f"dead-worker-{worker_num}"
-            worker_jobs[worker_host] = []
+        first = await claim(conn, unique_queue)
+        assert first["id"] == job_id and first["run_epoch"] == 1
 
-            for i in range(3):
-                job_id = await create_job(conn, state="queued")
-
-                # Manually set as claimed by this worker with old timestamp
-                old_time = datetime.utcnow() - timedelta(minutes=10)
-                await conn.execute(
-                    """UPDATE jorb
-                       SET state = 'claimed',
-                           worker_pid = $1,
-                           worker_host = $2,
-                           updated = $3
-                       WHERE id = $4""",
-                    10000 + worker_num,
-                    worker_host,
-                    old_time,
-                    job_id,
-                )
-                worker_jobs[worker_host].append(job_id)
-
+        # the row is requeued (e.g. by the monitor) and claimed again
+        await db.requeue_job(
+            conn, job_id, allowed_states=("claimed", "running"), reset_errors=False
+        )
+        second = await claim(conn, unique_queue, pid=2, host="worker-2")
+        assert second["run_epoch"] == 2
         await conn.close()
 
-        from pyjobby.pj import STMTS
-
-        async def recover_worker(worker_host: str):
-            """Recover jobs from a dead worker."""
+        async def finish_with_epoch(epoch: int):
             conn = await connect_with_codec(db_params)
             try:
-                recovery_timeout = timedelta(minutes=5)
-                results = await conn.fetch(
-                    STMTS["recover-abandoned"], worker_host, recovery_timeout
+                rows = await conn.fetch(
+                    STMTS["finished"], job_id, {"epoch": epoch}, epoch
                 )
-                return [r["id"] for r in results]
+                return len(rows)
             finally:
                 await conn.close()
 
-        # Recover all workers concurrently
-        results = await asyncio.gather(
-            *[recover_worker(whost) for whost in worker_jobs]
+        stale, current = await asyncio.gather(
+            finish_with_epoch(1), finish_with_epoch(2)
         )
+        assert stale == 0  # fenced out
+        assert current == 1
 
-        # Verify each worker's jobs were recovered
-        for i, (worker_host, expected_jobs) in enumerate(worker_jobs.items()):
-            recovered_jobs = results[i]
-            assert set(recovered_jobs) == set(expected_jobs)
-
-        # Verify all jobs are queued
         conn = await connect_with_codec(db_params)
-        for job_list in worker_jobs.values():
-            for job_id in job_list:
-                job = await get_job(conn, job_id)
-                assert job["state"] == "queued"
+        job = await get_job(conn, job_id)
+        assert job["state"] == "finished"
+        assert job["result"] == {"epoch": 2}
         await conn.close()
 
 
 class TestHighContentionScenarios:
     """Test behavior under high contention."""
 
-    async def test_high_contention_claiming(self, db_params):
+    async def test_high_contention_claiming(self, db_params, unique_queue):
         """Test claiming with many workers competing for few jobs."""
         conn = await connect_with_codec(db_params)
 
         # Create only 5 jobs
-        job_ids = await create_job_batch(conn, count=5, state="queued")
+        job_ids = await create_job_batch(
+            conn, count=5, queue=unique_queue, state="queued"
+        )
         await conn.close()
-
-        from pyjobby.pj import STMTS
 
         async def aggressive_claimer(worker_id: int):
             """Worker aggressively tries to claim jobs."""
@@ -514,13 +466,11 @@ class TestHighContentionScenarios:
             try:
                 # Try 20 times even though only 5 jobs exist
                 for _ in range(20):
-                    result = await conn.fetchrow(
-                        STMTS["claim"],
-                        worker_id,
-                        f"worker-{worker_id}",
-                        "test_queue",
-                        ["test"],
-                        1000,
+                    result = await claim(
+                        conn,
+                        unique_queue,
+                        pid=worker_id,
+                        host=f"worker-{worker_id}",
                     )
                     if result:
                         claimed.append(result["id"])
@@ -542,17 +492,13 @@ class TestHighContentionScenarios:
         assert len(all_claimed) == len(set(all_claimed))
 
         # Our 5 jobs should all be claimed
-        our_jobs_claimed = [jid for jid in all_claimed if jid in job_ids]
-        assert len(our_jobs_claimed) == 5
-        assert set(our_jobs_claimed) == set(job_ids)
+        assert set(all_claimed) == set(job_ids)
 
-    async def test_rapid_state_transitions(self, db_params):
+    async def test_rapid_state_transitions(self, db_params, unique_queue):
         """Test rapid state transitions don't cause corruption."""
         conn = await connect_with_codec(db_params)
-        job_id = await create_job(conn, state="queued")
+        job_id = await create_job(conn, queue=unique_queue, state="queued")
         await conn.close()
-
-        from pyjobby.pj import STMTS
 
         # Multiple operations on same job
         async def claim_and_finish(worker_id: int):
@@ -560,19 +506,17 @@ class TestHighContentionScenarios:
             conn = await connect_with_codec(db_params)
             try:
                 # Try to claim
-                claimed = await conn.fetchrow(
-                    STMTS["claim"],
-                    worker_id,
-                    f"worker-{worker_id}",
-                    "test_queue",
-                    ["test"],
-                    1000,
+                claimed = await claim(
+                    conn, unique_queue, pid=worker_id, host=f"worker-{worker_id}"
                 )
 
                 if claimed:
-                    # Try to finish
+                    # Finish under our claim's epoch
                     await conn.fetchrow(
-                        STMTS["finished"], claimed["id"], {"worker": worker_id}
+                        STMTS["finished"],
+                        claimed["id"],
+                        {"worker": worker_id},
+                        claimed["run_epoch"],
                     )
                     return True
                 return False
@@ -596,15 +540,13 @@ class TestHighContentionScenarios:
 class TestDeadlockPrevention:
     """Test that our SQL patterns don't cause deadlocks."""
 
-    async def test_concurrent_updates_no_deadlock(self, db_params):
+    async def test_concurrent_updates_no_deadlock(self, db_params, unique_queue):
         """Test that concurrent updates don't cause deadlocks."""
         conn = await connect_with_codec(db_params)
 
         # Create jobs
-        job_ids = await create_job_batch(conn, count=20, state="queued")
+        await create_job_batch(conn, count=20, queue=unique_queue, state="queued")
         await conn.close()
-
-        from pyjobby.pj import STMTS
 
         async def worker_lifecycle(worker_id: int):
             """Complete lifecycle: claim, run, finish."""
@@ -614,29 +556,28 @@ class TestDeadlockPrevention:
             try:
                 for _ in range(10):
                     # Claim
-                    claimed = await conn.fetchrow(
-                        STMTS["claim"],
-                        worker_id,
-                        f"worker-{worker_id}",
-                        "test_queue",
-                        ["test"],
-                        1000,
+                    claimed = await claim(
+                        conn,
+                        unique_queue,
+                        pid=worker_id,
+                        host=f"worker-{worker_id}",
                     )
 
                     if not claimed:
                         break
 
                     job_id = claimed["id"]
+                    epoch = claimed["run_epoch"]
 
                     # Run
-                    await conn.execute(STMTS["run"], job_id)
+                    await conn.execute(STMTS["run"], job_id, epoch)
 
                     # Small processing delay
                     await asyncio.sleep(0.001)
 
                     # Finish
                     await conn.fetchrow(
-                        STMTS["finished"], job_id, {"worker": worker_id}
+                        STMTS["finished"], job_id, {"worker": worker_id}, epoch
                     )
 
                     processed += 1
@@ -654,23 +595,21 @@ class TestDeadlockPrevention:
 
         # No jobs should be left in intermediate states
         conn = await connect_with_codec(db_params)
-        finished_count = await count_jobs_by_state(conn, "finished")
+        finished_count = await count_state(conn, unique_queue, "finished")
         await conn.close()
 
-        assert finished_count >= 20
+        assert finished_count == 20
 
 
 @pytest.mark.stress
 class TestStressScenarios:
     """Stress tests with high load."""
 
-    async def test_many_workers_many_jobs(self, db_params):
+    async def test_many_workers_many_jobs(self, db_params, unique_queue):
         """Test system under high load: 50 workers, 100 jobs."""
         conn = await connect_with_codec(db_params)
-        job_ids = await create_job_batch(conn, count=100, state="queued")
+        await create_job_batch(conn, count=100, queue=unique_queue, state="queued")
         await conn.close()
-
-        from pyjobby.pj import STMTS
 
         async def worker_process(worker_id: int):
             """Worker claims and processes jobs."""
@@ -679,22 +618,21 @@ class TestStressScenarios:
 
             try:
                 while True:
-                    claimed = await conn.fetchrow(
-                        STMTS["claim"],
-                        worker_id,
-                        f"worker-{worker_id}",
-                        "test_queue",
-                        ["test"],
-                        1000,
+                    claimed = await claim(
+                        conn,
+                        unique_queue,
+                        pid=worker_id,
+                        host=f"worker-{worker_id}",
                     )
 
                     if not claimed:
                         break
 
-                    await conn.execute(STMTS["run"], claimed["id"])
+                    epoch = claimed["run_epoch"]
+                    await conn.execute(STMTS["run"], claimed["id"], epoch)
                     await asyncio.sleep(0.0001)  # Tiny processing time
                     await conn.fetchrow(
-                        STMTS["finished"], claimed["id"], {"worker": worker_id}
+                        STMTS["finished"], claimed["id"], {"worker": worker_id}, epoch
                     )
 
                     processed += 1
@@ -704,9 +642,9 @@ class TestStressScenarios:
             return processed
 
         # 50 workers
-        start_time = datetime.utcnow()
+        start_time = datetime.now(UTC)
         results = await asyncio.gather(*[worker_process(i) for i in range(50)])
-        duration = (datetime.utcnow() - start_time).total_seconds()
+        duration = (datetime.now(UTC) - start_time).total_seconds()
 
         # Verify all jobs processed
         total_processed = sum(results)
@@ -723,29 +661,25 @@ class TestStressScenarios:
 class TestConcurrencyIntegration:
     """Integration tests for concurrent workflows."""
 
-    async def test_concurrent_dependency_workflow(self, db_params):
+    async def test_concurrent_dependency_workflow(self, db_params, unique_queue):
         """Test complex workflow with concurrent dependency resolution."""
         conn = await connect_with_codec(db_params)
 
         # Create fan-out pattern: 1 parent -> 5 children
-        parent_id = await create_job(conn, state="queued")
+        parent_id = await create_job(conn, queue=unique_queue, state="queued")
 
         child_ids = []
-        for i in range(5):
-            child_id = await create_job(conn, waitfor_job=parent_id, state="waiting")
+        for _ in range(5):
+            child_id = await create_job(
+                conn, queue=unique_queue, waitfor_job=parent_id, state="waiting"
+            )
             child_ids.append(child_id)
 
-        await conn.close()
-
-        from pyjobby.pj import STMTS
-
         # Process parent
-        conn = await connect_with_codec(db_params)
-        claimed = await conn.fetchrow(
-            STMTS["claim"], 1, "worker-1", "test_queue", ["test"], 1000
-        )
-        await conn.execute(STMTS["run"], claimed["id"])
-        await conn.fetchrow(STMTS["finished"], claimed["id"], {})
+        claimed = await claim(conn, unique_queue)
+        epoch = claimed["run_epoch"]
+        await conn.execute(STMTS["run"], claimed["id"], epoch)
+        await conn.fetchrow(STMTS["finished"], claimed["id"], {}, epoch)
 
         # Trigger dependency resolution
         await conn.fetch(STMTS["enqueue-next-self-finished"], parent_id)
@@ -756,17 +690,13 @@ class TestConcurrencyIntegration:
             """Claim and process a child job."""
             conn = await connect_with_codec(db_params)
             try:
-                claimed = await conn.fetchrow(
-                    STMTS["claim"],
-                    worker_id,
-                    f"worker-{worker_id}",
-                    "test_queue",
-                    ["test"],
-                    1000,
+                claimed = await claim(
+                    conn, unique_queue, pid=worker_id, host=f"worker-{worker_id}"
                 )
                 if claimed:
-                    await conn.execute(STMTS["run"], claimed["id"])
-                    await conn.fetchrow(STMTS["finished"], claimed["id"], {})
+                    epoch = claimed["run_epoch"]
+                    await conn.execute(STMTS["run"], claimed["id"], epoch)
+                    await conn.fetchrow(STMTS["finished"], claimed["id"], {}, epoch)
                     return claimed["id"]
                 return None
             finally:

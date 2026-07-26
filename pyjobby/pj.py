@@ -425,11 +425,13 @@ class JobSystem:
         return web.Response(text="not so fast!")
 
     async def _start_web_listener(self) -> None:
+        self._web_runner: web.ServerRunner | None = None
         if not (self.webPort and "sites" in self.webPort):
             return
         server = web.Server(self.webHandler)  # type: ignore
         runner = web.ServerRunner(server)
         await runner.setup()
+        self._web_runner = runner
 
         for site in self.webPort["sites"]:
             assert isinstance(site, dict)
@@ -548,6 +550,10 @@ class JobSystem:
                 # dict copy so kwargs can be augmented before running
                 await self._process(dict(jobs[0]))
         finally:
+            web_runner = getattr(self, "_web_runner", None)
+            if web_runner is not None:
+                with contextlib.suppress(Exception):
+                    await web_runner.cleanup()  # release listen sockets
             await self._deregister_worker()
             await self.cxn.close()
 

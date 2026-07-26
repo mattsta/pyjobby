@@ -2,68 +2,45 @@
 Comprehensive tests for pj.py JobSystem run() loop - THE CORE WORKER!
 
 Tests the ACTUAL worker execution loop with LIVE database operations.
-NO MOCKS - real job processing, real database, real worker loop.
+NO MOCKS - real workers via the ``live_worker`` fixture, real job classes
+(shared ones from ``tests.dxe_jobs``, plus local classes for shapes that
+have no shared equivalent: sync tasks, async generators, self-reschedules,
+web handlers).
 
-This tests the HEART of the platform - lines 403-699 in pj.py!
-
-Coverage Target: Drive pj.py from 44% to 70%+
+Schema v1 semantics under test: same-row retries with error_count/run_epoch
+bumped in place, terminal 'crashed' as the DLQ, timeout handling honoring
+admin_data on_timeout, and jorb_history as the per-attempt audit trail.
 """
+
+from __future__ import annotations
 
 import asyncio
 import contextlib
-import uuid
 from datetime import UTC, datetime
 
 import pytest
 
 from pyjobby.pj import Job, JobSystem
 
+from .conftest import wait_for_job_state
+
+pytestmark = pytest.mark.asyncio
+
+
 # ============================================================================
-# Test Job Classes
+# Local Job Classes (shapes not covered by tests.dxe_jobs)
 # ============================================================================
 
 
-class QuickJob(Job):
-    """Job that completes quickly."""
+class SyncQuickJob(Job):
+    """Synchronous job that completes quickly (OkJob is async)."""
 
     def task(self, value: str = "default"):
         return f"quick: {value}"
 
 
-class AsyncQuickJob(Job):
-    """Async job that completes quickly."""
-
-    async def task(self, value: str = "async"):
-        await asyncio.sleep(0.01)
-        return f"async: {value}"
-
-
-class TimeoutTestJob(Job):
-    """Job that will timeout."""
-
-    timeout = 2
-
-    async def task(self):
-        await asyncio.sleep(10)  # Will timeout
-        return "should not reach"
-
-
-class FailingTestJob(Job):
-    """Job that always fails."""
-
-    def task(self):
-        raise ValueError("Test error for retry")
-
-
-class CounterJob(Job):
-    """Job that returns the attempt counter."""
-
-    def task(self, attempt: int = 1):
-        return f"attempt_{attempt}"
-
-
 class AsyncGenJob(Job):
-    """Job that returns async generator."""
+    """Job that returns an async generator."""
 
     async def task(self):
         async def gen():
@@ -159,6 +136,32 @@ class ReschedulingJobWithDeltas(Job):
         return "rescheduled_with_deltas"
 
 
+THIS = "tests.test_pj_worker_run_loop"
+
+
+async def enqueue(conn, queue, job_class, kwargs=None, admin_data=None, **cols):
+    """Insert a queued job row (jsonb columns default to {}; never NULL)."""
+    return await conn.fetchval(
+        """INSERT INTO jorb (job_class, kwargs, queue, admin_data)
+           VALUES ($1, $2, $3, $4) RETURNING id""",
+        job_class,
+        kwargs or {},
+        queue,
+        admin_data or {},
+    )
+
+
+async def wait_for(condition, timeout: float = 10.0, interval: float = 0.1):
+    """Poll `condition` (async, returns truthy/row) until it holds."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        result = await condition()
+        if result:
+            return result
+        await asyncio.sleep(interval)
+    raise AssertionError("condition never became true")
+
+
 # ============================================================================
 # Test Main run() Loop
 # ============================================================================
@@ -167,159 +170,49 @@ class ReschedulingJobWithDeltas(Job):
 class TestWorkerRunLoop:
     """Test the actual worker run() loop execution."""
 
-    @pytest.mark.asyncio
-    async def test_worker_processes_single_job(self, db_pool, db_params):
-        """Test worker run loop processes a job and stops."""
-        async with db_pool.acquire() as conn:
-            # Clean database
-            await conn.execute("DELETE FROM jorb")
+    async def test_worker_processes_single_job(
+        self, live_worker, unique_queue, db_pool
+    ):
+        """Test worker run loop processes a (sync) job."""
+        await live_worker()
 
-            # Create a job - let asyncpg handle JSON encoding
-            job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING id
-            """,
-                "tests.test_pj_worker_run_loop.QuickJob",
-                {"value": "test1"},
-                "default",
-                "queued",
-                100,
-            )
-
-        # Create worker
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=1,
-            checkInterval=0.1,
-            webPort=None,
+        job_id = await enqueue(
+            db_pool, unique_queue, f"{THIS}.SyncQuickJob", {"value": "test1"}
         )
 
-        # Start worker in background with timeout
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=2.0)
+        job = await wait_for_job_state(db_pool, job_id, ("finished",))
+        assert job["result"] == "quick: test1"
+        assert job["run_count"] == 1
+        assert job["run_epoch"] == 1
+        assert job["worker_pid"] is not None
 
-        worker_task = asyncio.create_task(run_worker())
-
-        # Wait a bit for processing
-        await asyncio.sleep(0.5)
-
-        # Stop the worker
-        system.stop = True
-
-        with contextlib.suppress(TimeoutError):  # expected when worker stops
-            await worker_task
-
-        # Verify job was processed
-        async with db_pool.acquire() as conn:
-            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-            assert job["state"] == "finished"
-            assert job["result"] == "quick: test1"
-
-    @pytest.mark.asyncio
-    async def test_worker_processes_multiple_jobs(self, db_pool, db_params):
+    async def test_worker_processes_multiple_jobs(
+        self, live_worker, unique_queue, db_pool
+    ):
         """Test worker processes multiple jobs in sequence."""
-        async with db_pool.acquire() as conn:
-            # Clean database
-            await conn.execute("DELETE FROM jorb")
+        await live_worker()
 
-            # Create multiple jobs
-            job_ids = []
-            for i in range(3):
-                job_id = await conn.fetchval(
-                    """
-                    INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                    VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                    RETURNING id
-                """,
-                    "tests.test_pj_worker_run_loop.QuickJob",
-                    {"value": f"job{i}"},
-                    "default",
-                    "queued",
-                    100,
-                )
-                job_ids.append(job_id)
-
-        # Create and run worker
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=2,
-            checkInterval=0.1,
-            webPort=None,
-        )
-
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=3.0)
-
-        worker_task = asyncio.create_task(run_worker())
-
-        # Wait for all jobs to process
-        await asyncio.sleep(1.0)
-
-        # Stop worker
-        system.stop = True
-
-        with contextlib.suppress(TimeoutError):
-            await worker_task
-
-        # Verify all jobs processed
-        async with db_pool.acquire() as conn:
-            for i, job_id in enumerate(job_ids):
-                job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-                assert job["state"] == "finished"
-                assert job["result"] == f"quick: job{i}"
-
-    @pytest.mark.asyncio
-    async def test_worker_processes_async_jobs(self, db_pool, db_params):
-        """Test worker can process async jobs."""
-        async with db_pool.acquire() as conn:
-            # Clean database
-            await conn.execute("DELETE FROM jorb")
-
-            # Create async job
-            job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING id
-            """,
-                "tests.test_pj_worker_run_loop.AsyncQuickJob",
-                {"value": "async_test"},
-                "default",
-                "queued",
-                100,
+        job_ids = [
+            await enqueue(
+                db_pool, unique_queue, f"{THIS}.SyncQuickJob", {"value": f"job{i}"}
             )
+            for i in range(3)
+        ]
 
-        # Create and run worker
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=3,
-            checkInterval=0.1,
-            webPort=None,
-        )
+        for i, job_id in enumerate(job_ids):
+            job = await wait_for_job_state(db_pool, job_id, ("finished",))
+            assert job["result"] == f"quick: job{i}"
 
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=2.0)
+    async def test_worker_processes_async_jobs(
+        self, live_worker, unique_queue, db_pool
+    ):
+        """Test worker can process async jobs (shared OkJob is async)."""
+        await live_worker()
 
-        worker_task = asyncio.create_task(run_worker())
-        await asyncio.sleep(0.5)
-        system.stop = True
+        job_id = await enqueue(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {"x": 21})
 
-        with contextlib.suppress(TimeoutError):
-            await worker_task
-
-        # Verify async job processed
-        async with db_pool.acquire() as conn:
-            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-            assert job["state"] == "finished"
-            assert job["result"] == "async: async_test"
+        job = await wait_for_job_state(db_pool, job_id, ("finished",))
+        assert job["result"] == {"doubled": 42}
 
 
 # ============================================================================
@@ -330,178 +223,71 @@ class TestWorkerRunLoop:
 class TestWorkerTimeoutHandling:
     """Test timeout handling within the run() loop."""
 
-    @pytest.mark.asyncio
-    async def test_worker_handles_job_timeout_with_retry(self, db_pool, db_params):
-        """Test worker handles timeout and creates retry job."""
-        async with db_pool.acquire() as conn:
-            # Clean database
-            await conn.execute("DELETE FROM jorb")
+    async def test_worker_handles_job_timeout_with_retry(
+        self, live_worker, unique_queue, db_pool
+    ):
+        """A timeout retries the SAME row, then dead-letters when exhausted."""
+        await live_worker()
 
-            # Create job that will timeout with retry enabled
-            job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
-                                 admin_data)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), $6)
-                RETURNING id
-            """,
-                "tests.test_pj_worker_run_loop.TimeoutTestJob",
-                {},
-                "default",
-                "queued",
-                100,
-                {"timeout_seconds": 1, "on_timeout": "retry", "max_retries": 3},
-            )
-
-        # Create and run worker
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=4,
-            checkInterval=0.1,
-            webPort=None,
+        job_id = await enqueue(
+            db_pool,
+            unique_queue,
+            "tests.dxe_jobs.SlowJob",
+            {"seconds": 30},
+            admin_data={
+                "timeout_seconds": 1,
+                "on_timeout": "retry",
+                "max_retries": 2,
+                "initial_retry_delay": 0,
+            },
         )
 
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=6.0)
+        # attempt 1 times out -> requeued (same row); attempt 2 times out ->
+        # retries exhausted -> terminal 'crashed'
+        job = await wait_for_job_state(db_pool, job_id, ("crashed",), timeout=20)
+        assert job["error_count"] == 2
+        assert job["run_epoch"] == 2
+        assert "timed out" in job["error_message"].lower()
 
-        worker_task = asyncio.create_task(run_worker())
+        # the retry was a same-row requeue carrying the timeout error
+        requeue_detail = await db_pool.fetchval(
+            """SELECT detail FROM jorb_history
+               WHERE job_id = $1 AND event = 'queued' LIMIT 1""",
+            job_id,
+        )
+        assert "timed out" in requeue_detail["error"].lower()
 
-        # Give worker time to claim and start processing job
-        await asyncio.sleep(0.5)
+        # ONE row for the whole life of the job — no retry copies
+        rows = await db_pool.fetchval(
+            "SELECT count(*) FROM jorb WHERE queue = $1", unique_queue
+        )
+        assert rows == 1
 
-        # Check job state after 0.5s (should be claimed or running)
-        async with db_pool.acquire() as conn:
-            job_after_claim = await conn.fetchrow(
-                "SELECT id, state, error_count FROM jorb WHERE id = $1", job_id
-            )
-            print(
-                f"\nAfter 0.5s: Job {job_after_claim['id']}, state={job_after_claim['state']}, error_count={job_after_claim['error_count']}"
-            )
-
-        # Wait for timeout to occur (job has 1s timeout, sleeps 10s)
-        await asyncio.sleep(1.2)  # Just past 1s timeout
-
-        # Check job state right after timeout
-        async with db_pool.acquire() as conn:
-            job_after_timeout = await conn.fetchrow(
-                "SELECT id, state, error_count, error_message FROM jorb WHERE id = $1",
-                job_id,
-            )
-            print(
-                f"After 1.7s (just after timeout): Job {job_after_timeout['id']}, state={job_after_timeout['state']}, error_count={job_after_timeout['error_count']}"
-            )
-            print(f"  error_message={job_after_timeout['error_message']}")
-
-            # Also check if any retry jobs exist yet
-            all_jobs = await conn.fetch(
-                "SELECT id, state, error_count FROM jorb ORDER BY id"
-            )
-            print(f"  Total jobs in system: {len(all_jobs)}")
-            for j in all_jobs:
-                print(
-                    f"    Job {j['id']}: state={j['state']}, error_count={j['error_count']}"
-                )
-
-        # Wait a bit more for retry creation
-        await asyncio.sleep(0.5)
-
-        # Now stop the worker
-        system.stop = True
-
-        with contextlib.suppress(TimeoutError):
-            await worker_task
-
-        # Verify original job crashed and retry was created
-        async with db_pool.acquire() as conn:
-            original_job = await conn.fetchrow(
-                "SELECT * FROM jorb WHERE id = $1", job_id
-            )
-
-            assert original_job["state"] == "crashed", (
-                f"Expected 'crashed' but got '{original_job['state']}'"
-            )
-            assert "timed out" in original_job["error_message"].lower()
-
-            # Check retry job(s) were created
-            # The retry job should have parent_job_id set in admin_data
-            retry_jobs = await conn.fetch("""
-                SELECT * FROM jorb
-                WHERE job_class = 'tests.test_pj_worker_run_loop.TimeoutTestJob'
-                AND admin_data ? 'parent_job_id'
-            """)
-            assert len(retry_jobs) >= 1, (
-                f"Expected at least one retry job, found {len(retry_jobs)}"
-            )
-
-            # Verify that the original job is the parent
-            retry_parent_id = retry_jobs[0]["admin_data"]["parent_job_id"]
-            assert retry_parent_id == job_id, (
-                f"Retry job parent should be {job_id}, got {retry_parent_id}"
-            )
-
-    @pytest.mark.asyncio
-    async def test_worker_handles_timeout_with_fail(self, db_pool, db_params):
+    async def test_worker_handles_timeout_with_fail(
+        self, live_worker, unique_queue, db_pool
+    ):
         """Test worker handles timeout when on_timeout=fail."""
-        async with db_pool.acquire() as conn:
-            # Clean database
-            await conn.execute(
-                "DELETE FROM jorb WHERE job_class LIKE 'tests.test_pj_worker_run_loop.%'"
-            )
+        await live_worker()
 
-            # Create job that will timeout with fail mode
-            job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
-                                 admin_data)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), $6)
-                RETURNING id
-            """,
-                "tests.test_pj_worker_run_loop.TimeoutTestJob",
-                {},
-                "default",
-                "queued",
-                100,
-                {"timeout_seconds": 1, "on_timeout": "fail", "max_retries": 3},
-            )
-
-        # Create and run worker
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=5,
-            checkInterval=0.1,
-            webPort=None,
+        job_id = await enqueue(
+            db_pool,
+            unique_queue,
+            "tests.dxe_jobs.SlowJob",
+            {"seconds": 30},
+            admin_data={"timeout_seconds": 1, "on_timeout": "fail", "max_retries": 3},
         )
 
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=5.0)
+        # first timeout dead-letters immediately (no retry allowed)
+        job = await wait_for_job_state(db_pool, job_id, ("crashed",), timeout=15)
+        assert job["error_count"] == 1
+        assert job["run_epoch"] == 1
 
-        worker_task = asyncio.create_task(run_worker())
-        await asyncio.sleep(2.5)
-        system.stop = True
-
-        with contextlib.suppress(TimeoutError):
-            await worker_task
-
-        # Verify job crashed and NO retry was created
-        async with db_pool.acquire() as conn:
-            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-            assert job["state"] == "crashed"
-
-            # Should be no retry jobs created
-            retry_count = await conn.fetchval(
-                """
-                SELECT COUNT(*) FROM jorb
-                WHERE job_class = 'tests.test_pj_worker_run_loop.TimeoutTestJob'
-                AND id != $1
-                AND error_count > 0
-            """,
-                job_id,
-            )
-            assert retry_count == 0
+        # never requeued: no 'queued' transition after the initial enqueue
+        requeues = await db_pool.fetchval(
+            "SELECT count(*) FROM jorb_history WHERE job_id = $1 AND event='queued'",
+            job_id,
+        )
+        assert requeues == 0
 
 
 # ============================================================================
@@ -512,133 +298,69 @@ class TestWorkerTimeoutHandling:
 class TestWorkerExceptionHandling:
     """Test exception handling and retry logic in run() loop."""
 
-    @pytest.mark.asyncio
-    async def test_worker_handles_exception_with_retry(self, db_pool, db_params):
-        """Test worker handles exception and creates retry job."""
-        # Use unique queue name to avoid interference
-        test_queue = f"exception_retry_{uuid.uuid4().hex[:8]}"
+    async def test_worker_handles_exception_with_retry(
+        self, live_worker, unique_queue, db_pool
+    ):
+        """A failing job goes back to 'queued' on the SAME row with backoff."""
+        await live_worker()
 
-        async with db_pool.acquire() as conn:
-            # Clean database
-            await conn.execute("DELETE FROM jorb")
-
-            # Create failing job with retry
-            job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
-                                 admin_data)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), $6)
-                RETURNING id
-            """,
-                "tests.test_pj_worker_run_loop.FailingTestJob",
-                {},
-                test_queue,
-                "queued",
-                100,
-                {"max_retries": 3, "retry_strategy": "exponential"},
-            )
-
-        # Create and run worker
-        system = JobSystem(
-            dsn=db_params,
-            qname=test_queue,
-            capabilities=("std",),
-            workerId=6,
-            checkInterval=0.1,
-            webPort=None,
+        job_id = await enqueue(
+            db_pool,
+            unique_queue,
+            "tests.dxe_jobs.FailJob",
+            admin_data={
+                "max_retries": 3,
+                "retry_strategy": "exponential",
+                # long delay so the retry sits observably queued
+                "initial_retry_delay": 60,
+            },
         )
 
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=3.0)
-
-        worker_task = asyncio.create_task(run_worker())
-        await asyncio.sleep(0.8)
-        system.stop = True
-
-        with contextlib.suppress(TimeoutError):
-            await worker_task
-
-        # Verify job crashed and retry created
-        async with db_pool.acquire() as conn:
-            original_job = await conn.fetchrow(
-                "SELECT * FROM jorb WHERE id = $1", job_id
+        # wait for the first failed attempt to be requeued
+        job = await wait_for(
+            lambda: db_pool.fetchrow(
+                "SELECT * FROM jorb WHERE id = $1 AND error_count > 0", job_id
             )
-            assert original_job["state"] == "crashed"
-            assert "Test error for retry" in original_job["error_message"]
-            assert "Traceback" in (original_job["error_backtrace"] or "")
-
-            # Check retry job exists (in the same unique queue)
-            retry_jobs = await conn.fetch(
-                """
-                SELECT * FROM jorb
-                WHERE job_class = 'tests.test_pj_worker_run_loop.FailingTestJob'
-                AND queue = $1
-                AND state = 'queued'
-                AND error_count = 1
-            """,
-                test_queue,
-            )
-            assert len(retry_jobs) >= 1, f"Expected retry job in queue {test_queue}"
-
-    @pytest.mark.asyncio
-    async def test_worker_stops_retry_after_max_attempts(self, db_pool, db_params):
-        """Test worker stops retrying after max_retries exceeded."""
-        async with db_pool.acquire() as conn:
-            # Clean database
-            await conn.execute(
-                "DELETE FROM jorb WHERE job_class LIKE 'tests.test_pj_worker_run_loop.%'"
-            )
-
-            # Create failing job with error_count near max
-            job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
-                                 error_count, admin_data)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), $6, $7)
-                RETURNING id
-            """,
-                "tests.test_pj_worker_run_loop.FailingTestJob",
-                {},
-                "default",
-                "queued",
-                100,
-                2,  # Already failed twice
-                {"max_retries": 3},
-            )
-
-        # Create and run worker
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=7,
-            checkInterval=0.1,
-            webPort=None,
         )
 
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=3.0)
+        assert job["state"] == "queued"  # same row, back in the queue
+        assert job["error_count"] == 1
+        assert "intentional failure" in job["error_message"]
+        assert "Traceback" in (job["error_backtrace"] or "")
+        assert job["run_after"] > datetime.now(UTC)  # backoff applied
 
-        worker_task = asyncio.create_task(run_worker())
-        await asyncio.sleep(0.8)
-        system.stop = True
+        # no retry-copy rows: the queue still holds exactly one job
+        rows = await db_pool.fetchval(
+            "SELECT count(*) FROM jorb WHERE queue = $1", unique_queue
+        )
+        assert rows == 1
 
-        with contextlib.suppress(TimeoutError):
-            await worker_task
+    async def test_worker_stops_retry_after_max_attempts(
+        self, live_worker, unique_queue, db_pool
+    ):
+        """Test worker dead-letters after max_retries attempts."""
+        await live_worker()
 
-        # Verify job crashed and NO retry created (max exceeded)
-        async with db_pool.acquire() as conn:
-            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-            assert job["state"] == "crashed"
+        # error_count starts at 2: the next failure is attempt 3 of 3
+        job_id = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, kwargs, queue, error_count, admin_data)
+               VALUES ($1, $2, $3, $4, $5) RETURNING id""",
+            "tests.dxe_jobs.FailJob",
+            {},
+            unique_queue,
+            2,
+            {"max_retries": 3, "initial_retry_delay": 0},
+        )
 
-            # Should be no new retry jobs (error_count would be 3)
-            retry_count = await conn.fetchval("""
-                SELECT COUNT(*) FROM jorb
-                WHERE job_class = 'tests.test_pj_worker_run_loop.FailingTestJob'
-                AND error_count >= 3
-                AND state = 'queued'
-            """)
-            assert retry_count == 0
+        job = await wait_for_job_state(db_pool, job_id, ("crashed",), timeout=15)
+        assert job["error_count"] == 3
+
+        # terminal: nothing left queued
+        queued = await db_pool.fetchval(
+            "SELECT count(*) FROM jorb WHERE queue = $1 AND state = 'queued'",
+            unique_queue,
+        )
+        assert queued == 0
 
 
 # ============================================================================
@@ -649,160 +371,57 @@ class TestWorkerExceptionHandling:
 class TestWorkerRunLoopEdgeCases:
     """Test edge cases in the run() loop."""
 
-    @pytest.mark.asyncio
-    async def test_worker_handles_empty_queue(self, db_pool, db_params):
-        """Test worker correctly sleeps when queue is empty."""
-        async with db_pool.acquire() as conn:
-            # Clean database - ensure no jobs
-            await conn.execute("DELETE FROM jorb WHERE queue = 'empty_test'")
+    async def test_worker_handles_empty_queue(self, live_worker, unique_queue, db_pool):
+        """Test worker correctly idles when queue is empty."""
+        system = await live_worker()
 
-        # Create worker
-        system = JobSystem(
-            dsn=db_params,
-            qname="empty_test",
-            capabilities=("std",),
-            workerId=8,
-            checkInterval=0.2,
-            webPort=None,
-        )
-
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=1.0)
-
-        worker_task = asyncio.create_task(run_worker())
-
-        # Let worker run with empty queue
-        await asyncio.sleep(0.6)
-
-        # Stop worker
-        system.stop = True
-
-        with contextlib.suppress(TimeoutError):
-            await worker_task
-
-        # Worker should have handled empty queue gracefully
-        # (No assertion needed - just verify it doesn't crash)
-
-    @pytest.mark.asyncio
-    async def test_worker_respects_queue_filter(self, db_pool, db_params):
-        """Test worker only processes jobs from specified queues."""
-        # Use unique queue names to avoid interference with other tests
-        queue_a = f"queue_a_{uuid.uuid4().hex[:8]}"
-        queue_b = f"queue_b_{uuid.uuid4().hex[:8]}"
-
-        async with db_pool.acquire() as conn:
-            # Clean database
-            await conn.execute("DELETE FROM jorb")
-
-            # Create job in queue_a
-            job_id_a = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING id
-            """,
-                "tests.test_pj_worker_run_loop.QuickJob",
-                {"value": "queue_a"},
-                queue_a,
-                "queued",
-                100,
-            )
-
-            # Create job in queue_b (different queue)
-            job_id_b = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING id
-            """,
-                "tests.test_pj_worker_run_loop.QuickJob",
-                {"value": "queue_b"},
-                queue_b,
-                "queued",
-                100,
-            )
-
-        # Create worker that only processes queue_a (not queue_b)
-        system = JobSystem(
-            dsn=db_params,
-            qname=queue_a,  # Only queue_a, not queue_b
-            capabilities=("std",),
-            workerId=9,
-            checkInterval=0.1,
-            webPort=None,
-        )
-
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=2.0)
-
-        worker_task = asyncio.create_task(run_worker())
+        # Let worker poll an empty queue for a while
         await asyncio.sleep(0.8)
-        system.stop = True
 
-        with contextlib.suppress(TimeoutError):
-            await worker_task
+        # still alive and heartbeating (registry row is open)
+        assert not system.stop
+        live = await db_pool.fetchval(
+            """SELECT count(*) FROM jorb_worker
+               WHERE queue = $1 AND shutdown_at IS NULL""",
+            unique_queue,
+        )
+        assert live == 1
 
-        # Verify only queue_a job was processed
-        async with db_pool.acquire() as conn:
-            job_a = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id_a)
-            job_b = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id_b)
+    async def test_worker_respects_queue_filter(
+        self, live_worker, unique_queue, db_pool
+    ):
+        """Test worker only processes jobs from its own queue."""
+        other_queue = f"{unique_queue}_other"
+        await live_worker()
 
-            assert job_a["state"] == "finished", (
-                f"queue_a job should be finished, got {job_a['state']}"
-            )
-            assert job_b["state"] == "queued", (
-                f"queue_b job should not be processed, got {job_b['state']}"
-            )
+        job_id_a = await enqueue(
+            db_pool, unique_queue, f"{THIS}.SyncQuickJob", {"value": "mine"}
+        )
+        job_id_b = await enqueue(
+            db_pool, other_queue, f"{THIS}.SyncQuickJob", {"value": "other"}
+        )
 
-    @pytest.mark.asyncio
-    async def test_worker_processes_async_generator_job(self, db_pool, db_params):
+        job_a = await wait_for_job_state(db_pool, job_id_a, ("finished",))
+        assert job_a["result"] == "quick: mine"
+
+        # the other queue's job is untouched
+        await asyncio.sleep(0.5)
+        job_b = await db_pool.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id_b)
+        assert job_b["state"] == "queued", (
+            f"other-queue job should not be processed, got {job_b['state']}"
+        )
+
+    async def test_worker_processes_async_generator_job(
+        self, live_worker, unique_queue, db_pool
+    ):
         """Test worker can handle async generator jobs."""
-        async with db_pool.acquire() as conn:
-            # Clean database
-            await conn.execute(
-                "DELETE FROM jorb WHERE job_class LIKE 'tests.test_pj_worker_run_loop.%'"
-            )
+        await live_worker()
 
-            # Create async generator job
-            job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING id
-            """,
-                "tests.test_pj_worker_run_loop.AsyncGenJob",
-                {},
-                "default",
-                "queued",
-                100,
-            )
+        job_id = await enqueue(db_pool, unique_queue, f"{THIS}.AsyncGenJob")
 
-        # Create and run worker
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=10,
-            checkInterval=0.1,
-            webPort=None,
-        )
-
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=2.0)
-
-        worker_task = asyncio.create_task(run_worker())
-        await asyncio.sleep(0.8)
-        system.stop = True
-
-        with contextlib.suppress(TimeoutError):
-            await worker_task
-
-        # Verify async generator job was processed
-        async with db_pool.acquire() as conn:
-            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-            assert job["state"] == "finished"
-            # Result should be list from async generator
-            assert job["result"] == [0, 1, 2]
+        job = await wait_for_job_state(db_pool, job_id, ("finished",))
+        # Result should be list from async generator
+        assert job["result"] == [0, 1, 2]
 
 
 # ============================================================================
@@ -811,152 +430,41 @@ class TestWorkerRunLoopEdgeCases:
 
 
 class TestJobsWithoutTimeouts:
-    """Test jobs that have NO timeout configured - cover lines 558, 568, 571-576."""
+    """Test jobs that have NO timeout configured."""
 
-    @pytest.mark.asyncio
-    async def test_async_job_without_timeout(self, db_pool, db_params):
-        """Test async job with NO timeout configured (covers line 558)."""
-        async with db_pool.acquire() as conn:
-            # Clean database
-            await conn.execute("DELETE FROM jorb")
+    async def test_async_job_without_timeout(self, live_worker, unique_queue, db_pool):
+        """Test async job with NO timeout configured."""
+        await live_worker()
 
-            # Create async job with NO timeout in admin_data and no timeout attribute
-            job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING id
-            """,
-                "tests.test_pj_worker_run_loop.AsyncJobNoTimeout",
-                {"value": "test"},
-                "default",
-                "queued",
-                100,
-            )
-
-        # Create and run worker
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=200,
-            checkInterval=0.1,
-            webPort=None,
+        job_id = await enqueue(
+            db_pool, unique_queue, f"{THIS}.AsyncJobNoTimeout", {"value": "test"}
         )
 
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=1.0)
+        job = await wait_for_job_state(db_pool, job_id, ("finished",))
+        assert job["result"] == "async_no_timeout: test"
+        assert job["timeout_at"] is None  # no deadline was armed
 
-        worker_task = asyncio.create_task(run_worker())
-        await asyncio.sleep(0.3)
-        system.stop = True
-
-        with contextlib.suppress(TimeoutError):
-            await worker_task
-
-        # Verify job completed successfully
-        async with db_pool.acquire() as conn:
-            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-            assert job["state"] == "finished", f"Job should finish, got: {job['state']}"
-            assert job["result"] == "async_no_timeout: test"
-
-    @pytest.mark.asyncio
     async def test_async_generator_from_async_function_without_timeout(
-        self, db_pool, db_params
+        self, live_worker, unique_queue, db_pool
     ):
-        """Test async generator (from async function) with NO timeout (covers line 568)."""
-        async with db_pool.acquire() as conn:
-            # Clean database
-            await conn.execute("DELETE FROM jorb")
+        """Test async generator (from async function) with NO timeout."""
+        await live_worker()
 
-            # Create async generator job with NO timeout
-            job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING id
-            """,
-                "tests.test_pj_worker_run_loop.AsyncGenJobNoTimeout",
-                {},
-                "default",
-                "queued",
-                100,
-            )
+        job_id = await enqueue(db_pool, unique_queue, f"{THIS}.AsyncGenJobNoTimeout")
 
-        # Create and run worker
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=201,
-            checkInterval=0.1,
-            webPort=None,
-        )
+        job = await wait_for_job_state(db_pool, job_id, ("finished",))
+        assert job["result"] == ["item_0", "item_1"]
 
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=1.0)
+    async def test_direct_async_generator_without_timeout(
+        self, live_worker, unique_queue, db_pool
+    ):
+        """Test direct async generator (via run() override) with NO timeout."""
+        await live_worker()
 
-        worker_task = asyncio.create_task(run_worker())
-        await asyncio.sleep(0.3)
-        system.stop = True
+        job_id = await enqueue(db_pool, unique_queue, f"{THIS}.DirectAsyncGenJob")
 
-        with contextlib.suppress(TimeoutError):
-            await worker_task
-
-        # Verify job completed and collected generator
-        async with db_pool.acquire() as conn:
-            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-            assert job["state"] == "finished", f"Job should finish, got: {job['state']}"
-            # Result should be list from collected generator
-            assert job["result"] == ["item_0", "item_1"]
-
-    @pytest.mark.asyncio
-    async def test_direct_async_generator_without_timeout(self, db_pool, db_params):
-        """Test direct async generator (not from async function) with NO timeout (covers lines 571-576)."""
-        async with db_pool.acquire() as conn:
-            # Clean database
-            await conn.execute("DELETE FROM jorb")
-
-            # Create job that directly returns async generator
-            job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING id
-            """,
-                "tests.test_pj_worker_run_loop.DirectAsyncGenJob",
-                {},
-                "default",
-                "queued",
-                100,
-            )
-
-        # Create and run worker
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=202,
-            checkInterval=0.1,
-            webPort=None,
-        )
-
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=1.0)
-
-        worker_task = asyncio.create_task(run_worker())
-        await asyncio.sleep(0.3)
-        system.stop = True
-
-        with contextlib.suppress(TimeoutError):
-            await worker_task
-
-        # Verify job completed and collected generator
-        async with db_pool.acquire() as conn:
-            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-            assert job["state"] == "finished", f"Job should finish, got: {job['state']}"
-            # Result should be list from collected generator
-            assert job["result"] == ["direct_0", "direct_1"]
+        job = await wait_for_job_state(db_pool, job_id, ("finished",))
+        assert job["result"] == ["direct_0", "direct_1"]
 
 
 # ============================================================================
@@ -965,41 +473,32 @@ class TestJobsWithoutTimeouts:
 
 
 class TestRescheduleBackoffEdgeCases:
-    """Test rescheduleBackoff edge cases - cover line 761."""
+    """Test rescheduleBackoff edge cases (pure calculation, no DB)."""
 
-    @pytest.mark.asyncio
     async def test_rescheduleBackoff_with_none_attempt(self):
-        """Test rescheduleBackoff when attempt=None (uses job error_count) - covers line 761."""
-        from pyjobby.pj import Job
+        """rescheduleBackoff with attempt=None uses the job's error_count."""
+        from datetime import timedelta
 
-        # Create a job dict with error_count
         job_dict = {
             "id": 999,
             "error_count": 2,
             "admin_data": {},  # No retry_strategy specified, will use default
         }
 
-        # Call rescheduleBackoff with attempt=None
-        # This should use job.get("error_count", 0) = 2
+        # Class-style call with attempt=None: uses error_count = 2
         delay = await Job.rescheduleBackoff(job_dict, attempt=None)
 
-        # Verify we got a timedelta back
-        assert isinstance(delay, type(delay)), "Should return timedelta"
+        assert isinstance(delay, timedelta)
         assert delay.total_seconds() > 0, "Delay should be positive"
 
-    @pytest.mark.asyncio
     async def test_rescheduleBackoff_with_explicit_attempt(self):
-        """Test rescheduleBackoff with explicit attempt value (doesn't use error_count)."""
-        from pyjobby.pj import Job
-
-        # Create a job dict
+        """rescheduleBackoff with explicit attempt ignores error_count."""
         job_dict = {
             "id": 999,
             "error_count": 5,  # This should be ignored when attempt is provided
             "admin_data": {"retry_strategy": "exponential"},
         }
 
-        # Call rescheduleBackoff with explicit attempt=1
         # Should use attempt=1, NOT error_count=5
         delay = await Job.rescheduleBackoff(job_dict, attempt=1)
 
@@ -1015,105 +514,31 @@ class TestRescheduleBackoffEdgeCases:
 
 
 class TestAsyncGeneratorWithTimeout:
-    """Test async generators WITH timeout configured - cover lines 566, 574."""
+    """Test async generators WITH a timeout configured."""
 
-    @pytest.mark.asyncio
     async def test_async_generator_from_async_function_with_timeout(
-        self, db_pool, db_params
+        self, live_worker, unique_queue, db_pool
     ):
-        """Test async generator (from async function) WITH timeout - covers line 566."""
-        async with db_pool.acquire() as conn:
-            # Clean database
-            await conn.execute("DELETE FROM jorb")
+        """Test async generator (from async function) WITH timeout."""
+        await live_worker()
 
-            # Create async generator job WITH timeout
-            job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING id
-            """,
-                "tests.test_pj_worker_run_loop.AsyncGenJobWithTimeout",
-                {},
-                "default",
-                "queued",
-                100,
-            )
+        job_id = await enqueue(db_pool, unique_queue, f"{THIS}.AsyncGenJobWithTimeout")
 
-        # Create and run worker
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=300,
-            checkInterval=0.1,
-            webPort=None,
+        job = await wait_for_job_state(db_pool, job_id, ("finished",))
+        assert job["result"] == ["item_0", "item_1", "item_2"]
+
+    async def test_direct_async_generator_with_timeout(
+        self, live_worker, unique_queue, db_pool
+    ):
+        """Test direct async generator (via run() override) WITH timeout."""
+        await live_worker()
+
+        job_id = await enqueue(
+            db_pool, unique_queue, f"{THIS}.DirectAsyncGenJobWithTimeout"
         )
 
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=1.0)
-
-        worker_task = asyncio.create_task(run_worker())
-        await asyncio.sleep(0.3)
-        system.stop = True
-
-        with contextlib.suppress(TimeoutError):
-            await worker_task
-
-        # Verify job completed and collected generator
-        async with db_pool.acquire() as conn:
-            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-            assert job["state"] == "finished", f"Job should finish, got: {job['state']}"
-            # Result should be list from collected generator
-            assert job["result"] == ["item_0", "item_1", "item_2"]
-
-    @pytest.mark.asyncio
-    async def test_direct_async_generator_with_timeout(self, db_pool, db_params):
-        """Test direct async generator (not from async function) WITH timeout - covers line 574."""
-        async with db_pool.acquire() as conn:
-            # Clean database
-            await conn.execute("DELETE FROM jorb")
-
-            # Create job that directly returns async generator WITH timeout
-            job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING id
-            """,
-                "tests.test_pj_worker_run_loop.DirectAsyncGenJobWithTimeout",
-                {},
-                "default",
-                "queued",
-                100,
-            )
-
-        # Create and run worker
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=301,
-            checkInterval=0.1,
-            webPort=None,
-        )
-
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=1.0)
-
-        worker_task = asyncio.create_task(run_worker())
-        await asyncio.sleep(0.3)
-        system.stop = True
-
-        with contextlib.suppress(TimeoutError):
-            await worker_task
-
-        # Verify job completed and collected generator
-        async with db_pool.acquire() as conn:
-            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-            assert job["state"] == "finished", f"Job should finish, got: {job['state']}"
-            # Result should be list from collected generator
-            assert job["result"] == ["direct_0", "direct_1"]
+        job = await wait_for_job_state(db_pool, job_id, ("finished",))
+        assert job["result"] == ["direct_0", "direct_1"]
 
 
 # ============================================================================
@@ -1122,282 +547,53 @@ class TestAsyncGeneratorWithTimeout:
 
 
 class TestJobReschedule:
-    """Test job.reschedule() method - covers lines 788-798."""
+    """Test job.reschedule(): a self-reschedule wins over completion."""
 
-    @pytest.mark.asyncio
-    async def test_job_reschedule_with_seconds(self, db_pool, db_params):
-        """Test job calls reschedule() to defer execution - covers lines 788-798."""
-        async with db_pool.acquire() as conn:
-            # Clean database
-            await conn.execute("DELETE FROM jorb")
+    async def test_job_reschedule_with_seconds(
+        self, live_worker, unique_queue, db_pool
+    ):
+        """Test job calls reschedule() to defer execution."""
+        await live_worker()
 
-            # Create rescheduling job
-            job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING id
-            """,
-                "tests.test_pj_worker_run_loop.ReschedulingJob",
-                {"seconds_delay": 300},  # Reschedule for 5 minutes
-                "default",
-                "queued",
-                100,
-            )
-
-        # Create and run worker
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=300,
-            checkInterval=0.1,
-            webPort=None,
+        job_id = await enqueue(
+            db_pool,
+            unique_queue,
+            f"{THIS}.ReschedulingJob",
+            {"seconds_delay": 300},  # Reschedule for 5 minutes
         )
 
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=1.0)
-
-        worker_task = asyncio.create_task(run_worker())
-        await asyncio.sleep(0.4)
-        system.stop = True
-
-        with contextlib.suppress(TimeoutError):
-            await worker_task
-
-        # Verify job completed (job called reschedule() then returned result, so it finishes)
-        # The important thing is that reschedule() was called, which covers lines 788-798
-        async with db_pool.acquire() as conn:
-            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-
-            # Job finishes because it returned a result after calling reschedule()
-            # reschedule() puts the job back in 'queued' with a future
-            # run_after; the worker's finished-update is state-guarded so it
-            # does NOT cancel the self-requested reschedule.
-            assert job["state"] == "queued", (
-                f"Job should stay queued for its reschedule, got: {job['state']}"
+        # reschedule() puts the job back in 'queued' with a future run_after;
+        # the worker's finished-update is epoch/state-guarded so it does NOT
+        # cancel the self-requested reschedule.
+        job = await wait_for(
+            lambda: db_pool.fetchrow(
+                """SELECT * FROM jorb
+                   WHERE id = $1 AND state = 'queued' AND run_after > now()""",
+                job_id,
             )
-            assert job["run_after"] > datetime.now(UTC).replace(tzinfo=None)
+        )
+        assert job["state"] == "queued"
+        assert job["run_after"] > datetime.now(UTC)
+        assert job["result"] is None  # completion did not overwrite
 
-    @pytest.mark.asyncio
-    async def test_job_reschedule_with_deltas(self, db_pool, db_params):
-        """Test job calls reschedule() with deltas dict - covers lines 788-798."""
-        async with db_pool.acquire() as conn:
-            # Clean database
-            await conn.execute("DELETE FROM jorb")
+    async def test_job_reschedule_with_deltas(self, live_worker, unique_queue, db_pool):
+        """Test job calls reschedule() with a deltas dict."""
+        await live_worker()
 
-            # Create rescheduling job using deltas
-            job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING id
-            """,
-                "tests.test_pj_worker_run_loop.ReschedulingJobWithDeltas",
-                {},
-                "default",
-                "queued",
-                100,
-            )
-
-        # Create and run worker
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=301,
-            checkInterval=0.1,
-            webPort=None,
+        job_id = await enqueue(
+            db_pool, unique_queue, f"{THIS}.ReschedulingJobWithDeltas"
         )
 
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=1.0)
-
-        worker_task = asyncio.create_task(run_worker())
-        await asyncio.sleep(0.4)
-        system.stop = True
-
-        with contextlib.suppress(TimeoutError):
-            await worker_task
-
-        # Verify job completed (job called reschedule() with deltas then returned result)
-        # The important thing is that reschedule() was called with deltas dict, covering lines 788-798
-        async with db_pool.acquire() as conn:
-            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-
-            # reschedule() wins over normal completion: the job stays queued
-            # for its future run instead of being stamped finished.
-            assert job["state"] == "queued", (
-                f"Job should stay queued for its reschedule, got: {job['state']}"
+        # reschedule() wins over normal completion: the job stays queued
+        # for its future run instead of being stamped finished.
+        job = await wait_for(
+            lambda: db_pool.fetchrow(
+                """SELECT * FROM jorb
+                   WHERE id = $1 AND state = 'queued' AND run_after > now()""",
+                job_id,
             )
-            assert job["run_after"] > datetime.now(UTC).replace(tzinfo=None)
-
-
-# ============================================================================
-# Test Job Recovery
-# ============================================================================
-
-
-class TestJobRecovery:
-    """Test abandoned job recovery on worker startup - covers lines 338-364."""
-
-    @pytest.mark.asyncio
-    async def test_recover_abandoned_jobs_disabled(self, db_pool, db_params):
-        """Test recovery when enable_recovery=False - covers lines 338-339."""
-        async with db_pool.acquire() as conn:
-            # Clean database
-            await conn.execute("DELETE FROM jorb")
-
-            # Create an abandoned job (claimed but old)
-            await conn.execute(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
-                                 worker_host, worker_pid)
-                VALUES ($1, $2, $3, $4, $5, NOW() - INTERVAL '10 minutes',
-                        NOW() - INTERVAL '10 minutes', $6, $7)
-            """,
-                "tests.test_pj_worker_run_loop.QuickJob",
-                {},
-                "default",
-                "claimed",
-                100,
-                "test-node",
-                12345,
-            )
-
-        # Create worker with recovery DISABLED
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=400,
-            checkInterval=0.1,
-            webPort=None,
-            enable_recovery=False,  # DISABLE recovery
         )
-
-        # Call recovery method
-        recovered = await system.recover_abandoned_jobs()
-
-        # Should return empty list when disabled
-        assert recovered == [], (
-            f"Should return empty list when recovery disabled, got: {recovered}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_recover_abandoned_jobs_with_worker_startup(self, db_pool, db_params):
-        """Test recovery of abandoned jobs when worker starts - covers lines 346-359, 362-364."""
-        async with db_pool.acquire() as conn:
-            # Clean database
-            await conn.execute("DELETE FROM jorb")
-
-            # Create abandoned jobs (claimed/running but old) on a specific node
-            job1_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
-                                 worker_host, worker_pid)
-                VALUES ($1, $2, $3, $4, $5, NOW() - INTERVAL '10 minutes',
-                        NOW() - INTERVAL '10 minutes', $6, $7)
-                RETURNING id
-            """,
-                "tests.test_pj_worker_run_loop.QuickJob",
-                {},
-                "default",
-                "claimed",
-                100,
-                "abandoned-host",
-                999,
-            )
-
-            job2_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
-                                 worker_host, worker_pid)
-                VALUES ($1, $2, $3, $4, $5, NOW() - INTERVAL '10 minutes',
-                        NOW() - INTERVAL '10 minutes', $6, $7)
-                RETURNING id
-            """,
-                "tests.test_pj_worker_run_loop.QuickJob",
-                {},
-                "default",
-                "running",
-                100,
-                "abandoned-host",
-                999,
-            )
-
-        # Create worker with recovery ENABLED on the SAME host
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=401,
-            checkInterval=0.1,
-            webPort=None,
-            enable_recovery=True,
-            recovery_timeout=300,  # Jobs older than 5 minutes get recovered
-        )
-
-        # Set node to match the abandoned jobs
-        system.node = "abandoned-host"
-
-        # Start worker briefly (which triggers recovery in its run() method)
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=0.5)
-
-        worker_task = asyncio.create_task(run_worker())
-        await asyncio.sleep(0.2)  # Let worker start and run recovery
-        system.stop = True
-
-        with contextlib.suppress(TimeoutError):
-            await worker_task
-
-        # Verify jobs were recovered (moved back to queued)
-        async with db_pool.acquire() as conn:
-            job1 = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job1_id)
-            job2 = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job2_id)
-
-            # Jobs should be recovered to queued state
-            # NOTE: They might have been processed already, so we check they're not in claimed/running
-            assert job1["state"] in ("queued", "finished"), (
-                f"Job 1 should be recovered, got: {job1['state']}"
-            )
-            assert job2["state"] in ("queued", "finished"), (
-                f"Job 2 should be recovered, got: {job2['state']}"
-            )
-
-
-# ============================================================================
-# Test Shutdown Handler
-# ============================================================================
-
-
-class TestShutdownHandler:
-    """Test graceful shutdown signal handler - covers lines 326-327."""
-
-    @pytest.mark.asyncio
-    async def test_shutdown_sets_stop_flag(self, db_pool, db_params):
-        """Test shutdown() signal handler sets stop flag - covers lines 326-327."""
-        # Create worker
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=500,
-            checkInterval=0.1,
-            webPort=None,
-        )
-
-        # Initially stop should be False
-        assert system.stop == False, "Stop flag should be False initially"
-
-        # Call shutdown handler (simulating SIGTERM)
-        import signal
-
-        system.shutdown(signal.SIGTERM, None)
-
-        # Stop flag should now be True
-        assert system.stop == True, "Stop flag should be True after shutdown()"
+        assert job["run_after"] > datetime.now(UTC)
 
 
 # ============================================================================
@@ -1427,93 +623,59 @@ class AsyncWebEnabledJob(Job):
 
 
 class TestWebHandler:
-    """Test web handler functionality - covers lines 367-379."""
+    """Test web handler functionality."""
 
-    @pytest.mark.asyncio
-    async def test_web_handler_sync_response(self, db_pool, db_params):
-        """Test webHandler with sync web() method - covers lines 367-377."""
+    async def test_web_handler_sync_response(self, db_params, worker_params):
+        """Test webHandler with sync web() method."""
         from aiohttp.test_utils import make_mocked_request
 
-        # Create worker with webPort configured
         system = JobSystem(
             dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=600,
-            checkInterval=0.1,
-            webPort={
-                "paths": {"tests.test_pj_worker_run_loop.WebEnabledJob"},
-                "sites": [],
+            **{
+                **worker_params,
+                "webPort": {"paths": {f"{THIS}.WebEnabledJob"}, "sites": []},
             },
         )
 
-        # Create mock request
-        request = make_mocked_request(
-            "GET", "/tests.test_pj_worker_run_loop.WebEnabledJob"
-        )
-
-        # Call webHandler directly
+        request = make_mocked_request("GET", f"/{THIS}.WebEnabledJob")
         response = await system.webHandler(request)
 
-        # Verify response
         assert response.status == 200
         assert response.text == "web_job_response"
 
-    @pytest.mark.asyncio
-    async def test_web_handler_async_response(self, db_pool, db_params):
-        """Test webHandler with async web() method - covers lines 372-373."""
+    async def test_web_handler_async_response(self, db_params, worker_params):
+        """Test webHandler with async web() method."""
         from aiohttp.test_utils import make_mocked_request
 
-        # Create worker with webPort configured
         system = JobSystem(
             dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=601,
-            checkInterval=0.1,
-            webPort={
-                "paths": {"tests.test_pj_worker_run_loop.AsyncWebEnabledJob"},
-                "sites": [],
+            **{
+                **worker_params,
+                "webPort": {"paths": {f"{THIS}.AsyncWebEnabledJob"}, "sites": []},
             },
         )
 
-        # Create mock request
-        request = make_mocked_request(
-            "GET", "/tests.test_pj_worker_run_loop.AsyncWebEnabledJob"
-        )
-
-        # Call webHandler directly
+        request = make_mocked_request("GET", f"/{THIS}.AsyncWebEnabledJob")
         response = await system.webHandler(request)
 
-        # Verify response
         assert response.status == 200
         assert response.text == "async_web_job_response"
 
-    @pytest.mark.asyncio
-    async def test_web_handler_invalid_path(self, db_pool, db_params):
-        """Test webHandler with invalid path - covers line 379."""
+    async def test_web_handler_invalid_path(self, db_params, worker_params):
+        """Test webHandler with a path not in the allowlist."""
         from aiohttp.test_utils import make_mocked_request
 
-        # Create worker with webPort configured
         system = JobSystem(
             dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=602,
-            checkInterval=0.1,
-            webPort={
-                "paths": {"tests.test_pj_worker_run_loop.WebEnabledJob"},
-                "sites": [],
+            **{
+                **worker_params,
+                "webPort": {"paths": {f"{THIS}.WebEnabledJob"}, "sites": []},
             },
         )
 
-        # Create mock request for invalid path
         request = make_mocked_request("GET", "/invalid.path.NotFound")
-
-        # Call webHandler directly
         response = await system.webHandler(request)
 
-        # Verify "not so fast!" response
         assert response.status == 200
         assert response.text == "not so fast!"
 
@@ -1524,27 +686,18 @@ class TestWebHandler:
 
 
 class TestClassLoadingErrors:
-    """Test error handling when loading job classes - covers lines 393-396."""
+    """Test error handling when loading job classes."""
 
-    @pytest.mark.asyncio
-    async def test_class_not_found_raises_file_not_found(self, db_pool, db_params):
-        """Test that loading non-existent job class raises FileNotFoundError - covers lines 393-396."""
-        # Create worker
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=700,
-            checkInterval=0.1,
-            webPort=None,
-        )
+    async def test_class_not_found_raises_file_not_found(
+        self, db_params, worker_params
+    ):
+        """Loading a non-existent job class raises FileNotFoundError."""
+        system = JobSystem(dsn=db_params, **worker_params)
 
-        # Try to load class from existing module but non-existent class
         # Use a real module (asyncio) but fake class name
         with pytest.raises(FileNotFoundError) as excinfo:
             system.classForKlassFromName("asyncio.NonExistentClass")
 
-        # Verify error message
         assert "Job class not found" in str(excinfo.value)
         assert "asyncio.NonExistentClass" in str(excinfo.value)
 
@@ -1555,11 +708,10 @@ class TestClassLoadingErrors:
 
 
 class TestWebServerStartup:
-    """Test web server startup when webPort is configured - covers lines 408-425."""
+    """Test web server startup when webPort is configured."""
 
-    @pytest.mark.asyncio
-    async def test_web_server_tcp_startup(self, db_pool, db_params):
-        """Test that worker starts TCP web server when configured - covers lines 408-423."""
+    async def test_web_server_tcp_startup(self, live_worker, unique_queue):
+        """Test that worker starts a TCP web server when configured."""
         import random
 
         import aiohttp
@@ -1567,52 +719,23 @@ class TestWebServerStartup:
         # Choose a random high port to avoid conflicts
         port = random.randint(49152, 65535)
 
-        # Create worker with webPort TCP site configured
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=800,
-            checkInterval=0.1,
+        await live_worker(
             webPort={
-                "paths": {"tests.test_pj_worker_run_loop.WebEnabledJob"},
+                "paths": {f"{THIS}.WebEnabledJob"},
                 "sites": [{"host": "127.0.0.1", "port": port}],
-            },
+            }
         )
 
-        # Start worker briefly
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=0.5)
+        async with (
+            aiohttp.ClientSession() as session,
+            session.get(f"http://127.0.0.1:{port}/{THIS}.WebEnabledJob") as resp,
+        ):
+            assert resp.status == 200
+            text = await resp.text()
+            assert text == "web_job_response"
 
-        worker_task = asyncio.create_task(run_worker())
-
-        # Wait for server to start
-        await asyncio.sleep(0.2)
-
-        # Try to connect to the web server
-        try:
-            async with (
-                aiohttp.ClientSession() as session,
-                session.get(
-                    f"http://127.0.0.1:{port}/tests.test_pj_worker_run_loop.WebEnabledJob"
-                ) as resp,
-            ):
-                assert resp.status == 200
-                text = await resp.text()
-                assert text == "web_job_response"
-        except aiohttp.ClientError:
-            # Server might have stopped, but we at least covered the startup code
-            pass
-
-        # Stop worker
-        system.stop = True
-
-        with contextlib.suppress(TimeoutError):
-            await worker_task
-
-    @pytest.mark.asyncio
-    async def test_web_server_unix_socket_startup(self, db_pool, db_params):
-        """Test that worker starts Unix socket web server when configured - covers lines 415-418."""
+    async def test_web_server_unix_socket_startup(self, live_worker, unique_queue):
+        """Test that worker starts a Unix socket web server when configured."""
         import os
         import tempfile
 
@@ -1620,43 +743,19 @@ class TestWebServerStartup:
         with tempfile.NamedTemporaryFile(delete=True) as f:
             socket_path = f.name
 
-        # Create worker with webPort Unix socket site configured
-        system = JobSystem(
-            dsn=db_params,
-            qname="default",
-            capabilities=("std",),
-            workerId=801,
-            checkInterval=0.1,
+        system = await live_worker(
             webPort={
-                "paths": {"tests.test_pj_worker_run_loop.WebEnabledJob"},
+                "paths": {f"{THIS}.WebEnabledJob"},
                 "sites": [{"path": socket_path}],  # Unix socket path
-            },
+            }
         )
 
-        # Start worker briefly
-        async def run_worker():
-            await asyncio.wait_for(system.run(), timeout=0.5)
-
-        worker_task = asyncio.create_task(run_worker())
-
-        # Wait for server to start
-        await asyncio.sleep(0.2)
-
-        # Check that socket file was created (with worker ID appended)
+        # Socket file is created with the worker ID appended
         expected_socket = f"{socket_path}-{system.workerId}"
-        socket_exists = os.path.exists(expected_socket)
-
-        # Stop worker
-        system.stop = True
-
-        with contextlib.suppress(TimeoutError):
-            await worker_task
-
-        # Clean up socket file if it exists
-        if os.path.exists(expected_socket):
-            os.unlink(expected_socket)
-
-        # Verify socket was created (indicates Unix socket path was executed)
-        assert socket_exists, (
-            f"Unix socket should have been created at {expected_socket}"
-        )
+        try:
+            assert os.path.exists(expected_socket), (
+                f"Unix socket should have been created at {expected_socket}"
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(expected_socket)

@@ -41,17 +41,3 @@ class TestVersionDetection:
 
             # Should fall back to "dev"
             assert pyjobby.__version__ == "dev"
-
-    def test_importlib_metadata_fallback(self):
-        """Test fallback to importlib_metadata for pre-3.8 Python - covers lines 3-5."""
-        # This path is hard to test in Python 3.11, but we can verify the import logic
-        # The fallback is for Python < 3.8, which we're not running
-
-        # Test that the current import works
-        from importlib import metadata
-
-        # Verify metadata module has version function
-        assert hasattr(metadata, "version")
-
-        # Note: Lines 3-5 are defensive code for older Python versions
-        # They won't execute in Python 3.11+ environment

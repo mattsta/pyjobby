@@ -1,22 +1,20 @@
 """
-Comprehensive integration tests for pj.py JobSystem worker.
+Comprehensive integration tests for pj.py JobSystem worker (schema v1).
 
-Tests THE CORE WORKER PROCESS with LIVE database operations.
-NO MOCKS - real job execution, real database, real worker process.
-
-This is the HEART of the platform - the actual job execution engine!
-
-Coverage Target: 70%+ for pj.py
+Tests the core worker machinery with LIVE database operations.
+NO MOCKS - real job execution, real database, the real claim/finish/crash
+statements from pyjobby.pj.STMTS.
 """
 
 import asyncio
-import os
-from typing import Any
 
-import asyncpg
 import pytest
 
-from pyjobby.pj import Job, JobSystem
+from pyjobby import db
+from pyjobby.pj import STMTS, Job, JobSystem
+
+pytestmark = pytest.mark.asyncio
+
 
 # ============================================================================
 # Test Job Classes for Worker Integration Testing
@@ -57,11 +55,9 @@ class TimeoutJob(Job):
         return "should_not_reach"
 
 
-class CounterJob(Job):
-    """Job that increments a counter in kwargs."""
-
-    def task(self, count: int = 0):
-        return count + 1
+async def claim(conn, queue, *, pid=12345, host="test-node", caps=(), prio=1000):
+    """Claim the next job on `queue` via the REAL claim statement."""
+    return await conn.fetchrow(STMTS["claim"], pid, host, queue, list(caps), prio, None)
 
 
 # ============================================================================
@@ -72,67 +68,35 @@ class CounterJob(Job):
 class TestJobSystemInitialization:
     """Test JobSystem initialization with live database."""
 
-    @pytest.mark.asyncio
-    async def test_jobsystem_database_connection(self, db_params):
-        """Test JobSystem can connect to database."""
-        system = JobSystem(
-            dsn=db_params,
-            qname=["default"],
-            capabilities=["std"],
-            workerId=1,
-            checkInterval=1,
-            webPort=None,
-        )
+    async def test_jobsystem_database_connection(self, db_params, worker_params):
+        """Test JobSystem can connect to database (with pyjobby codecs)."""
+        system = JobSystem(dsn=db_params, **worker_params)
 
-        # Connect to database
-        system.cxn = await asyncpg.connect(**db_params)
+        system.cxn = await db.connect(**db_params)
+        try:
+            assert system.cxn is not None
+            assert not system.cxn.is_closed()
 
-        assert system.cxn is not None
-        assert not system.cxn.is_closed()
+            # codecs registered: jsonb round-trips as dict
+            row = await system.cxn.fetchval("SELECT '{\"a\": 1}'::jsonb")
+            assert row == {"a": 1}
+        finally:
+            await system.cxn.close()
 
-        # Test codec setup (orjson)
-        def orjson_encoder(obj: Any) -> str:
-            import orjson
-
-            return orjson.dumps(obj).decode("utf-8")
-
-        import orjson
-
-        await system.cxn.set_type_codec(
-            "json", encoder=orjson_encoder, decoder=orjson.loads, schema="pg_catalog"
-        )
-
-        # Cleanup
-        await system.cxn.close()
-
-    @pytest.mark.asyncio
-    async def test_jobsystem_statement_preparation(self, db_params):
+    async def test_jobsystem_statement_preparation(self, db_params, worker_params):
         """Test JobSystem prepares all SQL statements."""
-        from pyjobby.pj import STMTS
+        system = JobSystem(dsn=db_params, **worker_params)
 
-        system = JobSystem(
-            dsn=db_params,
-            qname=["default"],
-            capabilities=["std"],
-            workerId=1,
-            checkInterval=1,
-            webPort=None,
-        )
+        system.cxn = await db.connect(**db_params)
+        try:
+            system.stmts = {
+                name: await system.cxn.prepare(stmt) for name, stmt in STMTS.items()
+            }
 
-        system.cxn = await asyncpg.connect(**db_params)
-
-        # Prepare all statements
-        system.stmts = {}
-        for name, stmt in STMTS.items():
-            system.stmts[name] = await system.cxn.prepare(stmt)
-
-        # Verify all statements prepared
-        assert len(system.stmts) == len(STMTS)
-        # PreparedStatement is not directly exposed by asyncpg, so just check they're not None
-        assert all(stmt is not None for stmt in system.stmts.values())
-
-        # Cleanup
-        await system.cxn.close()
+            assert len(system.stmts) == len(STMTS)
+            assert all(stmt is not None for stmt in system.stmts.values())
+        finally:
+            await system.cxn.close()
 
 
 # ============================================================================
@@ -141,104 +105,42 @@ class TestJobSystemInitialization:
 
 
 class TestJobPollingAndClaiming:
-    """Test worker job polling and claiming with live database."""
+    """Test worker job claiming with the real claim statement."""
 
-    @pytest.mark.asyncio
-    async def test_worker_claims_job(self, db_pool):
+    async def test_worker_claims_job(self, db_pool, unique_queue):
         """Test worker can claim a job from the queue."""
         async with db_pool.acquire() as conn:
-            # Clean up any existing queued jobs to avoid test pollution
-            await conn.execute("""
-                DELETE FROM jorb
-                WHERE state = 'queued'
-                AND queue = 'default'
-                AND (run_after IS NULL OR run_after <= TIMEZONE('utc', clock_timestamp()))
-            """)
-
-            # Create a job
             job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING id
-            """,
-                "test_pj_worker_integration.SimpleTestJob",
+                """INSERT INTO jorb (job_class, kwargs, queue)
+                   VALUES ($1, $2, $3) RETURNING id""",
+                "tests.test_pj_worker_integration.SimpleTestJob",
                 {"value": "test"},
-                "default",
-                "queued",
-                100,
+                unique_queue,
             )
 
-            # Claim the job (simulating worker claim logic)
-            claimed = await conn.fetchrow(
-                """
-                UPDATE jorb
-                SET state = 'claimed',
-                    worker_pid = $2,
-                    worker_host = $3
-                WHERE id = (
-                    SELECT id FROM jorb
-                    WHERE state = 'queued'
-                    AND queue = ANY($1::text[])
-                    AND (run_after IS NULL OR run_after <= TIMEZONE('utc', clock_timestamp()))
-                    ORDER BY prio DESC, id ASC
-                    LIMIT 1
-                    FOR UPDATE SKIP LOCKED
-                )
-                RETURNING *
-            """,
-                ["default"],
-                os.getpid(),
-                "test-node",
-            )
+            claimed = await claim(conn, unique_queue, pid=4242)
 
             assert claimed is not None
             assert claimed["id"] == job_id
             assert claimed["state"] == "claimed"
-            assert claimed["worker_pid"] == os.getpid()
+            assert claimed["worker_pid"] == 4242
+            assert claimed["worker_host"] == "test-node"
+            assert claimed["run_epoch"] == 1  # bumped on claim
 
-    @pytest.mark.asyncio
-    async def test_worker_skips_jobs_not_in_queue(self, db_pool):
+    async def test_worker_skips_jobs_not_in_queue(self, db_pool, unique_queue):
         """Test worker doesn't claim jobs from other queues."""
+        other_queue = f"{unique_queue}_high"
         async with db_pool.acquire() as conn:
-            # First, clean up any queued jobs in 'default' queue to avoid test pollution
-            await conn.execute(
-                "DELETE FROM jorb WHERE state = 'queued' AND queue = 'default'"
-            )
-
-            # Create job in 'high' queue
             job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING id
-            """,
-                "test_pj_worker_integration.SimpleTestJob",
+                """INSERT INTO jorb (job_class, kwargs, queue)
+                   VALUES ($1, $2, $3) RETURNING id""",
+                "tests.test_pj_worker_integration.SimpleTestJob",
                 {},
-                "high",
-                "queued",
-                100,
+                other_queue,
             )
 
-            # Try to claim from 'default' queue only
-            claimed = await conn.fetchrow(
-                """
-                UPDATE jorb
-                SET state = 'claimed'
-                WHERE id = (
-                    SELECT id FROM jorb
-                    WHERE state = 'queued'
-                    AND queue = ANY($1::text[])
-                    ORDER BY prio DESC, id ASC
-                    LIMIT 1
-                    FOR UPDATE SKIP LOCKED
-                )
-                RETURNING *
-            """,
-                ["default"],
-            )  # Only looking in 'default', not 'high'
-
-            # Should not claim the job
+            # Claim from unique_queue only — must not see the other queue
+            claimed = await claim(conn, unique_queue)
             assert claimed is None
 
             # Verify job still queued
@@ -254,92 +156,56 @@ class TestJobPollingAndClaiming:
 class TestJobExecution:
     """Test actual job execution with live database and worker."""
 
-    @pytest.mark.asyncio
-    async def test_execute_simple_sync_job(self, db_pool, db_params):
+    async def test_execute_simple_sync_job(
+        self, db_pool, db_params, worker_params, unique_queue
+    ):
         """Test executing a simple synchronous job."""
         async with db_pool.acquire() as conn:
-            # Create and claim job
             job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING id
-            """,
-                "test_pj_worker_integration.SimpleTestJob",
+                """INSERT INTO jorb (job_class, kwargs, queue)
+                   VALUES ($1, $2, $3) RETURNING id""",
+                "tests.test_pj_worker_integration.SimpleTestJob",
                 {"value": "test123"},
-                "default",
-                "claimed",
-                100,
+                unique_queue,
             )
+            claimed = await claim(conn, unique_queue)
+            assert claimed["id"] == job_id
+            epoch = claimed["run_epoch"]
 
-            # Execute job manually (simulating worker execution)
-            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+            system = JobSystem(dsn=db_params, **worker_params)
 
-            # Create a minimal JobSystem for the job
-            system = JobSystem(
-                dsn=db_params,
-                qname=["default"],
-                capabilities=["std"],
-                workerId=1,
-                checkInterval=1,
-                webPort=None,
-            )
-
-            # Instantiate job class with proper parameters
-            job_instance = SimpleTestJob(s=system, job=dict(job))
+            # Instantiate job class with the claimed row
+            job_instance = SimpleTestJob(s=system, job=dict(claimed))
             result = job_instance.run()
 
             assert result == "processed: test123"
 
-            # Mark as finished
-            await conn.execute(
-                """
-                UPDATE jorb
-                SET state = 'finished',
-                    result = $2,
-                    finished = NOW()
-                WHERE id = $1
-            """,
-                job_id,
-                result,
-            )
+            # Mark as finished via the real (epoch-fenced) statement
+            await conn.execute(STMTS["finished"], job_id, result, epoch)
 
-            # Verify
             final_job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
             assert final_job["state"] == "finished"
             assert final_job["result"] == "processed: test123"
 
-    @pytest.mark.asyncio
-    async def test_execute_async_job(self, db_pool, db_params):
+    async def test_execute_async_job(
+        self, db_pool, db_params, worker_params, unique_queue
+    ):
         """Test executing an async job."""
         async with db_pool.acquire() as conn:
             job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING id
-            """,
-                "test_pj_worker_integration.AsyncTestJob",
+                """INSERT INTO jorb (job_class, kwargs, queue)
+                   VALUES ($1, $2, $3) RETURNING id""",
+                "tests.test_pj_worker_integration.AsyncTestJob",
                 {"delay": 0.1},
-                "default",
-                "claimed",
-                100,
+                unique_queue,
             )
+            claimed = await claim(conn, unique_queue)
+            epoch = claimed["run_epoch"]
 
-            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-
-            # Create a minimal JobSystem for the job
-            system = JobSystem(
-                dsn=db_params,
-                qname=["default"],
-                capabilities=["std"],
-                workerId=1,
-                checkInterval=1,
-                webPort=None,
-            )
+            system = JobSystem(dsn=db_params, **worker_params)
 
             # Execute async job
-            job_instance = AsyncTestJob(s=system, job=dict(job))
+            job_instance = AsyncTestJob(s=system, job=dict(claimed))
             resultStageA = job_instance.run()
 
             assert asyncio.iscoroutine(resultStageA)
@@ -347,18 +213,7 @@ class TestJobExecution:
 
             assert result == "async_complete"
 
-            # Mark as finished
-            await conn.execute(
-                """
-                UPDATE jorb
-                SET state = 'finished',
-                    result = $2,
-                    finished = NOW()
-                WHERE id = $1
-            """,
-                job_id,
-                result,
-            )
+            await conn.execute(STMTS["finished"], job_id, result, epoch)
 
             final_job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
             assert final_job["state"] == "finished"
@@ -372,39 +227,26 @@ class TestJobExecution:
 class TestJobErrorHandling:
     """Test job error handling and retry logic."""
 
-    @pytest.mark.asyncio
-    async def test_job_failure_marks_crashed(self, db_pool, db_params):
-        """Test that failing jobs are marked as crashed."""
+    async def test_job_failure_marks_crashed(
+        self, db_pool, db_params, worker_params, unique_queue
+    ):
+        """Test that failing jobs can be dead-lettered (state 'crashed')."""
         async with db_pool.acquire() as conn:
             job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
-                                 error_count, admin_data)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), 0, $6)
-                RETURNING id
-            """,
-                "test_pj_worker_integration.FailingJob",
+                """INSERT INTO jorb (job_class, kwargs, queue, admin_data)
+                   VALUES ($1, $2, $3, $4) RETURNING id""",
+                "tests.test_pj_worker_integration.FailingJob",
                 {},
-                "default",
-                "claimed",
-                100,
+                unique_queue,
                 {"max_retries": 3},
             )
+            claimed = await claim(conn, unique_queue)
+            epoch = claimed["run_epoch"]
 
-            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-
-            # Create a minimal JobSystem for the job
-            system = JobSystem(
-                dsn=db_params,
-                qname=["default"],
-                capabilities=["std"],
-                workerId=1,
-                checkInterval=1,
-                webPort=None,
-            )
+            system = JobSystem(dsn=db_params, **worker_params)
 
             # Try to execute failing job
-            job_instance = FailingJob(s=system, job=dict(job))
+            job_instance = FailingJob(s=system, job=dict(claimed))
             error_message = None
             try:
                 job_instance.run()
@@ -413,18 +255,9 @@ class TestJobErrorHandling:
 
             assert error_message == "Intentional test failure"
 
-            # Mark as crashed
+            # Dead-letter via the real statement (increments error_count)
             await conn.execute(
-                """
-                UPDATE jorb
-                SET state = 'crashed',
-                    error_count = error_count + 1,
-                    error_message = $2,
-                    finished = NOW()
-                WHERE id = $1
-            """,
-                job_id,
-                error_message,
+                STMTS["crashed"], job_id, error_message, "Traceback...", epoch
             )
 
             final_job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
@@ -432,40 +265,41 @@ class TestJobErrorHandling:
             assert final_job["error_count"] == 1
             assert "Intentional test failure" in final_job["error_message"]
 
-    @pytest.mark.asyncio
-    async def test_job_retry_on_failure(self, db_pool):
-        """Test that failed jobs are retried."""
+    async def test_job_retry_on_failure(self, db_pool, unique_queue):
+        """A failed attempt requeues the SAME row with backoff."""
+        from datetime import timedelta
+
         async with db_pool.acquire() as conn:
             job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
-                                 error_count, admin_data)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), 1, $6)
-                RETURNING id
-            """,
-                "test_pj_worker_integration.FailingJob",
+                """INSERT INTO jorb (job_class, kwargs, queue, admin_data)
+                   VALUES ($1, $2, $3, $4) RETURNING id""",
+                "tests.test_pj_worker_integration.FailingJob",
                 {},
-                "default",
-                "crashed",
-                100,
+                unique_queue,
                 {"max_retries": 5},
             )
+            claimed = await claim(conn, unique_queue)
 
-            # Simulate retry logic - requeue the job
+            # Same-row retry with a 1-second backoff
             await conn.execute(
-                """
-                UPDATE jorb
-                SET state = 'queued',
-                    run_after = NOW() + INTERVAL '1 second'
-                WHERE id = $1
-            """,
+                STMTS["retry"],
                 job_id,
+                timedelta(seconds=1),
+                "Intentional test failure",
+                "Traceback...",
+                claimed["run_epoch"],
             )
 
             job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
             assert job["state"] == "queued"
             assert job["error_count"] == 1
             assert job["run_after"] is not None
+
+            # one row only — retries never create copies
+            total = await conn.fetchval(
+                "SELECT count(*) FROM jorb WHERE queue = $1", unique_queue
+            )
+            assert total == 1
 
 
 # ============================================================================
@@ -476,49 +310,39 @@ class TestJobErrorHandling:
 class TestJobTimeoutHandling:
     """Test job timeout enforcement."""
 
-    @pytest.mark.asyncio
-    async def test_timeout_enforcement(self, db_pool, db_params):
+    async def test_timeout_enforcement(
+        self, db_pool, db_params, worker_params, unique_queue
+    ):
         """Test that jobs respect timeout settings."""
         async with db_pool.acquire() as conn:
             job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
-                                 admin_data)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), $6)
-                RETURNING id
-            """,
-                "test_pj_worker_integration.TimeoutJob",
+                """INSERT INTO jorb (job_class, kwargs, queue, admin_data)
+                   VALUES ($1, $2, $3, $4) RETURNING id""",
+                "tests.test_pj_worker_integration.TimeoutJob",
                 {},
-                "default",
-                "claimed",
-                100,
+                unique_queue,
                 {"timeout_seconds": 1},
             )
+            claimed = await claim(conn, unique_queue)
 
-            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+            # Arm the (epoch-fenced) timeout deadline like the worker does
+            from datetime import timedelta
 
-            # Set timeout_at in database
             await conn.execute(
-                """
-                UPDATE jorb
-                SET timeout_at = NOW() + INTERVAL '1 second'
-                WHERE id = $1
-            """,
+                STMTS["set-timeout"],
                 job_id,
+                timedelta(seconds=1),
+                claimed["run_epoch"],
             )
+            timeout_at = await conn.fetchval(
+                "SELECT timeout_at FROM jorb WHERE id = $1", job_id
+            )
+            assert timeout_at is not None
 
-            # Create a minimal JobSystem for the job
-            system = JobSystem(
-                dsn=db_params,
-                qname=["default"],
-                capabilities=["std"],
-                workerId=1,
-                checkInterval=1,
-                webPort=None,
-            )
+            system = JobSystem(dsn=db_params, **worker_params)
 
             # Execute with timeout
-            job_instance = TimeoutJob(s=system, job=dict(job))
+            job_instance = TimeoutJob(s=system, job=dict(claimed))
             resultStageA = job_instance.run()
 
             with pytest.raises(asyncio.TimeoutError):
@@ -526,63 +350,49 @@ class TestJobTimeoutHandling:
 
 
 # ============================================================================
-# Test Crash Recovery
+# Test Crash Recovery (monitor-style requeue of a dead worker's job)
 # ============================================================================
 
 
 class TestCrashRecovery:
-    """Test worker crash recovery."""
+    """Test requeueing in-flight jobs owned by a dead worker."""
 
-    @pytest.mark.asyncio
-    async def test_recover_abandoned_running_jobs(self, db_pool):
-        """Test recovery of jobs that were running when worker crashed."""
+    async def test_requeue_abandoned_running_job(self, db_pool, unique_queue):
+        """The monitor's requeue primitive puts an abandoned job back in
+        the queue: SAME row, epoch trail preserved in history."""
         async with db_pool.acquire() as conn:
-            # Clean up any existing abandoned jobs from this worker to avoid test pollution
-            await conn.execute("""
-                DELETE FROM jorb
-                WHERE worker_pid = 99999
-                AND worker_host = 'dead-node'
-            """)
-
-            # Create "abandoned" jobs (running but worker died)
-            abandoned_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
-                                 worker_pid, worker_host, started)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), $6, $7, NOW() - INTERVAL '10 minutes')
-                RETURNING id
-            """,
-                "test_pj_worker_integration.SimpleTestJob",
+            job_id = await conn.fetchval(
+                """INSERT INTO jorb (job_class, kwargs, queue)
+                   VALUES ($1, $2, $3) RETURNING id""",
+                "tests.test_pj_worker_integration.SimpleTestJob",
                 {},
-                "default",
-                "running",
-                100,
-                99999,
-                "dead-node",
+                unique_queue,
             )
+            claimed = await claim(conn, unique_queue, pid=99999, host="dead-node")
+            await conn.execute(STMTS["run"], job_id, claimed["run_epoch"])
 
-            # Simulate recovery (what JobSystem.recover_abandoned_jobs does)
-            recovered = await conn.fetch(
-                """
-                UPDATE jorb
-                SET state = 'queued',
-                    worker_pid = NULL,
-                    worker_host = NULL,
-                    error_count = error_count + 1,
-                    error_message = 'Worker crash - requeued'
-                WHERE state IN ('running', 'claimed')
-                AND worker_pid = $1
-                AND worker_host = $2
-                RETURNING *
-            """,
-                99999,
-                "dead-node",
+            # dead-worker recovery is the shared requeue primitive in
+            # pyjobby.db (driven by pyjobby.monitor via the worker registry)
+            requeued = await db.requeue_job(
+                conn,
+                job_id,
+                allowed_states=("claimed", "running"),
+                reset_errors=False,
             )
+            assert requeued == job_id
 
-            assert len(recovered) == 1
-            assert recovered[0]["id"] == abandoned_id
-            assert recovered[0]["state"] == "queued"
-            assert recovered[0]["error_count"] == 1
+            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+            assert job["state"] == "queued"
+
+            # a fresh claim gets a HIGHER epoch, fencing out the dead attempt
+            reclaimed = await claim(conn, unique_queue, pid=11111, host="live-node")
+            assert reclaimed["id"] == job_id
+            assert reclaimed["run_epoch"] == claimed["run_epoch"] + 1
+
+            stale = await conn.fetch(
+                STMTS["finished"], job_id, {"stale": True}, claimed["run_epoch"]
+            )
+            assert stale == []
 
 
 # ============================================================================
@@ -593,48 +403,26 @@ class TestCrashRecovery:
 class TestJobClassLoading:
     """Test dynamic job class loading."""
 
-    @pytest.mark.asyncio
-    async def test_class_for_klass_from_name(self, db_pool, db_params):
+    async def test_class_for_klass_from_name(
+        self, db_pool, db_params, worker_params, unique_queue
+    ):
         """Test loading job class from string name."""
         async with db_pool.acquire() as conn:
             job = await conn.fetchrow(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING *
-            """,
+                """INSERT INTO jorb (job_class, kwargs, queue)
+                   VALUES ($1, $2, $3) RETURNING *""",
                 "tests.test_pj_worker_integration.SimpleTestJob",
                 {"value": "test"},
-                "default",
-                "queued",
-                100,
+                unique_queue,
             )
 
-        # Test class loading (what JobSystem.classForKlassFromName does)
-        import importlib
-        import pydoc
+        system = JobSystem(dsn=db_params, **worker_params)
 
-        klass_mod = pydoc.locate(".".join(job["job_class"].split(".")[:-1]))
-        assert klass_mod is not None
+        # the real loader: resolves the dotted path, reloads the module,
+        # and instantiates with (s=..., job=...)
+        instance = system.classForKlassFromName(job["job_class"], job=dict(job))
+        assert type(instance).__name__ == "SimpleTestJob"
 
-        importlib.reload(klass_mod)
-
-        klass = pydoc.locate(job["job_class"])
-        assert klass is not None
-        assert klass == SimpleTestJob
-
-        # Create a minimal JobSystem for the job
-        system = JobSystem(
-            dsn=db_params,
-            qname=["default"],
-            capabilities=["std"],
-            workerId=1,
-            checkInterval=1,
-            webPort=None,
-        )
-
-        # Instantiate and run
-        instance = klass(s=system, job=dict(job))
         result = instance.run()
         assert result == "processed: test"
 
@@ -647,54 +435,46 @@ class TestJobClassLoading:
 class TestJobPriorityOrdering:
     """Test that jobs are claimed in correct priority order."""
 
-    @pytest.mark.asyncio
-    async def test_high_priority_claimed_first(self, db_pool):
-        """Test that high priority jobs are claimed before low priority."""
+    async def test_most_urgent_priority_claimed_first(self, db_pool, unique_queue):
+        """Lower prio number = more urgent: claimed first."""
         async with db_pool.acquire() as conn:
-            # Create jobs with different priorities
-            low_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING id
-            """,
-                "test_pj_worker_integration.SimpleTestJob",
+            urgent_id = await conn.fetchval(
+                """INSERT INTO jorb (job_class, kwargs, queue, prio)
+                   VALUES ($1, $2, $3, $4) RETURNING id""",
+                "tests.test_pj_worker_integration.SimpleTestJob",
                 {},
-                "default",
-                "queued",
+                unique_queue,
                 50,
             )
-
-            high_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-                RETURNING id
-            """,
-                "test_pj_worker_integration.SimpleTestJob",
+            await conn.fetchval(
+                """INSERT INTO jorb (job_class, kwargs, queue, prio)
+                   VALUES ($1, $2, $3, $4) RETURNING id""",
+                "tests.test_pj_worker_integration.SimpleTestJob",
                 {},
-                "default",
-                "queued",
+                unique_queue,
                 200,
             )
 
-            # Claim next job (should get high priority first)
-            claimed = await conn.fetchrow("""
-                UPDATE jorb
-                SET state = 'claimed'
-                WHERE id = (
-                    SELECT id FROM jorb
-                    WHERE state = 'queued'
-                    AND queue = 'default'
-                    ORDER BY prio DESC, id ASC
-                    LIMIT 1
-                    FOR UPDATE SKIP LOCKED
-                )
-                RETURNING *
-            """)
+            claimed = await claim(conn, unique_queue)
+            assert claimed["id"] == urgent_id
+            assert claimed["prio"] == 50
 
-            assert claimed["id"] == high_id
-            assert claimed["prio"] == 200
+    async def test_priority_ceiling_excludes_urgent_enough_jobs(
+        self, db_pool, unique_queue
+    ):
+        """Jobs above the worker's prio ceiling are not claimed."""
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO jorb (job_class, kwargs, queue, prio)
+                   VALUES ($1, $2, $3, $4)""",
+                "tests.test_pj_worker_integration.SimpleTestJob",
+                {},
+                unique_queue,
+                500,
+            )
+
+            assert await claim(conn, unique_queue, prio=100) is None
+            assert await claim(conn, unique_queue, prio=1000) is not None
 
 
 # ============================================================================
@@ -705,97 +485,40 @@ class TestJobPriorityOrdering:
 class TestRunAfterScheduling:
     """Test run_after delayed execution."""
 
-    @pytest.mark.asyncio
-    async def test_job_not_claimed_before_run_after(self, db_pool):
+    async def test_job_not_claimed_before_run_after(self, db_pool, unique_queue):
         """Test that jobs with run_after are not claimed too early."""
         async with db_pool.acquire() as conn:
-            # Clean up any queued jobs in 'default' queue to avoid test pollution
-            await conn.execute("""
-                DELETE FROM jorb
-                WHERE state = 'queued'
-                AND queue = 'default'
-                AND (run_after IS NULL OR run_after <= TIMEZONE('utc', clock_timestamp()))
-            """)
-
-            # Create job with future run_after
+            # Create job with future run_after (plain now() arithmetic —
+            # every timestamp column is timestamptz)
             job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
-                                 run_after)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), TIMEZONE('utc', clock_timestamp()) + INTERVAL '1 hour')
-                RETURNING id
-            """,
-                "test_pj_worker_integration.SimpleTestJob",
+                """INSERT INTO jorb (job_class, kwargs, queue, run_after)
+                   VALUES ($1, $2, $3, now() + INTERVAL '1 hour')
+                   RETURNING id""",
+                "tests.test_pj_worker_integration.SimpleTestJob",
                 {},
-                "default",
-                "queued",
-                100,
+                unique_queue,
             )
 
-            # Try to claim (should not claim - run_after is in future)
-            claimed = await conn.fetchrow("""
-                UPDATE jorb
-                SET state = 'claimed'
-                WHERE id = (
-                    SELECT id FROM jorb
-                    WHERE state = 'queued'
-                    AND queue = 'default'
-                    AND (run_after IS NULL OR run_after <= TIMEZONE('utc', clock_timestamp()))
-                    ORDER BY prio DESC, id ASC
-                    LIMIT 1
-                    FOR UPDATE SKIP LOCKED
-                )
-                RETURNING *
-            """)
-
+            claimed = await claim(conn, unique_queue)
             assert claimed is None
 
             # Verify our job is still queued
             state = await conn.fetchval("SELECT state FROM jorb WHERE id = $1", job_id)
             assert state == "queued"
 
-    @pytest.mark.asyncio
-    async def test_job_claimed_after_run_after_time(self, db_pool):
+    async def test_job_claimed_after_run_after_time(self, db_pool, unique_queue):
         """Test that jobs are claimed after run_after time passes."""
         async with db_pool.acquire() as conn:
-            # Clean up any existing queued jobs
-            await conn.execute("""
-                DELETE FROM jorb
-                WHERE state = 'queued'
-                AND queue = 'default'
-                AND (run_after IS NULL OR run_after <= TIMEZONE('utc', clock_timestamp()))
-            """)
-
             # Create job with past run_after
             job_id = await conn.fetchval(
-                """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, created, updated,
-                                 run_after)
-                VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), TIMEZONE('utc', clock_timestamp()) - INTERVAL '1 second')
-                RETURNING id
-            """,
-                "test_pj_worker_integration.SimpleTestJob",
+                """INSERT INTO jorb (job_class, kwargs, queue, run_after)
+                   VALUES ($1, $2, $3, now() - INTERVAL '1 second')
+                   RETURNING id""",
+                "tests.test_pj_worker_integration.SimpleTestJob",
                 {},
-                "default",
-                "queued",
-                100,
+                unique_queue,
             )
 
-            # Should be able to claim now
-            claimed = await conn.fetchrow("""
-                UPDATE jorb
-                SET state = 'claimed'
-                WHERE id = (
-                    SELECT id FROM jorb
-                    WHERE state = 'queued'
-                    AND queue = 'default'
-                    AND (run_after IS NULL OR run_after <= TIMEZONE('utc', clock_timestamp()))
-                    ORDER BY prio DESC, id ASC
-                    LIMIT 1
-                    FOR UPDATE SKIP LOCKED
-                )
-                RETURNING *
-            """)
-
+            claimed = await claim(conn, unique_queue)
             assert claimed is not None
             assert claimed["id"] == job_id

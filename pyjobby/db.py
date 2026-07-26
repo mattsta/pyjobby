@@ -25,10 +25,9 @@ class JobState(enum.StrEnum):
     QUEUED = "queued"
     CLAIMED = "claimed"
     RUNNING = "running"
-    HEARTBEAT = "heartbeat"
-    CRASHED = "crashed"
-    FINISHED = "finished"
     WAITING = "waiting"
+    FINISHED = "finished"
+    CRASHED = "crashed"  # terminal: the dead letter queue
     CANCELLED = "cancelled"
 
 
