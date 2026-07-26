@@ -30,6 +30,7 @@ from pyjobby import monitor as monitor_module
 from pyjobby.monitor import (
     handle_timed_out_job,
     monitor,
+    sweep_completed_checkpoints,
     sweep_consumed_mailbox,
     sweep_dead_workers,
     sweep_expired_jobs,
@@ -164,6 +165,35 @@ async def add_child_rows(pool, job_id: int) -> None:
         job_id,
         {"hello": "world"},
     )
+
+
+async def add_checkpoints(
+    pool, job_id: int, count: int, *, name: str = "step", output: dict | None = None
+) -> list[int]:
+    """Record ``count`` DXE checkpoints on a job; returns their step_seqs."""
+    seqs = list(range(1, count + 1))
+    for seq in seqs:
+        await pool.execute(
+            """
+            INSERT INTO jorb_step (job_id, step_seq, name, output, run_epoch)
+            VALUES ($1, $2, $3, $4, 0)
+            """,
+            job_id,
+            seq,
+            f"{name}-{seq}",
+            output if output is not None else {"seq": seq},
+        )
+    return seqs
+
+
+async def step_seqs(pool, job_id: int) -> list[int]:
+    """Every surviving checkpoint sequence for a job, in order."""
+    return [
+        r["step_seq"]
+        for r in await pool.fetch(
+            "SELECT step_seq FROM jorb_step WHERE job_id = $1 ORDER BY step_seq", job_id
+        )
+    ]
 
 
 async def child_counts(pool, job_id: int) -> dict[str, int]:
@@ -731,17 +761,23 @@ class TestSweepExpiredJobs:
         assert await sweep_expired_jobs(db_pool, retention_days=7) == 0
         assert await job_ids(db_pool) == sorted([member, waiter])
 
-    async def test_batch_size_bounds_one_sweep(self, db_pool, unique_queue):
+    async def test_batch_size_bounds_one_sweep_taking_the_oldest_first(
+        self, db_pool, unique_queue
+    ):
+        """Batches are bounded, and each one takes the jobs that terminated
+        longest ago — the order ``jorb_retention_idx`` provides, and the order
+        an operator would expect a retention policy to reap in."""
+        # oldest last: ids[4] terminated 34 days ago, ids[0] 30 days ago
         ids = [
-            await insert_terminal_job(db_pool, unique_queue, days_ago=30)
-            for _ in range(5)
+            await insert_terminal_job(db_pool, unique_queue, days_ago=30 + n)
+            for n in range(5)
         ]
 
         assert await sweep_expired_jobs(db_pool, retention_days=7, batch_size=2) == 2
-        assert await job_ids(db_pool) == ids[2:]
+        assert await job_ids(db_pool) == sorted(ids[:3])
 
         assert await sweep_expired_jobs(db_pool, retention_days=7, batch_size=2) == 2
-        assert await job_ids(db_pool) == ids[4:]
+        assert await job_ids(db_pool) == [ids[0]]
 
         assert await sweep_expired_jobs(db_pool, retention_days=7, batch_size=2) == 1
         assert await job_ids(db_pool) == []
@@ -769,6 +805,175 @@ class TestSweepExpiredJobs:
         assert sum(counts) == 6
         assert await job_ids(db_pool) == []
         assert await db_pool.fetchval("SELECT count(*) FROM jorb_history") == 0
+
+
+class TestSweepCompletedCheckpoints:
+    """Checkpoints live on their own, much shorter window.
+
+    A checkpoint exists to make a job resumable. A terminal job is never
+    resumed, so from the moment it finishes its checkpoints are pure audit —
+    the bulkiest thing on the row with the shortest useful life."""
+
+    async def test_terminal_job_loses_checkpoints_and_keeps_everything_else(
+        self, db_pool, unique_queue
+    ):
+        """The whole point: two lifetimes, not one."""
+        job = await insert_terminal_job(db_pool, unique_queue, days_ago=3)
+        await add_child_rows(db_pool, job)
+        assert await child_counts(db_pool, job) == {
+            "jorb_step": 1,
+            "jorb_event": 1,
+            "jorb_mailbox": 1,
+            "jorb_history": 2,
+        }
+
+        deleted = await sweep_completed_checkpoints(
+            db_pool, checkpoint_retention_days=1
+        )
+        assert deleted == 1
+
+        assert await job_ids(db_pool) == [job]
+        assert await child_counts(db_pool, job) == {
+            "jorb_step": 0,
+            "jorb_event": 1,
+            "jorb_mailbox": 1,
+            "jorb_history": 2,
+        }
+
+    async def test_deletes_for_every_terminal_state(self, db_pool, unique_queue):
+        jobs = [
+            await insert_terminal_job(db_pool, unique_queue, state=state, days_ago=3)
+            for state in ("finished", "crashed", "cancelled")
+        ]
+        for job in jobs:
+            await add_checkpoints(db_pool, job, 2)
+
+        deleted = await sweep_completed_checkpoints(
+            db_pool, checkpoint_retention_days=1
+        )
+        assert deleted == 6
+
+        assert await job_ids(db_pool) == sorted(jobs)
+        assert await db_pool.fetchval("SELECT count(*) FROM jorb_step") == 0
+
+    async def test_job_terminated_inside_the_window_keeps_its_checkpoints(
+        self, db_pool, unique_queue
+    ):
+        job = await insert_terminal_job(db_pool, unique_queue, days_ago=0.5)
+        seqs = await add_checkpoints(db_pool, job, 3)
+
+        deleted = await sweep_completed_checkpoints(
+            db_pool, checkpoint_retention_days=1
+        )
+        assert deleted == 0
+        assert await step_seqs(db_pool, job) == seqs
+
+    @pytest.mark.parametrize("state", ["queued", "claimed", "running", "waiting"])
+    async def test_live_job_keeps_its_checkpoints_however_old(
+        self, db_pool, unique_queue, state
+    ):
+        """The dangerous failure mode.
+
+        A durable sleep parks a job in 'queued' for months holding the very
+        checkpoint that records when to wake; deleting it would make the job
+        silently re-run steps it already completed."""
+        live = await insert_job(db_pool, unique_queue, state=state)
+        await age_job(db_pool, live, days=365)
+        await add_checkpoints(
+            db_pool, live, 2, name="sleep", output={"wake_at": "2027-01-01T00:00:00Z"}
+        )
+
+        deleted = await sweep_completed_checkpoints(
+            db_pool, checkpoint_retention_days=1
+        )
+        assert deleted == 0
+
+        assert await step_seqs(db_pool, live) == [1, 2]
+        # the checkpoint is intact, not merely present
+        surviving = await db_pool.fetch(
+            "SELECT name, output FROM jorb_step WHERE job_id = $1 ORDER BY step_seq",
+            live,
+        )
+        assert [r["name"] for r in surviving] == ["sleep-1", "sleep-2"]
+        assert surviving[0]["output"] == {"wake_at": "2027-01-01T00:00:00Z"}
+        assert (await get_job(db_pool, live))["state"] == state
+
+    async def test_batch_size_bounds_one_sweep(self, db_pool, unique_queue):
+        """Counts are exact; which of one job's checkpoints goes first is not.
+
+        The sweep is ordered by the job's terminal timestamp so it can ride
+        jorb_retention_idx, and every checkpoint of a single job ties on that
+        — so identity is asserted as a shrinking subset, not a sequence."""
+        job = await insert_terminal_job(db_pool, unique_queue, days_ago=3)
+        seqs = await add_checkpoints(db_pool, job, 5)
+
+        for expected, remaining in ((2, 3), (2, 1), (1, 0), (0, 0)):
+            deleted = await sweep_completed_checkpoints(
+                db_pool, checkpoint_retention_days=1, batch_size=2
+            )
+            left = await step_seqs(db_pool, job)
+            assert (deleted, len(left)) == (expected, remaining)
+            assert set(left) <= set(seqs)
+
+        # the job row itself was never in scope
+        assert await job_ids(db_pool) == [job]
+
+    async def test_checkpoints_of_the_longest_dead_job_go_first(
+        self, db_pool, unique_queue
+    ):
+        """Across jobs the order IS exact: oldest terminal job first."""
+        older = await insert_terminal_job(db_pool, unique_queue, days_ago=10)
+        newer = await insert_terminal_job(db_pool, unique_queue, days_ago=3)
+        await add_checkpoints(db_pool, older, 1)
+        await add_checkpoints(db_pool, newer, 1)
+
+        deleted = await sweep_completed_checkpoints(
+            db_pool, checkpoint_retention_days=1, batch_size=1
+        )
+        assert deleted == 1
+        assert await step_seqs(db_pool, older) == []
+        assert await step_seqs(db_pool, newer) == [1]
+
+    async def test_the_two_windows_are_independent(self, db_pool, unique_queue):
+        """Checkpoints go at 1 day while the job row sits well inside its own
+        30-day window — that separation is the reason this sweep exists."""
+        job = await insert_terminal_job(db_pool, unique_queue, days_ago=5)
+        await add_child_rows(db_pool, job)
+
+        assert (
+            await sweep_completed_checkpoints(db_pool, checkpoint_retention_days=1) == 1
+        )
+        assert await sweep_expired_jobs(db_pool, retention_days=30) == 0
+
+        assert await job_ids(db_pool) == [job]
+        assert await child_counts(db_pool, job) == {
+            "jorb_step": 0,
+            "jorb_event": 1,
+            "jorb_mailbox": 1,
+            "jorb_history": 2,
+        }
+
+        # ...and the job goes on its own schedule once past the longer window
+        await age_job(db_pool, job, days=40)
+        assert await sweep_expired_jobs(db_pool, retention_days=30) == 1
+        assert await job_ids(db_pool) == []
+
+    async def test_concurrent_sweeps_partition_the_backlog(self, db_pool, unique_queue):
+        job = await insert_terminal_job(db_pool, unique_queue, days_ago=3)
+        await add_checkpoints(db_pool, job, 6)
+
+        counts = await asyncio.gather(
+            sweep_completed_checkpoints(
+                db_pool, checkpoint_retention_days=1, batch_size=4
+            ),
+            sweep_completed_checkpoints(
+                db_pool, checkpoint_retention_days=1, batch_size=4
+            ),
+        )
+
+        assert sum(counts) == 6
+        assert await step_seqs(db_pool, job) == []
+        assert await job_ids(db_pool) == [job]
 
 
 class TestSweepConsumedMailbox:
@@ -1002,15 +1207,48 @@ class TestMonitorLoop:
             with pytest.raises(asyncio.CancelledError):
                 await task
 
-    async def test_retention_off_by_default(self, db_pool, unique_queue, db_params):
-        """A fresh install must not silently start destroying history.
+    async def test_retention_is_on_by_default(self, db_pool, unique_queue, db_params):
+        """A retention policy nobody remembers to switch on is not a policy.
+
+        A loop started with no retention arguments at all reaps a 10-year-old
+        terminal job on the 30-day default and its checkpoints on the 1-day
+        one, while a job that finished yesterday keeps its row."""
+        params = inspect.signature(monitor).parameters
+        assert params["retention_days"].default == 30.0
+        assert params["checkpoint_retention_days"].default == 1.0
+
+        ancient = await insert_terminal_job(db_pool, unique_queue, days_ago=3650)
+        await add_child_rows(db_pool, ancient)
+        recent = await insert_terminal_job(db_pool, unique_queue, days_ago=1)
+
+        task = asyncio.create_task(
+            monitor(dsn_from(db_params), check_interval=0.1, liveness_grace_seconds=60)
+        )
+        try:
+            await wait_for_job_gone(db_pool, ancient, timeout=10)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert await job_ids(db_pool) == [recent]
+        assert await child_counts(db_pool, ancient) == {
+            "jorb_step": 0,
+            "jorb_event": 0,
+            "jorb_mailbox": 0,
+            "jorb_history": 0,
+        }
+
+    async def test_retention_days_zero_keeps_everything_forever(
+        self, db_pool, unique_queue, db_params
+    ):
+        """The escape hatch, for operators who keep their audit trail.
 
         The dead-worker requeue is the barrier: once it lands, the loop has
         completed a full cycle, so the ancient job's survival is a decision
         and not a race."""
-        assert inspect.signature(monitor).parameters["retention_days"].default is None
-
         ancient = await insert_terminal_job(db_pool, unique_queue, days_ago=3650)
+        await add_child_rows(db_pool, ancient)
         dead_worker = await insert_worker(
             db_pool, unique_queue, last_seen_age_seconds=300
         )
@@ -1019,7 +1257,13 @@ class TestMonitorLoop:
         )
 
         task = asyncio.create_task(
-            monitor(dsn_from(db_params), check_interval=0.1, liveness_grace_seconds=60)
+            monitor(
+                dsn_from(db_params),
+                check_interval=0.1,
+                liveness_grace_seconds=60,
+                retention_days=0,
+                checkpoint_retention_days=0,
+            )
         )
         try:
             await wait_for_job_state(db_pool, orphaned, ("queued",), timeout=10)
@@ -1029,8 +1273,45 @@ class TestMonitorLoop:
                 await task
 
         assert await job_ids(db_pool) == sorted([ancient, orphaned])
+        assert await child_counts(db_pool, ancient) == {
+            "jorb_step": 1,
+            "jorb_event": 1,
+            "jorb_mailbox": 1,
+            "jorb_history": 2,
+        }
 
-    async def test_loop_runs_the_retention_sweeps_when_enabled(
+    async def test_loop_reaps_checkpoints_of_a_job_it_still_keeps(
+        self, db_pool, unique_queue, db_params
+    ):
+        """The two windows stay independent inside the running daemon: the
+        checkpoints of a job that terminated 5 days ago go, the job does not."""
+        job = await insert_terminal_job(db_pool, unique_queue, days_ago=5)
+        await add_child_rows(db_pool, job)
+
+        task = asyncio.create_task(
+            monitor(dsn_from(db_params), check_interval=0.1, liveness_grace_seconds=60)
+        )
+        try:
+            await wait_until(
+                lambda: db_pool.fetchval(
+                    "SELECT NOT EXISTS (SELECT 1 FROM jorb_step WHERE job_id = $1)", job
+                ),
+                timeout=10,
+            )
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert await job_ids(db_pool) == [job]
+        assert await child_counts(db_pool, job) == {
+            "jorb_step": 0,
+            "jorb_event": 1,
+            "jorb_mailbox": 1,
+            "jorb_history": 2,
+        }
+
+    async def test_loop_runs_the_retention_sweeps(
         self, db_pool, unique_queue, db_params
     ):
         expired = await insert_terminal_job(db_pool, unique_queue, days_ago=30)
@@ -1105,6 +1386,42 @@ class TestMonitorLoop:
         try:
             await wait_until(lambda: len(attempts) >= 2, timeout=10)
             await wait_for_job_state(db_pool, orphaned, ("queued",), timeout=10)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    async def test_failing_checkpoint_sweep_does_not_starve_the_others(
+        self, db_pool, unique_queue, db_params, monkeypatch
+    ):
+        """The checkpoint sweep runs first in the cycle, so its failure is the
+        one that could swallow every sweep behind it."""
+        attempts = []
+
+        async def exploding_sweep(*args, **kwargs):
+            attempts.append(1)
+            raise RuntimeError("checkpoint sweep is broken")
+
+        monkeypatch.setattr(
+            monitor_module, "sweep_completed_checkpoints", exploding_sweep
+        )
+
+        ancient = await insert_terminal_job(db_pool, unique_queue, days_ago=3650)
+        dead_worker = await insert_worker(
+            db_pool, unique_queue, last_seen_age_seconds=300
+        )
+        orphaned = await insert_job(
+            db_pool, unique_queue, state="running", claimed_by=dead_worker
+        )
+
+        task = asyncio.create_task(
+            monitor(dsn_from(db_params), check_interval=0.1, liveness_grace_seconds=60)
+        )
+        try:
+            await wait_until(lambda: len(attempts) >= 2, timeout=10)
+            # both the sweep before it and the sweep after it still ran
+            await wait_for_job_state(db_pool, orphaned, ("queued",), timeout=10)
+            await wait_for_job_gone(db_pool, ancient, timeout=10)
         finally:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):

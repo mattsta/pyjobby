@@ -15,11 +15,25 @@ recovery:
 3. **Unregistered-claim reclaim**: jobs stuck in 'claimed' with no registry
    reference past a grace period (a worker died between claim and register,
    or the registry was unavailable).
-4. **Retention**: terminal jobs (and their checkpoints, history, events and
-   mailbox) older than ``--retention-days`` are deleted. Opt-in and off by
-   default — a platform that runs indefinitely otherwise accumulates every
-   checkpoint and every state transition forever, but no fresh install may
-   silently start destroying an operator's audit trail.
+4. **Job retention**: terminal jobs older than ``--retention-days`` (default
+   30) are deleted, taking their checkpoints, history, events and mailbox
+   with them via ON DELETE CASCADE. On by default: a platform that runs
+   indefinitely accumulates every completed job forever otherwise, and a
+   retention policy nobody remembers to switch on is not a policy. Pass
+   ``--retention-days 0`` to keep everything forever.
+5. **Checkpoint retention**: ``jorb_step`` rows of terminal jobs older than
+   ``--checkpoint-retention-days`` (default 1) are deleted while the job row
+   itself stays. Checkpoints exist to make a job RESUMABLE; the moment it
+   reaches a terminal state resume is impossible, so they are the bulkiest
+   thing on the row with the shortest useful life. They outlive the job's
+   terminal transition only far enough to debug it. ``0`` keeps them for as
+   long as the job.
+
+Both retention sweeps DRAIN: a cycle keeps taking batches until it is caught
+up or spends ``--retention-max-seconds``, then yields. One batch per cycle
+would be a fixed deletion rate that a busy install simply outruns, leaving
+retention switched on and the table still growing; the budget keeps a backlog
+from delaying the latency-critical sweeps above.
 
 Requeues bump nothing themselves: the next claim increments ``run_epoch``,
 which fences any still-running stale execution out of the row.
@@ -261,6 +275,16 @@ async def sweep_unregistered_claims(
 #: (a job parked on a dependency can legitimately outlive any window).
 TERMINAL_STATES = ("finished", "crashed", "cancelled")
 
+#: The same list inlined into SQL, because ``jorb_retention_idx`` is PARTIAL
+#: on exactly this predicate. A bound ``state = ANY($1)`` reads fine under the
+#: custom plan of the first few executions and then silently falls off the
+#: index: asyncpg prepares its statements, and once PostgreSQL switches to a
+#: GENERIC plan it can no longer prove an unknown parameter implies the index
+#: predicate. Measured on 20k terminal rows with nothing expired -- generic
+#: plan, bound states: Seq Scan + Sort, 617 buffers; literal states: Index
+#: Scan, 2 buffers. Interpolating a module constant is not user input.
+_TERMINAL_STATES_SQL = ", ".join(f"'{state}'" for state in TERMINAL_STATES)
+
 
 async def sweep_expired_jobs(
     pool: asyncpg.Pool,
@@ -280,25 +304,31 @@ async def sweep_expired_jobs(
     upstream would strand the waiter in 'waiting' forever — nothing but the
     upstream's own terminal transition ever wakes it.
 
-    jorb_step, jorb_event and jorb_mailbox follow via ON DELETE CASCADE.
-    jorb_history does NOT — it references jorb.job_id with no foreign key at
-    all (it outlives the job on purpose in the schema), so it is deleted here
-    explicitly, in the same transaction, or retention would free the small
-    tables and leave the largest one growing.
+    Every child table — jorb_step, jorb_event, jorb_mailbox, jorb_history —
+    follows via ON DELETE CASCADE, so deleting the job row is the whole job.
 
-    Bounded and batched like the other sweeps: one bite of ``batch_size`` per
-    call, holding only those rows' locks. FOR UPDATE SKIP LOCKED makes
-    concurrent monitors partition the backlog instead of colliding on it.
-    Returns the number of jobs deleted."""
+    Bounded and batched: one bite of ``batch_size`` per call, holding only
+    those rows' locks. FOR UPDATE SKIP LOCKED makes concurrent monitors
+    partition the backlog instead of colliding on it. ``_drain`` calls this
+    repeatedly so a cycle can catch up rather than nibble.
+
+    Ordered by the retention expression, never by id. Oldest-first is the
+    semantically right order to reap in, and it is also the only order that
+    ``jorb_retention_idx`` can serve: ORDER BY id makes the planner prefer a
+    pkey scan to avoid a sort and then filter the entire terminal backlog
+    (measured on 20k rows with nothing expired: 366 buffers and 20k rows
+    discarded, against 2 buffers and no sort). That gap grows with the table,
+    so the sweep that exists to stop unbounded growth would itself get slower
+    forever. Returns the number of jobs deleted."""
     retention = datetime.timedelta(days=retention_days)
 
     async with pool.acquire() as conn, conn.transaction():
         expired = await conn.fetch(
-            """
+            f"""
             SELECT j.id
             FROM jorb j
-            WHERE j.state = ANY($1::jorbstate[])
-              AND COALESCE(j.finished, j.updated) < now() - $2::interval
+            WHERE j.state IN ({_TERMINAL_STATES_SQL})
+              AND COALESCE(j.finished, j.updated) < now() - $1::interval
               AND NOT EXISTS (
                   SELECT 1 FROM jorb w
                   WHERE w.state = 'waiting' AND w.waitfor_job = j.id
@@ -307,11 +337,10 @@ async def sweep_expired_jobs(
                   SELECT 1 FROM jorb w
                   WHERE w.state = 'waiting' AND w.waitfor_group = j.run_group
               )
-            ORDER BY j.id
+            ORDER BY COALESCE(j.finished, j.updated)
             FOR UPDATE OF j SKIP LOCKED
-            LIMIT $3
-            """,
-            TERMINAL_STATES,
+            LIMIT $2
+            """,  # noqa: S608 - interpolates a module constant, never input
             retention,
             batch_size,
         )
@@ -319,13 +348,67 @@ async def sweep_expired_jobs(
             return 0
 
         job_ids = [row["id"] for row in expired]
-        await conn.execute(
-            "DELETE FROM jorb_history WHERE job_id = ANY($1::bigint[])", job_ids
-        )
         await conn.execute("DELETE FROM jorb WHERE id = ANY($1::bigint[])", job_ids)
 
-    logger.info(f"Retention deleted {len(job_ids)} expired jobs")
     return len(job_ids)
+
+
+async def sweep_completed_checkpoints(
+    pool: asyncpg.Pool,
+    checkpoint_retention_days: float,
+    batch_size: int = 1000,
+) -> int:
+    """Delete the DXE checkpoints of jobs that terminated long enough ago.
+
+    Checkpoints exist for one reason: so a resumed attempt fast-forwards past
+    steps it already ran. A terminal job is never resumed, so from the instant
+    it finishes its ``jorb_step`` rows are pure audit — readable through
+    ``pj-admin jobs steps <id>`` and nothing else. They are also the bulkiest
+    thing hanging off a job (one row per step, each with the step's output),
+    which is why they get their own, much shorter window instead of living as
+    long as the job row.
+
+    Only the checkpoints go. The job row and its history, events and mailbox
+    are ``sweep_expired_jobs``' business on the longer window — the two are
+    deliberately independent lifetimes.
+
+    A checkpoint of a NON-terminal job is never touched at any age. A durable
+    sleep parks a job in 'queued' for months holding the very checkpoint that
+    records when to wake; deleting it would silently re-run completed steps.
+    So state is the gate and age only decides among terminal jobs.
+
+    ``FOR UPDATE OF s`` locks the checkpoint rows and not the jobs: a worker
+    writing to a live job must never queue behind retention.
+
+    Driven from ``jorb_retention_idx`` in oldest-terminated-first order — the
+    job side is what has an index worth using, and ordering by ``s.job_id``
+    instead would trade it for a full scan of jorb_step. The batch boundary
+    within one job is therefore unordered; nothing depends on which of a
+    doomed job's checkpoints go first. Returns the number of rows deleted."""
+    retention = datetime.timedelta(days=checkpoint_retention_days)
+
+    deleted = await pool.fetch(
+        f"""
+        WITH doomed AS MATERIALIZED (
+            SELECT s.job_id, s.step_seq
+            FROM jorb_step s
+            JOIN jorb j ON j.id = s.job_id
+            WHERE j.state IN ({_TERMINAL_STATES_SQL})
+              AND COALESCE(j.finished, j.updated) < now() - $1::interval
+            ORDER BY COALESCE(j.finished, j.updated)
+            FOR UPDATE OF s SKIP LOCKED
+            LIMIT $2
+        )
+        DELETE FROM jorb_step s
+        USING doomed d
+        WHERE s.job_id = d.job_id AND s.step_seq = d.step_seq
+        RETURNING s.job_id, s.step_seq
+        """,  # noqa: S608 - interpolates a module constant, never input
+        retention,
+        batch_size,
+    )
+
+    return len(deleted)
 
 
 async def sweep_consumed_mailbox(
@@ -347,6 +430,13 @@ async def sweep_consumed_mailbox(
     FOR UPDATE SKIP LOCKED scan returns a *different* set — so the LIMIT stops
     bounding the delete and the batch overruns (observed: batch_size=2
     deleting 5 rows). MATERIALIZED forces exactly one evaluation.
+
+    Ordered by id, which here IS the index order worth having: jorb_mailbox
+    carries only its primary key and a pending-only partial index, so the pkey
+    is the sole ordered access path over consumed rows. Ordering by
+    ``consumed_at`` instead would sort the whole consumed backlog on every
+    call for no benefit — and id is insertion order, so oldest-first anyway.
+    (jorb_mailbox has no index on consumed_at; adding one is a schema change.)
 
     Single atomic statement; safe with concurrent monitor instances."""
     retention = datetime.timedelta(days=retention_days)
@@ -370,8 +460,6 @@ async def sweep_consumed_mailbox(
         batch_size,
     )
 
-    if deleted:
-        logger.info(f"Retention deleted {len(deleted)} consumed mailbox messages")
     return len(deleted)
 
 
@@ -388,25 +476,93 @@ async def _run_sweep(name: str, sweep: Callable[[], Awaitable[int]]) -> int:
         return 0
 
 
+async def _drain(
+    name: str,
+    sweep: Callable[[], Awaitable[int]],
+    batch_size: int,
+    max_seconds: float,
+) -> int:
+    """Run one batched retention sweep until it is caught up or out of time.
+
+    One batch per cycle is a rate limit, not a policy: ``batch_size`` per
+    ``check_interval`` is a hard ceiling on deletions per second, and any
+    platform ingesting faster than that outruns retention permanently — the
+    dashboard says retention is enabled while the table grows forever, which
+    is the exact defect this feature exists to prevent. So a cycle keeps
+    taking batches until one comes back short (nothing left to delete).
+
+    ``max_seconds`` is the other half. Retention is the only sweep here that
+    is not latency-critical: timeout enforcement and dead-worker recovery
+    decide how long a stuck job stays stuck, and they must not queue behind an
+    unbounded backlog. So a cycle yields when its budget is spent and picks up
+    where it left off on the next one.
+
+    Stopping early is logged at WARNING with the count, because a retention
+    sweep that cannot keep up has to be visible: silence would read exactly
+    like being caught up. Returns the number of rows deleted this cycle."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max_seconds
+    total = 0
+
+    while True:
+        deleted = await sweep()
+        total += deleted
+
+        if deleted < batch_size:
+            if total:
+                logger.info(f"Retention {name}: deleted {total}, caught up")
+            return total
+
+        if loop.time() >= deadline:
+            logger.warning(
+                f"Retention {name}: deleted {total} and stopped on its "
+                f"{max_seconds}s budget with a backlog still pending — "
+                f"retention is falling behind"
+            )
+            return total
+
+
+async def _run_retention(
+    name: str,
+    sweep: Callable[[], Awaitable[int]],
+    batch_size: int,
+    max_seconds: float,
+) -> int:
+    """Drain one retention sweep with the same failure isolation as the rest."""
+    return await _run_sweep(name, lambda: _drain(name, sweep, batch_size, max_seconds))
+
+
 async def monitor(
     dsn: str,
     check_interval: float = 10,
     batch_size: int = 100,
     liveness_grace_seconds: float = 60,
     claimed_grace_seconds: float = 300,
-    retention_days: float | None = None,
+    retention_days: float = 30.0,
+    checkpoint_retention_days: float = 1.0,
     retention_batch_size: int = 1000,
+    retention_max_seconds: float = 5.0,
 ) -> None:
     """Run all sweeps every ``check_interval`` seconds, forever.
 
-    ``retention_days=None`` (the default) disables the retention sweeps
-    entirely — nothing is deleted unless an operator asks for it."""
+    Retention is on by default and the two windows are independent:
+    ``retention_days`` deletes whole terminal jobs, ``checkpoint_retention_days``
+    deletes just the checkpoints of terminal jobs much sooner. Either set to
+    ``0`` means keep forever — that sweep does not run at all.
+
+    Each retention sweep drains its backlog within a ``retention_max_seconds``
+    budget per cycle, so it can catch up on a busy install without ever
+    delaying the latency-critical sweeps above it."""
     pool = await db.create_pool(dsn, min_size=1, max_size=2)
+
+    def window(days: float) -> str:
+        return f"{days}d" if days else "forever"
 
     logger.info(
         f"Monitor started (interval {check_interval}s, "
-        f"liveness grace {liveness_grace_seconds}s, retention "
-        f"{f'{retention_days}d' if retention_days is not None else 'disabled'})"
+        f"liveness grace {liveness_grace_seconds}s, "
+        f"job retention {window(retention_days)}, "
+        f"checkpoint retention {window(checkpoint_retention_days)})"
     )
 
     try:
@@ -426,15 +582,32 @@ async def monitor(
                 lambda: sweep_unregistered_claims(pool, claimed_grace_seconds),
             )
 
-            if retention_days is not None:
-                days = retention_days
-                await _run_sweep(
-                    "expired jobs",
-                    lambda: sweep_expired_jobs(pool, days, retention_batch_size),
+            if checkpoint_retention_days:
+                await _run_retention(
+                    "completed checkpoints",
+                    lambda: sweep_completed_checkpoints(
+                        pool, checkpoint_retention_days, retention_batch_size
+                    ),
+                    retention_batch_size,
+                    retention_max_seconds,
                 )
-                await _run_sweep(
+
+            if retention_days:
+                await _run_retention(
+                    "expired jobs",
+                    lambda: sweep_expired_jobs(
+                        pool, retention_days, retention_batch_size
+                    ),
+                    retention_batch_size,
+                    retention_max_seconds,
+                )
+                await _run_retention(
                     "consumed mailbox",
-                    lambda: sweep_consumed_mailbox(pool, days, retention_batch_size),
+                    lambda: sweep_consumed_mailbox(
+                        pool, retention_days, retention_batch_size
+                    ),
+                    retention_batch_size,
+                    retention_max_seconds,
                 )
 
             await asyncio.sleep(check_interval)
@@ -478,15 +651,34 @@ def cli() -> None:
     @click.option(
         "--retention-days",
         type=float,
-        default=None,
-        help="Delete terminal jobs (and their history/checkpoints/events/"
-        "mailbox) older than this. Omit to keep everything forever.",
+        default=30.0,
+        show_default=True,
+        help="Delete terminal jobs (with their history, events, mailbox and "
+        "checkpoints) older than this. 0 keeps every job forever.",
+    )
+    @click.option(
+        "--checkpoint-retention-days",
+        type=float,
+        default=1.0,
+        show_default=True,
+        help="Delete the DXE checkpoints of terminal jobs this long after they "
+        "terminated, keeping the job itself. 0 keeps checkpoints as long as "
+        "the job.",
     )
     @click.option(
         "--retention-batch-size",
         default=1000,
         show_default=True,
-        help="Maximum jobs deleted per retention sweep",
+        help="Rows deleted per retention batch (a cycle drains many batches)",
+    )
+    @click.option(
+        "--retention-max-seconds",
+        type=float,
+        default=5.0,
+        show_default=True,
+        help="Time budget per retention sweep per cycle. It drains its backlog "
+        "until caught up or this runs out, so it can never delay timeout and "
+        "dead-worker recovery.",
     )
     def main(
         dsn: str | None,
@@ -494,11 +686,13 @@ def cli() -> None:
         check_interval: float,
         liveness_grace: float,
         claimed_grace: float,
-        retention_days: float | None,
+        retention_days: float,
+        checkpoint_retention_days: float,
         retention_batch_size: int,
+        retention_max_seconds: float,
     ) -> None:
-        """Run the pyjobby monitor (timeouts, dead-worker recovery, and —
-        only with --retention-days — deletion of expired terminal jobs)."""
+        """Run the pyjobby monitor: timeouts, dead-worker recovery, and
+        retention (on by default; --retention-days 0 keeps everything)."""
         import asyncio
 
         if not dsn:
@@ -522,10 +716,16 @@ def cli() -> None:
 
         click.echo(f"Starting monitor (check every {check_interval}s)...")
         click.echo(f"DSN: {dsn.split('@')[1] if '@' in dsn else dsn}")
-        if retention_days is not None:
-            click.echo(
-                f"Retention: deleting terminal jobs older than {retention_days}d"
+        click.echo(
+            "Retention: jobs "
+            + (f"older than {retention_days}d" if retention_days else "kept forever")
+            + ", checkpoints "
+            + (
+                f"{checkpoint_retention_days}d after the job terminates"
+                if checkpoint_retention_days
+                else "kept as long as the job"
             )
+        )
 
         asyncio.run(
             monitor(
@@ -534,7 +734,9 @@ def cli() -> None:
                 liveness_grace_seconds=liveness_grace,
                 claimed_grace_seconds=claimed_grace,
                 retention_days=retention_days,
+                checkpoint_retention_days=checkpoint_retention_days,
                 retention_batch_size=retention_batch_size,
+                retention_max_seconds=retention_max_seconds,
             )
         )
 

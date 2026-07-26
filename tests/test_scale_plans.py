@@ -31,12 +31,18 @@ ROWS = 20_000
 
 
 async def seed_terminal_jobs(pool, queue: str, rows: int = ROWS) -> None:
-    """Insert `rows` jobs spread over 60 days, mixed terminal and live."""
+    """Insert `rows` jobs spread over 60 days, mixed terminal and live.
+
+    `created` is spread too, so a reporting window covers a realistic slice
+    rather than the whole table -- a scan IS the right plan when the window
+    matches everything, and a test that seeds it that way proves nothing.
+    """
     await pool.execute(
         """
-        INSERT INTO jorb (job_class, kwargs, queue, state, finished, updated)
+        INSERT INTO jorb (job_class, kwargs, queue, state, created, finished, updated)
         SELECT 'scale.Job', '{}', $1,
                (ARRAY['finished','crashed','cancelled','queued'])[1 + (i % 4)]::jorbstate,
+               now() - (i % 60) * interval '1 day',
                now() - (i % 60) * interval '1 day',
                now() - (i % 60) * interval '1 day'
         FROM generate_series(1, $2) i
@@ -110,7 +116,13 @@ class TestRetentionScanPlan:
 
 
 class TestMetricsScanPlan:
-    """/metrics is scraped on a timer; it must not read the whole table."""
+    """/metrics is scraped on a timer; it must not read the whole table.
+
+    The window is on `created`, not `updated`: `updated` changes on every
+    state transition, so indexing it would cost an index write per transition
+    and block HOT updates on the hottest table -- a permanent write-path tax
+    for a read that happens once a scrape.
+    """
 
     async def test_metrics_window_uses_an_index(self, db_pool, unique_queue):
         await seed_terminal_jobs(db_pool, unique_queue)
@@ -119,13 +131,13 @@ class TestMetricsScanPlan:
             db_pool,
             """
             SELECT state, count(*) FROM jorb
-             WHERE updated >= now() - $1::interval
+             WHERE created >= now() - $1::interval
              GROUP BY state
             """,
             datetime.timedelta(hours=1),
         )
 
-        assert "jorb_updated_idx" in plan, plan
+        assert "jorb_created_idx" in plan, plan
 
 
 class TestCascadeIndexes:

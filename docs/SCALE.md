@@ -123,13 +123,24 @@ Four row versions per job means **~4M dead tuples/hour** on the hottest table.
 Default autovacuum thresholds are proportional to table size, so on a large
 `jorb` they trigger too late and the claim index bloats.
 
-Tune per table rather than globally:
+**The schema already tunes this per table** — it is part of the install, not a
+runbook step you have to remember:
 
 ```sql
-ALTER TABLE jorb SET (autovacuum_vacuum_scale_factor = 0.01,
-                      autovacuum_vacuum_cost_limit = 2000);
-ALTER TABLE jorb_history SET (autovacuum_vacuum_scale_factor = 0.02);
+ALTER TABLE jorb SET (autovacuum_vacuum_scale_factor  = 0.02,
+                      autovacuum_vacuum_threshold     = 1000,
+                      autovacuum_analyze_scale_factor = 0.02,
+                      autovacuum_vacuum_cost_limit    = 2000,
+                      fillfactor                      = 85);
 ```
+
+`fillfactor` leaves room on each page for an updated row version to live beside
+its original, which is what allows a **HOT update** — one that does not have to
+touch every index. That is also why `jorb.updated` is deliberately *not*
+indexed: it is rewritten by every state transition, so an index on it would add
+a write to each of the ~4 updates per job and defeat HOT, paying permanent
+write-path bloat for a read that happens once per scrape. Reporting windows use
+`created`, which is written once.
 
 The dead-tuple ratio for `jorb` is reported in metrics, because "is autovacuum
 keeping up" is a survival question at this rate and nothing else answers it.

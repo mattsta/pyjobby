@@ -26,6 +26,27 @@ class Unset:
 
 UNSET = Unset()
 
+# Jobs in flight this long without a state change are reported separately from
+# "busy": at 278 jobs/sec a worker that has held one job for five minutes is
+# not slow, it is wedged.
+DEFAULT_STUCK_AFTER_SECONDS = 300.0
+
+# Tables whose footprint an operator has to watch: jorb is the hot table,
+# jorb_history is the biggest (one row per transition), jorb_step is written
+# once per DXE checkpoint.
+FOOTPRINT_TABLES = ("jorb", "jorb_history", "jorb_step")
+
+
+def _rate(count: int | None, window_seconds: float) -> float:
+    """Per-second rate, comparable across window sizes.
+
+    A zero-length window (`since` == now) has no rate to report -- returning
+    0.0 beats dividing by ~0 and publishing a meaningless spike.
+    """
+    if window_seconds <= 0:
+        return 0.0
+    return (count or 0) / window_seconds
+
 
 @dataclass
 class JobInfo:
@@ -760,17 +781,226 @@ class AdminAPI:
     # Metrics & Monitoring
     # =========================================================================
 
+    async def backlog_stats(self, queue: str | None = None) -> dict[str, Any]:
+        """
+        Claimable backlog: how much work is waiting, and how long the head
+        of each queue has been waiting for it.
+
+        Depth alone does not say whether the fleet is keeping up -- a deep
+        queue that drains in seconds is healthy, a shallow one whose oldest
+        job has sat for 40 minutes is not. Both numbers together do.
+
+        Only CLAIMABLE work counts: `run_after` gates claimability, so a job
+        deliberately scheduled for next week is not backlog and must not
+        raise the alarm.
+
+        Cost: served by the partial index `jorb_claim_idx (queue, prio,
+        run_after) WHERE state = 'queued'`, so the work is proportional to
+        the number of QUEUED jobs, not to table size. Terminal history --
+        which is where hundreds of millions of rows accumulate -- is not in
+        the index at all.
+
+        Args:
+            queue: Restrict to one queue (optional)
+
+        Returns:
+            Dictionary with per-queue depth/age plus the fleet-wide totals
+        """
+        params: list[Any] = []
+        queue_sql = ""
+        if queue:
+            params.append(queue)
+            queue_sql = "AND queue = $1"
+
+        rows = await self.conn.fetch(
+            f"""
+            SELECT queue,
+                   COUNT(*)                                        AS depth,
+                   EXTRACT(EPOCH FROM (now() - MIN(created)))::float8
+                                                                   AS oldest_age
+            FROM jorb
+            WHERE state = 'queued' AND run_after <= now() {queue_sql}
+            GROUP BY queue
+            ORDER BY queue
+            """,
+            *params,
+        )
+
+        per_queue = {
+            r["queue"]: {
+                "depth": r["depth"],
+                "oldest_age_seconds": max(float(r["oldest_age"] or 0.0), 0.0),
+            }
+            for r in rows
+        }
+        return {
+            "per_queue": per_queue,
+            "depth": sum(q["depth"] for q in per_queue.values()),
+            "oldest_age_seconds": max(
+                (q["oldest_age_seconds"] for q in per_queue.values()), default=0.0
+            ),
+        }
+
+    async def inflight_stats(
+        self,
+        queue: str | None = None,
+        stuck_after_seconds: float = DEFAULT_STUCK_AFTER_SECONDS,
+    ) -> dict[str, Any]:
+        """
+        Work a worker is holding right now, and how much of it looks wedged.
+
+        In-flight count alone cannot tell "busy" from "wedged": both look
+        like a big number. Splitting out the jobs whose last state change is
+        older than `stuck_after_seconds` does.
+
+        Cost: every column referenced (state, updated) lives in the partial
+        index `jorb_inflight_idx (state, updated) WHERE state IN ('claimed',
+        'running')`, so this is an index-only scan bounded by the size of
+        the worker fleet -- not by the table. Passing `queue` adds a heap
+        recheck (queue is not in that index) but keeps the same bound.
+
+        Args:
+            queue: Restrict to one queue (optional)
+            stuck_after_seconds: In-flight age past which a job counts as stuck
+
+        Returns:
+            Dictionary with in-flight, stuck, and oldest in-flight age
+        """
+        params: list[Any] = [stuck_after_seconds]
+        queue_sql = ""
+        if queue:
+            params.append(queue)
+            queue_sql = "AND queue = $2"
+
+        row = await self.conn.fetchrow(
+            f"""
+            SELECT COUNT(*)                                          AS inflight,
+                   COUNT(*) FILTER (
+                       WHERE updated <= now() - make_interval(secs => $1)
+                   )                                                 AS stuck,
+                   EXTRACT(EPOCH FROM (now() - MIN(updated)))::float8
+                                                                     AS oldest_age
+            FROM jorb
+            WHERE state IN ('claimed', 'running') {queue_sql}
+            """,
+            *params,
+        )
+
+        return {
+            "inflight": row["inflight"] or 0,
+            "stuck": row["stuck"] or 0,
+            "stuck_after_seconds": float(stuck_after_seconds),
+            "oldest_age_seconds": max(float(row["oldest_age"] or 0.0), 0.0),
+        }
+
+    async def storage_stats(self) -> dict[str, Any]:
+        """
+        On-disk footprint and autovacuum health for the job tables.
+
+        At a million jobs an hour the platform churns roughly four million
+        dead tuples an hour, and whether autovacuum is keeping up with that
+        is a survival question, not a curiosity: once the dead-tuple ratio
+        runs away the hot table bloats, the indexes stop fitting in cache,
+        and the claim path -- which is the whole product -- slows down.
+
+        Cost: catalog and statistics views only (`pg_stat_user_tables`,
+        `pg_total_relation_size`). No job rows are read at any table size.
+
+        Returns:
+            Dictionary with per-table byte counts and jorb's dead-tuple ratio
+        """
+        rows = await self.conn.fetch(
+            """
+            SELECT relname::text                     AS table_name,
+                   pg_total_relation_size(relid)     AS total_bytes,
+                   pg_table_size(relid)              AS table_bytes,
+                   pg_indexes_size(relid)            AS index_bytes,
+                   n_live_tup                        AS live_tuples,
+                   n_dead_tup                        AS dead_tuples,
+                   last_autovacuum,
+                   last_autoanalyze
+            FROM pg_stat_user_tables
+            WHERE relname = ANY($1::text[])
+            """,
+            list(FOOTPRINT_TABLES),
+        )
+
+        tables: dict[str, Any] = {}
+        for r in rows:
+            live = r["live_tuples"] or 0
+            dead = r["dead_tuples"] or 0
+            total_tup = live + dead
+            tables[r["table_name"]] = {
+                "total_bytes": r["total_bytes"] or 0,
+                "table_bytes": r["table_bytes"] or 0,
+                "index_bytes": r["index_bytes"] or 0,
+                "live_tuples": live,
+                "dead_tuples": dead,
+                "dead_tuple_ratio": (dead / total_tup) if total_tup else 0.0,
+                "last_autovacuum": (
+                    r["last_autovacuum"].isoformat() if r["last_autovacuum"] else None
+                ),
+                "last_autoanalyze": (
+                    r["last_autoanalyze"].isoformat() if r["last_autoanalyze"] else None
+                ),
+            }
+
+        jorb = tables.get("jorb", {})
+        return {
+            "tables": tables,
+            "total_bytes": sum(t["total_bytes"] for t in tables.values()),
+            "dead_tuple_ratio": float(jorb.get("dead_tuple_ratio", 0.0)),
+        }
+
+    async def notify_queue_usage(self) -> float:
+        """
+        Fraction (0.0-1.0) of PostgreSQL's shared async-NOTIFY queue in use.
+
+        This is the platform's sharpest cliff. pyjobby fires ~5 notifications
+        per job lifecycle (enqueue, claim, start, state-change feed,
+        completion) -- about 1,400/second at a million jobs an hour -- and
+        the shared queue drains only as fast as the SLOWEST connected
+        listener. One wedged dashboard or websocket client that stops
+        reading fills it, and at 1.0 EVERY transaction that issues a NOTIFY
+        fails: no job can be enqueued or completed anywhere in the system.
+        An observability client takes down job processing.
+
+        It is a cliff, not a gradient -- fine until it is a total outage --
+        so it is worth a metric of its own even though it never appears in
+        latency or throughput until the moment everything stops.
+
+        Cost: one C function call. No table or catalog access.
+
+        Returns:
+            Usage fraction, 0.0 (empty) to 1.0 (full; NOTIFY now failing)
+        """
+        usage = await self.conn.fetchval("SELECT pg_notification_queue_usage()")
+        return float(usage or 0.0)
+
     async def get_metrics(
         self,
         since: datetime | None = None,
         queue: str | None = None,
+        stuck_after_seconds: float = DEFAULT_STUCK_AFTER_SECONDS,
     ) -> dict[str, Any]:
         """
         Get system metrics.
 
+        Two kinds of number live here and they must not be confused:
+
+        * RATES (``*_per_second``) are measured over the ``since`` window and
+          are therefore comparable across window sizes. The pair that
+          matters most is ``throughput_per_second`` versus
+          ``arrival_rate_per_second``: sustained arrivals above completions
+          is the definition of falling behind, and no single number can say
+          that.
+        * LEVELS (backlog, in-flight, footprint, NOTIFY usage) are instants,
+          not window aggregates -- "how deep is it right now".
+
         Args:
             since: Only include jobs updated since this time (default: last 24h)
             queue: Filter by queue (optional)
+            stuck_after_seconds: In-flight age past which a job counts as stuck
 
         Returns:
             Dictionary with metrics

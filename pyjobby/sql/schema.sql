@@ -96,9 +96,12 @@ CREATE INDEX jorb_inflight_idx ON jorb (state, updated)
 -- Indexed on the expression the sweep actually filters by.
 CREATE INDEX jorb_retention_idx ON jorb (COALESCE(finished, updated))
     WHERE state IN ('finished', 'crashed', 'cancelled');
--- reporting windows (`WHERE updated >= $1`): /metrics is scraped on a timer,
--- so an unindexed scan here turns the dashboard into the outage.
-CREATE INDEX jorb_updated_idx ON jorb (updated);
+-- reporting windows. Deliberately on `created` and NOT on `updated`:
+-- `updated` is rewritten by every state change, so indexing it would add an
+-- index write to each of the ~4 updates per job AND block HOT updates on the
+-- hottest table in the system -- paying in permanent bloat for a read that
+-- happens on a scrape interval. `created` is written once.
+CREATE INDEX jorb_created_idx ON jorb (created);
 CREATE INDEX jorb_timeout_idx ON jorb (timeout_at)
     WHERE state = 'running' AND timeout_at IS NOT NULL;
 -- dependency wakeups
@@ -110,6 +113,25 @@ CREATE INDEX jorb_dag_idx           ON jorb (dag_id) WHERE dag_id IS NOT NULL;
 -- idempotent enqueue
 CREATE UNIQUE INDEX jorb_deadline_idx ON jorb (deadline_key, queue)
     WHERE state = 'queued' AND deadline_key IS NOT NULL;
+
+-- ----------------------------------------------------------------------------
+-- Autovacuum, tuned for this table's write pattern rather than left at the
+-- server defaults. A job costs ~4 row versions (insert, claim, run, terminal),
+-- so a busy install produces dead tuples in the millions per hour. The default
+-- scale factor of 0.2 means "wait until 20% of the table is garbage", which on
+-- a large jorb is both far too late and then far too much work at once; the
+-- claim index bloats in the meantime.
+--
+-- fillfactor leaves room on each page for an updated row version to live
+-- beside its original, which is what allows a HOT update -- an update that
+-- does not have to touch every index. That is why `updated` is not indexed.
+ALTER TABLE jorb SET (
+    autovacuum_vacuum_scale_factor  = 0.02,
+    autovacuum_vacuum_threshold     = 1000,
+    autovacuum_analyze_scale_factor = 0.02,
+    autovacuum_vacuum_cost_limit    = 2000,
+    fillfactor                      = 85
+);
 
 -- ============================================================================
 -- Queue control plane (live-tunable; absent row = defaults)
@@ -285,6 +307,15 @@ CREATE TABLE jorb_history (
 );
 
 CREATE INDEX jorb_history_job_idx ON jorb_history (job_id, id);
+
+-- Append-only until retention deletes in bulk, so it needs a low scale factor
+-- to clean up promptly after a sweep, but no fillfactor headroom.
+ALTER TABLE jorb_history SET (
+    autovacuum_vacuum_scale_factor = 0.05,
+    autovacuum_vacuum_threshold    = 5000,
+    autovacuum_vacuum_cost_limit   = 2000
+);
+
 
 COMMENT ON TABLE jorb_history IS 'Every state transition with worker/epoch/error detail; the per-attempt audit trail (jobs keep one row in jorb for life).';
 
