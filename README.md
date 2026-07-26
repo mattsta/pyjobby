@@ -11,7 +11,7 @@ So, in January 2021 I wrote `pyjobby` and this is all about it.
   - job workers are any python class inheriting from `pyjobby.Job`
     - includes automatic logging of failures and backoff retries
 - **modernness**
-  - python 3.12 minimum
+  - python 3.14 minimum
   - passes mypy strict
   - full async/await support
 - **outsourced persistence**
@@ -401,7 +401,7 @@ to `finished`, the job returns to `queued` for the requested future run.
 
 ## 📦 Installation
 
-Requires Python 3.12+. The project uses a standard PEP 621 `pyproject.toml`
+Requires Python 3.14+. The project uses a standard PEP 621 `pyproject.toml`
 and works with both **uv** and **poetry** (both lockfiles are committed).
 
 ### As a dependency
