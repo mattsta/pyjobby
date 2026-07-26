@@ -609,3 +609,41 @@ class TestDeadLetterQueue:
         assert job["error_count"] == 0
         assert job["error_message"] is None
         assert job["state"] == "queued"
+
+
+class TestJobInfoTracksTheSchema:
+    """JobInfo mirrors `SELECT * FROM jorb`, so it must not drift from it.
+
+    from_record() ignores unknown columns, because building it with
+    `cls(**dict(record))` meant that adding any column to jorb broke every
+    endpoint returning a job -- at runtime, in production, far from the
+    change that caused it. That happened twice (claimed_at, awaited).
+
+    Tolerating the drift there would only move the failure: the column would
+    silently never be reported. So the tolerance is paired with this test,
+    which fails the moment the two disagree -- loudly, in CI, next to the
+    schema change that caused it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_jobinfo_covers_every_jorb_column(self, db_pool):
+        from dataclasses import fields
+
+        from pyjobby.admin_api import JobInfo
+
+        columns = {
+            r["column_name"]
+            for r in await db_pool.fetch(
+                """SELECT column_name FROM information_schema.columns
+                   WHERE table_name = 'jorb' AND table_schema = 'public'"""
+            )
+        }
+        declared = {f.name for f in fields(JobInfo)}
+
+        assert columns - declared == set(), (
+            f"jorb columns missing from JobInfo: {sorted(columns - declared)} "
+            "— add them, or they will never be reported by the API"
+        )
+        assert declared - columns == set(), (
+            f"JobInfo declares columns jorb does not have: {sorted(declared - columns)}"
+        )

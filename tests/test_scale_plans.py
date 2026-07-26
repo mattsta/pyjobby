@@ -18,16 +18,21 @@ dropped. A plan is a fact.
 from __future__ import annotations
 
 import datetime
+import re
 
 import pytest
 
-from pyjobby.monitor import TERMINAL_STATES
+from pyjobby.monitor import SWEEP_CHECKPOINT_JOBS_SQL, TERMINAL_STATES
 
 pytestmark = pytest.mark.asyncio
 
 # Enough rows that the planner has a real choice. A seq scan of a tiny table
 # is genuinely cheaper than an index, so under this the test proves nothing.
 ROWS = 20_000
+
+#: The sweeps' default batch, so a plan assertion can say "a batch's worth"
+#: rather than a bare number.
+BATCH = 1000
 
 
 async def seed_terminal_jobs(pool, queue: str, rows: int = ROWS) -> None:
@@ -56,6 +61,60 @@ async def seed_terminal_jobs(pool, queue: str, rows: int = ROWS) -> None:
 async def plan_for(pool, sql: str, *args) -> str:
     rows = await pool.fetch(f"EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) {sql}", *args)
     return "\n".join(r["QUERY PLAN"] for r in rows)
+
+
+_REMOVED_RE = re.compile(r"Rows Removed by (?:Filter|Index Recheck): (\d+)")
+_BUFFERS_RE = re.compile(r"shared hit=(\d+)(?: read=(\d+))?")
+
+
+def rows_removed_by_filter(plan: str) -> int:
+    """Every row the plan read and then threw away.
+
+    The number that catches an index scan doing a table's worth of work: it
+    is not a Seq Scan, so a seq-scan assertion passes it, and it costs the
+    same. Summed across nodes because the discard can happen at any of them.
+    """
+    return sum(int(m.group(1)) for m in _REMOVED_RE.finditer(plan))
+
+
+def buffers_in(plan: str) -> int:
+    """Buffers the whole statement touched, from the root node's line.
+
+    EXPLAIN reports buffers cumulatively up the tree, so summing every node
+    counts each child once per ancestor.
+    """
+    match = _BUFFERS_RE.search(plan)
+    if not match:
+        return 0
+    return int(match.group(1)) + int(match.group(2) or 0)
+
+
+async def heap_pages(pool, table: str = "jorb") -> int:
+    """How many pages a sequential scan of `table` would have to read."""
+    pages: int = await pool.fetchval(
+        "SELECT (pg_relation_size($1::regclass) / current_setting("
+        "'block_size')::bigint)::bigint",
+        table,
+    )
+    return max(pages, 1)
+
+
+async def assert_reads_far_less_than_a_scan(pool, plan: str, table: str = "jorb"):
+    """The probe touched a small fraction of what reading the table costs.
+
+    Calibrated against the table's CURRENT size rather than a fixed number.
+    An absolute threshold looks precise and is not: dead tuples inflate both
+    the heap and the index, so the same correct plan touches more buffers on
+    a well-used database than a fresh one. A gate that passes only after
+    VACUUM FULL is a gate nobody can trust, and the first flake teaches
+    everyone to ignore it.
+    """
+    pages = await heap_pages(pool, table)
+    touched = buffers_in(plan)
+    assert touched * 10 < pages, (
+        f"touched {touched} buffers against a {pages}-page {table}: "
+        f"that is not a probe, that is a scan wearing an index\n{plan}"
+    )
 
 
 class TestRetentionScanPlan:
@@ -113,6 +172,148 @@ class TestRetentionScanPlan:
         )
 
         assert "Seq Scan on jorb" not in plan, plan
+
+
+class TestCheckpointSweepPlan:
+    """The checkpoint sweep runs every cycle forever, like retention does.
+
+    It is also the one that hid the longest, because an INDEX SCAN THAT
+    DISCARDS EVERY ROW IT READS is not a sequential scan and passes a
+    seq-scan check while costing exactly the same. The measured original --
+    ``jorb_step JOIN jorb`` filtered on the job's retention expression --
+    planned as a merge join driven by ``jorb_pkey``: 20,000 rows removed by
+    filter and 534-1,194 buffers to delete nothing, growing with the table
+    forever. So these assert the access method AND the rows it threw away.
+
+    They run the monitor's own ``SWEEP_CHECKPOINT_JOBS_SQL``, not a copy of it:
+    a plan gate that reads a duplicate of the statement certifies a query
+    nobody executes as soon as the two drift.
+    """
+
+    #: One job in `STEP_EVERY` has checkpoints at all, which is the real
+    #: shape -- only DXE jobs check point, and the sweep has to walk past the
+    #: ones that do not. `STEPS_PER_JOB` then puts ~20k rows in jorb_step, so
+    #: that table is big enough for a scan of it to be the wrong plan too.
+    #:
+    #: 3, not 4: seed_terminal_jobs assigns state by `i % 4` and ids are
+    #: sequential, so every 4th job is the SAME state -- checkpointing every
+    #: 4th would give them all to the one non-terminal state and seed a
+    #: backlog with nothing in it.
+    STEP_EVERY = 3
+    STEPS_PER_JOB = 3
+
+    async def seed(self, pool, queue: str) -> None:
+        await seed_terminal_jobs(pool, queue)
+        await pool.execute(
+            """
+            INSERT INTO jorb_step (job_id, step_seq, name, output, run_epoch)
+            SELECT j.id, s, 'step', '{}', 1
+              FROM jorb j, generate_series(1, $3) s
+             WHERE j.queue = $1 AND j.id % $2 = 0
+            """,
+            queue,
+            self.STEP_EVERY,
+            self.STEPS_PER_JOB,
+        )
+        await pool.execute("ANALYZE jorb")
+        await pool.execute("ANALYZE jorb_step")
+
+    async def explain_sweep(self, pool, retention_days: float) -> str:
+        """EXPLAIN the real sweep statement, rolled back so it deletes nothing."""
+        async with pool.acquire() as conn:
+            tx = conn.transaction()
+            await tx.start()
+            try:
+                rows = await conn.fetch(
+                    "EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) "
+                    + SWEEP_CHECKPOINT_JOBS_SQL,
+                    datetime.timedelta(days=retention_days),
+                    BATCH,
+                )
+                return "\n".join(r["QUERY PLAN"] for r in rows)
+            finally:
+                await tx.rollback()
+
+    async def test_nothing_expired_reads_almost_nothing(self, db_pool, unique_queue):
+        """The steady state: caught up, asked every cycle, answer empty.
+
+        Nothing for a LIMIT to stop early on, so a badly planned version has
+        to examine every terminal row in the table to return none."""
+        await self.seed(db_pool, unique_queue)
+
+        plan = await self.explain_sweep(db_pool, retention_days=3650)
+
+        assert "jorb_retention_idx" in plan, plan
+        assert "Seq Scan on jorb " not in plan, plan
+        # the whole point: nothing read, so nothing thrown away. The original
+        # form reported 20,000 here while deleting nothing.
+        assert rows_removed_by_filter(plan) == 0, plan
+        await assert_reads_far_less_than_a_scan(db_pool, plan)
+
+    async def test_a_backlog_is_still_driven_by_the_retention_index(
+        self, db_pool, unique_queue
+    ):
+        """...and when there IS work, it must not degrade into a scan.
+
+        The batch is bounded by jobs that actually HAVE checkpoints, which
+        is also what stops the drain loop concluding it is caught up after a
+        batch of step-less jobs."""
+        await self.seed(db_pool, unique_queue)
+
+        plan = await self.explain_sweep(db_pool, retention_days=0)
+
+        assert "jorb_retention_idx" in plan, plan
+        assert "Seq Scan on jorb " not in plan, plan
+        # It walks past step-less jobs to fill a batch, so it does discard
+        # some — but the count scales with the BATCH and the fraction of jobs
+        # that check point (here 1 in 3), never with the table. The form this
+        # replaced discarded every terminal row in existence, every cycle.
+        assert rows_removed_by_filter(plan) < self.STEP_EVERY * BATCH, plan
+
+    async def test_the_sweep_deletes_only_terminal_jobs_checkpoints(
+        self, db_pool, unique_queue
+    ):
+        """The plan is only worth asserting if the statement is still right."""
+        from pyjobby.monitor import sweep_completed_checkpoints
+
+        await self.seed(db_pool, unique_queue)
+        # a live job that the seed did NOT already give checkpoints to, so
+        # this one row is unambiguously the thing the sweep must not touch
+        live = await db_pool.fetchval(
+            """SELECT j.id FROM jorb j
+                WHERE j.queue = $1 AND j.state = 'queued'
+                  AND NOT EXISTS (SELECT 1 FROM jorb_step s WHERE s.job_id = j.id)
+                LIMIT 1""",
+            unique_queue,
+        )
+        await db_pool.execute(
+            """INSERT INTO jorb_step (job_id, step_seq, name, output, run_epoch)
+               VALUES ($1, 1, 'live', '{}', 1)""",
+            live,
+        )
+
+        deleted = 0
+        for _ in range(50):
+            batch = await sweep_completed_checkpoints(db_pool, 0, batch_size=BATCH)
+            deleted += batch
+            if not batch:
+                break
+
+        assert deleted > 0, "the sweep found nothing to reap"
+        assert (
+            await db_pool.fetchval(
+                "SELECT count(*) FROM jorb_step s JOIN jorb j ON j.id = s.job_id "
+                "WHERE j.queue = $1 AND j.state IN ('finished','crashed','cancelled')",
+                unique_queue,
+            )
+            == 0
+        ), "terminal jobs kept checkpoints"
+        assert (
+            await db_pool.fetchval(
+                "SELECT count(*) FROM jorb_step WHERE job_id = $1", live
+            )
+            == 1
+        ), "a live job's checkpoints were reaped"
 
 
 class TestMetricsScanPlan:

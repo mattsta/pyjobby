@@ -10,7 +10,7 @@ All methods are async and return structured data (dicts/lists).
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -83,11 +83,27 @@ class JobInfo:
     cancel_requested: bool = False
     claimed_by: int | None = None
     claimed_at: datetime | None = None
+    # someone has waited on this job; the demand signal that switches its
+    # jorb_done/jorb_event notifications on (see sql/schema.sql)
+    awaited: bool = False
 
     @classmethod
     def from_record(cls, record: asyncpg.Record) -> JobInfo:
-        """Create JobInfo from asyncpg Record"""
-        return cls(**dict(record))
+        """Build a JobInfo from a `SELECT * FROM jorb` row.
+
+        Unknown columns are ignored rather than raising. This mirrors a
+        `SELECT *`, so `cls(**dict(record))` meant that adding ANY column to
+        jorb broke every endpoint that returns a job -- list, get, and the
+        DLQ -- at runtime, in production, far from the change that caused it.
+        That has happened twice.
+
+        Silently dropping a column would hide the drift instead, so
+        tests/test_admin_api.py asserts JobInfo covers every column jorb has:
+        the schema and this dataclass are kept in step by a test that fails
+        loudly at the right moment, not by an exception in a live request.
+        """
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in record.items() if k in known})
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary with datetime serialization"""
