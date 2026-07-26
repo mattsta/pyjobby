@@ -98,22 +98,26 @@ def event_loop() -> Iterator[asyncio.AbstractEventLoop]:
 
 
 @pytest.fixture(scope="session")
-def db_params() -> dict[str, str]:
+def db_params() -> dict[str, str | int]:
     """
     Get database connection parameters for the test database.
 
-    Uses native PostgreSQL server on localhost:5432.
-    Connection details can be overridden via PYJOBBY_TEST_DSN environment variable.
+    Honors the PYJOBBY_TEST_DSN environment variable (so parallel test
+    sessions can each point at their own database); falls back to the
+    default local test database.
 
     Returns:
         dict: Connection parameters for asyncpg
     """
+    from urllib.parse import unquote, urlparse
+
+    parsed = urlparse(TEST_DSN)
     return {
-        "host": "localhost",
-        "port": 5432,
-        "user": "pyjobby_test",
-        "password": "pyjobby_test_password",
-        "database": "pyjobby_test",
+        "host": parsed.hostname or "localhost",
+        "port": parsed.port or 5432,
+        "user": unquote(parsed.username or "pyjobby_test"),
+        "password": unquote(parsed.password or "pyjobby_test_password"),
+        "database": (parsed.path or "/pyjobby_test").lstrip("/"),
     }
 
 

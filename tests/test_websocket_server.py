@@ -19,16 +19,7 @@ def unique_name(base: str) -> str:
     return f"{base}_{uuid.uuid4().hex[:8]}"
 
 
-@pytest.fixture
-def db_params():
-    """Database parameters for testing."""
-    return {
-        "host": "localhost",
-        "port": 5432,
-        "user": "pyjobby_test",
-        "password": "pyjobby_test_password",
-        "database": "pyjobby_test",
-    }
+# db_params comes from conftest.py (honors PYJOBBY_TEST_DSN)
 
 
 class TestWebSocketServerInit:
@@ -531,6 +522,219 @@ class TestNotificationTaskTracking:
         assert len(server._notification_tasks) == server.max_pending_notifications
         await asyncio.sleep(0.05)
         assert server.stats["events_received"] == 0
+
+
+class TestJobActionHandlers:
+    """cancel/retry handlers use the shared v1 db primitives and shapes."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_queued_job(self, db_params, db_pool):
+        """Cancelling a queued job cancels it immediately."""
+        server = WebSocketServer(db_params)
+        await server.init_db_pool()
+        try:
+            async with db_pool.acquire() as conn:
+                job_id = await conn.fetchval("""
+                    INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                    VALUES ('WsCancelJob', '{}', 'test', 100, 'queued')
+                    RETURNING id
+                """)
+
+            import time
+
+            ws = FakeWS()
+            client = ClientConnection(ws=ws, channels=set(), connected_at=time.time())
+            await server.handle_cancel_job(ws, client, {"job_id": job_id})
+
+            assert ws.sent[-1]["event"] == "job_cancelled"
+            assert ws.sent[-1]["data"] == {"job_id": job_id, "status": "cancelled"}
+
+            async with db_pool.acquire() as conn:
+                state = await conn.fetchval(
+                    "SELECT state FROM jorb WHERE id = $1", job_id
+                )
+            assert state == "cancelled"
+        finally:
+            await server.db_pool.close()
+
+    @pytest.mark.asyncio
+    async def test_cancel_running_job_requests_cancel(self, db_params, db_pool):
+        """Cancelling a running job delivers a cancel request instead."""
+        server = WebSocketServer(db_params)
+        await server.init_db_pool()
+        try:
+            async with db_pool.acquire() as conn:
+                job_id = await conn.fetchval("""
+                    INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                    VALUES ('WsCancelRun', '{}', 'test', 100, 'running')
+                    RETURNING id
+                """)
+
+            import time
+
+            ws = FakeWS()
+            client = ClientConnection(ws=ws, channels=set(), connected_at=time.time())
+            await server.handle_cancel_job(ws, client, {"job_id": job_id})
+
+            assert ws.sent[-1]["event"] == "job_cancelled"
+            assert ws.sent[-1]["data"] == {
+                "job_id": job_id,
+                "status": "cancel_requested",
+            }
+
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT state, cancel_requested FROM jorb WHERE id = $1", job_id
+                )
+            assert row["state"] == "running"
+            assert row["cancel_requested"] is True
+        finally:
+            await server.db_pool.close()
+
+    @pytest.mark.asyncio
+    async def test_retry_crashed_job_same_row(self, db_params, db_pool):
+        """Retry requeues the SAME row; response carries job_id/status."""
+        server = WebSocketServer(db_params)
+        await server.init_db_pool()
+        try:
+            async with db_pool.acquire() as conn:
+                job_id = await conn.fetchval("""
+                    INSERT INTO jorb (job_class, kwargs, queue, prio, state,
+                                      error_count)
+                    VALUES ('WsRetryJob', '{}', 'test', 100, 'crashed', 5)
+                    RETURNING id
+                """)
+
+            import time
+
+            ws = FakeWS()
+            client = ClientConnection(ws=ws, channels=set(), connected_at=time.time())
+            await server.handle_retry_job(ws, client, {"job_id": job_id})
+
+            assert ws.sent[-1]["event"] == "job_retried"
+            assert ws.sent[-1]["data"] == {"job_id": job_id, "status": "requeued"}
+
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT state, error_count FROM jorb WHERE id = $1", job_id
+                )
+            assert row["state"] == "queued"
+            assert row["error_count"] == 0
+        finally:
+            await server.db_pool.close()
+
+    @pytest.mark.asyncio
+    async def test_retry_running_job_rejected(self, db_params, db_pool):
+        """A running job cannot be retried."""
+        server = WebSocketServer(db_params)
+        await server.init_db_pool()
+        try:
+            async with db_pool.acquire() as conn:
+                job_id = await conn.fetchval("""
+                    INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                    VALUES ('WsRetryRun', '{}', 'test', 100, 'running')
+                    RETURNING id
+                """)
+
+            import time
+
+            ws = FakeWS()
+            client = ClientConnection(ws=ws, channels=set(), connected_at=time.time())
+            await server.handle_retry_job(ws, client, {"job_id": job_id})
+
+            assert ws.sent[-1]["event"] == "error"
+        finally:
+            await server.db_pool.close()
+
+
+class TestStatsControlPlane:
+    """get_stats / periodic broadcast include paused flags + live workers."""
+
+    @pytest.mark.asyncio
+    async def test_get_stats_includes_paused_and_workers(self, db_params, db_pool):
+        """stats reply carries jorb_queue paused flags and live worker count."""
+        server = WebSocketServer(db_params)
+        await server.init_db_pool()
+        try:
+            queue = unique_name("ws_ctrl")
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO jorb_queue (name, paused) VALUES ($1, TRUE)",
+                    queue,
+                )
+                await conn.execute("""
+                    INSERT INTO jorb_worker (host, pid, queue)
+                    VALUES ('ws_host', 4321, 'default')
+                """)
+
+            import time
+
+            ws = FakeWS()
+            client = ClientConnection(ws=ws, channels=set(), connected_at=time.time())
+            await server.handle_get_stats(ws, client, {})
+
+            data = ws.sent[-1]["data"]
+            assert ws.sent[-1]["event"] == "stats"
+            assert data["queues"][queue]["paused"] is True
+            assert data["workers_live"] == 1
+        finally:
+            await server.db_pool.close()
+
+    @pytest.mark.asyncio
+    async def test_get_stats_without_pool_defaults(self, db_params):
+        """With no pool yet, stats still answer with defaults."""
+        import time
+
+        server = WebSocketServer(db_params)
+        ws = FakeWS()
+        client = ClientConnection(ws=ws, channels=set(), connected_at=time.time())
+
+        await server.handle_get_stats(ws, client, {})
+
+        data = ws.sent[-1]["data"]
+        assert data["queues"] == {}
+        assert data["workers_live"] == 0
+
+    @pytest.mark.asyncio
+    async def test_collect_queue_stats(self, db_params, db_pool):
+        """Broadcast stats carry depths, paused flag, and worker count."""
+        server = WebSocketServer(db_params)
+        await server.init_db_pool()
+        try:
+            busy_queue = unique_name("ws_busy")
+            idle_paused = unique_name("ws_idle")
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                    VALUES ('WsStatsJob', '{}', $1, 100, 'queued'),
+                           ('WsStatsJob', '{}', $1, 100, 'running')
+                """,
+                    busy_queue,
+                )
+                # Paused queue with no pending jobs must still be reported
+                await conn.execute(
+                    "INSERT INTO jorb_queue (name, paused) VALUES ($1, TRUE)",
+                    idle_paused,
+                )
+                await conn.execute("""
+                    INSERT INTO jorb_worker (host, pid, queue)
+                    VALUES ('ws_host', 8765, 'default')
+                """)
+
+            stats = await server.collect_queue_stats()
+
+            busy = stats[busy_queue]
+            assert busy["queued"] == 1
+            assert busy["running"] == 1
+            assert busy["paused"] is False
+            assert busy["workers_live"] == 1
+
+            idle = stats[idle_paused]
+            assert idle["queued"] == 0
+            assert idle["paused"] is True
+        finally:
+            await server.db_pool.close()
 
 
 class TestNotifyConnectionListen:

@@ -58,16 +58,7 @@ class TestWebAdminServerInit:
         assert "/schedules" in routes
 
 
-@pytest.fixture
-def db_params():
-    """Database parameters for testing."""
-    return {
-        "host": "localhost",
-        "port": 5432,
-        "user": "pyjobby_test",
-        "password": "pyjobby_test_password",
-        "database": "pyjobby_test",
-    }
+# db_params comes from conftest.py (honors PYJOBBY_TEST_DSN)
 
 
 @pytest_asyncio.fixture
@@ -101,29 +92,34 @@ class TestHTMLPages:
     async def test_queues_page(self, web_admin_client):
         """Test queues page returns HTML."""
         resp = await web_admin_client.get("/queues")
-        # Page may return 200 or error depending on DB state
-        assert resp.status in [200, 500]
+        assert resp.status == 200
+        text = await resp.text()
+        assert "Queue Management" in text
+        assert "/api/queues?format=html" in text
 
     @pytest.mark.asyncio
     async def test_workers_page(self, web_admin_client):
         """Test workers page returns HTML."""
         resp = await web_admin_client.get("/workers")
-        # Page may return 200 or error depending on DB state
-        assert resp.status in [200, 500]
+        assert resp.status == 200
+        text = await resp.text()
+        assert "Worker Registry" in text
+        assert "/api/workers?format=html" in text
 
     @pytest.mark.asyncio
     async def test_dlq_page(self, web_admin_client):
         """Test DLQ page returns HTML."""
         resp = await web_admin_client.get("/dlq")
-        # Page may return 200 or error depending on DB state
-        assert resp.status in [200, 500]
+        assert resp.status == 200
+        text = await resp.text()
+        assert "Dead Letter Queue" in text
 
     @pytest.mark.asyncio
-    async def test_metrics_page(self, web_admin_client):
-        """Test metrics page returns HTML."""
+    async def test_metrics_is_prometheus_not_html(self, web_admin_client):
+        """GET /metrics serves the Prometheus text exposition now."""
         resp = await web_admin_client.get("/metrics")
-        # Page may return 200 or error depending on DB state
-        assert resp.status in [200, 500]
+        assert resp.status == 200
+        assert "version=0.0.4" in resp.headers["Content-Type"]
 
     @pytest.mark.asyncio
     async def test_schedules_page(self, web_admin_client):
@@ -231,7 +227,12 @@ class TestJobsAPI:
         assert resp.status == 200
 
         data = await resp.json()
-        assert "new_job_id" in data
+        # v1 shape: retries requeue the SAME row
+        assert data == {"job_id": job_id, "status": "requeued"}
+
+        async with db_pool.acquire() as conn:
+            state = await conn.fetchval("SELECT state FROM jorb WHERE id = $1", job_id)
+        assert state == "queued"
 
     @pytest.mark.asyncio
     async def test_api_job_cancel(self, web_admin_client, db_pool):
@@ -302,49 +303,446 @@ class TestQueuesAPI:
             )
 
         resp = await web_admin_client.get(f"/api/queues/{queue}/stats")
-        # May return 200 or 500 depending on DB
-        assert resp.status in [200, 500]
+        assert resp.status == 200
+        data = await resp.json()
+        assert data[0]["queue"] == queue
+        assert data[0]["queued"] == 1
+
+
+class TestQueueControls:
+    """Pause/resume endpoints drive the jorb_queue control plane."""
+
+    @pytest.mark.asyncio
+    async def test_pause_queue_creates_control_row(self, web_admin_client, db_pool):
+        """POST pause upserts a paused jorb_queue row."""
+        queue = unique_name("pause_q")
+
+        resp = await web_admin_client.post(f"/api/queues/{queue}/pause")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["name"] == queue
+        assert data["paused"] is True
+
+        async with db_pool.acquire() as conn:
+            paused = await conn.fetchval(
+                "SELECT paused FROM jorb_queue WHERE name = $1", queue
+            )
+        assert paused is True
+
+    @pytest.mark.asyncio
+    async def test_resume_queue_unpauses(self, web_admin_client, db_pool):
+        """POST resume flips paused back to false."""
+        queue = unique_name("resume_q")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO jorb_queue (name, paused) VALUES ($1, TRUE)", queue
+            )
+
+        resp = await web_admin_client.post(f"/api/queues/{queue}/resume")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["paused"] is False
+
+        async with db_pool.acquire() as conn:
+            paused = await conn.fetchval(
+                "SELECT paused FROM jorb_queue WHERE name = $1", queue
+            )
+        assert paused is False
+
+    @pytest.mark.asyncio
+    async def test_pause_html_format_returns_fragment(self, web_admin_client, db_pool):
+        """format=html returns the refreshed queues table for htmx."""
+        queue = unique_name("pause_html")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                VALUES ('PauseHtmlJob', '{}', $1, 100, 'queued')
+            """,
+                queue,
+            )
+
+        resp = await web_admin_client.post(f"/api/queues/{queue}/pause?format=html")
+        assert resp.status == 200
+        assert resp.content_type == "text/html"
+        text = await resp.text()
+        assert queue in text
+        assert "Resume" in text  # paused queue offers the resume action
+
+    @pytest.mark.asyncio
+    async def test_queues_html_shows_paused_and_limits(self, web_admin_client, db_pool):
+        """Queues fragment shows paused state, limit columns, and buttons."""
+        queue = unique_name("ctrl_html")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                VALUES ('CtrlJob', '{}', $1, 100, 'queued')
+            """,
+                queue,
+            )
+            await conn.execute(
+                """
+                INSERT INTO jorb_queue (name, paused, max_concurrency, rate_limit)
+                VALUES ($1, TRUE, 5, 100)
+            """,
+                queue,
+            )
+
+        resp = await web_admin_client.get("/api/queues?format=html")
+        assert resp.status == 200
+        text = await resp.text()
+        assert queue in text
+        assert "paused" in text
+        assert "Max Concurrency" in text
+        assert "Rate Limit" in text
+        assert f"/api/queues/{queue}/resume" in text
+
+    @pytest.mark.asyncio
+    async def test_queues_json_includes_control_fields(self, web_admin_client, db_pool):
+        """JSON queue stats carry the control-plane fields."""
+        queue = unique_name("ctrl_json")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb_queue (name, paused, max_concurrency)
+                VALUES ($1, TRUE, 3)
+            """,
+                queue,
+            )
+
+        resp = await web_admin_client.get("/api/queues")
+        assert resp.status == 200
+        data = await resp.json()
+        stats = next(s for s in data if s["queue"] == queue)
+        assert stats["paused"] is True
+        assert stats["max_concurrency"] == 3
+
+
+class TestJobHistoryAndSteps:
+    """/api/jobs/{id}/history and /api/jobs/{id}/steps JSON endpoints."""
+
+    @pytest.mark.asyncio
+    async def test_api_job_history(self, web_admin_client, db_pool):
+        """History returns the trigger-recorded transition trail in order."""
+        async with db_pool.acquire() as conn:
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                VALUES ('HistJob', '{}', 'test', 100, 'queued')
+                RETURNING id
+            """)
+            await conn.execute(
+                "UPDATE jorb SET state = 'running' WHERE id = $1", job_id
+            )
+            await conn.execute(
+                "UPDATE jorb SET state = 'finished' WHERE id = $1", job_id
+            )
+
+        resp = await web_admin_client.get(f"/api/jobs/{job_id}/history")
+        assert resp.status == 200
+        history = await resp.json()
+        events = [h["event"] for h in history]
+        assert events == ["enqueued", "running", "finished"]
+        assert all(h["job_id"] == job_id for h in history)
+        assert history[1]["detail"]["from"] == "queued"
+
+    @pytest.mark.asyncio
+    async def test_api_job_history_not_found(self, web_admin_client):
+        """Unknown job id gives 404."""
+        resp = await web_admin_client.get("/api/jobs/99999999/history")
+        assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_api_job_steps(self, web_admin_client, db_pool):
+        """Steps return DXE checkpoints ordered by sequence."""
+        async with db_pool.acquire() as conn:
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                VALUES ('StepJob', '{}', 'test', 100, 'running')
+                RETURNING id
+            """)
+            await conn.execute(
+                """
+                INSERT INTO jorb_step
+                    (job_id, step_seq, name, output, run_epoch, started, finished)
+                VALUES
+                    ($1, 2, 'second', '{"ok": true}', 1,
+                     now() - interval '5 seconds', now()),
+                    ($1, 1, 'first', '{}', 1,
+                     now() - interval '10 seconds', now() - interval '8 seconds')
+            """,
+                job_id,
+            )
+
+        resp = await web_admin_client.get(f"/api/jobs/{job_id}/steps")
+        assert resp.status == 200
+        steps = await resp.json()
+        assert [s["name"] for s in steps] == ["first", "second"]
+        assert steps[0]["duration_seconds"] == pytest.approx(2.0, abs=0.5)
+        assert steps[1]["output"] == {"ok": True}
+
+    @pytest.mark.asyncio
+    async def test_api_job_steps_not_found(self, web_admin_client):
+        """Unknown job id gives 404."""
+        resp = await web_admin_client.get("/api/jobs/99999999/steps")
+        assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_jobs_html_links_to_details(self, web_admin_client, db_pool):
+        """Jobs table links each row to its history/steps endpoints."""
+        queue = unique_name("detail_links")
+        async with db_pool.acquire() as conn:
+            job_id = await conn.fetchval(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                VALUES ('LinkJob', '{}', $1, 100, 'queued')
+                RETURNING id
+            """,
+                queue,
+            )
+
+        resp = await web_admin_client.get(f"/api/jobs?format=html&queue={queue}")
+        assert resp.status == 200
+        text = await resp.text()
+        assert f"/api/jobs/{job_id}/history" in text
+        assert f"/api/jobs/{job_id}/steps" in text
+
+
+class TestPrometheusMetrics:
+    """GET /metrics - Prometheus text exposition format."""
+
+    @pytest.mark.asyncio
+    async def test_metrics_content_type(self, web_admin_client):
+        """Exposition uses text/plain; version=0.0.4."""
+        resp = await web_admin_client.get("/metrics")
+        assert resp.status == 200
+        assert resp.headers["Content-Type"].startswith("text/plain")
+        assert "version=0.0.4" in resp.headers["Content-Type"]
+
+    @pytest.mark.asyncio
+    async def test_jobs_by_state_and_oldest_queued(self, web_admin_client, db_pool):
+        """Per-queue state gauges and oldest-queued age are exposed."""
+        queue = unique_name("prom_q")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state, created)
+                VALUES ('PromJob', '{}', $1, 100, 'queued',
+                        now() - interval '120 seconds'),
+                       ('PromJob', '{}', $1, 100, 'queued', now()),
+                       ('PromJob', '{}', $1, 100, 'crashed', now())
+            """,
+                queue,
+            )
+
+        resp = await web_admin_client.get("/metrics")
+        text = await resp.text()
+
+        assert f'pyjobby_jobs_by_state{{queue="{queue}",state="queued"}} 2' in text
+        assert f'pyjobby_jobs_by_state{{queue="{queue}",state="crashed"}} 1' in text
+        assert "# TYPE pyjobby_jobs_by_state gauge" in text
+
+        age_line = next(
+            line
+            for line in text.splitlines()
+            if line.startswith(
+                f'pyjobby_queue_oldest_queued_seconds{{queue="{queue}"}}'
+            )
+        )
+        assert float(age_line.rsplit(" ", 1)[1]) == pytest.approx(120.0, abs=10.0)
+
+    @pytest.mark.asyncio
+    async def test_paused_and_workers_live(self, web_admin_client, db_pool):
+        """Queue paused gauge and live worker count come from v1 tables."""
+        queue = unique_name("prom_paused")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO jorb_queue (name, paused) VALUES ($1, TRUE)", queue
+            )
+            await conn.execute("""
+                INSERT INTO jorb_worker (host, pid, queue)
+                VALUES ('prom_host', 777, 'default')
+            """)
+            # A shut-down worker must not count as live
+            await conn.execute("""
+                INSERT INTO jorb_worker (host, pid, queue, shutdown_at)
+                VALUES ('prom_host', 778, 'default', now())
+            """)
+
+        resp = await web_admin_client.get("/metrics")
+        text = await resp.text()
+
+        assert f'pyjobby_queue_paused{{queue="{queue}"}} 1' in text
+        assert "pyjobby_workers_live 1" in text
+
+    @pytest.mark.asyncio
+    async def test_history_counters(self, web_admin_client, db_pool):
+        """started/finished/crashed counters come from jorb_history events."""
+        queue = unique_name("prom_hist")
+        async with db_pool.acquire() as conn:
+            ok_id = await conn.fetchval(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                VALUES ('HistPromJob', '{}', $1, 100, 'queued') RETURNING id
+            """,
+                queue,
+            )
+            bad_id = await conn.fetchval(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                VALUES ('HistPromJob', '{}', $1, 100, 'queued') RETURNING id
+            """,
+                queue,
+            )
+            for job_id, final in ((ok_id, "finished"), (bad_id, "crashed")):
+                await conn.execute(
+                    "UPDATE jorb SET state = 'running' WHERE id = $1", job_id
+                )
+                await conn.execute(
+                    f"UPDATE jorb SET state = '{final}' WHERE id = $1", job_id
+                )
+
+        resp = await web_admin_client.get("/metrics")
+        text = await resp.text()
+
+        assert f'pyjobby_jobs_started_total{{queue="{queue}"}} 2' in text
+        assert f'pyjobby_jobs_finished_total{{queue="{queue}"}} 1' in text
+        assert f'pyjobby_jobs_crashed_total{{queue="{queue}"}} 1' in text
+        assert "# TYPE pyjobby_jobs_started_total counter" in text
+
+    @pytest.mark.asyncio
+    async def test_duration_quantiles(self, web_admin_client, db_pool):
+        """Duration quantiles cover jobs finished in the last hour."""
+        queue = unique_name("prom_dur")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb
+                    (job_class, kwargs, queue, prio, state, started, finished)
+                VALUES ('DurJob', '{}', $1, 100, 'finished',
+                        now() - interval '70 seconds', now() - interval '10 seconds')
+            """,
+                queue,
+            )
+
+        resp = await web_admin_client.get("/metrics")
+        text = await resp.text()
+
+        for quantile in ("0.5", "0.9", "0.99"):
+            line = next(
+                ln
+                for ln in text.splitlines()
+                if ln.startswith(
+                    f'pyjobby_job_duration_seconds{{queue="{queue}",'
+                    f'quantile="{quantile}"}}'
+                )
+            )
+            assert float(line.rsplit(" ", 1)[1]) == pytest.approx(60.0, abs=1.0)
+
+    @pytest.mark.asyncio
+    async def test_label_escaping(self, web_admin_client, db_pool):
+        """Queue names with quotes/backslashes/newlines are escaped."""
+        nasty = f'esc_{uuid.uuid4().hex[:8]}"q\\b\nnl'
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                VALUES ('EscJob', '{}', $1, 100, 'queued')
+            """,
+                nasty,
+            )
+
+        resp = await web_admin_client.get("/metrics")
+        text = await resp.text()
+
+        escaped = nasty.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        assert f'pyjobby_jobs_by_state{{queue="{escaped}",state="queued"}} 1' in text
+        # The raw (unescaped) name must not appear as a label value
+        assert f'queue="{nasty}"' not in text
 
 
 class TestWorkersAPI:
-    """Test Workers API endpoints - covers api_workers_* methods."""
+    """Test Workers API endpoints - registry (jorb_worker) based."""
 
     @pytest.mark.asyncio
     async def test_api_workers_list(self, web_admin_client, db_pool):
-        """Test listing workers."""
+        """Workers come from the jorb_worker registry with liveness info."""
+        queue = unique_name("workers_api")
         async with db_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO jorb (job_class, kwargs, queue, prio, state, worker_host, worker_pid)
-                VALUES ('WorkerJob', '{}', 'test', 100, 'running', 'test_host', 12345)
-            """)
+            await conn.execute(
+                """
+                INSERT INTO jorb_worker (host, pid, queue, capabilities)
+                VALUES ('test_host', 12345, $1, '{test}')
+            """,
+                queue,
+            )
 
         resp = await web_admin_client.get("/api/workers")
         assert resp.status == 200
 
         data = await resp.json()
         assert isinstance(data, list)
+        worker = next(w for w in data if w["queue"] == queue)
+        assert worker["host"] == "test_host"
+        assert worker["pid"] == 12345
+        assert worker["live"] is True
+        assert worker["capabilities"] == ["test"]
+        assert worker["current_job_id"] is None
 
     @pytest.mark.asyncio
-    async def test_api_workers_stats(self, web_admin_client):
-        """Test getting worker statistics."""
+    async def test_api_workers_list_html(self, web_admin_client, db_pool):
+        """HTML fragment shows registry workers with a live badge."""
+        queue = unique_name("workers_html")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb_worker (host, pid, queue)
+                VALUES ('html_host', 4242, $1)
+            """,
+                queue,
+            )
+
+        resp = await web_admin_client.get("/api/workers?format=html")
+        assert resp.status == 200
+        text = await resp.text()
+        assert "html_host" in text
+        assert "live" in text
+
+    @pytest.mark.asyncio
+    async def test_api_workers_stats(self, web_admin_client, db_pool):
+        """Worker stats aggregate the registry (live/stale/shutdown)."""
+        queue = unique_name("worker_stats")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb_worker (host, pid, queue)
+                VALUES ('stats_host', 999, $1)
+            """,
+                queue,
+            )
+
         resp = await web_admin_client.get("/api/workers/stats")
         assert resp.status == 200
 
         data = await resp.json()
-        assert "active_workers" in data
-        assert "workers" in data
+        assert data["live_workers"] >= 1
+        assert data["active_workers"] == data["live_workers"]  # compat alias
+        assert "stale_workers" in data
+        assert "shutdown_workers" in data
+        assert data["per_queue"][queue] == 1
 
 
 class TestDLQAPI:
-    """Test Dead Letter Queue API endpoints - covers api_dlq_* methods."""
+    """DLQ = every terminal 'crashed' job (retries exhausted), no heuristic."""
 
     @pytest.mark.asyncio
     async def test_api_dlq_list(self, web_admin_client, db_pool):
-        """Test listing DLQ jobs."""
+        """Any crashed job is in the DLQ, regardless of error_count."""
         async with db_pool.acquire() as conn:
-            await conn.execute("""
+            job_id = await conn.fetchval("""
                 INSERT INTO jorb (job_class, kwargs, queue, prio, state, error_count)
-                VALUES ('DLQJob', '{}', 'test', 100, 'crashed', 15)
+                VALUES ('DLQJob', '{}', 'test', 100, 'crashed', 1)
+                RETURNING id
             """)
 
         resp = await web_admin_client.get("/api/dlq")
@@ -352,10 +750,37 @@ class TestDLQAPI:
 
         data = await resp.json()
         assert isinstance(data, list)
+        assert any(j["id"] == job_id for j in data)
+
+    @pytest.mark.asyncio
+    async def test_api_dlq_list_html(self, web_admin_client, db_pool):
+        """DLQ HTML fragment lists crashed jobs with a retry button."""
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO jorb
+                    (job_class, kwargs, queue, prio, state, error_count, error_message)
+                VALUES ('DLQHtmlJob', '{}', 'test', 100, 'crashed', 3, 'boom')
+            """)
+
+        resp = await web_admin_client.get("/api/dlq?format=html")
+        assert resp.status == 200
+        text = await resp.text()
+        assert "DLQHtmlJob" in text
+        assert "boom" in text
+        assert "Retry" in text
+
+    @pytest.mark.asyncio
+    async def test_dlq_page_wording(self, web_admin_client):
+        """DLQ page explains crashed is the terminal dead-letter state."""
+        resp = await web_admin_client.get("/dlq")
+        assert resp.status == 200
+        text = await resp.text()
+        assert "crashed" in text
+        assert "retries are exhausted" in text
 
     @pytest.mark.asyncio
     async def test_api_dlq_retry(self, web_admin_client, db_pool):
-        """Test retrying a DLQ job."""
+        """Retry requeues the SAME row and resets the error budget."""
         async with db_pool.acquire() as conn:
             job_id = await conn.fetchval("""
                 INSERT INTO jorb (job_class, kwargs, queue, prio, state, error_count)
@@ -365,6 +790,28 @@ class TestDLQAPI:
 
         resp = await web_admin_client.post(f"/api/dlq/{job_id}/retry")
         assert resp.status == 200
+        data = await resp.json()
+        assert data == {"job_id": job_id, "status": "requeued_from_dlq"}
+
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT state, error_count FROM jorb WHERE id = $1", job_id
+            )
+        assert row["state"] == "queued"
+        assert row["error_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_api_dlq_retry_non_crashed_rejected(self, web_admin_client, db_pool):
+        """Only crashed jobs live in the DLQ."""
+        async with db_pool.acquire() as conn:
+            job_id = await conn.fetchval("""
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                VALUES ('NotDLQJob', '{}', 'test', 100, 'finished')
+                RETURNING id
+            """)
+
+        resp = await web_admin_client.post(f"/api/dlq/{job_id}/retry")
+        assert resp.status == 400
 
 
 class TestMetricsAPI:

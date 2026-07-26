@@ -178,6 +178,16 @@
             color: #2d3748;
         }
 
+        .badge.claimed {
+            background: #bee3f8;
+            color: #2a4365;
+        }
+
+        .badge.paused {
+            background: #fbd38d;
+            color: #7b341e;
+        }
+
         .log {
             max-height: 300px;
             overflow-y: auto;
@@ -425,6 +435,14 @@
                     log(`Schedule "${message.data.schedule_name}" executed: ${message.data.result}`);
                     break;
 
+                case 'job_retried':
+                    log(`Job ${message.data.job_id} retry: ${message.data.status}`);
+                    break;
+
+                case 'job_cancelled':
+                    log(`Job ${message.data.job_id} cancel: ${message.data.status}`);
+                    break;
+
                 case 'subscribed':
                     log('Subscribed to channels: ' + message.data.channels.join(', '));
                     break;
@@ -435,14 +453,14 @@
             }
         }
 
-        // Handle job state change
+        // Handle job state change (NOTIFY payload carries `id`, not `job_id`)
         function handleJobStateChange(data) {
             const job = {
-                id: data.job_id,
+                id: data.id ?? data.job_id,
                 job_class: data.job_class || 'Unknown',
                 queue: data.queue || 'default',
                 state: data.new_state || data.state,
-                priority: data.priority || 100,
+                error_count: data.error_count || 0,
                 timestamp: new Date().toLocaleTimeString()
             };
 
@@ -458,13 +476,21 @@
             updateActiveJobs();
         }
 
-        // Handle queue statistics
+        // Handle queue statistics (includes paused flag + live worker count)
         function handleQueueStats(data) {
             document.getElementById('queueDepth').textContent = data.queued || 0;
+
+            const pausedBadge = data.paused
+                ? ' <span class="badge paused">paused</span>'
+                : '';
 
             // Update stats grid
             const statsGrid = document.getElementById('statsGrid');
             statsGrid.innerHTML = `
+                <div class="stat-item" style="grid-column: 1 / -1;">
+                    <div class="stat-label">Queue</div>
+                    <div class="stat-value" style="font-size: 18px;">${data.queue || 'default'}${pausedBadge}</div>
+                </div>
                 <div class="stat-item">
                     <div class="stat-label">Queued</div>
                     <div class="stat-value">${data.queued || 0}</div>
@@ -478,8 +504,8 @@
                     <div class="stat-value">${data.waiting || 0}</div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-label">Total</div>
-                    <div class="stat-value">${(data.queued || 0) + (data.running || 0) + (data.waiting || 0)}</div>
+                    <div class="stat-label">Live Workers</div>
+                    <div class="stat-value">${data.workers_live ?? '-'}</div>
                 </div>
             `;
         }
@@ -553,11 +579,11 @@
                     </div>
                     <div class="job-class">${job.job_class}</div>
                     <div style="font-size: 12px; color: #a0aec0; margin-top: 5px;">
-                        Queue: ${job.queue} | Priority: ${job.priority}
+                        Queue: ${job.queue} | Errors: ${job.error_count}
                     </div>
                     <div class="actions">
-                        <button class="action-btn secondary" onclick="cancelJob(${job.id})" ${job.state !== 'queued' && job.state !== 'waiting' ? 'disabled' : ''}>Cancel</button>
-                        <button class="action-btn secondary" onclick="retryJob(${job.id})" ${job.state !== 'crashed' && job.state !== 'finished' ? 'disabled' : ''}>Retry</button>
+                        <button class="action-btn secondary" onclick="cancelJob(${job.id})" ${['queued', 'waiting', 'claimed', 'running'].includes(job.state) ? '' : 'disabled'}>Cancel</button>
+                        <button class="action-btn secondary" onclick="retryJob(${job.id})" ${['crashed', 'cancelled', 'finished'].includes(job.state) ? '' : 'disabled'}>Retry</button>
                     </div>
                 </div>
             `).join('');

@@ -5,7 +5,7 @@ Provides helpers for creating jobs, workers, and test scenarios.
 """
 
 import secrets
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 
@@ -48,8 +48,14 @@ def make_job_kwargs(
     if kwargs is None:
         kwargs = {}
 
+    if admin_data is None:
+        # schema v1: jsonb columns are NOT NULL (defaults '{}'); never
+        # insert explicit NULL
+        admin_data = {}
+
     if run_after is None:
-        run_after = datetime.utcnow()
+        # schema v1: all timestamps are timestamptz — always aware UTC
+        run_after = datetime.now(UTC)
 
     return {
         "job_class": job_class,

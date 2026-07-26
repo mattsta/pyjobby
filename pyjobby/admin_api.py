@@ -1369,7 +1369,7 @@ class AdminAPI:
         query = f"""
             SELECT * FROM jorb_schedule_log
             {where_sql}
-            ORDER BY created DESC
+            ORDER BY id DESC
             LIMIT ${param_idx} OFFSET ${param_idx + 1}
         """
         params.extend([limit, offset])

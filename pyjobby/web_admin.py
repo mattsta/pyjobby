@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import html as html_mod
 import json
+import urllib.parse
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -57,18 +58,23 @@ class WebAdminServer:
         self.app.router.add_get("/queues", self.queues_page)
         self.app.router.add_get("/workers", self.workers_page)
         self.app.router.add_get("/dlq", self.dlq_page)
-        self.app.router.add_get("/metrics", self.metrics_page)
+        # Prometheus text exposition (not an HTML page)
+        self.app.router.add_get("/metrics", self.metrics_prometheus)
         self.app.router.add_get("/schedules", self.schedules_page)
 
         # API endpoints for htmx
         self.app.router.add_get("/api/jobs", self.api_jobs_list)
         self.app.router.add_get("/api/jobs/{job_id}", self.api_job_get)
+        self.app.router.add_get("/api/jobs/{job_id}/history", self.api_job_history)
+        self.app.router.add_get("/api/jobs/{job_id}/steps", self.api_job_steps)
         self.app.router.add_post("/api/jobs/{job_id}/retry", self.api_job_retry)
         self.app.router.add_post("/api/jobs/{job_id}/cancel", self.api_job_cancel)
         self.app.router.add_delete("/api/jobs/{job_id}", self.api_job_delete)
 
         self.app.router.add_get("/api/queues", self.api_queues_list)
         self.app.router.add_get("/api/queues/{queue}/stats", self.api_queue_stats)
+        self.app.router.add_post("/api/queues/{queue}/pause", self.api_queue_pause)
+        self.app.router.add_post("/api/queues/{queue}/resume", self.api_queue_resume)
 
         self.app.router.add_get("/api/workers", self.api_workers_list)
         self.app.router.add_get("/api/workers/stats", self.api_workers_stats)
@@ -332,28 +338,228 @@ class WebAdminServer:
 </html>"""
         return web.Response(text=html, content_type="text/html")
 
+    def _page(self, title: str, active: str, body: str) -> str:
+        """Render a simple admin page with shared nav around `body`."""
+        nav_links = [
+            ("/", "Dashboard"),
+            ("/jobs", "Jobs"),
+            ("/queues", "Queues"),
+            ("/workers", "Workers"),
+            ("/dlq", "Dead Letter Queue"),
+            ("/schedules", "Schedules"),
+        ]
+        nav = ""
+        for href, label in nav_links:
+            cls = ' class="active"' if href == active else ""
+            nav += f'<a href="{href}"{cls}>{label}</a>'
+
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{html_mod.escape(title)} - Pyjobby Admin</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #333; }}
+        .header {{ background: #2c3e50; color: white; padding: 1rem 2rem; }}
+        .nav {{ background: white; border-bottom: 1px solid #ddd; padding: 0 2rem; display: flex; }}
+        .nav a {{ padding: 1rem 1.5rem; text-decoration: none; color: #555; border-bottom: 3px solid transparent; }}
+        .nav a.active {{ color: #2c3e50; border-bottom-color: #3498db; font-weight: 600; }}
+        .container {{ max-width: 1400px; margin: 0 auto; padding: 2rem; }}
+        table {{ width: 100%; background: white; border-collapse: collapse; }}
+        th, td {{ padding: 0.75rem; border-bottom: 1px solid #eee; text-align: left; }}
+        .badge {{ padding: 0.25rem 0.75rem; border-radius: 12px; font-size: 0.85rem; font-weight: 600; }}
+        .badge.queued {{ background: #e3f2fd; color: #1976d2; }}
+        .badge.running {{ background: #fff3e0; color: #f57c00; }}
+        .badge.finished {{ background: #e8f5e9; color: #388e3c; }}
+        .badge.crashed {{ background: #ffebee; color: #d32f2f; }}
+        .badge.paused {{ background: #fff3cd; color: #856404; }}
+        .badge.live {{ background: #e8f5e9; color: #388e3c; }}
+        .badge.dead {{ background: #eceff1; color: #546e7a; }}
+        .btn {{ background: #3498db; color: white; border: none; padding: 0.4rem 0.9rem; border-radius: 4px; cursor: pointer; }}
+        .btn-danger {{ background: #e74c3c; }}
+        .btn-success {{ background: #27ae60; }}
+    </style>
+</head>
+<body>
+    <div class="header"><h1>📊 Pyjobby Administration</h1></div>
+    <div class="nav">{nav}</div>
+    <div class="container">{body}</div>
+</body>
+</html>"""
+
     async def queues_page(self, request: web.Request) -> web.Response:
-        """Queues management page - Placeholder"""
+        """Queues management page: depths plus pause/resume controls."""
+        body = """
+        <h1>Queue Management</h1>
+        <p style="color: #888; margin: 0.5rem 0 1rem;">
+            Paused queues stop being claimed immediately; limits are enforced
+            live by the worker claim statement.
+        </p>
+        <div id="queues-table" hx-get="/api/queues?format=html"
+             hx-trigger="load, every 5s" hx-swap="innerHTML">
+            Loading queues...
+        </div>"""
         return web.Response(
-            text="<h1>Queues Page - Coming Soon</h1>", content_type="text/html"
+            text=self._page("Queues", "/queues", body), content_type="text/html"
         )
 
     async def workers_page(self, request: web.Request) -> web.Response:
-        """Workers management page - Placeholder"""
+        """Workers page backed by the jorb_worker registry."""
+        body = """
+        <h1>Worker Registry</h1>
+        <p style="color: #888; margin: 0.5rem 0 1rem;">
+            A worker is live while it has not shut down and its heartbeat is
+            recent; recently shut-down workers stay listed for an hour.
+        </p>
+        <div id="workers-table" hx-get="/api/workers?format=html"
+             hx-trigger="load, every 5s" hx-swap="innerHTML">
+            Loading workers...
+        </div>"""
         return web.Response(
-            text="<h1>Workers Page - Coming Soon</h1>", content_type="text/html"
+            text=self._page("Workers", "/workers", body), content_type="text/html"
         )
 
     async def dlq_page(self, request: web.Request) -> web.Response:
-        """DLQ management page - Placeholder"""
+        """DLQ page: terminal crashed jobs (retries exhausted)."""
+        body = """
+        <h1>Dead Letter Queue</h1>
+        <p style="color: #888; margin: 0.5rem 0 1rem;">
+            Jobs in the terminal <span class="badge crashed">crashed</span>
+            state: their retries are exhausted. Retrying requeues the
+            <strong>same</strong> job row with a fresh error budget.
+        </p>
+        <div id="dlq-table" hx-get="/api/dlq?format=html"
+             hx-trigger="load, every 10s" hx-swap="innerHTML">
+            Loading dead letter queue...
+        </div>"""
         return web.Response(
-            text="<h1>DLQ Page - Coming Soon</h1>", content_type="text/html"
+            text=self._page("Dead Letter Queue", "/dlq", body),
+            content_type="text/html",
         )
 
-    async def metrics_page(self, request: web.Request) -> web.Response:
-        """Metrics page - Placeholder"""
+    # =========================================================================
+    # Prometheus metrics
+    # =========================================================================
+
+    @staticmethod
+    def _prom_escape(value: str) -> str:
+        """Escape a Prometheus label value (backslash, quote, newline)."""
+        return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+    async def metrics_prometheus(self, request: web.Request) -> web.Response:
+        """Prometheus text exposition (text/plain; version 0.0.4)."""
+        esc = self._prom_escape
+        lines: list[str] = []
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            by_state = await conn.fetch("""
+                SELECT queue, state::text AS state, COUNT(*) AS n
+                FROM jorb GROUP BY queue, state ORDER BY queue, state
+            """)
+            lines.append(
+                "# HELP pyjobby_jobs_by_state Number of jobs per queue and state."
+            )
+            lines.append("# TYPE pyjobby_jobs_by_state gauge")
+            for r in by_state:
+                lines.append(
+                    f'pyjobby_jobs_by_state{{queue="{esc(r["queue"])}",'
+                    f'state="{esc(r["state"])}"}} {r["n"]}'
+                )
+
+            oldest = await conn.fetch("""
+                SELECT queue,
+                       EXTRACT(EPOCH FROM (now() - MIN(created)))::float AS age
+                FROM jorb WHERE state = 'queued'
+                GROUP BY queue ORDER BY queue
+            """)
+            lines.append(
+                "# HELP pyjobby_queue_oldest_queued_seconds "
+                "Age of the oldest queued job per queue."
+            )
+            lines.append("# TYPE pyjobby_queue_oldest_queued_seconds gauge")
+            for r in oldest:
+                lines.append(
+                    f'pyjobby_queue_oldest_queued_seconds{{queue="{esc(r["queue"])}"}}'
+                    f" {r['age']}"
+                )
+
+            paused = await conn.fetch(
+                "SELECT name, paused FROM jorb_queue ORDER BY name"
+            )
+            lines.append(
+                "# HELP pyjobby_queue_paused Whether the queue is paused (1) or not (0)."
+            )
+            lines.append("# TYPE pyjobby_queue_paused gauge")
+            for r in paused:
+                lines.append(
+                    f'pyjobby_queue_paused{{queue="{esc(r["name"])}"}}'
+                    f" {1 if r['paused'] else 0}"
+                )
+
+            workers_live = await conn.fetchval("""
+                SELECT COUNT(*) FROM jorb_worker
+                WHERE shutdown_at IS NULL
+                  AND last_seen > now() - interval '60 seconds'
+            """)
+            lines.append(
+                "# HELP pyjobby_workers_live Live workers "
+                "(registered, not shut down, recent heartbeat)."
+            )
+            lines.append("# TYPE pyjobby_workers_live gauge")
+            lines.append(f"pyjobby_workers_live {workers_live}")
+
+            events = await conn.fetch("""
+                SELECT j.queue, h.event, COUNT(*) AS n
+                FROM jorb_history h
+                JOIN jorb j ON j.id = h.job_id
+                WHERE h.event IN ('running', 'finished', 'crashed')
+                GROUP BY j.queue, h.event ORDER BY j.queue, h.event
+            """)
+            for event, metric, help_text in (
+                ("running", "pyjobby_jobs_started_total", "Job start events"),
+                ("finished", "pyjobby_jobs_finished_total", "Job finish events"),
+                ("crashed", "pyjobby_jobs_crashed_total", "Job crash events"),
+            ):
+                lines.append(f"# HELP {metric} {help_text} recorded in job history.")
+                lines.append(f"# TYPE {metric} counter")
+                for r in events:
+                    if r["event"] == event:
+                        lines.append(f'{metric}{{queue="{esc(r["queue"])}"}} {r["n"]}')
+
+            durations = await conn.fetch("""
+                SELECT queue,
+                       percentile_cont(ARRAY[0.5, 0.9, 0.99]) WITHIN GROUP (
+                           ORDER BY EXTRACT(EPOCH FROM (finished - started))
+                       ) AS quantiles
+                FROM jorb
+                WHERE state = 'finished'
+                  AND started IS NOT NULL AND finished IS NOT NULL
+                  AND finished > now() - interval '1 hour'
+                GROUP BY queue ORDER BY queue
+            """)
+            lines.append(
+                "# HELP pyjobby_job_duration_seconds "
+                "Duration quantiles of jobs finished in the last hour."
+            )
+            lines.append("# TYPE pyjobby_job_duration_seconds gauge")
+            for r in durations:
+                for quantile, value in zip(
+                    ("0.5", "0.9", "0.99"), r["quantiles"], strict=True
+                ):
+                    if value is None:
+                        continue
+                    lines.append(
+                        f'pyjobby_job_duration_seconds{{queue="{esc(r["queue"])}",'
+                        f'quantile="{quantile}"}} {value}'
+                    )
+
+        body = "\n".join(lines) + "\n"
         return web.Response(
-            text="<h1>Metrics Page - Coming Soon</h1>", content_type="text/html"
+            body=body.encode("utf-8"),
+            headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
         )
 
     # =========================================================================
@@ -386,6 +592,7 @@ class WebAdminServer:
                     html += '<th style="padding: 0.75rem;">Queue</th>'
                     html += '<th style="padding: 0.75rem;">Job Class</th>'
                     html += '<th style="padding: 0.75rem;">Created</th>'
+                    html += '<th style="padding: 0.75rem;">Details</th>'
                     html += "</tr></thead><tbody>"
 
                     for job in jobs:
@@ -395,12 +602,18 @@ class WebAdminServer:
                         job_state = html_mod.escape(str(job["state"]))
                         job_queue = html_mod.escape(str(job["queue"]))
                         job_class = html_mod.escape(str(job["job_class"]))
+                        job_id = int(job["id"])
                         html += '<tr style="border-bottom: 1px solid #eee;">'
-                        html += f'<td style="padding: 0.75rem;">{int(job["id"])}</td>'
+                        html += f'<td style="padding: 0.75rem;">{job_id}</td>'
                         html += f'<td style="padding: 0.75rem;"><span class="badge {job_state}">{job_state}</span></td>'
                         html += f'<td style="padding: 0.75rem;">{job_queue}</td>'
                         html += f'<td style="padding: 0.75rem;">{job_class}</td>'
                         html += f'<td style="padding: 0.75rem;">{created}</td>'
+                        html += (
+                            f'<td style="padding: 0.75rem;">'
+                            f'<a href="/api/jobs/{job_id}/history">history</a> | '
+                            f'<a href="/api/jobs/{job_id}/steps">steps</a></td>'
+                        )
                         html += "</tr>"
 
                     html += "</tbody></table>"
@@ -417,6 +630,26 @@ class WebAdminServer:
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response(job)
+
+    async def api_job_history(self, request: web.Request) -> web.Response:
+        """Get a job's full transition history (jorb_history, oldest first)"""
+        job_id = int(request.match_info["job_id"])
+        async with self.api() as api:
+            job = await api.get_job(job_id)
+            if not job:
+                return web.json_response({"error": "Job not found"}, status=404)
+            history = await api.get_job_history(job_id)
+            return web.json_response(history)
+
+    async def api_job_steps(self, request: web.Request) -> web.Response:
+        """Get a job's DXE step checkpoints (jorb_step, in sequence order)"""
+        job_id = int(request.match_info["job_id"])
+        async with self.api() as api:
+            job = await api.get_job(job_id)
+            if not job:
+                return web.json_response({"error": "Job not found"}, status=404)
+            steps = await api.get_job_steps(job_id)
+            return web.json_response(steps)
 
     async def api_job_retry(self, request: web.Request) -> web.Response:
         """Retry a job"""
@@ -448,45 +681,177 @@ class WebAdminServer:
             else:
                 return web.json_response({"error": "Job not found"}, status=404)
 
+    def _render_queues_table(self, stats: list[dict[str, Any]]) -> str:
+        """Render queue stats + control plane as an HTML fragment."""
+        if not stats:
+            return '<p style="padding: 1rem; color: #888;">No queue data</p>'
+
+        html = '<table style="width: 100%; border-collapse: collapse;">'
+        html += "<thead><tr>"
+        for col in (
+            "Queue",
+            "Queued",
+            "Running",
+            "Crashed",
+            "Status",
+            "Max Concurrency",
+            "Rate Limit",
+            "Actions",
+        ):
+            html += f'<th style="padding: 0.75rem; text-align: left;">{col}</th>'
+        html += "</tr></thead><tbody>"
+
+        for s in stats:
+            queue_name = str(s["queue"])
+            queue_html = html_mod.escape(queue_name)
+            queue_url = urllib.parse.quote(queue_name, safe="")
+            paused = bool(s.get("paused"))
+            status = (
+                '<span class="badge paused">paused</span>'
+                if paused
+                else '<span class="badge running">active</span>'
+            )
+            max_conc = s.get("max_concurrency")
+            rate = s.get("rate_limit")
+            rate_html = (
+                f"{int(rate)}/{s.get('rate_period_seconds', 60):g}s"
+                if rate is not None
+                else "unlimited"
+            )
+            if paused:
+                action = (
+                    f'<button class="btn btn-success" '
+                    f'hx-post="/api/queues/{queue_url}/resume?format=html" '
+                    f'hx-target="#queues-table" hx-swap="innerHTML">Resume</button>'
+                )
+            else:
+                action = (
+                    f'<button class="btn btn-danger" '
+                    f'hx-post="/api/queues/{queue_url}/pause?format=html" '
+                    f'hx-target="#queues-table" hx-swap="innerHTML">Pause</button>'
+                )
+
+            html += "<tr>"
+            html += f'<td style="padding: 0.75rem;"><strong>{queue_html}</strong></td>'
+            html += f'<td style="padding: 0.75rem;">{int(s["queued"])}</td>'
+            html += f'<td style="padding: 0.75rem;">{int(s["running"])}</td>'
+            html += f'<td style="padding: 0.75rem;">{int(s["crashed"])}</td>'
+            html += f'<td style="padding: 0.75rem;">{status}</td>'
+            html += (
+                f'<td style="padding: 0.75rem;">'
+                f"{int(max_conc) if max_conc is not None else 'unlimited'}</td>"
+            )
+            html += f'<td style="padding: 0.75rem;">{rate_html}</td>'
+            html += f'<td style="padding: 0.75rem;">{action}</td>'
+            html += "</tr>"
+
+        html += "</tbody></table>"
+        return html
+
     async def api_queues_list(self, request: web.Request) -> web.Response:
-        """List queue statistics"""
+        """List queue statistics (with paused/limit control-plane columns)"""
         async with self.api() as api:
             stats = await api.queue_stats()
             format_type = request.query.get("format", "json")
 
             if format_type == "html":
-                if not stats:
-                    html = "<p>No queue data</p>"
-                else:
-                    html = '<div class="stats-grid">'
-                    for s in stats:
-                        html += '<div class="stat-item">'
-                        html += f"<span><strong>{html_mod.escape(str(s['queue']))}</strong></span>"
-                        html += "<span>"
-                        if s["queued"] > 0:
-                            html += f'<span class="badge queued">{int(s["queued"])} queued</span> '
-                        if s["running"] > 0:
-                            html += f'<span class="badge running">{int(s["running"])} running</span> '
-                        if s["crashed"] > 0:
-                            html += f'<span class="badge crashed">{int(s["crashed"])} crashed</span>'
-                        html += "</span></div>"
-                    html += "</div>"
+                html = self._render_queues_table(stats)
                 return web.Response(text=html, content_type="text/html")
             else:
-                return web.json_response(stats)
+                # oldest_queued_age_seconds arrives as Decimal from EXTRACT()
+                return web.json_response(
+                    stats, dumps=lambda x: json.dumps(x, default=float)
+                )
 
     async def api_queue_stats(self, request: web.Request) -> web.Response:
         """Get stats for specific queue"""
         queue = request.match_info["queue"]
         async with self.api() as api:
             stats = await api.queue_stats(queue=queue)
-            return web.json_response(stats)
+            return web.json_response(
+                stats, dumps=lambda x: json.dumps(x, default=float)
+            )
+
+    async def api_queue_pause(self, request: web.Request) -> web.Response:
+        """Pause a queue (workers stop claiming from it immediately)"""
+        queue = request.match_info["queue"]
+        async with self.api() as api:
+            control = await api.pause_queue(queue)
+            if request.query.get("format") == "html":
+                stats = await api.queue_stats()
+                return web.Response(
+                    text=self._render_queues_table(stats), content_type="text/html"
+                )
+            return web.json_response(control)
+
+    async def api_queue_resume(self, request: web.Request) -> web.Response:
+        """Resume a paused queue"""
+        queue = request.match_info["queue"]
+        async with self.api() as api:
+            control = await api.resume_queue(queue)
+            if request.query.get("format") == "html":
+                stats = await api.queue_stats()
+                return web.Response(
+                    text=self._render_queues_table(stats), content_type="text/html"
+                )
+            return web.json_response(control)
 
     async def api_workers_list(self, request: web.Request) -> web.Response:
-        """List active workers"""
+        """List workers from the jorb_worker registry"""
         async with self.api() as api:
             workers = await api.list_workers()
-            return web.json_response(workers)
+            format_type = request.query.get("format", "json")
+
+            if format_type != "html":
+                return web.json_response(workers)
+
+            if not workers:
+                html = (
+                    '<p style="padding: 1rem; color: #888;">No workers registered</p>'
+                )
+                return web.Response(text=html, content_type="text/html")
+
+            html = '<table style="width: 100%; border-collapse: collapse;">'
+            html += "<thead><tr>"
+            for col in (
+                "ID",
+                "Host",
+                "PID",
+                "Queue",
+                "Status",
+                "Last Seen",
+                "Current Job",
+            ):
+                html += f'<th style="padding: 0.75rem; text-align: left;">{col}</th>'
+            html += "</tr></thead><tbody>"
+            for w in workers:
+                if w["shutdown_at"] is not None:
+                    status = '<span class="badge dead">shut down</span>'
+                elif w["live"]:
+                    status = '<span class="badge live">live</span>'
+                else:
+                    status = '<span class="badge paused">stale</span>'
+                age = w.get("last_seen_age_seconds")
+                age_html = f"{age:.0f}s ago" if age is not None else "-"
+                if w.get("current_job_id") is not None:
+                    current = (
+                        f"#{int(w['current_job_id'])} "
+                        f"{html_mod.escape(str(w['current_job_class']))} "
+                        f"({html_mod.escape(str(w['current_job_state']))})"
+                    )
+                else:
+                    current = "-"
+                html += "<tr>"
+                html += f'<td style="padding: 0.75rem;">{int(w["id"])}</td>'
+                html += f'<td style="padding: 0.75rem;">{html_mod.escape(str(w["host"]))}</td>'
+                html += f'<td style="padding: 0.75rem;">{int(w["pid"])}</td>'
+                html += f'<td style="padding: 0.75rem;">{html_mod.escape(str(w["queue"]))}</td>'
+                html += f'<td style="padding: 0.75rem;">{status}</td>'
+                html += f'<td style="padding: 0.75rem;">{age_html}</td>'
+                html += f'<td style="padding: 0.75rem;">{current}</td>'
+                html += "</tr>"
+            html += "</tbody></table>"
+            return web.Response(text=html, content_type="text/html")
 
     async def api_workers_stats(self, request: web.Request) -> web.Response:
         """Get worker statistics"""
@@ -501,22 +866,65 @@ class WebAdminServer:
             else:
                 return web.json_response(stats)
 
+    def _render_dlq_table(self, jobs: list[dict[str, Any]]) -> str:
+        """Render terminal crashed (DLQ) jobs as an HTML fragment."""
+        if not jobs:
+            return (
+                '<p style="padding: 1rem; color: #888;">'
+                "Dead letter queue is empty — no crashed jobs.</p>"
+            )
+
+        html = '<table style="width: 100%; border-collapse: collapse;">'
+        html += "<thead><tr>"
+        for col in ("ID", "Queue", "Job Class", "Errors", "Last Error", "Actions"):
+            html += f'<th style="padding: 0.75rem; text-align: left;">{col}</th>'
+        html += "</tr></thead><tbody>"
+        for job in jobs:
+            job_id = int(job["id"])
+            error = str(job.get("error_message") or "")
+            if len(error) > 120:
+                error = error[:120] + "…"
+            html += "<tr>"
+            html += f'<td style="padding: 0.75rem;">{job_id}</td>'
+            html += f'<td style="padding: 0.75rem;">{html_mod.escape(str(job["queue"]))}</td>'
+            html += f'<td style="padding: 0.75rem;">{html_mod.escape(str(job["job_class"]))}</td>'
+            html += f'<td style="padding: 0.75rem;">{int(job["error_count"])}</td>'
+            html += f'<td style="padding: 0.75rem;"><code>{html_mod.escape(error)}</code></td>'
+            html += (
+                f'<td style="padding: 0.75rem;"><button class="btn btn-success" '
+                f'hx-post="/api/dlq/{job_id}/retry?format=html" '
+                f'hx-target="#dlq-table" hx-swap="innerHTML">Retry</button></td>'
+            )
+            html += "</tr>"
+        html += "</tbody></table>"
+        return html
+
     async def api_dlq_list(self, request: web.Request) -> web.Response:
-        """List Dead Letter Queue jobs"""
+        """List Dead Letter Queue jobs (terminal crashed state)"""
         async with self.api() as api:
             limit = int(request.query.get("limit", 100))
             jobs = await api.list_dlq(limit=limit)
+            if request.query.get("format") == "html":
+                return web.Response(
+                    text=self._render_dlq_table(jobs), content_type="text/html"
+                )
             return web.json_response(jobs)
 
     async def api_dlq_retry(self, request: web.Request) -> web.Response:
-        """Retry job from DLQ"""
+        """Retry job from DLQ (requeues the same row with errors reset)"""
         job_id = int(request.match_info["job_id"])
         async with self.api() as api:
             try:
                 result = await api.retry_from_dlq(job_id)
-                return web.json_response(result)
             except ValueError as e:
                 return web.json_response({"error": str(e)}, status=400)
+            if request.query.get("format") == "html":
+                # Refresh the DLQ table for htmx buttons
+                jobs = await api.list_dlq(limit=100)
+                return web.Response(
+                    text=self._render_dlq_table(jobs), content_type="text/html"
+                )
+            return web.json_response(result)
 
     async def api_metrics(self, request: web.Request) -> web.Response:
         """Get system metrics"""
@@ -526,9 +934,7 @@ class WebAdminServer:
             format_type = request.query.get("format", "json")
 
             # jorb timestamps are naive-UTC, so compare with a naive-UTC value
-            since = datetime.now(UTC) - timedelta(
-                hours=since_hours
-            )
+            since = datetime.now(UTC) - timedelta(hours=since_hours)
             metrics = await api.get_metrics(since=since, queue=queue)
 
             if format_type == "html":
@@ -988,9 +1394,19 @@ class WebAdminServer:
             schedule_id = int(request.match_info["schedule_id"])
             limit = int(request.query.get("limit", 50))
 
-            history = await api.get_schedule_history(
-                schedule_id=schedule_id, limit=limit
+            # Query directly: jorb_schedule_log is ordered by id (schema v1
+            # has actual_time, not a 'created' column)
+            records = await api.conn.fetch(
+                """
+                SELECT * FROM jorb_schedule_log
+                WHERE schedule_id = $1
+                ORDER BY id DESC
+                LIMIT $2
+                """,
+                schedule_id,
+                limit,
             )
+            history = [dict(r) for r in records]
             return web.json_response(
                 history, dumps=lambda x: json.dumps(x, default=str)
             )

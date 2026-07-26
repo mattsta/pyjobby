@@ -412,11 +412,11 @@ class WebSocketServer:
         try:
             async with self.db_pool.acquire() as conn:
                 # shared requeue statement — jobs keep their ids across retries
-                new_job_id = await db.requeue_job(
+                requeued = await db.requeue_job(
                     conn, job_id, allowed_states=("crashed", "cancelled", "finished")
                 )
 
-                if new_job_id:
+                if requeued:
                     await self.send_to_client(
                         ws,
                         {
@@ -424,7 +424,7 @@ class WebSocketServer:
                             "timestamp": datetime.now(UTC).isoformat(),
                             "data": {
                                 "job_id": job_id,
-                                "success": True,
+                                "status": "requeued",
                             },
                         },
                     )
@@ -490,10 +490,47 @@ class WebSocketServer:
             await self.send_error(ws, f"Failed to adjust priority: {str(e)}")
             self.stats["errors"] += 1
 
+    async def get_queue_controls(self) -> dict[str, dict[str, Any]]:
+        """Fetch jorb_queue control rows keyed by queue name."""
+        assert self.db_pool is not None
+        rows = await self.db_pool.fetch(
+            """
+            SELECT name, paused, max_concurrency, rate_limit
+            FROM jorb_queue ORDER BY name
+            """
+        )
+        return {
+            r["name"]: {
+                "paused": r["paused"],
+                "max_concurrency": r["max_concurrency"],
+                "rate_limit": r["rate_limit"],
+            }
+            for r in rows
+        }
+
+    async def get_live_worker_count(self, stale_after_seconds: float = 60.0) -> int:
+        """Count live workers in the registry (no shutdown, fresh heartbeat)."""
+        assert self.db_pool is not None
+        count: int = await self.db_pool.fetchval(
+            """
+            SELECT COUNT(*) FROM jorb_worker
+            WHERE shutdown_at IS NULL
+              AND last_seen > now() - make_interval(secs => $1)
+            """,
+            stale_after_seconds,
+        )
+        return count
+
     async def handle_get_stats(
         self, ws: web.WebSocketResponse, client: ClientConnection, data: dict[str, Any]
     ) -> None:
         """Handle stats request"""
+        queues: dict[str, dict[str, Any]] = {}
+        workers_live = 0
+        if self.db_pool is not None:
+            queues = await self.get_queue_controls()
+            workers_live = await self.get_live_worker_count()
+
         await self.send_to_client(
             ws,
             {
@@ -501,6 +538,8 @@ class WebSocketServer:
                 "timestamp": datetime.now(UTC).isoformat(),
                 "data": {
                     "server": self.stats,
+                    "queues": queues,
+                    "workers_live": workers_live,
                     "client": {
                         "connected_at": client.connected_at,
                         "channels": list(client.channels),
@@ -546,6 +585,46 @@ class WebSocketServer:
             },
         )
 
+    async def collect_queue_stats(self) -> dict[str, dict[str, Any]]:
+        """
+        Collect per-queue stats for broadcasting: pending depths by state,
+        the paused flag from jorb_queue, and the live worker count from the
+        registry. Paused queues appear even when they have no pending jobs.
+        """
+        assert self.db_pool is not None
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT
+                    queue,
+                    state::text AS state,
+                    COUNT(*) as count
+                FROM jorb
+                WHERE state IN ('queued', 'claimed', 'running', 'waiting')
+                GROUP BY queue, state
+            """)
+
+        controls = await self.get_queue_controls()
+        workers_live = await self.get_live_worker_count()
+
+        queue_stats: dict[str, dict[str, Any]] = {}
+
+        def _empty() -> dict[str, Any]:
+            return {"queued": 0, "claimed": 0, "running": 0, "waiting": 0}
+
+        for row in rows:
+            stats = queue_stats.setdefault(row["queue"], _empty())
+            stats[row["state"]] = row["count"]
+
+        # Control rows surface even for queues with nothing pending
+        for name in controls:
+            queue_stats.setdefault(name, _empty())
+
+        for name, stats in queue_stats.items():
+            stats["paused"] = controls.get(name, {}).get("paused", False)
+            stats["workers_live"] = workers_live
+
+        return queue_stats
+
     async def periodic_stats_broadcast(self) -> None:
         """Periodically broadcast queue statistics"""
         while True:
@@ -555,25 +634,7 @@ class WebSocketServer:
                 if not self.db_pool:
                     continue
 
-                # Get queue statistics
-                async with self.db_pool.acquire() as conn:
-                    rows = await conn.fetch("""
-                        SELECT
-                            queue,
-                            state,
-                            COUNT(*) as count
-                        FROM jorb
-                        WHERE state IN ('queued', 'running', 'waiting')
-                        GROUP BY queue, state
-                    """)
-
-                # Organize by queue
-                queue_stats = {}
-                for row in rows:
-                    queue = row["queue"]
-                    if queue not in queue_stats:
-                        queue_stats[queue] = {"queued": 0, "running": 0, "waiting": 0}
-                    queue_stats[queue][row["state"]] = row["count"]
+                queue_stats = await self.collect_queue_stats()
 
                 # Broadcast to subscribers
                 for queue, stats in queue_stats.items():
