@@ -26,7 +26,8 @@ class ChargeAndShip(Job):
 
 | Primitive | Backing table | What it guarantees |
 |---|---|---|
-| `await self.step(name, fn, *a, **kw)` | `jorb_step` | `fn` runs **at most once** across every attempt of this job |
+| `await self.step(name, fn, *a, **kw)` | `jorb_step` | `fn` runs **at least once**; once its checkpoint commits it never runs again |
+| `await self.transaction(name, fn, *a, **kw)` | `jorb_step` | **exactly once** — the effect and the checkpoint are one commit |
 | `await self.sleep(seconds)` | `jorb_step` | the job resumes after the delay **without occupying a worker** |
 | `await self.set_event(key, value)` | `jorb_event` | a durable key/value another job or an operator can read |
 | `await self.send(job_id, msg)` / `await self.recv(topic)` | `jorb_mailbox` | a durable mailbox; each message is consumed exactly once |
@@ -107,6 +108,40 @@ and why) without making a transient error permanent.
 
 ---
 
+## Transactional steps
+
+`step()` is at-least-once, because the step's effect and its checkpoint commit
+separately (see [Invariants](#invariants)). When the step's work is a write to
+**this** database, that window can be closed completely: put the effect and the
+checkpoint in the *same* transaction, so they commit or roll back together.
+
+```python
+async def task(self, order_id: int) -> dict:
+    # exactly-once: the row insert and the checkpoint are one commit
+    await self.transaction("charge", self.charge, order_id)
+
+async def charge(self, conn, order_id: int) -> dict:
+    await conn.execute("INSERT INTO charges (order_id) VALUES ($1)", order_id)
+    return {"charged": order_id}
+```
+
+There is no window: a crash before the commit leaves neither the charge nor the
+checkpoint, so the step runs again cleanly. A crash after it leaves both, so the
+step is skipped. Nothing in between exists.
+
+This also unifies exactly-once with fencing, rather than bolting them together.
+The checkpoint write is already epoch-fenced, so a **superseded** execution's
+checkpoint insert matches zero rows — which raises inside the transaction and
+rolls the application write back with it. A zombie worker cannot commit
+application data for a job another worker has taken over.
+
+The trade is that the function must do its work on the connection it is handed,
+and must not do anything it cannot roll back. Use `step()` for external effects
+and make them idempotent; use `transaction()` for database work and get
+exactly-once for free.
+
+---
+
 ## How results are stored and reused
 
 `jorb_step.output` is `JSONB`, so **a step's return value must be
@@ -175,8 +210,25 @@ step the old attempts completed.
 
 ## Invariants
 
-1. **A completed step executes at most once per job**, across every attempt,
-   forever.
+1. **A step whose checkpoint committed never executes again**, across every
+   attempt, forever.
+
+   Read that precisely. The guarantee is anchored on the *checkpoint*, not on
+   the step's side effect, and the two are written in separate transactions:
+
+   ```
+   fn() runs and its effects commit
+        ← a crash HERE re-executes fn on the next attempt
+   the checkpoint commits
+   ```
+
+   That window is narrow but real, and it is inherent to any step whose work
+   happens outside the checkpoint's transaction — calling an external API,
+   sending mail, writing to another database. For those, `step()` is
+   **at-least-once**, and the step should be made idempotent by the caller.
+
+   For work against *this* database, the window is closable: see
+   [Transactional steps](#transactional-steps).
 2. **A job keeps one row for its entire life.** Retries requeue it;
    `jorb_history` is the per-attempt audit trail.
 3. **`run_epoch` only increases**, and a write at a stale epoch is a no-op.
