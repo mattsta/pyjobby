@@ -1,60 +1,44 @@
 #!/usr/bin/env bash
 #
-# Run pyjobby test suite against native PostgreSQL
+# Run pyjobby test suite against PostgreSQL (portable: macOS + Linux, no sudo).
 #
 # Usage:
-#   ./scripts/run-tests.sh              # Run all tests
+#   ./scripts/run-tests.sh                # Run all tests
 #   ./scripts/run-tests.sh -k test_claim  # Run specific test
-#   ./scripts/run-tests.sh --cov        # Run with coverage
-#   ./scripts/run-tests.sh --fast       # Run fast tests only (skip slow/concurrency)
-#   ./scripts/run-tests.sh --parallel   # Run tests in parallel
+#   ./scripts/run-tests.sh --fast         # Skip slow/concurrency tests
+#   ./scripts/run-tests.sh --parallel     # Run tests in parallel
 #
+# Set PYJOBBY_TEST_DSN to override the default test database.
 
 set -euo pipefail
 
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
+log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
+export PYJOBBY_TEST_DSN="${PYJOBBY_TEST_DSN:-postgresql://pyjobby_test:pyjobby_test_password@localhost:5432/pyjobby_test}"
 
-# Check if PostgreSQL is running
-if ! sudo systemctl is-active --quiet postgresql 2>/dev/null; then
-    log_error "PostgreSQL is not running!"
-    log_info "Start it with: sudo systemctl start postgresql"
-    log_info "Or run: ./scripts/setup-test-db.sh"
-    exit 1
+# Portable PostgreSQL liveness check (no sudo, no systemctl)
+if command -v pg_isready >/dev/null 2>&1; then
+    if ! pg_isready -h localhost -p 5432 -q; then
+        log_error "PostgreSQL is not accepting connections on localhost:5432"
+        log_info "Create/start the test database with: ./scripts/setup-test-db.sh"
+        exit 1
+    fi
 fi
 
-# Check if test database exists
-DB_NAME="pyjobby_test"
-if ! sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$DB_NAME"; then
-    log_error "Test database '$DB_NAME' does not exist!"
-    log_info "Create it with: ./scripts/setup-test-db.sh"
-    exit 1
-fi
-
-log_info "PostgreSQL is running and test database exists"
-
-# Parse arguments
 PYTEST_ARGS=()
-FAST_ONLY=false
-PARALLEL=false
 
 for arg in "$@"; do
     case $arg in
         --fast)
-            FAST_ONLY=true
+            PYTEST_ARGS+=(-m "not slow and not concurrency")
             ;;
         --parallel)
-            PARALLEL=true
+            PYTEST_ARGS+=(-n auto)
             ;;
         *)
             PYTEST_ARGS+=("$arg")
@@ -62,41 +46,5 @@ for arg in "$@"; do
     esac
 done
 
-# Build pytest command
-PYTEST_CMD="poetry run pytest"
-
-if [ "$FAST_ONLY" = true ]; then
-    PYTEST_CMD="$PYTEST_CMD -m 'not slow and not concurrency'"
-fi
-
-if [ "$PARALLEL" = true ]; then
-    # Use all available CPU cores
-    PYTEST_CMD="$PYTEST_CMD -n auto"
-fi
-
-# Add any additional arguments
-if [ ${#PYTEST_ARGS[@]} -gt 0 ]; then
-    PYTEST_CMD="$PYTEST_CMD ${PYTEST_ARGS[*]}"
-fi
-
-# Run tests
 log_info "Running tests..."
-log_info "Command: $PYTEST_CMD"
-echo ""
-
-# Export database connection for tests
-export PYJOBBY_TEST_DSN="postgresql://pyjobby_test:pyjobby_test_password@localhost:5432/pyjobby_test"
-
-eval "$PYTEST_CMD"
-
-exit_code=$?
-
-if [ $exit_code -eq 0 ]; then
-    echo ""
-    log_info "All tests passed! ✓"
-else
-    echo ""
-    log_error "Some tests failed. ✗"
-fi
-
-exit $exit_code
+poetry run pytest ${PYTEST_ARGS[@]+"${PYTEST_ARGS[@]}"}

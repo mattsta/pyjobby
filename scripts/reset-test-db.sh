@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Reset test database (drop and recreate)
+# Reset test database (drop and recreate, then install schema + migrations)
 #
 
 set -euo pipefail
@@ -11,7 +11,7 @@ NC='\033[0m'
 
 DB_NAME="pyjobby_test"
 DB_USER="pyjobby_test"
-SCHEMA_FILE="priv/schema.sql"
+DB_PASS="pyjobby_test_password"
 
 echo -e "${YELLOW}[WARN]${NC} This will DROP the test database and all data!"
 read -p "Are you sure? (y/N) " -n 1 -r
@@ -22,15 +22,15 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
 fi
 
 echo -e "${GREEN}[INFO]${NC} Dropping test database..."
-sudo -u postgres psql -c "DROP DATABASE IF EXISTS $DB_NAME;"
+psql -U postgres -c "DROP DATABASE IF EXISTS $DB_NAME;" 2>/dev/null \
+    || sudo -u postgres psql -c "DROP DATABASE IF EXISTS $DB_NAME;"
 
 echo -e "${GREEN}[INFO]${NC} Recreating test database..."
-sudo -u postgres psql -c "CREATE DATABASE $DB_NAME OWNER $DB_USER;"
+psql -U postgres -c "CREATE DATABASE $DB_NAME OWNER $DB_USER;" 2>/dev/null \
+    || sudo -u postgres psql -c "CREATE DATABASE $DB_NAME OWNER $DB_USER;"
 
-if [ -f "$SCHEMA_FILE" ]; then
-    echo -e "${GREEN}[INFO]${NC} Loading schema..."
-    sudo -u postgres psql -d "$DB_NAME" -f "$SCHEMA_FILE" > /dev/null
-    echo -e "${GREEN}[INFO]${NC} Schema loaded"
-fi
+echo -e "${GREEN}[INFO]${NC} Installing schema + migrations..."
+PYJOBBY_DSN="postgresql://$DB_USER:$DB_PASS@localhost:5432/$DB_NAME" \
+    poetry run pj-admin db migrate
 
 echo -e "${GREEN}[INFO]${NC} Test database has been reset!"

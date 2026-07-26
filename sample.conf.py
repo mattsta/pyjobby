@@ -8,7 +8,10 @@ db_params = {
     "port": "5432",  # optional when using directory
 }
 
-# hosts/ports/paths where workers will listen for out-of-queue requests.
+# EXPERIMENTAL / UNSUPPORTED: hosts/ports/paths where workers will listen
+# for out-of-queue requests. The current handler does not implement the
+# /job/<class> URL shape described below, so this feature should not be
+# relied on as documented.
 # Paths are classes allowed for web use, access in the form of:
 # http://127.0.0.1:6661/job/job.image.thumbnails.Thumbnails
 # The .web() method of the class will run with web.Request as an argument

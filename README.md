@@ -7,11 +7,11 @@ So, in January 2021 I wrote `pyjobby` and this is all about it.
 ## 🎯 Goals
 
 - **simplicity**
-  - core job system is under 1,000 lines in one file: [`pyjobby/pj.py`](pyjobby/pj.py)
-  - job workers are any python class inheriting from `pyjobby.pj.Job`
+  - a small, focused core worker loop: [`pyjobby/pj.py`](pyjobby/pj.py)
+  - job workers are any python class inheriting from `pyjobby.Job`
     - includes automatic logging of failures and backoff retries
 - **modernness**
-  - python 3.9 minimum
+  - python 3.12 minimum
   - passes mypy strict
   - full async/await support
 - **outsourced persistence**
@@ -26,7 +26,7 @@ So, in January 2021 I wrote `pyjobby` and this is all about it.
   - job dependencies: `waitfor_job` and `waitfor_group` for pipelines
   - scheduled jobs with `run_after` for cron-like applications
   - deadline keys for idempotent job creation (prevent duplicates)
-  - optionally listens for web connections to run worker job classes directly
+  - optionally listens for web connections to run worker job classes directly (experimental/unsupported)
 
 ---
 
@@ -46,7 +46,7 @@ Clean, high-performance Python client with:
 - Built-in patterns (pipelines, fan-out/fan-in)
 
 ```python
-from pyjobby.client import JobClient
+from pyjobby import JobClient
 
 async with await JobClient.from_config('./pyjobby.conf.py') as client:
     # Simple job
@@ -79,7 +79,7 @@ pj-admin jobs retry 12345
 
 # Queue monitoring
 pj-admin queues list
-pj-admin queues stats default
+pj-admin queues stats -q default
 
 # Worker monitoring
 pj-admin workers list
@@ -89,21 +89,33 @@ pj-admin workers stats
 pj-admin dlq list
 pj-admin dlq retry 12345
 
-# Metrics
-pj-admin metrics execution-stats
+# Metrics (single command, not a group)
+pj-admin metrics
+pj-admin metrics -q default --since-hours 48 --json
 
 # Schedule management
 pj-admin schedule add daily-cleanup myapp.jobs.CleanupJob "0 2 * * *"
 pj-admin schedule list
 pj-admin schedule history daily-cleanup
+pj-admin schedule delete daily-cleanup --yes
+
+# Database schema management
+pj-admin db migrate   # install base schema + apply all pending migrations
+pj-admin db status    # show applied vs pending migrations
 ```
+
+`pj-admin` reads its connection from `--config/-c` (a pyjobby conf file) or
+`--dsn` (also read from the `PYJOBBY_DSN` environment variable).
 
 **Web Interface**: Auto-refreshing dashboard (`pj-web`)
 
 ```bash
-pj-web ./pyjobby.conf.py --port 8081
-# Open http://localhost:8081
+pj-web ./pyjobby.conf.py --host 127.0.0.1 --port 8081
+# Open http://127.0.0.1:8081
 ```
+
+Binds to `127.0.0.1` by default and has **no authentication** — if you pass
+`--host 0.0.0.0` to expose it, put an authenticating proxy in front of it.
 
 Features:
 
@@ -115,6 +127,21 @@ Features:
 - Pure HTML + htmx (no React/Vue bloat)
 
 See [docs/ADMIN_TOOLS.md](docs/ADMIN_TOOLS.md) for complete documentation.
+
+### ✅ Realtime Websocket Dashboard (NEW!)
+
+A live event-stream dashboard server (`pj-ws`) pushes job/queue/worker events
+over websockets as they happen:
+
+```bash
+pj-ws ./pyjobby.conf.py --host 127.0.0.1 --port 8082
+```
+
+Defaults to `127.0.0.1:8082`; the websocket API is unauthenticated, so front
+it with a proxy before exposing it. The standalone client page lives at
+[`frontend/live-dashboard.html`](frontend/live-dashboard.html).
+
+See [docs/WEBSOCKET_DASHBOARD.md](docs/WEBSOCKET_DASHBOARD.md) for details.
 
 ### ✅ Recurring Scheduler (NEW!)
 
@@ -129,9 +156,14 @@ pj-admin schedule add daily-cleanup \
     --jitter 300 \
     --circuit-breaker 5
 
-# Start scheduler worker
-pj scheduler ./pyjobby.conf.py
+# Start the schedule executor (polls every 60s by default)
+pj-scheduler --config ./pyjobby.conf.py --poll-interval 60
 ```
+
+The scheduler is a separate process from `pj` workers: it only enqueues jobs
+when schedules come due; regular `pj` workers execute them. It is safe to run
+multiple `pj-scheduler` instances (schedules are row-locked while firing and
+deadline keys prevent duplicate jobs).
 
 **Safety Features:**
 
@@ -150,18 +182,24 @@ Production-grade features for complex workflows:
 **Job Result Storage & Passing**
 
 ```python
-# Store results from jobs
+# Results are stored by default (save_result=True); opt out per job:
 job_id = await client.enqueue(
     'myapp.jobs.FetchData',
-    save_result=True  # Store result in database
+    save_result=False  # Don't persist this job's return value
 )
 
-# Pass results between jobs
+# Pass results between jobs: combine use_result_from with waitfor_job
+job_id = await client.enqueue('myapp.jobs.FetchData')
 pipeline_job = await client.enqueue(
     'myapp.jobs.ProcessData',
-    use_result_from=job_id  # Inject upstream result
+    waitfor_job=job_id,      # Run only after the upstream job finishes
+    use_result_from=job_id,  # Worker injects kwargs['upstream_result']
 )
 ```
+
+The upstream result is resolved **at run time** by the worker (not at enqueue
+time): when the downstream job executes, its `task()` receives the upstream
+job's stored result as `kwargs['upstream_result']`.
 
 **Configurable Retry Strategies**
 
@@ -177,6 +215,10 @@ await client.enqueue(
 # Also supports: 'linear', 'fibonacci', 'fixed'
 ```
 
+When a job crashes, the retry is enqueued as a **new job row** (the crashed
+row is preserved as an audit trail). Retry rows are stamped in `admin_data`
+with both `parent_job_id` and `retry_of` so you can trace the full chain.
+
 **Job Timeout Enforcement**
 
 ```python
@@ -191,10 +233,15 @@ await client.enqueue(
 pj-timeout-monitor --dsn postgresql://... --check-interval 10
 ```
 
+`pj-timeout-monitor` does two things: it enforces `timeout_at` on running
+jobs, and it requeues jobs stuck in `claimed` whose worker died
+(`--claimed-grace`, default 300 seconds). It connects via `--dsn` (or the
+`PYJOBBY_DSN` environment variable) or `--config`.
+
 **DAG Support (Directed Acyclic Graphs)**
 
 ```python
-from pyjobby.dag import DAGBuilder
+from pyjobby import DAGBuilder
 
 # Build complex dependency graphs
 dag = DAGBuilder(name='ETL Pipeline')
@@ -237,17 +284,14 @@ See [docs/PHASE2_USER_GUIDE.md](docs/PHASE2_USER_GUIDE.md) for complete Phase 2 
 - [ADMIN_TOOLS.md](docs/ADMIN_TOOLS.md) - CLI, Web UI, and Admin API
 - [RECURRING_SCHEDULER.md](docs/RECURRING_SCHEDULER.md) - Cron scheduling guide
 - **[PHASE2_USER_GUIDE.md](docs/PHASE2_USER_GUIDE.md) - Advanced job patterns (NEW!)**
+- [WEBSOCKET_DASHBOARD.md](docs/WEBSOCKET_DASHBOARD.md) - Realtime websocket dashboard
 - [ARCHITECTURE_CAPABILITIES.md](docs/ARCHITECTURE_CAPABILITIES.md) - System design
-- [PROJECT_STATUS.md](docs/PROJECT_STATUS.md) - Feature completion status
 
-### ✅ Comprehensive Testing
+### ✅ Testing
 
-- **3,500+ test scenarios** via Hypothesis property-based testing
-- **149 Phase 2 tests** for advanced patterns (result storage, retries, timeouts, DAGs)
-- **100+ unit and integration tests** for core functionality
-- All passing, extensive coverage
-- Direct SQL function testing
-- Property-based fuzzing for retry strategies, timeout enforcement, and DAG algorithms
+- The test suite is roughly 1,120 tests, run against a **real PostgreSQL** instance (not mocks)
+- Covers core job lifecycle, result storage, retries, timeouts, DAGs, the scheduler, and the admin tools
+- Includes direct SQL function testing and Hypothesis property-based tests for retry strategies, timeout enforcement, and DAG algorithms
 
 ---
 
@@ -279,61 +323,85 @@ See [docs/PHASE2_USER_GUIDE.md](docs/PHASE2_USER_GUIDE.md) for complete Phase 2 
 - **crashed** - Failed with error
 - **cancelled** - Manually cancelled
 
+Note on `Job.reschedule()`: if a job calls `reschedule()` while it is
+executing, the reschedule **wins** over normal completion — instead of moving
+to `finished`, the job returns to `queued` for the requested future run.
+
 ### Job Selection
 
-- Using the `pj` script, on startup `--workers` numbers of completely independent workers are forked using `multiprocessing.Process` (defaults to number of cores on the system)
+- Using the `pj` script, on startup `--workers` numbers of completely independent workers are forked using `multiprocessing.Process` (defaults to half the number of CPU cores on the system)
 - If web endpoints are enabled, each worker also opens a web server for requests
   - Under linux, each web server on each worker process can receive queries due to in-kernel TCP port load balancing
   - On other platforms, only one of the workers will receive all web requests
-- Each worker polls the job database at 5 to 6 second intervals
-- If a worker finds a job, it claims the job, runs it, completes it, then immediately checks the job database for more jobs without entering the delay loop again
-  - see query `claim` for logic behind next job selection based on: matching server capability, allowed server priority, highest job priority (lower number is higher priority), scheduled run time, and current job state
-- If a worker doesn't find an eligible job, it returns to the 'sleep 5-6 seconds' request loop
+- Workers `LISTEN` on postgres `NOTIFY` channels (migration 009), so a newly enqueued job wakes an idle worker **immediately**; the periodic poll (`--check-interval`, default 5 seconds) is only a fallback
+- If a worker finds a job, it claims it (state `claimed`), marks it `running` while executing, completes it, then immediately checks the job database for more jobs without entering the delay loop again
+  - see query `claim` for logic behind next job selection based on: matching server capability, allowed server priority, most urgent job priority (lower number is more urgent; workers claim jobs with `prio <=` the worker ceiling, default 1000), scheduled run time, and current job state
+- If a worker doesn't find an eligible job, it waits for a `NOTIFY` or the next `--check-interval` poll
+- On startup, workers recover abandoned same-host jobs by checking pid liveness: jobs claimed by a process on this host that is no longer alive get requeued
 
 ---
 
 ## 📦 Installation
 
-### Via Poetry
+Requires Python 3.12+. The project uses a standard PEP 621 `pyproject.toml`
+and works with both **uv** and **poetry** (both lockfiles are committed).
+
+### As a dependency
 
 ```bash
+# uv
+uv add git+https://github.com/mattsta/pyjobby.git
+
+# poetry
 poetry add git+https://github.com/mattsta/pyjobby.git#main
+
+# pip
+pip install git+https://github.com/mattsta/pyjobby.git#main
 ```
 
-### Via pip
+### Working on a checkout
 
 ```bash
-pip install git+https://github.com/mattsta/pyjobby.git#main
+# uv
+uv sync
+
+# poetry
+poetry install
 ```
 
 ### Database Setup
 
-The postgres DB schema is available as:
-
-- SQL dump: [`priv/schema.sql`](priv/schema.sql)
-- SQLAlchemy classes: [`priv/schema.py`](priv/schema.py)
-- Migrations: [`priv/migrations/`](priv/migrations/)
+One step — `pj-admin db migrate` installs the base schema and applies **all**
+migrations (001-009) idempotently, tracking them in a `schema_migrations`
+table (the SQL ships inside the package under `pyjobby/sql/`):
 
 ```bash
-# Create database and schema
 createdb pyjobby
-psql pyjobby < priv/schema.sql
+pj-admin --config ./pyjobby.conf.py db migrate
 
-# Apply migrations
-psql pyjobby < priv/migrations/001_add_recovery_index.sql
-psql pyjobby < priv/migrations/002_add_cancelled_state.sql
-psql pyjobby < priv/migrations/003_add_recurring_scheduler.sql
+# Check what's applied vs pending
+pj-admin --config ./pyjobby.conf.py db status
 ```
+
+For local development, `make setup-db` (which runs
+`scripts/setup-test-db.sh`) creates the role and database and then runs the
+same migrate command.
 
 ---
 
 ## 🚦 Quick Start
 
+The public API is exported from the package top level:
+
+```python
+from pyjobby import Job, JobClient, JobState, JobSystem, DAGBuilder, RetryStrategy
+```
+
 ### 1. Define a Job
 
 ```python
 # jobs/email.py
-from pyjobby.pj import Job
+from pyjobby import Job
 from dataclasses import dataclass
 import smtplib
 
@@ -363,19 +431,16 @@ db_params = {
     "host": "localhost",
     "port": "5432",
 }
-
-# Optional: Web interface for direct job submission
-web_listen = {
-    "sites": [{"host": "127.0.0.1", "port": 6661}],
-    "paths": set(["jobs.email.SendEmailJob"]),
-}
 ```
+
+(See [`sample.conf.py`](sample.conf.py) for all options, including the
+experimental `web_listen` per-worker web endpoints.)
 
 ### 3. Start Worker
 
 ```bash
-# Start job worker
-pj ./pyjobby.conf.py --workers 4 --queue default
+# Start job workers (pj is a flat command: no subcommands, no positional args)
+pj --config ./pyjobby.conf.py --queue default --workers 4
 ```
 
 ### 4. Enqueue Jobs
@@ -383,7 +448,7 @@ pj ./pyjobby.conf.py --workers 4 --queue default
 **Using Client Library (Recommended):**
 
 ```python
-from pyjobby.client import JobClient
+from pyjobby import JobClient
 import asyncio
 
 async def main():
@@ -497,10 +562,11 @@ await client.enqueue(
 ### High-Priority Jobs
 
 ```python
-# Higher priority = processes first
-await client.enqueue('UrgentTask', priority=500)  # High priority
-await client.enqueue('NormalTask', priority=100)  # Normal (default)
-await client.enqueue('BackgroundTask', priority=10)  # Low priority
+# LOWER number = MORE urgent. Workers only claim jobs with
+# prio <= the worker's priority ceiling (default 1000).
+await client.enqueue('UrgentTask', priority=10)       # Most urgent
+await client.enqueue('NormalTask', priority=100)      # Normal (default)
+await client.enqueue('BackgroundTask', priority=500)  # Least urgent
 ```
 
 ### Capability-Based Routing
@@ -523,17 +589,24 @@ await client.enqueue(
 - **[Admin Tools](docs/ADMIN_TOOLS.md)** - CLI, Web UI, and Admin API documentation
 - **[Recurring Scheduler](docs/RECURRING_SCHEDULER.md)** - Cron-based scheduling with safety features
 - **[Architecture & Capabilities](docs/ARCHITECTURE_CAPABILITIES.md)** - System design and technical details
-- **[Project Status](docs/PROJECT_STATUS.md)** - Feature completion and roadmap
+- **[Websocket Dashboard](docs/WEBSOCKET_DASHBOARD.md)** - Realtime event-stream dashboard (`pj-ws`)
 
 ---
 
-## ⚡ Performance
+## ⚡ Performance Notes
 
-- **Job throughput**: 1000+ jobs/second
-- **Batch operations**: 10,000 jobs in < 100ms (using UNNEST)
-- **Scheduler overhead**: < 1% (60-second poll interval)
-- **Connection pooling**: 5-20 connections per client
-- **Tested scale**: 1000+ schedules, 100,000+ jobs
+- Batch enqueueing uses a single `UNNEST` insert, so thousands of jobs are one database round-trip
+- Enqueue triggers postgres `NOTIFY`, so idle workers pick up new jobs immediately instead of waiting for the next poll
+- The client pools 5-20 connections by default
+- Throughput is bounded by your PostgreSQL instance and job duration; every job state change is a committed update
+
+---
+
+## 📝 Schema Notes
+
+- The original `jorb` timestamp columns (`created`, `updated`, `run_after`) are **naive timestamps interpreted as UTC**
+- Columns added by migrations (`started`, `finished`, `timeout_at`, and all `jorb_schedule` timestamps) are **`timestamptz`**
+- Keep this in mind when writing raw SQL queries that compare or join across the two kinds of columns
 
 ---
 
@@ -542,7 +615,7 @@ await client.enqueue(
 - Python / PostgreSQL only (no other languages/databases)
 - Every job state change hits the DB as a committed update (WAL pollution for high volume servers)
 - Using `FOR UPDATE SKIP LOCKED` atomic update primitive (reliable but not highest-performing)
-  - We've avoided the postgres pub/sub notify interface with in-memory tables that [some projects use](https://github.com/que-rb/que/blob/master/lib/que/migrations/4/up.sql) for higher performance, preferring simplicity
+  - We use postgres `LISTEN`/`NOTIFY` only as a wakeup signal for idle workers; we've avoided the in-memory-table pub/sub designs that [some projects use](https://github.com/que-rb/que/blob/master/lib/que/migrations/4/up.sql) for higher performance, preferring simplicity
 
 **Note**: Many limitations from the original 2021 version have been addressed:
 

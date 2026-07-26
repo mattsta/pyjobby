@@ -13,8 +13,9 @@ Pyjobby now includes critical production-ready improvements:
 - ✅ **Job Timeout Protection** - Configurable per-job and system-wide timeouts
 - ✅ **Max Retry Limits** - Prevent infinite retry loops with permanent failure detection
 - ✅ **Enhanced Error Handling** - Detailed logging and monitoring support
-
-See [PHASE1_IMPROVEMENTS.md](../PHASE1_IMPROVEMENTS.md) for complete details.
+- ✅ **Recurring Scheduler** - Cron-based schedules executed by `pj-scheduler` (see [RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md))
+- ✅ **Realtime Websocket Dashboard** - Live event stream via `pj-ws` (see [WEBSOCKET_DASHBOARD.md](WEBSOCKET_DASHBOARD.md))
+- ✅ **One-Step Schema Install** - `pj-admin db migrate` installs the base schema and all migrations idempotently
 
 ## Table of Contents
 
@@ -109,16 +110,29 @@ See [PHASE1_IMPROVEMENTS.md](../PHASE1_IMPROVEMENTS.md) for complete details.
 
 ### Essential Files
 
-- `pyjobby/pj.py` - Core job system (783 lines)
-- `priv/schema.py` - SQLAlchemy schema definition
-- `priv/schema.sql` - PostgreSQL schema dump
+- `pyjobby/pj.py` - Core job system
+- `pyjobby/sql/schema.sql` - PostgreSQL base schema (shipped in the wheel)
+- `pyjobby/sql/migrations/` - Schema migrations 001-009 (applied by `pj-admin db migrate`)
 - `sample.conf.py` - Example configuration
 
 ### Common Commands
 
 ```bash
+# Install/upgrade the database schema (base schema + all migrations)
+pj-admin db migrate --config ./pyjobby.conf.py
+pj-admin db status --config ./pyjobby.conf.py
+
 # Start workers
 pj --queue default --workers 4 --config ./pyjobby.conf.py
+
+# Start the recurring (cron) schedule executor
+pj-scheduler --config ./pyjobby.conf.py
+
+# Start the web admin UI (localhost:8081, no auth)
+pj-web ./pyjobby.conf.py
+
+# Start the realtime websocket dashboard server (localhost:8082)
+pj-ws ./pyjobby.conf.py
 
 # View help
 pj --help
