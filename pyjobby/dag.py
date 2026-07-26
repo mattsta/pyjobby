@@ -377,24 +377,27 @@ async def wait_for_dag(
             logger.error(f"DAG {dag_id} not found")
             return False
 
-        state = status.get("dag_state")
-        if state == "complete":
-            logger.info(
-                f"DAG {dag_id} completed: {status['finished_jobs']}/{status['total_jobs']} jobs finished"
-            )
-            return True
-        elif state == "failed":
+        # Derive terminal state from the jorb_dag_status counts: any crashed
+        # job fails the DAG; otherwise it is complete once nothing is pending.
+        if status["crashed_jobs"]:
             logger.error(
                 f"DAG {dag_id} failed: {status['crashed_jobs']} crashed, "
                 f"{status['finished_jobs']}/{status['total_jobs']} finished"
             )
             return False
 
+        if status["total_jobs"] and not status["pending_jobs"]:
+            logger.info(
+                f"DAG {dag_id} completed: "
+                f"{status['finished_jobs']}/{status['total_jobs']} jobs finished"
+            )
+            return True
+
         if time.time() - start > timeout:
             logger.error(
                 f"DAG {dag_id} timeout after {timeout}s: "
                 f"{status['finished_jobs']}/{status['total_jobs']} finished, "
-                f"{status['running_jobs']} running, {status['queued_jobs']} queued"
+                f"{status['pending_jobs']} still pending"
             )
             return False
 

@@ -17,14 +17,6 @@ import pytest
 from pyjobby.client import JobClient
 from pyjobby.dag import DAGBuilder, DAGNode
 
-_WAIT_FOR_DAG_BUG = (
-    "SOURCE BUG: pyjobby.dag.wait_for_dag reads 'dag_state', 'running_jobs', "
-    "and 'queued_jobs' from jorb_dag_status, but the schema v1 view exposes "
-    "completed/total_jobs/finished_jobs/crashed_jobs/cancelled_jobs/"
-    "pending_jobs — it can never see completion and raises KeyError on the "
-    "timeout path"
-)
-
 # =============================================================================
 # Test Fixtures
 # =============================================================================
@@ -691,11 +683,6 @@ class TestDAGHelperFunctions:
         assert status["cancelled_jobs"] == 0
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason=_WAIT_FOR_DAG_BUG,
-        raises=KeyError,
-        strict=True,
-    )
     async def test_wait_for_dag_success(self, job_client, db_pool):
         """Test wait_for_dag returns True when DAG completes successfully."""
         from pyjobby.dag import wait_for_dag
@@ -730,11 +717,6 @@ class TestDAGHelperFunctions:
         assert success is True
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason=_WAIT_FOR_DAG_BUG,
-        raises=KeyError,
-        strict=True,
-    )
     async def test_wait_for_dag_failure(self, job_client, db_pool):
         """Test wait_for_dag returns False when DAG fails."""
         from pyjobby.dag import wait_for_dag
@@ -769,11 +751,6 @@ class TestDAGHelperFunctions:
         assert success is False
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason=_WAIT_FOR_DAG_BUG,
-        raises=KeyError,
-        strict=True,
-    )
     async def test_wait_for_dag_timeout(self, job_client, db_pool):
         """Test wait_for_dag returns False when timeout is exceeded."""
         from pyjobby.dag import wait_for_dag
@@ -818,3 +795,115 @@ class TestDAGHelperFunctions:
 
         # Should return False immediately
         assert success is False
+
+
+class TestDAGCompletionTrigger:
+    """jorb_dag.completed is stamped by trigger when a DAG's last job ends.
+
+    Recorded in the database rather than by any one writer, so the worker,
+    the monitor, and operator tooling all keep it truthful."""
+
+    @pytest.mark.asyncio
+    async def test_completed_stamped_when_last_job_finishes(
+        self, db_pool, unique_queue
+    ):
+        dag_id = await db_pool.fetchval(
+            "INSERT INTO jorb_dag (name) VALUES ($1) RETURNING id", "completion test"
+        )
+        job_ids = [
+            await db_pool.fetchval(
+                """INSERT INTO jorb (job_class, queue, state, dag_id)
+                   VALUES ('tests.dxe_jobs.OkJob', $1, 'running', $2) RETURNING id""",
+                unique_queue,
+                dag_id,
+            )
+            for _ in range(2)
+        ]
+
+        # first job finishing leaves the DAG open
+        await db_pool.execute(
+            "UPDATE jorb SET state = 'finished' WHERE id = $1", job_ids[0]
+        )
+        assert (
+            await db_pool.fetchval(
+                "SELECT completed FROM jorb_dag WHERE id = $1", dag_id
+            )
+            is None
+        )
+
+        # the last one closes it
+        await db_pool.execute(
+            "UPDATE jorb SET state = 'finished' WHERE id = $1", job_ids[1]
+        )
+        completed = await db_pool.fetchval(
+            "SELECT completed FROM jorb_dag WHERE id = $1", dag_id
+        )
+        assert completed is not None
+
+    @pytest.mark.asyncio
+    async def test_crashed_and_cancelled_jobs_also_complete_the_dag(
+        self, db_pool, unique_queue
+    ):
+        """A DAG is done when nothing is pending — success is not required."""
+        dag_id = await db_pool.fetchval(
+            "INSERT INTO jorb_dag (name) VALUES ($1) RETURNING id", "terminal mix"
+        )
+        crashed = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, queue, state, dag_id)
+               VALUES ('tests.dxe_jobs.FailJob', $1, 'running', $2) RETURNING id""",
+            unique_queue,
+            dag_id,
+        )
+        cancelled = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, queue, state, dag_id)
+               VALUES ('tests.dxe_jobs.OkJob', $1, 'running', $2) RETURNING id""",
+            unique_queue,
+            dag_id,
+        )
+
+        await db_pool.execute(
+            "UPDATE jorb SET state = 'crashed' WHERE id = $1", crashed
+        )
+        await db_pool.execute(
+            "UPDATE jorb SET state = 'cancelled' WHERE id = $1", cancelled
+        )
+
+        assert (
+            await db_pool.fetchval(
+                "SELECT completed FROM jorb_dag WHERE id = $1", dag_id
+            )
+            is not None
+        )
+
+    @pytest.mark.asyncio
+    async def test_completion_timestamp_is_not_overwritten(self, db_pool, unique_queue):
+        """Re-running a job in a finished DAG keeps the original stamp."""
+        dag_id = await db_pool.fetchval(
+            "INSERT INTO jorb_dag (name) VALUES ($1) RETURNING id", "stable stamp"
+        )
+        job_id = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, queue, state, dag_id)
+               VALUES ('tests.dxe_jobs.OkJob', $1, 'running', $2) RETURNING id""",
+            unique_queue,
+            dag_id,
+        )
+
+        await db_pool.execute(
+            "UPDATE jorb SET state = 'finished' WHERE id = $1", job_id
+        )
+        first = await db_pool.fetchval(
+            "SELECT completed FROM jorb_dag WHERE id = $1", dag_id
+        )
+
+        # operator requeues and it finishes again
+        await db_pool.execute("UPDATE jorb SET state = 'queued' WHERE id = $1", job_id)
+        await db_pool.execute(
+            "UPDATE jorb SET state = 'finished' WHERE id = $1", job_id
+        )
+
+        assert (
+            await db_pool.fetchval(
+                "SELECT completed FROM jorb_dag WHERE id = $1", dag_id
+            )
+            == first
+        )

@@ -126,21 +126,26 @@ class TestCalculateRetryDelay:
         # fib(20) = 6765, would be large, capped at 100
         assert delay.total_seconds() <= 105  # 100 + max jitter
 
-    # ===== Fixed (Legacy) Strategy =====
+    # ===== Fixed Strategy (constant delay) =====
 
     def test_fixed_first_retry(self):
-        """Test fixed/legacy backoff for first retry"""
-        delay = calculate_retry_delay(1, "fixed")
-        # 2 * (1^2) + random(1,5) + jitter
-        # = 2 + 1-5 + jitter = 3-7 + jitter
-        assert 3 <= delay.total_seconds() <= 12
+        """Fixed uses initial_delay regardless of attempt"""
+        delay = calculate_retry_delay(1, "fixed", initial_delay=30)
+        assert 30 <= delay.total_seconds() <= 33  # + up to 10% jitter
 
     def test_fixed_fifth_retry(self):
-        """Test fixed/legacy backoff for fifth retry"""
-        delay = calculate_retry_delay(5, "fixed")
-        # 2 * (5^2) + random(1,5) + jitter
-        # = 50 + 1-5 + jitter = 51-55 + jitter
-        assert 50 <= delay.total_seconds() <= 65
+        """Fixed does not grow with the attempt number"""
+        delay = calculate_retry_delay(5, "fixed", initial_delay=30)
+        assert 30 <= delay.total_seconds() <= 33
+
+    # ===== Quadratic Strategy =====
+
+    def test_quadratic_grows_with_square_of_attempt(self):
+        """Quadratic: initial * attempt^2"""
+        first = calculate_retry_delay(1, "quadratic", initial_delay=3)
+        fourth = calculate_retry_delay(4, "quadratic", initial_delay=3)
+        assert 3 <= first.total_seconds() <= 4  # 3*1
+        assert 48 <= fourth.total_seconds() <= 53  # 3*16
 
     # ===== Unknown/Default Strategy =====
 

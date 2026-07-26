@@ -2,7 +2,7 @@
 Retry Strategies for Pyjobby Phase 2
 
 Provides configurable retry backoff strategies to replace fixed retry intervals.
-Supports exponential, linear, fibonacci, and fixed (legacy) strategies.
+Supports exponential, linear, fibonacci, fixed, and quadratic strategies.
 """
 
 from __future__ import annotations
@@ -15,7 +15,8 @@ from enum import StrEnum
 class RetryStrategy(StrEnum):
     """Retry backoff strategies"""
 
-    FIXED = "fixed"  # Fixed interval (legacy behavior)
+    FIXED = "fixed"  # Constant delay: initial_delay every attempt
+    QUADRATIC = "quadratic"  # Steeply growing: initial * attempt^2
     EXPONENTIAL = "exponential"  # Exponential backoff (recommended)
     LINEAR = "linear"  # Linear increase
     FIBONACCI = "fibonacci"  # Fibonacci sequence
@@ -49,12 +50,18 @@ def calculate_retry_delay(
     Exponential (default): 1, 2, 4, 8, 16, 32, 64, 128...
     Linear: 1, 2, 3, 4, 5, 6, 7, 8...
     Fibonacci: 1, 1, 2, 3, 5, 8, 13, 21...
-    Fixed (legacy): quadratic with jitter
+    Fixed: 1, 1, 1, 1, 1... (constant initial_delay)
+    Quadratic: 1, 4, 9, 16, 25... (initial * attempt^2)
     """
     delay: float
     if strategy == "fixed":
-        # Legacy behavior: quadratic with jitter
-        delay = 2 * (error_count**2) + random.randint(1, 5)
+        # Constant delay: every attempt waits the same amount
+        delay = initial_delay
+
+    elif strategy == "quadratic":
+        # Quadratic backoff: initial * attempts^2 (steeper than linear,
+        # gentler than exponential at low attempt counts)
+        delay = initial_delay * (error_count**2)
 
     elif strategy == "exponential":
         # Exponential backoff: initial * (multiplier ^ attempts)

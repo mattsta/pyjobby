@@ -14,14 +14,6 @@ import pytest
 from pyjobby.dag import DAGBuilder, DAGNode, execute_dag, get_dag_status, wait_for_dag
 from tests.utils.factories import get_job
 
-_WAIT_FOR_DAG_BUG = (
-    "SOURCE BUG: pyjobby.dag.wait_for_dag reads 'dag_state', 'running_jobs', "
-    "and 'queued_jobs' from jorb_dag_status, but the schema v1 view exposes "
-    "completed/total_jobs/finished_jobs/crashed_jobs/cancelled_jobs/"
-    "pending_jobs — it can never see completion and raises KeyError on the "
-    "timeout path"
-)
-
 
 class TestDAGNode:
     """Test DAGNode dataclass."""
@@ -687,7 +679,6 @@ class TestDAGHelperFunctions:
         assert status["error"] == "DAG not found"
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(reason=_WAIT_FOR_DAG_BUG, raises=KeyError, strict=True)
     async def test_wait_for_dag_success(self, db_pool):
         """Test wait_for_dag() completes when DAG finishes."""
         # Create completed DAG
@@ -714,7 +705,6 @@ class TestDAGHelperFunctions:
         assert result is True
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(reason=_WAIT_FOR_DAG_BUG, raises=KeyError, strict=True)
     async def test_wait_for_dag_failure(self, db_pool):
         """Test wait_for_dag() fails when jobs crash."""
         # Create DAG with crashed job
@@ -741,7 +731,6 @@ class TestDAGHelperFunctions:
         assert result is False
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(reason=_WAIT_FOR_DAG_BUG, raises=KeyError, strict=True)
     async def test_wait_for_dag_timeout(self, db_pool):
         """Test wait_for_dag() times out for incomplete DAG."""
         # Create incomplete DAG

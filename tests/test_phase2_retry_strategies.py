@@ -69,20 +69,29 @@ class TestRetryDelayCalculation:
         assert 7.9 <= delays[5].total_seconds() <= 8.9  # ~8
         assert 12.9 <= delays[6].total_seconds() <= 14.3  # ~13 (13 + 10% jitter = 14.3)
 
-    def test_fixed_backoff_legacy(self):
-        """Test fixed (legacy) backoff: quadratic."""
+    def test_fixed_backoff_is_constant(self):
+        """Fixed backoff waits the same amount on every attempt."""
         delays = [
-            calculate_retry_delay(attempt, strategy="fixed") for attempt in range(1, 5)
+            calculate_retry_delay(attempt, strategy="fixed", initial_delay=5)
+            for attempt in range(1, 5)
         ]
 
-        # Fixed: 2*(n^2) + jitter
-        # 1: 2*1 + jitter = ~2-7
-        # 2: 2*4 + jitter = ~8-13
-        # 3: 2*9 + jitter = ~18-23
-        # 4: 2*16 + jitter = ~32-37
-        assert 1 <= delays[0].total_seconds() <= 8
-        assert 7 <= delays[1].total_seconds() <= 14
-        assert 17 <= delays[2].total_seconds() <= 24
+        # every attempt: 5 seconds plus up to 10% jitter
+        for delay in delays:
+            assert 5 <= delay.total_seconds() <= 6
+
+    def test_quadratic_backoff_grows_by_square(self):
+        """Quadratic backoff: initial * attempt^2."""
+        delays = [
+            calculate_retry_delay(attempt, strategy="quadratic", initial_delay=2)
+            for attempt in range(1, 5)
+        ]
+
+        # 2*1, 2*4, 2*9, 2*16 (+ up to 10% jitter)
+        assert 2 <= delays[0].total_seconds() <= 3
+        assert 8 <= delays[1].total_seconds() <= 9
+        assert 18 <= delays[2].total_seconds() <= 20
+        assert 32 <= delays[3].total_seconds() <= 36
 
     def test_max_delay_cap(self):
         """Test that delays are capped at max_delay."""

@@ -15,7 +15,9 @@ from pyjobby.dag import DAGBuilder, DAGNode
 from pyjobby.retry_strategies import calculate_retry_delay, get_retry_config
 
 # Strategy definitions
-retry_strategies = st.sampled_from(["exponential", "linear", "fibonacci", "fixed"])
+retry_strategies = st.sampled_from(
+    ["exponential", "linear", "fibonacci", "fixed", "quadratic"]
+)
 positive_ints = st.integers(min_value=1, max_value=1000)
 small_positive_ints = st.integers(min_value=1, max_value=100)
 attempt_numbers = st.integers(min_value=0, max_value=50)
@@ -111,7 +113,7 @@ class TestRetryDelayProperties:
         config_data=st.fixed_dictionaries(
             {
                 "retry_strategy": st.sampled_from(
-                    ["exponential", "linear", "fibonacci", "fixed", None]
+                    ["exponential", "linear", "fibonacci", "fixed", "quadratic", None]
                 ),
                 "max_retries": st.one_of(
                     st.none(), st.integers(min_value=1, max_value=50)
@@ -145,6 +147,7 @@ class TestRetryDelayProperties:
             "linear",
             "fibonacci",
             "fixed",
+            "quadratic",
         ]
         assert isinstance(config["max_retries"], int)
         assert config["max_retries"] > 0
@@ -481,7 +484,9 @@ class TestEdgeCases:
     @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
     def test_unknown_strategy_does_not_crash(self, strategy):
         """Property: Unknown retry strategy should fall back gracefully."""
-        assume(strategy not in ["exponential", "linear", "fibonacci", "fixed"])
+        assume(
+            strategy not in ["exponential", "linear", "fibonacci", "fixed", "quadratic"]
+        )
 
         # Should not crash, should fall back to default (exponential)
         delay = calculate_retry_delay(2, strategy, 1, 3600)

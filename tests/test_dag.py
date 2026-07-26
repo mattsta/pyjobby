@@ -560,15 +560,6 @@ class TestWaitForDAG:
         assert result is False
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason="SOURCE BUG: pyjobby.dag.wait_for_dag reads 'dag_state', "
-        "'running_jobs', and 'queued_jobs' from jorb_dag_status, but the "
-        "schema v1 view exposes completed/total_jobs/finished_jobs/"
-        "crashed_jobs/cancelled_jobs/pending_jobs — it can never see "
-        "completion and raises KeyError on the timeout path",
-        raises=KeyError,
-        strict=True,
-    )
     async def test_wait_for_dag_timeout(self, db_pool):
         """wait_for_dag should return False when the DAG never completes."""
         # Create a DAG that won't complete

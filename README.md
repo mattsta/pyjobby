@@ -265,7 +265,7 @@ await client.enqueue(
     initial_retry_delay=1
 )
 
-# Also supports: 'linear', 'fibonacci', 'fixed'
+# Also supports: 'linear', 'fibonacci', 'quadratic', 'fixed' (constant)
 ```
 
 When a job crashes, the retry **requeues the same row** — the job keeps

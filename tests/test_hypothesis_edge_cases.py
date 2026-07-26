@@ -41,7 +41,7 @@ class TestRetryStrategyEdgeCases:
         """Property: Retry delay must never exceed max_delay."""
         assume(max_delay >= initial_delay)
 
-        for strategy in ["exponential", "linear", "fibonacci", "fixed"]:
+        for strategy in ["exponential", "linear", "fibonacci", "fixed", "quadratic"]:
             delay = calculate_retry_delay(
                 error_count,
                 strategy=strategy,
@@ -467,7 +467,9 @@ class TestAdminDataValidation:
 
     @given(
         on_timeout=st.sampled_from(["retry", "fail", "ignore"]),
-        retry_strategy=st.sampled_from(["exponential", "linear", "fibonacci", "fixed"]),
+        retry_strategy=st.sampled_from(
+            ["exponential", "linear", "fibonacci", "fixed", "quadratic"]
+        ),
     )
     def test_admin_data_enum_values(self, on_timeout, retry_strategy):
         """Property: Enum-like admin_data fields should have valid values."""
@@ -480,6 +482,7 @@ class TestAdminDataValidation:
             "linear",
             "fibonacci",
             "fixed",
+            "quadratic",
         ]
 
 

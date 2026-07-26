@@ -17,15 +17,26 @@ class TestRetryStrategies:
     """Test all retry backoff strategies - covers lines 52-80."""
 
     def test_fixed_strategy(self):
-        """Test fixed (legacy) strategy with quadratic backoff - covers line 54."""
-        delay = calculate_retry_delay(1, strategy="fixed")
+        """Fixed waits the same initial_delay on every attempt."""
+        delay = calculate_retry_delay(1, strategy="fixed", initial_delay=10)
         assert isinstance(delay, datetime.timedelta)
-        # Fixed: 2 * (1^2) + jitter(1-5) = 2 + jitter, so 3-7 seconds
-        assert 2 <= delay.total_seconds() <= 10
+        # 10 plus up to 10% jitter
+        assert 10 <= delay.total_seconds() <= 11
 
-        delay2 = calculate_retry_delay(3, strategy="fixed")
-        # Fixed: 2 * (3^2) + jitter = 18 + jitter
-        assert 18 <= delay2.total_seconds() <= 30
+        delay2 = calculate_retry_delay(5, strategy="fixed", initial_delay=10)
+        # the attempt number does not change a fixed delay
+        assert 10 <= delay2.total_seconds() <= 11
+
+    def test_quadratic_strategy(self):
+        """Quadratic grows with the square of the attempt number."""
+        delays = [
+            calculate_retry_delay(n, strategy="quadratic", initial_delay=2)
+            for n in (1, 2, 3)
+        ]
+        # 2*1, 2*4, 2*9 (+ up to 10% jitter)
+        assert 2 <= delays[0].total_seconds() <= 3
+        assert 8 <= delays[1].total_seconds() <= 9
+        assert 18 <= delays[2].total_seconds() <= 20
 
     def test_exponential_strategy(self):
         """Test exponential backoff strategy - covers line 58."""
