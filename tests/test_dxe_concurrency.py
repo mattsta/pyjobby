@@ -245,7 +245,7 @@ async def test_completed_steps_never_re_execute_under_worker_contention(
     ]
     assert [r["result"] for r in rows] == [{"pipeline": True}] * 4
     assert [r["error_count"] for r in rows] == [1] * 4
-    assert [r["run_epoch"] for r in rows] == [2] * 4  # exactly two attempts each
+    assert [r["run_count"] for r in rows] == [2] * 4  # exactly two attempts each
 
     # the checkpoint table: 12 successful steps, no failures left behind
     # (step 2's recorded error is overwritten when it succeeds on the retry)
@@ -279,7 +279,9 @@ async def test_completed_steps_never_re_execute_under_worker_contention(
            WHERE job_id = ANY($1) AND name IN ('s2', 's3')""",
         ids,
     )
-    assert [s["run_epoch"] for s in later_steps] == [2] * 8
+    # (epochs advance on abandonment too, so compare rather than hardcode)
+    assert all(s["run_epoch"] > 1 for s in later_steps)
+    assert len(later_steps) == 8
 
 
 # ============================================================================
@@ -373,7 +375,8 @@ async def test_stale_execution_cannot_overwrite_the_winning_result(
 
     b = await live_worker()
     claimed = await wait_for_job_state(db_pool, job_id, ("running",))
-    assert claimed["run_epoch"] == 2
+    winner_epoch = claimed["run_epoch"]
+    assert winner_epoch > 1
 
     # let A come back from its (now stale) execution and try to complete
     await wait_until(
@@ -381,13 +384,15 @@ async def test_stale_execution_cannot_overwrite_the_winning_result(
         timeout=20,
         what="worker A finished its stale attempt",
     )
-    row = await db_pool.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-    assert row["state"] == "running", "the stale attempt must not finish the job"
-    assert row["result"] is None
 
+    # Deliberately no assertion on the in-flight state here: A and B race, and
+    # B legitimately finishing first is not a failure. What must hold either
+    # way is the OUTCOME -- A's write is fenced, so the row can only ever
+    # carry B's result.
     row = await wait_for_job_state(db_pool, job_id, ("finished",), timeout=20)
-    assert row["result"] == {"epoch": 2}  # B's result, never A's
-    assert row["run_epoch"] == 2
+    assert row["result"] == {"epoch": winner_epoch}  # B's result, never A's
+    assert row["result"] != {"epoch": running["run_epoch"]}, "A's result won"
+    assert row["run_epoch"] == winner_epoch
     assert row["error_count"] == 0
 
     assert await history_events(db_pool, job_id) == [
@@ -823,7 +828,9 @@ async def test_four_concurrent_timeout_sweeps_handle_a_job_exactly_once(
     assert row["state"] == "queued"
     assert row["error_count"] == 1
     assert row["timeout_at"] is None
-    assert row["run_epoch"] == 1  # a requeue never bumps the fence; the claim does
+    # the requeue advances the fence itself, so the attempt it abandoned is
+    # locked out before anything re-claims the row
+    assert row["run_epoch"] > claimed["run_epoch"]
     assert await event_count(db_pool, job_id, "queued") == 1
 
 

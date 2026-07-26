@@ -407,7 +407,11 @@ class TestConcurrentEpochFencing:
     """Epoch fencing under concurrency: exactly one attempt owns the row."""
 
     async def test_stale_epoch_writers_lose(self, db_params, unique_queue):
-        """After a requeue+reclaim, writers holding the old epoch are no-ops."""
+        """After a requeue+reclaim, writers holding the old epoch are no-ops.
+
+        The requeue advances the epoch by itself, so the first attempt is
+        already fenced before the second claim even happens.
+        """
         conn = await connect_with_codec(db_params)
         job_id = await create_job(conn, queue=unique_queue, state="queued")
 
@@ -419,7 +423,7 @@ class TestConcurrentEpochFencing:
             conn, job_id, allowed_states=("claimed", "running"), reset_errors=False
         )
         second = await claim(conn, unique_queue, pid=2, host="worker-2")
-        assert second["run_epoch"] == 2
+        assert second["run_epoch"] > first["run_epoch"]
         await conn.close()
 
         async def finish_with_epoch(epoch: int):
@@ -433,7 +437,8 @@ class TestConcurrentEpochFencing:
                 await conn.close()
 
         stale, current = await asyncio.gather(
-            finish_with_epoch(1), finish_with_epoch(2)
+            finish_with_epoch(first["run_epoch"]),
+            finish_with_epoch(second["run_epoch"]),
         )
         assert stale == 0  # fenced out
         assert current == 1
@@ -441,7 +446,7 @@ class TestConcurrentEpochFencing:
         conn = await connect_with_codec(db_params)
         job = await get_job(conn, job_id)
         assert job["state"] == "finished"
-        assert job["result"] == {"epoch": 2}
+        assert job["result"] == {"epoch": second["run_epoch"]}
         await conn.close()
 
 

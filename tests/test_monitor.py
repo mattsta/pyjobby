@@ -184,6 +184,42 @@ async def child_counts(pool, job_id: int) -> dict[str, int]:
     }
 
 
+async def wait_until(predicate, *, timeout: float = 10) -> None:
+    """Poll ``predicate`` (sync or async) until true, or fail at the deadline.
+
+    The retention sweeps delete rows, so the monitor loop cannot be observed
+    with wait_for_job_state — there is no row left to read a state from."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        result = predicate()
+        if inspect.isawaitable(result):
+            result = await result
+        if result:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"condition not reached within {timeout}s")
+
+
+async def wait_for_job_gone(pool, job_id: int, *, timeout: float = 10) -> None:
+    await wait_until(
+        lambda: pool.fetchval(
+            "SELECT NOT EXISTS (SELECT 1 FROM jorb WHERE id = $1)", job_id
+        ),
+        timeout=timeout,
+    )
+
+
+async def wait_for_mailbox_empty(pool, job_id: int, *, timeout: float = 10) -> None:
+    await wait_until(
+        lambda: pool.fetchval(
+            "SELECT NOT EXISTS (SELECT 1 FROM jorb_mailbox WHERE dest_job_id = $1)",
+            job_id,
+        ),
+        timeout=timeout,
+    )
+
+
 async def hand_claim(pool, job_id: int) -> int:
     """Simulate a worker claim: bump run_epoch and move to running.
 
@@ -497,8 +533,9 @@ class TestSweepDeadWorkers:
 
         row = await wait_for_job_state(db_pool, job_id, ("finished",))
         assert row["result"] == {"doubled": 10}
-        # the live worker's claim bumped the fencing token
-        assert row["run_epoch"] == 1
+        # the requeue fenced the dead worker's attempt and the live
+        # worker's claim advanced the token again
+        assert row["run_epoch"] > 1
 
 
 # ============================================================================
@@ -553,27 +590,30 @@ class TestSweepUnregisteredClaims:
 
 
 class TestRetentionCascade:
-    async def test_child_tables_cascade_except_history(self, db_pool):
+    async def test_every_child_table_cascades(self, db_pool):
         """What actually reaps the child rows is the schema, not the sweep.
 
-        Pinned per table rather than assumed: jorb_history references jorb by
-        id with no foreign key at all, so it does NOT cascade — that is why
-        sweep_expired_jobs deletes it explicitly. If a foreign key is ever
-        added there, this test says so and the explicit DELETE can go."""
+        Pinned per table rather than assumed. jorb_history was the one child
+        with no foreign key at all, which meant retention would free the small
+        tables and leave the largest one growing; it cascades now like the
+        rest."""
         constraints = await db_pool.fetch(
             """
-            SELECT conrelid::regclass::text AS child, confdeltype
+            SELECT conrelid::regclass::text AS child,
+                   confdeltype::text        AS on_delete
             FROM pg_constraint
             WHERE contype = 'f' AND confrelid = 'jorb'::regclass
             """
         )
 
-        cascading = {c["child"] for c in constraints if c["confdeltype"] == "c"}
+        # 'c' is pg_constraint's code for ON DELETE CASCADE
+        cascading = {c["child"] for c in constraints if c["on_delete"] == "c"}
         assert cascading == {
             "jorb_step",
             "jorb_event",
             "jorb_mailbox",
             "jorb_dependencies",
+            "jorb_history",
         }
         # every foreign key to jorb cascades; none of them is history's
         assert {c["child"] for c in constraints} == cascading
@@ -715,9 +755,7 @@ class TestSweepExpiredJobs:
         assert await sweep_expired_jobs(db_pool, retention_days=7) == 0
         assert await job_ids(db_pool) == [keep]
 
-    async def test_concurrent_sweeps_partition_the_backlog(
-        self, db_pool, unique_queue
-    ):
+    async def test_concurrent_sweeps_partition_the_backlog(self, db_pool, unique_queue):
         """FOR UPDATE SKIP LOCKED means two monitors split the work instead of
         colliding: no error, no double count, no orphaned history."""
         for _ in range(6):
@@ -781,21 +819,30 @@ class TestSweepConsumedMailbox:
 
     async def test_batch_size_bounds_one_sweep(self, db_pool, unique_queue):
         live = await insert_job(db_pool, unique_queue, state="running")
-        for _ in range(5):
-            await db_pool.execute(
+        ids = [
+            await db_pool.fetchval(
                 """
                 INSERT INTO jorb_mailbox (dest_job_id, topic, message, consumed_at)
-                VALUES ($1, 'ping', $2, now() - interval '30 days')
+                VALUES ($1, 'ping', $2, now() - interval '30 days') RETURNING id
                 """,
                 live,
                 {},
             )
+            for _ in range(5)
+        ]
 
-        assert await sweep_consumed_mailbox(db_pool, retention_days=7, batch_size=2) == 2
-        assert await sweep_consumed_mailbox(db_pool, retention_days=7, batch_size=2) == 2
-        assert await sweep_consumed_mailbox(db_pool, retention_days=7, batch_size=2) == 1
-        assert await sweep_consumed_mailbox(db_pool, retention_days=7, batch_size=2) == 0
-        assert await db_pool.fetchval("SELECT count(*) FROM jorb_mailbox") == 0
+        async def surviving() -> list[int]:
+            return [
+                r["id"]
+                for r in await db_pool.fetch("SELECT id FROM jorb_mailbox ORDER BY id")
+            ]
+
+        for expected, remaining in ((2, ids[2:]), (2, ids[4:]), (1, []), (0, [])):
+            deleted = await sweep_consumed_mailbox(
+                db_pool, retention_days=7, batch_size=2
+            )
+            left = await surviving()
+            assert (deleted, left) == (expected, remaining)
 
 
 # ============================================================================
@@ -822,9 +869,9 @@ class TestEpochFencing:
         assert handled == 1
         assert (await get_job(db_pool, job_id))["state"] == "queued"
 
-        # attempt 2 claims the requeued row (epoch 2)
+        # attempt 2 claims the requeued row
         new_epoch = await hand_claim(db_pool, job_id)
-        assert new_epoch == 2
+        assert new_epoch > stale_epoch
 
         # the zombie from attempt 1 comes back and tries to complete
         fenced = await db_pool.fetch(
@@ -835,7 +882,7 @@ class TestEpochFencing:
         job = await get_job(db_pool, job_id)
         assert job["state"] == "running"  # attempt 2 still owns the row
         assert job["result"] is None
-        assert job["run_epoch"] == 2
+        assert job["run_epoch"] == new_epoch
 
         # ...while the current attempt's completion succeeds
         done = await db_pool.fetch(
@@ -856,7 +903,8 @@ class TestEpochFencing:
             job_id,
         )
         await sweep_timed_out_jobs(db_pool)
-        await hand_claim(db_pool, job_id)  # epoch 2 owns the row
+        live_epoch = await hand_claim(db_pool, job_id)  # a new attempt owns it
+        assert live_epoch > stale_epoch
 
         fenced = await db_pool.fetch(
             STMTS["retry"],
@@ -869,7 +917,7 @@ class TestEpochFencing:
         assert fenced == []
         job = await get_job(db_pool, job_id)
         assert job["state"] == "running"
-        assert job["run_epoch"] == 2
+        assert job["run_epoch"] == live_epoch
 
 
 # ============================================================================
@@ -954,17 +1002,13 @@ class TestMonitorLoop:
             with pytest.raises(asyncio.CancelledError):
                 await task
 
-    async def test_retention_is_off_unless_asked_for(
-        self, db_pool, unique_queue, db_params
-    ):
+    async def test_retention_off_by_default(self, db_pool, unique_queue, db_params):
         """A fresh install must not silently start destroying history.
 
         The dead-worker requeue is the barrier: once it lands, the loop has
         completed a full cycle, so the ancient job's survival is a decision
         and not a race."""
-        assert (
-            inspect.signature(monitor).parameters["retention_days"].default is None
-        )
+        assert inspect.signature(monitor).parameters["retention_days"].default is None
 
         ancient = await insert_terminal_job(db_pool, unique_queue, days_ago=3650)
         dead_worker = await insert_worker(
@@ -1031,11 +1075,14 @@ class TestMonitorLoop:
         self, db_pool, unique_queue, db_params, monkeypatch
     ):
         """Retention is the newest sweep and the one most likely to hit a lock
-        timeout on a big table; it must not take recovery down with it."""
-        sweep_attempted = asyncio.Event()
+        timeout on a big table; it must not take recovery down with it.
+
+        Attempts are counted rather than flagged: a second attempt proves the
+        loop kept cycling instead of dying on the first exception."""
+        attempts = []
 
         async def exploding_sweep(*args, **kwargs):
-            sweep_attempted.set()
+            attempts.append(1)
             raise RuntimeError("retention sweep is broken")
 
         monkeypatch.setattr(monitor_module, "sweep_expired_jobs", exploding_sweep)
@@ -1056,7 +1103,7 @@ class TestMonitorLoop:
             )
         )
         try:
-            await asyncio.wait_for(sweep_attempted.wait(), timeout=10)
+            await wait_until(lambda: len(attempts) >= 2, timeout=10)
             await wait_for_job_state(db_pool, orphaned, ("queued",), timeout=10)
         finally:
             task.cancel()

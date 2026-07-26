@@ -72,6 +72,7 @@ async def handle_timed_out_job(
             """
             UPDATE jorb
             SET state = 'queued',
+                run_epoch = run_epoch + 1,
                 timeout_at = NULL,
                 error_count = error_count + 1,
                 error_message = $2,
@@ -164,12 +165,7 @@ async def sweep_dead_workers(
 
     requeued = await pool.fetch(
         """
-        UPDATE jorb
-        SET state = 'queued',
-            run_after = now(),
-            timeout_at = NULL,
-            updated = now()
-        WHERE id IN (
+        WITH doomed AS MATERIALIZED (
             SELECT j.id FROM jorb j
             JOIN jorb_worker w ON w.id = j.claimed_by
             WHERE j.state IN ('claimed', 'running')
@@ -177,8 +173,16 @@ async def sweep_dead_workers(
             FOR UPDATE OF j SKIP LOCKED
             LIMIT $2
         )
-          AND state IN ('claimed', 'running')
-        RETURNING id, job_class, worker_host, claimed_by
+        UPDATE jorb
+        SET state = 'queued',
+            run_epoch = run_epoch + 1,
+            run_after = now(),
+            timeout_at = NULL,
+            updated = now()
+        FROM doomed
+        WHERE jorb.id = doomed.id
+          AND jorb.state IN ('claimed', 'running')
+        RETURNING jorb.id, jorb.job_class, jorb.worker_host, jorb.claimed_by
         """,
         grace,
         batch_size,
@@ -220,12 +224,7 @@ async def sweep_unregistered_claims(
     grace = datetime.timedelta(seconds=claimed_grace_seconds)
     requeued = await pool.fetch(
         """
-        UPDATE jorb
-        SET state = 'queued',
-            run_after = now(),
-            timeout_at = NULL,
-            updated = now()
-        WHERE id IN (
+        WITH doomed AS MATERIALIZED (
             SELECT id FROM jorb
             WHERE state = 'claimed'
               AND claimed_by IS NULL
@@ -233,8 +232,16 @@ async def sweep_unregistered_claims(
             FOR UPDATE SKIP LOCKED
             LIMIT $2
         )
-          AND state = 'claimed'
-        RETURNING id, job_class, worker_host
+        UPDATE jorb
+        SET state = 'queued',
+            run_epoch = run_epoch + 1,
+            run_after = now(),
+            timeout_at = NULL,
+            updated = now()
+        FROM doomed
+        WHERE jorb.id = doomed.id
+          AND jorb.state = 'claimed'
+        RETURNING jorb.id, jorb.job_class, jorb.worker_host
         """,
         grace,
         batch_size,
@@ -334,13 +341,19 @@ async def sweep_consumed_mailbox(
     A consumed message is unreadable (``recv`` filters ``consumed_at IS
     NULL``) and referenced by nothing, so age is the only thing to decide on.
 
+    The victims are picked in an explicitly MATERIALIZED CTE, not an
+    ``IN (SELECT ... LIMIT n)`` subquery: the planner is free to re-execute an
+    un-materialized subquery once per outer row, and each re-execution of a
+    FOR UPDATE SKIP LOCKED scan returns a *different* set — so the LIMIT stops
+    bounding the delete and the batch overruns (observed: batch_size=2
+    deleting 5 rows). MATERIALIZED forces exactly one evaluation.
+
     Single atomic statement; safe with concurrent monitor instances."""
     retention = datetime.timedelta(days=retention_days)
 
     deleted = await pool.fetch(
         """
-        DELETE FROM jorb_mailbox
-        WHERE id IN (
+        WITH doomed AS MATERIALIZED (
             SELECT id FROM jorb_mailbox
             WHERE consumed_at IS NOT NULL
               AND consumed_at < now() - $1::interval
@@ -348,7 +361,10 @@ async def sweep_consumed_mailbox(
             FOR UPDATE SKIP LOCKED
             LIMIT $2
         )
-        RETURNING id
+        DELETE FROM jorb_mailbox m
+        USING doomed d
+        WHERE m.id = d.id
+        RETURNING m.id
         """,
         retention,
         batch_size,
@@ -481,7 +497,8 @@ def cli() -> None:
         retention_days: float | None,
         retention_batch_size: int,
     ) -> None:
-        """Run the pyjobby monitor (timeouts + dead-worker recovery)."""
+        """Run the pyjobby monitor (timeouts, dead-worker recovery, and —
+        only with --retention-days — deletion of expired terminal jobs)."""
         import asyncio
 
         if not dsn:
@@ -506,7 +523,9 @@ def cli() -> None:
         click.echo(f"Starting monitor (check every {check_interval}s)...")
         click.echo(f"DSN: {dsn.split('@')[1] if '@' in dsn else dsn}")
         if retention_days is not None:
-            click.echo(f"Retention: deleting terminal jobs older than {retention_days}d")
+            click.echo(
+                f"Retention: deleting terminal jobs older than {retention_days}d"
+            )
 
         asyncio.run(
             monitor(

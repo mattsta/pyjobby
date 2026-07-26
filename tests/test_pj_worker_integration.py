@@ -387,7 +387,9 @@ class TestCrashRecovery:
             # a fresh claim gets a HIGHER epoch, fencing out the dead attempt
             reclaimed = await claim(conn, unique_queue, pid=11111, host="live-node")
             assert reclaimed["id"] == job_id
-            assert reclaimed["run_epoch"] == claimed["run_epoch"] + 1
+            # the requeue fenced the abandoned attempt, then the claim
+            # advanced the token again -- only the ordering is guaranteed
+            assert reclaimed["run_epoch"] > claimed["run_epoch"]
 
             stale = await conn.fetch(
                 STMTS["finished"], job_id, {"stale": True}, claimed["run_epoch"]

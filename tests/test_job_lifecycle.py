@@ -3,7 +3,8 @@ Job lifecycle tests (schema v1).
 
 Tests complete job lifecycle scenarios from creation through execution,
 failure handling, same-row retries, and dependencies. A job keeps ONE row
-for life: retries requeue that row (run_epoch bumps per claim) and the
+for life: retries requeue that row (run_epoch advances on every claim and
+every abandonment) and the
 per-attempt audit trail lives in jorb_history.
 """
 
@@ -153,7 +154,12 @@ class TestJobClaiming:
         assert claim2 is None
 
     async def test_run_count_and_epoch_increment(self, db_connection, unique_queue):
-        """run_count and run_epoch both increment with each claim."""
+        """run_count counts attempts; run_epoch only ever increases.
+
+        The epoch is a fencing token, not a counter: it advances when a job
+        enters an attempt AND when one abandons it, so it outruns run_count
+        as soon as a retry happens.
+        """
         job_id = await create_job(
             db_connection, queue=unique_queue, state="queued", run_after=past()
         )
@@ -162,15 +168,16 @@ class TestJobClaiming:
             claimed = await claim(db_connection, unique_queue)
             assert claimed["id"] == job_id
             assert claimed["run_count"] == expected
-            assert claimed["run_epoch"] == expected
-            # same-row requeue for the next attempt
+            assert claimed["run_epoch"] >= expected
+            # same-row requeue for the next attempt, fenced with the epoch
+            # this attempt actually holds
             await db_connection.execute(
                 STMTS["retry"],
                 job_id,
                 timedelta(seconds=-1),
                 "err",
                 "trace",
-                expected,
+                claimed["run_epoch"],
             )
 
 
@@ -289,7 +296,7 @@ class TestRetryMechanism:
                 timedelta(seconds=-1),
                 f"error {attempt}",
                 "trace",
-                attempt,
+                claimed["run_epoch"],
             )
             job = await get_job(db_connection, job_id)
             assert job["error_count"] == attempt
@@ -560,7 +567,7 @@ class TestCompleteJobFlows:
         # Second attempt - claim the SAME row, run, succeed
         second = await claim(db_connection, unique_queue, pid=12346, host="worker-2")
         assert second["id"] == job_id
-        assert second["run_epoch"] == first["run_epoch"] + 1
+        assert second["run_epoch"] > first["run_epoch"]
         await db_connection.execute(STMTS["run"], job_id, second["run_epoch"])
         await db_connection.fetchrow(
             STMTS["finished"], job_id, {"status": "success"}, second["run_epoch"]

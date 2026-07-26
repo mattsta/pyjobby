@@ -257,7 +257,9 @@ async def test_sigkilled_worker_is_reclaimed_and_resumes_from_its_checkpoint(
 
     requeued = await db_pool.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
     assert requeued["state"] == "queued"
-    assert requeued["run_epoch"] == 1  # the reclaim itself never bumps the fence
+    # the reclaim fences the SIGKILLed attempt: were it somehow still alive,
+    # it could no longer write a checkpoint over the recovery attempt
+    assert requeued["run_epoch"] > orphan["run_epoch"]
 
     # a fresh worker resumes: step 1 fast-forwards, only step 2 executes
     await live_worker()
@@ -266,7 +268,8 @@ async def test_sigkilled_worker_is_reclaimed_and_resumes_from_its_checkpoint(
         "first": {"stamp": "first-done"},
         "second": {"stamp": "second-done"},
     }
-    assert row["run_epoch"] == 2
+    recovery_epoch = row["run_epoch"]
+    assert recovery_epoch > requeued["run_epoch"]
     assert row["error_count"] == 0
 
     assert await effect_counts(db_pool, unique_queue) == {"first": 1, "second": 1}
@@ -276,8 +279,10 @@ async def test_sigkilled_worker_is_reclaimed_and_resumes_from_its_checkpoint(
         job_id,
     )
     assert [(s["step_seq"], s["name"], s["error"], s["run_epoch"]) for s in steps] == [
-        (1, "first", None, 1),  # recorded by the worker that was killed
-        (2, "second", None, 2),  # only this one ran on the recovery attempt
+        # step 1 still carries the KILLED attempt's epoch: it was never
+        # re-executed, it was replayed from the checkpoint
+        (1, "first", None, orphan["run_epoch"]),
+        (2, "second", None, recovery_epoch),  # only this one actually ran
     ]
     assert await history_events(db_pool, job_id) == [
         "enqueued",
@@ -325,14 +330,15 @@ async def test_unregistered_claim_is_reclaimed_only_after_the_grace_period(
     requeued = await db_pool.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
     assert requeued["state"] == "queued"
     assert requeued["timeout_at"] is None
-    assert requeued["run_epoch"] == 1
+    # the requeue fences the abandoned claim; run_count still counts attempts
+    assert requeued["run_epoch"] > claimed["run_epoch"]
     assert requeued["run_count"] == 1
 
     # and the recovered job actually runs
     await live_worker()
     row = await wait_for_job_state(db_pool, job_id, ("finished",), timeout=20)
     assert row["result"] == {"doubled": 12}
-    assert row["run_epoch"] == 2
+    assert row["run_epoch"] > requeued["run_epoch"]
     assert row["run_count"] == 2
     assert await history_events(db_pool, job_id) == [
         "enqueued",

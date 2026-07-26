@@ -246,7 +246,7 @@ class TestWorkerTimeoutHandling:
         # retries exhausted -> terminal 'crashed'
         job = await wait_for_job_state(db_pool, job_id, ("crashed",), timeout=20)
         assert job["error_count"] == 2
-        assert job["run_epoch"] == 2
+        assert job["run_epoch"] >= 2
         assert "timed out" in job["error_message"].lower()
 
         # the retry was a same-row requeue carrying the timeout error
