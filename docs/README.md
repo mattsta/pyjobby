@@ -28,7 +28,19 @@ Pyjobby now includes critical production-ready improvements:
    - Scaling and distribution strategies
    - Advanced features overview
 
-2. **[Deployment Guide](deployment-guide.md)** - Production deployment and operations
+2. **[Operations Runbook](OPERATIONS.md)** - What runs, how to check it, what to do when it breaks
+   - Process inventory and start commands
+   - Health checking (`pj-admin doctor`, `/metrics`)
+   - The job state machine (one row for life, epoch fencing, crashed = DLQ)
+   - Live queue controls
+   - Failure playbooks (dead host, hung job, flooding queue, DLQ triage)
+
+3. **[Testing Guide](TESTING.md)** - Running the suite, shared fixtures, and why coverage is a diagnostic
+   - How to run tests and point them at any database
+   - Reusable fixtures (`live_worker`, `wait_for_job_state`, shared job classes)
+   - Coverage baseline and the anti-goal (evidence from this repo's own history)
+
+4. **[Deployment Guide](deployment-guide.md)** - Production deployment and operations
    - Quick start for development
    - Production deployment checklist
    - Docker and Kubernetes configurations
@@ -39,7 +51,7 @@ Pyjobby now includes critical production-ready improvements:
 
 ### Core Components
 
-3. **[JobSystem Class](jobsystem.md)** - The orchestrator that runs on each worker
+5. **[JobSystem Class](jobsystem.md)** - The orchestrator that runs on each worker
    - Class definition and initialization
    - Key methods and their usage
    - Database operations and prepared statements
@@ -48,7 +60,7 @@ Pyjobby now includes critical production-ready improvements:
    - Real-world usage examples
    - Performance tuning
 
-4. **[Job Base Class](job-class.md)** - How to write job workers
+6. **[Job Base Class](job-class.md)** - How to write job workers
    - Class interface and attributes
    - Core methods (task, run, reschedule)
    - Job lifecycle and state transitions
@@ -57,7 +69,7 @@ Pyjobby now includes critical production-ready improvements:
    - Advanced patterns
    - Best practices
 
-5. **[Database Schema](database-schema.md)** - PostgreSQL table structure
+7. **[Database Schema](database-schema.md)** - PostgreSQL table structure
    - Complete column reference
    - State machine and transitions
    - Indexes and their purposes
@@ -67,39 +79,39 @@ Pyjobby now includes critical production-ready improvements:
 
 ### Features
 
-6. **Configuration System** _(See sample.conf.py)_ - How to configure pyjobby
+8. **Configuration System** _(See sample.conf.py)_ - How to configure pyjobby
    - Database connection parameters
    - Web server configuration
    - Custom application settings
    - Environment-specific configs
 
-7. **Job Dependencies** _(Covered in architecture.md and job-class.md)_ - waitfor_job and waitfor_group
+9. **Job Dependencies** _(Covered in architecture.md and job-class.md)_ - waitfor_job and waitfor_group
    - Single job dependencies
    - Group dependencies (fan-out/fan-in)
    - Complex workflow examples
    - Best practices
 
-8. **Web Server Integration** _(Covered in jobsystem.md)_ - Direct HTTP job invocation
+10. **Web Server Integration** _(Covered in jobsystem.md)_ - Direct HTTP job invocation
    - Configuration and setup
    - Job web() method
    - Load balancing strategies
    - Security considerations
 
-9. **Retry and Backoff** _(Covered in job-class.md)_ - Automatic error handling
+11. **Retry and Backoff** _(Covered in job-class.md)_ - Automatic error handling
    - Exponential backoff algorithm
    - Custom retry logic
    - Manual rescheduling
 
 ### Operations
 
-10. **Best Practices** - Production-ready patterns
+12. **Best Practices** - Production-ready patterns
     - Idempotent jobs
     - Resource caching
     - Error handling
     - Security
     - Performance optimization
 
-11. **Troubleshooting** - Common issues and solutions
+13. **Troubleshooting** - Common issues and solutions
     - Worker not claiming jobs
     - Jobs stuck in claimed/running state
     - High error rates
@@ -111,8 +123,10 @@ Pyjobby now includes critical production-ready improvements:
 ### Essential Files
 
 - `pyjobby/pj.py` - Core job system
-- `pyjobby/sql/schema.sql` - PostgreSQL base schema (shipped in the wheel)
-- `pyjobby/sql/migrations/` - Schema migrations 001-009 (applied by `pj-admin db migrate`)
+- `pyjobby/sql/schema.sql` - the canonical schema v1 (shipped in the wheel)
+- `pyjobby/sql/migrations/` - future incremental migrations (v1 is the baseline; `pj-admin db migrate` installs and tracks both)
+- `pyjobby/dxe.py` - Durable Execution Engine semantics and SQL
+- `pyjobby/monitor.py` - the reaper (timeouts, dead-worker reclaim)
 - `sample.conf.py` - Example configuration
 
 ### Common Commands
@@ -172,31 +186,36 @@ class MyJob(Job):
 ## Architecture at a Glance
 
 ```
-CLI (pj) → Spawns Workers (multiprocessing)
+CLI (pj) → spawns workers (multiprocessing), each registers in jorb_worker
     ↓
-Workers Poll Database (every 5-6s)
+Worker sleeps on LISTEN jorb_enqueued (poll is the fallback)
     ↓
-Claim Job (FOR UPDATE SKIP LOCKED)
+Claim: UPDATE ... FOR UPDATE SKIP LOCKED, honoring jorb_queue
+       (paused / max_concurrency / rate_limit), bumping run_epoch
     ↓
-Load Job Class (pydoc.locate + importlib.reload)
+claimed → running (records `started`; timeouts key off this)
     ↓
-Execute task(**kwargs)
+Load job class (pydoc.locate + importlib.reload) and bind DXE checkpoints
     ↓
-Mark Finished or Crashed
+Execute task(**kwargs) — steps/sleeps/events/messages are durable
     ↓
-Trigger Dependent Jobs
+finished │ queued (same-row retry with backoff) │ crashed (terminal DLQ)
+         │ cancelled (operator request, delivered by NOTIFY)
+    ↓
+Wake dependents (waitfor_job / waitfor_group); every transition lands in
+jorb_history; pj-monitor reaps timeouts and jobs of dead workers
 ```
 
 ## Key Features
 
-- ✅ **Simple**: <1000 lines in one file
+- ✅ **Focused**: a small worker loop; the platform is explicit and readable
 - ✅ **Reliable**: PostgreSQL-backed persistence
 - ✅ **Type-safe**: Full mypy strict compliance
-- ✅ **Powerful**: Dependencies, priorities, scheduling, retries
+- ✅ **Powerful**: durable execution (checkpointed steps, durable sleep, events, messaging), dependencies, priorities, cron
 - ✅ **Flexible**: Sync/async jobs, web integration
-- ✅ **Observable**: Complete audit trail in database
+- ✅ **Observable**: full transition history, DXE step checkpoints, Prometheus `/metrics`
 - ✅ **Scalable**: Horizontal scaling via database
-- ✅ **Self-Healing**: Automatic crash recovery and retry management
+- ✅ **Self-Healing**: registry-heartbeat dead-worker reclaim, same-row retries, epoch fencing
 - ✅ **Fault-Tolerant**: Timeout protection and max retry limits
 - ✅ **Production-Ready**: Enhanced error handling and monitoring
 

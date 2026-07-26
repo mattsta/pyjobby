@@ -80,6 +80,11 @@ source = ["pyjobby"]
 omit = ["*/tests/*", "*/test_*.py"]
 
 [tool.coverage.report]
+# A FLOOR, not a target: it stops coverage from silently rotting. Raise it
+# when real behavioral coverage lands; never write tests just to move it.
+# (See docs/TESTING.md — this project has shipped 97%-covered modules that
+# had no entry point and 99%-covered modules that were total no-ops.)
+fail_under = 81
 exclude_lines = [
     "pragma: no cover",
     "def __repr__",
