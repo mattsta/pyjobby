@@ -228,15 +228,26 @@ Retention is the operator's call:
 
 ```
 pj-monitor --retention-days 30              # automatic sweep (opt-in)
+pj-monitor --retention-days 30 --retention-batch-size 500
 pj-admin queues clear <queue> --state finished --older-than-days 30
 pj-admin jobs delete <id>
 ```
 
-The automatic sweep is **off by default**: a fresh install must not silently
-delete an operator's history. It only ever removes jobs in a terminal state
-(`finished`, `crashed`, `cancelled`) past the window — a `waiting` job can
-legitimately be very old — and it deletes in bounded batches so it never takes
-a long lock.
+The automatic sweep is **off by default** — a fresh install must not silently
+delete an operator's history — and it is deliberately conservative:
+
+* it removes only jobs in a **terminal** state (`finished`, `crashed`,
+  `cancelled`) past the window. A `queued`, `claimed`, `running` or `waiting`
+  job is never deleted at any age: a job waiting on a dependency can
+  legitimately be very old.
+* it will not delete a terminal job that a `waiting` job still depends on
+  (via `waitfor_job` or `waitfor_group`), which would strand the waiter.
+* it deletes in **bounded batches** so the reaper never takes a long lock.
+* consumed mailbox messages are pruned on the same window even when their job
+  is still alive — a long-running workflow reads messages for months, and the
+  job-scoped cascade would never reach them.
+
+The child rows go with the job through `ON DELETE CASCADE`.
 
 Sizing rule of thumb: budget one `jorb_step` row per `step()` call per job, and
 roughly four `jorb_history` rows per attempt.
