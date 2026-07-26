@@ -1086,6 +1086,8 @@ class WebAdminServer:
                 html += "</div>"
                 html += '<div class="stat-item">'
                 html += f"<span>Avg Duration</span><span>{metrics['avg_duration_seconds']:.2f}s</span>"
+                html += f"<span>Avg Queue Wait</span><span>{metrics['avg_wait_seconds']:.2f}s</span>"
+                html += f"<span>Max Queue Wait</span><span>{metrics['max_wait_seconds']:.2f}s</span>"
                 html += "</div>"
                 html += "</div>"
                 return web.Response(text=html, content_type="text/html")

@@ -774,6 +774,8 @@ class TestAdminAPIMetrics:
         assert "finished_count" in metrics
         assert "crashed_count" in metrics
         assert "avg_duration_seconds" in metrics
+        assert "avg_wait_seconds" in metrics
+        assert "max_wait_seconds" in metrics
 
         # Counts should be non-negative
         assert metrics["finished_count"] >= 1
@@ -840,6 +842,41 @@ class TestAdminAPIMetrics:
 
         assert metrics is not None
         # Queue-filtered metrics should work
+
+    @pytest.mark.asyncio
+    async def test_metrics_separate_queue_wait_from_execution_time(self, db_pool):
+        """Waiting to be picked up and running are different problems.
+
+        A job that sat in the queue for 60s and then ran for 2s must not be
+        reported as a 62s job: the first number is a capacity signal and the
+        second is a code signal, and an operator acts on them differently.
+        """
+        api = AdminAPI(db_pool)
+        queue = "metric_latency_split"
+
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb (
+                    job_class, kwargs, queue, state, prio,
+                    run_after, claimed_at, started, finished
+                )
+                VALUES ($1, $2, $3, 'finished', 100,
+                        NOW() - INTERVAL '62 seconds',
+                        NOW() - INTERVAL '2 seconds',
+                        NOW() - INTERVAL '2 seconds',
+                        NOW())
+            """,
+                "test.Job",
+                {},
+                queue,
+            )
+
+        metrics = await api.get_metrics(queue=queue)
+
+        assert 1.0 <= metrics["avg_duration_seconds"] <= 3.0
+        assert 59.0 <= metrics["avg_wait_seconds"] <= 61.0
+        assert 59.0 <= metrics["max_wait_seconds"] <= 61.0
 
 
 # =============================================================================

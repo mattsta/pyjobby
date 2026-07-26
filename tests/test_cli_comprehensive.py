@@ -307,6 +307,8 @@ def mock_admin_api():
         "finished_count": 950,
         "crashed_count": 50,
         "avg_duration_seconds": 12.3,
+        "avg_wait_seconds": 4.5,
+        "max_wait_seconds": 31.0,
         "top_errors": [
             {
                 "job_class": "test.FailedJob",

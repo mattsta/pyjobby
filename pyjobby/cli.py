@@ -1220,6 +1220,12 @@ def metrics(
                 click.echo(
                     f"Avg Duration:      {metrics_data['avg_duration_seconds']:.2f}s"
                 )
+                click.echo(
+                    f"Avg Queue Wait:    {metrics_data['avg_wait_seconds']:.2f}s"
+                )
+                click.echo(
+                    f"Max Queue Wait:    {metrics_data['max_wait_seconds']:.2f}s"
+                )
 
                 if metrics_data.get("state_counts"):
                     click.echo(f"\n{Colors.BOLD}Jobs by State:{Colors.ENDC}")

@@ -799,14 +799,23 @@ class AdminAPI:
             *params,
         )
 
-        # Job completion rate
+        # Completion rate, plus the two latencies an operator acts on:
+        # how long jobs WAIT to be picked up (a capacity signal) versus how
+        # long they RUN once picked up (a code signal). Measuring either one
+        # as `updated - created` would blend them together -- along with the
+        # backoff between every retry -- and hide which is the problem.
         completion_stats = await self.conn.fetchrow(
             f"""
             SELECT
                 COUNT(*) FILTER (WHERE state = 'finished') as finished_count,
                 COUNT(*) FILTER (WHERE state = 'crashed') as crashed_count,
-                AVG(EXTRACT(EPOCH FROM (updated - created)))
-                    FILTER (WHERE state = 'finished') as avg_duration_seconds
+                AVG(EXTRACT(EPOCH FROM (finished - started)))
+                    FILTER (WHERE state = 'finished'
+                            AND started IS NOT NULL) as avg_duration_seconds,
+                AVG(EXTRACT(EPOCH FROM (claimed_at - run_after)))
+                    FILTER (WHERE claimed_at IS NOT NULL) as avg_wait_seconds,
+                MAX(EXTRACT(EPOCH FROM (claimed_at - run_after)))
+                    FILTER (WHERE claimed_at IS NOT NULL) as max_wait_seconds
             FROM jorb
             {where_sql}
         """,
@@ -839,6 +848,8 @@ class AdminAPI:
             "avg_duration_seconds": float(
                 completion_stats["avg_duration_seconds"] or 0
             ),
+            "avg_wait_seconds": float(completion_stats["avg_wait_seconds"] or 0),
+            "max_wait_seconds": float(completion_stats["max_wait_seconds"] or 0),
             "top_errors": [
                 {
                     "job_class": r["job_class"],
