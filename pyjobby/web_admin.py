@@ -6,13 +6,20 @@ HTTP server providing web-based management interface using htmx.
 Built on top of the admin API for clean separation.
 """
 
-import asyncio
-import json
-from datetime import datetime, timedelta
+from __future__ import annotations
 
-import asyncpg
+import asyncio
+import html as html_mod
+import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from typing import Any, cast
+
+import asyncpg  # type: ignore[import-untyped]
 from aiohttp import web
 
+from . import db
 from .admin_api import AdminAPI
 
 
@@ -24,22 +31,25 @@ class WebAdminServer:
     Uses htmx for dynamic updates without full page reloads.
     """
 
-    def __init__(self, db_params: dict, host: str = "0.0.0.0", port: int = 8081):
+    def __init__(self, db_params: dict, host: str = "127.0.0.1", port: int = 8081):
         """
         Initialize web admin server.
 
         Args:
             db_params: Database connection parameters
-            host: Host to bind to (default: 0.0.0.0)
+            host: Host to bind to (default: 127.0.0.1)
             port: Port to listen on (default: 8081)
         """
         self.db_params = db_params
         self.host = host
         self.port = port
+        self.pool: asyncpg.Pool | None = None
+        self._pool_lock = asyncio.Lock()
         self.app = web.Application()
+        self.app.on_cleanup.append(self._on_cleanup)
         self.setup_routes()
 
-    def setup_routes(self):
+    def setup_routes(self) -> None:
         """Setup HTTP routes"""
         # HTML pages
         self.app.router.add_get("/", self.index)
@@ -85,10 +95,32 @@ class WebAdminServer:
             "/api/schedules/{schedule_id}/history", self.api_schedule_history
         )
 
-    async def get_api(self) -> AdminAPI:
-        """Get AdminAPI instance with fresh database connection"""
-        conn = await asyncpg.connect(**self.db_params)
-        return AdminAPI(conn)
+    async def _get_pool(self) -> asyncpg.Pool:
+        """Lazily create the shared asyncpg connection pool."""
+        if self.pool is None:
+            async with self._pool_lock:
+                if self.pool is None:
+                    self.pool = await db.create_pool(
+                        **self.db_params, min_size=1, max_size=10
+                    )
+        return self.pool
+
+    @asynccontextmanager
+    async def api(self) -> AsyncIterator[AdminAPI]:
+        """Acquire a pooled connection wrapped in an AdminAPI for one request."""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            yield AdminAPI(conn)
+
+    async def close(self) -> None:
+        """Close the connection pool (if it was created)."""
+        if self.pool is not None:
+            await self.pool.close()
+            self.pool = None
+
+    async def _on_cleanup(self, app: web.Application) -> None:
+        """aiohttp on_cleanup hook: release the pool on shutdown."""
+        await self.close()
 
     # =========================================================================
     # HTML Pages
@@ -330,8 +362,7 @@ class WebAdminServer:
 
     async def api_jobs_list(self, request: web.Request) -> web.Response:
         """List jobs (JSON or HTML)"""
-        api = await self.get_api()
-        try:
+        async with self.api() as api:
             # Parse query parameters
             queue = request.query.get("queue")
             state = request.query.get("state")
@@ -358,12 +389,17 @@ class WebAdminServer:
                     html += "</tr></thead><tbody>"
 
                     for job in jobs:
-                        created = job["created"][:19] if job["created"] else ""
-                        html += f'<tr style="border-bottom: 1px solid #eee;">'
-                        html += f'<td style="padding: 0.75rem;">{job["id"]}</td>'
-                        html += f'<td style="padding: 0.75rem;"><span class="badge {job["state"]}">{job["state"]}</span></td>'
-                        html += f'<td style="padding: 0.75rem;">{job["queue"]}</td>'
-                        html += f'<td style="padding: 0.75rem;">{job["job_class"]}</td>'
+                        created = html_mod.escape(
+                            job["created"][:19] if job["created"] else ""
+                        )
+                        job_state = html_mod.escape(str(job["state"]))
+                        job_queue = html_mod.escape(str(job["queue"]))
+                        job_class = html_mod.escape(str(job["job_class"]))
+                        html += '<tr style="border-bottom: 1px solid #eee;">'
+                        html += f'<td style="padding: 0.75rem;">{int(job["id"])}</td>'
+                        html += f'<td style="padding: 0.75rem;"><span class="badge {job_state}">{job_state}</span></td>'
+                        html += f'<td style="padding: 0.75rem;">{job_queue}</td>'
+                        html += f'<td style="padding: 0.75rem;">{job_class}</td>'
                         html += f'<td style="padding: 0.75rem;">{created}</td>'
                         html += "</tr>"
 
@@ -373,62 +409,48 @@ class WebAdminServer:
             else:
                 return web.json_response(jobs)
 
-        finally:
-            await api.conn.close()
-
     async def api_job_get(self, request: web.Request) -> web.Response:
         """Get single job"""
         job_id = int(request.match_info["job_id"])
-        api = await self.get_api()
-        try:
+        async with self.api() as api:
             job = await api.get_job(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response(job)
-        finally:
-            await api.conn.close()
 
     async def api_job_retry(self, request: web.Request) -> web.Response:
         """Retry a job"""
         job_id = int(request.match_info["job_id"])
-        api = await self.get_api()
-        try:
-            result = await api.retry_job(job_id)
-            return web.json_response(result)
-        except ValueError as e:
-            return web.json_response({"error": str(e)}, status=400)
-        finally:
-            await api.conn.close()
+        async with self.api() as api:
+            try:
+                result = await api.retry_job(job_id)
+                return web.json_response(result)
+            except ValueError as e:
+                return web.json_response({"error": str(e)}, status=400)
 
     async def api_job_cancel(self, request: web.Request) -> web.Response:
         """Cancel a job"""
         job_id = int(request.match_info["job_id"])
-        api = await self.get_api()
-        try:
-            result = await api.cancel_job(job_id)
-            return web.json_response(result)
-        except ValueError as e:
-            return web.json_response({"error": str(e)}, status=400)
-        finally:
-            await api.conn.close()
+        async with self.api() as api:
+            try:
+                result = await api.cancel_job(job_id)
+                return web.json_response(result)
+            except ValueError as e:
+                return web.json_response({"error": str(e)}, status=400)
 
     async def api_job_delete(self, request: web.Request) -> web.Response:
         """Delete a job"""
         job_id = int(request.match_info["job_id"])
-        api = await self.get_api()
-        try:
+        async with self.api() as api:
             deleted = await api.delete_job(job_id)
             if deleted:
                 return web.json_response({"status": "deleted", "job_id": job_id})
             else:
                 return web.json_response({"error": "Job not found"}, status=404)
-        finally:
-            await api.conn.close()
 
     async def api_queues_list(self, request: web.Request) -> web.Response:
         """List queue statistics"""
-        api = await self.get_api()
-        try:
+        async with self.api() as api:
             stats = await api.queue_stats()
             format_type = request.query.get("format", "json")
 
@@ -439,97 +461,83 @@ class WebAdminServer:
                     html = '<div class="stats-grid">'
                     for s in stats:
                         html += '<div class="stat-item">'
-                        html += f"<span><strong>{s['queue']}</strong></span>"
+                        html += f"<span><strong>{html_mod.escape(str(s['queue']))}</strong></span>"
                         html += "<span>"
                         if s["queued"] > 0:
-                            html += f'<span class="badge queued">{s["queued"]} queued</span> '
+                            html += f'<span class="badge queued">{int(s["queued"])} queued</span> '
                         if s["running"] > 0:
-                            html += f'<span class="badge running">{s["running"]} running</span> '
+                            html += f'<span class="badge running">{int(s["running"])} running</span> '
                         if s["crashed"] > 0:
-                            html += f'<span class="badge crashed">{s["crashed"]} crashed</span>'
+                            html += f'<span class="badge crashed">{int(s["crashed"])} crashed</span>'
                         html += "</span></div>"
                     html += "</div>"
                 return web.Response(text=html, content_type="text/html")
             else:
                 return web.json_response(stats)
-        finally:
-            await api.conn.close()
 
     async def api_queue_stats(self, request: web.Request) -> web.Response:
         """Get stats for specific queue"""
         queue = request.match_info["queue"]
-        api = await self.get_api()
-        try:
+        async with self.api() as api:
             stats = await api.queue_stats(queue=queue)
             return web.json_response(stats)
-        finally:
-            await api.conn.close()
 
     async def api_workers_list(self, request: web.Request) -> web.Response:
         """List active workers"""
-        api = await self.get_api()
-        try:
+        async with self.api() as api:
             workers = await api.list_workers()
             return web.json_response(workers)
-        finally:
-            await api.conn.close()
 
     async def api_workers_stats(self, request: web.Request) -> web.Response:
         """Get worker statistics"""
-        api = await self.get_api()
-        try:
+        async with self.api() as api:
             stats = await api.worker_stats()
             format_type = request.query.get("format", "json")
 
             if format_type == "html":
-                html = f'<div class="stat-value">{stats["active_workers"]}</div>'
-                html += f'<div class="stat-label">Active Workers</div>'
+                html = f'<div class="stat-value">{int(stats["active_workers"])}</div>'
+                html += '<div class="stat-label">Active Workers</div>'
                 return web.Response(text=html, content_type="text/html")
             else:
                 return web.json_response(stats)
-        finally:
-            await api.conn.close()
 
     async def api_dlq_list(self, request: web.Request) -> web.Response:
         """List Dead Letter Queue jobs"""
-        api = await self.get_api()
-        try:
+        async with self.api() as api:
             limit = int(request.query.get("limit", 100))
             jobs = await api.list_dlq(limit=limit)
             return web.json_response(jobs)
-        finally:
-            await api.conn.close()
 
     async def api_dlq_retry(self, request: web.Request) -> web.Response:
         """Retry job from DLQ"""
         job_id = int(request.match_info["job_id"])
-        api = await self.get_api()
-        try:
-            result = await api.retry_from_dlq(job_id)
-            return web.json_response(result)
-        except ValueError as e:
-            return web.json_response({"error": str(e)}, status=400)
-        finally:
-            await api.conn.close()
+        async with self.api() as api:
+            try:
+                result = await api.retry_from_dlq(job_id)
+                return web.json_response(result)
+            except ValueError as e:
+                return web.json_response({"error": str(e)}, status=400)
 
     async def api_metrics(self, request: web.Request) -> web.Response:
         """Get system metrics"""
-        api = await self.get_api()
-        try:
+        async with self.api() as api:
             since_hours = int(request.query.get("since_hours", 24))
             queue = request.query.get("queue")
             format_type = request.query.get("format", "json")
 
-            since = datetime.utcnow() - timedelta(hours=since_hours)
+            # jorb timestamps are naive-UTC, so compare with a naive-UTC value
+            since = datetime.now(UTC).replace(tzinfo=None) - timedelta(
+                hours=since_hours
+            )
             metrics = await api.get_metrics(since=since, queue=queue)
 
             if format_type == "html":
                 html = '<div class="stats-grid">'
                 html += '<div class="stat-item">'
-                html += f'<span>Finished</span><span class="badge finished">{metrics["finished_count"]}</span>'
+                html += f'<span>Finished</span><span class="badge finished">{int(metrics["finished_count"])}</span>'
                 html += "</div>"
                 html += '<div class="stat-item">'
-                html += f'<span>Crashed</span><span class="badge crashed">{metrics["crashed_count"]}</span>'
+                html += f'<span>Crashed</span><span class="badge crashed">{int(metrics["crashed_count"])}</span>'
                 html += "</div>"
                 html += '<div class="stat-item">'
                 html += f"<span>Avg Duration</span><span>{metrics['avg_duration_seconds']:.2f}s</span>"
@@ -538,8 +546,6 @@ class WebAdminServer:
                 return web.Response(text=html, content_type="text/html")
             else:
                 return web.json_response(metrics)
-        finally:
-            await api.conn.close()
 
     # =========================================================================
     # Schedule Management Pages & API
@@ -831,10 +837,57 @@ class WebAdminServer:
 </html>"""
         return web.Response(text=html, content_type="text/html")
 
+    def _render_schedules_table(self, schedules: list[dict[str, Any]]) -> str:
+        """Render the schedules table HTML fragment (all values escaped)."""
+        html = "<table><thead><tr>"
+        html += "<th>Name</th><th>Status</th><th>Cron</th><th>Queue</th>"
+        html += "<th>Next Run</th><th>Stats</th><th>Actions</th>"
+        html += "</tr></thead><tbody>"
+
+        for s in schedules:
+            status_badge = "badge-enabled" if s["enabled"] else "badge-disabled"
+            status_text = "Enabled" if s["enabled"] else "Disabled"
+
+            success_rate = None
+            if s["success_count"] + s["failure_count"] > 0:
+                success_rate = (
+                    s["success_count"] / (s["success_count"] + s["failure_count"])
+                ) * 100
+
+            name = html_mod.escape(str(s["name"]))
+            description = html_mod.escape(str(s.get("description") or ""))
+            cron_expr = html_mod.escape(str(s["cron_expr"]))
+            queue = html_mod.escape(str(s["queue"]))
+
+            html += "<tr>"
+            html += f"<td><strong>{name}</strong><br><small>{description}</small></td>"
+            html += f'<td><span class="badge {status_badge}">{status_text}</span></td>'
+            html += f"<td><code>{cron_expr}</code></td>"
+            html += f"<td>{queue}</td>"
+            html += f"<td>{s['next_run'].strftime('%Y-%m-%d %H:%M') if s.get('next_run') else '-'}</td>"
+            html += f"<td>{int(s['run_count'])} runs<br>"
+            if success_rate is not None:
+                rate_class = "badge-success" if success_rate >= 95 else "badge-warning"
+                html += f'<span class="badge {rate_class}">{success_rate:.1f}% success</span>'
+            html += "</td>"
+            html += "<td>"
+
+            schedule_id = int(s["id"])
+            if s["enabled"]:
+                html += f'<button class="btn btn-danger" hx-post="/api/schedules/{schedule_id}/disable" hx-target="#schedules-table" hx-swap="innerHTML">Disable</button>'
+            else:
+                html += f'<button class="btn btn-success" hx-post="/api/schedules/{schedule_id}/enable" hx-target="#schedules-table" hx-swap="innerHTML">Enable</button>'
+
+            html += f' <button class="btn btn-danger" hx-delete="/api/schedules/{schedule_id}" hx-confirm="Delete schedule {name}?" hx-target="#schedules-table" hx-swap="innerHTML">Delete</button>'
+            html += "</td>"
+            html += "</tr>"
+
+        html += "</tbody></table>"
+        return html
+
     async def api_schedules_list(self, request: web.Request) -> web.Response:
         """List schedules (JSON or HTML)"""
-        api = await self.get_api()
-        try:
+        async with self.api() as api:
             format_type = request.query.get("format", "json")
             enabled = request.query.get("enabled")
             queue = request.query.get("queue")
@@ -845,65 +898,21 @@ class WebAdminServer:
                 enabled_bool = enabled.lower() in ("true", "1", "yes")
 
             schedules = await api.list_schedules(
-                enabled=enabled_bool, queue=queue if queue else None
+                enabled=enabled_bool, queue=queue or None
             )
 
             if format_type == "html":
-                html = "<table><thead><tr>"
-                html += "<th>Name</th><th>Status</th><th>Cron</th><th>Queue</th>"
-                html += "<th>Next Run</th><th>Stats</th><th>Actions</th>"
-                html += "</tr></thead><tbody>"
-
-                for s in schedules:
-                    status_badge = "badge-enabled" if s["enabled"] else "badge-disabled"
-                    status_text = "Enabled" if s["enabled"] else "Disabled"
-
-                    success_rate = None
-                    if s["success_count"] + s["failure_count"] > 0:
-                        success_rate = (
-                            s["success_count"]
-                            / (s["success_count"] + s["failure_count"])
-                        ) * 100
-
-                    html += "<tr>"
-                    html += f"<td><strong>{s['name']}</strong><br><small>{s.get('description') or ''}</small></td>"
-                    html += f'<td><span class="badge {status_badge}">{status_text}</span></td>'
-                    html += f"<td><code>{s['cron_expr']}</code></td>"
-                    html += f"<td>{s['queue']}</td>"
-                    html += f"<td>{s['next_run'].strftime('%Y-%m-%d %H:%M') if s.get('next_run') else '-'}</td>"
-                    html += f"<td>{s['run_count']} runs<br>"
-                    if success_rate is not None:
-                        rate_class = (
-                            "badge-success" if success_rate >= 95 else "badge-warning"
-                        )
-                        html += f'<span class="badge {rate_class}">{success_rate:.1f}% success</span>'
-                    html += "</td>"
-                    html += f"<td>"
-
-                    schedule_id = s["id"]
-                    if s["enabled"]:
-                        html += f'<button class="btn btn-danger" hx-post="/api/schedules/{schedule_id}/disable" hx-target="#schedules-table" hx-swap="innerHTML">Disable</button>'
-                    else:
-                        html += f'<button class="btn btn-success" hx-post="/api/schedules/{schedule_id}/enable" hx-target="#schedules-table" hx-swap="innerHTML">Enable</button>'
-
-                    html += f' <button class="btn btn-danger" hx-delete="/api/schedules/{schedule_id}" hx-confirm="Delete schedule {s["name"]}?" hx-target="#schedules-table" hx-swap="innerHTML">Delete</button>'
-                    html += "</td>"
-                    html += "</tr>"
-
-                html += "</tbody></table>"
+                html = self._render_schedules_table(schedules)
                 return web.Response(text=html, content_type="text/html")
             else:
                 # JSON response
                 return web.json_response(
                     schedules, dumps=lambda x: json.dumps(x, default=str)
                 )
-        finally:
-            await api.conn.close()
 
     async def api_schedule_get(self, request: web.Request) -> web.Response:
         """Get single schedule"""
-        api = await self.get_api()
-        try:
+        async with self.api() as api:
             schedule_id = int(request.match_info["schedule_id"])
             schedule = await api.get_schedule(schedule_id=schedule_id)
 
@@ -913,119 +922,69 @@ class WebAdminServer:
             return web.json_response(
                 schedule, dumps=lambda x: json.dumps(x, default=str)
             )
-        finally:
-            await api.conn.close()
 
     async def api_schedule_create(self, request: web.Request) -> web.Response:
         """Create new schedule"""
-        api = await self.get_api()
-        try:
-            data = await request.post()
+        async with self.api() as api:
+            try:
+                data = await request.post()
 
-            schedule = await api.create_schedule(
-                name=data["name"],
-                job_class=data["job_class"],
-                cron_expr=data["cron_expr"],
-                queue=data.get("queue", "default"),
-                prio=int(data.get("prio", 100)),
-                description=data.get("description"),
-                max_concurrent_jobs=int(data.get("max_concurrent_jobs", 1)),
-                jitter_seconds=int(data.get("jitter_seconds", 0)),
-                backpressure_threshold=int(data.get("backpressure_threshold", 1000)),
-                circuit_breaker_threshold=int(data.get("circuit_breaker_threshold", 5)),
-            )
-
-            # Return refreshed schedules list as HTML
-            schedules = await api.list_schedules()
-            html = "<table><thead><tr>"
-            html += "<th>Name</th><th>Status</th><th>Cron</th><th>Queue</th>"
-            html += "<th>Next Run</th><th>Stats</th><th>Actions</th>"
-            html += "</tr></thead><tbody>"
-
-            for s in schedules:
-                status_badge = "badge-enabled" if s["enabled"] else "badge-disabled"
-                status_text = "Enabled" if s["enabled"] else "Disabled"
-
-                success_rate = None
-                if s["success_count"] + s["failure_count"] > 0:
-                    success_rate = (
-                        s["success_count"] / (s["success_count"] + s["failure_count"])
-                    ) * 100
-
-                html += "<tr>"
-                html += f"<td><strong>{s['name']}</strong><br><small>{s.get('description') or ''}</small></td>"
-                html += (
-                    f'<td><span class="badge {status_badge}">{status_text}</span></td>'
+                schedule = await api.create_schedule(
+                    name=cast(str, data["name"]),
+                    job_class=cast(str, data["job_class"]),
+                    cron_expr=cast(str, data["cron_expr"]),
+                    queue=cast(str, data.get("queue", "default")),
+                    prio=int(cast(str | int, data.get("prio", 100))),
+                    description=cast(str | None, data.get("description")),
+                    max_concurrent_jobs=int(
+                        cast(str | int, data.get("max_concurrent_jobs", 1))
+                    ),
+                    jitter_seconds=int(cast(str | int, data.get("jitter_seconds", 0))),
+                    backpressure_threshold=int(
+                        cast(str | int, data.get("backpressure_threshold", 1000))
+                    ),
+                    circuit_breaker_threshold=int(
+                        cast(str | int, data.get("circuit_breaker_threshold", 5))
+                    ),
                 )
-                html += f"<td><code>{s['cron_expr']}</code></td>"
-                html += f"<td>{s['queue']}</td>"
-                html += f"<td>{s['next_run'].strftime('%Y-%m-%d %H:%M') if s.get('next_run') else '-'}</td>"
-                html += f"<td>{s['run_count']} runs<br>"
-                if success_rate is not None:
-                    rate_class = (
-                        "badge-success" if success_rate >= 95 else "badge-warning"
-                    )
-                    html += f'<span class="badge {rate_class}">{success_rate:.1f}% success</span>'
-                html += "</td>"
-                html += f"<td>"
 
-                schedule_id = s["id"]
-                if s["enabled"]:
-                    html += f'<button class="btn btn-danger" hx-post="/api/schedules/{schedule_id}/disable" hx-target="#schedules-table" hx-swap="innerHTML">Disable</button>'
-                else:
-                    html += f'<button class="btn btn-success" hx-post="/api/schedules/{schedule_id}/enable" hx-target="#schedules-table" hx-swap="innerHTML">Enable</button>'
-
-                html += f' <button class="btn btn-danger" hx-delete="/api/schedules/{schedule_id}" hx-confirm="Delete schedule {s["name"]}?" hx-target="#schedules-table" hx-swap="innerHTML">Delete</button>'
-                html += "</td>"
-                html += "</tr>"
-
-            html += "</tbody></table>"
-            return web.Response(text=html, content_type="text/html")
-        except ValueError as e:
-            return web.json_response({"error": str(e)}, status=400)
-        finally:
-            await api.conn.close()
+                # Return refreshed schedules list as HTML
+                schedules = await api.list_schedules()
+                html = self._render_schedules_table(schedules)
+                return web.Response(text=html, content_type="text/html")
+            except ValueError as e:
+                return web.json_response({"error": str(e)}, status=400)
 
     async def api_schedule_enable(self, request: web.Request) -> web.Response:
         """Enable schedule"""
-        api = await self.get_api()
-        try:
-            schedule_id = int(request.match_info["schedule_id"])
+        schedule_id = int(request.match_info["schedule_id"])
+        async with self.api() as api:
             await api.enable_schedule(schedule_id)
 
-            # Return refreshed list
-            return await self.api_schedules_list(request)
-        finally:
-            await api.conn.close()
+        # Return refreshed list
+        return await self.api_schedules_list(request)
 
     async def api_schedule_disable(self, request: web.Request) -> web.Response:
         """Disable schedule"""
-        api = await self.get_api()
-        try:
-            schedule_id = int(request.match_info["schedule_id"])
+        schedule_id = int(request.match_info["schedule_id"])
+        async with self.api() as api:
             await api.disable_schedule(schedule_id)
 
-            # Return refreshed list
-            return await self.api_schedules_list(request)
-        finally:
-            await api.conn.close()
+        # Return refreshed list
+        return await self.api_schedules_list(request)
 
     async def api_schedule_delete(self, request: web.Request) -> web.Response:
         """Delete schedule"""
-        api = await self.get_api()
-        try:
-            schedule_id = int(request.match_info["schedule_id"])
+        schedule_id = int(request.match_info["schedule_id"])
+        async with self.api() as api:
             await api.delete_schedule(schedule_id)
 
-            # Return refreshed list
-            return await self.api_schedules_list(request)
-        finally:
-            await api.conn.close()
+        # Return refreshed list
+        return await self.api_schedules_list(request)
 
     async def api_schedule_history(self, request: web.Request) -> web.Response:
         """Get schedule execution history"""
-        api = await self.get_api()
-        try:
+        async with self.api() as api:
             schedule_id = int(request.match_info["schedule_id"])
             limit = int(request.query.get("limit", 50))
 
@@ -1035,10 +994,8 @@ class WebAdminServer:
             return web.json_response(
                 history, dumps=lambda x: json.dumps(x, default=str)
             )
-        finally:
-            await api.conn.close()
 
-    async def start(self):
+    async def start(self) -> None:
         """Start the web server"""
         runner = web.AppRunner(self.app)
         await runner.setup()
@@ -1051,30 +1008,42 @@ class WebAdminServer:
             await asyncio.Event().wait()
         except KeyboardInterrupt:
             print("\n👋 Shutting down...")
+        finally:
+            # Cleans up the app, which also closes the connection pool
             await runner.cleanup()
 
 
-async def async_main():
-    """Run web admin server standalone (async)"""
-    import sys
-
-    from .configloader import load_config_from_file
-
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "./pyjobby.conf.py"
-    config = load_config_from_file(config_path, keys=["db_params"])
-    db_params = config.get("db_params")
-
-    if not db_params:
-        print("Error: No db_params found in config file")
-        sys.exit(1)
-
-    server = WebAdminServer(db_params)
+async def serve(db_params: dict, host: str, port: int) -> None:
+    """Create and run a WebAdminServer until interrupted."""
+    server = WebAdminServer(db_params, host=host, port=port)
     await server.start()
 
 
-def main():
-    """Sync entry point for poetry script"""
-    asyncio.run(async_main())
+def main() -> None:
+    """CLI entry point for the web admin server."""
+    import click
+
+    @click.command()
+    @click.argument("config", default="./pyjobby.conf.py")
+    @click.option(
+        "--host",
+        default="127.0.0.1",
+        show_default=True,
+        help="Bind address (use 0.0.0.0 to expose; the admin UI has no authentication)",
+    )
+    @click.option("--port", default=8081, show_default=True, help="Bind port")
+    def cli(config: str, host: str, port: int) -> None:
+        """Run the pyjobby web admin interface."""
+        from .configloader import load_config_from_file
+
+        cfg = load_config_from_file(config, keys=["db_params"])
+        db_params = cfg.get("db_params")
+        if not db_params:
+            raise click.ClickException(f"No db_params found in config: {config}")
+
+        asyncio.run(serve(db_params, host, port))
+
+    cli()
 
 
 if __name__ == "__main__":

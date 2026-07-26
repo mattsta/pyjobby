@@ -10,16 +10,18 @@ Production-grade recurring job scheduler with comprehensive safety features:
 - Comprehensive logging and metrics
 """
 
+from __future__ import annotations
+
 import asyncio
-import json
+import contextlib
 import random
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
-import asyncpg
-import pytz
+import asyncpg  # type: ignore[import-untyped]
+import pytz  # type: ignore[import-untyped]
 from loguru import logger
 
 
@@ -225,7 +227,7 @@ class ScheduleManager:
         """
         try:
             import pytz
-            from croniter import croniter
+            from croniter import croniter  # type: ignore[import-untyped]
 
             # Get timezone
             tz = pytz.timezone(timezone)
@@ -235,7 +237,7 @@ class ScheduleManager:
 
             # Calculate next run
             cron = croniter(cron_expr, now)
-            next_run = cron.get_next(datetime)
+            next_run: datetime = cron.get_next(datetime)
 
             logger.debug(
                 f"Calculated next run: {next_run} (cron: {cron_expr}, tz: {timezone})"
@@ -247,7 +249,7 @@ class ScheduleManager:
             raise ValueError(f"Invalid cron expression '{cron_expr}': {e}")
 
     async def create_schedule(
-        self, name: str, job_class: str, cron_expr: str, **kwargs
+        self, name: str, job_class: str, cron_expr: str, **kwargs: Any
     ) -> int:
         """
         Create new recurring schedule.
@@ -269,7 +271,7 @@ class ScheduleManager:
         next_run = self.calculate_next_run(cron_expr, timezone)
 
         # Insert schedule
-        schedule_id = await self.conn.fetchval(
+        schedule_id: int = await self.conn.fetchval(
             """
             INSERT INTO jorb_schedule (
                 name, description,
@@ -291,7 +293,7 @@ class ScheduleManager:
             name,
             kwargs.get("description"),
             job_class,
-            json.dumps(kwargs.get("kwargs", {})),
+            kwargs.get("kwargs", {}),
             kwargs.get("queue", "default"),
             kwargs.get("prio", 100),
             kwargs.get("capability"),
@@ -441,12 +443,15 @@ class SchedulerWorker:
         Returns:
             List of schedule records
         """
+        # Plain read: actual cross-instance mutual exclusion happens in run(),
+        # which re-locks each row with FOR UPDATE SKIP LOCKED inside a real
+        # transaction. (A lock taken here would be released as soon as this
+        # statement's implicit transaction ends, protecting nothing.)
         records = await self.conn.fetch("""
             SELECT * FROM jorb_schedule
             WHERE enabled = true
               AND next_run <= NOW()
             ORDER BY next_run
-            FOR UPDATE SKIP LOCKED
         """)
 
         schedules = [dict(r) for r in records]
@@ -456,7 +461,10 @@ class SchedulerWorker:
         return schedules
 
     async def create_scheduled_job(
-        self, schedule: dict[str, Any], scheduled_time: datetime
+        self,
+        schedule: dict[str, Any],
+        scheduled_time: datetime,
+        jitter_seconds: float = 0,
     ) -> int | None:
         """
         Create job for schedule with deadline key.
@@ -464,6 +472,9 @@ class SchedulerWorker:
         Args:
             schedule: Schedule record
             scheduled_time: When job should have run
+            jitter_seconds: Load-spreading offset added to the job's run_after
+                (jitter is applied to when the job may START, not by sleeping
+                the scheduler, so one jittery schedule never stalls the others)
 
         Returns:
             Job ID if created, None if duplicate
@@ -487,24 +498,31 @@ class SchedulerWorker:
             # Convert to UTC and remove timezone info
             run_after_time = scheduled_time.astimezone(pytz.UTC).replace(tzinfo=None)
 
+        if jitter_seconds > 0:
+            run_after_time = run_after_time + timedelta(seconds=jitter_seconds)
+
         try:
-            job_id = await self.conn.fetchval(
-                """
-                INSERT INTO jorb (
-                    job_class, kwargs, queue, prio, capability,
-                    deadline_key, run_after, admin_data, state
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued')
-                RETURNING id
-            """,
-                schedule["job_class"],
-                schedule["kwargs"],  # Dict - custom codec handles conversion
-                schedule["queue"],
-                schedule["prio"],
-                schedule["capability"],
-                deadline_key,
-                run_after_time,
-                admin_data,  # Dict - custom codec handles conversion
-            )
+            # Nested transaction = savepoint when run() already holds a
+            # transaction, so a UniqueViolationError here cannot poison the
+            # outer transaction's later statements (log_execution etc).
+            async with self.conn.transaction():
+                job_id: int = await self.conn.fetchval(
+                    """
+                    INSERT INTO jorb (
+                        job_class, kwargs, queue, prio, capability,
+                        deadline_key, run_after, admin_data, state
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued')
+                    RETURNING id
+                """,
+                    schedule["job_class"],
+                    schedule["kwargs"],  # Dict - custom codec handles conversion
+                    schedule["queue"],
+                    schedule["prio"],
+                    schedule["capability"],
+                    deadline_key,
+                    run_after_time,
+                    admin_data,  # Dict - custom codec handles conversion
+                )
 
             logger.info(
                 f"Created job {job_id} for schedule '{schedule['name']}'",
@@ -647,7 +665,9 @@ class SchedulerWorker:
             await self.manager.record_execution_skip(schedule["id"], "backpressure")
             return result
 
-        # Safety feature 4: Apply jitter
+        # Safety feature 4: Apply jitter as a run_after offset on the created
+        # job (never by sleeping here — with N schedules a serial sleep would
+        # stall every schedule behind this one).
         jitter = self.safety.calculate_jitter(schedule["jitter_seconds"])
         if jitter > 0:
             logger.debug(
@@ -658,11 +678,12 @@ class SchedulerWorker:
                     "jitter_seconds": jitter,
                 },
             )
-            await asyncio.sleep(jitter)
 
         # Create job
         try:
-            job_id = await self.create_scheduled_job(schedule, scheduled_time)
+            job_id = await self.create_scheduled_job(
+                schedule, scheduled_time, jitter_seconds=jitter
+            )
 
             if job_id:
                 # Success!
@@ -691,14 +712,12 @@ class SchedulerWorker:
                 )
             else:
                 # Duplicate (deadline key collision)
-                try:
+                # Transaction may already be aborted from UniqueViolationError
+                # in test environments with transaction isolation
+                with contextlib.suppress(asyncpg.InFailedSQLTransactionError):
                     await self.manager.record_execution_skip(
                         schedule["id"], "duplicate"
                     )
-                except asyncpg.InFailedSQLTransactionError:
-                    # Transaction already aborted from UniqueViolationError
-                    # This can happen in test environments with transaction isolation
-                    pass
 
                 return ScheduleExecutionResult(
                     result="skipped", skip_reason="duplicate"
@@ -736,25 +755,48 @@ class SchedulerWorker:
                 # Execute each schedule
                 for schedule in schedules:
                     try:
-                        # Execute schedule
-                        result = await self.execute_schedule(schedule)
+                        async with self.conn.transaction():
+                            # Re-lock the row inside a real transaction so a
+                            # concurrent scheduler instance skips it — and
+                            # re-check due-ness, since another instance may
+                            # have already advanced next_run.
+                            locked = await self.conn.fetchrow(
+                                """
+                                SELECT * FROM jorb_schedule
+                                WHERE id = $1
+                                  AND enabled = true
+                                  AND next_run <= NOW()
+                                FOR UPDATE SKIP LOCKED
+                                """,
+                                schedule["id"],
+                            )
+                            if not locked:
+                                continue
+                            schedule = dict(locked)
 
-                        # Log execution
-                        await self.log_execution(schedule, schedule["next_run"], result)
+                            # Execute schedule
+                            result = await self.execute_schedule(schedule)
 
-                        # Update metrics
-                        self.executions_total += 1
-                        if result.result == "success":
-                            self.successes_total += 1
-                        elif result.result == "failure":
-                            self.failures_total += 1
-                        elif result.result == "skipped":
-                            self.skips_total += 1
+                            # Log execution
+                            await self.log_execution(
+                                schedule, schedule["next_run"], result
+                            )
 
-                        # Update next_run
-                        await self.manager.update_schedule_next_run(
-                            schedule["id"], schedule["cron_expr"], schedule["timezone"]
-                        )
+                            # Update metrics
+                            self.executions_total += 1
+                            if result.result == "success":
+                                self.successes_total += 1
+                            elif result.result == "failure":
+                                self.failures_total += 1
+                            elif result.result == "skipped":
+                                self.skips_total += 1
+
+                            # Update next_run
+                            await self.manager.update_schedule_next_run(
+                                schedule["id"],
+                                schedule["cron_expr"],
+                                schedule["timezone"],
+                            )
 
                     except Exception as e:
                         logger.error(
@@ -784,3 +826,63 @@ class SchedulerWorker:
         """Request graceful shutdown"""
         logger.info("Scheduler stop requested")
         self.stop_requested = True
+
+
+async def run_scheduler(db_params: dict[str, Any], poll_interval: int = 60) -> None:
+    """Connect and run a SchedulerWorker until SIGTERM/SIGINT."""
+    import signal
+
+    from . import db
+
+    conn = await db.connect(**db_params)
+    worker = SchedulerWorker(conn, poll_interval=poll_interval)
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, worker.stop)
+
+    try:
+        await worker.run()
+    finally:
+        await conn.close()
+
+
+def main() -> None:
+    """CLI entry point: the ``pj-scheduler`` console script."""
+    import click
+
+    @click.command()
+    @click.option(
+        "--config",
+        "-c",
+        default="./pyjobby.conf.py",
+        show_default=True,
+        help="Config file path (must define db_params)",
+    )
+    @click.option(
+        "--poll-interval",
+        default=60,
+        show_default=True,
+        help="Seconds between schedule polls",
+    )
+    def cli(config: str, poll_interval: int) -> None:
+        """Run the recurring (cron) schedule executor.
+
+        Polls jorb_schedule for due schedules and enqueues their jobs.
+        Safe to run multiple instances: schedules are row-locked while
+        being fired and duplicate jobs are prevented by deadline keys.
+        """
+        from .configloader import load_config_from_file
+
+        cfg = load_config_from_file(config, keys=["db_params"])
+        db_params = cfg.get("db_params")
+        if not db_params:
+            raise click.ClickException(f"No db_params found in config: {config}")
+
+        asyncio.run(run_scheduler(db_params, poll_interval=poll_interval))
+
+    cli()
+
+
+if __name__ == "__main__":
+    main()

@@ -19,17 +19,22 @@ Features:
 - Multiple WebSocket servers can run independently
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
-from datetime import datetime
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 import aiohttp
-import asyncpg
+import asyncpg  # type: ignore[import-untyped]
 from aiohttp import web
+
+from . import db
 
 # Configure logging
 logging.basicConfig(
@@ -45,8 +50,8 @@ class ClientConnection:
     ws: web.WebSocketResponse
     channels: set[str]
     connected_at: float
-    last_action: float
-    action_count: int
+    # Sliding window of recent action timestamps for rate limiting
+    action_times: deque[float] = field(default_factory=deque)
     uid: int | None = None  # For multi-tenancy
 
 
@@ -74,8 +79,13 @@ class WebSocketServer:
         self.subscriptions: dict[str, set[web.WebSocketResponse]] = {}
 
         # Database connections
-        self.db_pool = None  # For queries
-        self.notify_conn = None  # Dedicated connection for LISTEN
+        self.db_pool: asyncpg.Pool | None = None  # For queries
+        self.notify_conn: asyncpg.Connection | None = None  # For LISTEN
+
+        # In-flight notification broadcast tasks (kept to avoid GC of
+        # fire-and-forget tasks; bounded so a flood cannot grow unbounded)
+        self._notification_tasks: set[asyncio.Task] = set()
+        self.max_pending_notifications = 1000
 
         # Statistics
         self.stats = {
@@ -87,18 +97,18 @@ class WebSocketServer:
             "errors": 0,
         }
 
-    async def init_db_pool(self):
+    async def init_db_pool(self) -> None:
         """Initialize database connection pool for queries"""
         if not self.db_pool:
-            self.db_pool = await asyncpg.create_pool(
+            self.db_pool = await db.create_pool(
                 **self.db_params, min_size=2, max_size=10
             )
             logger.info("Database connection pool initialized")
 
-    async def init_notify_connection(self):
+    async def init_notify_connection(self) -> None:
         """Initialize dedicated connection for PostgreSQL LISTEN"""
         if not self.notify_conn or self.notify_conn.is_closed():
-            self.notify_conn = await asyncpg.connect(**self.db_params)
+            self.notify_conn = await db.connect(**self.db_params)
 
             # Set up listeners for all event channels
             await self.notify_conn.add_listener(
@@ -111,16 +121,31 @@ class WebSocketServer:
 
             logger.info("PostgreSQL LISTEN connections established")
 
-    def handle_notification(self, connection, pid, channel, payload):
+    def handle_notification(
+        self, connection: Any, pid: int, channel: str, payload: str
+    ) -> None:
         """
         Handle PostgreSQL NOTIFY event.
 
         This is called by asyncpg when a NOTIFY is received.
-        We schedule it as a task to avoid blocking.
+        We schedule it as a task to avoid blocking. Task handles are kept in
+        a bounded set so they cannot be garbage-collected mid-flight; if too
+        many are pending, the notification is dropped (dashboard events are
+        lossy by design).
         """
-        asyncio.create_task(self.process_notification(channel, payload))
+        if len(self._notification_tasks) >= self.max_pending_notifications:
+            logger.warning(
+                f"Too many pending notification tasks "
+                f"({len(self._notification_tasks)}); dropping notification "
+                f"on channel {channel}"
+            )
+            return
 
-    async def process_notification(self, channel: str, payload: str):
+        task = asyncio.create_task(self.process_notification(channel, payload))
+        self._notification_tasks.add(task)
+        task.add_done_callback(self._notification_tasks.discard)
+
+    async def process_notification(self, channel: str, payload: str) -> None:
         """Process and broadcast notification to WebSocket clients"""
         try:
             # Parse payload
@@ -129,7 +154,7 @@ class WebSocketServer:
             # Create event structure
             event = {
                 "event": channel,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
                 "data": data,
             }
 
@@ -180,8 +205,6 @@ class WebSocketServer:
             ws=ws,
             channels=set(),
             connected_at=time.time(),
-            last_action=time.time(),
-            action_count=0,
         )
 
         self.clients[ws] = client
@@ -198,7 +221,7 @@ class WebSocketServer:
                 ws,
                 {
                     "event": "connected",
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                     "data": {
                         "server": "pyjobby-websocket",
                         "version": "1.0.0",
@@ -244,7 +267,7 @@ class WebSocketServer:
 
     async def handle_message(
         self, ws: web.WebSocketResponse, client: ClientConnection, data: dict[str, Any]
-    ):
+    ) -> None:
         """Handle incoming client message"""
         action = data.get("action")
 
@@ -252,17 +275,15 @@ class WebSocketServer:
             await self.send_error(ws, "Missing 'action' field")
             return
 
-        # Rate limiting
+        # Rate limiting: sliding 1-second window of action timestamps
         now = time.time()
-        if now - client.last_action < 1.0:
-            client.action_count += 1
-            if client.action_count > self.max_actions_per_second:
-                await self.send_error(ws, "Rate limit exceeded")
-                return
-        else:
-            client.action_count = 0
-
-        client.last_action = now
+        window = client.action_times
+        while window and now - window[0] > 1.0:
+            window.popleft()
+        if len(window) >= self.max_actions_per_second:
+            await self.send_error(ws, "Rate limit exceeded")
+            return
+        window.append(now)
 
         # Handle different actions
         if action == "subscribe":
@@ -288,7 +309,7 @@ class WebSocketServer:
 
     async def handle_subscribe(
         self, ws: web.WebSocketResponse, client: ClientConnection, data: dict[str, Any]
-    ):
+    ) -> None:
         """Handle channel subscription"""
         channels = data.get("channels", [])
 
@@ -313,7 +334,7 @@ class WebSocketServer:
             ws,
             {
                 "event": "subscribed",
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
                 "data": {"channels": list(client.channels)},
             },
         )
@@ -322,7 +343,7 @@ class WebSocketServer:
 
     async def handle_unsubscribe(
         self, ws: web.WebSocketResponse, client: ClientConnection, data: dict[str, Any]
-    ):
+    ) -> None:
         """Handle channel unsubscription"""
         channels = data.get("channels", [])
 
@@ -335,14 +356,14 @@ class WebSocketServer:
             ws,
             {
                 "event": "unsubscribed",
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
                 "data": {"channels": channels},
             },
         )
 
     async def handle_cancel_job(
         self, ws: web.WebSocketResponse, client: ClientConnection, data: dict[str, Any]
-    ):
+    ) -> None:
         """Handle job cancellation request"""
         job_id = data.get("job_id")
 
@@ -350,6 +371,7 @@ class WebSocketServer:
             await self.send_error(ws, "Missing job_id")
             return
 
+        assert self.db_pool is not None
         try:
             async with self.db_pool.acquire() as conn:
                 result = await conn.execute(
@@ -371,7 +393,7 @@ class WebSocketServer:
                         ws,
                         {
                             "event": "job_cancelled",
-                            "timestamp": datetime.utcnow().isoformat(),
+                            "timestamp": datetime.now(UTC).isoformat(),
                             "data": {"job_id": job_id, "success": True},
                         },
                     )
@@ -384,7 +406,7 @@ class WebSocketServer:
 
     async def handle_retry_job(
         self, ws: web.WebSocketResponse, client: ClientConnection, data: dict[str, Any]
-    ):
+    ) -> None:
         """Handle job retry request"""
         job_id = data.get("job_id")
 
@@ -392,30 +414,12 @@ class WebSocketServer:
             await self.send_error(ws, "Missing job_id")
             return
 
+        assert self.db_pool is not None
         try:
             async with self.db_pool.acquire() as conn:
-                new_job_id = await conn.fetchval(
-                    """
-                    INSERT INTO jorb (
-                        job_class, kwargs, queue, prio, uid, capability,
-                        run_after, run_group, admin_data, state
-                    )
-                    SELECT
-                        job_class, kwargs, queue, prio, uid, capability,
-                        TIMEZONE('utc', clock_timestamp()) as run_after,
-                        run_group,
-                        jsonb_set(
-                            COALESCE(admin_data::jsonb, '{}'::jsonb),
-                            '{retry_of}',
-                            to_jsonb($1::bigint)
-                        )::json,
-                        'queued' as state
-                    FROM jorb
-                    WHERE id = $1
-                      AND state IN ('crashed', 'finished')
-                    RETURNING id
-                """,
-                    job_id,
+                # shared retry statement — identical rows to every other path
+                new_job_id = await db.create_retry_job(
+                    conn, job_id, allowed_states=("crashed", "finished")
                 )
 
                 if new_job_id:
@@ -423,7 +427,7 @@ class WebSocketServer:
                         ws,
                         {
                             "event": "job_retried",
-                            "timestamp": datetime.utcnow().isoformat(),
+                            "timestamp": datetime.now(UTC).isoformat(),
                             "data": {
                                 "original_job_id": job_id,
                                 "new_job_id": new_job_id,
@@ -444,7 +448,7 @@ class WebSocketServer:
 
     async def handle_adjust_priority(
         self, ws: web.WebSocketResponse, client: ClientConnection, data: dict[str, Any]
-    ):
+    ) -> None:
         """Handle priority adjustment request"""
         job_id = data.get("job_id")
         new_priority = data.get("new_priority")
@@ -453,6 +457,7 @@ class WebSocketServer:
             await self.send_error(ws, "Missing job_id or new_priority")
             return
 
+        assert self.db_pool is not None
         try:
             async with self.db_pool.acquire() as conn:
                 result = await conn.execute(
@@ -475,7 +480,7 @@ class WebSocketServer:
                         ws,
                         {
                             "event": "priority_adjusted",
-                            "timestamp": datetime.utcnow().isoformat(),
+                            "timestamp": datetime.now(UTC).isoformat(),
                             "data": {
                                 "job_id": job_id,
                                 "new_priority": new_priority,
@@ -494,25 +499,25 @@ class WebSocketServer:
 
     async def handle_get_stats(
         self, ws: web.WebSocketResponse, client: ClientConnection, data: dict[str, Any]
-    ):
+    ) -> None:
         """Handle stats request"""
         await self.send_to_client(
             ws,
             {
                 "event": "stats",
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
                 "data": {
                     "server": self.stats,
                     "client": {
                         "connected_at": client.connected_at,
                         "channels": list(client.channels),
-                        "action_count": client.action_count,
+                        "action_count": len(client.action_times),
                     },
                 },
             },
         )
 
-    async def broadcast_event(self, channel: str, event: dict[str, Any]):
+    async def broadcast_event(self, channel: str, event: dict[str, Any]) -> None:
         """Broadcast event to all subscribers of channel"""
         subscribers = self.subscriptions.get(channel, set())
         dead_clients = set()
@@ -530,23 +535,25 @@ class WebSocketServer:
             subscribers.discard(ws)
             self.clients.pop(ws, None)
 
-    async def send_to_client(self, ws: web.WebSocketResponse, event: dict[str, Any]):
+    async def send_to_client(
+        self, ws: web.WebSocketResponse, event: dict[str, Any]
+    ) -> None:
         """Send event to specific client"""
         await ws.send_json(event)
         self.stats["messages_sent"] += 1
 
-    async def send_error(self, ws: web.WebSocketResponse, message: str):
+    async def send_error(self, ws: web.WebSocketResponse, message: str) -> None:
         """Send error message to client"""
         await self.send_to_client(
             ws,
             {
                 "event": "error",
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
                 "data": {"message": message},
             },
         )
 
-    async def periodic_stats_broadcast(self):
+    async def periodic_stats_broadcast(self) -> None:
         """Periodically broadcast queue statistics"""
         while True:
             try:
@@ -581,7 +588,7 @@ class WebSocketServer:
                         f"queues:{queue}",
                         {
                             "event": "queue_stats",
-                            "timestamp": datetime.utcnow().isoformat(),
+                            "timestamp": datetime.now(UTC).isoformat(),
                             "data": {"queue": queue, **stats},
                         },
                     )
@@ -592,7 +599,7 @@ class WebSocketServer:
                 logger.error(f"Error in periodic stats broadcast: {e}")
                 self.stats["errors"] += 1
 
-    async def start(self, host: str = "0.0.0.0", port: int = 8082):
+    async def start(self, host: str = "127.0.0.1", port: int = 8082) -> None:
         """Start WebSocket server"""
         # Initialize connections
         await self.init_db_pool()
@@ -603,7 +610,7 @@ class WebSocketServer:
         app.router.add_get("/ws", self.handle_websocket)
 
         # Health check endpoint
-        async def health_check(request):
+        async def health_check(request: web.Request) -> web.Response:
             return web.json_response(
                 {
                     "status": "healthy",
@@ -611,7 +618,7 @@ class WebSocketServer:
                     "notify_connection": not self.notify_conn.is_closed()
                     if self.notify_conn
                     else False,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                 }
             )
 
@@ -642,41 +649,42 @@ class WebSocketServer:
                 await self.db_pool.close()
 
 
-async def main():
-    """Main entry point for WebSocket server"""
-    import sys
-
-    from .configloader import load_config_from_file
-
-    if len(sys.argv) < 2:
-        print(
-            "Usage: python -m pyjobby.websocket_server <config_file> [--host HOST] [--port PORT]"
-        )
-        sys.exit(1)
-
-    config_file = sys.argv[1]
-    host = "0.0.0.0"
-    port = 8082
-
-    # Parse command line arguments
-    for i, arg in enumerate(sys.argv[2:], 2):
-        if arg == "--host" and i + 1 < len(sys.argv):
-            host = sys.argv[i + 1]
-        elif arg == "--port" and i + 1 < len(sys.argv):
-            port = int(sys.argv[i + 1])
-
-    # Load configuration
-    config = load_config_from_file(config_file, keys=["db_params"])
-    db_params = config.get("db_params", {})
-
-    # Create and start server
+async def serve(db_params: dict[str, Any], host: str, port: int) -> None:
+    """Create and run a WebSocketServer until interrupted."""
     server = WebSocketServer(db_params=db_params)
-
     try:
         await server.start(host=host, port=port)
     except KeyboardInterrupt:
         logger.info("Shutting down...")
 
 
+def main() -> None:
+    """CLI entry point: the ``pj-ws`` console script."""
+    import click
+
+    @click.command()
+    @click.argument("config", default="./pyjobby.conf.py")
+    @click.option(
+        "--host",
+        default="127.0.0.1",
+        show_default=True,
+        help="Bind address (use 0.0.0.0 to expose beyond localhost; the "
+        "websocket API is unauthenticated, so front it with a proxy first)",
+    )
+    @click.option("--port", default=8082, show_default=True, help="Bind port")
+    def cli(config: str, host: str, port: int) -> None:
+        """Run the realtime websocket dashboard server."""
+        from .configloader import load_config_from_file
+
+        cfg = load_config_from_file(config, keys=["db_params"])
+        db_params = cfg.get("db_params")
+        if not db_params:
+            raise click.ClickException(f"No db_params found in config: {config}")
+
+        asyncio.run(serve(db_params, host, port))
+
+    cli()
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
