@@ -1048,7 +1048,7 @@ class TestAdminAPIScheduleManagement:
         """Test creating schedule with invalid cron expression fails."""
         api = AdminAPI(db_pool)
 
-        with pytest.raises(ValueError, match="Invalid cron expression"):
+        with pytest.raises(ValueError, match="malformed cron expression"):
             await api.create_schedule(
                 name="bad-schedule",
                 job_class="test.Job",
@@ -1061,7 +1061,9 @@ class TestAdminAPIScheduleManagement:
         """Test creating schedule with invalid timezone fails."""
         api = AdminAPI(db_pool)
 
-        with pytest.raises(ValueError, match="Invalid cron expression or timezone"):
+        with pytest.raises(
+            ValueError, match="malformed cron expression|unknown timezone"
+        ):
             await api.create_schedule(
                 name="bad-tz-schedule",
                 job_class="test.Job",
@@ -1541,7 +1543,9 @@ class TestAdminAPIScheduleManagement:
             )
 
             # Try to update with invalid cron expression - covers lines 969-970
-            with pytest.raises(ValueError, match="Invalid cron expression or timezone"):
+            with pytest.raises(
+                ValueError, match="malformed cron expression|unknown timezone"
+            ):
                 await api.update_schedule(schedule_id, cron_expr="INVALID_CRON")
 
     @pytest.mark.asyncio

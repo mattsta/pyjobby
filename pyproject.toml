@@ -20,8 +20,8 @@ dependencies = [
     "asyncpg>=0.30",
     "loguru>=0.7",
     "aiohttp>=3.9",
-    "croniter>=2.0",
-    "pytz>=2024.1",
+    "croniter>=6.2.4",
+    "tzdata>=2025.2",
 ]
 
 [project.urls]

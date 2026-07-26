@@ -835,8 +835,7 @@ class TestScheduleAddValidation:
         )
 
         assert result.exit_code == 1, result.output
-        assert "Error: Invalid cron expression or timezone:" in result.stderr
-        assert "Exactly 5, 6 or 7 columns" in result.stderr
+        assert "Error: malformed cron expression 'nope'" in result.stderr
         assert await self._count(db_pool, test_id) == 0
 
     async def test_cron_with_out_of_range_field(self, dsn, db_pool, test_id):
@@ -851,7 +850,7 @@ class TestScheduleAddValidation:
         )
 
         assert result.exit_code == 1, result.output
-        assert "Error: Invalid cron expression or timezone:" in result.stderr
+        assert "Error: malformed cron expression '0 99 * * *'" in result.stderr
         assert await self._count(db_pool, test_id) == 0
 
     async def test_invalid_timezone(self, dsn, db_pool, test_id):
@@ -868,9 +867,7 @@ class TestScheduleAddValidation:
         )
 
         assert result.exit_code == 1, result.output
-        assert (
-            "Error: Invalid cron expression or timezone: 'Mars/Phobos'" in result.stderr
-        )
+        assert "Error: unknown timezone 'Mars/Phobos'" in result.stderr
         assert await self._count(db_pool, test_id) == 0
 
     async def test_invalid_kwargs_json(self, dsn, db_pool, test_id):

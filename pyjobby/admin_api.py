@@ -17,6 +17,7 @@ from typing import Any
 import asyncpg  # type: ignore[import-untyped]
 
 from . import db
+from .cron import next_cron_run
 
 
 class Unset:
@@ -913,7 +914,10 @@ class AdminAPI:
             raise ValueError(f"Job {job_id} is not in DLQ (state: {job['state']})")
 
         await db.requeue_job(
-            self.conn, job_id, reset_errors=True, allowed_states=("crashed",)  # DLQ is crashed by definition
+            self.conn,
+            job_id,
+            reset_errors=True,
+            allowed_states=("crashed",),  # DLQ is crashed by definition
         )
 
         return {"job_id": job_id, "status": "requeued_from_dlq"}
@@ -1148,17 +1152,9 @@ class AdminAPI:
         Returns:
             Created schedule dictionary
         """
-        import pytz  # type: ignore[import-untyped]
-        from croniter import croniter  # type: ignore[import-untyped]
-
-        # Validate cron expression
-        try:
-            tz = pytz.timezone(timezone)
-            now = datetime.now(tz)
-            cron = croniter(cron_expr, now)
-            next_run = cron.get_next(datetime)
-        except Exception as e:
-            raise ValueError(f"Invalid cron expression or timezone: {e}")
+        # Reject the expression here rather than at fire time: a schedule
+        # that cannot be evaluated is a schedule that silently never runs.
+        next_run = next_cron_run(cron_expr, timezone)
 
         # Create schedule
         record = await self.conn.fetchrow(
@@ -1239,20 +1235,10 @@ class AdminAPI:
             if not schedule:
                 raise ValueError(f"Schedule {schedule_id} not found")
 
-            import pytz
-            from croniter import croniter
-
             cron_expr = updates.get("cron_expr", schedule["cron_expr"])
             timezone = updates.get("timezone", schedule["timezone"])
 
-            try:
-                tz = pytz.timezone(timezone)
-                now = datetime.now(tz)
-                cron = croniter(cron_expr, now)
-                next_run = cron.get_next(datetime)
-                updates["next_run"] = next_run
-            except Exception as e:
-                raise ValueError(f"Invalid cron expression or timezone: {e}")
+            updates["next_run"] = next_cron_run(cron_expr, timezone)
 
         # Build UPDATE query dynamically
         set_clauses = []

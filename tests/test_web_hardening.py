@@ -1059,7 +1059,7 @@ class TestMalformedInput:
             },
         )
         assert resp.status == 400
-        assert "Invalid cron expression" in (await resp.json())["error"]
+        assert "malformed cron expression" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
     async def test_duplicate_schedule_name_is_409(
