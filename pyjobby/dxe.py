@@ -20,6 +20,13 @@ Execution model:
   (**exactly-once** for work on that connection). The fence is what makes
   the rollback happen: a superseded execution's checkpoint matches zero
   rows, raises inside the transaction, and takes the write with it.
+* Both step primitives accept a **per-step timeout** (``timeout=`` on the
+  call, or the job class's ``step_timeout``). Exceeding it raises
+  ``StepTimeoutError``, which is recorded as that step's error and then
+  takes the job's ordinary retry path — so the next attempt fast-forwards
+  the completed prefix and re-runs only the step that hung. The job's own
+  deadline is a ceiling: a per-step budget is installed only while it is
+  strictly tighter than the job's remaining time.
 * A **name mismatch** at a sequence number means the job code took a
   different path than the attempt that recorded the checkpoint —
   nondeterminism the author must fix (usually branching on non-checkpointed
@@ -45,6 +52,27 @@ class StaleExecutionError(DXEError):
     """This execution's run_epoch was superseded (the job was requeued by
     the monitor or an operator while we ran); abandon quietly — the newer
     attempt owns the row now."""
+
+
+class StepTimeoutError(Exception):
+    """A durable step ran longer than its per-step budget.
+
+    Deliberately **not** a ``DXEError``: those are control-flow signals that
+    bypass checkpoint recording, and a blown budget is a step *failure* that
+    must be recorded — naming the step that hung is half the point of having
+    per-step budgets at all.
+
+    Deliberately **not** a ``TimeoutError`` either: the worker reads a bare
+    TimeoutError out of a task as the *job* timeout, reports it as "Job timed
+    out after Ns", and applies the job's ``on_timeout`` policy to it. A step
+    that blew its own budget is an ordinary step failure and takes the
+    ordinary retry path.
+    """
+
+    def __init__(self, name: str, timeout: float) -> None:
+        super().__init__(f"step '{name}' exceeded its {timeout:g}s timeout")
+        self.name = name
+        self.timeout = timeout
 
 
 class DurableSleep(Exception):  # noqa: N818 - control-flow signal, not an error

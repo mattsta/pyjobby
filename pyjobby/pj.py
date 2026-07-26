@@ -678,6 +678,9 @@ class JobSystem:
         jname = job["job_class"].split(".")[-1]
         admin_data = job.get("admin_data") or {}
         klass: Job | None = None
+        # monotonic instant THIS job's timeout fires; the only thing that
+        # tells a TimeoutError we produced from one job code raised
+        job_deadline: float | None = None
 
         logger.info(
             "[job {}] Running {} ({}, {}, {})",
@@ -739,6 +742,11 @@ class JobSystem:
             await self.ex("run", jid, epoch)
 
             start_counter = time.perf_counter()
+            # DXE: the job's deadline is the ceiling every per-step budget is
+            # measured against (see Job._dxe_budget). Monotonic, in-process,
+            # and the same instant _execute starts counting from.
+            job_deadline = time.monotonic() + job_timeout if job_timeout else None
+            klass._dxe_deadline = job_deadline
             self._exec_task = asyncio.create_task(self._execute(klass, job_timeout))
             result = await self._exec_task
 
@@ -768,27 +776,38 @@ class JobSystem:
             await self.ex("cancelled", jid, epoch)
             self.errors += 1
 
-        except TimeoutError:
-            await self._handle_failure(
-                job,
-                klass,
-                error=f"Job timed out after {job_timeout}s",
-                backtrace="Timeout error - job exceeded maximum execution time",
-                timed_out=True,
-            )
-
         except Exception as e:
-            _, _, exc_traceback = sys.exc_info()
-            logger.exception(
-                "[job {}:{}] Error in {}: {}", jid, jname, job["job_class"], e
-            )
-            await self._handle_failure(
-                job,
-                klass,
-                error=str(e),
-                backtrace="Traceback:\n" + "".join(traceback.format_tb(exc_traceback)),
-                timed_out=False,
-            )
+            # A TimeoutError here is the job's own deadline ONLY if that
+            # deadline has actually passed. Job code raises TimeoutError on
+            # its own account all the time (a step's inner deadline, an HTTP
+            # client); reporting that as the job timeout would misname the
+            # failure and apply the operator's on_timeout policy to something
+            # they never configured, so it takes the ordinary failure path.
+            if (
+                isinstance(e, TimeoutError)
+                and job_deadline is not None
+                and time.monotonic() >= job_deadline
+            ):
+                await self._handle_failure(
+                    job,
+                    klass,
+                    error=f"Job timed out after {job_timeout}s",
+                    backtrace="Timeout error - job exceeded maximum execution time",
+                    timed_out=True,
+                )
+            else:
+                _, _, exc_traceback = sys.exc_info()
+                logger.exception(
+                    "[job {}:{}] Error in {}: {}", jid, jname, job["job_class"], e
+                )
+                await self._handle_failure(
+                    job,
+                    klass,
+                    error=str(e),
+                    backtrace="Traceback:\n"
+                    + "".join(traceback.format_tb(exc_traceback)),
+                    timed_out=False,
+                )
         finally:
             self._current_job_id = None
             self._exec_task = None
@@ -921,6 +940,9 @@ class Job:
                                              # retries and worker crashes
         await self.transaction("name", fn)   # exactly-once: fn(conn) and
                                              # its checkpoint are ONE commit
+        await self.step("slow", fn, timeout=30)   # per-step budget; blowing
+                                             # it records a timeout against
+                                             # THIS step and retries the job
         await self.sleep(3600)               # durable sleep: survives
                                              # restarts, resumes past here
         await self.set_event("progress", {"pct": 50})   # publish to waiters
@@ -937,6 +959,13 @@ class Job:
     #: (the default) defers to the worker's --default-timeout.
     timeout: ClassVar[int | None] = None
 
+    #: Default per-step budget in seconds for every ``step()`` and
+    #: ``transaction()`` this job runs. ``None`` (the default) means no
+    #: per-step bound — only the job's own deadline applies. A single call
+    #: overrides it with ``timeout=``; ``timeout=0`` disables it for that
+    #: call, matching the "0 disables" convention of ``timeout`` above.
+    step_timeout: ClassVar[float | None] = None
+
     #: Set by the @job decorator when a class is registered.
     job_class_path: ClassVar[str] = ""
 
@@ -945,6 +974,10 @@ class Job:
     _dxe_steps: dict[int, Any] = field(default_factory=dict)
     _dxe_seq: int = 0
     _dxe_epoch: int = 0
+    #: monotonic instant this job's own timeout fires, or None when the job
+    #: has no deadline. Set by the worker; a Job built outside one has no
+    #: ceiling and its declared step budgets apply as declared.
+    _dxe_deadline: float | None = None
 
     def __post_init__(self) -> None:
         # a Job constructed outside the worker (tests, direct use) still has
@@ -1031,6 +1064,96 @@ class Job:
             # recorded failure: fall through and re-execute this step
         return seq, _DXE_RUN
 
+    def _dxe_budget(self, timeout: float | None) -> float | None:
+        """Resolve this call's per-step budget, or None for "unbounded".
+
+        Precedence is per-call > class default > none, with ``0`` disabling
+        the budget for a call (the same convention as the job-level
+        ``timeout`` class attribute).
+
+        **The job's deadline is a ceiling, and only the tighter of the two
+        bounds is ever armed.** A per-step budget is installed only while it
+        is strictly tighter than the time the job has left; once the job's
+        own deadline is the binding constraint, that deadline is left to fire
+        alone. So a step timeout can never outlive the job's deadline, the
+        job timeout still fires however the work is split into steps, and the
+        two can never race to report the same overrun as two different
+        failures."""
+        budget = self.step_timeout if timeout is None else timeout
+        if not budget:  # None or 0: no per-step bound
+            return None
+        if self._dxe_deadline is not None:
+            remaining = self._dxe_deadline - time.monotonic()
+            if remaining <= budget:
+                logger.warning(
+                    "[job {}] step budget {:g}s exceeds the {:.1f}s this job "
+                    "has left; the job timeout is the binding deadline",
+                    self.job["id"],
+                    budget,
+                    remaining,
+                )
+                return None
+        return budget
+
+    async def _dxe_invoke(
+        self,
+        name: str,
+        fn: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        timeout: float | None,
+    ) -> Any:
+        """Call ``fn`` under its per-step budget — the one place both
+        primitives execute user code, so their timeout behavior cannot drift.
+
+        Raises ``StepTimeoutError`` when the budget expires; the caller
+        records that as the step's error and lets it take the job's ordinary
+        retry path.
+
+        The budget scopes **only** ``fn``. The checkpoint write happens after
+        this returns, outside the cancel scope, because a cancellation
+        delivered into the checkpoint write would abandon the observability
+        it exists to provide — and, in ``transaction()``, would fire inside
+        an open transaction.
+
+        Interruption is real for a coroutine and impossible for a blocking
+        synchronous ``fn``: cancellation is delivered at an await point, and
+        a function that never yields to the event loop has none. A sync
+        ``fn`` that overruns therefore runs to completion and, if it
+        succeeded, is recorded as a success — the overrun is logged, not
+        invented into a failure. ``self.cancelled`` remains the cooperative
+        signal a long synchronous loop can poll."""
+        budget = self._dxe_budget(timeout)
+        began = time.monotonic()
+
+        if budget is None:
+            result = fn(*args, **kwargs)
+            return await result if asyncio.iscoroutine(result) else result
+
+        try:
+            async with asyncio.timeout(budget) as bounded:
+                result = fn(*args, **kwargs)
+                if asyncio.iscoroutine(result):
+                    result = await result
+        except TimeoutError as expired:
+            if not bounded.expired():
+                raise  # fn's OWN timeout, not this step's budget: don't relabel
+            raise dxe.StepTimeoutError(name, budget) from expired
+
+        elapsed = time.monotonic() - began
+        if elapsed > budget:
+            # only reachable when fn blocked the event loop: the timer never
+            # got to run, so nothing could interrupt it
+            logger.warning(
+                "[job {}] synchronous step '{}' ran {:.3f}s over its {:g}s "
+                "budget; a blocking step cannot be interrupted",
+                self.job["id"],
+                name,
+                elapsed - budget,
+                budget,
+            )
+        return result
+
     async def _dxe_record(
         self,
         seq: int,
@@ -1073,7 +1196,14 @@ class Job:
                 f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
             )
 
-    async def step(self, name: str, fn: Any, *args: Any, **kwargs: Any) -> Any:
+    async def step(
+        self,
+        name: str,
+        fn: Any,
+        *args: Any,
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> Any:
         """Execute ``fn(*args, **kwargs)`` as a durable, checkpointed step.
 
         On success the return value (must be JSON-serializable) is recorded;
@@ -1082,6 +1212,19 @@ class Job:
         and the exception propagates into the job's normal retry path — the
         next attempt fast-forwards every completed step and re-executes
         only from the failure onward.
+
+        ``timeout`` bounds this one step in seconds (falling back to the
+        class's ``step_timeout``; ``0`` disables it for this call). Blowing
+        the budget raises ``StepTimeoutError``, which is recorded as this
+        step's error — ``pj-admin jobs steps`` then names the step that hung
+        and says it was a timeout — and then takes the same retry path as any
+        other step failure. See ``_dxe_invoke`` for what "timeout" can and
+        cannot mean for a *synchronous* ``fn``, and ``_dxe_budget`` for how a
+        step budget composes with the job's own deadline.
+
+        ``timeout`` is consumed here rather than forwarded, so a function
+        that wants its own ``timeout=`` keyword must be bound to it first
+        (``functools.partial(fn, timeout=5)``).
 
         **At-least-once**: the effect and the checkpoint commit separately,
         so a crash between them re-executes ``fn`` on the next attempt.
@@ -1094,9 +1237,7 @@ class Job:
 
         started = db.utcnow()
         try:
-            result = fn(*args, **kwargs)
-            if asyncio.iscoroutine(result):
-                result = await result
+            result = await self._dxe_invoke(name, fn, args, kwargs, timeout)
         except dxe.DXEError:
             raise
         except Exception as e:
@@ -1111,14 +1252,23 @@ class Job:
         await self._dxe_record(seq, name, result, None, started)
         return result
 
-    async def transaction(self, name: str, fn: Any, *args: Any, **kwargs: Any) -> Any:
+    async def transaction(
+        self,
+        name: str,
+        fn: Any,
+        *args: Any,
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> Any:
         """Execute ``fn(conn, *args, **kwargs)`` **exactly once**: the work
         and its checkpoint commit or roll back together.
 
         Identical to ``step()`` in every replay respect — same sequence
         numbering, same fast-forward of a completed checkpoint, same
         re-execution of a recorded failure, same NondeterminismError on a
-        name mismatch (they share ``_dxe_resume``). The difference is
+        name mismatch, same ``timeout`` budget with the same
+        ``StepTimeoutError`` recorded against the step (they share
+        ``_dxe_resume`` and ``_dxe_invoke``). The difference is
         atomicity: ``fn`` is handed the worker's own connection inside an
         explicit transaction, and the checkpoint is written on that same
         connection before the commit. There is no window between the effect
@@ -1134,7 +1284,11 @@ class Job:
         Failure path: when ``fn`` raises, the transaction (including the
         checkpoint) is rolled back, and the error checkpoint is then
         recorded in a **separate** transaction — observability must survive
-        the rollback that erased the work.
+        the rollback that erased the work. A blown ``timeout`` is that same
+        path: the budget expires *inside* the transaction, so the
+        cancellation aborts whatever query is in flight and the raise rolls
+        the application write back on the way out. The connection is left
+        clean and idle, never mid-transaction.
 
         Caveats, because this guarantee is exactly as wide as the
         connection it runs on:
@@ -1158,9 +1312,9 @@ class Job:
         started = db.utcnow()
         try:
             async with self.s.cxn.transaction():  # type: ignore[union-attr]
-                result = fn(self.s.cxn, *args, **kwargs)
-                if asyncio.iscoroutine(result):
-                    result = await result
+                result = await self._dxe_invoke(
+                    name, fn, (self.s.cxn, *args), kwargs, timeout
+                )
                 # inside the transaction: a fenced-out checkpoint raises,
                 # and the rollback undoes the application write with it
                 await self._dxe_record(seq, name, result, None, started, atomic=True)

@@ -16,7 +16,7 @@ die at any instant and another worker resumes the job correctly.
 ```python
 class ChargeAndShip(Job):
     async def task(self, order_id: int) -> dict:
-        charge   = await self.step("charge", self.charge_card, order_id)
+        charge   = await self.step("charge", self.charge_card, order_id, timeout=30)
         label    = await self.step("label",  self.buy_label,   order_id)
         await self.sleep(3600)                      # durable: holds no worker
         await self.set_event("shipped", label)      # readable by others
@@ -28,6 +28,7 @@ class ChargeAndShip(Job):
 |---|---|---|
 | `await self.step(name, fn, *a, **kw)` | `jorb_step` | `fn` runs **at least once**; once its checkpoint commits it never runs again |
 | `await self.transaction(name, fn, *a, **kw)` | `jorb_step` | **exactly once** for work `fn` does on the connection it is handed — that write and the checkpoint are one commit |
+| `timeout=` on either of those (or `step_timeout` on the class) | `jorb_step` | one step is bounded on its own; blowing the budget records a **timeout against that step** and retries the job |
 | `await self.sleep(seconds)` | `jorb_step` | the job resumes after the delay **without occupying a worker** |
 | `await self.set_event(key, value)` | `jorb_event` | a durable key/value another job or an operator can read |
 | `await self.send(job_id, msg)` / `await self.recv(topic)` | `jorb_mailbox` | a durable mailbox; each message is consumed exactly once |
@@ -170,6 +171,92 @@ for database work and get exactly-once for free.
 
 ---
 
+## Per-step timeouts
+
+`jorb.timeout_at` bounds the **job**. That is not enough for a job made of
+several steps: one slow step spends the whole budget, and when the job is
+finally timed out the row does not say which step hung. Both step primitives
+therefore take a budget of their own:
+
+```python
+class ChargeAndShip(Job):
+    step_timeout = 30                      # default for every step here
+
+    async def task(self, order_id: int) -> dict:
+        charge = await self.step("charge", self.charge_card, order_id, timeout=5)
+        label  = await self.step("label",  self.buy_label,   order_id)   # 30s
+        await self.transaction("record", self.write_row, order_id, timeout=2)
+```
+
+**Where it is declared.** A step's sensible budget is a property of the work,
+and the call is where that work is named — so `timeout=` on the call is the
+primary form. `step_timeout` on the class is the default behind it, for the
+common job where every step wants one number. Per-call wins, `timeout=0`
+disables the budget for that one call, and `None` (both defaults) means no
+per-step bound at all. `timeout` is consumed by the primitive rather than
+forwarded to `fn`, so a function that wants its own `timeout=` keyword must be
+bound to it first: `self.step("x", partial(fn, timeout=5), timeout=30)`.
+
+**What a blown budget does.** It raises `StepTimeoutError`, which is recorded
+as *that step's* error and then takes the **ordinary retry path** — the same
+one an exception from the step takes. The next attempt fast-forwards the
+completed prefix and re-executes only the step that hung, so retrying a
+timeout is as cheap as retrying any other step failure, and a step that keeps
+hanging exhausts `max_retries` and dead-letters exactly like one that keeps
+raising. There is no separate escalation policy to configure, and no way for
+one slow call to make a job permanently unrunnable on the first occurrence.
+
+**Reading it back.** The recorded error carries the exception type, as every
+recorded step error does, so a timeout is distinguishable from an ordinary
+failure by reading the row — and the tag comes first, so it survives the
+truncation `pj-admin jobs steps` applies:
+
+```
+Seq  Name    Epoch  Status  Duration  Error
+2    hang     1     error    0.301s   StepTimeoutError: step 'hang' exceeded...
+```
+
+Only the *budget* is reported that way. A `TimeoutError` a step raises on its
+own account — an inner `asyncio.timeout`, an HTTP client's deadline — is an
+ordinary failure: it is recorded as `TimeoutError`, not relabelled as a blown
+budget, and not reported as the job's timeout either (so the job's `on_timeout`
+policy is not applied to a deadline the operator never set).
+
+### How it composes with the job timeout
+
+> **The job's deadline is a ceiling, and only the tighter of the two bounds is
+> ever armed.** A per-step budget is installed only while it is strictly
+> tighter than the time the job has left. Once the job's own deadline is the
+> binding constraint, the step budget is not armed at all and the job timeout
+> fires alone.
+
+So per-step budgets *subdivide* the job's budget and never extend it; a step
+timeout cannot outlive the job's deadline; the job timeout still fires however
+the work is split into steps, reported as a job timeout with the job's
+`on_timeout` policy applied; and the two can never race to report one overrun
+as two different failures. A step that declares more time than the job has
+left logs a warning saying so.
+
+### What a timeout can and cannot interrupt
+
+A timeout is delivered as a **cancellation at an await point**.
+
+* An **async** `fn` is genuinely stopped: it is cancelled where it is
+  suspended, its `finally` blocks run, and the step then raises
+  `StepTimeoutError`. Inside `transaction()` the cancellation aborts whatever
+  statement is in flight, and the raise rolls the application write back on
+  the way out — the connection is left clean and idle, never mid-transaction.
+* A **synchronous** `fn` that blocks the event loop **cannot be interrupted by
+  anything**. It starves the very timer that would fire, so neither the step
+  budget nor the job's in-process deadline can touch it. It runs to
+  completion, and if it succeeded its result is recorded as a success — a step
+  whose work actually finished is not retroactively failed to enforce a bound
+  that was never enforceable. The overrun is logged. For long synchronous
+  loops the cooperative signal is `self.cancelled`, which the loop must poll
+  itself; only killing the process stops a blocking call.
+
+---
+
 ## How results are stored and reused
 
 `jorb_step.output` is `JSONB`, so **a step's return value must be
@@ -272,11 +359,14 @@ step the old attempts completed.
 7. **A failed step is re-executed**, not replayed.
 8. **`crashed` is terminal** — it *is* the dead letter queue.
 9. **A durable sleep holds no worker.**
+10. **A per-step budget never outlives the job's deadline**, and only the
+    tighter of the two is ever armed — a blown step budget is a step failure
+    on the ordinary retry path, not a job verdict.
 
 These are enforced by tests, not just asserted here: see
 `tests/test_dxe_primitives.py`, `tests/test_dxe_transactions.py`,
-`tests/test_dxe_faults.py`, `tests/test_dxe_concurrency.py`, and
-`tests/test_invariants.py`.
+`tests/test_dxe_step_timeouts.py`, `tests/test_dxe_faults.py`,
+`tests/test_dxe_concurrency.py`, and `tests/test_invariants.py`.
 
 The at-least-once/exactly-once distinction in particular is proved by fault
 injection rather than argued: `test_kill_between_the_write_and_the_checkpoint`

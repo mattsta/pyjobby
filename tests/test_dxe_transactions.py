@@ -626,6 +626,108 @@ async def test_transaction_does_not_leave_an_open_transaction_behind(
     assert await count_effects(db_pool, unique_queue, "boom") == 0
 
 
+async def test_a_timed_out_transaction_rolls_back_and_leaves_the_connection_clean(
+    prepared_worker, unique_queue, db_pool
+):
+    """A blown step budget must not strand the worker's connection.
+
+    The budget expires *inside* the transaction and while a query is really
+    in flight — the hardest case, because the cancellation has to abort a
+    running statement rather than an idle ``asyncio.sleep``. Everything after
+    that is on trial: the application write must roll back, no transaction
+    may be left open, and the connection must still work, since a stranded
+    transaction would silently swallow every subsequent statement of the
+    attempt. The error checkpoint is written afterwards, in its own
+    transaction, exactly like any other failed ``transaction()``.
+    """
+    await ensure_effects_table(db_pool)
+    job_id = await db_pool.fetchval(
+        """INSERT INTO jorb (job_class, queue, state, run_epoch)
+           VALUES ('tests.dxe_jobs.OkJob', $1, 'running', 1) RETURNING id""",
+        unique_queue,
+    )
+    backend = await prepared_worker.cxn.fetchval("SELECT pg_backend_pid()")
+
+    klass = Job(s=prepared_worker, job={"id": job_id, "run_epoch": 1})
+    klass._dxe_bind([], 1)
+
+    async def slow(conn) -> dict[str, bool]:
+        await record_effect(conn, unique_queue, job_id, "timed-out")
+        await conn.execute("SELECT pg_sleep(30)")  # cancelled mid-statement
+        return {"never": True}
+
+    with pytest.raises(dxe.StepTimeoutError) as blown:
+        await klass.transaction("slow", slow, timeout=0.3)
+    assert str(blown.value) == "step 'slow' exceeded its 0.3s timeout"
+    assert (blown.value.name, blown.value.timeout) == ("slow", 0.3)
+
+    # the application write went back with the rollback
+    assert await count_effects(db_pool, unique_queue, "timed-out") == 0
+    # nothing was left open, and the connection is still usable
+    assert prepared_worker.cxn.is_in_transaction() is False
+    assert (
+        await db_pool.fetchval(
+            "SELECT state FROM pg_stat_activity WHERE pid = $1", backend
+        )
+        == "idle"
+    )
+    assert await prepared_worker.cxn.fetchval("SELECT 42") == 42
+
+    # ...and the checkpoint that survived the rollback says it was a timeout
+    step = await db_pool.fetchrow("SELECT * FROM jorb_step WHERE job_id = $1", job_id)
+    assert (step["step_seq"], step["name"], step["output"], step["error"]) == (
+        1,
+        "slow",
+        None,
+        "StepTimeoutError: step 'slow' exceeded its 0.3s timeout",
+    )
+
+
+async def test_step_and_transaction_time_out_identically(
+    prepared_worker, unique_queue, db_pool
+):
+    """The budget must not drift between the two primitives.
+
+    Same budget, same shape of slow work, same recorded checkpoint and same
+    error — the structural half (one shared ``_dxe_invoke``) is asserted in
+    ``tests/test_dxe_step_timeouts.py``.
+    """
+    ids = [
+        await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, queue, state, run_epoch)
+               VALUES ('tests.dxe_jobs.OkJob', $1, 'running', 1) RETURNING id""",
+            unique_queue,
+        )
+        for _ in range(2)
+    ]
+
+    async def slow_step() -> None:
+        await asyncio.sleep(30)
+
+    async def slow_txn(conn) -> None:
+        await asyncio.sleep(30)
+
+    stepper = Job(s=prepared_worker, job={"id": ids[0], "run_epoch": 1})
+    stepper._dxe_bind([], 1)
+    with pytest.raises(dxe.StepTimeoutError) as from_step:
+        await stepper.step("slow", slow_step, timeout=0.3)
+
+    txn = Job(s=prepared_worker, job={"id": ids[1], "run_epoch": 1})
+    txn._dxe_bind([], 1)
+    with pytest.raises(dxe.StepTimeoutError) as from_txn:
+        await txn.transaction("slow", slow_txn, timeout=0.3)
+
+    assert str(from_txn.value) == str(from_step.value)
+    recorded = [
+        await db_pool.fetchval("SELECT error FROM jorb_step WHERE job_id = $1", job_id)
+        for job_id in ids
+    ]
+    assert recorded == [
+        "StepTimeoutError: step 'slow' exceeded its 0.3s timeout",
+        "StepTimeoutError: step 'slow' exceeded its 0.3s timeout",
+    ]
+
+
 async def test_asyncpg_nests_a_transaction_as_a_savepoint(prepared_worker):
     """The nesting assumption the docstring makes, verified against asyncpg.
 
