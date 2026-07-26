@@ -264,11 +264,33 @@ keeping up" is a survival question at this rate and nothing else answers it.
 ### The one caveat on capped queues
 
 `max_concurrency` and `rate_limit` are exact rather than approximate, which
-requires serializing claims for that queue through an advisory lock. The lock is
-non-blocking: a claimer that cannot take it reports nothing claimable and polls
-again. That is the right trade for a capped queue — a cap is a throughput limit
-by definition — but do not put a million-jobs-per-hour queue under a cap and
-expect uncapped throughput. Queues with no limits never take the lock at all.
+requires serialising claims for that queue through an advisory lock. Queues with
+no limits never take the lock at all and are unaffected by any of this.
+
+A capped queue runs at `1 / (critical section)`, and **no lock strategy changes
+that** — it is set by the serialised section itself. Do not put a
+million-jobs-per-hour queue under a cap and expect uncapped throughput; raising
+the ceiling would take claiming a *batch* per lock acquisition, which is a
+change to the one-job-at-a-time worker model, not a lock tweak.
+
+What the lock choice *does* decide is what happens to a claimer that loses it.
+The lock waits up to 50ms rather than failing instantly, and the reason is
+worth knowing because it is not the obvious one:
+
+A worker does not retry in a tight loop. It reads an empty claim as *"the queue
+is empty"* — so it publishes idle demand, which re-arms that queue's enqueue
+notifications for **every producer** (see [Why NOTIFY set the
+ceiling](#why-notify-set-the-ceiling)), and then parks for `checkInterval`, 5
+seconds by default, waiting for a wakeup nobody is going to send. Measured with
+4 real workers against a cap that could never bind: failing instantly left **1
+of 4 workers ever claiming anything**; waiting briefly left **4 of 4**.
+
+So losing the lock never cost a round trip. It cost a worker — and quietly
+undid the notification gating at the same time. Wasted claim round trips went
+from 87% to 2.3%.
+
+The wait stays bounded so a claim held open by a stuck transaction can still
+never freeze the queue, which is what the non-blocking version was protecting.
 
 ---
 
