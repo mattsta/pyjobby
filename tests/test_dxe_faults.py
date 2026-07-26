@@ -7,6 +7,9 @@ subjected to, so nothing here is simulated with mocks:
 * a real worker process group is SIGKILLed while a step is in flight (no
   signal handler runs, nothing deregisters, no terminal state is written);
 * a job is abandoned in 'claimed' with no registry reference at all;
+* the same worker is SIGKILLed in the window between a job's database write
+  and its checkpoint, once with ``step()`` and once with ``transaction()``,
+  which is where at-least-once and exactly-once actually come apart;
 * every epoch-fenced statement is fired at a superseded epoch, table-driven,
   with a positive control at the current epoch so a statement that simply
   stopped working could never pass.
@@ -39,6 +42,7 @@ from .utils.faults import (
     kill_backends,
     new_backends,
     record_effect,
+    record_effect_out_of_band,
     sigkill_group,
     write_worker_config,
 )
@@ -83,6 +87,53 @@ class ResumableEffectJob(Job):
             await asyncio.sleep(600)  # the killed attempt never gets past here
         await record_effect(self.s.cxn, tag, self.job["id"], "second")
         return {"stamp": "second-done"}
+
+
+class UncommittedTransactionJob(Job):
+    """A ``transaction()`` step killed between its write and its commit.
+
+    The write happens on the connection the primitive hands in, so it is
+    still uncommitted when the process dies: the recovery attempt must find
+    no trace of it and produce the effect EXACTLY once overall.
+
+    ``attempt`` is announced on a separate connection (committed
+    immediately) so the test can see that the write is staged and kill at
+    precisely that moment — and so a re-execution is countable even though
+    the transactional write it accompanies was rolled back.
+    """
+
+    async def task(self, tag: str) -> dict[str, str]:
+        result: dict[str, str] = await self.transaction("write", self._write, tag)
+        return result
+
+    async def _write(self, conn, tag: str) -> dict[str, str]:
+        await record_effect(conn, tag, self.job["id"], "write")
+        await record_effect_out_of_band(self.s.dsn, tag, self.job["id"], "attempt")
+        if self.job["run_epoch"] == 1:
+            await asyncio.sleep(600)  # killed here: the transaction never commits
+        return {"stamp": "written"}
+
+
+class AtLeastOnceWriteJob(Job):
+    """The SAME shape written with ``step()`` — the control for the contrast.
+
+    Here the write commits on its own (the worker connection is in
+    autocommit) and the checkpoint would commit afterwards, so a kill in
+    between leaves the effect behind and the recovery attempt performs it a
+    second time. That duplicate is not a bug in ``step()``; it is what
+    at-least-once means, and it is why ``transaction()`` exists.
+    """
+
+    async def task(self, tag: str) -> dict[str, str]:
+        result: dict[str, str] = await self.step("write", self._write, tag)
+        return result
+
+    async def _write(self, tag: str) -> dict[str, str]:
+        await record_effect(self.s.cxn, tag, self.job["id"], "write")
+        await record_effect_out_of_band(self.s.dsn, tag, self.job["id"], "attempt")
+        if self.job["run_epoch"] == 1:
+            await asyncio.sleep(600)  # killed here: the checkpoint never lands
+        return {"stamp": "written"}
 
 
 # ============================================================================
@@ -293,6 +344,121 @@ async def test_sigkilled_worker_is_reclaimed_and_resumes_from_its_checkpoint(
         "running",
         "finished",
     ]
+
+
+# ============================================================================
+# 10b. the window between the effect and the checkpoint: step vs transaction
+# ============================================================================
+
+#: (job class, effects visible right after the kill, effects when it is done).
+#: The two rows are the same fault injected into the same code shape, so the
+#: only thing that differs is the primitive — and with it, how many times the
+#: application write really happened. Pinning BOTH is what stops the two
+#: primitives being "simplified" back into one.
+KILL_WINDOW_CASES = (
+    pytest.param(
+        "tests.test_dxe_faults.UncommittedTransactionJob",
+        {"attempt": 1},  # the write is staged, invisible, and never commits
+        {"attempt": 2, "write": 1},  # exactly once across both attempts
+        id="transaction-is-exactly-once",
+    ),
+    pytest.param(
+        "tests.test_dxe_faults.AtLeastOnceWriteJob",
+        {"attempt": 1, "write": 1},  # the write already committed on its own
+        {"attempt": 2, "write": 2},  # ...so recovery performs it a second time
+        id="step-is-at-least-once",
+    ),
+)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("job_class,after_kill,at_the_end", KILL_WINDOW_CASES)
+async def test_kill_between_the_write_and_the_checkpoint(
+    live_worker,
+    unique_queue,
+    db_pool,
+    db_params,
+    tmp_path,
+    job_class,
+    after_kill,
+    at_the_end,
+):
+    """SIGKILL a real worker in the window this feature exists to close.
+
+    A ``pj`` process is hard-killed while the job's database write has
+    happened but its checkpoint has not. With ``step()`` the write is
+    already committed, so the recovery attempt redoes it — at-least-once.
+    With ``transaction()`` the write and the checkpoint are one commit that
+    never happened, so the recovery attempt is the only execution that
+    counts — exactly-once. The ledger counts what really executed; the
+    checkpoint table is not consulted for the claim.
+    """
+    await ensure_effects_table(db_pool)
+    config = write_worker_config(tmp_path, db_params)
+
+    job_id = await enqueue(db_pool, unique_queue, job_class, {"tag": unique_queue})
+
+    proc = spawn(
+        "pj",
+        "--config",
+        str(config),
+        "--queue",
+        unique_queue,
+        "--workers",
+        "1",
+        "--check-interval",
+        "1",
+    )
+    try:
+        # the out-of-band marker says the write is done and the checkpoint
+        # is not: this is the instant the whole feature is about
+        await wait_until(
+            lambda: db_pool.fetchval(
+                """SELECT 1 FROM jorb_test_effect
+                   WHERE tag = $1 AND label = 'attempt'""",
+                unique_queue,
+            ),
+            timeout=60,
+            what="the worker staged its write inside the target window",
+        )
+        assert sigkill_group(proc) == -9
+    finally:
+        terminate(proc)
+
+    # no checkpoint was recorded on either side of the contrast — the kill
+    # really landed in the window, rather than before or after it
+    assert (
+        await db_pool.fetchval(
+            "SELECT count(*) FROM jorb_step WHERE job_id = $1", job_id
+        )
+        == 0
+    )
+    assert await effect_counts(db_pool, unique_queue) == after_kill
+
+    orphan = await db_pool.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+    assert orphan["state"] == "running"
+    assert orphan["run_epoch"] == 1
+
+    # the monitor reclaims the orphan and a fresh worker runs it to the end
+    assert await age_worker_heartbeats(db_pool, unique_queue, 300) == "UPDATE 1"
+    assert await sweep_dead_workers(db_pool, liveness_grace_seconds=60) == 1
+
+    await live_worker()
+    row = await wait_for_job_state(db_pool, job_id, ("finished",), timeout=40)
+    assert row["result"] == {"stamp": "written"}
+    assert row["error_count"] == 0
+    assert row["run_epoch"] > orphan["run_epoch"]
+
+    assert await effect_counts(db_pool, unique_queue) == at_the_end
+    steps = await db_pool.fetch(
+        """SELECT step_seq, name, output, error, run_epoch FROM jorb_step
+           WHERE job_id = $1 ORDER BY step_seq""",
+        job_id,
+    )
+    assert [(s["step_seq"], s["name"], s["error"]) for s in steps] == [
+        (1, "write", None)
+    ]
+    assert steps[0]["run_epoch"] == row["run_epoch"]
 
 
 # ============================================================================

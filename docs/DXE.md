@@ -27,7 +27,7 @@ class ChargeAndShip(Job):
 | Primitive | Backing table | What it guarantees |
 |---|---|---|
 | `await self.step(name, fn, *a, **kw)` | `jorb_step` | `fn` runs **at least once**; once its checkpoint commits it never runs again |
-| `await self.transaction(name, fn, *a, **kw)` | `jorb_step` | **exactly once** — the effect and the checkpoint are one commit |
+| `await self.transaction(name, fn, *a, **kw)` | `jorb_step` | **exactly once** for work `fn` does on the connection it is handed — that write and the checkpoint are one commit |
 | `await self.sleep(seconds)` | `jorb_step` | the job resumes after the delay **without occupying a worker** |
 | `await self.set_event(key, value)` | `jorb_event` | a durable key/value another job or an operator can read |
 | `await self.send(job_id, msg)` / `await self.recv(topic)` | `jorb_mailbox` | a durable mailbox; each message is consumed exactly once |
@@ -129,16 +129,44 @@ There is no window: a crash before the commit leaves neither the charge nor the
 checkpoint, so the step runs again cleanly. A crash after it leaves both, so the
 step is skipped. Nothing in between exists.
 
+Everything else about the primitive is `step()` — the same `step_seq`, the same
+fast-forward of a completed checkpoint, the same re-execution of a recorded
+failure, the same `NondeterminismError` on a renamed step. Both call the same
+`_dxe_resume`, so the replay decision is one implementation rather than two
+that can drift.
+
 This also unifies exactly-once with fencing, rather than bolting them together.
 The checkpoint write is already epoch-fenced, so a **superseded** execution's
-checkpoint insert matches zero rows — which raises inside the transaction and
-rolls the application write back with it. A zombie worker cannot commit
-application data for a job another worker has taken over.
+checkpoint insert matches zero rows — which raises `StaleExecutionError` inside
+the transaction and rolls the application write back with it. A zombie worker
+cannot commit application data for a job another worker has taken over.
 
-The trade is that the function must do its work on the connection it is handed,
-and must not do anything it cannot roll back. Use `step()` for external effects
-and make them idempotent; use `transaction()` for database work and get
-exactly-once for free.
+**When `fn` raises**, the transaction is rolled back — the work *and* its
+checkpoint — and the error checkpoint is then written in a **separate**
+transaction. Observability that rolled back with the failure would be no
+observability at all, so `pj-admin jobs steps <id>` still shows which step
+failed and why, for work that left nothing else behind.
+
+The trade is real, and it is exactly as wide as the connection:
+
+* **`fn` must use the connection it is handed.** Anything it does on another
+  connection — a second pool, an HTTP call, a file — is outside the transaction
+  and is **not** rolled back with it. That work is at-least-once, exactly like
+  `step()`. This cannot be enforced (a function is free to ignore its argument);
+  it is documented, and pinned by a test.
+* `fn` must not commit, roll back, or close the connection.
+* If the worker's connection already holds a transaction, the inner one becomes
+  a savepoint: the write and the checkpoint still stand or fall together, they
+  just commit with the enclosing transaction.
+* Because the guarantee lives on one connection, the checkpoint inside a
+  transaction is written *without* the worker's transparent reconnect. A
+  reconnect there would commit the checkpoint on a new connection while the
+  server rolled the write back — a checkpoint for work that no longer exists.
+  Inside a transaction, a lost connection is an error, which fails the step and
+  leaves it to re-execute.
+
+Use `step()` for external effects and make them idempotent; use `transaction()`
+for database work and get exactly-once for free.
 
 ---
 
@@ -227,8 +255,12 @@ step the old attempts completed.
    sending mail, writing to another database. For those, `step()` is
    **at-least-once**, and the step should be made idempotent by the caller.
 
-   For work against *this* database, the window is closable: see
-   [Transactional steps](#transactional-steps).
+   For work against *this* database the window is closed, not merely narrow:
+   `transaction()` writes the effect and the checkpoint in one transaction on
+   one connection, so the pair commits or rolls back together and the step is
+   **exactly-once**. See [Transactional steps](#transactional-steps) — and note
+   that the guarantee covers only what `fn` does on the connection it is
+   handed.
 2. **A job keeps one row for its entire life.** Retries requeue it;
    `jorb_history` is the per-attempt audit trail.
 3. **`run_epoch` only increases**, and a write at a stale epoch is a no-op.
@@ -242,8 +274,15 @@ step the old attempts completed.
 9. **A durable sleep holds no worker.**
 
 These are enforced by tests, not just asserted here: see
-`tests/test_dxe_primitives.py`, `tests/test_dxe_faults.py`,
-`tests/test_dxe_concurrency.py`, and `tests/test_invariants.py`.
+`tests/test_dxe_primitives.py`, `tests/test_dxe_transactions.py`,
+`tests/test_dxe_faults.py`, `tests/test_dxe_concurrency.py`, and
+`tests/test_invariants.py`.
+
+The at-least-once/exactly-once distinction in particular is proved by fault
+injection rather than argued: `test_kill_between_the_write_and_the_checkpoint`
+SIGKILLs a real worker in that exact window, with `step()` and `transaction()`
+running the same code shape, and asserts that the effect happened **twice** for
+`step()` and **once** for `transaction()`.
 
 ---
 

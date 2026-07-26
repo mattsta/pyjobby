@@ -42,7 +42,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from multiprocessing import Process
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Final
 
 import asyncpg  # type: ignore[import-untyped]
 import click
@@ -903,6 +903,12 @@ class JobSystem:
                 )
 
 
+#: Returned by ``Job._dxe_resume`` when there is no usable checkpoint and
+#: the primitive must really execute. A sentinel rather than ``None``
+#: because ``None`` is a perfectly good recorded step output.
+_DXE_RUN: Final = object()
+
+
 @dataclass
 class Job:
     """Parent class of all jobs run by JobSystem.
@@ -913,6 +919,8 @@ class Job:
         await self.step("name", fn, *args)   # checkpointed: never re-runs
                                              # once succeeded, even across
                                              # retries and worker crashes
+        await self.transaction("name", fn)   # exactly-once: fn(conn) and
+                                             # its checkpoint are ONE commit
         await self.sleep(3600)               # durable sleep: survives
                                              # restarts, resumes past here
         await self.set_event("progress", {"pct": 50})   # publish to waiters
@@ -996,16 +1004,18 @@ class Job:
         from long sync loops; async code is cancelled at await points)."""
         return self.s._cancel_current
 
-    async def step(self, name: str, fn: Any, *args: Any, **kwargs: Any) -> Any:
-        """Execute ``fn(*args, **kwargs)`` as a durable, checkpointed step.
+    def _dxe_resume(self, name: str) -> tuple[int, Any]:
+        """Consume the next sequence number and make the replay decision.
 
-        On success the return value (must be JSON-serializable) is recorded;
-        any later attempt of this job returns the recorded value without
-        re-executing. On failure the error is recorded for observability
-        and the exception propagates into the job's normal retry path — the
-        next attempt fast-forwards every completed step and re-executes
-        only from the failure onward.
-        """
+        Returns ``(seq, output)``: *output* is the recorded result to hand
+        back **without executing**, or the ``_DXE_RUN`` sentinel when this
+        call has to really execute (no checkpoint, or a recorded failure —
+        a failed step is not a result). A name mismatch raises
+        NondeterminismError before anything runs.
+
+        Every checkpointed primitive that can execute user code goes
+        through here, so ``step()`` and ``transaction()`` cannot drift
+        apart in their replay behavior."""
         seq = self._dxe_next_seq()
         prior = self._dxe_steps.get(seq)
         if prior is not None:
@@ -1017,8 +1027,70 @@ class Job:
                 )
             if prior["error"] is None:
                 logger.debug(f"[job {self.job['id']}] step {seq} '{name}' replayed")
-                return prior["output"]
+                return seq, prior["output"]
             # recorded failure: fall through and re-execute this step
+        return seq, _DXE_RUN
+
+    async def _dxe_record(
+        self,
+        seq: int,
+        name: str,
+        output: Any,
+        error: str | None,
+        started: datetime.datetime,
+        atomic: bool = False,
+    ) -> None:
+        """Write this step's checkpoint, fenced on our run_epoch.
+
+        Runs on the worker's connection, so it joins whatever transaction
+        that connection currently holds — which is exactly what makes
+        ``transaction()`` atomic. Raises StaleExecutionError when the fence
+        rejects the write (a newer attempt owns the job).
+
+        ``atomic=True`` bypasses ``JobSystem.ex``: that wrapper transparently
+        reconnects on a lost connection, and a reconnect inside a
+        transaction would commit the checkpoint on a NEW connection while
+        the server rolled the application write back — a checkpoint for work
+        that no longer exists, which is the precise failure this primitive
+        exists to prevent. Inside a transaction the connection error must
+        propagate instead."""
+        args = (
+            self.job["id"],
+            seq,
+            name,
+            output,
+            error,
+            self._dxe_epoch,
+            started,
+        )
+        recorded = (
+            await self.s.stmts["record-step"].fetch(*args)
+            if atomic
+            else await self.s.ex("record-step", *args)
+        )
+        if not recorded:
+            raise dxe.StaleExecutionError(
+                f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
+            )
+
+    async def step(self, name: str, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        """Execute ``fn(*args, **kwargs)`` as a durable, checkpointed step.
+
+        On success the return value (must be JSON-serializable) is recorded;
+        any later attempt of this job returns the recorded value without
+        re-executing. On failure the error is recorded for observability
+        and the exception propagates into the job's normal retry path — the
+        next attempt fast-forwards every completed step and re-executes
+        only from the failure onward.
+
+        **At-least-once**: the effect and the checkpoint commit separately,
+        so a crash between them re-executes ``fn`` on the next attempt.
+        Make external effects idempotent — or, when the effect is a write to
+        *this* database, use ``transaction()`` and get exactly-once.
+        """
+        seq, replayed = self._dxe_resume(name)
+        if replayed is not _DXE_RUN:
+            return replayed
 
         started = db.utcnow()
         try:
@@ -1028,36 +1100,82 @@ class Job:
         except dxe.DXEError:
             raise
         except Exception as e:
-            recorded = await self.s.ex(
-                "record-step",
-                self.job["id"],
-                seq,
-                name,
-                None,
-                f"{type(e).__name__}: {e}",
-                self._dxe_epoch,
-                started,
-            )
-            if not recorded:
-                raise dxe.StaleExecutionError(
-                    f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
-                ) from e
+            try:
+                await self._dxe_record(
+                    seq, name, None, f"{type(e).__name__}: {e}", started
+                )
+            except dxe.StaleExecutionError as stale:
+                raise stale from e
             raise
 
-        recorded = await self.s.ex(
-            "record-step",
-            self.job["id"],
-            seq,
-            name,
-            result,
-            None,
-            self._dxe_epoch,
-            started,
-        )
-        if not recorded:
-            raise dxe.StaleExecutionError(
-                f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
-            )
+        await self._dxe_record(seq, name, result, None, started)
+        return result
+
+    async def transaction(self, name: str, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        """Execute ``fn(conn, *args, **kwargs)`` **exactly once**: the work
+        and its checkpoint commit or roll back together.
+
+        Identical to ``step()`` in every replay respect — same sequence
+        numbering, same fast-forward of a completed checkpoint, same
+        re-execution of a recorded failure, same NondeterminismError on a
+        name mismatch (they share ``_dxe_resume``). The difference is
+        atomicity: ``fn`` is handed the worker's own connection inside an
+        explicit transaction, and the checkpoint is written on that same
+        connection before the commit. There is no window between the effect
+        and the checkpoint for a crash to fall into.
+
+        The epoch fence and exactly-once are the same mechanism here: the
+        checkpoint insert is conditional on this execution still owning the
+        job, so a superseded attempt's checkpoint matches zero rows, raises
+        StaleExecutionError *inside* the transaction, and takes the
+        application write down with it. A zombie worker cannot commit
+        application data for a job another worker has taken over.
+
+        Failure path: when ``fn`` raises, the transaction (including the
+        checkpoint) is rolled back, and the error checkpoint is then
+        recorded in a **separate** transaction — observability must survive
+        the rollback that erased the work.
+
+        Caveats, because this guarantee is exactly as wide as the
+        connection it runs on:
+
+        * **Use the connection you are handed.** Anything ``fn`` does on a
+          different connection (another pool, an HTTP call, a file) is
+          outside the transaction and is *not* rolled back with it — that
+          work is at-least-once, exactly like ``step()``. This cannot be
+          prevented, only documented: the connection is passed in, so a
+          function that ignores it silently loses the guarantee.
+        * Do not commit, roll back, or close the connection inside ``fn``.
+        * If the worker's connection already holds a transaction, asyncpg
+          opens a savepoint instead; the write and the checkpoint still
+          stand or fall together, they just commit with the enclosing
+          transaction.
+        """
+        seq, replayed = self._dxe_resume(name)
+        if replayed is not _DXE_RUN:
+            return replayed
+
+        started = db.utcnow()
+        try:
+            async with self.s.cxn.transaction():  # type: ignore[union-attr]
+                result = fn(self.s.cxn, *args, **kwargs)
+                if asyncio.iscoroutine(result):
+                    result = await result
+                # inside the transaction: a fenced-out checkpoint raises,
+                # and the rollback undoes the application write with it
+                await self._dxe_record(seq, name, result, None, started, atomic=True)
+        except dxe.DXEError:
+            raise
+        except Exception as e:
+            # the application transaction has rolled back, so the error
+            # checkpoint needs a transaction of its own to survive
+            try:
+                await self._dxe_record(
+                    seq, name, None, f"{type(e).__name__}: {e}", started
+                )
+            except dxe.StaleExecutionError as stale:
+                raise stale from e
+            raise
         return result
 
     async def sleep(self, seconds: float) -> None:

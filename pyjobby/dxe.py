@@ -14,6 +14,12 @@ Execution model:
   recorded step errors: a recorded error is observability, not destiny.)
 * Checkpoint writes are fenced on ``jorb.run_epoch``: a stale execution
   (superseded by the monitor or an operator requeue) cannot record steps.
+* ``await self.transaction(...)`` runs its function on the worker's own
+  connection inside one transaction and records the checkpoint there too,
+  so the application write and the checkpoint commit or roll back together
+  (**exactly-once** for work on that connection). The fence is what makes
+  the rollback happen: a superseded execution's checkpoint matches zero
+  rows, raises inside the transaction, and takes the write with it.
 * A **name mismatch** at a sequence number means the job code took a
   different path than the attempt that recorded the checkpoint —
   nondeterminism the author must fix (usually branching on non-checkpointed
@@ -61,6 +67,11 @@ LOAD_STEPS_SQL = """SELECT step_seq, name, output, error
 # Success and failure both record the attempt; only rows with error IS NULL
 # fast-forward on replay. Fenced: the insert-select no-ops unless our epoch
 # still owns the job.
+#
+# The fence is also what makes ``transaction()`` atomic: run inside the
+# caller's transaction, "wrote nothing" means "superseded", the raise rolls
+# that transaction back, and the application write goes with it. Exactly-once
+# and fencing are therefore one mechanism, not two.
 RECORD_STEP_SQL = """INSERT INTO jorb_step
             (job_id, step_seq, name, output, error, run_epoch, started, finished)
         SELECT $1, $2, $3, $4, $5, $6, $7, now()

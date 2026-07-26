@@ -74,6 +74,28 @@ async def record_effect(
     return effect_id
 
 
+async def record_effect_out_of_band(
+    dsn: dict[str, Any], tag: str, job_id: int, label: str
+) -> int:
+    """Append an execution on a SEPARATE connection, committed immediately.
+
+    Two jobs at once, both needed by the ``transaction()`` suites:
+
+    * it is **visible to the test** while the job's own transaction is still
+      open, which is the only way to know that a transactional write has
+      been staged but not yet committed — the exact instant to inject a
+      crash into;
+    * it is deliberately **outside** that transaction, so it demonstrates
+      the documented limit of ``transaction()``: work done on another
+      connection is not rolled back with it.
+    """
+    conn = await asyncpg.connect(**dsn)
+    try:
+        return await record_effect(conn, tag, job_id, label)
+    finally:
+        await conn.close()
+
+
 async def count_effects(
     conn: asyncpg.Connection | asyncpg.Pool, tag: str, label: str | None = None
 ) -> int:
