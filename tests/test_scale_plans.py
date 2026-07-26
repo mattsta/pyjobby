@@ -18,11 +18,17 @@ dropped. A plan is a fact.
 from __future__ import annotations
 
 import datetime
-import re
 
 import pytest
 
 from pyjobby.monitor import SWEEP_CHECKPOINT_JOBS_SQL, TERMINAL_STATES
+from tests.utils.plans import (
+    assert_reads_far_less_than_a_scan,
+    plan_for,
+    reset_job_tables,
+    rows_removed_by_filter,
+    settle,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -42,6 +48,7 @@ async def seed_terminal_jobs(pool, queue: str, rows: int = ROWS) -> None:
     rather than the whole table -- a scan IS the right plan when the window
     matches everything, and a test that seeds it that way proves nothing.
     """
+    await reset_job_tables(pool)
     await pool.execute(
         """
         INSERT INTO jorb (job_class, kwargs, queue, state, created, finished, updated)
@@ -55,66 +62,7 @@ async def seed_terminal_jobs(pool, queue: str, rows: int = ROWS) -> None:
         queue,
         rows,
     )
-    await pool.execute("ANALYZE jorb")
-
-
-async def plan_for(pool, sql: str, *args) -> str:
-    rows = await pool.fetch(f"EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) {sql}", *args)
-    return "\n".join(r["QUERY PLAN"] for r in rows)
-
-
-_REMOVED_RE = re.compile(r"Rows Removed by (?:Filter|Index Recheck): (\d+)")
-_BUFFERS_RE = re.compile(r"shared hit=(\d+)(?: read=(\d+))?")
-
-
-def rows_removed_by_filter(plan: str) -> int:
-    """Every row the plan read and then threw away.
-
-    The number that catches an index scan doing a table's worth of work: it
-    is not a Seq Scan, so a seq-scan assertion passes it, and it costs the
-    same. Summed across nodes because the discard can happen at any of them.
-    """
-    return sum(int(m.group(1)) for m in _REMOVED_RE.finditer(plan))
-
-
-def buffers_in(plan: str) -> int:
-    """Buffers the whole statement touched, from the root node's line.
-
-    EXPLAIN reports buffers cumulatively up the tree, so summing every node
-    counts each child once per ancestor.
-    """
-    match = _BUFFERS_RE.search(plan)
-    if not match:
-        return 0
-    return int(match.group(1)) + int(match.group(2) or 0)
-
-
-async def heap_pages(pool, table: str = "jorb") -> int:
-    """How many pages a sequential scan of `table` would have to read."""
-    pages: int = await pool.fetchval(
-        "SELECT (pg_relation_size($1::regclass) / current_setting("
-        "'block_size')::bigint)::bigint",
-        table,
-    )
-    return max(pages, 1)
-
-
-async def assert_reads_far_less_than_a_scan(pool, plan: str, table: str = "jorb"):
-    """The probe touched a small fraction of what reading the table costs.
-
-    Calibrated against the table's CURRENT size rather than a fixed number.
-    An absolute threshold looks precise and is not: dead tuples inflate both
-    the heap and the index, so the same correct plan touches more buffers on
-    a well-used database than a fresh one. A gate that passes only after
-    VACUUM FULL is a gate nobody can trust, and the first flake teaches
-    everyone to ignore it.
-    """
-    pages = await heap_pages(pool, table)
-    touched = buffers_in(plan)
-    assert touched * 10 < pages, (
-        f"touched {touched} buffers against a {pages}-page {table}: "
-        f"that is not a probe, that is a scan wearing an index\n{plan}"
-    )
+    await settle(pool)
 
 
 class TestRetentionScanPlan:
@@ -215,7 +163,7 @@ class TestCheckpointSweepPlan:
             self.STEP_EVERY,
             self.STEPS_PER_JOB,
         )
-        await pool.execute("ANALYZE jorb")
+        await settle(pool)
         await pool.execute("ANALYZE jorb_step")
 
     async def explain_sweep(self, pool, retention_days: float) -> str:

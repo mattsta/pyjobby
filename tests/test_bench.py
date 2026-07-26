@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 import traceback
 
 import asyncpg
@@ -29,7 +31,7 @@ import pytest
 from click.testing import CliRunner
 
 from pyjobby import bench
-from tests.utils.processes import dsn_from
+from tests.utils.processes import dsn_from, spawn, terminate, wait_until
 
 #: Enough rows that the planner has a real choice. Below this a sequential
 #: scan is the genuinely correct plan and the gate would pass for the wrong
@@ -40,7 +42,6 @@ TRIGGERS = (
     bench.TRIGGER_ENQUEUED,
     bench.TRIGGER_DONE,
     bench.TRIGGER_CANCEL,
-    bench.TRIGGER_FIREHOSE,
     bench.TRIGGER_HISTORY,
 )
 
@@ -142,8 +143,28 @@ class TestSubcommandsEmitDocumentedJson:
         assert production["all_notify_off"]["jobs_per_second"] > 0
         lock = payload["notify_commit_lock"]
         assert lock["ratio"] is not None
-        assert lock["firehose_only_recovery_pct"] is not None
+        assert lock["wakeup_only_recovery_pct"] is not None
+        # Every variant must name only triggers that exist. A variant naming
+        # a deleted trigger fails the whole run inside ALTER TABLE, which is
+        # how `pj-bench enqueue --allow-trigger-toggle` broke when
+        # job_state_change_notify was removed from the schema.
+        assert "firehose_off" not in production
+        assert "firehose_and_history_off" not in production
         assert payload["cleanup"]["jobs_deleted"] >= 0
+
+    async def test_every_toggled_trigger_still_exists_in_the_schema(self, db_pool):
+        """The variants are only meaningful if their triggers are real.
+
+        `ALTER TABLE ... DISABLE TRIGGER` on a name that is not there is an
+        error, so a stale entry in ENQUEUE_VARIANTS does not degrade the
+        report — it takes the subcommand down with it.
+        """
+        live = set(await trigger_states(db_pool))
+
+        named = {t for _, triggers in bench.ENQUEUE_VARIANTS for t in triggers}
+
+        assert named <= live, named - live
+        assert set(bench.NOTIFY_TRIGGERS) <= live
 
     async def test_enqueue_refuses_trigger_toggling_by_default(self, db_params):
         """The dangerous variants must be opt-in, and say so rather than
@@ -201,19 +222,89 @@ class TestSubcommandsEmitDocumentedJson:
 
         assert code == 0
         assert payload["benchmark"] == "notify"
-        # the whole point of the subcommand: five per lifecycle, and the
-        # breakdown that says which three are the dashboard firehose
-        assert payload["per_lifecycle"] == 5.0
-        assert payload["per_channel"]["jorb_enqueued"] == 5
-        assert payload["per_channel"]["jorb_done"] == 5
-        assert payload["per_channel"]["job_state_change"] == 15
-        assert payload["history_rows_per_lifecycle"] == 4.0
-        assert payload["scale_md"]["agrees"] is True
-        assert payload["scale_md"]["history_agrees"] is True
-        assert payload["projected_notifications_per_second"] == pytest.approx(
-            5 * bench.SCALE_TARGET_RATE
+
+        # The arithmetic is asserted as the harness being RIGHT, not as a
+        # fixed count: how many notifications a lifecycle emits is a property
+        # of the schema, and a test that pinned it would fail on an
+        # improvement and be silently "fixed" by editing the number, which is
+        # how a benchmark stops meaning anything. What must never move is
+        # that the reported figure is the count that arrived.
+        lifecycles = payload["lifecycles"]
+        assert lifecycles == 5
+        assert set(payload["phases"]) == {"unobserved", "observed"}
+        for phase in payload["phases"].values():
+            assert phase["total"] == sum(phase["per_channel"].values())
+            assert phase["per_lifecycle"] == phase["total"] / lifecycles
+            assert phase["projected_notifications_per_second"] == pytest.approx(
+                phase["per_lifecycle"] * bench.SCALE_TARGET_RATE
+            )
+            # every channel it counted is one the schema can actually emit on
+            assert set(phase["per_channel"]) == set(bench.NOTIFY_CHANNELS)
+
+        # There is no unqualified "per_lifecycle": the number's meaning
+        # depends on who was watching, so the key has to say which.
+        assert "per_lifecycle" not in payload
+        assert (
+            payload["per_lifecycle_unobserved"]
+            == (payload["phases"]["unobserved"]["per_lifecycle"])
         )
+        assert (
+            payload["per_lifecycle_observed"]
+            == (payload["phases"]["observed"]["per_lifecycle"])
+        )
+
+        # The demand gate, measured rather than asserted from the schema: an
+        # unobserved lifecycle costs strictly less than a watched one, and
+        # the difference is what the gate saves.
+        assert payload["per_lifecycle_unobserved"] < payload["per_lifecycle_observed"]
+        assert payload["demand_gate_saves_per_lifecycle"] == (
+            payload["per_lifecycle_observed"] - payload["per_lifecycle_unobserved"]
+        )
+
+        # The claims, re-derived after job_state_change was deleted: zero for
+        # a job nobody is watching (every remaining channel is gated), two
+        # for a watched one (the jorb_enqueued wakeup and the jorb_done
+        # completion signal, and nothing else).
+        claims = payload["scale_md"]
+        assert claims["claimed_unobserved"] == 0
+        assert claims["claimed_observed"] == 2
+        assert claims["unobserved_agrees"] == (payload["per_lifecycle_unobserved"] == 0)
+        assert claims["observed_agrees"] == (payload["per_lifecycle_observed"] == 2)
+        assert claims["agrees"] == (
+            claims["unobserved_agrees"] and claims["observed_agrees"]
+        )
+
+        # Structural rather than tunable: history records all four row
+        # writes, and the queue-usage reading is a fraction.
+        assert payload["history_rows_per_lifecycle"] == 4.0
+        assert claims["history_agrees"] is True
         assert 0.0 <= payload["notify_queue_usage"]["after"] <= 1.0
+
+    async def test_notify_counts_only_channels_the_schema_emits_on(self, db_pool):
+        """LISTENing on a dead channel is not harmless.
+
+        PostgreSQL accepts LISTEN on any name, so a stale entry in
+        NOTIFY_CHANNELS does not raise -- it reports a confident 0 for a
+        channel that cannot exist, which is exactly how `pj-bench notify`
+        kept counting job_state_change after it was deleted.
+        """
+        emitted = {
+            r["channel"]
+            for r in await db_pool.fetch(
+                r"""
+                SELECT DISTINCT
+                       (regexp_match(pg_get_triggerdef(t.oid),
+                                     $re$jorb_notify\('([a-z_]+)'$re$))[1]
+                           AS channel
+                  FROM pg_trigger t
+                  JOIN pg_proc p ON p.oid = t.tgfoid
+                 WHERE p.proname = 'jorb_notify' AND NOT t.tgisinternal
+                """
+            )
+        }
+
+        assert emitted, "no jorb_notify triggers found; the query is wrong"
+        assert set(bench.NOTIFY_CHANNELS) == emitted
 
     async def test_e2e(self, db_params):
         code, payload, _ = await run_bench(
@@ -299,7 +390,8 @@ class TestSubcommandsEmitDocumentedJson:
         assert code == 0, payload
         assert set(payload) >= {"enqueue", "claim", "e2e", "notify", "plans", "healthy"}
         assert payload["healthy"] is True
-        assert payload["notify"]["per_lifecycle"] == 5.0
+        assert payload["notify"]["per_lifecycle_observed"] > 0
+        assert payload["notify"]["per_lifecycle_unobserved"] == 0
 
 
 class TestPlansGate:
@@ -404,6 +496,89 @@ class TestTriggerRestoration:
         assert all(state == "O" for state in (await trigger_states(db_pool)).values())
         # nothing left for the atexit hook to rescue
         assert bench._PENDING_RESTORE == []
+
+    async def test_triggers_are_restored_after_ctrl_c(self, db_params, db_pool):
+        """SIGINT a REAL pj-bench process while a trigger is disabled.
+
+        The in-process failure test above cannot reach this path: Ctrl-C
+        unwinds through a cancelled event loop, where the ``finally``'s own
+        awaits raise immediately, so the restore has to come from the atexit
+        hook opening a fresh connection. That is the difference between "the
+        benchmark crashed" and "the install stopped recording history until
+        someone noticed", so it is worth a real process to prove.
+        """
+        before = await trigger_states(db_pool)
+
+        proc = spawn(
+            "pj-bench",
+            "--dsn",
+            dsn_from(db_params),
+            "enqueue",
+            "--concurrency",
+            "4",
+            "--jobs-per-connection",
+            "4000",
+            "--rows",
+            "2000",
+            "--repeat",
+            "1",
+            "--no-warmup",
+            "--allow-trigger-toggle",
+        )
+        try:
+            # interrupt only once something is actually disabled, rather
+            # than after a sleep that could land anywhere
+            disabled = await wait_until(
+                lambda: _disabled_triggers(db_pool),
+                timeout=60,
+                interval=0.02,
+                what="a jorb trigger being disabled",
+            )
+            assert set(disabled) <= set(TRIGGERS), disabled
+            os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+            proc.wait(timeout=30)
+        finally:
+            terminate(proc)
+
+        assert proc.returncode != 0
+        assert await trigger_states(db_pool) == before
+
+    async def test_the_rescue_path_re_enables_on_a_fresh_connection(
+        self, db_params, db_pool
+    ):
+        """The last-resort restore, exercised on its own.
+
+        It has to work from a connection the run no longer owns, which is
+        the case the in-band ``finally`` cannot cover — a benchmark whose
+        connection died with a trigger disabled. It also must NOT be left to
+        an atexit hook: by then ``concurrent.futures`` has shut down and the
+        ``asyncio.run`` this needs raises "cannot schedule new futures after
+        interpreter shutdown", which is exactly how a disabled trigger
+        survives a benchmark.
+        """
+        dsn = dsn_from(db_params)
+        before = await trigger_states(db_pool)
+        await db_pool.execute(
+            f"ALTER TABLE jorb DISABLE TRIGGER {bench.TRIGGER_HISTORY}"
+        )
+        assert await _disabled_triggers(db_pool) == [bench.TRIGGER_HISTORY]
+
+        bench._PENDING_RESTORE.append((dsn, (bench.TRIGGER_HISTORY,)))
+        try:
+            await asyncio.to_thread(bench._restore_pending_triggers)
+        finally:
+            bench._PENDING_RESTORE.clear()
+            await db_pool.execute(
+                f"ALTER TABLE jorb ENABLE TRIGGER {bench.TRIGGER_HISTORY}"
+            )
+
+        assert await trigger_states(db_pool) == before
+        assert bench._PENDING_RESTORE == []
+
+
+async def _disabled_triggers(pool: asyncpg.Pool) -> list[str]:
+    states = await trigger_states(pool)
+    return [name for name, state in states.items() if state != "O"]
 
 
 class TestCleanup:
@@ -552,7 +727,10 @@ class TestBusyDatabaseGuard:
 
         assert code == 0
         assert payload["guard"]["existing_jobs"] == 5
-        assert payload["per_lifecycle"] == 5.0
+        # The observed phase is the one that must have produced traffic: an
+        # unobserved lifecycle legitimately emits nothing, so asserting on it
+        # would only prove the run happened, not that it measured anything.
+        assert payload["per_lifecycle_observed"] > 0
         assert await db_pool.fetchval("SELECT count(*) FROM jorb") == 5
 
 

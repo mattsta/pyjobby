@@ -36,6 +36,7 @@ from pyjobby.cli import (
     notify_queue_verdict,
 )
 from pyjobby.web_admin import PROM_RATE_WINDOW_SECONDS, WebAdminServer
+from tests.utils.plans import reset_job_tables
 
 pytestmark = pytest.mark.asyncio
 
@@ -891,6 +892,7 @@ async def seed_for_plans(pool, rows: int = PLAN_ROWS) -> None:
     Timestamps are spread over 60 days so a reporting window covers a real
     slice rather than everything.
     """
+    await reset_job_tables(pool)
     await pool.execute(
         """
         INSERT INTO jorb (job_class, kwargs, queue, state, run_count,

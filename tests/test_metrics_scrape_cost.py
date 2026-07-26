@@ -43,6 +43,7 @@ from pyjobby.web_admin import (
     PROM_SQL_TERMINAL_RECENT,
     WebAdminServer,
 )
+from tests.utils.plans import reset_job_tables
 
 pytestmark = pytest.mark.asyncio
 
@@ -78,6 +79,7 @@ async def seed_for_plans(pool, rows: int = PLAN_ROWS) -> None:
     here, against ~4 in production, which only makes these tests kinder to
     the plans they are trying to catch.
     """
+    await reset_job_tables(pool)
     await pool.execute(
         """
         INSERT INTO jorb (job_class, kwargs, queue, state, run_count,

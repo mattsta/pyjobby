@@ -75,9 +75,31 @@ PROM_RATE_WINDOW_SECONDS = 300
 # straight back into a sequential scan. Each arm is its own index:
 # jorb_claim_idx (index-only: queue is its leading column), jorb_inflight_idx,
 # and jorb_waitfor_*_idx.
+#
+# WHY THE QUEUED ARM IS SPLIT IN TWO. A bare `state = 'queued'` predicate
+# gives the planner a FILTER but no index CONDITION, so whether it is
+# answered index-only or by reading the heap depends on the visibility map,
+# which depends on when autovacuum last ran. That is not a plan, it is a coin
+# flip, and it flipped: the same statement measured as an index-only scan on
+# one run and as a full sequential scan of jorb on the next. Splitting on
+# `run_after <= now()` gives BOTH halves a real index condition against
+# jorb_claim_idx (queue, prio, run_after), so neither half can degrade.
+#
+# The split is also the more useful question, and it is exactly the one
+# websocket_server.SNAPSHOT_SQL's first two arms already ask -- same
+# predicates, same emitted state names, so the dashboard and the scrape
+# cannot disagree about what "queued" means:
+#
+#   state="queued"     claimable RIGHT NOW. The number an operator pages on.
+#   state="scheduled"  deliberately parked in the future (retry backoff,
+#                      enqueue-at). Not a backlog, and it used to be counted
+#                      as one.
 PROM_SQL_LIVE_STATES = """
     SELECT queue, 'queued' AS state, COUNT(*) AS n
-      FROM jorb WHERE state = 'queued' GROUP BY queue
+      FROM jorb WHERE state = 'queued' AND run_after <= now() GROUP BY queue
+    UNION ALL
+    SELECT queue, 'scheduled', COUNT(*)
+      FROM jorb WHERE state = 'queued' AND run_after > now() GROUP BY queue
     UNION ALL
     SELECT queue, state::text, COUNT(*)
       FROM jorb WHERE state IN ('claimed', 'running')
@@ -699,11 +721,16 @@ class WebAdminServer:
             live = await conn.fetch(PROM_SQL_LIVE_STATES)
             lines.append(
                 "# HELP pyjobby_jobs_by_state Jobs per queue currently in a "
-                "LIVE state (queued, claimed, running, waiting). Terminal "
-                "states are NOT reported here: their count is every job the "
-                "installation has ever run and not yet aged out, which no "
-                "index can bound and no scrape can afford -- see "
-                "pyjobby_jobs_terminal_recent for terminal outcomes."
+                "LIVE state. The queued state is reported SPLIT: "
+                'state="queued" is work claimable right now (run_after '
+                'already due) and state="scheduled" is work parked for the '
+                "future (retry backoff, enqueue-at) -- so queued means "
+                "backlog rather than backlog plus everything deferred. The "
+                'rest are state="claimed", "running" and "waiting". '
+                "Terminal states are NOT reported here: their count is "
+                "every job the installation has ever run and not yet aged "
+                "out, which no index can bound and no scrape can afford -- "
+                "see pyjobby_jobs_terminal_recent for terminal outcomes."
             )
             lines.append("# TYPE pyjobby_jobs_by_state gauge")
             for r in live:

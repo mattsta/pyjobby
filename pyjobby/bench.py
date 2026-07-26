@@ -101,7 +101,12 @@ from .cli import (
     print_warning,
 )
 from .configloader import load_config_from_file
-from .monitor import TERMINAL_STATES
+from .monitor import (
+    SWEEP_CHECKPOINT_JOBS_SQL,
+    SWEEP_EXPIRED_JOBS_SQL,
+    SWEEP_MAILBOX_SQL,
+    TERMINAL_STATES,
+)
 from .pj import Job
 
 DEFAULT_CONFIG = "./pyjobby.conf.py"
@@ -111,7 +116,32 @@ SCALE_TARGET_RATE = 278.0
 
 #: docs/SCALE.md's claims, carried here so a run can say "agrees" or
 #: "DISAGREES" instead of leaving the reader to diff two documents.
-SCALE_CLAIM_NOTIFICATIONS_PER_LIFECYCLE = 5
+#: DISAGREES is not automatically a bug in the platform — a schema that
+#: gates notifications on demand legitimately emits fewer for a job nobody
+#: is waiting for, and then it is docs/SCALE.md that is stale. The harness's
+#: job is to say which number is true today, not which one ought to be.
+#:
+#: "Notifications per lifecycle" HAS TWO ANSWERS NOW, and the gap between
+#: them is the feature rather than an inconsistency. Every remaining channel
+#: is gated on demand, so:
+#:
+#:   unobserved  0 — nothing parked on the queue, nothing awaiting a result.
+#:                   The insert's wakeup is gated on an idle worker
+#:                   (jorb_enqueued/idle_worker), the terminal transition's
+#:                   signal on jorb.awaited (jorb_done/row_local), and the
+#:                   claimed/running transitions have no channel at all since
+#:                   job_state_change was deleted. Nobody is asking, so
+#:                   nothing is sent — and nothing pays the commit lock.
+#:   observed    2 — one jorb_enqueued when a worker is parked on the queue,
+#:                   one jorb_done when a wait_for_result()-style caller has
+#:                   set jorb.awaited. That is the ceiling for a plain job:
+#:                   the two load-bearing wakeups, and nothing else.
+#:
+#: The old claim of 5 was wrong twice over: it counted three job_state_change
+#: transitions on a channel that no longer exists, and it counted the other
+#: two unconditionally on channels that now only fire on demand.
+SCALE_CLAIM_NOTIFICATIONS_UNOBSERVED = 0
+SCALE_CLAIM_NOTIFICATIONS_OBSERVED = 2
 SCALE_CLAIM_HISTORY_ROWS_PER_LIFECYCLE = 4
 SCALE_CLAIM_ROW_WRITES_PER_LIFECYCLE = 4
 
@@ -124,7 +154,9 @@ DEFAULT_MAX_EXISTING_JOBS = 1000
 BENCH_JOB_CLASS = "pyjobby.bench.BenchJob"
 
 #: Triggers on ``jorb``, by the role docs/SCALE.md discusses them in.
-TRIGGER_FIREHOSE = "job_state_change_notify"
+#: ``job_state_change_notify`` used to be here. It is not "disabled" or
+#: "deprecated": the trigger and its channel were DELETED from the schema,
+#: so naming it would make every variant below fail on a missing trigger.
 TRIGGER_HISTORY = "jorb_history_record"
 TRIGGER_ENQUEUED = "jorb_enqueued_notify"
 TRIGGER_DONE = "jorb_done_notify"
@@ -134,17 +166,21 @@ TRIGGER_CANCEL = "jorb_cancel_notify"
 #: the upper bound for enqueue: the cost of the commit lock is paid once per
 #: transaction that notifies at all, so the interesting comparison is
 #: "notifies" versus "does not", not "notifies three times" versus "once".
-NOTIFY_TRIGGERS = (TRIGGER_ENQUEUED, TRIGGER_DONE, TRIGGER_CANCEL, TRIGGER_FIREHOSE)
+NOTIFY_TRIGGERS = (TRIGGER_ENQUEUED, TRIGGER_DONE, TRIGGER_CANCEL)
 
 #: Every channel the schema can emit on, so ``pj-bench notify`` counts what
-#: is actually sent rather than what it expected to be sent.
+#: is actually sent rather than what it expected to be sent. Two names that
+#: used to be here are gone from the schema entirely, and LISTENing on a
+#: dead channel is not harmless — PostgreSQL accepts any name, so the tool
+#: would sit there reporting a confident 0 for a channel that cannot exist:
+#:
+#:   job_state_change  deleted; the dashboard polls aggregates instead.
+#:   jorb_mailbox      deleted; Job.recv() polls jorb_mailbox directly.
 NOTIFY_CHANNELS = (
     "jorb_enqueued",
     "jorb_done",
     "jorb_cancel",
     "jorb_event",
-    "jorb_mailbox",
-    "job_state_change",
     "schedule_executed",
 )
 
@@ -339,6 +375,8 @@ async def cleanup_queue(conn: asyncpg.Connection, queue: str) -> dict[str, int]:
     registry rows the real processes ``pj-bench e2e`` starts register — are
     both keyed by queue name, so they are removed by the same predicate and
     no row belonging to anything else is ever in range.
+
+    Cleanup is page-accurate, not just row-accurate: see the VACUUM below.
     """
     jobs = int(await conn.fetchval("SELECT count(*) FROM jorb WHERE queue = $1", queue))
     workers = int(
@@ -347,6 +385,21 @@ async def cleanup_queue(conn: asyncpg.Connection, queue: str) -> dict[str, int]:
     await conn.execute("DELETE FROM jorb WHERE queue = $1", queue)
     await conn.execute("DELETE FROM jorb_queue WHERE name = $1", queue)
     await conn.execute("DELETE FROM jorb_worker WHERE queue = $1", queue)
+
+    # Deleting the rows is not the whole cleanup, because a deleted row is not
+    # a gone row: it leaves a dead tuple and an unset visibility-map bit. A
+    # benchmark churns hundreds of thousands of them, which measurably changes
+    # how the planner costs OTHER queries on the same database -- enough to
+    # turn index-only scans into heap access and fail plan assertions in tests
+    # that never ran a benchmark. A tool that silently degrades everything
+    # sharing its database is not usable infrastructure.
+    #
+    # Plain VACUUM, never FULL: this resets the visibility map and statistics
+    # without taking an exclusive lock, so it is safe even on a live table.
+    # It does not return pages to the operating system; it makes them reusable,
+    # which is what the planner cares about.
+    await conn.execute("VACUUM (ANALYZE) jorb")
+    await conn.execute("VACUUM (ANALYZE) jorb_history")
     return {"jobs_deleted": jobs, "workers_deleted": workers}
 
 
@@ -438,10 +491,11 @@ async def repeat_timed(
 # Trigger toggling — the one genuinely dangerous thing in here
 # =========================================================================
 
-#: Triggers disabled right now that have not been re-enabled yet. The
-#: atexit hook below is the last line of defense: a benchmark that leaves
-#: jorb_history_record or jorb_enqueued_notify disabled silently breaks the
-#: audit trail or every worker wakeup in the install.
+#: Triggers disabled right now that have not been re-enabled yet. A
+#: benchmark that leaves jorb_history_record or jorb_enqueued_notify
+#: disabled silently breaks the audit trail or every worker wakeup in the
+#: install, so this list is drained from three places (see run_command and
+#: TriggerToggle) rather than one.
 _PENDING_RESTORE: list[tuple[str, tuple[str, ...]]] = []
 _ATEXIT_REGISTERED = False
 
@@ -464,11 +518,13 @@ async def _restore_via_new_connection(dsn: str, triggers: tuple[str, ...]) -> No
 
 
 def _restore_pending_triggers() -> None:
-    """Last-resort re-enable, running at interpreter exit.
+    """Re-enable anything ``TriggerToggle``'s own ``finally`` could not.
 
-    Reached when the normal ``finally`` could not run its statements — a
-    cancelled event loop after Ctrl-C, or a connection that died mid-run —
-    so it opens a fresh connection on a fresh loop.
+    Reached when the in-band restore failed — a connection that died
+    mid-run, or an event loop torn down under the unwinding — so it opens a
+    fresh connection on a fresh loop. If even that fails it prints the exact
+    ALTER TABLE statements to run by hand, because an operator who is told
+    only that something went wrong cannot fix a disabled trigger.
     """
     while _PENDING_RESTORE:
         dsn, triggers = _PENDING_RESTORE.pop()
@@ -478,13 +534,33 @@ def _restore_pending_triggers() -> None:
                 f"pj-bench: re-enabled triggers {', '.join(triggers)} on jorb",
                 file=sys.stderr,
             )
-        except Exception as e:  # pragma: no cover - needs a dead database
+        except BaseException as e:  # pragma: no cover - needs a dead database
             print(
                 f"pj-bench: CRITICAL - could not re-enable triggers "
                 f"{', '.join(triggers)} on jorb ({e}). Run: "
                 + "; ".join(f"ALTER TABLE jorb ENABLE TRIGGER {t}" for t in triggers),
                 file=sys.stderr,
             )
+
+
+def run_command(coro: Any) -> Any:
+    """``asyncio.run`` for a benchmark, with the trigger rescue attached.
+
+    Every subcommand goes through here so the rescue runs while the
+    interpreter is still fully alive. An ``atexit`` hook is NOT sufficient
+    on its own and this was measured, not assumed: atexit callbacks run
+    after ``threading._shutdown()``, so ``concurrent.futures``' executor is
+    already closed and the fresh ``asyncio.run`` the rescue needs dies with
+    "cannot schedule new futures after interpreter shutdown" — leaving the
+    trigger disabled and only a printed remedy behind. Running the rescue
+    from this ``finally`` covers a normal exit, an exception, Ctrl-C and
+    SIGTERM alike; the atexit hook stays registered for the case where this
+    frame itself never runs.
+    """
+    try:
+        return asyncio.run(coro)
+    finally:
+        _restore_pending_triggers()
 
 
 class TriggerToggle:
@@ -562,10 +638,8 @@ ENQUEUE_ONE_SQL = """
 #: out of the commit path entirely.
 ENQUEUE_VARIANTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("all_triggers_on", ()),
-    ("firehose_off", (TRIGGER_FIREHOSE,)),
     ("wakeup_notify_off", (TRIGGER_ENQUEUED,)),
     ("history_off", (TRIGGER_HISTORY,)),
-    ("firehose_and_history_off", (TRIGGER_FIREHOSE, TRIGGER_HISTORY)),
     ("all_notify_off", NOTIFY_TRIGGERS),
     ("all_notify_and_history_off", (*NOTIFY_TRIGGERS, TRIGGER_HISTORY)),
 )
@@ -646,12 +720,26 @@ async def run_enqueue(
       inserting 20k rows. It amortizes a single lock acquisition over the
       whole batch and overstates production enqueue by roughly 6x. It is
       reported here as ``bulk_contrast`` and nothing else.
-    * The cost is per COMMIT, not per notification. Turning off the
-      ``job_state_change`` firehose removes three of the five notifications
-      in a job's lifecycle and recovers almost nothing, because one NOTIFY
-      in a transaction takes the same lock as three. Trimming channels does
-      not raise the ceiling; only taking NOTIFY out of the commit path (or
-      batching it outside) does.
+    * The cost is per COMMIT, not per notification — and that is a much
+      sharper statement than "trimming channels never helps", which is what
+      this docstring used to say and what the numbers used to look like.
+
+      What was actually measured, in order. While several channels still
+      notified unconditionally, silencing any ONE of them recovered nothing:
+      switching off the three-per-lifecycle ``job_state_change`` firehose
+      left the ceiling where it was, because the surviving ungated channels
+      took the same global lock in the same commit. Gating ``jorb_done`` on
+      ``jorb.awaited`` then bought 1.01x, for the same reason. Deleting
+      ``job_state_change`` — the LAST ungated channel — measured 2.63-2.95x
+      on the completion path.
+
+      Same mechanism throughout: what the lock responds to is the number of
+      COMMITS that notify at all, not the number of notifications inside
+      them. Removing one of several ungated channels buys nothing; removing
+      the last one buys everything, because that is the commit which stops
+      taking the lock. The lesson is not "do not trim" — it is that partial
+      trimming is worth exactly zero until a commit path reaches zero, so
+      the unit of optimization is the transaction, never the channel.
     """
     queue = bench_queue("enqueue")
     conn = await open_connection(target)
@@ -741,10 +829,27 @@ async def run_enqueue(
 def _notify_commit_lock_cost(modes: dict[str, Any]) -> dict[str, Any]:
     """What NOTIFY-in-the-commit-path costs, and what it does NOT cost.
 
-    ``firehose_only_recovery_pct`` is reported next to the full cost on
-    purpose: it is the number that stops someone "optimizing" by trimming
-    notification volume. Three fewer notifications per lifecycle, and the
-    ceiling does not move, because the lock is taken once per commit.
+    ``wakeup_only_recovery_pct`` is reported next to the full cost on
+    purpose. ``jorb_enqueued`` is the only channel on the INSERT path, so
+    turning it off and turning ALL notification off are the same experiment
+    for enqueue — and they must therefore report the same recovery. When
+    they do, that is the per-COMMIT mechanism visible in one line: the last
+    channel to leave a commit path is the one that pays for everything.
+    When they DISAGREE, the run is noisy rather than informative: they are
+    the same experiment, so the spread between them is a lower bound on
+    this machine's measurement error, and neither figure means more than
+    that gap. Read ``spread_pct`` on the variants before quoting either.
+
+    WHAT THIS GAP IS MADE OF, now that the channel is gated. Nothing is
+    parked on the bench's queue, so the ``idle_worker`` gate says no and no
+    notification is emitted at all — ``pj-bench notify``'s unobserved phase
+    measures exactly zero on this channel. The throughput this variant
+    recovers is therefore NOT the commit lock: it is the price of the gate
+    itself, a deferred constraint trigger dispatched per row at commit plus
+    one indexed EXISTS against jorb_worker. The commit lock is on top of
+    that, and is paid only when a worker really is parked. Reading this gap
+    as "what NOTIFY costs" would overstate the lock and understate how much
+    the gate already won.
     """
 
     def rate(mode: str, variant: str) -> float:
@@ -767,17 +872,26 @@ def _notify_commit_lock_cost(modes: dict[str, Any]) -> dict[str, Any]:
         "cost_pct": (
             (no_notify - shipped) / no_notify * 100.0 if shipped and no_notify else None
         ),
-        "firehose_only_recovery_pct": recovery("production", "firehose_off"),
         "wakeup_only_recovery_pct": recovery("production", "wakeup_notify_off"),
         "serial_contrast_recovery_pct": recovery("serial_contrast", "all_notify_off"),
         "bulk_contrast_recovery_pct": recovery("bulk_contrast", "all_notify_off"),
         "explanation": (
-            "The lock is taken once per COMMIT, not once per notification: "
-            "removing the 3-of-5 job_state_change firehose recovers "
-            "essentially nothing, while removing NOTIFY from the commit "
-            "path entirely recovers the whole gap. Reduce commits that "
-            "notify, or move the notification outside the commit — trimming "
-            "channels does not raise the ceiling."
+            "The lock is taken once per COMMIT, not once per notification. "
+            "That is why removing ONE of several ungated channels recovered "
+            "nothing (the 3-of-5 job_state_change firehose: ceiling "
+            "unmoved; gating jorb_done while the firehose survived: 1.01x) "
+            "and why removing the LAST one recovered everything (deleting "
+            "job_state_change: 2.63-2.95x on the completion path). Partial "
+            "trimming is worth zero until a commit path notifies zero "
+            "times, so the unit of optimization is the transaction, not "
+            "the channel: reduce commits that notify at all, gate the rest "
+            "on demand, or move the notification outside the commit. "
+            "CAVEAT on the numbers above: nothing is parked on the bench's "
+            "queue, so jorb_enqueued's idle_worker gate emits nothing and "
+            "as_shipped_jobs_per_second already excludes the commit lock. "
+            "The gap to no_notify_jobs_per_second is the GATE's cost -- a "
+            "deferred constraint trigger plus one indexed EXISTS -- with "
+            "the lock on top of it only when a worker really is parked."
         ),
     }
 
@@ -1020,10 +1134,17 @@ async def _e2e_round(
         terminate(proc)
     wall_seconds = time.perf_counter() - wall_started
 
+    # COALESCE down the admission timestamps rather than requiring
+    # claimed_at: a job whose admission stamp is missing is still a job the
+    # fleet completed, and dropping it would report a throughput of zero for
+    # a run that plainly did work — the one output a benchmark must never
+    # produce, because it reads as a catastrophic regression.
     rows = await conn.fetch(
         """
-        SELECT EXTRACT(EPOCH FROM (finished - created))    AS enqueue_to_finished,
-               EXTRACT(EPOCH FROM (finished - claimed_at)) AS claim_to_finished
+        SELECT EXTRACT(EPOCH FROM (finished - created)) AS enqueue_to_finished,
+               EXTRACT(EPOCH FROM (
+                   finished - COALESCE(claimed_at, started, created)
+               ))                                       AS claim_to_finished
         FROM jorb
         WHERE queue = $1 AND finished IS NOT NULL
         """,
@@ -1031,15 +1152,22 @@ async def _e2e_round(
     )
     window = await conn.fetchrow(
         """
-        SELECT EXTRACT(EPOCH FROM (max(finished) - min(claimed_at))) AS drain_seconds,
-               count(*)                                              AS finished
+        SELECT EXTRACT(EPOCH FROM (
+                   max(finished) - min(COALESCE(claimed_at, started, created))
+               ))       AS drain_seconds,
+               count(*) AS finished
         FROM jorb
-        WHERE queue = $1 AND finished IS NOT NULL AND claimed_at IS NOT NULL
+        WHERE queue = $1 AND finished IS NOT NULL
         """,
         queue,
     )
-    drain_seconds = float(window["drain_seconds"] or 0.0)
+    drain_seconds = max(float(window["drain_seconds"] or 0.0), 0.0)
     finished = int(window["finished"] or 0)
+    # A drain window of zero means the whole batch landed inside one clock
+    # tick, not that it was infinitely fast. Fall back to wall time and SAY
+    # which basis was used, so two runs are only ever compared like for like.
+    basis = "first_claim_to_last_finish" if drain_seconds > 0 else "wall_clock"
+    measured_seconds = drain_seconds if drain_seconds > 0 else wall_seconds
 
     return {
         "enqueued": jobs,
@@ -1048,7 +1176,8 @@ async def _e2e_round(
         "timed_out": timed_out,
         "wall_seconds": wall_seconds,
         "drain_seconds": drain_seconds,
-        "jobs_per_second": (finished / drain_seconds) if drain_seconds else 0.0,
+        "drain_basis": basis,
+        "jobs_per_second": (finished / measured_seconds) if measured_seconds else 0.0,
         "jobs_per_second_including_startup": (
             finished / wall_seconds if wall_seconds else 0.0
         ),
@@ -1152,14 +1281,33 @@ async def run_notify(
     max_existing_jobs: int,
     force: bool,
 ) -> dict[str, Any]:
-    """Count the notifications one job lifecycle actually emits.
+    """Count the notifications one job lifecycle actually emits — TWICE.
 
-    docs/SCALE.md claims five per job and projects ~1,390/s at the reference
-    rate. This LISTENs on every channel the schema can emit on and drives
-    the four row writes of a real lifecycle (insert, claim, run, terminal),
-    counting what arrives per channel — so the claim is proven or refuted
-    rather than restated. Notifications from other work in the database are
-    counted separately and excluded from the per-lifecycle figure.
+    "How many notifications does a job cost?" has two correct answers on
+    this schema, and the distance between them IS the demand gate. So the
+    run drives the same four row writes (insert, claim, run, terminal)
+    under two conditions and reports both:
+
+      unobserved  nothing parked on the queue, nobody awaiting a result.
+                  Every remaining channel is gated on demand, so the expected
+                  answer is ZERO — no wakeup, no completion signal, and no
+                  commit anywhere in the lifecycle that takes the NOTIFY
+                  commit lock. This is what the overwhelming majority of jobs
+                  cost in an installation that fires and forgets.
+      observed    one worker row parked idle on the queue (the jorb_enqueued
+                  gate), and jorb.awaited set on each job the way
+                  wait_for_result() sets it (the jorb_done gate). Expected
+                  answer: TWO, the two load-bearing wakeups and nothing else.
+
+    Reporting only the first would understate what a watched job costs;
+    reporting only the second would restate the pre-gate world. Reporting one
+    number labelled "notifications per lifecycle" would be worst of all,
+    because its meaning would depend on what happened to be running.
+
+    docs/SCALE.md's old claim of five per job (~1,390/s at the reference
+    rate) is refuted on both counts: three of those five were
+    ``job_state_change``, a channel that no longer exists, and the remaining
+    two only fire when somebody is actually waiting.
 
     Each of the four writes runs in its OWN transaction, because that is
     what a real install does and because PostgreSQL collapses identical
@@ -1170,6 +1318,9 @@ async def run_notify(
     and useful property of batch enqueue, and a completely wrong answer to
     "what does one job cost".
 
+    Notifications from other work in the database are counted separately and
+    excluded from the per-lifecycle figures.
+
     ``pg_notification_queue_usage()`` is sampled before and after because
     that queue is server-wide, bounded, and drains only as fast as the
     slowest listener: at 1.0 every NOTIFY-issuing transaction fails, which
@@ -1178,9 +1329,9 @@ async def run_notify(
     queue = bench_queue("notify")
     conn = await open_connection(target)
     listener = await open_connection(target)
+    job_ids: set[int] = set()
     counts: dict[str, int] = dict.fromkeys(NOTIFY_CHANNELS, 0)
     foreign: dict[str, int] = dict.fromkeys(NOTIFY_CHANNELS, 0)
-    job_ids: set[int] = set()
     result: dict[str, Any] = {}
 
     def make_handler(channel: str) -> Callable[..., None]:
@@ -1200,42 +1351,45 @@ async def run_notify(
         usage_before = float(
             await conn.fetchval("SELECT pg_notification_queue_usage()")
         )
-
         usage_peak = usage_before
-        for _ in range(lifecycles):
-            job_id = int(
-                await conn.fetchval(
-                    "INSERT INTO jorb (job_class, kwargs, queue) "
-                    "VALUES ($1, '{}'::jsonb, $2) RETURNING id",
-                    BENCH_JOB_CLASS,
-                    queue,
-                )
-            )
-            job_ids.add(job_id)
-            await conn.execute(
-                "UPDATE jorb SET state = 'claimed', claimed_at = now(), "
-                "run_count = run_count + 1, run_epoch = run_epoch + 1, "
-                "updated = now() WHERE id = $1",
-                job_id,
-            )
-            await conn.execute(
-                "UPDATE jorb SET state = 'running', started = now(), "
-                "updated = now() WHERE id = $1",
-                job_id,
-            )
-            await conn.execute(
-                "UPDATE jorb SET state = 'finished', finished = now(), "
-                "result = '{}'::jsonb, updated = now() WHERE id = $1",
-                job_id,
-            )
-        usage_peak = max(
-            usage_peak,
-            float(await conn.fetchval("SELECT pg_notification_queue_usage()")),
-        )
+        phases: dict[str, Any] = {}
 
-        total = await _drain_notifications(listener, counts)
+        phase_names = ("unobserved", "observed")
+        for phase in phase_names:
+            # Fresh counters per phase: the two phases are two separate
+            # measurements, and carrying counts across them would report the
+            # observed run's notifications as if the unobserved run had made
+            # some of them.
+            counts.update(dict.fromkeys(NOTIFY_CHANNELS, 0))
+            foreign.update(dict.fromkeys(NOTIFY_CHANNELS, 0))
+            job_ids.clear()
+            observed = phase == "observed"
+            if observed:
+                await _park_idle_worker(conn, queue)
+            await _drive_lifecycles(conn, queue, lifecycles, job_ids, observed=observed)
+            usage_peak = max(
+                usage_peak,
+                float(await conn.fetchval("SELECT pg_notification_queue_usage()")),
+            )
+            total = await _drain_notifications(listener, counts)
+            phases[phase] = _notify_phase(
+                dict(counts),
+                {k: v for k, v in foreign.items() if v},
+                total=total,
+                lifecycles=lifecycles,
+                target_rate=target_rate,
+            )
+            if phase != phase_names[-1]:
+                # Each phase drives its own lifecycles. The last phase's rows
+                # stay: they are what the history count below is taken from,
+                # and cleanup_queue removes them at the end.
+                await conn.execute("DELETE FROM jorb WHERE queue = $1", queue)
+
         usage_after = float(await conn.fetchval("SELECT pg_notification_queue_usage()"))
 
+        # History is a property of the row writes, not of who was watching:
+        # record_jorb_history() fires on INSERT and on UPDATE OF state, and
+        # the observed phase's extra `awaited` write touches neither.
         history_rows = int(
             await conn.fetchval(
                 "SELECT count(*) FROM jorb_history h JOIN jorb j ON j.id = h.job_id "
@@ -1244,9 +1398,8 @@ async def run_notify(
             )
         )
 
-        per_lifecycle = total / lifecycles if lifecycles else 0.0
-        firehose = counts["job_state_change"]
-        load_bearing = sum(counts[c] for c in LOAD_BEARING_CHANNELS)
+        unobserved = phases["unobserved"]["per_lifecycle"]
+        observed_rate = phases["observed"]["per_lifecycle"]
         result.update(
             {
                 "benchmark": "notify",
@@ -1254,35 +1407,37 @@ async def run_notify(
                 "queue": queue,
                 "lifecycles": lifecycles,
                 "guard": guard,
-                "per_channel": counts,
-                "per_channel_per_lifecycle": {
-                    channel: (count / lifecycles if lifecycles else 0.0)
-                    for channel, count in counts.items()
-                },
-                "foreign_notifications": {k: v for k, v in foreign.items() if v},
-                "total": total,
-                "per_lifecycle": per_lifecycle,
+                # No unqualified "per_lifecycle" key, deliberately: a single
+                # name here would silently mean whichever phase the reader
+                # assumed, which is exactly the ambiguity this command exists
+                # to remove.
+                "phases": phases,
+                "per_lifecycle_unobserved": unobserved,
+                "per_lifecycle_observed": observed_rate,
+                "demand_gate_saves_per_lifecycle": observed_rate - unobserved,
                 "history_rows_per_lifecycle": (
                     history_rows / lifecycles if lifecycles else 0.0
                 ),
                 "row_writes_per_lifecycle": float(SCALE_CLAIM_ROW_WRITES_PER_LIFECYCLE),
-                "firehose_share": (firehose / total) if total else 0.0,
-                "load_bearing_per_lifecycle": (
-                    load_bearing / lifecycles if lifecycles else 0.0
-                ),
                 "target_rate": target_rate,
-                "projected_notifications_per_second": per_lifecycle * target_rate,
-                "projected_without_firehose_per_second": (
-                    (total - firehose) / lifecycles * target_rate if lifecycles else 0.0
-                ),
                 "notify_queue_usage": {
                     "before": usage_before,
                     "peak": max(usage_before, usage_peak),
                     "after": usage_after,
                 },
                 "scale_md": {
-                    "claimed_per_lifecycle": SCALE_CLAIM_NOTIFICATIONS_PER_LIFECYCLE,
-                    "agrees": per_lifecycle == SCALE_CLAIM_NOTIFICATIONS_PER_LIFECYCLE,
+                    "claimed_unobserved": SCALE_CLAIM_NOTIFICATIONS_UNOBSERVED,
+                    "claimed_observed": SCALE_CLAIM_NOTIFICATIONS_OBSERVED,
+                    "unobserved_agrees": (
+                        unobserved == SCALE_CLAIM_NOTIFICATIONS_UNOBSERVED
+                    ),
+                    "observed_agrees": (
+                        observed_rate == SCALE_CLAIM_NOTIFICATIONS_OBSERVED
+                    ),
+                    "agrees": (
+                        unobserved == SCALE_CLAIM_NOTIFICATIONS_UNOBSERVED
+                        and observed_rate == SCALE_CLAIM_NOTIFICATIONS_OBSERVED
+                    ),
                     "claimed_history_rows_per_lifecycle": (
                         SCALE_CLAIM_HISTORY_ROWS_PER_LIFECYCLE
                     ),
@@ -1300,12 +1455,100 @@ async def run_notify(
         await conn.close()
 
 
+def _notify_phase(
+    counts: dict[str, int],
+    foreign: dict[str, int],
+    *,
+    total: int,
+    lifecycles: int,
+    target_rate: float,
+) -> dict[str, Any]:
+    """One phase's counts, in the shape both phases report."""
+    per_lifecycle = total / lifecycles if lifecycles else 0.0
+    load_bearing = sum(counts[c] for c in LOAD_BEARING_CHANNELS)
+    return {
+        "per_channel": counts,
+        "per_channel_per_lifecycle": {
+            channel: (count / lifecycles if lifecycles else 0.0)
+            for channel, count in counts.items()
+        },
+        "foreign_notifications": foreign,
+        "total": total,
+        "per_lifecycle": per_lifecycle,
+        "load_bearing_per_lifecycle": (
+            load_bearing / lifecycles if lifecycles else 0.0
+        ),
+        "projected_notifications_per_second": per_lifecycle * target_rate,
+    }
+
+
+async def _park_idle_worker(conn: asyncpg.Connection, queue: str) -> None:
+    """Register one worker parked on ``queue``, the jorb_enqueued gate.
+
+    The gate is ``EXISTS (SELECT 1 FROM jorb_worker WHERE queue = ... AND
+    idle AND shutdown_at IS NULL)``, so this row IS the demand signal a real
+    idle worker publishes before its last claim attempt. It carries this
+    run's queue name, which is what lets ``cleanup_queue`` reach it.
+    """
+    await conn.execute(
+        "INSERT INTO jorb_worker (host, pid, queue, idle) "
+        "VALUES ('pj-bench', $1, $2, TRUE)",
+        os.getpid(),
+        queue,
+    )
+
+
+async def _drive_lifecycles(
+    conn: asyncpg.Connection,
+    queue: str,
+    lifecycles: int,
+    job_ids: set[int],
+    *,
+    observed: bool,
+) -> None:
+    """Drive the four row writes of a real lifecycle, one txn per write.
+
+    ``observed`` sets ``jorb.awaited`` immediately after the insert, which is
+    what ``wait_for_result()`` does and what the jorb_done trigger's WHEN
+    clause reads. It is its own statement rather than a column on the INSERT
+    because that is the real ordering: the client learns the id, then
+    registers. It touches no state column, so it fires nothing itself.
+    """
+    for _ in range(lifecycles):
+        job_id = int(
+            await conn.fetchval(
+                "INSERT INTO jorb (job_class, kwargs, queue) "
+                "VALUES ($1, '{}'::jsonb, $2) RETURNING id",
+                BENCH_JOB_CLASS,
+                queue,
+            )
+        )
+        job_ids.add(job_id)
+        if observed:
+            await conn.execute("UPDATE jorb SET awaited = TRUE WHERE id = $1", job_id)
+        await conn.execute(
+            "UPDATE jorb SET state = 'claimed', claimed_at = now(), "
+            "run_count = run_count + 1, run_epoch = run_epoch + 1, "
+            "updated = now() WHERE id = $1",
+            job_id,
+        )
+        await conn.execute(
+            "UPDATE jorb SET state = 'running', started = now(), "
+            "updated = now() WHERE id = $1",
+            job_id,
+        )
+        await conn.execute(
+            "UPDATE jorb SET state = 'finished', finished = now(), "
+            "result = '{}'::jsonb, updated = now() WHERE id = $1",
+            job_id,
+        )
+
+
 def _payload_is_ours(channel: str, payload: str, queue: str, job_ids: set[int]) -> bool:
     """Attribute a notification to this run, or to other work.
 
     Every channel carries enough to tell: the wakeup channel carries the
-    queue name, the state feed carries it in JSON, and the rest carry a job
-    id this run knows it created.
+    queue name, and the rest carry a job id this run knows it created.
     """
     if channel == "jorb_enqueued":
         return payload == queue
@@ -1317,37 +1560,48 @@ def _payload_is_ours(channel: str, payload: str, queue: str, job_ids: set[int]) 
         data = json.loads(payload)
     except (ValueError, TypeError):
         return False
-    if channel == "job_state_change":
-        return bool(data.get("queue") == queue)
     if channel == "jorb_done":
         return int(data.get("id", -1)) in job_ids
     if channel == "jorb_event":
         return int(data.get("job_id", -1)) in job_ids
-    if channel == "jorb_mailbox":
-        return int(data.get("dest", -1)) in job_ids
     return False
 
 
 async def _drain_notifications(
-    listener: asyncpg.Connection, counts: dict[str, int], timeout: float = 5.0
+    listener: asyncpg.Connection,
+    counts: dict[str, int],
+    timeout: float = 5.0,
+    quiet: float = 0.3,
+    minimum: float = 1.0,
 ) -> int:
     """Wait until the notification count stops moving.
 
     NOTIFY is delivered after commit and asynchronously, so counting
     immediately after the last UPDATE undercounts. Settling on "no new
-    message for 300ms" is what makes the per-lifecycle figure a fact.
+    message for ``quiet`` seconds" is what makes the per-lifecycle figure a
+    fact rather than a race.
+
+    ZERO IS AN ANSWER, and that is why "settled" cannot mean "stopped
+    growing after it grew". A demand-gated schema emits nothing at all for
+    an unobserved lifecycle, so a loop that refuses to settle until it has
+    seen at least one message would burn the whole timeout on every correct
+    run and then report the same zero. Instead the loop settles on "nothing
+    new for ``quiet``, having watched for at least ``minimum``" — a claim
+    about silence that is as checkable as a claim about traffic.
     """
-    deadline = time.monotonic() + timeout
-    last_total = -1
-    stable_since = time.monotonic()
+    started = time.monotonic()
+    deadline = started + timeout
+    last_total = sum(counts.values())
+    stable_since = started
     while time.monotonic() < deadline:
         await listener.execute("SELECT 1")
         await asyncio.sleep(0.05)
         total = sum(counts.values())
+        now = time.monotonic()
         if total != last_total:
             last_total = total
-            stable_since = time.monotonic()
-        elif total > 0 and time.monotonic() - stable_since > 0.3:
+            stable_since = now
+        elif now - stable_since > quiet and now - started > minimum:
             break
     return sum(counts.values())
 
@@ -1356,53 +1610,13 @@ async def _drain_notifications(
 # 5. plans — EXPLAIN every hot query; the CI regression gate
 # =========================================================================
 
-RETENTION_PROBE_SQL = f"""
-    SELECT j.id
-    FROM jorb j
-    WHERE j.state IN ({TERMINAL_STATES_SQL})
-      AND COALESCE(j.finished, j.updated) < now() - $1::interval
-      AND NOT EXISTS (
-          SELECT 1 FROM jorb w
-          WHERE w.state = 'waiting' AND w.waitfor_job = j.id
-      )
-      AND NOT EXISTS (
-          SELECT 1 FROM jorb w
-          WHERE w.state = 'waiting' AND w.waitfor_group = j.run_group
-      )
-    ORDER BY COALESCE(j.finished, j.updated)
-    FOR UPDATE OF j SKIP LOCKED
-    LIMIT $2
-"""
-
-CHECKPOINT_SWEEP_SQL = f"""
-    WITH doomed AS MATERIALIZED (
-        SELECT s.job_id, s.step_seq
-        FROM jorb_step s
-        JOIN jorb j ON j.id = s.job_id
-        WHERE j.state IN ({TERMINAL_STATES_SQL})
-          AND COALESCE(j.finished, j.updated) < now() - $1::interval
-        ORDER BY COALESCE(j.finished, j.updated)
-        FOR UPDATE OF s SKIP LOCKED
-        LIMIT $2
-    )
-    DELETE FROM jorb_step s
-    USING doomed d
-    WHERE s.job_id = d.job_id AND s.step_seq = d.step_seq
-"""
-
-MAILBOX_SWEEP_SQL = """
-    WITH doomed AS MATERIALIZED (
-        SELECT id FROM jorb_mailbox
-        WHERE consumed_at IS NOT NULL
-          AND consumed_at < now() - $1::interval
-        ORDER BY consumed_at
-        FOR UPDATE SKIP LOCKED
-        LIMIT $2
-    )
-    DELETE FROM jorb_mailbox m
-    USING doomed d
-    WHERE m.id = d.id
-"""
+# The monitor's own statements, not copies of them. A benchmark that gates
+# CI on a query's plan has to run the query the monitor runs: a copy passes
+# review, drifts on the next edit, and then certifies a statement nobody
+# executes. These are re-exported under the names the plan gate uses.
+RETENTION_PROBE_SQL = SWEEP_EXPIRED_JOBS_SQL
+CHECKPOINT_SWEEP_SQL = SWEEP_CHECKPOINT_JOBS_SQL
+MAILBOX_SWEEP_SQL = SWEEP_MAILBOX_SQL
 
 CLAIM_PROBE_SQL = """
     SELECT j.id FROM jorb j
@@ -1639,9 +1853,18 @@ async def seed_plan_data(
         anchor,
         mailbox,
     )
-    await conn.execute("ANALYZE jorb")
-    await conn.execute("ANALYZE jorb_step")
-    await conn.execute("ANALYZE jorb_mailbox")
+    # VACUUM as well as ANALYZE, and not as a nicety: ANALYZE gives the
+    # planner its statistics, but only VACUUM sets the VISIBILITY MAP, and
+    # an index-only or bitmap plan is costed as though every tuple needed a
+    # heap fetch until it is set. On a freshly seeded (or repeatedly
+    # re-seeded, and therefore bloated) table that inflates the index plans
+    # until a sequential scan wins -- and this gate then reports "sequential
+    # scan of jorb" for a query whose index is perfectly healthy. Autovacuum
+    # does both continuously in production; a gate that skips them measures
+    # a table no running system ever has.
+    await conn.execute("VACUUM (ANALYZE) jorb")
+    await conn.execute("VACUUM (ANALYZE) jorb_step")
+    await conn.execute("VACUUM (ANALYZE) jorb_mailbox")
     return {"jobs": rows, "steps": steps, "mailbox": mailbox}
 
 
@@ -1876,7 +2099,7 @@ def enqueue_cmd(
 ) -> None:
     """Enqueue throughput, and what NOTIFY costs at the commit lock."""
     target = resolve_target(pick(ctx, config, "config"), pick(ctx, dsn, "dsn"))
-    result = asyncio.run(
+    result = run_command(
         run_enqueue(
             target,
             rows=rows,
@@ -1911,7 +2134,10 @@ def enqueue_table(result: dict[str, Any]) -> list[list[str]]:
             f"{lock['no_notify_jobs_per_second']:,.0f} jobs/s (upper bound)",
         ],
         [
-            "  NOTIFY commit-lock cost",
+            # NOT "commit-lock cost": with jorb_enqueued gated and nothing
+            # parked, no notification is emitted here at all, so this gap
+            # cannot be the lock. See the row two below.
+            "  cost of having them",
             (
                 "n/a (needs --allow-trigger-toggle)"
                 if lock["ratio"] is None
@@ -1920,14 +2146,27 @@ def enqueue_table(result: dict[str, Any]) -> list[list[str]]:
             ),
         ],
         [
-            "  firehose off ONLY",
-            f"{pct(lock['firehose_only_recovery_pct'])} — 3 of 5 notifications "
-            "removed, ceiling unmoved: the lock is per COMMIT, not per NOTIFY",
-        ],
-        [
             "  wakeup notify off ONLY",
             f"{pct(lock['wakeup_only_recovery_pct'])} — the only NOTIFY on the "
-            "INSERT path; removing it removes the commit lock",
+            "INSERT path, so it SHOULD equal the all-off number above; any "
+            "gap between the two is this run's noise, not a finding",
+        ],
+        [
+            "  what that gap really is",
+            "nothing is parked on this queue, so the gate emits NOTHING: this "
+            "is the gate's own cost, not the commit lock",
+        ],
+        [
+            "  why those two match",
+            "the lock is taken per COMMIT, not per NOTIFY",
+        ],
+        [
+            "    one of several ungated",
+            "job_state_change off while others still notified: ceiling unmoved",
+        ],
+        [
+            "    the LAST one ungated",
+            "job_state_change deleted: 2.63-2.95x on the completion path",
         ],
         ["headroom vs 278/s", f"{result['headroom_vs_target_rate']:,.0f}x"],
     ]
@@ -1976,7 +2215,7 @@ def claim_cmd(
 ) -> None:
     """Claim throughput and contention through the real claim_jorb()."""
     target = resolve_target(pick(ctx, config, "config"), pick(ctx, dsn, "dsn"))
-    result = asyncio.run(
+    result = run_command(
         run_claim(
             target,
             workers=workers,
@@ -2034,7 +2273,7 @@ def e2e_cmd(
 ) -> None:
     """End-to-end throughput and latency with REAL worker processes."""
     target = resolve_target(pick(ctx, config, "config"), pick(ctx, dsn, "dsn"))
-    result = asyncio.run(
+    result = run_command(
         run_e2e(
             target,
             jobs=jobs,
@@ -2094,9 +2333,14 @@ def notify_cmd(
     lifecycles: int,
     target_rate: float,
 ) -> None:
-    """Notifications per job lifecycle, per channel, and the projection."""
+    """Notifications per job lifecycle, unobserved AND observed.
+
+    Two phases, because a demand-gated schema has two honest answers: what a
+    job nobody is watching costs (the floor, and what almost every job is),
+    and what a job with a parked worker and a waiting client costs.
+    """
     target = resolve_target(pick(ctx, config, "config"), pick(ctx, dsn, "dsn"))
-    result = asyncio.run(
+    result = run_command(
         run_notify(
             target,
             lifecycles=lifecycles,
@@ -2105,22 +2349,39 @@ def notify_cmd(
             force=force,
         )
     )
+    claims = result["scale_md"]
+    unobserved = result["phases"]["unobserved"]
+    observed = result["phases"]["observed"]
+
+    def verdict(agrees: bool) -> str:
+        return "agrees" if agrees else "DISAGREES"
+
     table = [
-        ["lifecycles driven", fmt(result["lifecycles"])],
-        ["notifications per lifecycle", fmt(result["per_lifecycle"], 2)],
+        ["lifecycles driven", f"{fmt(result['lifecycles'])} per phase"],
         [
-            "docs/SCALE.md claims",
-            f"{result['scale_md']['claimed_per_lifecycle']} "
-            f"({'agrees' if result['scale_md']['agrees'] else 'DISAGREES'})",
+            "UNOBSERVED notify/lifecycle",
+            f"{unobserved['per_lifecycle']:,.2f}  (no worker parked, nothing "
+            f"awaited) — claim {claims['claimed_unobserved']}, "
+            f"{verdict(claims['unobserved_agrees'])}",
+        ],
+        [
+            "OBSERVED notify/lifecycle",
+            f"{observed['per_lifecycle']:,.2f}  (a worker parked idle on the "
+            f"queue, jorb.awaited set) — claim {claims['claimed_observed']}, "
+            f"{verdict(claims['observed_agrees'])}",
+        ],
+        [
+            "what the demand gate saves",
+            f"{result['demand_gate_saves_per_lifecycle']:,.2f}/lifecycle — and "
+            "the lock is per COMMIT, so those commits stop taking it at all",
         ],
         ["history rows per lifecycle", fmt(result["history_rows_per_lifecycle"], 2)],
         [
             f"projected at {result['target_rate']:.0f} jobs/s",
-            f"{result['projected_notifications_per_second']:,.0f} notify/s",
-        ],
-        [
-            "without the state firehose",
-            f"{result['projected_without_firehose_per_second']:,.0f} notify/s",
+            f"{unobserved['projected_notifications_per_second']:,.0f} notify/s "
+            f"unobserved, "
+            f"{observed['projected_notifications_per_second']:,.0f} notify/s "
+            f"if every job is watched",
         ],
         [
             "pg_notification_queue_usage",
@@ -2128,11 +2389,12 @@ def notify_cmd(
             f"{result['notify_queue_usage']['after']:.6f}",
         ],
     ]
-    table.extend(
-        [f"  channel {channel}", fmt(count)]
-        for channel, count in result["per_channel"].items()
-        if count
-    )
+    for phase_name, phase in (("unobserved", unobserved), ("observed", observed)):
+        table.extend(
+            [f"  {phase_name} channel {channel}", fmt(count)]
+            for channel, count in phase["per_channel"].items()
+            if count
+        )
     emit(result, output_json, table)
 
 
@@ -2167,7 +2429,7 @@ def plans_cmd(
 ) -> None:
     """EXPLAIN (ANALYZE, BUFFERS) every hot query; non-zero on a seq scan."""
     target = resolve_target(pick(ctx, config, "config"), pick(ctx, dsn, "dsn"))
-    result = asyncio.run(
+    result = run_command(
         run_plans(
             target,
             seed=seed,
@@ -2289,7 +2551,7 @@ def all_cmd(
             ),
         }
 
-    results = asyncio.run(everything())
+    results = run_command(everything())
     results["healthy"] = results["plans"]["healthy"]
     lock = results["enqueue"]["notify_commit_lock"]
     summary = [
@@ -2321,10 +2583,17 @@ def all_cmd(
             f"{results['e2e']['enqueue_to_finished']['p50']:.3f} / "
             f"{results['e2e']['enqueue_to_finished']['p99']:.3f} s",
         ],
-        ["notifications/lifecycle", fmt(results["notify"]["per_lifecycle"], 2)],
+        [
+            "notifications/lifecycle",
+            f"{results['notify']['per_lifecycle_unobserved']:,.2f} unobserved / "
+            f"{results['notify']['per_lifecycle_observed']:,.2f} observed",
+        ],
         [
             f"notify/s at {target_rate:.0f} jobs/s",
-            fmt(results["notify"]["projected_notifications_per_second"]),
+            f"{results['notify']['phases']['unobserved']['projected_notifications_per_second']:,.0f}"
+            f" unobserved / "
+            f"{results['notify']['phases']['observed']['projected_notifications_per_second']:,.0f}"
+            f" observed",
         ],
         [
             "hot query plans",
