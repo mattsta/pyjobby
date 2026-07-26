@@ -4,9 +4,13 @@ Reference workload throughout: **1,000,000 jobs/hour** — about 278/second
 sustained. Every number below was measured on this schema, not estimated. Where
 something is a projection from a smaller measurement, it says so.
 
-The short version: **raw write throughput is not the problem** — there is
-roughly 240× headroom on enqueue. What breaks first is everything that has to
-read or retain the *accumulated* table, and the notification fan-out.
+The short version: write throughput has **~43× headroom** at this target, but
+less than a naive benchmark suggests, and the limit is `NOTIFY` rather than the
+writes themselves. What breaks first is everything that has to read or retain
+the *accumulated* table.
+
+Every number here is reproducible with `pj-bench` — see [Reproducing
+these numbers](#reproducing-these-numbers). They are not hand-measurements.
 
 ---
 
@@ -19,19 +23,59 @@ read or retain the *accumulated* table, and the notification fan-out.
 | Notifications emitted | 5 | **~1,390/s** |
 | `jorb_step` rows | 1 per `step()` call | workload-dependent |
 
-Measured enqueue throughput, 20k rows, single connection:
+### Measuring enqueue honestly
+
+How you measure this changes the answer by **6×**, so it is worth being precise
+about what production actually does: each job is enqueued in **its own
+transaction**, and many clients do so **concurrently**.
 
 ```
-all triggers on (as shipped)      298 ms    67,085 rows/s
-state-change firehose off         279 ms    71,767 rows/s
-firehose + history off            102 ms   196,160 rows/s
+one bulk transaction, 20k rows                     68,105 rows/s   ← misleading
+serial, one transaction per job                     5,979 jobs/s
+16 concurrent connections, one transaction each    11,326 jobs/s   ← production shape
 ```
 
-The history trigger is **59%** of enqueue cost and the transition firehose is
-**7%**. Both are affordable — 67k rows/s against a 278/s requirement is 240×
-headroom — but the history trigger is why `jorb_history` becomes the largest
-table in the system, and that is a storage and retention problem rather than a
-throughput one.
+The bulk number is the one a careless benchmark reports, and it is meaningless:
+a single transaction pays the per-commit costs **once**, amortised across 20,000
+rows.
+
+Against a 278/s requirement, 11,326/s is **~43× headroom** — comfortable, but
+not the 240× the bulk figure implies.
+
+### Why NOTIFY sets the ceiling
+
+Committing a transaction that calls `NOTIFY` requires Postgres to take a
+**global exclusive lock**, held until the commit completes and reaches disk.
+Postgres does this because notifications must be delivered in commit order, and
+commit order is not established until commits finish — so it serialises every
+commit containing a `NOTIFY`, defeating group commit. DBOS documented the same
+wall and recovered ~20× by moving notifications out of the commit path
+([writeup](https://www.dbos.dev/blog/postgres-listen-notify-scalability)).
+
+Measured here, 16 concurrent connections, one transaction per job:
+
+| | jobs/s |
+|---|---|
+| as shipped (all channels) | 11,326 |
+| `job_state_change` firehose disabled | 11,668 |
+| all `NOTIFY` triggers disabled | **28,790** |
+
+**The cost is per-COMMIT, not per-notification.** Disabling the transition
+firehose — 3 of the 5 notifications per job — recovers only **3%**, because one
+`NOTIFY` in a transaction takes the same global lock as three. Reducing
+notification *volume* does not raise the ceiling; only removing `NOTIFY` from
+the commit path does.
+
+This is the single most important thing to understand before tuning: it is
+invisible to a serial benchmark (3% there) and invisible to a bulk benchmark,
+and it only appears under concurrent commits — which is exactly the production
+shape.
+
+### The other per-job costs
+
+The history trigger is the dominant *non-NOTIFY* cost and is why `jorb_history`
+becomes the largest table in the system — but that is a storage and retention
+problem rather than a throughput one.
 
 ---
 
@@ -114,6 +158,11 @@ load-bearing channels:
 ALTER TABLE jorb DISABLE TRIGGER job_state_change_notify;
 ```
 
+Do this to stop drowning your listeners and to slow the queue filling — **not
+to gain write throughput.** It buys 3% (see [Why NOTIFY sets the
+ceiling](#why-notify-sets-the-ceiling)); the ceiling is per-commit, so the only
+way through it is taking `NOTIFY` out of the commit path entirely.
+
 `jorb_enqueued` (worker wakeup) and `jorb_done` (result waiters) are
 load-bearing and must stay on.
 
@@ -194,3 +243,35 @@ window than the job row. See [DXE.md](DXE.md#retention).
 4. Alert on `notify_queue_usage`, backlog age (not depth), and completions/sec
    versus arrivals/sec. Those three catch almost everything.
 5. Watch that retention reports "caught up" rather than "out of budget".
+
+---
+
+## Reproducing these numbers
+
+Every measurement above comes from `pj-bench`, which ships with the platform so
+the numbers can be re-taken on your hardware and re-checked after a change:
+
+```
+pj-bench enqueue    # write throughput; bulk vs serial vs concurrent, and the
+                    # per-NOTIFY-channel breakdown that shows the commit lock
+pj-bench claim      # claim throughput and advisory-lock contention
+pj-bench e2e        # completed jobs/sec and enqueue->finished p50/p95/p99
+pj-bench notify     # notifications per lifecycle, per channel, + queue usage
+pj-bench plans      # EXPLAINs every hot query; exits non-zero on a seq scan
+pj-bench all --json # everything, machine-readable, for diffing runs
+```
+
+`pj-bench plans` is the one to wire into CI: it is the gate that catches a lost
+index before it reaches production, and it needs no baseline to compare against
+— a sequential scan of the job table is wrong regardless of hardware.
+
+The rest are hardware-dependent, so compare runs against **your own** previous
+`--json` output rather than against the figures here. Ratios travel between
+machines; absolute numbers do not.
+
+Two measurement traps these tools exist to avoid, both of which produced wrong
+answers here before the harness existed:
+
+* **Bulk inserts amortise per-commit costs.** Measure one transaction per job.
+* **The NOTIFY commit lock only appears under concurrency.** A serial benchmark
+  reports 3% for something that costs 62% in production.

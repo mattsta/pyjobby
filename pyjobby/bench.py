@@ -7,7 +7,7 @@ change can be shown to have made things better or worse instead of argued
 about, and the next bottleneck hunt starts from a running tool rather than
 from zero.
 
-    pj-bench enqueue --rows 20000     insert throughput + per-trigger cost
+    pj-bench enqueue --concurrency 16 enqueue throughput + NOTIFY commit lock
     pj-bench claim   --workers 8      claim throughput and lock contention
     pj-bench e2e     --jobs 200       real worker processes, real latency
     pj-bench notify                   notifications per job lifecycle
@@ -53,6 +53,20 @@ First touch of a page is not the steady state, and one sample is not a
 measurement. Every timed subcommand runs a discarded-but-reported warm-up
 (``--no-warmup`` to skip) and then ``--repeat N`` measured runs, reporting
 the MEDIAN and the spread rather than a single number.
+
+Shape matters as much as repetition. ``pj-bench enqueue`` measures
+CONCURRENT, one-transaction-per-job inserts because that is the only shape
+in which pyjobby's real write ceiling appears: committing a transaction
+that issued a NOTIFY takes a global exclusive lock held to the end of the
+commit, since notifications must be delivered in commit order and that
+order is not settled until commits finish. Concurrent enqueues therefore
+serialize instead of grouping. A single-client benchmark has nothing to
+serialize against and a bulk insert amortizes one lock over the whole
+batch, so both report a number several times too high — which is exactly
+how docs/SCALE.md's 67k rows/s came to describe an enqueue path that
+actually tops out an order of magnitude lower. Those two shapes are still
+measured, and labelled ``*_contrast`` so they cannot be quoted as the
+answer.
 """
 
 from __future__ import annotations
@@ -1785,7 +1799,30 @@ def cli(ctx: click.Context, config: str | None, dsn: str | None) -> None:
 @cli.command("enqueue")
 @db_options
 @timing_options
-@click.option("--rows", default=20000, show_default=True, help="Rows per insert run")
+@click.option(
+    "--concurrency",
+    default=16,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Connections enqueueing at once, each job in its own transaction. "
+    "This is the measurement that matters: a NOTIFY-bearing commit takes a "
+    "global exclusive lock, so concurrent enqueues serialize against each "
+    "other. At concurrency 1 that cost is invisible.",
+)
+@click.option(
+    "--jobs-per-connection",
+    default=100,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Jobs each connection enqueues per run (one transaction each)",
+)
+@click.option(
+    "--rows",
+    default=20000,
+    show_default=True,
+    help="Rows for the BULK CONTRAST run (one transaction, set-based). This "
+    "is the figure docs/SCALE.md quotes; it is not production enqueue.",
+)
 @click.option(
     "--allow-trigger-toggle",
     is_flag=True,
@@ -1807,15 +1844,19 @@ def enqueue_cmd(
     max_existing_jobs: int,
     repeat: int,
     warmup: bool,
+    concurrency: int,
+    jobs_per_connection: int,
     rows: int,
     allow_trigger_toggle: bool,
 ) -> None:
-    """Insert throughput (rows/s), and what each trigger costs."""
+    """Enqueue throughput, and what NOTIFY costs at the commit lock."""
     target = resolve_target(pick(ctx, config, "config"), pick(ctx, dsn, "dsn"))
     result = asyncio.run(
         run_enqueue(
             target,
             rows=rows,
+            concurrency=concurrency,
+            jobs_per_connection=jobs_per_connection,
             repeat=repeat,
             warmup=warmup,
             allow_trigger_toggle=allow_trigger_toggle,
@@ -1823,24 +1864,70 @@ def enqueue_cmd(
             force=force,
         )
     )
+    emit(result, output_json, enqueue_table(result))
+
+
+def enqueue_table(result: dict[str, Any]) -> list[list[str]]:
+    """Lay the enqueue result out so the commit-lock story reads top-down."""
+    lock = result["notify_commit_lock"]
+
+    def pct(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:+.1f}%"
+
     table: list[list[str]] = [
-        ["rows per run", fmt(result["rows"])],
-        ["rows/s (as shipped)", fmt(result["rows_per_second"])],
+        [
+            "PRODUCTION enqueue",
+            f"{result['concurrency']} connections x "
+            f"{result['jobs_per_connection']} jobs, one txn per job",
+        ],
+        ["  as shipped", f"{lock['as_shipped_jobs_per_second']:,.0f} jobs/s"],
+        [
+            "  all NOTIFY triggers off",
+            f"{lock['no_notify_jobs_per_second']:,.0f} jobs/s (upper bound)",
+        ],
+        [
+            "  NOTIFY commit-lock cost",
+            (
+                "n/a (needs --allow-trigger-toggle)"
+                if lock["ratio"] is None
+                else f"{lock['cost_pct']:.0f}% of throughput lost "
+                f"({lock['ratio']:.2f}x ceiling)"
+            ),
+        ],
+        [
+            "  firehose off ONLY",
+            f"{pct(lock['firehose_only_recovery_pct'])} — 3 of 5 notifications "
+            "removed, ceiling unmoved: the lock is per COMMIT, not per NOTIFY",
+        ],
+        [
+            "  wakeup notify off ONLY",
+            pct(lock["wakeup_only_recovery_pct"]),
+        ],
         ["headroom vs 278/s", f"{result['headroom_vs_target_rate']:,.0f}x"],
     ]
-    for key, data in result["variants"].items():
-        if "skipped" in data:
-            table.append([key, data["skipped"]])
-            continue
+    for mode in ("serial_contrast", "bulk_contrast"):
+        data = result["modes"][mode]
         table.append(
             [
-                key,
-                f"{data['milliseconds']:,.0f} ms  "
-                f"{data['rows_per_second']:,.0f} rows/s  "
-                f"(spread {data['spread_pct']:.0f}%)",
+                f"CONTRAST {mode.removesuffix('_contrast')}",
+                f"{data['jobs_per_second']:,.0f} jobs/s over {data['jobs']:,} "
+                f"jobs — NOT production enqueue",
             ]
         )
-    emit(result, output_json, table)
+    for mode, data in result["modes"].items():
+        for key, variant in data["variants"].items():
+            if "skipped" in variant:
+                table.append([f"  {mode}/{key}", variant["skipped"]])
+                continue
+            table.append(
+                [
+                    f"  {mode}/{key}",
+                    f"{variant['milliseconds']:,.0f} ms  "
+                    f"{variant['jobs_per_second']:,.0f} jobs/s  "
+                    f"(spread {variant['spread_pct']:.0f}%)",
+                ]
+            )
+    return table
 
 
 @cli.command("claim")
@@ -2088,7 +2175,11 @@ def plans_cmd(
 @cli.command("all")
 @db_options
 @timing_options
-@click.option("--rows", default=20000, show_default=True, help="enqueue: rows per run")
+@click.option(
+    "--rows", default=20000, show_default=True, help="enqueue: bulk contrast rows"
+)
+@click.option("--concurrency", default=16, show_default=True, help="enqueue: connections")
+@click.option("--jobs-per-connection", default=100, show_default=True)
 @click.option("--claim-workers", default=8, show_default=True)
 @click.option("--claim-jobs", default=2000, show_default=True)
 @click.option("--e2e-jobs", default=200, show_default=True)
@@ -2108,6 +2199,8 @@ def all_cmd(
     repeat: int,
     warmup: bool,
     rows: int,
+    concurrency: int,
+    jobs_per_connection: int,
     claim_workers: int,
     claim_jobs: int,
     e2e_jobs: int,
@@ -2125,6 +2218,8 @@ def all_cmd(
             "enqueue": await run_enqueue(
                 target,
                 rows=rows,
+                concurrency=concurrency,
+                jobs_per_connection=jobs_per_connection,
                 repeat=repeat,
                 warmup=warmup,
                 allow_trigger_toggle=allow_trigger_toggle,
@@ -2168,8 +2263,22 @@ def all_cmd(
 
     results = asyncio.run(everything())
     results["healthy"] = results["plans"]["healthy"]
+    lock = results["enqueue"]["notify_commit_lock"]
     summary = [
-        ["enqueue rows/s", fmt(results["enqueue"]["rows_per_second"])],
+        [
+            f"enqueue jobs/s ({concurrency} conns, 1 txn/job)",
+            fmt(results["enqueue"]["jobs_per_second"]),
+        ],
+        [
+            "  NOTIFY commit-lock cost",
+            "n/a (needs --allow-trigger-toggle)"
+            if lock["ratio"] is None
+            else f"{lock['cost_pct']:.0f}% lost ({lock['ratio']:.2f}x ceiling)",
+        ],
+        [
+            "  CONTRAST bulk rows/s (one txn)",
+            fmt(results["enqueue"]["modes"]["bulk_contrast"]["jobs_per_second"]),
+        ],
         [
             "claim/s (uncapped)",
             fmt(results["claim"]["modes"]["uncapped"]["claims_per_second"]["median"]),
