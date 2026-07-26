@@ -52,6 +52,9 @@ COMMENT ON VIEW jorb_timeout_violations IS
     'The timeout monitor process uses this to identify jobs to terminate.';
 
 -- Create function to check for timed-out jobs
+-- (DROP first: the return type changed from JSON to JSONB to match the
+-- jorb.admin_data column, and CREATE OR REPLACE cannot change return types)
+DROP FUNCTION IF EXISTS check_timed_out_jobs(INT);
 CREATE OR REPLACE FUNCTION check_timed_out_jobs(batch_limit INT DEFAULT 100)
 RETURNS TABLE(
     job_id BIGINT,
@@ -59,7 +62,7 @@ RETURNS TABLE(
     overdue_seconds INT,
     action TEXT,
     error_count INT,
-    admin_data JSON
+    admin_data JSONB
 ) AS $$
 BEGIN
     RETURN QUERY
