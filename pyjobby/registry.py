@@ -163,9 +163,14 @@ def _attach_typed_enqueue(
         job_id = await enqueue(client, **kwargs)
         return JobHandle(id=job_id, client=client)
 
-    setattr(cls, "enqueue", staticmethod(enqueue))  # noqa: B010
-    setattr(cls, "enqueue_handle", staticmethod(enqueue_handle))  # noqa: B010
-    setattr(cls, "job_class_path", dotted)  # noqa: B010
+    # Deliberate metaprogramming: the decorator generates per-class enqueue
+    # helpers closed over this class's dotted path and task signature, so
+    # they must be installed on the class object itself. (Job declares
+    # job_class_path as a ClassVar; the enqueue helpers are dynamic by
+    # nature, hence the attr-defined waivers.)
+    cls.enqueue = staticmethod(enqueue)  # type: ignore[attr-defined]
+    cls.enqueue_handle = staticmethod(enqueue_handle)  # type: ignore[attr-defined]
+    cls.job_class_path = dotted
 
 
 def _register_job_class[J: Job](cls: type[J]) -> type[J]:

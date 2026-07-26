@@ -37,7 +37,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from multiprocessing import Process
-from typing import Any
+from typing import Any, ClassVar
 
 import asyncpg  # type: ignore[import-untyped]
 import click
@@ -281,6 +281,25 @@ class JobSystem:
     # their launcher is killed). 0 disables the check (direct/embedded use).
     _launcher_pid: int = 0
 
+    # --- runtime state (populated by run(); declared so every attribute
+    # exists from construction and is type-checked, never probed for) ---
+    cxn: asyncpg.Connection | None = None
+    stmts: dict[str, asyncpg.PreparedStatement] = field(default_factory=dict)
+    worker_id: int | None = None  # jorb_worker.id once registered
+    processed: int = 0
+    errors: int = 0
+    # wakeup + cancellation coordination
+    _wake: asyncio.Event = field(default_factory=asyncio.Event)
+    _current_job_id: int | None = None
+    _exec_task: asyncio.Task[Any] | None = None
+    _cancel_current: bool = False
+    # registry heartbeat runs on its own connection so a long job never
+    # delays liveness reporting
+    _hb_cxn: asyncpg.Connection | None = None
+    _hb_task: asyncio.Task[None] | None = None
+    # optional per-worker HTTP listener
+    _web_runner: web.ServerRunner | None = None
+
     async def ex(self, op: str, *args: Any) -> list[asyncpg.Record]:
         """Execute prepared statement ``op`` with *args, reconnecting (and
         re-preparing everything) if the connection was lost."""
@@ -301,8 +320,8 @@ class JobSystem:
     # ------------------------------------------------------------------
 
     async def _connect_and_prepare(self) -> None:
-        self.cxn: asyncpg.Connection = await db.connect(**self.dsn)
-        self.stmts: dict[str, asyncpg.PreparedStatement] = {
+        self.cxn = await db.connect(**self.dsn)
+        self.stmts = {
             name: await self.cxn.prepare(stmt) for name, stmt in STMTS.items()
         }
         await self._listen()
@@ -324,6 +343,7 @@ class JobSystem:
                 self._cancel_current = True
                 self._exec_task.cancel()
 
+        assert self.cxn is not None, "_listen requires an established connection"
         try:
             await self.cxn.add_listener("jorb_enqueued", _on_enqueue)
             await self.cxn.add_listener("jorb_cancel", _on_cancel)
@@ -336,8 +356,9 @@ class JobSystem:
         Retries until the database is reachable again (workers are long-lived
         daemons: losing the database is expected to be a transient
         condition)."""
-        with contextlib.suppress(Exception):
-            await self.cxn.close()
+        if self.cxn is not None:
+            with contextlib.suppress(Exception):
+                await self.cxn.close()
 
         while not self.stop:
             try:
@@ -356,10 +377,9 @@ class JobSystem:
     async def _register_worker(self) -> None:
         from pyjobby import __version__
 
-        self._hb_cxn: asyncpg.Connection | None = None
         try:
             self._hb_cxn = await db.connect(**self.dsn)
-            self.worker_id: int | None = await self._hb_cxn.fetchval(
+            self.worker_id = await self._hb_cxn.fetchval(
                 WORKER_REGISTER_SQL,
                 self.node,
                 self.pid,
@@ -367,9 +387,7 @@ class JobSystem:
                 list(self.capabilities),
                 __version__,
             )
-            self._hb_task: asyncio.Task[None] | None = asyncio.create_task(
-                self._heartbeat_loop()
-            )
+            self._hb_task = asyncio.create_task(self._heartbeat_loop())
         except (OSError, asyncpg.PostgresError) as e:
             logger.warning(f"Worker registry unavailable ({e}); running unregistered")
             self.worker_id = None
@@ -386,18 +404,16 @@ class JobSystem:
             await asyncio.sleep(self.heartbeat_interval)
 
     async def _deregister_worker(self) -> None:
-        hb_task = getattr(self, "_hb_task", None)
-        if hb_task is not None:
-            hb_task.cancel()
+        if self._hb_task is not None:
+            self._hb_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await hb_task
-        hb_cxn = getattr(self, "_hb_cxn", None)
-        if hb_cxn is not None:
+                await self._hb_task
+        if self._hb_cxn is not None:
             if self.worker_id is not None:
                 with contextlib.suppress(Exception):
-                    await hb_cxn.execute(WORKER_SHUTDOWN_SQL, self.worker_id)
+                    await self._hb_cxn.execute(WORKER_SHUTDOWN_SQL, self.worker_id)
             with contextlib.suppress(Exception):
-                await hb_cxn.close()
+                await self._hb_cxn.close()
 
     def shutdown(self, signum: int, frame: Any) -> None:
         """Request graceful shutdown - stop processing new jobs but finish current job."""
@@ -425,7 +441,6 @@ class JobSystem:
         return web.Response(text="not so fast!")
 
     async def _start_web_listener(self) -> None:
-        self._web_runner: web.ServerRunner | None = None
         if not (self.webPort and "sites" in self.webPort):
             return
         server = web.Server(self.webHandler)  # type: ignore
@@ -476,18 +491,10 @@ class JobSystem:
         await self._start_web_listener()
         await self._connect_and_prepare()
 
-        # wakeup + cancellation coordination
-        self._wake: asyncio.Event = asyncio.Event()
-        self._current_job_id: int | None = None
-        self._exec_task: asyncio.Task[Any] | None = None
-        self._cancel_current = False
-
         await self._register_worker()
 
         logger.info(f"[{self.qname}:{self.prio}] Connected and waiting for jobs!")
         prev: float = 0.0
-        self.processed: int = 0
-        self.errors: int = 0
         prev_status: float = time.perf_counter()
         prev_processed: int = 0
         sleepytime: bool = False  # skip initial sleep check
@@ -539,7 +546,7 @@ class JobSystem:
                     self.qname,
                     self.capabilities,
                     self.prio,
-                    getattr(self, "worker_id", None),
+                    self.worker_id,
                 )
 
                 if not jobs:
@@ -550,12 +557,12 @@ class JobSystem:
                 # dict copy so kwargs can be augmented before running
                 await self._process(dict(jobs[0]))
         finally:
-            web_runner = getattr(self, "_web_runner", None)
-            if web_runner is not None:
+            if self._web_runner is not None:
                 with contextlib.suppress(Exception):
-                    await web_runner.cleanup()  # release listen sockets
+                    await self._web_runner.cleanup()  # release listen sockets
             await self._deregister_worker()
-            await self.cxn.close()
+            if self.cxn is not None:
+                await self.cxn.close()
 
     # ------------------------------------------------------------------
     # per-job orchestration
@@ -602,7 +609,11 @@ class JobSystem:
             # timeout: admin_data override > class attribute > worker default
             job_timeout = admin_data.get("timeout_seconds")
             if job_timeout is None:
-                job_timeout = getattr(klass, "timeout", self.default_timeout)
+                # class attribute wins when set (0 disables the timeout),
+                # otherwise the worker default applies
+                job_timeout = (
+                    self.default_timeout if klass.timeout is None else klass.timeout
+                )
 
             if job_timeout:
                 await self.ex(
@@ -746,10 +757,10 @@ class JobSystem:
         )
 
         if retryable:
-            delay = await (klass or Job).rescheduleBackoff(
-                job,  # type: ignore[arg-type]
-                attempt,
-            )
+            # the class may have failed to load; the base Job knows how to
+            # compute backoff from the row alone
+            backoff_from = klass if klass is not None else Job(s=self, job=job)
+            delay = await backoff_from.rescheduleBackoff(attempt)
             retried = await self.ex("retry", jid, delay, error, backtrace, epoch)
             if retried:
                 logger.info(
@@ -801,6 +812,26 @@ class Job:
     s: JobSystem
     job: dict[str, Any]
 
+    #: Per-class execution timeout in seconds. Subclasses may override:
+    #: a number caps this job's runtime, 0 disables the timeout, and None
+    #: (the default) defers to the worker's --default-timeout.
+    timeout: ClassVar[int | None] = None
+
+    #: Set by the @job decorator when a class is registered.
+    job_class_path: ClassVar[str] = ""
+
+    # --- DXE state (bound by the worker before execution; declared so the
+    # attributes always exist and are type-checked) ---
+    _dxe_steps: dict[int, Any] = field(default_factory=dict)
+    _dxe_seq: int = 0
+    _dxe_epoch: int = 0
+
+    def __post_init__(self) -> None:
+        # a Job constructed outside the worker (tests, direct use) still has
+        # a coherent epoch to fence its checkpoint writes on
+        if isinstance(self.job, dict):
+            self._dxe_epoch = self.job.get("run_epoch", 0)
+
     # @abc.abstractmethod # can't use with @dataclass
     def task(self, *args: Any, **kwargs: Any) -> Any:
         """User-implemented task definition.
@@ -823,14 +854,11 @@ class Job:
     def _dxe_bind(self, checkpoints: list[Any], epoch: int) -> None:
         """Called by the worker before execution: attach recorded
         checkpoints and this attempt's fencing epoch."""
-        self._dxe_steps: dict[int, Any] = {row["step_seq"]: row for row in checkpoints}
-        self._dxe_seq: int = 0
-        self._dxe_epoch: int = epoch
+        self._dxe_steps = {row["step_seq"]: row for row in checkpoints}
+        self._dxe_seq = 0
+        self._dxe_epoch = epoch
 
     def _dxe_next_seq(self) -> int:
-        if not hasattr(self, "_dxe_seq"):
-            # constructed outside the worker (tests, direct use): bind empty
-            self._dxe_bind([], self.job.get("run_epoch", 0))
         self._dxe_seq += 1
         return self._dxe_seq
 
@@ -838,7 +866,7 @@ class Job:
     def cancelled(self) -> bool:
         """True once cancellation of this job has been requested (poll this
         from long sync loops; async code is cancelled at await points)."""
-        return bool(getattr(self.s, "_cancel_current", False))
+        return self.s._cancel_current
 
     async def step(self, name: str, fn: Any, *args: Any, **kwargs: Any) -> Any:
         """Execute ``fn(*args, **kwargs)`` as a durable, checkpointed step.
@@ -1018,47 +1046,24 @@ class Job:
             )
         return message
 
-    async def rescheduleBackoff(
-        self,
-        job: dict | int | None = None,
-        attempt: int | None = None,
-    ) -> datetime.timedelta:
-        """Calculate retry delay using configurable retry strategy from admin_data.
+    async def rescheduleBackoff(self, attempt: int | None = None) -> datetime.timedelta:
+        """Calculate this job's retry delay from its admin_data strategy.
 
-        Returns a timedelta for when the job should be retried.
-
-        If no 'attempt' count is given, use the current job's error_count.
-
-        Accepted call shapes (all supported):
-            instance.rescheduleBackoff()               # uses self.job
-            instance.rescheduleBackoff(attempt=3)
-            instance.rescheduleBackoff(3)              # attempt positionally
-            instance.rescheduleBackoff(job_dict, 3)
-            Job.rescheduleBackoff(job_dict, attempt=1) # class-style call
+        Args:
+            attempt: which attempt to compute the delay for; defaults to the
+                job's current error_count.
 
         Strategies: exponential (default), linear, fibonacci, fixed.
+        Subclasses may override to implement custom backoff policy.
 
-        NOTE: This method only CALCULATES the delay; it does not touch the
+        NOTE: This only CALCULATES the delay; it does not touch the
         database."""
         from .retry_strategies import calculate_retry_from_job
 
-        # normalize the accepted call shapes into (job, attempt)
-        if isinstance(job, int) and attempt is None:
-            job, attempt = None, job
-        if job is None:
-            if isinstance(self, Job):
-                job = self.job
-            elif hasattr(self, "get"):
-                # Job.rescheduleBackoff(job_dict, ...) class-style call
-                job = self
-            else:
-                job = {}
-
-        assert not isinstance(job, int)
         if attempt is None:
-            attempt = job.get("error_count", 0)
+            attempt = self.job.get("error_count", 0)
 
-        return calculate_retry_from_job(job, attempt)
+        return calculate_retry_from_job(self.job, attempt)
 
     async def reschedule(
         self,

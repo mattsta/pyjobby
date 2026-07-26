@@ -485,8 +485,8 @@ class TestRescheduleBackoffEdgeCases:
             "admin_data": {},  # No retry_strategy specified, will use default
         }
 
-        # Class-style call with attempt=None: uses error_count = 2
-        delay = await Job.rescheduleBackoff(job_dict, attempt=None)
+        # attempt=None: uses the job's error_count (2)
+        delay = await Job(s=None, job=job_dict).rescheduleBackoff(attempt=None)
 
         assert isinstance(delay, timedelta)
         assert delay.total_seconds() > 0, "Delay should be positive"
@@ -500,7 +500,7 @@ class TestRescheduleBackoffEdgeCases:
         }
 
         # Should use attempt=1, NOT error_count=5
-        delay = await Job.rescheduleBackoff(job_dict, attempt=1)
+        delay = await Job(s=None, job=job_dict).rescheduleBackoff(attempt=1)
 
         # With exponential and attempt=1, should be 1 second (2^0 = 1)
         assert delay.total_seconds() == 1.0, (
