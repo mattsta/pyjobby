@@ -44,9 +44,18 @@ class Migration:
 
 
 def available_migrations() -> list[Migration]:
-    """All migration files shipped with the package, ordered by version."""
+    """All migration files shipped with the package, ordered by version.
+
+    Schema v1 is the current baseline, so this is empty today; future
+    changes land as pyjobby/sql/migrations/NNN_*.sql files."""
+    migrations_dir = _SQL_ROOT / "migrations"
+    try:
+        entries = list(migrations_dir.iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+
     migrations = []
-    for entry in (_SQL_ROOT / "migrations").iterdir():
+    for entry in entries:
         m = _MIGRATION_NAME.match(entry.name)
         if m:
             migrations.append(
@@ -89,9 +98,6 @@ async def migrate(conn: asyncpg.Connection) -> list[int]:
     if not await conn.fetchval("SELECT to_regclass('public.jorb')"):
         logger.info("Installing base schema (jorb table not found)")
         await conn.execute(base_schema_sql())
-        # the pg_dump'd schema file empties search_path on this session;
-        # restore it so the unqualified migration SQL below resolves
-        await conn.execute("SET search_path TO public")
 
     done = await applied_versions(conn)
     applied = []
