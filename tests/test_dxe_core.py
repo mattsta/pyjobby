@@ -59,7 +59,10 @@ async def test_retries_reuse_row_and_dead_letter(live_worker, unique_queue, db_p
     row = await wait_for_job_state(db_pool, job_id, ("crashed",))
     # terminal 'crashed' IS the DLQ; the job kept one id across attempts
     assert row["error_count"] == 2
-    assert row["run_epoch"] == 2
+    # run_count is the attempt counter; run_epoch is only a monotonic fence
+    # (it also advances on the retry that abandons an attempt)
+    assert row["run_count"] == 2
+    assert row["run_epoch"] >= 2
     assert "intentional failure" in row["error_message"]
 
     attempts = await db_pool.fetchval(

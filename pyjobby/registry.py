@@ -36,6 +36,12 @@ signature (``self`` and the worker-injected ``upstream_result`` are
 ignored). An option name therefore shadows any task parameter of the same
 name — pick different names for task parameters.
 
+The helpers belong to the class they were generated for: decorate every
+subclass you enqueue (an inherited ``enqueue`` is refused rather than
+silently enqueueing the parent's job_class), and since the worker invokes
+``task(**kwargs)``, a task with a REQUIRED positional-only parameter is
+rejected at decoration time — nothing could ever supply it.
+
 Tooling access:
 
     from pyjobby.registry import registry
@@ -116,12 +122,48 @@ def _validate_task_kwargs(
         ) from None
 
 
+def _check_enqueueable_signature(dotted: str, signature: inspect.Signature) -> None:
+    """Reject a task whose required arguments can never be supplied.
+
+    The worker invokes ``task(**kwargs)``, so a required POSITIONAL-ONLY
+    parameter is unsatisfiable: enqueue could only ever omit it and the job
+    would crash inside a worker. Fail at decoration time instead."""
+    unsatisfiable = [
+        p.name
+        for name, p in signature.parameters.items()
+        if name not in _IGNORED_TASK_PARAMS
+        and p.kind is inspect.Parameter.POSITIONAL_ONLY
+        and p.default is inspect.Parameter.empty
+    ]
+    if unsatisfiable:
+        raise TypeError(
+            f"{dotted}: positional-only parameters {unsatisfiable} can never be "
+            "supplied — jobs are invoked with keyword arguments only"
+        )
+
+
+def _reject_inherited_enqueue(caller: type[Job], owner: type[Job], dotted: str) -> None:
+    """Refuse a typed enqueue reached through an undecorated subclass.
+
+    The helpers are generated per class and closed over that class's dotted
+    path and task signature, so an inherited one would enqueue the PARENT's
+    job_class (running the wrong code) and validate against the parent's
+    signature."""
+    if caller is not owner:
+        raise TypeError(
+            f"{caller.__module__}.{caller.__qualname__} inherits the typed enqueue "
+            f"of {dotted}; decorate it with @job so it enqueues itself"
+        )
+
+
 def _attach_typed_enqueue(
     cls: type[Job], dotted: str, signature: inspect.Signature
 ) -> None:
-    """Attach validated `enqueue` / `enqueue_handle` staticmethods to cls."""
+    """Attach validated `enqueue` / `enqueue_handle` classmethods to cls."""
+    _check_enqueueable_signature(dotted, signature)
 
     async def enqueue(
+        caller: type[Job],
         client: JobClient,
         *,
         queue: str = "default",
@@ -139,8 +181,10 @@ def _attach_typed_enqueue(
         """Enqueue this job with kwargs validated against its task signature.
 
         Raises TypeError (before any database work) when **task_kwargs has
-        unknown or missing required parameters.
+        unknown or missing required parameters, or when reached through an
+        undecorated subclass.
         """
+        _reject_inherited_enqueue(caller, cls, dotted)
         _validate_task_kwargs(dotted, signature, task_kwargs)
         return await client.enqueue(
             dotted,
@@ -157,19 +201,23 @@ def _attach_typed_enqueue(
             **task_kwargs,
         )
 
-    async def enqueue_handle(client: JobClient, **kwargs: Any) -> JobHandle:
+    async def enqueue_handle(
+        caller: type[Job], client: JobClient, **kwargs: Any
+    ) -> JobHandle:
         """Like enqueue() (same options + validated task kwargs) but returns
         a JobHandle for waiting/cancelling/event access."""
-        job_id = await enqueue(client, **kwargs)
+        job_id: int = await caller.enqueue(client, **kwargs)  # type: ignore[attr-defined]
         return JobHandle(id=job_id, client=client)
 
     # Deliberate metaprogramming: the decorator generates per-class enqueue
     # helpers closed over this class's dotted path and task signature, so
-    # they must be installed on the class object itself. (Job declares
+    # they must be installed on the class object itself. They are
+    # classmethods so a call through an undecorated subclass is visible (and
+    # refused) instead of silently enqueueing the parent. (Job declares
     # job_class_path as a ClassVar; the enqueue helpers are dynamic by
     # nature, hence the attr-defined waivers.)
-    cls.enqueue = staticmethod(enqueue)  # type: ignore[attr-defined]
-    cls.enqueue_handle = staticmethod(enqueue_handle)  # type: ignore[attr-defined]
+    cls.enqueue = classmethod(enqueue)  # type: ignore[attr-defined]
+    cls.enqueue_handle = classmethod(enqueue_handle)  # type: ignore[attr-defined]
     cls.job_class_path = dotted
 
 

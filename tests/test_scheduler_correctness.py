@@ -1,0 +1,190 @@
+"""Regression tests for recurring-scheduler correctness.
+
+Each test here pins a property the scheduler got wrong: an execution-log
+timestamp that was off by the database server's UTC offset, a schedule whose
+cron expression cannot be evaluated wedging the poll loop forever, and a
+stop() that only took effect a whole poll interval later.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import time
+import uuid
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from pyjobby.scheduler import (
+    ScheduleExecutionResult,
+    ScheduleManager,
+    SchedulerWorker,
+)
+
+pytestmark = pytest.mark.asyncio
+
+
+async def _insert_schedule(conn, *, cron_expr: str, timezone: str = "UTC") -> int:
+    """Insert a schedule row directly, bypassing validation.
+
+    Schedules can reach this state through a hand-edited row or a cron
+    expression that a newer croniter no longer accepts.
+    """
+    schedule_id: int = await conn.fetchval(
+        """
+        INSERT INTO jorb_schedule (name, job_class, cron_expr, timezone, next_run)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id
+        """,
+        f"correctness-{uuid.uuid4().hex[:8]}",
+        f"test.Job_{uuid.uuid4().hex[:8]}",
+        cron_expr,
+        timezone,
+        datetime.now(UTC) - timedelta(minutes=5),
+    )
+    return schedule_id
+
+
+async def _run_one_pass(worker: SchedulerWorker) -> None:
+    task = asyncio.create_task(worker.run())
+    await asyncio.sleep(0.4)
+    worker.stop()
+    try:
+        await asyncio.wait_for(task, timeout=5.0)
+    except TimeoutError:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+class TestExecutionLogTimestamps:
+    async def test_actual_time_is_the_real_instant(self, db_connection):
+        """actual_time is timestamptz, so it must be written aware.
+
+        asyncpg encodes a NAIVE datetime for a timestamptz column by reading
+        it in the SERVER's time zone. datetime.utcnow() is naive, so every
+        jorb_schedule_log row was displaced by the server's UTC offset --
+        invisible on a UTC server, hours wrong on any other.
+        """
+        # Pin a non-UTC server zone so the defect cannot hide behind the
+        # local postgres configuration (rolled back with the test's txn).
+        await db_connection.execute("SET TIME ZONE 'America/New_York'")
+
+        schedule_id = await _insert_schedule(db_connection, cron_expr="* * * * *")
+        schedule = dict(
+            await db_connection.fetchrow(
+                "SELECT * FROM jorb_schedule WHERE id = $1", schedule_id
+            )
+        )
+
+        worker = SchedulerWorker(db_connection)
+        await worker.log_execution(
+            schedule,
+            schedule["next_run"],
+            ScheduleExecutionResult(result="success", job_id=1),
+        )
+
+        actual_time, server_now = await db_connection.fetchrow(
+            "SELECT actual_time, now() FROM jorb_schedule_log WHERE schedule_id = $1",
+            schedule_id,
+        )
+        assert abs(actual_time - server_now) < timedelta(seconds=10)
+
+
+class TestUnevaluatableSchedule:
+    async def test_broken_cron_disables_the_schedule(self, db_pool):
+        """A schedule whose cron cannot be evaluated must fail loudly, once.
+
+        next_run was advanced at the END of the firing transaction, so an
+        unevaluatable expression rolled the whole transaction back: no job,
+        no log row, no failure counted, and next_run still in the past. The
+        schedule was then re-selected and re-failed on every single poll,
+        forever, without leaving a trace anywhere an operator would look.
+        """
+        async with db_pool.acquire() as conn:
+            schedule_id = await _insert_schedule(conn, cron_expr="not a cron")
+            before = await conn.fetchrow(
+                "SELECT next_run, run_count FROM jorb_schedule WHERE id = $1",
+                schedule_id,
+            )
+
+            worker = SchedulerWorker(conn, poll_interval=0.05)
+            await _run_one_pass(worker)
+
+            after = await conn.fetchrow(
+                "SELECT * FROM jorb_schedule WHERE id = $1", schedule_id
+            )
+            assert after["enabled"] is False
+            assert after["failure_count"] == 1
+            assert after["consecutive_failures"] == 1
+            assert after["run_count"] == before["run_count"] + 1
+            assert after["next_run"] == before["next_run"]
+
+            log = await conn.fetch(
+                "SELECT * FROM jorb_schedule_log WHERE schedule_id = $1", schedule_id
+            )
+            assert len(log) == 1
+            assert log[0]["result"] == "failure"
+            assert "not a cron" in log[0]["error_message"]
+
+    async def test_broken_timezone_disables_the_schedule(self, db_pool):
+        """Same handling for a timezone the platform cannot resolve."""
+        async with db_pool.acquire() as conn:
+            schedule_id = await _insert_schedule(
+                conn, cron_expr="* * * * *", timezone="Mars/Olympus_Mons"
+            )
+
+            worker = SchedulerWorker(conn, poll_interval=0.05)
+            await _run_one_pass(worker)
+
+            after = await conn.fetchrow(
+                "SELECT * FROM jorb_schedule WHERE id = $1", schedule_id
+            )
+            assert after["enabled"] is False
+            assert after["failure_count"] == 1
+
+    async def test_working_schedule_still_advances(self, db_pool):
+        """The guard must not disturb a schedule that evaluates fine."""
+        async with db_pool.acquire() as conn:
+            schedule_id = await _insert_schedule(conn, cron_expr="* * * * *")
+
+            worker = SchedulerWorker(conn, poll_interval=0.05)
+            await _run_one_pass(worker)
+
+            after = await conn.fetchrow(
+                "SELECT * FROM jorb_schedule WHERE id = $1", schedule_id
+            )
+            assert after["enabled"] is True
+            assert after["success_count"] >= 1
+            assert after["next_run"] > datetime.now(UTC)
+            expected = ScheduleManager.calculate_next_run("* * * * *", "UTC")
+            assert after["next_run"] <= expected
+
+
+class TestGracefulShutdown:
+    async def test_stop_interrupts_the_poll_sleep(self, db_pool):
+        """stop() must cut the poll sleep short.
+
+        The loop only re-read stop_requested after a full asyncio.sleep(
+        poll_interval), so SIGTERM took up to a whole poll interval to take
+        effect -- long enough for an orchestrator to escalate to SIGKILL
+        while the scheduler was between polls.
+        """
+        async with db_pool.acquire() as conn:
+            worker = SchedulerWorker(conn, poll_interval=30)
+
+            task = asyncio.create_task(worker.run())
+            await asyncio.sleep(0.2)  # let it reach the sleep
+
+            started = time.monotonic()
+            worker.stop()
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except TimeoutError:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                pytest.fail("run() did not return after stop()")
+
+            assert time.monotonic() - started < 5.0

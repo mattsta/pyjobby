@@ -272,13 +272,18 @@ class JobClient:
         return cls(pool, db_params=db_params)
 
     async def close(self) -> None:
-        """Close the shared LISTEN connection (if open) and the pool."""
+        """Close the shared LISTEN connection (if open) and the pool.
+
+        Holds the listener lock so a wait starting concurrently cannot open a
+        replacement listener that nothing would ever close.
+        """
         if not self._closed:
             self._closed = True
-            if self._listener_conn is not None:
-                with contextlib.suppress(Exception):
-                    await self._listener_conn.close()
-                self._listener_conn = None
+            async with self._listener_lock:
+                if self._listener_conn is not None:
+                    with contextlib.suppress(Exception):
+                        await self._listener_conn.close()
+                    self._listener_conn = None
             await self.pool.close()
 
     async def __aenter__(self) -> JobClient:
@@ -696,7 +701,11 @@ class JobClient:
 
     async def retry_job(self, job_id: int) -> int | None:
         """
-        Retry a crashed/cancelled/finished job by requeuing it.
+        Retry a job that did not succeed (crashed or cancelled).
+
+        A job that already FINISHED is deliberately not retriable — re-running
+        successful work repeats its side effects (see db.rerun_job, the
+        operator verb for that).
 
         The job keeps its id (retries reuse the same row; per-attempt
         history lives in jorb_history).
@@ -730,20 +739,29 @@ class JobClient:
         """Lazily open the single shared LISTEN connection.
 
         Returns True when the listener is available, False when the client
-        was constructed without db_params (pure-polling mode).
+        was constructed without db_params (pure-polling mode) or has been
+        closed — a closed client must never open new connections.
         """
-        if self._db_params is None:
+        if self._db_params is None or self._closed:
             return False
         if self._listener_conn is not None and not self._listener_conn.is_closed():
             return True
         async with self._listener_lock:
+            if self._closed:
+                return False
             if self._listener_conn is None or self._listener_conn.is_closed():
                 if isinstance(self._db_params, str):
                     conn = await db.connect(self._db_params)
                 else:
                     conn = await db.connect(**self._db_params)
-                await conn.add_listener("jorb_done", self._on_jorb_done)
-                await conn.add_listener("jorb_event", self._on_jorb_event)
+                try:
+                    await conn.add_listener("jorb_done", self._on_jorb_done)
+                    await conn.add_listener("jorb_event", self._on_jorb_event)
+                except BaseException:
+                    # never leak the half-registered connection
+                    with contextlib.suppress(Exception):
+                        await conn.close()
+                    raise
                 self._listener_conn = conn
         return True
 
@@ -1117,18 +1135,23 @@ class JobClient:
 
     async def get_job_result(self, job_id: int) -> Any | None:
         """
-        Get job result.
+        Get a finished job's stored result without waiting.
+
+        The stored result is whatever the job returned, so it may legitimately
+        be falsy (0, False, [], "") or None — those are returned as-is, the
+        same values wait_for_result() yields. None therefore means "no result
+        to read" only when the job is absent or not finished; use get_job()
+        to tell the two apart.
 
         Args:
             job_id: Job ID
 
         Returns:
-            Job result (parsed from JSON), or None if not finished or no result
+            The job's result, or None if the job does not exist / has not
+            finished
 
         Example:
             result = await client.get_job_result(12345)
-            if result:
-                print(f"Job returned: {result}")
         """
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -1140,14 +1163,13 @@ class JobClient:
                 job_id,
             )
 
-        if not row or row["state"] != "finished" or not row["result"]:
+        if row is None or row["state"] != "finished":
             return None
 
-        # Result is stored as JSON
-        result = row["result"]
-        if isinstance(result, str):
-            return json.loads(result)
-        return result
+        # jsonb comes back already decoded (every pyjobby connection registers
+        # the JSON codecs), so a string result is the job's string, not JSON
+        # text waiting to be parsed a second time.
+        return row["result"]
 
     async def delete_job(self, job_id: int) -> bool:
         """
@@ -1459,13 +1481,18 @@ class JobClient:
 
     async def bulk_cancel(self, job_ids: list[int]) -> int:
         """
-        Cancel multiple jobs.
+        Cancel multiple jobs — cancel_job() applied to each id.
+
+        Claimed/running jobs get a cancellation request delivered to their
+        worker exactly as the single-job verb does; only terminal and missing
+        jobs are skipped.
 
         Args:
             job_ids: List of job IDs to cancel
 
         Returns:
-            Number of jobs cancelled
+            How many jobs accepted cancellation (cancelled outright or
+            cancellation requested)
 
         Example:
             cancelled = await client.bulk_cancel([123, 456, 789])
@@ -1475,31 +1502,24 @@ class JobClient:
             return 0
 
         async with self.pool.acquire() as conn:
-            result = await conn.execute(
-                """
-                UPDATE jorb
-                SET state = 'cancelled'
-                WHERE id = ANY($1::bigint[])
-                  AND state IN ('queued', 'waiting')
-            """,
-                job_ids,
-            )
+            outcomes = [await db.cancel_job(conn, job_id) for job_id in job_ids]
 
-        return int(result.split()[-1]) if result.split()[-1].isdigit() else 0
+        return sum(outcome is not None for outcome in outcomes)
 
     async def bulk_retry(self, job_ids: list[int]) -> list[int]:
         """
-        Retry multiple failed jobs.
+        Retry multiple jobs — retry_job() applied to each id.
 
         Args:
             job_ids: List of job IDs to retry
 
         Returns:
-            List of new job IDs
+            The ids that were requeued (jobs keep their id across retries),
+            omitting any that were not in a retryable state
 
         Example:
-            new_job_ids = await client.bulk_retry([123, 456, 789])
-            print(f"Created {len(new_job_ids)} retry jobs")
+            requeued = await client.bulk_retry([123, 456, 789])
+            print(f"Requeued {len(requeued)} jobs")
         """
         if not job_ids:
             return []

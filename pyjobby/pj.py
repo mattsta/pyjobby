@@ -131,8 +131,12 @@ STMTS["finished"] = """UPDATE jorb
 
 # Same-row retry: back into the queue with backoff; jorb_history holds the
 # per-attempt audit trail (recorded by trigger on the state change).
+# Bumps run_epoch so the attempt being abandoned is fenced out immediately --
+# a timed-out task may still be executing, and checkpoint writes are guarded
+# by the epoch alone.
 STMTS["retry"] = """UPDATE jorb
               SET state = 'queued',
+                  run_epoch = run_epoch + 1,
                   run_after = now() + $2::interval,
                   error_message = $3,
                   error_backtrace = $4,

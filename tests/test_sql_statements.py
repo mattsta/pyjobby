@@ -201,22 +201,34 @@ class TestClaimStatement:
         # one in flight already: the cap blocks a second claim
         assert await claim(db_connection, unique_queue) is None
 
-    async def test_claim_bumps_epoch_every_claim(self, db_connection, unique_queue):
-        """Each claim of the SAME row increments run_epoch (fencing token)."""
+    async def test_epoch_advances_whenever_the_job_leaves_or_enters_an_attempt(
+        self, db_connection, unique_queue
+    ):
+        """run_epoch is a fencing token, not an attempt counter.
+
+        It advances on claim AND on the retry that abandons an attempt, so an
+        execution the platform has given up on is fenced out the moment it is
+        abandoned rather than when the next worker happens to claim. The
+        attempt number is run_count.
+        """
         job_id = await create_job(
             db_connection, queue=unique_queue, state="queued", run_after=past()
         )
 
         first = await claim(db_connection, unique_queue)
         assert first["run_epoch"] == 1
+        assert first["run_count"] == 1
 
-        # same-row retry back into the queue, then claim again
-        await db_connection.execute(
+        # same-row retry back into the queue: the abandoned attempt is fenced
+        # out immediately, before anything re-claims the row
+        requeued = await db_connection.fetchrow(
             STMTS["retry"], job_id, timedelta(seconds=-1), "boom", "trace", 1
         )
+        assert requeued["run_epoch"] > first["run_epoch"]
+
         second = await claim(db_connection, unique_queue)
         assert second["id"] == job_id
-        assert second["run_epoch"] == 2
+        assert second["run_epoch"] > requeued["run_epoch"]
         assert second["run_count"] == 2
 
 
@@ -648,7 +660,9 @@ class TestHistoryTrigger:
         )
         assert detail["error"] == "kapow"
         assert detail["error_count"] == 1
-        assert detail["run_epoch"] == 1
+        # the history row records the epoch AFTER the retry advanced the
+        # fence -- the attempt that failed has already been superseded
+        assert detail["run_epoch"] > 1
 
 
 @pytest.mark.slow
@@ -726,15 +740,18 @@ class TestSQLStatementIntegration:
         for attempt in range(1, 4):
             claimed = await claim(db_connection, unique_queue)
             assert claimed["id"] == job_id
-            assert claimed["run_epoch"] == attempt
-            await db_connection.execute(
+            # run_count is the attempt number; run_epoch only ever increases
+            assert claimed["run_count"] == attempt
+            assert claimed["run_epoch"] >= attempt
+            requeued = await db_connection.fetchrow(
                 STMTS["retry"],
                 job_id,
                 timedelta(seconds=-1),  # immediately claimable again
                 f"Error {attempt}",
                 "Traceback",
-                attempt,
+                claimed["run_epoch"],  # the fence: this attempt's own epoch
             )
+            assert requeued is not None, "the retry must apply at the live epoch"
 
         job = await get_job(db_connection, job_id)
         assert job["error_count"] == 3

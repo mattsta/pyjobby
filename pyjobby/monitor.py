@@ -15,6 +15,11 @@ recovery:
 3. **Unregistered-claim reclaim**: jobs stuck in 'claimed' with no registry
    reference past a grace period (a worker died between claim and register,
    or the registry was unavailable).
+4. **Retention**: terminal jobs (and their checkpoints, history, events and
+   mailbox) older than ``--retention-days`` are deleted. Opt-in and off by
+   default — a platform that runs indefinitely otherwise accumulates every
+   checkpoint and every state transition forever, but no fresh install may
+   silently start destroying an operator's audit trail.
 
 Requeues bump nothing themselves: the next claim increments ``run_epoch``,
 which fences any still-running stale execution out of the row.
@@ -28,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+from collections.abc import Awaitable, Callable
 
 import asyncpg  # type: ignore[import-untyped]
 from loguru import logger
@@ -146,6 +152,13 @@ async def sweep_dead_workers(
     """Requeue in-flight jobs owned by workers whose heartbeat went stale,
     and retire those workers from the registry.
 
+    Liveness is the heartbeat and nothing else: a job still 'claimed' or
+    'running' behind a stale ``last_seen`` is orphaned whether or not the
+    worker managed to stamp ``shutdown_at`` on the way out. Requiring the
+    worker to still look live would strand exactly the jobs that need
+    recovery — those of a worker that deregistered (or was retired by an
+    earlier sweep) while a job was still in flight.
+
     Single atomic statements; safe with concurrent monitor instances."""
     grace = datetime.timedelta(seconds=liveness_grace_seconds)
 
@@ -160,7 +173,6 @@ async def sweep_dead_workers(
             SELECT j.id FROM jorb j
             JOIN jorb_worker w ON w.id = j.claimed_by
             WHERE j.state IN ('claimed', 'running')
-              AND w.shutdown_at IS NULL
               AND w.last_seen < now() - $1::interval
             FOR UPDATE OF j SKIP LOCKED
             LIMIT $2
@@ -237,36 +249,176 @@ async def sweep_unregistered_claims(
     return len(requeued)
 
 
+#: The states a job never leaves. Only these are ever eligible for deletion:
+#: a queued/claimed/running/waiting job is live work however old it looks
+#: (a job parked on a dependency can legitimately outlive any window).
+TERMINAL_STATES = ("finished", "crashed", "cancelled")
+
+
+async def sweep_expired_jobs(
+    pool: asyncpg.Pool,
+    retention_days: float,
+    batch_size: int = 1000,
+) -> int:
+    """Delete terminal jobs whose retention window has elapsed.
+
+    Eligibility is state first, age second: only ``TERMINAL_STATES`` rows are
+    considered, and their age is ``finished`` — the terminal timestamp every
+    completion, crash and cancellation path stamps. ``updated`` stands in when
+    ``finished`` is somehow NULL so a terminal row can never become immortal
+    and leak.
+
+    Jobs an unfinished job is still parked on are kept regardless of age:
+    ``waitfor_job``/``waitfor_group`` carry no foreign key, so deleting the
+    upstream would strand the waiter in 'waiting' forever — nothing but the
+    upstream's own terminal transition ever wakes it.
+
+    jorb_step, jorb_event and jorb_mailbox follow via ON DELETE CASCADE.
+    jorb_history does NOT — it references jorb.job_id with no foreign key at
+    all (it outlives the job on purpose in the schema), so it is deleted here
+    explicitly, in the same transaction, or retention would free the small
+    tables and leave the largest one growing.
+
+    Bounded and batched like the other sweeps: one bite of ``batch_size`` per
+    call, holding only those rows' locks. FOR UPDATE SKIP LOCKED makes
+    concurrent monitors partition the backlog instead of colliding on it.
+    Returns the number of jobs deleted."""
+    retention = datetime.timedelta(days=retention_days)
+
+    async with pool.acquire() as conn, conn.transaction():
+        expired = await conn.fetch(
+            """
+            SELECT j.id
+            FROM jorb j
+            WHERE j.state = ANY($1::jorbstate[])
+              AND COALESCE(j.finished, j.updated) < now() - $2::interval
+              AND NOT EXISTS (
+                  SELECT 1 FROM jorb w
+                  WHERE w.state = 'waiting' AND w.waitfor_job = j.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM jorb w
+                  WHERE w.state = 'waiting' AND w.waitfor_group = j.run_group
+              )
+            ORDER BY j.id
+            FOR UPDATE OF j SKIP LOCKED
+            LIMIT $3
+            """,
+            TERMINAL_STATES,
+            retention,
+            batch_size,
+        )
+        if not expired:
+            return 0
+
+        job_ids = [row["id"] for row in expired]
+        await conn.execute(
+            "DELETE FROM jorb_history WHERE job_id = ANY($1::bigint[])", job_ids
+        )
+        await conn.execute("DELETE FROM jorb WHERE id = ANY($1::bigint[])", job_ids)
+
+    logger.info(f"Retention deleted {len(job_ids)} expired jobs")
+    return len(job_ids)
+
+
+async def sweep_consumed_mailbox(
+    pool: asyncpg.Pool,
+    retention_days: float,
+    batch_size: int = 1000,
+) -> int:
+    """Delete consumed mailbox messages older than the retention window.
+
+    The job-scoped cascade cannot reach these: ``recv`` only stamps
+    ``consumed_at``, so a long-lived job — a durable workflow that runs for
+    months, or a never-terminating one — keeps every message it ever read.
+    A consumed message is unreadable (``recv`` filters ``consumed_at IS
+    NULL``) and referenced by nothing, so age is the only thing to decide on.
+
+    Single atomic statement; safe with concurrent monitor instances."""
+    retention = datetime.timedelta(days=retention_days)
+
+    deleted = await pool.fetch(
+        """
+        DELETE FROM jorb_mailbox
+        WHERE id IN (
+            SELECT id FROM jorb_mailbox
+            WHERE consumed_at IS NOT NULL
+              AND consumed_at < now() - $1::interval
+            ORDER BY id
+            FOR UPDATE SKIP LOCKED
+            LIMIT $2
+        )
+        RETURNING id
+        """,
+        retention,
+        batch_size,
+    )
+
+    if deleted:
+        logger.info(f"Retention deleted {len(deleted)} consumed mailbox messages")
+    return len(deleted)
+
+
+async def _run_sweep(name: str, sweep: Callable[[], Awaitable[int]]) -> int:
+    """Run one sweep, containing its failure to itself.
+
+    The sweeps are independent safety nets: a database error while handling a
+    timed-out job must not also cancel dead-worker recovery for that cycle
+    (nor kill the daemon), so each one reports and returns 0 on failure."""
+    try:
+        return await sweep()
+    except Exception:
+        logger.exception(f"Monitor sweep {name} failed")
+        return 0
+
+
 async def monitor(
     dsn: str,
     check_interval: float = 10,
     batch_size: int = 100,
     liveness_grace_seconds: float = 60,
     claimed_grace_seconds: float = 300,
+    retention_days: float | None = None,
+    retention_batch_size: int = 1000,
 ) -> None:
-    """Run all sweeps every ``check_interval`` seconds, forever."""
+    """Run all sweeps every ``check_interval`` seconds, forever.
+
+    ``retention_days=None`` (the default) disables the retention sweeps
+    entirely — nothing is deleted unless an operator asks for it."""
     pool = await db.create_pool(dsn, min_size=1, max_size=2)
 
     logger.info(
         f"Monitor started (interval {check_interval}s, "
-        f"liveness grace {liveness_grace_seconds}s)"
+        f"liveness grace {liveness_grace_seconds}s, retention "
+        f"{f'{retention_days}d' if retention_days is not None else 'disabled'})"
     )
 
     try:
         while True:
-            try:
-                timed_out = await sweep_timed_out_jobs(pool, batch_size)
-                if timed_out:
-                    logger.info(f"Handled {timed_out} timed-out jobs")
+            timed_out = await _run_sweep(
+                "timed-out jobs", lambda: sweep_timed_out_jobs(pool, batch_size)
+            )
+            if timed_out:
+                logger.info(f"Handled {timed_out} timed-out jobs")
 
-                await sweep_dead_workers(pool, liveness_grace_seconds)
-                await sweep_unregistered_claims(pool, claimed_grace_seconds)
+            await _run_sweep(
+                "dead workers",
+                lambda: sweep_dead_workers(pool, liveness_grace_seconds),
+            )
+            await _run_sweep(
+                "unregistered claims",
+                lambda: sweep_unregistered_claims(pool, claimed_grace_seconds),
+            )
 
-            except Exception as e:
-                import traceback
-
-                logger.error(
-                    f"Monitor error: {e}\nFull traceback: {traceback.format_exc()}"
+            if retention_days is not None:
+                days = retention_days
+                await _run_sweep(
+                    "expired jobs",
+                    lambda: sweep_expired_jobs(pool, days, retention_batch_size),
+                )
+                await _run_sweep(
+                    "consumed mailbox",
+                    lambda: sweep_consumed_mailbox(pool, days, retention_batch_size),
                 )
 
             await asyncio.sleep(check_interval)
@@ -307,12 +459,27 @@ def cli() -> None:
         show_default=True,
         help="Age before an unregistered 'claimed' job counts as abandoned",
     )
+    @click.option(
+        "--retention-days",
+        type=float,
+        default=None,
+        help="Delete terminal jobs (and their history/checkpoints/events/"
+        "mailbox) older than this. Omit to keep everything forever.",
+    )
+    @click.option(
+        "--retention-batch-size",
+        default=1000,
+        show_default=True,
+        help="Maximum jobs deleted per retention sweep",
+    )
     def main(
         dsn: str | None,
         config: str | None,
         check_interval: float,
         liveness_grace: float,
         claimed_grace: float,
+        retention_days: float | None,
+        retention_batch_size: int,
     ) -> None:
         """Run the pyjobby monitor (timeouts + dead-worker recovery)."""
         import asyncio
@@ -338,6 +505,8 @@ def cli() -> None:
 
         click.echo(f"Starting monitor (check every {check_interval}s)...")
         click.echo(f"DSN: {dsn.split('@')[1] if '@' in dsn else dsn}")
+        if retention_days is not None:
+            click.echo(f"Retention: deleting terminal jobs older than {retention_days}d")
 
         asyncio.run(
             monitor(
@@ -345,6 +514,8 @@ def cli() -> None:
                 check_interval=check_interval,
                 liveness_grace_seconds=liveness_grace,
                 claimed_grace_seconds=claimed_grace,
+                retention_days=retention_days,
+                retention_batch_size=retention_batch_size,
             )
         )
 

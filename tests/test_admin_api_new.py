@@ -1117,7 +1117,7 @@ class TestAdminAPIScheduleManagement:
                 await api.create_schedule(
                     name=name, job_class="InvalidCronJob", cron_expr="invalid cron"
                 )
-            assert "Invalid cron" in str(excinfo.value)
+            assert "malformed cron expression" in str(excinfo.value)
 
     @pytest.mark.asyncio
     async def test_update_schedule(self, db_pool):

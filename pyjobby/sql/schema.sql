@@ -7,7 +7,8 @@
 --   * every json payload is JSONB, NOT NULL, defaulting to '{}'
 --   * priorities: LOWER numbers are MORE urgent; workers claim prio <= ceiling
 --   * job identity is stable across retries: a retry requeues the SAME row
---     with run_epoch+1 (checkpoints and history reference one job id forever)
+--     and advances run_epoch (checkpoints and history reference one job id
+--     forever; run_count, not run_epoch, counts attempts)
 --   * 'crashed' is TERMINAL: the job exhausted its retries (the DLQ is
 --     `WHERE state = 'crashed'`, not a heuristic)
 -- ============================================================================
@@ -51,7 +52,7 @@ CREATE TABLE jorb (
     error_count     INTEGER     NOT NULL DEFAULT 0,
     error_message   TEXT,
     error_backtrace TEXT,
-    run_epoch       INTEGER     NOT NULL DEFAULT 0,  -- fencing token, +1 per claim
+    run_epoch       INTEGER     NOT NULL DEFAULT 0,  -- fencing token (see COMMENT)
     cancel_requested BOOLEAN    NOT NULL DEFAULT FALSE,
 
     -- who has it
@@ -72,7 +73,7 @@ CREATE TABLE jorb (
 COMMENT ON TABLE jorb IS 'Jobs. One row per job for its whole life; retries re-queue the same row.';
 COMMENT ON COLUMN jorb.prio IS 'Lower numbers are more urgent; workers claim jobs with prio <= their ceiling.';
 COMMENT ON COLUMN jorb.claimed_at IS 'When this attempt was admitted by a worker. Rate limits count admissions, not execution starts: started is written after the claim commits, so counting it lets a claim miss the claim before it.';
-COMMENT ON COLUMN jorb.run_epoch IS 'Fencing token: incremented on each claim; stale executions may not write results or checkpoints.';
+COMMENT ON COLUMN jorb.run_epoch IS 'Fencing token, NOT an attempt counter (that is run_count). Advances whenever the job enters an attempt (claim) or is abandoned by one (retry/requeue), so a superseded execution may not write results or checkpoints.';
 COMMENT ON COLUMN jorb.waitfor_group IS 'Becomes queued only when ALL jobs with run_group = this value are finished.';
 COMMENT ON COLUMN jorb.waitfor_job IS 'Becomes queued only when the job with this id is finished.';
 

@@ -39,7 +39,9 @@ class DAGNode:
     kwargs: dict[str, Any] = field(default_factory=dict)
     depends_on: list[DAGNode] = field(default_factory=list)
     job_id: int | None = None
-    node_id: str = ""  # Internal unique ID
+    # Identity for hashing/equality, so it must be unique per node even when
+    # a node is constructed directly instead of through DAGBuilder.add().
+    node_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     _job_options: dict[str, Any] = field(default_factory=dict)
 
     def __hash__(self) -> int:
@@ -98,11 +100,18 @@ class DAGBuilder:
             job1 = dag.add('Step1', {'input': 'data'})
             job2 = dag.add('Step2', depends_on=[job1])
         """
+        # De-duplicate dependencies: the same upstream listed twice is one
+        # edge, and duplicates would otherwise inflate the in-degree in
+        # topological_sort() beyond what it can ever decrement.
+        deps: list[DAGNode] = []
+        for dep in depends_on or []:
+            if dep not in deps:
+                deps.append(dep)
+
         node = DAGNode(
             job_class=job_class,
             kwargs=kwargs or {},
-            depends_on=depends_on or [],
-            node_id=str(uuid.uuid4()),
+            depends_on=deps,
         )
 
         # Merge common and job-specific options
@@ -152,6 +161,9 @@ class DAGBuilder:
             if node not in visited and has_cycle(node):
                 raise ValueError("DAG contains a cycle - dependencies must be acyclic")
 
+        # Raises if the fan-in nodes cannot be expressed with run_group
+        self.dependency_groups()
+
     def topological_sort(self) -> list[list[DAGNode]]:
         """
         Return nodes in topological order, grouped by execution level.
@@ -198,9 +210,101 @@ class DAGBuilder:
 
         return levels
 
+    def dependency_groups(self) -> dict[DAGNode, list[DAGNode]]:
+        """
+        Assign a run_group to every fan-in node (a node with 2+ dependencies).
+
+        A job waits for several upstreams via ``waitfor_group``, which fires
+        when every job carrying that ``run_group`` has finished. ``run_group``
+        is a single column, so a job can belong to exactly ONE group: two
+        fan-in nodes that share a dependency MUST share a group, and that
+        group is the union of their dependency sets. Sharing therefore makes
+        a node wait for more than it strictly depends on — never for less.
+
+        Returns:
+            Dict mapping each fan-in node to the members of the group it
+            waits for (a superset of its dependencies). Nodes with 0 or 1
+            dependencies are absent — they need no group.
+
+        Raises:
+            ValueError: If a merged group would contain a node that is
+                downstream of one of its waiters, which would deadlock.
+        """
+        fan_in = [node for node in self.nodes if len(node.depends_on) > 1]
+        if not fan_in:
+            return {}
+
+        # Union-find over dependency sets: overlapping sets become one group.
+        parent: dict[DAGNode, DAGNode] = {}
+
+        def find(node: DAGNode) -> DAGNode:
+            root = parent.setdefault(node, node)
+            while root is not parent[root]:
+                root = parent[root]
+            parent[node] = root
+            return root
+
+        for node in fan_in:
+            first, *rest = node.depends_on
+            for dep in rest:
+                parent[find(dep)] = find(first)
+
+        members: dict[DAGNode, list[DAGNode]] = {}
+        for node in fan_in:
+            for dep in node.depends_on:
+                members.setdefault(find(dep), []).append(dep)
+        # Preserve DAG order and drop the duplicates union-find collapsed
+        for root, group in members.items():
+            seen = set(group)
+            members[root] = [node for node in self.nodes if node in seen]
+
+        # A group that contains a node downstream of one of its waiters can
+        # never finish: the waiter blocks the very job it is waiting for.
+        downstream = self._downstream_sets()
+        for node in fan_in:
+            group = members[find(node.depends_on[0])]
+            blocked = [other for other in group if other in downstream[node]]
+            if blocked:
+                names = ", ".join(other.job_class for other in blocked)
+                raise ValueError(
+                    f"Node {node.job_class} shares a dependency with a fan-in "
+                    f"node it is upstream of, so its wait group would contain "
+                    f"{names}, which cannot finish until {node.job_class} "
+                    f"does. Split the shared dependency into separate jobs."
+                )
+
+        return {node: members[find(node.depends_on[0])] for node in fan_in}
+
+    def _downstream_sets(self) -> dict[DAGNode, set[DAGNode]]:
+        """Map each node to itself plus every node reachable from it."""
+        dependents: dict[DAGNode, list[DAGNode]] = {node: [] for node in self.nodes}
+        for node in self.nodes:
+            for dep in node.depends_on:
+                dependents[dep].append(node)
+
+        downstream: dict[DAGNode, set[DAGNode]] = {}
+        for start in self.nodes:
+            reached = {start}
+            stack = [start]
+            while stack:
+                for child in dependents[stack.pop()]:
+                    if child not in reached:
+                        reached.add(child)
+                        stack.append(child)
+            downstream[start] = reached
+        return downstream
+
     async def execute(self, client: JobClient) -> dict[DAGNode, int]:
         """
         Execute the DAG using the provided client.
+
+        The whole graph is created in ONE transaction: no job of the DAG is
+        visible to a worker until every job and every dependency link exists.
+        That is what makes the graph safe to submit against live workers — a
+        level-0 job that finished while later levels were still being written
+        would leave its dependents blocked forever, because the wake-up is
+        performed by the worker that finishes the upstream job, not by a
+        trigger. It also means a mid-way failure leaves no partial DAG.
 
         Args:
             client: JobClient instance
@@ -211,85 +315,85 @@ class DAGBuilder:
         Raises:
             ValueError: If DAG is invalid
         """
-        # Validate structure
         self.validate()
-
-        # Get execution levels
         levels = self.topological_sort()
+        wait_groups = self.dependency_groups()
 
-        # Create DAG record
-        dag_id = await client.pool.fetchval(
-            """
-            INSERT INTO jorb_dag (name, metadata)
-            VALUES ($1, $2)
-            RETURNING id
-            """,
-            self.name,
-            {"total_nodes": len(self.nodes)},
-        )
+        # Each group is keyed by its first member; group_id holds the
+        # run_group value, which is the job id of whichever member is
+        # created first (job ids are only known as we go).
+        group_key: dict[DAGNode, DAGNode] = {
+            member: members[0] for members in wait_groups.values() for member in members
+        }
 
-        logger.info(
-            f"DAG '{self.name}' ({dag_id}): Starting execution of "
-            f"{len(self.nodes)} jobs in {len(levels)} levels"
-        )
-
-        # Track node -> job_id mapping
         node_to_job: dict[DAGNode, int] = {}
+        group_id: dict[DAGNode, int] = {}
+        group_members: dict[DAGNode, list[int]] = {}
+        edges: list[tuple[int, int]] = []
 
-        # Execute level by level
-        for level_num, level in enumerate(levels):
-            logger.info(
-                f"DAG '{self.name}' ({dag_id}): Executing level {level_num} "
-                f"({len(level)} jobs in parallel)"
+        async with client.pool.acquire() as conn, conn.transaction():
+            dag_id: int = await conn.fetchval(
+                """
+                INSERT INTO jorb_dag (name, metadata)
+                VALUES ($1, $2)
+                RETURNING id
+                """,
+                self.name,
+                {"total_nodes": len(self.nodes)},
             )
 
-            # Enqueue all jobs in this level
-            for node in level:
-                # Build waitfor list from dependencies
-                waitfor_jobs = [node_to_job[dep] for dep in node.depends_on]
+            logger.info(
+                f"DAG '{self.name}' ({dag_id}): Creating "
+                f"{len(self.nodes)} jobs in {len(levels)} levels"
+            )
 
-                # Merge node options with kwargs
-                job_options = {**node._job_options}
+            for level in levels:
+                for node in level:
+                    job_options = {**node._job_options}
 
-                # Handle dependencies
-                if len(waitfor_jobs) == 1:
-                    # Single dependency - use waitfor_job
-                    job_options["waitfor_job"] = waitfor_jobs[0]
-                elif len(waitfor_jobs) > 1:
-                    # Multiple dependencies - create a group
-                    # Use the first job's ID as the group ID
-                    group_id = waitfor_jobs[0]
+                    if len(node.depends_on) == 1:
+                        job_options["waitfor_job"] = node_to_job[node.depends_on[0]]
+                    elif node.depends_on:
+                        # Every member of the group is a dependency of some
+                        # earlier level, so the group already has an id.
+                        key = group_key[node.depends_on[0]]
+                        job_options["waitfor_group"] = group_id[key]
 
-                    # Update all dependencies to be in the same group
-                    await client.pool.execute(
-                        "UPDATE jorb SET run_group = $1 WHERE id = ANY($2)",
-                        group_id,
-                        waitfor_jobs,
+                    job_id = await client.enqueue_in_transaction(
+                        conn, node.job_class, **node.kwargs, **job_options
                     )
 
-                    job_options["waitfor_group"] = group_id
+                    node_to_job[node] = job_id
+                    node.job_id = job_id
+                    edges.extend((job_id, node_to_job[dep]) for dep in node.depends_on)
 
-                # Enqueue job
-                job_id = await client.enqueue(
-                    node.job_class, **node.kwargs, **job_options
+                    member_of = group_key.get(node)
+                    if member_of is not None:
+                        group_id.setdefault(member_of, job_id)
+                        group_members.setdefault(member_of, []).append(job_id)
+
+            if node_to_job:
+                await conn.execute(
+                    "UPDATE jorb SET dag_id = $1 WHERE id = ANY($2)",
+                    dag_id,
+                    list(node_to_job.values()),
                 )
-
-                # Tag with DAG ID
-                await client.pool.execute(
-                    "UPDATE jorb SET dag_id = $1 WHERE id = $2", dag_id, job_id
+            for key, member_ids in group_members.items():
+                await conn.execute(
+                    "UPDATE jorb SET run_group = $1 WHERE id = ANY($2)",
+                    group_id[key],
+                    member_ids,
                 )
-
-                # Track mapping
-                node_to_job[node] = job_id
-                node.job_id = job_id
-
-            job_ids = [node_to_job[n] for n in level]
-            logger.info(
-                f"DAG '{self.name}' ({dag_id}): Level {level_num} enqueued (job IDs: {job_ids})"
-            )
+            if edges:
+                await conn.executemany(
+                    "INSERT INTO jorb_dependencies (job_id, depends_on) "
+                    "VALUES ($1, $2)",
+                    edges,
+                )
 
         logger.info(
-            f"DAG '{self.name}' ({dag_id}): All {len(self.nodes)} jobs enqueued"
+            f"DAG '{self.name}' ({dag_id}): All {len(self.nodes)} jobs enqueued "
+            f"(job IDs: {sorted(node_to_job.values())})"
         )
 
         return node_to_job
@@ -377,11 +481,14 @@ async def wait_for_dag(
             logger.error(f"DAG {dag_id} not found")
             return False
 
-        # Derive terminal state from the jorb_dag_status counts: any crashed
-        # job fails the DAG; otherwise it is complete once nothing is pending.
-        if status["crashed_jobs"]:
+        # Derive terminal state from the jorb_dag_status counts. A crashed or
+        # cancelled job means the DAG did not run to completion: everything
+        # downstream of it stays blocked, so success is not recoverable and
+        # waiting longer cannot change the answer.
+        if status["crashed_jobs"] or status["cancelled_jobs"]:
             logger.error(
                 f"DAG {dag_id} failed: {status['crashed_jobs']} crashed, "
+                f"{status['cancelled_jobs']} cancelled, "
                 f"{status['finished_jobs']}/{status['total_jobs']} finished"
             )
             return False

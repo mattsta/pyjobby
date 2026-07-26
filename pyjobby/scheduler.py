@@ -24,6 +24,7 @@ import asyncpg  # type: ignore[import-untyped]
 from loguru import logger
 
 from .cron import next_cron_run
+from .db import utcnow
 
 
 @dataclass
@@ -305,19 +306,20 @@ class ScheduleManager:
 
         return schedule_id
 
-    async def update_schedule_next_run(
-        self, schedule_id: int, cron_expr: str, timezone: str
-    ) -> None:
+    async def set_next_run(self, schedule_id: int, next_run: datetime) -> None:
         """
-        Update schedule's next_run timestamp.
+        Store a schedule's next_run timestamp.
+
+        Takes an already-computed time rather than a cron expression: the
+        caller must be able to evaluate the expression BEFORE it starts
+        firing the schedule, because a cron/timezone that only fails at this
+        point would roll back the whole firing transaction and leave next_run
+        in the past forever.
 
         Args:
             schedule_id: Schedule ID
-            cron_expr: Cron expression
-            timezone: Timezone name
+            next_run: When the schedule should fire next
         """
-        next_run = self.calculate_next_run(cron_expr, timezone)
-
         await self.conn.execute(
             """
             UPDATE jorb_schedule
@@ -391,6 +393,38 @@ class ScheduleManager:
             schedule_id,
         )
 
+    async def disable_unevaluatable(self, schedule_id: int, error: str) -> None:
+        """
+        Disable a schedule whose cron expression or timezone cannot be
+        evaluated, and count it as a failure.
+
+        Such a schedule can never get a new next_run, so leaving it enabled
+        makes it due forever: the scheduler would re-select it on every poll,
+        fail on every poll, and record nothing (the failing transaction rolls
+        its own bookkeeping back). Disabling it is the only outcome that both
+        stops the spin and is visible to an operator.
+
+        Args:
+            schedule_id: Schedule ID
+            error: Why the schedule cannot be evaluated
+        """
+        await self.conn.execute(
+            """
+            UPDATE jorb_schedule
+            SET enabled = false,
+                run_count = run_count + 1,
+                failure_count = failure_count + 1,
+                consecutive_failures = consecutive_failures + 1,
+                last_run = NOW(),
+                last_failure = NOW(),
+                updated = NOW()
+            WHERE id = $1
+        """,
+            schedule_id,
+        )
+
+        logger.error(f"Schedule {schedule_id} disabled: {error}")
+
 
 class SchedulerWorker:
     """
@@ -413,6 +447,9 @@ class SchedulerWorker:
         self.safety = ScheduleSafetyManager(conn)
         self.manager = ScheduleManager(conn)
         self.stop_requested = False
+        # Set by stop(); cuts the poll sleep short so SIGTERM does not have
+        # to wait out a whole poll interval before the loop exits.
+        self._stop_event = asyncio.Event()
 
         # Metrics
         self.executions_total = 0
@@ -558,7 +595,7 @@ class SchedulerWorker:
             schedule["id"],
             schedule["name"],
             scheduled_time,
-            datetime.utcnow(),
+            utcnow(),
             result.result,
             result.skip_reason,
             result.job_id,
@@ -755,6 +792,30 @@ class SchedulerWorker:
                                 continue
                             schedule = dict(locked)
 
+                            # Resolve the following fire time BEFORE firing:
+                            # if the expression is unevaluatable, firing
+                            # would only be rolled back by the failure to
+                            # advance next_run, and the schedule would spin
+                            # on every poll forever.
+                            try:
+                                next_run = self.manager.calculate_next_run(
+                                    schedule["cron_expr"], schedule["timezone"]
+                                )
+                            except ValueError as e:
+                                await self.manager.disable_unevaluatable(
+                                    schedule["id"], str(e)
+                                )
+                                await self.log_execution(
+                                    schedule,
+                                    schedule["next_run"],
+                                    ScheduleExecutionResult(
+                                        result="failure", error_message=str(e)
+                                    ),
+                                )
+                                self.executions_total += 1
+                                self.failures_total += 1
+                                continue
+
                             # Execute schedule
                             result = await self.execute_schedule(schedule)
 
@@ -773,11 +834,7 @@ class SchedulerWorker:
                                 self.skips_total += 1
 
                             # Update next_run
-                            await self.manager.update_schedule_next_run(
-                                schedule["id"],
-                                schedule["cron_expr"],
-                                schedule["timezone"],
-                            )
+                            await self.manager.set_next_run(schedule["id"], next_run)
 
                     except Exception as e:
                         logger.error(
@@ -795,18 +852,24 @@ class SchedulerWorker:
                     )
 
                 # Sleep until next poll
-                await asyncio.sleep(self.poll_interval)
+                await self._sleep(self.poll_interval)
 
             except Exception as e:
                 logger.error(f"Scheduler main loop error: {e}", exc_info=True)
-                await asyncio.sleep(10)  # Shorter sleep on error
+                await self._sleep(10)  # Shorter sleep on error
 
         logger.info("Scheduler worker stopped")
+
+    async def _sleep(self, seconds: float) -> None:
+        """Wait ``seconds``, or until stop() is called — whichever is first."""
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
 
     def stop(self) -> None:
         """Request graceful shutdown"""
         logger.info("Scheduler stop requested")
         self.stop_requested = True
+        self._stop_event.set()
 
 
 async def run_scheduler(db_params: dict[str, Any], poll_interval: int = 60) -> None:

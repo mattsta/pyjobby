@@ -396,7 +396,12 @@ async def apply_fenced_statement(pool, name: str, job_id: int, epoch: int) -> in
 
 
 async def superseded_job(pool, queue: str) -> tuple[int, int, int]:
-    """A job claimed twice: returns (job_id, stale epoch, current epoch)."""
+    """A job claimed twice: returns (job_id, stale epoch, current epoch).
+
+    The epochs are only guaranteed to increase, not to be consecutive: the
+    requeue between the two claims advances the token itself so the first
+    attempt is fenced before the second one starts.
+    """
     job_id = await enqueue(pool, queue, "tests.dxe_jobs.OkJob", {"x": 1})
     first = await claim_once(pool, queue)
     await db.requeue_job(pool, job_id, allowed_states=("claimed",), reset_errors=False)
@@ -422,7 +427,7 @@ async def test_stale_epoch_write_is_a_noop(db_pool, unique_queue, statement):
     guard) cannot masquerade as good fencing.
     """
     job_id, stale, current = await superseded_job(db_pool, unique_queue)
-    assert (stale, current) == (1, 2)
+    assert stale < current
 
     assert await apply_fenced_statement(db_pool, statement, job_id, stale) == 0
 

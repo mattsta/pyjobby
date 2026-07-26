@@ -261,8 +261,8 @@ class TestScheduleManagerIntegration:
                 pytest.skip("croniter not installed")
 
     @pytest.mark.asyncio
-    async def test_update_schedule_next_run(self, db_pool):
-        """Test next_run update - covers lines 322-347."""
+    async def test_set_next_run(self, db_pool):
+        """Test next_run update."""
         async with db_pool.acquire() as conn:
             name = unique_name("update_test")
             schedule_id = await conn.fetchval(
@@ -270,12 +270,13 @@ class TestScheduleManagerIntegration:
                 name,
             )
             manager = ScheduleManager(conn)
-            try:
-                await manager.update_schedule_next_run(
-                    schedule_id=schedule_id, cron_expr="0 * * * *", timezone="UTC"
-                )
-            except ImportError:
-                pytest.skip("croniter not installed")
+            next_run = manager.calculate_next_run("0 * * * *", "UTC")
+            await manager.set_next_run(schedule_id, next_run)
+
+            stored = await conn.fetchval(
+                "SELECT next_run FROM jorb_schedule WHERE id = $1", schedule_id
+            )
+            assert stored == next_run
 
     @pytest.mark.asyncio
     async def test_record_execution_success(self, db_pool):

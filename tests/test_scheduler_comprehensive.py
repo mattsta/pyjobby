@@ -467,7 +467,7 @@ class TestScheduleManager:
             assert schedule["created_by"] == "test_user"
 
     @pytest.mark.asyncio
-    async def test_update_schedule_next_run(self, db_pool, manager):
+    async def test_set_next_run(self, db_pool, manager):
         """Test updating schedule's next_run timestamp."""
         # Create schedule
         schedule_id = await manager.create_schedule(
@@ -481,7 +481,9 @@ class TestScheduleManager:
             )
 
         # Update to run every minute
-        await manager.update_schedule_next_run(schedule_id, "* * * * *", "UTC")
+        await manager.set_next_run(
+            schedule_id, manager.calculate_next_run("* * * * *", "UTC")
+        )
 
         # Verify next_run was updated
         async with db_pool.acquire() as conn:

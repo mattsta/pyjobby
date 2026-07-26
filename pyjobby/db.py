@@ -61,14 +61,24 @@ def build_requeue_sql(allowed_states: tuple[str, ...] = ("crashed",)) -> str:
 
     Jobs keep ONE row for life: a retry (automatic or operator-driven)
     requeues the same row, the per-attempt audit trail lives in
-    jorb_history, and run_epoch (bumped at claim) fences any stale
-    execution out of writing results or checkpoints.
+    jorb_history, and run_epoch fences any stale execution out of writing
+    results or checkpoints.
+
+    The requeue bumps run_epoch itself rather than leaving that to the next
+    claim. Otherwise the abandoned execution keeps the current epoch for the
+    whole window between requeue and re-claim, and statements guarded ONLY by
+    the epoch -- recording a DXE checkpoint, setting a timeout -- would still
+    apply, letting a job the platform has given up on write checkpoints for
+    the attempt that replaces it. Terminal writes were never exposed: they
+    also guard on state IN ('claimed','running'). Checkpoints are loaded
+    without an epoch filter, so bumping costs no resume capability.
 
     Parameters: $1 job_id, $2 delay (interval), $3 reset_errors (bool).
     """
     states = ", ".join(f"'{s}'" for s in allowed_states)
     return f"""UPDATE jorb
             SET state = 'queued',
+                run_epoch = run_epoch + 1,
                 run_after = now() + $2::interval,
                 error_count = CASE WHEN $3 THEN 0 ELSE error_count END,
                 error_message = CASE WHEN $3 THEN NULL ELSE error_message END,

@@ -40,17 +40,22 @@ async def test_step_checkpoint_resume_skips_completed_work(
     )
     by_seq = {s["step_seq"]: s for s in steps}
 
-    # step 1 recorded during epoch 1 and NEVER re-executed on the retry
+    # step 1 was recorded by the FIRST attempt and never re-executed: its
+    # checkpoint still carries that attempt's epoch after the retry
+    first_attempt = by_seq[1]["run_epoch"]
+    assert first_attempt == 1
     assert by_seq[1]["name"] == "fetch"
-    assert by_seq[1]["run_epoch"] == 1
     assert by_seq[1]["output"] == {"n": 7}
-    # step 2 failed on epoch 1, re-executed and succeeded on epoch 2
+    # step 2 failed on the first attempt, then re-executed and succeeded on a
+    # later one (epochs only increase; they are not consecutive, because the
+    # retry that abandons an attempt advances the fence too)
+    retry_attempt = by_seq[2]["run_epoch"]
+    assert retry_attempt > first_attempt
     assert by_seq[2]["name"] == "maybe-explode"
-    assert by_seq[2]["run_epoch"] == 2
     assert by_seq[2]["error"] is None
     assert by_seq[2]["output"] == {"ok": True}
-    # step 3 only ever ran on epoch 2
-    assert by_seq[3]["run_epoch"] == 2
+    # step 3 only ever ran on that same later attempt
+    assert by_seq[3]["run_epoch"] == retry_attempt
 
 
 async def test_durable_sleep_unwinds_and_resumes(live_worker, unique_queue, db_pool):

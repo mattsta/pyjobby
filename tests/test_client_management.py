@@ -589,27 +589,34 @@ class TestBulkOperations:
             assert job["state"] == "cancelled"
 
     async def test_bulk_cancel_mixed_states(self, db_pool, job_client):
-        """Test bulk cancel with mixed job states."""
-        job_ids = []
+        """Bulk cancel is the single-job verb applied to a list: queued jobs
+        stop now, running ones get a cancellation request for their worker."""
+        queued_ids = []
+        running_ids = []
 
-        # Create queued jobs
         for i in range(3):
-            job_id = await job_client.enqueue("test.Job", data=f"queued_{i}")
-            job_ids.append(job_id)
+            queued_ids.append(await job_client.enqueue("test.Job", data=f"queued_{i}"))
 
-        # Create and run some jobs (can't be cancelled)
         for i in range(2):
             job_id = await job_client.enqueue("test.Job", data=f"running_{i}")
-            job_ids.append(job_id)
+            running_ids.append(job_id)
             # Manually set to running state (bypassing claim)
             async with db_pool.acquire() as conn:
                 await conn.execute(
                     "UPDATE jorb SET state = 'running' WHERE id = $1", job_id
                 )
 
-        # Try to cancel all (only queued should be cancelled)
-        cancelled = await job_client.bulk_cancel(job_ids)
-        assert cancelled == 3  # Only the queued jobs
+        cancelled = await job_client.bulk_cancel(queued_ids + running_ids)
+        assert cancelled == 5
+
+        for job_id in queued_ids:
+            job = await job_client.get_job_full(job_id)
+            assert job["state"] == "cancelled"
+
+        for job_id in running_ids:
+            job = await job_client.get_job_full(job_id)
+            assert job["state"] == "running"
+            assert job["cancel_requested"] is True
 
     async def test_bulk_cancel_empty_list(self, db_pool, job_client):
         """Test bulk cancel with empty list."""

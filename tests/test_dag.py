@@ -65,6 +65,20 @@ class TestDAGNode:
         assert node != 42
         assert node != {"node_id": "test-id"}
 
+    def test_dag_node_ids_default_to_unique_values(self):
+        """node_id backs __hash__/__eq__, so it cannot default to a constant.
+
+        A shared default made every directly-constructed node compare equal,
+        which collapsed them in the sets and dicts validate() and
+        topological_sort() are built on.
+        """
+        first = DAGNode(job_class="Job1")
+        second = DAGNode(job_class="Job2")
+
+        assert first.node_id != second.node_id
+        assert first != second
+        assert len({first, second}) == 2
+
     def test_dag_node_usable_in_sets(self):
         """Test DAGNode can be used in sets due to hash/eq."""
         node1 = DAGNode(job_class="Job1", node_id="id-1")
@@ -419,11 +433,16 @@ class MockClient:
 
     async def enqueue(self, job_class, **kwargs):
         """Mock enqueue that records calls and returns incrementing IDs."""
+        async with self.pool.acquire() as conn:
+            return await self.enqueue_in_transaction(conn, job_class, **kwargs)
+
+    async def enqueue_in_transaction(self, conn, job_class, **kwargs):
+        """Mock of JobClient.enqueue_in_transaction (what DAGBuilder uses)."""
         self.enqueue_calls.append({"job_class": job_class, "kwargs": kwargs})
 
         # Actually insert a job record so dag_id updates work
         # Uses correct schema column names: kwargs (jsonb), state (jorbstate)
-        job_id = await self.pool.fetchval(
+        job_id = await conn.fetchval(
             """
             INSERT INTO jorb (job_class, kwargs, state)
             VALUES ($1, $2, 'queued')
