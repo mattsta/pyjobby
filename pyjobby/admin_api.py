@@ -19,6 +19,13 @@ import asyncpg  # type: ignore[import-untyped]
 from . import db
 
 
+class Unset:
+    """Sentinel type for 'argument not provided' where None is meaningful."""
+
+
+UNSET = Unset()
+
+
 @dataclass
 class JobInfo:
     """Structured job information"""
@@ -50,6 +57,9 @@ class JobInfo:
     finished: datetime | None = None
     timeout_at: datetime | None = None
     dag_id: int | None = None
+    run_epoch: int = 0
+    cancel_requested: bool = False
+    claimed_by: int | None = None
 
     @classmethod
     def from_record(cls, record: asyncpg.Record) -> JobInfo:
@@ -75,7 +85,7 @@ class JobInfo:
 
 @dataclass
 class QueueStats:
-    """Queue statistics"""
+    """Queue statistics (depths plus the jorb_queue control-plane row)"""
 
     queue: str
     queued: int = 0
@@ -87,6 +97,11 @@ class QueueStats:
     cancelled: int = 0
     total: int = 0
     oldest_queued_age_seconds: float | None = None
+    # control plane (jorb_queue); absent row = unpaused / unlimited
+    paused: bool = False
+    max_concurrency: int | None = None
+    rate_limit: int | None = None
+    rate_period_seconds: float = 60.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -263,9 +278,7 @@ class AdminAPI:
                 f"can only retry crashed or cancelled jobs"
             )
 
-        await db.requeue_job(
-            self.conn, job_id, allowed_states=("crashed", "cancelled")
-        )
+        await db.requeue_job(self.conn, job_id, allowed_states=("crashed", "cancelled"))
 
         return {"job_id": job_id, "status": "requeued"}
 
@@ -285,9 +298,7 @@ class AdminAPI:
                 result = await self.retry_job(job_id)
                 results.append(result)
             except ValueError as e:
-                results.append(
-                    {"job_id": job_id, "status": "error", "error": str(e)}
-                )
+                results.append({"job_id": job_id, "status": "error", "error": str(e)})
         return results
 
     async def cancel_job(self, job_id: int) -> dict[str, Any]:
@@ -390,9 +401,7 @@ class AdminAPI:
             param_idx += 1
 
         if older_than_days:
-            where_clauses.append(
-                f"updated < (now() - ${param_idx}::interval)"
-            )
+            where_clauses.append(f"updated < (now() - ${param_idx}::interval)")
             params.append(timedelta(days=older_than_days))
             param_idx += 1
 
@@ -413,21 +422,32 @@ class AdminAPI:
     # Queue Management
     # =========================================================================
 
-    async def list_queues(self) -> list[str]:
+    async def list_queues(self) -> list[dict[str, Any]]:
         """
-        List all queue names in the system.
+        List all queues: every queue with jobs plus every jorb_queue
+        control row, with paused/limit settings alongside.
 
         Returns:
-            List of unique queue names
+            List of dicts with name, paused, max_concurrency, rate_limit,
+            rate_period_seconds (control fields are defaults when no
+            jorb_queue row exists).
         """
-        records = await self.conn.fetch(
-            "SELECT DISTINCT queue FROM jorb ORDER BY queue"
-        )
-        return [r["queue"] for r in records]
+        records = await self.conn.fetch("""
+            SELECT COALESCE(j.queue, q.name) AS name,
+                   COALESCE(q.paused, FALSE) AS paused,
+                   q.max_concurrency,
+                   q.rate_limit,
+                   COALESCE(q.rate_period_seconds, 60) AS rate_period_seconds
+            FROM (SELECT DISTINCT queue FROM jorb) j
+            FULL OUTER JOIN jorb_queue q ON q.name = j.queue
+            ORDER BY 1
+        """)
+        return [dict(r) for r in records]
 
     async def queue_stats(self, queue: str | None = None) -> list[dict[str, Any]]:
         """
-        Get statistics for queues.
+        Get statistics for queues, joined with the jorb_queue control plane
+        so operators see paused/limits alongside depths.
 
         Args:
             queue: Specific queue name, or None for all queues
@@ -489,7 +509,19 @@ class AdminAPI:
 
             stats.total += count
 
-        return [stats.to_dict() for stats in queue_stats_map.values()]
+        # Merge in the control plane (a control row without jobs still shows)
+        control_where = "WHERE name = $1" if queue else ""
+        controls = await self.conn.fetch(
+            f"SELECT * FROM jorb_queue {control_where} ORDER BY name", *params
+        )
+        for c in controls:
+            stats = queue_stats_map.setdefault(c["name"], QueueStats(queue=c["name"]))
+            stats.paused = c["paused"]
+            stats.max_concurrency = c["max_concurrency"]
+            stats.rate_limit = c["rate_limit"]
+            stats.rate_period_seconds = c["rate_period_seconds"]
+
+        return [queue_stats_map[name].to_dict() for name in sorted(queue_stats_map)]
 
     async def clear_queue(
         self,
@@ -513,71 +545,235 @@ class AdminAPI:
         )
 
     # =========================================================================
+    # Queue Control Plane (jorb_queue: pause / concurrency / rate limits)
+    # =========================================================================
+
+    @staticmethod
+    def _queue_control_dict(record: asyncpg.Record) -> dict[str, Any]:
+        data = dict(record)
+        for key in ("created", "updated"):
+            if data.get(key):
+                data[key] = data[key].isoformat()
+        return data
+
+    async def list_queue_controls(self) -> list[dict[str, Any]]:
+        """
+        List all jorb_queue control rows.
+
+        Queues without a row are unpaused/unlimited (defaults).
+
+        Returns:
+            List of control dictionaries
+        """
+        records = await self.conn.fetch("SELECT * FROM jorb_queue ORDER BY name")
+        return [self._queue_control_dict(r) for r in records]
+
+    async def get_queue_control(self, name: str) -> dict[str, Any] | None:
+        """
+        Get the control row for one queue.
+
+        Args:
+            name: Queue name
+
+        Returns:
+            Control dictionary, or None when no row exists (defaults apply)
+        """
+        record = await self.conn.fetchrow(
+            "SELECT * FROM jorb_queue WHERE name = $1", name
+        )
+        return self._queue_control_dict(record) if record else None
+
+    async def set_queue_control(
+        self,
+        name: str,
+        *,
+        paused: bool | None = None,
+        max_concurrency: int | None | Unset = UNSET,
+        rate_limit: int | None | Unset = UNSET,
+        rate_period_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """
+        Upsert the jorb_queue control row, updating only the provided
+        fields. The worker's claim statement enforces these live.
+
+        Args:
+            name: Queue name
+            paused: Pause (True) / resume (False); None leaves it alone
+            max_concurrency: Claimed+running cap; None means unlimited
+                (pass explicitly to clear); omit to leave alone
+            rate_limit: Max starts per rate period; None means unlimited
+                (pass explicitly to clear); omit to leave alone
+            rate_period_seconds: Rate window in seconds; None leaves it alone
+
+        Returns:
+            The resulting control dictionary
+        """
+        mc: int | None = None if isinstance(max_concurrency, Unset) else max_concurrency
+        rl: int | None = None if isinstance(rate_limit, Unset) else rate_limit
+        set_mc = not isinstance(max_concurrency, Unset)
+        set_rl = not isinstance(rate_limit, Unset)
+
+        record = await self.conn.fetchrow(
+            """
+            INSERT INTO jorb_queue
+                (name, paused, max_concurrency, rate_limit, rate_period_seconds)
+            VALUES ($1, COALESCE($2, FALSE), $3, $4, COALESCE($5, 60))
+            ON CONFLICT (name) DO UPDATE SET
+                paused = COALESCE($2, jorb_queue.paused),
+                max_concurrency = CASE WHEN $6 THEN $3
+                                       ELSE jorb_queue.max_concurrency END,
+                rate_limit = CASE WHEN $7 THEN $4
+                                  ELSE jorb_queue.rate_limit END,
+                rate_period_seconds =
+                    COALESCE($5, jorb_queue.rate_period_seconds),
+                updated = now()
+            RETURNING *
+            """,
+            name,
+            paused,
+            mc,
+            rl,
+            rate_period_seconds,
+            set_mc,
+            set_rl,
+        )
+        return self._queue_control_dict(record)
+
+    async def pause_queue(self, name: str) -> dict[str, Any]:
+        """
+        Pause a queue: workers stop claiming from it immediately.
+
+        Args:
+            name: Queue name
+
+        Returns:
+            The resulting control dictionary
+        """
+        return await self.set_queue_control(name, paused=True)
+
+    async def resume_queue(self, name: str) -> dict[str, Any]:
+        """
+        Resume a paused queue.
+
+        Args:
+            name: Queue name
+
+        Returns:
+            The resulting control dictionary
+        """
+        return await self.set_queue_control(name, paused=False)
+
+    # =========================================================================
     # Worker Management
     # =========================================================================
 
-    async def list_workers(self) -> list[dict[str, Any]]:
+    async def list_workers(
+        self,
+        stale_after_seconds: float = 60.0,
+        include_dead_for_seconds: float = 3600.0,
+    ) -> list[dict[str, Any]]:
         """
-        List currently active workers (jobs in claimed or running state).
+        List workers from the jorb_worker registry: live workers plus
+        recently-shut-down ones, with their currently claimed job (if any).
+
+        A worker is live when shutdown_at IS NULL and its heartbeat
+        (last_seen) is recent; heartbeats arrive every ~10s.
+
+        Args:
+            stale_after_seconds: Heartbeat age past which a worker counts
+                as stale rather than live (default: 60)
+            include_dead_for_seconds: Show workers that shut down within
+                this window (default: 3600)
 
         Returns:
-            List of worker information dictionaries
+            List of worker dictionaries
         """
-        records = await self.conn.fetch("""
-            SELECT
-                worker_host,
-                worker_pid,
-                id as job_id,
-                job_class,
-                state,
-                updated as started_at
-            FROM jorb
-            WHERE state IN ('claimed', 'running')
-            ORDER BY worker_host, worker_pid, updated
-        """)
+        records = await self.conn.fetch(
+            """
+            SELECT w.id, w.host, w.pid, w.queue, w.capabilities, w.version,
+                   w.started, w.last_seen, w.shutdown_at,
+                   EXTRACT(EPOCH FROM (now() - w.last_seen))::float
+                       AS last_seen_age_seconds,
+                   (w.shutdown_at IS NULL
+                    AND w.last_seen > now() - make_interval(secs => $1))
+                       AS live,
+                   j.id AS current_job_id,
+                   j.job_class AS current_job_class,
+                   j.state AS current_job_state
+            FROM jorb_worker w
+            LEFT JOIN LATERAL (
+                SELECT id, job_class, state FROM jorb
+                WHERE claimed_by = w.id AND state IN ('claimed', 'running')
+                ORDER BY id
+                LIMIT 1
+            ) j ON TRUE
+            WHERE w.shutdown_at IS NULL
+               OR w.shutdown_at > now() - make_interval(secs => $2)
+            ORDER BY w.id
+            """,
+            stale_after_seconds,
+            include_dead_for_seconds,
+        )
 
-        return [WorkerInfo.from_record(r).to_dict() for r in records]
+        workers = []
+        for r in records:
+            data = dict(r)
+            data["capabilities"] = list(data["capabilities"] or [])
+            for key in ("started", "last_seen", "shutdown_at"):
+                if data.get(key):
+                    data[key] = data[key].isoformat()
+            workers.append(data)
+        return workers
 
-    async def worker_stats(self) -> dict[str, Any]:
+    async def worker_stats(self, stale_after_seconds: float = 60.0) -> dict[str, Any]:
         """
-        Get overall worker statistics.
+        Aggregate worker registry statistics.
+
+        Args:
+            stale_after_seconds: Heartbeat age past which a worker counts
+                as stale rather than live (default: 60)
 
         Returns:
-            Dictionary with worker stats
+            Dictionary with live/stale/shutdown counts and per-queue live
+            worker counts
         """
-        # Count active workers
-        worker_count = await self.conn.fetchval("""
-            SELECT COUNT(DISTINCT (worker_host, worker_pid))
-            FROM jorb
-            WHERE state IN ('claimed', 'running')
-        """)
-
-        # Count jobs by worker
-        jobs_by_worker = await self.conn.fetch("""
+        summary = await self.conn.fetchrow(
+            """
             SELECT
-                worker_host,
-                worker_pid,
-                COUNT(*) as job_count,
-                MIN(updated) as oldest_job_started
-            FROM jorb
-            WHERE state IN ('claimed', 'running')
-            GROUP BY worker_host, worker_pid
-            ORDER BY worker_host, worker_pid
-        """)
+                COUNT(*) AS total_registered,
+                COUNT(*) FILTER (
+                    WHERE shutdown_at IS NULL
+                      AND last_seen > now() - make_interval(secs => $1)
+                ) AS live,
+                COUNT(*) FILTER (
+                    WHERE shutdown_at IS NULL
+                      AND last_seen <= now() - make_interval(secs => $1)
+                ) AS stale,
+                COUNT(*) FILTER (WHERE shutdown_at IS NOT NULL) AS shutdown
+            FROM jorb_worker
+            """,
+            stale_after_seconds,
+        )
+
+        per_queue = await self.conn.fetch(
+            """
+            SELECT queue, COUNT(*) AS live
+            FROM jorb_worker
+            WHERE shutdown_at IS NULL
+              AND last_seen > now() - make_interval(secs => $1)
+            GROUP BY queue
+            ORDER BY queue
+            """,
+            stale_after_seconds,
+        )
 
         return {
-            "active_workers": worker_count or 0,
-            "workers": [
-                {
-                    "host": r["worker_host"],
-                    "pid": r["worker_pid"],
-                    "job_count": r["job_count"],
-                    "oldest_job_started": r["oldest_job_started"].isoformat()
-                    if r["oldest_job_started"]
-                    else None,
-                }
-                for r in jobs_by_worker
-            ],
+            "live_workers": summary["live"] or 0,
+            "active_workers": summary["live"] or 0,  # compat alias
+            "stale_workers": summary["stale"] or 0,
+            "shutdown_workers": summary["shutdown"] or 0,
+            "total_registered": summary["total_registered"] or 0,
+            "per_queue": {r["queue"]: r["live"] for r in per_queue},
         }
 
     # =========================================================================
@@ -600,7 +796,7 @@ class AdminAPI:
             Dictionary with metrics
         """
         if since is None:
-            since = datetime.utcnow() - timedelta(hours=24)
+            since = db.utcnow() - timedelta(hours=24)
 
         where_clauses = ["updated >= $1"]
         params: list[Any] = [since]
@@ -656,7 +852,7 @@ class AdminAPI:
 
         return {
             "period_start": since.isoformat(),
-            "period_end": datetime.utcnow().isoformat(),
+            "period_end": db.utcnow().isoformat(),
             "queue": queue,
             "state_counts": {r["state"]: r["count"] for r in state_counts},
             "finished_count": completion_stats["finished_count"] or 0,
@@ -680,10 +876,10 @@ class AdminAPI:
 
     async def list_dlq(self, limit: int = 100) -> list[dict[str, Any]]:
         """
-        List jobs in Dead Letter Queue (permanently failed).
+        List jobs in the Dead Letter Queue.
 
-        Currently identifies DLQ jobs as crashed jobs with high error counts.
-        Future: May use dedicated 'dead_letter' state.
+        'crashed' is the terminal dead-letter state (retries exhausted), so
+        the DLQ is simply every crashed job — no error-count heuristic.
 
         Args:
             limit: Maximum number of results
@@ -695,7 +891,6 @@ class AdminAPI:
             """
             SELECT * FROM jorb
             WHERE state = 'crashed'
-              AND error_count >= 10
             ORDER BY updated DESC
             LIMIT $1
         """,
@@ -708,8 +903,11 @@ class AdminAPI:
         """
         Retry a job from the Dead Letter Queue.
 
+        Requeues the SAME row (jobs keep one id for life) with the error
+        budget reset, so the operator-driven re-run gets fresh attempts.
+
         Args:
-            job_id: ID of DLQ job to retry
+            job_id: ID of DLQ (crashed) job to retry
 
         Returns:
             Dictionary with job_id and status
@@ -729,6 +927,114 @@ class AdminAPI:
         )
 
         return {"job_id": job_id, "status": "requeued_from_dlq"}
+
+    # =========================================================================
+    # History & DXE Steps
+    # =========================================================================
+
+    async def get_job_history(self, job_id: int) -> list[dict[str, Any]]:
+        """
+        Get the full transition trail for a job, oldest first.
+
+        Every state transition is trigger-recorded in jorb_history, so this
+        includes per-attempt detail (worker, epoch, errors) across retries
+        of the same row.
+
+        Args:
+            job_id: Job ID
+
+        Returns:
+            List of history dictionaries (at serialized as ISO string)
+        """
+        records = await self.conn.fetch(
+            """
+            SELECT id, job_id, at, event, detail
+            FROM jorb_history
+            WHERE job_id = $1
+            ORDER BY id
+            """,
+            job_id,
+        )
+
+        history = []
+        for r in records:
+            data = dict(r)
+            data["at"] = data["at"].isoformat()
+            history.append(data)
+        return history
+
+    async def get_job_steps(self, job_id: int) -> list[dict[str, Any]]:
+        """
+        Get a job's DXE step checkpoints, ordered by step sequence.
+
+        Args:
+            job_id: Job ID
+
+        Returns:
+            List of step dictionaries (timestamps serialized as ISO
+            strings; duration_seconds computed for finished steps)
+        """
+        records = await self.conn.fetch(
+            """
+            SELECT job_id, step_seq, name, output, error, run_epoch,
+                   started, finished,
+                   EXTRACT(EPOCH FROM (finished - started))::float
+                       AS duration_seconds
+            FROM jorb_step
+            WHERE job_id = $1
+            ORDER BY step_seq
+            """,
+            job_id,
+        )
+
+        steps = []
+        for r in records:
+            data = dict(r)
+            for key in ("started", "finished"):
+                if data.get(key):
+                    data[key] = data[key].isoformat()
+            steps.append(data)
+        return steps
+
+    async def requeue_job(self, job_id: int, fresh: bool = False) -> dict[str, Any]:
+        """
+        Requeue a terminal job for another run — also how an interrupted
+        durable job is RESUMED.
+
+        By default the job's DXE checkpoints are kept, so completed steps
+        fast-forward on the next run (resume). With fresh=True the
+        checkpoints are deleted first and the job restarts from step 1.
+        Either way the same row is requeued with its error budget reset.
+
+        Args:
+            job_id: Job ID
+            fresh: Delete jorb_step checkpoints before requeuing
+
+        Returns:
+            Dictionary with job_id, status, and fresh flag
+
+        Raises:
+            ValueError: If job not found or not in a requeueable state
+        """
+        job = await self.conn.fetchrow(
+            "SELECT id, state FROM jorb WHERE id = $1", job_id
+        )
+        if not job:
+            raise ValueError(f"Job {job_id} not found")
+
+        async with self.conn.transaction():
+            if fresh:
+                await self.conn.execute(
+                    "DELETE FROM jorb_step WHERE job_id = $1", job_id
+                )
+            requeued = await db.requeue_job(self.conn, job_id, reset_errors=True)
+            if requeued is None:
+                raise ValueError(
+                    f"Job {job_id} is in state '{job['state']}' and cannot "
+                    f"be requeued (must be crashed, cancelled, or finished)"
+                )
+
+        return {"job_id": job_id, "status": "requeued", "fresh": fresh}
 
     # =========================================================================
     # Schedule Management

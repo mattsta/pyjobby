@@ -386,16 +386,18 @@ class JobSystem:
             await asyncio.sleep(self.heartbeat_interval)
 
     async def _deregister_worker(self) -> None:
-        if getattr(self, "_hb_task", None) is not None:
-            self._hb_task.cancel()  # type: ignore[union-attr]
+        hb_task = getattr(self, "_hb_task", None)
+        if hb_task is not None:
+            hb_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self._hb_task  # type: ignore[arg-type]
-        if getattr(self, "_hb_cxn", None) is not None and self.worker_id is not None:
+                await hb_task
+        hb_cxn = getattr(self, "_hb_cxn", None)
+        if hb_cxn is not None:
+            if self.worker_id is not None:
+                with contextlib.suppress(Exception):
+                    await hb_cxn.execute(WORKER_SHUTDOWN_SQL, self.worker_id)
             with contextlib.suppress(Exception):
-                await self._hb_cxn.execute(WORKER_SHUTDOWN_SQL, self.worker_id)  # type: ignore[union-attr]
-        if getattr(self, "_hb_cxn", None) is not None:
-            with contextlib.suppress(Exception):
-                await self._hb_cxn.close()  # type: ignore[union-attr]
+                await hb_cxn.close()
 
     def shutdown(self, signum: int, frame: Any) -> None:
         """Request graceful shutdown - stop processing new jobs but finish current job."""
@@ -476,7 +478,7 @@ class JobSystem:
         self._wake: asyncio.Event = asyncio.Event()
         self._current_job_id: int | None = None
         self._exec_task: asyncio.Task[Any] | None = None
-        self._cancel_current: bool = False
+        self._cancel_current = False
 
         await self._register_worker()
 
@@ -702,7 +704,9 @@ class JobSystem:
         jid = job["id"]
         woken = await self.ex("enqueue-next-self-finished", jid)
         if woken:
-            logger.info(f"[job {jid}] Triggered scheduling of {[x['id'] for x in woken]}")
+            logger.info(
+                f"[job {jid}] Triggered scheduling of {[x['id'] for x in woken]}"
+            )
 
         gid = job.get("run_group")
         if gid:
@@ -947,7 +951,9 @@ class Job:
         via NOTIFY."""
         await self.s.ex("set-event", self.job["id"], key, value)
 
-    async def send(self, dest_job_id: int, message: Any, topic: str | None = None) -> None:
+    async def send(
+        self, dest_job_id: int, message: Any, topic: str | None = None
+    ) -> None:
         """Send a durable message to another job's mailbox — exactly once
         across retries (the send is a checkpointed step)."""
 

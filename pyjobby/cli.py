@@ -11,13 +11,13 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import asyncpg  # type: ignore[import-untyped]
 import click
 
 from . import db
-from .admin_api import AdminAPI
+from .admin_api import UNSET, AdminAPI, Unset
 from .configloader import load_config_from_file
 
 
@@ -280,9 +280,7 @@ def jobs_retry(ctx: click.Context, job_ids: tuple[int, ...]) -> None:
                 # Single job
                 try:
                     result = await api.retry_job(job_ids[0])
-                    print_success(
-                        f"Job {result['job_id']} requeued for retry"
-                    )
+                    print_success(f"Job {result['job_id']} requeued for retry")
                 except ValueError as e:
                     print_error(str(e))
                     sys.exit(1)
@@ -294,13 +292,9 @@ def jobs_retry(ctx: click.Context, job_ids: tuple[int, ...]) -> None:
 
                 for result in results:
                     if result["status"] == "error":
-                        print_error(
-                            f"Job {result['job_id']}: {result['error']}"
-                        )
+                        print_error(f"Job {result['job_id']}: {result['error']}")
                     else:
-                        print_success(
-                            f"Job {result['job_id']} requeued"
-                        )
+                        print_success(f"Job {result['job_id']} requeued")
 
                 click.echo(f"\n{Colors.BOLD}Summary:{Colors.ENDC}")
                 print_success(f"  Retried: {success_count}")
@@ -384,6 +378,155 @@ def jobs_delete(ctx: click.Context, job_id: int, force: bool) -> None:
     asyncio.run(_delete())
 
 
+@jobs.command("history")
+@click.argument("job_id", type=int)
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON")
+@click.pass_context
+def jobs_history(ctx: click.Context, job_id: int, output_json: bool) -> None:
+    """Show a job's full transition trail (including per-attempt errors)"""
+
+    async def _history() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        try:
+            api = AdminAPI(conn)
+            history = await api.get_job_history(job_id)
+
+            if output_json:
+                click.echo(json.dumps(history, indent=2, default=str))
+                return
+
+            if not history:
+                print_warning(f"No history for job {job_id}")
+                return
+
+            click.echo(f"\n{Colors.BOLD}Job {job_id} History{Colors.ENDC}")
+            headers = ["At", "Event", "From", "Epoch", "Errors", "Worker", "Error"]
+            rows = []
+            for h in history:
+                detail = h["detail"] or {}
+                worker = (
+                    f"{detail['worker_host']}:{detail['worker_pid']}"
+                    if detail.get("worker_host")
+                    else "-"
+                )
+                error = detail.get("error") or ""
+                if len(error) > 40:
+                    error = error[:37] + "..."
+                rows.append(
+                    [
+                        h["at"][:19],
+                        h["event"],
+                        str(detail.get("from") or "-"),
+                        str(detail.get("run_epoch", "-")),
+                        str(detail.get("error_count", "-")),
+                        worker,
+                        error,
+                    ]
+                )
+
+            print_table(headers, rows, max_width=140)
+            click.echo(f"\nTotal: {len(history)} transition(s)")
+
+        finally:
+            await conn.close()
+
+    asyncio.run(_history())
+
+
+@jobs.command("steps")
+@click.argument("job_id", type=int)
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON")
+@click.pass_context
+def jobs_steps(ctx: click.Context, job_id: int, output_json: bool) -> None:
+    """Show a job's DXE step checkpoints"""
+
+    async def _steps() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        try:
+            api = AdminAPI(conn)
+            steps = await api.get_job_steps(job_id)
+
+            if output_json:
+                click.echo(json.dumps(steps, indent=2, default=str))
+                return
+
+            if not steps:
+                print_warning(f"No step checkpoints for job {job_id}")
+                return
+
+            click.echo(f"\n{Colors.BOLD}Job {job_id} Steps{Colors.ENDC}")
+            headers = ["Seq", "Name", "Epoch", "Status", "Duration", "Error"]
+            rows = []
+            for s in steps:
+                if s["error"]:
+                    status = f"{Colors.FAIL}error{Colors.ENDC}"
+                elif s["finished"]:
+                    status = f"{Colors.OKGREEN}ok{Colors.ENDC}"
+                else:
+                    status = "in-progress"
+
+                duration = (
+                    f"{s['duration_seconds']:.3f}s"
+                    if s["duration_seconds"] is not None
+                    else "-"
+                )
+                error = s["error"] or ""
+                if len(error) > 40:
+                    error = error[:37] + "..."
+
+                rows.append(
+                    [
+                        str(s["step_seq"]),
+                        s["name"],
+                        str(s["run_epoch"]),
+                        status,
+                        duration,
+                        error,
+                    ]
+                )
+
+            print_table(headers, rows, max_width=120)
+            click.echo(f"\nTotal: {len(steps)} step(s)")
+
+        finally:
+            await conn.close()
+
+    asyncio.run(_steps())
+
+
+@jobs.command("requeue")
+@click.argument("job_id", type=int)
+@click.option(
+    "--fresh",
+    is_flag=True,
+    help="Wipe DXE checkpoints first: restart from step 1 instead of resuming",
+)
+@click.pass_context
+def jobs_requeue(ctx: click.Context, job_id: int, fresh: bool) -> None:
+    """Requeue a terminal job for another run (also: RESUME an interrupted job)
+
+    By default the job keeps its DXE step checkpoints, so completed steps
+    fast-forward and execution resumes where it left off — use this to
+    resume interrupted durable jobs. Pass --fresh to wipe the checkpoints
+    and restart from step 1.
+    """
+
+    async def _requeue() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        try:
+            api = AdminAPI(conn)
+            result = await api.requeue_job(job_id, fresh=fresh)
+            mode = "fresh restart" if result["fresh"] else "resume with checkpoints"
+            print_success(f"Job {result['job_id']} requeued ({mode})")
+        except ValueError as e:
+            print_error(str(e))
+            sys.exit(1)
+        finally:
+            await conn.close()
+
+    asyncio.run(_requeue())
+
+
 # =========================================================================
 # Queue Management Commands
 # =========================================================================
@@ -395,10 +538,16 @@ def queues() -> None:
     pass
 
 
+def _fmt_limit(value: int | None) -> str:
+    """Render an optional numeric limit ('-' means unlimited)."""
+    return str(value) if value is not None else "-"
+
+
 @queues.command("list")
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def queues_list(ctx: click.Context) -> None:
-    """List all queues"""
+def queues_list(ctx: click.Context, output_json: bool) -> None:
+    """List all queues with their pause/limit controls"""
 
     async def _list() -> None:
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
@@ -406,13 +555,27 @@ def queues_list(ctx: click.Context) -> None:
             api = AdminAPI(conn)
             queues = await api.list_queues()
 
+            if output_json:
+                click.echo(json.dumps(queues, indent=2, default=str))
+                return
+
             if not queues:
                 print_warning("No queues found")
                 return
 
-            click.echo(f"\n{Colors.BOLD}Queues:{Colors.ENDC}")
-            for queue in queues:
-                click.echo(f"  • {queue}")
+            headers = ["Queue", "Paused", "Max Conc", "Rate Limit", "Rate Period"]
+            rows = []
+            for q in queues:
+                rows.append(
+                    [
+                        q["name"],
+                        "yes" if q["paused"] else "no",
+                        _fmt_limit(q["max_concurrency"]),
+                        _fmt_limit(q["rate_limit"]),
+                        f"{q['rate_period_seconds']:g}s",
+                    ]
+                )
+            print_table(headers, rows)
 
         finally:
             await conn.close()
@@ -442,28 +605,39 @@ def queues_stats(ctx: click.Context, queue: str | None, output_json: bool) -> No
 
                 headers = [
                     "Queue",
+                    "Paused",
                     "Queued",
                     "Running",
                     "Waiting",
                     "Finished",
                     "Crashed",
                     "Total",
+                    "Limits",
                 ]
                 rows = []
                 for s in stats:
+                    limits = []
+                    if s["max_concurrency"] is not None:
+                        limits.append(f"conc={s['max_concurrency']}")
+                    if s["rate_limit"] is not None:
+                        limits.append(
+                            f"rate={s['rate_limit']}/{s['rate_period_seconds']:g}s"
+                        )
                     rows.append(
                         [
                             s["queue"],
+                            "yes" if s["paused"] else "no",
                             str(s["queued"]),
                             str(s["running"]),
                             str(s["waiting"]),
                             str(s["finished"]),
                             str(s["crashed"]),
                             str(s["total"]),
+                            ", ".join(limits) or "-",
                         ]
                     )
 
-                print_table(headers, rows)
+                print_table(headers, rows, max_width=120)
 
                 # Show oldest queued job age if available
                 for s in stats:
@@ -524,6 +698,197 @@ def queues_clear(
     asyncio.run(_clear())
 
 
+@queues.command("pause")
+@click.argument("queue")
+@click.pass_context
+def queues_pause(ctx: click.Context, queue: str) -> None:
+    """Pause a queue (workers stop claiming from it immediately)"""
+
+    async def _pause() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        try:
+            api = AdminAPI(conn)
+            await api.pause_queue(queue)
+            print_success(f"Queue '{queue}' paused")
+        finally:
+            await conn.close()
+
+    asyncio.run(_pause())
+
+
+@queues.command("resume")
+@click.argument("queue")
+@click.pass_context
+def queues_resume(ctx: click.Context, queue: str) -> None:
+    """Resume a paused queue"""
+
+    async def _resume() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        try:
+            api = AdminAPI(conn)
+            await api.resume_queue(queue)
+            print_success(f"Queue '{queue}' resumed")
+        finally:
+            await conn.close()
+
+    asyncio.run(_resume())
+
+
+def _parse_optional_limit(value: str | None, option: str) -> int | None | Unset:
+    """Parse an N|none CLI limit value; absent option means 'leave alone'."""
+    if value is None:
+        return UNSET
+    if value.lower() == "none":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        print_error(f"{option} must be an integer or 'none' (got '{value}')")
+        sys.exit(2)
+
+
+def _echo_queue_control(control: dict) -> None:
+    click.echo(f"Paused:              {'yes' if control['paused'] else 'no'}")
+    click.echo(
+        f"Max concurrency:     {_fmt_limit(control['max_concurrency'])}"
+        " (claimed+running cap; '-' = unlimited)"
+    )
+    click.echo(
+        f"Rate limit:          {_fmt_limit(control['rate_limit'])}"
+        f" start(s) per {control['rate_period_seconds']:g}s"
+        " ('-' = unlimited)"
+    )
+
+
+@queues.command("limits")
+@click.argument("queue")
+@click.option(
+    "--max-concurrency",
+    "max_concurrency",
+    default=None,
+    help="Cap on claimed+running jobs (integer, or 'none' for unlimited)",
+)
+@click.option(
+    "--rate-limit",
+    "rate_limit",
+    default=None,
+    help="Max job starts per rate period (integer, or 'none' for unlimited)",
+)
+@click.option(
+    "--rate-period",
+    "rate_period",
+    type=float,
+    default=None,
+    help="Rate limit window in seconds (default window: 60)",
+)
+@click.pass_context
+def queues_limits(
+    ctx: click.Context,
+    queue: str,
+    max_concurrency: str | None,
+    rate_limit: str | None,
+    rate_period: float | None,
+) -> None:
+    """Set (or show, with no options) a queue's concurrency/rate limits
+
+    Only the options you pass are changed; workers enforce the new values
+    on their very next claim attempt.
+    """
+    mc = _parse_optional_limit(max_concurrency, "--max-concurrency")
+    rl = _parse_optional_limit(rate_limit, "--rate-limit")
+
+    async def _limits() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        try:
+            api = AdminAPI(conn)
+
+            if isinstance(mc, Unset) and isinstance(rl, Unset) and rate_period is None:
+                # No changes requested: show the current control row.
+                control = await api.get_queue_control(queue)
+                if not control:
+                    print_warning(
+                        f"Queue '{queue}' has no control row "
+                        "(unpaused, unlimited defaults)"
+                    )
+                    return
+                click.echo(f"\n{Colors.BOLD}Queue '{queue}' controls{Colors.ENDC}")
+                _echo_queue_control(control)
+                return
+
+            control = await api.set_queue_control(
+                queue,
+                max_concurrency=mc,
+                rate_limit=rl,
+                rate_period_seconds=rate_period,
+            )
+            print_success(f"Queue '{queue}' limits updated")
+            _echo_queue_control(control)
+
+        finally:
+            await conn.close()
+
+    asyncio.run(_limits())
+
+
+@queues.command("show")
+@click.argument("queue")
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON")
+@click.pass_context
+def queues_show(ctx: click.Context, queue: str, output_json: bool) -> None:
+    """Show one queue's controls and statistics"""
+
+    async def _show() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        try:
+            api = AdminAPI(conn)
+            control = await api.get_queue_control(queue)
+            stats = await api.queue_stats(queue=queue)
+
+            if output_json:
+                click.echo(
+                    json.dumps(
+                        {"control": control, "stats": stats},
+                        indent=2,
+                        default=str,
+                    )
+                )
+                return
+
+            if not control and not stats:
+                print_warning(f"Queue '{queue}' has no jobs and no control row")
+                return
+
+            click.echo(f"\n{Colors.BOLD}Queue '{queue}'{Colors.ENDC}")
+            click.echo("-" * 50)
+            if control:
+                _echo_queue_control(control)
+            else:
+                click.echo("No control row (unpaused, unlimited defaults)")
+
+            if stats:
+                s = stats[0]
+                click.echo(f"\n{Colors.BOLD}Depths:{Colors.ENDC}")
+                for state in (
+                    "queued",
+                    "claimed",
+                    "running",
+                    "waiting",
+                    "finished",
+                    "crashed",
+                    "cancelled",
+                ):
+                    click.echo(f"  {state:12} {s[state]}")
+                click.echo(f"  {'total':12} {s['total']}")
+                if s.get("oldest_queued_age_seconds"):
+                    age_min = int(s["oldest_queued_age_seconds"]) // 60
+                    click.echo(f"\nOldest queued job: {age_min} minute(s) old")
+
+        finally:
+            await conn.close()
+
+    asyncio.run(_show())
+
+
 # =========================================================================
 # Worker Management Commands
 # =========================================================================
@@ -535,11 +900,28 @@ def workers() -> None:
     pass
 
 
+def _worker_status(worker: dict) -> str:
+    """Human status of a registry row: live / stale / shutdown."""
+    if worker["shutdown_at"]:
+        return "shutdown"
+    return "live" if worker["live"] else "stale"
+
+
+def _fmt_age(seconds: float | None) -> str:
+    if seconds is None:
+        return "-"
+    if seconds < 120:
+        return f"{seconds:.0f}s ago"
+    if seconds < 7200:
+        return f"{seconds / 60:.0f}m ago"
+    return f"{seconds / 3600:.1f}h ago"
+
+
 @workers.command("list")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
 def workers_list(ctx: click.Context, output_json: bool) -> None:
-    """List active workers"""
+    """List registered workers (live and recently dead)"""
 
     async def _list() -> None:
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
@@ -551,23 +933,38 @@ def workers_list(ctx: click.Context, output_json: bool) -> None:
                 click.echo(json.dumps(workers, indent=2))
             else:
                 if not workers:
-                    print_warning("No active workers")
+                    print_warning("No registered workers")
                     return
 
-                headers = ["Host", "PID", "Job ID", "Job Class", "State"]
+                headers = [
+                    "ID",
+                    "Host",
+                    "PID",
+                    "Queue",
+                    "Status",
+                    "Last Seen",
+                    "Current Job",
+                ]
                 rows = []
                 for w in workers:
+                    job = (
+                        f"{w['current_job_id']} ({w['current_job_class']})"
+                        if w["current_job_id"]
+                        else "-"
+                    )
                     rows.append(
                         [
-                            w["worker_host"],
-                            str(w["worker_pid"]),
-                            str(w["job_id"]),
-                            w["job_class"],
-                            w["state"],
+                            str(w["id"]),
+                            w["host"],
+                            str(w["pid"]),
+                            w["queue"],
+                            _worker_status(w),
+                            _fmt_age(w["last_seen_age_seconds"]),
+                            job,
                         ]
                     )
 
-                print_table(headers, rows)
+                print_table(headers, rows, max_width=120)
 
         finally:
             await conn.close()
@@ -579,7 +976,7 @@ def workers_list(ctx: click.Context, output_json: bool) -> None:
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
 def workers_stats(ctx: click.Context, output_json: bool) -> None:
-    """Show worker statistics"""
+    """Show worker registry statistics"""
 
     async def _stats() -> None:
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
@@ -592,21 +989,18 @@ def workers_stats(ctx: click.Context, output_json: bool) -> None:
             else:
                 click.echo(f"\n{Colors.BOLD}Worker Statistics{Colors.ENDC}")
                 click.echo("-" * 50)
-                click.echo(f"Active Workers: {stats['active_workers']}")
+                click.echo(f"Live workers:      {stats['live_workers']}")
+                click.echo(f"Stale workers:     {stats['stale_workers']}")
+                click.echo(f"Shut down:         {stats['shutdown_workers']}")
+                click.echo(f"Total registered:  {stats['total_registered']}")
 
-                if stats["workers"]:
-                    click.echo(f"\n{Colors.BOLD}Worker Details:{Colors.ENDC}")
-                    headers = ["Host", "PID", "Jobs", "Oldest Job Started"]
-                    rows = []
-                    for w in stats["workers"]:
-                        oldest = (
-                            w["oldest_job_started"][:19]
-                            if w["oldest_job_started"]
-                            else ""
-                        )
-                        rows.append(
-                            [w["host"], str(w["pid"]), str(w["job_count"]), oldest]
-                        )
+                if stats["per_queue"]:
+                    click.echo(f"\n{Colors.BOLD}Live Workers by Queue:{Colors.ENDC}")
+                    headers = ["Queue", "Live Workers"]
+                    rows = [
+                        [queue, str(count)]
+                        for queue, count in sorted(stats["per_queue"].items())
+                    ]
                     print_table(headers, rows)
 
         finally:
@@ -718,7 +1112,7 @@ def metrics(
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
-            since = datetime.utcnow() - timedelta(hours=since_hours)
+            since = db.utcnow() - timedelta(hours=since_hours)
             metrics_data = await api.get_metrics(since=since, queue=queue)
 
             if output_json:
@@ -1284,6 +1678,26 @@ def dag() -> None:
     pass
 
 
+def _dag_state(status: dict) -> str:
+    """Derive a DAG's overall state from the jorb_dag_status counts."""
+    total = status["total_jobs"] or 0
+    if total == 0:
+        return "empty"
+    if status["crashed_jobs"]:
+        return "failed"
+    if (status["pending_jobs"] or 0) > 0:
+        return "running"
+    return "complete"
+
+
+def _dag_completion_pct(status: dict) -> float:
+    """Finished-job percentage from the jorb_dag_status counts."""
+    total = status["total_jobs"] or 0
+    if total == 0:
+        return 0.0
+    return 100.0 * (status["finished_jobs"] or 0) / total
+
+
 @dag.command("list")
 @click.option("--limit", "-l", default=50, help="Max results (default: 50)")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
@@ -1294,24 +1708,21 @@ def dag_list(ctx: click.Context, limit: int, output_json: bool) -> None:
     async def _list() -> None:
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
-            # Get DAGs with their status
+            # Get DAGs with their status (jorb_dag_status view)
             dags = await conn.fetch(
                 """
                 SELECT
-                    d.id,
-                    d.name,
-                    d.created,
-                    d.completed,
-                    s.total_jobs,
-                    s.finished_jobs,
-                    s.running_jobs,
-                    s.queued_jobs,
-                    s.crashed_jobs,
-                    s.dag_state,
-                    s.completion_percentage
-                FROM jorb_dag d
-                LEFT JOIN jorb_dag_status s ON s.dag_id = d.id
-                ORDER BY d.created DESC
+                    dag_id AS id,
+                    name,
+                    created,
+                    completed,
+                    total_jobs,
+                    finished_jobs,
+                    crashed_jobs,
+                    cancelled_jobs,
+                    pending_jobs
+                FROM jorb_dag_status
+                ORDER BY created DESC
                 LIMIT $1
             """,
                 limit,
@@ -1332,7 +1743,7 @@ def dag_list(ctx: click.Context, limit: int, output_json: bool) -> None:
                     name = d["name"][:30] if d["name"] else f"DAG-{d['id']}"
 
                     # State with color
-                    state = d["dag_state"] or "unknown"
+                    state = _dag_state(d)
                     if state == "complete":
                         state_colored = f"{Colors.OKGREEN}{state}{Colors.ENDC}"
                     elif state == "failed":
@@ -1343,8 +1754,7 @@ def dag_list(ctx: click.Context, limit: int, output_json: bool) -> None:
                         state_colored = state
 
                     # Progress
-                    pct = d["completion_percentage"] or 0
-                    progress = f"{pct:.0f}%"
+                    progress = f"{_dag_completion_pct(d):.0f}%"
 
                     # Job counts
                     total = d["total_jobs"] or 0
@@ -1410,12 +1820,12 @@ def dag_show(ctx: click.Context, dag_id: int, output_json: bool) -> None:
                 result = {"dag": dict(dag), "jobs": [dict(j) for j in jobs]}
                 click.echo(json.dumps(result, indent=2, default=str))
             else:
-                name = dag["dag_name"] or f"DAG-{dag_id}"
+                name = dag["name"] or f"DAG-{dag_id}"
                 click.echo(f"\n{Colors.BOLD}DAG: {name} (ID: {dag_id}){Colors.ENDC}")
                 click.echo("-" * 60)
 
                 # Overall status
-                state = dag["dag_state"]
+                state = _dag_state(dict(dag))
                 if state == "complete":
                     state_str = f"{Colors.OKGREEN}Complete{Colors.ENDC}"
                 elif state == "failed":
@@ -1428,13 +1838,12 @@ def dag_show(ctx: click.Context, dag_id: int, output_json: bool) -> None:
                 click.echo(f"State:       {state_str}")
                 click.echo(f"Created:     {dag['created']}")
                 click.echo(f"Completed:   {dag['completed'] or 'Not yet'}")
-                click.echo(f"Progress:    {dag['completion_percentage']:.1f}%")
+                click.echo(f"Progress:    {_dag_completion_pct(dict(dag)):.1f}%")
 
                 click.echo(f"\n{Colors.BOLD}Job Counts:{Colors.ENDC}")
                 click.echo(f"Total:       {dag['total_jobs']}")
                 click.echo(f"Finished:    {dag['finished_jobs']}")
-                click.echo(f"Running:     {dag['running_jobs']}")
-                click.echo(f"Queued:      {dag['queued_jobs']}")
+                click.echo(f"Pending:     {dag['pending_jobs']}")
                 click.echo(f"Crashed:     {dag['crashed_jobs']}")
                 click.echo(f"Cancelled:   {dag['cancelled_jobs']}")
 
@@ -1487,10 +1896,22 @@ def dag_visualize(ctx: click.Context, dag_id: int) -> None:
     async def _visualize() -> None:
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
-            # Get DAG dependencies
+            # Get DAG jobs with their dependency edges (jorb_dependencies
+            # plus waitfor_job; the old get_dag_dependencies() SQL function
+            # no longer exists)
             deps = await conn.fetch(
                 """
-                SELECT * FROM get_dag_dependencies($1)
+                SELECT j.id AS job_id,
+                       j.job_class,
+                       ARRAY(
+                           SELECT d.depends_on FROM jorb_dependencies d
+                           WHERE d.job_id = j.id
+                           UNION
+                           SELECT j.waitfor_job WHERE j.waitfor_job IS NOT NULL
+                       ) AS depends_on
+                FROM jorb j
+                WHERE j.dag_id = $1
+                ORDER BY j.id
             """,
                 dag_id,
             )
@@ -1586,55 +2007,71 @@ def dag_visualize(ctx: click.Context, dag_id: int) -> None:
 def jobs_retry_stats(
     ctx: click.Context, queue: str | None, since_hours: int, output_json: bool
 ) -> None:
-    """Show retry statistics (Phase 2)"""
+    """Show retry statistics from the jorb_history audit trail
+
+    An attempt is a 'running' event in jorb_history; jobs with more than
+    one attempt were retried (retries requeue the same row).
+    """
 
     async def _retry_stats() -> None:
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
-            # Build WHERE clause
-            where_clauses = ["error_count > 0"]
-            params = []
+            # Build WHERE clause over the joined job rows
+            where_clauses = ["a.attempts > 1"]
+            params: list = []
 
             if since_hours:
-                where_clauses.append(
-                    "created > now() - $1::interval"
-                )
-                params.append(f"{since_hours} hours")
+                params.append(timedelta(hours=since_hours))
+                where_clauses.append(f"j.created > now() - ${len(params)}::interval")
 
             if queue:
-                where_clauses.append("queue = $2" if since_hours else "queue = $1")
                 params.append(queue)
+                where_clauses.append(f"j.queue = ${len(params)}")
 
             where_str = " AND ".join(where_clauses)
+            attempts_cte = """
+                WITH a AS (
+                    SELECT job_id, COUNT(*) AS attempts
+                    FROM jorb_history
+                    WHERE event = 'running'
+                    GROUP BY job_id
+                )
+            """
 
-            # Get retry statistics
+            # Aggregate retried jobs by job class
             stats = await conn.fetch(
                 f"""
+                {attempts_cte}
                 SELECT
-                    admin_data->>'retry_strategy' as strategy,
+                    j.job_class,
                     COUNT(*) as job_count,
-                    AVG(error_count) as avg_retries,
-                    MAX(error_count) as max_retries,
-                    COUNT(*) FILTER (WHERE state = 'finished') as eventually_succeeded,
-                    COUNT(*) FILTER (WHERE state = 'crashed') as permanently_failed
-                FROM jorb
+                    AVG(a.attempts) as avg_attempts,
+                    MAX(a.attempts) as max_attempts,
+                    COUNT(*) FILTER (WHERE j.state = 'finished')
+                        as eventually_succeeded,
+                    COUNT(*) FILTER (WHERE j.state = 'crashed')
+                        as permanently_failed
+                FROM jorb j
+                JOIN a ON a.job_id = j.id
                 WHERE {where_str}
-                GROUP BY admin_data->>'retry_strategy'
+                GROUP BY j.job_class
                 ORDER BY job_count DESC
             """,
                 *params,
             )
 
-            # Get most retried jobs
+            # Most retried individual jobs
             top_retries = await conn.fetch(
                 f"""
+                {attempts_cte}
                 SELECT
-                    id, job_class, queue, state, error_count,
-                    admin_data->>'retry_strategy' as strategy,
-                    SUBSTRING(error_message, 1, 60) as error_preview
-                FROM jorb
+                    j.id, j.job_class, j.queue, j.state, j.error_count,
+                    a.attempts,
+                    SUBSTRING(j.error_message, 1, 60) as error_preview
+                FROM jorb j
+                JOIN a ON a.job_id = j.id
                 WHERE {where_str}
-                ORDER BY error_count DESC
+                ORDER BY a.attempts DESC
                 LIMIT 10
             """,
                 *params,
@@ -1642,7 +2079,7 @@ def jobs_retry_stats(
 
             if output_json:
                 result = {
-                    "stats_by_strategy": [dict(s) for s in stats],
+                    "stats_by_job_class": [dict(s) for s in stats],
                     "top_retries": [dict(j) for j in top_retries],
                 }
                 click.echo(json.dumps(result, indent=2, default=str))
@@ -1655,31 +2092,30 @@ def jobs_retry_stats(
                 click.echo("-" * 60)
 
                 if stats:
-                    click.echo(f"\n{Colors.BOLD}By Retry Strategy:{Colors.ENDC}")
+                    click.echo(f"\n{Colors.BOLD}Retried Jobs by Class:{Colors.ENDC}")
                     headers = [
-                        "Strategy",
+                        "Job Class",
                         "Jobs",
-                        "Avg Retries",
+                        "Avg Attempts",
                         "Max",
                         "Succeeded",
                         "Failed",
                     ]
                     rows = []
                     for s in stats:
-                        strategy = s["strategy"] or "default"
                         rows.append(
                             [
-                                strategy,
+                                s["job_class"],
                                 str(s["job_count"]),
-                                f"{s['avg_retries']:.1f}",
-                                str(s["max_retries"]),
+                                f"{s['avg_attempts']:.1f}",
+                                str(s["max_attempts"]),
                                 str(s["eventually_succeeded"]),
                                 str(s["permanently_failed"]),
                             ]
                         )
                     print_table(headers, rows)
                 else:
-                    print_warning("No retry data found")
+                    print_warning("No retried jobs found")
 
                 if top_retries:
                     click.echo(f"\n{Colors.BOLD}Top Retried Jobs:{Colors.ENDC}")
@@ -1692,8 +2128,8 @@ def jobs_retry_stats(
                         click.echo(
                             f"\nJob {job['id']} {state_icon} - {job['job_class']}"
                         )
-                        click.echo(f"  Retries: {job['error_count']}")
-                        click.echo(f"  Strategy: {job['strategy'] or 'default'}")
+                        click.echo(f"  Attempts: {job['attempts']}")
+                        click.echo(f"  Errors:   {job['error_count']}")
                         if job["error_preview"]:
                             click.echo(f"  Error: {job['error_preview']}...")
 
@@ -1713,7 +2149,7 @@ def jobs_retry_stats(
 def jobs_timeout_stats(
     ctx: click.Context, queue: str | None, since_hours: int, output_json: bool
 ) -> None:
-    """Show timeout statistics (Phase 2)"""
+    """Show timeout statistics (from jorb.timeout_at/state)"""
 
     async def _timeout_stats() -> None:
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
@@ -1723,9 +2159,7 @@ def jobs_timeout_stats(
             params = []
 
             if since_hours:
-                where_clauses.append(
-                    "created > now() - $1::interval"
-                )
+                where_clauses.append("created > now() - $1::interval")
                 params.append(f"{since_hours} hours")
 
             if queue:
@@ -1751,9 +2185,17 @@ def jobs_timeout_stats(
                 *params,
             )
 
-            # Get current timeout violations
+            # Running jobs past their deadline (plain query over
+            # timeout_at/state; the old jorb_timeout_violations view is gone)
             violations = await conn.fetch("""
-                SELECT * FROM jorb_timeout_violations
+                SELECT
+                    id, job_class, queue, timeout_at,
+                    admin_data->>'timeout_seconds' as timeout_seconds,
+                    admin_data->>'on_timeout' as on_timeout
+                FROM jorb
+                WHERE state = 'running'
+                  AND timeout_at IS NOT NULL
+                  AND timeout_at < now()
                 ORDER BY timeout_at
                 LIMIT 20
             """)
@@ -1791,15 +2233,15 @@ def jobs_timeout_stats(
                     click.echo(f"Queue: {queue}")
                 click.echo("-" * 60)
 
-                if stats:
+                if stats and stats["total_with_timeout"]:
                     click.echo(
                         f"\nJobs with timeout config: {stats['total_with_timeout']}"
                     )
                     click.echo(f"Completed successfully:   {stats['completed']}")
                     click.echo(f"Timed out (crashed):      {stats['timed_out']}")
-                    click.echo(
-                        f"Avg timeout setting:      {stats['avg_timeout_seconds']:.0f}s"
-                    )
+                    avg = stats["avg_timeout_seconds"]
+                    if avg is not None:
+                        click.echo(f"Avg timeout setting:      {avg:.0f}s")
 
                     if (
                         stats["currently_timed_out"]
@@ -1836,6 +2278,183 @@ def jobs_timeout_stats(
             await conn.close()
 
     asyncio.run(_timeout_stats())
+
+
+# =========================================================================
+# Doctor (health checks)
+# =========================================================================
+
+
+DOCTOR_REQUIRED_TRIGGERS = (
+    "jorb_enqueued_notify",
+    "jorb_done_notify",
+    "jorb_cancel_notify",
+)
+
+
+class _Doctor:
+    """Accumulates PASS/WARN/FAIL check lines for `pj-admin doctor`."""
+
+    def __init__(self) -> None:
+        self.failed = False
+
+    def report(self, status: str, name: str, message: str) -> None:
+        color = {
+            "PASS": Colors.OKGREEN,
+            "WARN": Colors.WARNING,
+            "FAIL": Colors.FAIL,
+        }[status]
+        if status == "FAIL":
+            self.failed = True
+        click.echo(f"{color}{status}{Colors.ENDC} {name}: {message}")
+
+    def check(self, ok: bool, name: str, ok_msg: str, fail_msg: str) -> None:
+        if ok:
+            self.report("PASS", name, ok_msg)
+        else:
+            self.report("FAIL", name, fail_msg)
+
+    def warn_if(self, bad: bool, name: str, ok_msg: str, warn_msg: str) -> None:
+        if bad:
+            self.report("WARN", name, warn_msg)
+        else:
+            self.report("PASS", name, ok_msg)
+
+
+@cli.command()
+@click.option(
+    "--max-depth",
+    type=int,
+    default=10000,
+    help="WARN when a queue's backlog exceeds this many queued jobs",
+)
+@click.option(
+    "--max-age-minutes",
+    type=int,
+    default=60,
+    help="WARN when a queue's oldest queued job is older than this",
+)
+@click.pass_context
+def doctor(ctx: click.Context, max_depth: int, max_age_minutes: int) -> None:
+    """Run health checks against the job platform (exit 1 on any FAIL)
+
+    Checks: database reachability, schema/migrations, NOTIFY triggers,
+    live workers, queue backlogs, the DLQ, and overdue schedules.
+    """
+
+    async def _doctor() -> int:
+        doc = _Doctor()
+
+        try:
+            conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        except SystemExit:
+            doc.report("FAIL", "database", "unreachable")
+            return 1
+        doc.report("PASS", "database", "connected")
+
+        try:
+            from . import migrations
+
+            info = await migrations.status(conn)
+            if not info["base_schema_installed"]:
+                doc.report(
+                    "FAIL",
+                    "schema",
+                    "base schema not installed (run: pj-admin db migrate)",
+                )
+                return 1  # nothing else can be checked
+            if info["pending"]:
+                doc.report(
+                    "FAIL",
+                    "schema",
+                    f"pending migrations: {info['pending']} (run: pj-admin db migrate)",
+                )
+            else:
+                applied = info["applied"] or "baseline"
+                doc.report(
+                    "PASS", "schema", f"installed, migrations current ({applied})"
+                )
+
+            # NOTIFY triggers
+            rows = await conn.fetch(
+                "SELECT tgname FROM pg_trigger WHERE tgname = ANY($1::text[])",
+                list(DOCTOR_REQUIRED_TRIGGERS),
+            )
+            present = {r["tgname"] for r in rows}
+            missing = [t for t in DOCTOR_REQUIRED_TRIGGERS if t not in present]
+            doc.check(
+                not missing,
+                "triggers",
+                f"all NOTIFY triggers present ({len(DOCTOR_REQUIRED_TRIGGERS)})",
+                f"missing NOTIFY triggers: {', '.join(missing)}",
+            )
+
+            # Live workers (heartbeats arrive every ~10s)
+            live_workers = await conn.fetchval("""
+                SELECT COUNT(*) FROM jorb_worker
+                WHERE shutdown_at IS NULL
+                  AND last_seen > now() - interval '60 seconds'
+            """)
+            doc.warn_if(
+                not live_workers,
+                "workers",
+                f"{live_workers} live worker(s) seen in last 60s",
+                "no live workers seen in last 60s",
+            )
+
+            # Queue backlogs
+            backlogs = await conn.fetch("""
+                SELECT queue,
+                       COUNT(*) AS depth,
+                       EXTRACT(EPOCH FROM (now() - MIN(run_after))) / 60.0
+                           AS oldest_minutes
+                FROM jorb
+                WHERE state = 'queued'
+                GROUP BY queue
+                ORDER BY queue
+            """)
+            if not backlogs:
+                doc.report("PASS", "queues", "no queued jobs")
+            for b in backlogs:
+                oldest = max(b["oldest_minutes"] or 0.0, 0.0)
+                summary = f"depth {b['depth']}, oldest queued {oldest:.0f}m"
+                doc.warn_if(
+                    b["depth"] > max_depth or oldest > max_age_minutes,
+                    f"queue {b['queue']}",
+                    summary,
+                    f"{summary} (thresholds: depth {max_depth}, "
+                    f"age {max_age_minutes}m)",
+                )
+
+            # DLQ ('crashed' is the terminal dead-letter state)
+            dlq_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM jorb WHERE state = 'crashed'"
+            )
+            doc.warn_if(
+                bool(dlq_count),
+                "dlq",
+                "empty",
+                f"{dlq_count} dead-lettered job(s) (inspect: pj-admin dlq list)",
+            )
+
+            # Overdue schedules
+            overdue = await conn.fetchval("""
+                SELECT COUNT(*) FROM jorb_schedule
+                WHERE enabled AND next_run < now() - interval '5 minutes'
+            """)
+            doc.warn_if(
+                bool(overdue),
+                "schedules",
+                "no overdue schedules",
+                f"{overdue} enabled schedule(s) overdue by >5m "
+                "(is pj-scheduler running?)",
+            )
+        finally:
+            await conn.close()
+
+        return 1 if doc.failed else 0
+
+    sys.exit(asyncio.run(_doctor()))
 
 
 # =========================================================================

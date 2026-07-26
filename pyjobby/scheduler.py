@@ -225,7 +225,7 @@ class ScheduleManager:
             ValueError: If cron expression is invalid
         """
         try:
-            import pytz
+            import pytz  # type: ignore[import-untyped]
             from croniter import croniter  # type: ignore[import-untyped]
 
             # Get timezone
