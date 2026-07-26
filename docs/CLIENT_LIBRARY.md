@@ -45,23 +45,22 @@ poetry add pyjobby
 import asyncio
 from pyjobby.client import JobClient
 
+
 async def main():
     # Connect using context manager (recommended)
     async with await JobClient.create(
-        host='localhost',
-        database='pyjobby',
-        user='postgres'
+        host="localhost", database="pyjobby", user="postgres"
     ) as client:
-
         # Enqueue a simple job
         job_id = await client.enqueue(
-            'myapp.jobs.SendEmail',
-            to='user@example.com',
-            subject='Welcome!',
-            body='Thanks for signing up!'
+            "myapp.jobs.SendEmail",
+            to="user@example.com",
+            subject="Welcome!",
+            body="Thanks for signing up!",
         )
 
         print(f"Job enqueued: {job_id}")
+
 
 asyncio.run(main())
 ```
@@ -69,8 +68,8 @@ asyncio.run(main())
 ### Using Configuration File
 
 ```python
-async with await JobClient.from_config('./pyjobby.conf.py') as client:
-    job_id = await client.enqueue('myapp.jobs.ProcessData', data_id=123)
+async with await JobClient.from_config("./pyjobby.conf.py") as client:
+    job_id = await client.enqueue("myapp.jobs.ProcessData", data_id=123)
 ```
 
 ---
@@ -86,20 +85,21 @@ The main interface for interacting with the job queue. Manages connection poolin
 ```python
 # Method 1: Direct connection parameters
 client = await JobClient.create(
-    host='localhost',
+    host="localhost",
     port=5432,
-    database='pyjobby',
-    user='postgres',
-    password='secret',
-    min_size=5,      # Minimum pool size
-    max_size=20      # Maximum pool size
+    database="pyjobby",
+    user="postgres",
+    password="secret",
+    min_size=5,  # Minimum pool size
+    max_size=20,  # Maximum pool size
 )
 
 # Method 2: From configuration file
-client = await JobClient.from_config('./pyjobby.conf.py')
+client = await JobClient.from_config("./pyjobby.conf.py")
 
 # Method 3: From existing pool
 import asyncpg
+
 pool = await asyncpg.create_pool(...)
 client = JobClient(pool)
 
@@ -155,55 +155,53 @@ Enqueue a single job.
 
 ```python
 # Simple job
-job_id = await client.enqueue('myapp.jobs.SendEmail', to='user@example.com')
+job_id = await client.enqueue("myapp.jobs.SendEmail", to="user@example.com")
 
 # Scheduled job (run in 1 hour)
 from datetime import datetime, timedelta
+
 job_id = await client.enqueue(
-    'myapp.jobs.DailyReport',
+    "myapp.jobs.DailyReport",
     run_after=datetime.now() + timedelta(hours=1),
-    report_type='sales'
+    report_type="sales",
 )
 
 # High priority job
 job_id = await client.enqueue(
-    'myapp.jobs.UrgentTask',
+    "myapp.jobs.UrgentTask",
     priority=500,  # Higher than default 100
-    task_id=12345
+    task_id=12345,
 )
 
 # Job requiring GPU capability
 job_id = await client.enqueue(
-    'myapp.jobs.TrainModel',
-    capability='gpu',
-    model_type='resnet50',
-    dataset='imagenet'
+    "myapp.jobs.TrainModel", capability="gpu", model_type="resnet50", dataset="imagenet"
 )
 
 # Idempotent job (safe to retry)
 job_id = await client.enqueue(
-    'myapp.jobs.ProcessPayment',
-    deadline_key=f'payment:{payment_id}',
+    "myapp.jobs.ProcessPayment",
+    deadline_key=f"payment:{payment_id}",
     payment_id=payment_id,
-    amount=99.99
+    amount=99.99,
 )
 
 # Multi-tenant job
 job_id = await client.enqueue(
-    'myapp.jobs.GenerateReport',
+    "myapp.jobs.GenerateReport",
     uid=user.id,  # Tenant ID
-    report_type='monthly'
+    report_type="monthly",
 )
 
 # Job with metadata tracking
 job_id = await client.enqueue(
-    'myapp.jobs.ProcessData',
+    "myapp.jobs.ProcessData",
     admin_data={
-        'request_id': request_id,
-        'user_agent': request.headers.get('User-Agent'),
-        'ip_address': request.remote_addr
+        "request_id": request_id,
+        "user_agent": request.headers.get("User-Agent"),
+        "ip_address": request.remote_addr,
     },
-    data_id=123
+    data_id=123,
 )
 ```
 
@@ -226,28 +224,23 @@ Enqueue multiple jobs efficiently in a single transaction.
 ```python
 # Enqueue 1000 jobs efficiently
 jobs = [
-    ('myapp.jobs.ProcessItem', {'item_id': i, 'action': 'process'})
-    for i in range(1000)
+    ("myapp.jobs.ProcessItem", {"item_id": i, "action": "process"}) for i in range(1000)
 ]
-job_ids = await client.enqueue_batch(jobs, queue='processing')
+job_ids = await client.enqueue_batch(jobs, queue="processing")
 
 # Batch with scheduling
 from datetime import datetime, timedelta
-jobs = [
-    ('myapp.jobs.SendReminder', {'user_id': user_id})
-    for user_id in user_ids
-]
+
+jobs = [("myapp.jobs.SendReminder", {"user_id": user_id}) for user_id in user_ids]
 job_ids = await client.enqueue_batch(
-    jobs,
-    run_after=datetime.now() + timedelta(hours=24),
-    queue='notifications'
+    jobs, run_after=datetime.now() + timedelta(hours=24), queue="notifications"
 )
 
 # Batch with group tracking
 job_ids = await client.enqueue_batch(
     jobs,
     run_group=123,  # All jobs in same group
-    priority=200
+    priority=200,
 )
 ```
 
@@ -297,7 +290,7 @@ if new_job_id:
 Get number of queued jobs.
 
 ```python
-depth = await client.queue_depth('emails')
+depth = await client.queue_depth("emails")
 print(f"Queue has {depth} jobs waiting")
 ```
 
@@ -306,7 +299,7 @@ print(f"Queue has {depth} jobs waiting")
 Get statistics for a queue.
 
 ```python
-stats = await client.queue_stats('emails')
+stats = await client.queue_stats("emails")
 print(f"Queued: {stats['queued']}")
 print(f"Running: {stats['running']}")
 print(f"Finished: {stats['finished']}")
@@ -336,20 +329,20 @@ Process data through multiple stages where each step waits for the previous.
 
 ```python
 # Manual pipeline
-job1 = await client.enqueue('myapp.jobs.FetchData', source='api')
-job2 = await client.enqueue('myapp.jobs.TransformData',
-                            waitfor_job=job1,
-                            format='json')
-job3 = await client.enqueue('myapp.jobs.LoadData',
-                            waitfor_job=job2,
-                            destination='database')
+job1 = await client.enqueue("myapp.jobs.FetchData", source="api")
+job2 = await client.enqueue("myapp.jobs.TransformData", waitfor_job=job1, format="json")
+job3 = await client.enqueue(
+    "myapp.jobs.LoadData", waitfor_job=job2, destination="database"
+)
 
 # Or use helper method
-job_ids = await client.create_pipeline([
-    ('myapp.jobs.FetchData', {'source': 'api'}),
-    ('myapp.jobs.TransformData', {'format': 'json'}),
-    ('myapp.jobs.LoadData', {'destination': 'database'}),
-])
+job_ids = await client.create_pipeline(
+    [
+        ("myapp.jobs.FetchData", {"source": "api"}),
+        ("myapp.jobs.TransformData", {"format": "json"}),
+        ("myapp.jobs.LoadData", {"destination": "database"}),
+    ]
+)
 print(f"Pipeline created: {job_ids}")
 ```
 
@@ -360,29 +353,26 @@ async def process_daily_data(client, date):
     """ETL pipeline for daily data processing"""
 
     # Create pipeline
-    job_ids = await client.create_pipeline([
-        # Step 1: Extract from multiple sources
-        ('myapp.jobs.ExtractFromAPI', {
-            'date': date.isoformat(),
-            'endpoint': 'sales'
-        }),
-
-        # Step 2: Transform and validate
-        ('myapp.jobs.TransformSalesData', {
-            'validation_rules': ['check_totals', 'verify_dates']
-        }),
-
-        # Step 3: Load to warehouse
-        ('myapp.jobs.LoadToWarehouse', {
-            'table': 'sales_daily',
-            'truncate': False
-        }),
-
-        # Step 4: Update analytics
-        ('myapp.jobs.RefreshAnalytics', {
-            'dashboards': ['sales', 'revenue']
-        }),
-    ], queue='etl', priority=200)
+    job_ids = await client.create_pipeline(
+        [
+            # Step 1: Extract from multiple sources
+            (
+                "myapp.jobs.ExtractFromAPI",
+                {"date": date.isoformat(), "endpoint": "sales"},
+            ),
+            # Step 2: Transform and validate
+            (
+                "myapp.jobs.TransformSalesData",
+                {"validation_rules": ["check_totals", "verify_dates"]},
+            ),
+            # Step 3: Load to warehouse
+            ("myapp.jobs.LoadToWarehouse", {"table": "sales_daily", "truncate": False}),
+            # Step 4: Update analytics
+            ("myapp.jobs.RefreshAnalytics", {"dashboards": ["sales", "revenue"]}),
+        ],
+        queue="etl",
+        priority=200,
+    )
 
     return job_ids
 ```
@@ -393,21 +383,16 @@ Process many items in parallel, then aggregate results.
 
 ```python
 # Process 1000 orders in parallel
-orders = [{'order_id': i, 'total': i * 10.0} for i in range(1000)]
+orders = [{"order_id": i, "total": i * 10.0} for i in range(1000)]
 
 # Fan-out: Create parallel jobs
 job_ids, group_id = await client.create_fan_out(
-    'myapp.jobs.ProcessOrder',
-    orders,
-    queue='processing',
-    priority=150
+    "myapp.jobs.ProcessOrder", orders, queue="processing", priority=150
 )
 
 # Fan-in: Wait for all to complete
 summary_job = await client.enqueue(
-    'myapp.jobs.GenerateSummary',
-    waitfor_group=group_id,
-    report_type='daily_orders'
+    "myapp.jobs.GenerateSummary", waitfor_group=group_id, report_type="daily_orders"
 )
 
 print(f"Created {len(job_ids)} processing jobs")
@@ -422,30 +407,27 @@ async def process_user_uploads(client, user_id, image_urls):
 
     # Create jobs for each image
     items = [
-        {'user_id': user_id, 'image_url': url, 'size': 'thumbnail'}
+        {"user_id": user_id, "image_url": url, "size": "thumbnail"}
         for url in image_urls
     ]
 
     # Fan-out: Process images in parallel
     job_ids, group_id = await client.create_fan_out(
-        'myapp.jobs.ResizeImage',
-        items,
-        queue='images',
-        priority=100
+        "myapp.jobs.ResizeImage", items, queue="images", priority=100
     )
 
     # Fan-in: Generate gallery after all processed
     gallery_job = await client.enqueue(
-        'myapp.jobs.CreateGallery',
+        "myapp.jobs.CreateGallery",
         waitfor_group=group_id,
         user_id=user_id,
-        image_count=len(image_urls)
+        image_count=len(image_urls),
     )
 
     return {
-        'processing_jobs': job_ids,
-        'gallery_job': gallery_job,
-        'group_id': group_id
+        "processing_jobs": job_ids,
+        "gallery_job": gallery_job,
+        "group_id": group_id,
     }
 ```
 
@@ -458,9 +440,9 @@ from datetime import datetime, timedelta
 
 # Run in 1 hour
 await client.enqueue(
-    'myapp.jobs.SendReminder',
+    "myapp.jobs.SendReminder",
     run_after=datetime.now() + timedelta(hours=1),
-    user_id=123
+    user_id=123,
 )
 
 # Run tomorrow at 9am
@@ -469,9 +451,9 @@ tomorrow_9am = datetime.now().replace(
 ) + timedelta(days=1)
 
 await client.enqueue(
-    'myapp.jobs.DailyReport',
+    "myapp.jobs.DailyReport",
     run_after=tomorrow_9am,
-    report_date=(datetime.now() - timedelta(days=1)).date()
+    report_date=(datetime.now() - timedelta(days=1)).date(),
 )
 ```
 
@@ -485,10 +467,10 @@ payment_id = "pay_abc123"
 
 try:
     job_id = await client.enqueue(
-        'myapp.jobs.ProcessPayment',
-        deadline_key=f'payment:{payment_id}',
+        "myapp.jobs.ProcessPayment",
+        deadline_key=f"payment:{payment_id}",
         payment_id=payment_id,
-        amount=99.99
+        amount=99.99,
     )
     print(f"Payment job created: {job_id}")
 except asyncpg.UniqueViolationError:
@@ -498,9 +480,7 @@ except asyncpg.UniqueViolationError:
 date = datetime.now().date()
 try:
     job_id = await client.enqueue(
-        'myapp.jobs.DailyReport',
-        deadline_key=f'daily_report:{date}',
-        report_date=date
+        "myapp.jobs.DailyReport", deadline_key=f"daily_report:{date}", report_date=date
     )
 except asyncpg.UniqueViolationError:
     print(f"Report for {date} already scheduled")
@@ -512,13 +492,13 @@ Queue urgent jobs ahead of others.
 
 ```python
 # Normal priority (100 is default)
-await client.enqueue('myapp.jobs.ProcessData', priority=100)
+await client.enqueue("myapp.jobs.ProcessData", priority=100)
 
 # High priority - processes first
-await client.enqueue('myapp.jobs.UrgentTask', priority=500)
+await client.enqueue("myapp.jobs.UrgentTask", priority=500)
 
 # Low priority - processes last
-await client.enqueue('myapp.jobs.BackgroundCleanup', priority=10)
+await client.enqueue("myapp.jobs.BackgroundCleanup", priority=10)
 ```
 
 ### 6. Multi-Tenant Jobs
@@ -531,16 +511,14 @@ async def enqueue_user_job(client, user_id, job_class, **kwargs):
     return await client.enqueue(
         job_class,
         uid=user_id,  # Tenant isolation
-        queue=f'user_{user_id}',  # Dedicated queue
-        **kwargs
+        queue=f"user_{user_id}",  # Dedicated queue
+        **kwargs,
     )
+
 
 # Usage
 job_id = await enqueue_user_job(
-    client,
-    user_id=123,
-    job_class='myapp.jobs.GenerateReport',
-    report_type='monthly'
+    client, user_id=123, job_class="myapp.jobs.GenerateReport", report_type="monthly"
 )
 ```
 
@@ -551,25 +529,16 @@ Route jobs to workers with specific capabilities.
 ```python
 # GPU-required jobs
 await client.enqueue(
-    'myapp.jobs.TrainModel',
-    capability='gpu',
-    model='resnet50',
-    dataset='imagenet'
+    "myapp.jobs.TrainModel", capability="gpu", model="resnet50", dataset="imagenet"
 )
 
 # High-memory jobs
 await client.enqueue(
-    'myapp.jobs.ProcessLargeDataset',
-    capability='high-memory',
-    dataset_size='100GB'
+    "myapp.jobs.ProcessLargeDataset", capability="high-memory", dataset_size="100GB"
 )
 
 # Geolocation-specific
-await client.enqueue(
-    'myapp.jobs.SyncData',
-    capability='us-west',
-    region='us-west-1'
-)
+await client.enqueue("myapp.jobs.SyncData", capability="us-west", region="us-west-1")
 ```
 
 ---
@@ -583,13 +552,13 @@ import asyncpg
 
 # Create custom pool
 pool = await asyncpg.create_pool(
-    host='db.example.com',
+    host="db.example.com",
     port=5432,
-    database='pyjobby_prod',
-    user='app_user',
-    password='secret',
-    min_size=10,     # Minimum connections
-    max_size=50,     # Maximum connections
+    database="pyjobby_prod",
+    user="app_user",
+    password="secret",
+    min_size=10,  # Minimum connections
+    max_size=50,  # Maximum connections
     max_queries=50000,  # Recycle after 50k queries
     max_inactive_connection_lifetime=300,  # 5 minutes
     command_timeout=60,  # Command timeout
@@ -599,7 +568,7 @@ pool = await asyncpg.create_pool(
 client = JobClient(pool)
 
 try:
-    await client.enqueue('myapp.jobs.ProcessData')
+    await client.enqueue("myapp.jobs.ProcessData")
 finally:
     await client.close()
 ```
@@ -609,6 +578,7 @@ finally:
 ```python
 import asyncpg
 from pyjobby.client import JobClient
+
 
 async def enqueue_with_retry(client, job_class, max_retries=3, **kwargs):
     """Enqueue job with retry logic"""
@@ -625,7 +595,7 @@ async def enqueue_with_retry(client, job_class, max_retries=3, **kwargs):
         except asyncpg.PostgresConnectionError as e:
             # Database connection error
             if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                await asyncio.sleep(2**attempt)  # Exponential backoff
                 continue
             raise
 
@@ -638,7 +608,7 @@ async def enqueue_with_retry(client, job_class, max_retries=3, **kwargs):
 ### Monitoring Queue Health
 
 ```python
-async def monitor_queues(client, queues=['default', 'emails', 'processing']):
+async def monitor_queues(client, queues=["default", "emails", "processing"]):
     """Monitor queue health and alert on issues"""
 
     for queue in queues:
@@ -650,7 +620,7 @@ async def monitor_queues(client, queues=['default', 'emails', 'processing']):
             print(f"ALERT: Queue '{queue}' has {depth} jobs waiting!")
 
         # Alert if many crashes
-        crash_rate = stats['crashed'] / max(stats['finished'], 1)
+        crash_rate = stats["crashed"] / max(stats["finished"], 1)
         if crash_rate > 0.1:  # > 10% crash rate
             print(f"ALERT: Queue '{queue}' has {crash_rate:.1%} crash rate!")
 
@@ -691,12 +661,9 @@ async def bulk_enqueue_from_csv(client, csv_file, job_class):
             job_ids = await client.enqueue_batch(batch)
             print(f"Enqueued {len(job_ids)} jobs")
 
+
 # Usage
-await bulk_enqueue_from_csv(
-    client,
-    'data/orders.csv',
-    'myapp.jobs.ProcessOrder'
-)
+await bulk_enqueue_from_csv(client, "data/orders.csv", "myapp.jobs.ProcessOrder")
 ```
 
 ---
@@ -709,13 +676,13 @@ await bulk_enqueue_from_csv(
 
 ```python
 for i in range(1000):
-    await client.enqueue('myapp.jobs.ProcessItem', item_id=i)
+    await client.enqueue("myapp.jobs.ProcessItem", item_id=i)
 ```
 
 **✅ Fast (1 round-trip):**
 
 ```python
-jobs = [('myapp.jobs.ProcessItem', {'item_id': i}) for i in range(1000)]
+jobs = [("myapp.jobs.ProcessItem", {"item_id": i}) for i in range(1000)]
 await client.enqueue_batch(jobs)
 ```
 
@@ -744,15 +711,11 @@ Match pool size to concurrency:
 client = await JobClient.create(
     ...,
     min_size=20,  # Keep 20 connections ready
-    max_size=100  # Allow bursts up to 100
+    max_size=100,  # Allow bursts up to 100
 )
 
 # For low-concurrency batch scripts
-client = await JobClient.create(
-    ...,
-    min_size=2,
-    max_size=5
-)
+client = await JobClient.create(..., min_size=2, max_size=5)
 ```
 
 ### 4. Queue Organization
@@ -761,13 +724,13 @@ Separate queues for different priorities:
 
 ```python
 # High-priority queue
-await client.enqueue('myapp.jobs.UrgentTask', queue='high-priority')
+await client.enqueue("myapp.jobs.UrgentTask", queue="high-priority")
 
 # Normal queue
-await client.enqueue('myapp.jobs.NormalTask', queue='default')
+await client.enqueue("myapp.jobs.NormalTask", queue="default")
 
 # Background queue
-await client.enqueue('myapp.jobs.Cleanup', queue='low-priority')
+await client.enqueue("myapp.jobs.Cleanup", queue="low-priority")
 ```
 
 ### 5. Minimize Metadata
@@ -797,6 +760,7 @@ import asyncio
 from datetime import datetime, timedelta
 from pyjobby.client import JobClient
 
+
 class OrderProcessor:
     def __init__(self, client: JobClient):
         self.client = client
@@ -811,21 +775,19 @@ class OrderProcessor:
         """
 
         # Create pipeline for order processing
-        pipeline_jobs = await self.client.create_pipeline([
-            ('myapp.jobs.ValidateInventory', {
-                'order_id': order_id,
-                'items': items
-            }),
-            ('myapp.jobs.ChargePayment', {
-                'order_id': order_id
-            }),
-            ('myapp.jobs.CreateShipment', {
-                'order_id': order_id
-            }),
-            ('myapp.jobs.SendConfirmationEmail', {
-                'order_id': order_id
-            }),
-        ], queue='orders', priority=200)
+        pipeline_jobs = await self.client.create_pipeline(
+            [
+                (
+                    "myapp.jobs.ValidateInventory",
+                    {"order_id": order_id, "items": items},
+                ),
+                ("myapp.jobs.ChargePayment", {"order_id": order_id}),
+                ("myapp.jobs.CreateShipment", {"order_id": order_id}),
+                ("myapp.jobs.SendConfirmationEmail", {"order_id": order_id}),
+            ],
+            queue="orders",
+            priority=200,
+        )
 
         return pipeline_jobs
 
@@ -834,28 +796,22 @@ class OrderProcessor:
         Process bulk shipments in parallel, then generate manifest
         """
 
-        items = [{'order_id': oid} for oid in order_ids]
+        items = [{"order_id": oid} for oid in order_ids]
 
         # Fan-out: Process shipments in parallel
         job_ids, group_id = await self.client.create_fan_out(
-            'myapp.jobs.GenerateShippingLabel',
-            items,
-            queue='shipping',
-            priority=150
+            "myapp.jobs.GenerateShippingLabel", items, queue="shipping", priority=150
         )
 
         # Fan-in: Generate manifest after all labels created
         manifest_job = await self.client.enqueue(
-            'myapp.jobs.GenerateShippingManifest',
+            "myapp.jobs.GenerateShippingManifest",
             waitfor_group=group_id,
             group_id=group_id,
-            order_count=len(order_ids)
+            order_count=len(order_ids),
         )
 
-        return {
-            'label_jobs': job_ids,
-            'manifest_job': manifest_job
-        }
+        return {"label_jobs": job_ids, "manifest_job": manifest_job}
 
     async def schedule_abandoned_cart_reminders(self, cart_ids: list):
         """
@@ -867,19 +823,18 @@ class OrderProcessor:
 
         for cart_id in cart_ids:
             # Use deadline key to prevent duplicate reminders
-            jobs.append((
-                'myapp.jobs.SendAbandonedCartEmail',
-                {
-                    'cart_id': cart_id,
-                    'deadline_key': f'cart_reminder:{cart_id}'
-                }
-            ))
+            jobs.append(
+                (
+                    "myapp.jobs.SendAbandonedCartEmail",
+                    {"cart_id": cart_id, "deadline_key": f"cart_reminder:{cart_id}"},
+                )
+            )
 
         job_ids = await self.client.enqueue_batch(
             jobs,
-            queue='emails',
+            queue="emails",
             run_after=send_time,
-            priority=50  # Low priority
+            priority=50,  # Low priority
         )
 
         return job_ids
@@ -887,7 +842,7 @@ class OrderProcessor:
     async def monitor_order_queues(self):
         """Monitor order processing queues"""
 
-        for queue in ['orders', 'shipping', 'emails']:
+        for queue in ["orders", "shipping", "emails"]:
             stats = await self.client.queue_stats(queue)
             depth = await self.client.queue_depth(queue)
 
@@ -896,15 +851,15 @@ class OrderProcessor:
             print(f"  Running: {stats['running']}")
             print(f"  Crashed: {stats['crashed']}")
 
+
 # Usage
 async def main():
-    async with await JobClient.from_config('./pyjobby.conf.py') as client:
+    async with await JobClient.from_config("./pyjobby.conf.py") as client:
         processor = OrderProcessor(client)
 
         # Process new order
         order_jobs = await processor.process_new_order(
-            order_id=12345,
-            items=[{'sku': 'ABC', 'qty': 2}, {'sku': 'XYZ', 'qty': 1}]
+            order_id=12345, items=[{"sku": "ABC", "qty": 2}, {"sku": "XYZ", "qty": 1}]
         )
         print(f"Order pipeline: {order_jobs}")
 
@@ -923,7 +878,8 @@ async def main():
         # Monitor queues
         await processor.monitor_order_queues()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     asyncio.run(main())
 ```
 

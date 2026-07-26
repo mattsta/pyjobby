@@ -140,14 +140,17 @@ WHERE state = 'queued' AND deadline_key IS NOT NULL;
 # User uploads multiple files, but only schedule one billing update
 for file in uploaded_files:
     try:
-        await db.execute("""
+        await db.execute(
+            """
             INSERT INTO jorb (job_class, kwargs, deadline_key, run_after, queue)
             VALUES ($1, $2, $3, $4, $5)
-        """, 'job.billing.Update',
+        """,
+            "job.billing.Update",
             '{"user_id": 123}',
-            'billing:123:2025-11-18',  # Same key
-            '2025-11-18 23:59:00',
-            'default')
+            "billing:123:2025-11-18",  # Same key
+            "2025-11-18 23:59:00",
+            "default",
+        )
     except UniqueViolationError:
         pass  # Already scheduled, ignore
 ```
@@ -309,7 +312,7 @@ EOF
 from priv.schema import Jorb, JorbState, Base
 from sqlalchemy import create_engine
 
-engine = create_engine('postgresql://user:pass@localhost/myapp')
+engine = create_engine("postgresql://user:pass@localhost/myapp")
 Base.metadata.create_all(engine)
 ```
 
@@ -321,29 +324,34 @@ Base.metadata.create_all(engine)
 import asyncpg
 import orjson
 
+
 async def submit_job(job_class: str, kwargs: dict, **options):
     conn = await asyncpg.connect(**db_params)
 
-    job_id = await conn.fetchval("""
+    job_id = await conn.fetchval(
+        """
         INSERT INTO jorb (job_class, kwargs, queue, prio, uid, capability)
         VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING id
-    """, job_class,
+    """,
+        job_class,
         orjson.dumps(kwargs),
-        options.get('queue', 'default'),
-        options.get('prio', 0),
-        options.get('uid'),
-        options.get('capability'))
+        options.get("queue", "default"),
+        options.get("prio", 0),
+        options.get("uid"),
+        options.get("capability"),
+    )
 
     return job_id
 
+
 # Usage
 job_id = await submit_job(
-    'job.email.SendEmail',
-    {'to': 'user@example.com', 'subject': 'Hello'},
-    queue='email',
+    "job.email.SendEmail",
+    {"to": "user@example.com", "subject": "Hello"},
+    queue="email",
     prio=0,
-    uid=12345
+    uid=12345,
 )
 ```
 
@@ -352,23 +360,28 @@ job_id = await submit_job(
 ```python
 import datetime
 
+
 async def submit_scheduled_job(job_class: str, kwargs: dict, run_at: datetime.datetime):
     conn = await asyncpg.connect(**db_params)
 
-    return await conn.fetchval("""
+    return await conn.fetchval(
+        """
         INSERT INTO jorb (job_class, kwargs, run_after)
         VALUES ($1, $2, $3)
         RETURNING id
-    """, job_class, orjson.dumps(kwargs), run_at)
+    """,
+        job_class,
+        orjson.dumps(kwargs),
+        run_at,
+    )
+
 
 # Schedule for tomorrow 9 AM
 tomorrow_9am = datetime.datetime.now() + datetime.timedelta(days=1)
 tomorrow_9am = tomorrow_9am.replace(hour=9, minute=0, second=0, microsecond=0)
 
 await submit_scheduled_job(
-    'job.reports.DailySummary',
-    {'report_type': 'sales'},
-    tomorrow_9am
+    "job.reports.DailySummary", {"report_type": "sales"}, tomorrow_9am
 )
 ```
 
@@ -379,21 +392,28 @@ async def submit_dependent_jobs():
     conn = await asyncpg.connect(**db_params)
 
     # Parent job
-    parent_id = await conn.fetchval("""
+    parent_id = await conn.fetchval(
+        """
         INSERT INTO jorb (job_class, kwargs)
         VALUES ($1, $2)
         RETURNING id
-    """, 'job.file.Upload', '{"filepath": "/tmp/file.jpg"}')
+    """,
+        "job.file.Upload",
+        '{"filepath": "/tmp/file.jpg"}',
+    )
 
     # Child job (waits for parent)
-    child_id = await conn.fetchval("""
+    child_id = await conn.fetchval(
+        """
         INSERT INTO jorb (job_class, kwargs, state, waitfor_job)
         VALUES ($1, $2, $3, $4)
         RETURNING id
-    """, 'job.image.Thumbnail',
+    """,
+        "job.image.Thumbnail",
         '{"filepath": "/tmp/file.jpg"}',
-        'waiting',  # Must start in waiting state!
-        parent_id)
+        "waiting",  # Must start in waiting state!
+        parent_id,
+    )
 
     return parent_id, child_id
 ```
@@ -403,26 +423,35 @@ async def submit_dependent_jobs():
 ```python
 import secrets
 
+
 async def submit_parallel_pipeline():
     conn = await asyncpg.connect(**db_params)
     group_id = secrets.randbits(63)
 
     # Create 3 parallel jobs
-    for job_class in ['job.Hash', 'job.EXIF', 'job.Thumbnail']:
-        await conn.execute("""
+    for job_class in ["job.Hash", "job.EXIF", "job.Thumbnail"]:
+        await conn.execute(
+            """
             INSERT INTO jorb (job_class, kwargs, run_group)
             VALUES ($1, $2, $3)
-        """, job_class, '{"file": "/tmp/upload.jpg"}', group_id)
+        """,
+            job_class,
+            '{"file": "/tmp/upload.jpg"}',
+            group_id,
+        )
 
     # Create aggregator job (waits for all 3)
-    aggregator_id = await conn.fetchval("""
+    aggregator_id = await conn.fetchval(
+        """
         INSERT INTO jorb (job_class, kwargs, state, waitfor_group)
         VALUES ($1, $2, $3, $4)
         RETURNING id
-    """, 'job.Aggregate',
+    """,
+        "job.Aggregate",
         f'{{"group_id": {group_id}}}',
-        'waiting',
-        group_id)
+        "waiting",
+        group_id,
+    )
 
     return group_id, aggregator_id
 ```
@@ -435,19 +464,21 @@ async def submit_with_deadline_key(user_id: int):
 
     deadline_key = f"billing-update:{user_id}:{date.today()}"
     midnight = datetime.datetime.combine(
-        datetime.date.today() + datetime.timedelta(days=1),
-        datetime.time.min
+        datetime.date.today() + datetime.timedelta(days=1), datetime.time.min
     )
 
     try:
-        job_id = await conn.fetchval("""
+        job_id = await conn.fetchval(
+            """
             INSERT INTO jorb (job_class, kwargs, deadline_key, run_after)
             VALUES ($1, $2, $3, $4)
             RETURNING id
-        """, 'job.billing.UpdateUsage',
+        """,
+            "job.billing.UpdateUsage",
             f'{{"user_id": {user_id}}}',
             deadline_key,
-            midnight)
+            midnight,
+        )
         print(f"Scheduled job {job_id}")
     except asyncpg.UniqueViolationError:
         print("Job already scheduled for this user/date")
@@ -594,7 +625,7 @@ child_id = await conn.fetchval("INSERT INTO jorb ... waitfor_job = $1", parent_i
 
 ```python
 # Good: JSONB for structured data
-kwargs = {'user_id': 123, 'email': 'user@example.com'}
+kwargs = {"user_id": 123, "email": "user@example.com"}
 await conn.execute("INSERT INTO jorb (kwargs) VALUES ($1)", orjson.dumps(kwargs))
 
 # Bad: String encoding

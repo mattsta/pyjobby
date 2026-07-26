@@ -75,9 +75,10 @@ class RetryableAPICall(Job):
             # Simulate API call
             import aiohttp
 
-            async with aiohttp.ClientSession() as session, session.get(
-                url, timeout=aiohttp.ClientTimeout(total=25)
-            ) as response:
+            async with (
+                aiohttp.ClientSession() as session,
+                session.get(url, timeout=aiohttp.ClientTimeout(total=25)) as response,
+            ):
                 response.raise_for_status()
                 data = await response.json()
                 return {"status": "success", "data": data}
@@ -332,7 +333,7 @@ class DripCampaignJob(Job):
 class ProgressReportingJob(Job):
     """Publish progress events that clients can read/await:
 
-        value = await client.get_event(job_id, "progress")
+    value = await client.get_event(job_id, "progress")
     """
 
     async def task(self, items: int = 1000):

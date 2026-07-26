@@ -236,6 +236,7 @@ WHERE job_class = 'job.email.SendEmail'
 def validate_email(email: str) -> bool:
     return "@" in email and "." in email.split("@")[1]
 
+
 if not validate_email(email):
     raise ValueError(f"Invalid email: {email}")
 ```
@@ -252,7 +253,7 @@ class APIJob(Job):
                 return await call_api(endpoint)
             except aiohttp.ClientError:
                 if attempt < 2:
-                    await asyncio.sleep(2 ** attempt)
+                    await asyncio.sleep(2**attempt)
                     continue
                 raise
 ```
@@ -268,7 +269,7 @@ class ProcessLargeFile(Job):
         # data = open(filepath).read()
 
         # Good: Process in chunks
-        with open(filepath, 'rb') as f:
+        with open(filepath, "rb") as f:
             while chunk := f.read(4096):
                 process_chunk(chunk)
 ```
@@ -399,8 +400,8 @@ SHOW max_connections;
 # Reduce pool size in config
 db_params = {
     "database": "pyjobby_prod",
-    "min_size": 1,   # Reduce from 2
-    "max_size": 5,   # Reduce from 10
+    "min_size": 1,  # Reduce from 2
+    "max_size": 5,  # Reduce from 10
 }
 
 # Or increase PostgreSQL max_connections
@@ -494,7 +495,7 @@ class FixedJob(Job):
 class LeakyJob(Job):
     def task(self, filepath: str):
         # Returns entire file contents!
-        with open(filepath, 'rb') as f:
+        with open(filepath, "rb") as f:
             return {"data": f.read()}  # Could be gigabytes!
 ```
 
@@ -514,6 +515,7 @@ class FixedJob(Job):
 # Add memory tracking
 import psutil
 import os
+
 
 class MonitoredJob(Job):
     def run(self):
@@ -563,7 +565,7 @@ web_listen = {
     "sites": [{"host": "0.0.0.0", "port": 8080}],
     "paths": {
         "job.webhook.Handler",  # Add your job class here
-    }
+    },
 }
 ```
 
@@ -631,6 +633,7 @@ grep "class SendEmail" job/email.py
 # job/email.py
 from pyjobby.pj import Job
 
+
 class SendEmail(Job):  # Class name must match
     def task(self, **kwargs):
         pass
@@ -697,8 +700,7 @@ class SendEmail(Job):
     async def task(self, to: str, message_id: str):
         # Check if already sent
         sent = await self.s.cxn.fetchval(
-            "SELECT 1 FROM sent_emails WHERE message_id = $1",
-            message_id
+            "SELECT 1 FROM sent_emails WHERE message_id = $1", message_id
         )
 
         if not sent:
@@ -707,7 +709,7 @@ class SendEmail(Job):
             # Record that we sent it
             await self.s.cxn.execute(
                 "INSERT INTO sent_emails (message_id, sent_at) VALUES ($1, NOW())",
-                message_id
+                message_id,
             )
 ```
 
@@ -729,11 +731,16 @@ import uuid
 # Generate unique key for this operation
 operation_id = str(uuid.uuid4())
 
-await conn.execute("""
+await conn.execute(
+    """
     INSERT INTO jorb (job_class, kwargs, deadline_key)
     VALUES ($1, $2, $3)
     ON CONFLICT (deadline_key, queue) WHERE state = 'queued' DO NOTHING
-""", "job.Process", '{"data": "..."}', operation_id)
+""",
+    "job.Process",
+    '{"data": "..."}',
+    operation_id,
+)
 ```
 
 ---
@@ -775,6 +782,7 @@ ORDER BY avg_seconds DESC;
 
 ```python
 import time
+
 
 class SlowJob(Job):
     def task(self, **kwargs):
@@ -843,7 +851,9 @@ logger.add(sys.stderr, level="DEBUG")  # Show all logs
 # Add breakpoint in job
 class DebugJob(Job):
     def task(self, **kwargs):
-        import pdb; pdb.set_trace()  # Debugger
+        import pdb
+
+        pdb.set_trace()  # Debugger
         # Job will pause here, attach debugger
 ```
 

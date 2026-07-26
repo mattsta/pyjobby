@@ -152,9 +152,9 @@ async def test_jobs_reach_terminal_states(finish_count, crash_count):
 )
 async def test_concurrent_producers_create_all_jobs(producer_count, jobs_per_producer):
     # Run producers concurrently
-    results = await asyncio.gather(*[
-        producer(i, jobs_per_producer) for i in range(producer_count)
-    ])
+    results = await asyncio.gather(
+        *[producer(i, jobs_per_producer) for i in range(producer_count)]
+    )
 
     all_job_ids = flatten(results)
 
@@ -213,8 +213,11 @@ async def test_recovery_respects_timeout(old_job_count, recent_job_count):
 **Invariant**: Jobs claimed in priority order (lower number = higher priority)
 
 ```python
-@given(priorities=st.lists(st.integers(min_value=1, max_value=1000),
-                           min_size=2, max_size=10, unique=True))
+@given(
+    priorities=st.lists(
+        st.integers(min_value=1, max_value=1000), min_size=2, max_size=10, unique=True
+    )
+)
 async def test_jobs_claimed_in_priority_order(priorities):
     # Create jobs with random priorities
     for prio in priorities:
@@ -387,8 +390,7 @@ capabilities = st.sampled_from(["cpu", "gpu", "disk", None])
 
 # Lists
 priorities_list = st.lists(
-    st.integers(min_value=1, max_value=1000),
-    min_size=2, max_size=10, unique=True
+    st.integers(min_value=1, max_value=1000), min_size=2, max_size=10, unique=True
 )
 
 # Time offsets

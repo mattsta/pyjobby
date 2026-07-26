@@ -34,9 +34,9 @@ class ProcessUploadJob:
             raise FileNotFoundError(f"File not found: {file_path}")
 
         # Process based on type
-        if file_type == 'csv':
+        if file_type == "csv":
             await self.process_csv(file_path, user_id)
-        elif file_type == 'image':
+        elif file_type == "image":
             await self.process_image(file_path, user_id)
 
         # Clean up
@@ -52,8 +52,7 @@ class ProcessUploadJob:
             reader = csv.DictReader(f)
             for row in reader:
                 await conn.execute(
-                    "INSERT INTO user_data (...) VALUES (...)",
-                    user_id, ...
+                    "INSERT INTO user_data (...) VALUES (...)", user_id, ...
                 )
 
         await conn.close()
@@ -64,7 +63,7 @@ class ProcessUploadJob:
         # Create thumbnail
         img = Image.open(file_path)
         img.thumbnail((300, 300))
-        img.save(f'/var/thumbnails/{user_id}_{os.path.basename(file_path)}')
+        img.save(f"/var/thumbnails/{user_id}_{os.path.basename(file_path)}")
 ```
 
 ### FastAPI Integration
@@ -78,44 +77,45 @@ import os
 
 app = FastAPI()
 
+
 # Create client on startup
 @app.on_event("startup")
 async def startup():
-    app.state.job_client = await JobClient.from_config('./pyjobby.conf.py')
+    app.state.job_client = await JobClient.from_config("./pyjobby.conf.py")
+
 
 @app.on_event("shutdown")
 async def shutdown():
     await app.state.job_client.close()
 
+
 @app.post("/upload")
-async def upload_file(
-    file: UploadFile = File(...),
-    user_id: int = 1
-):
+async def upload_file(file: UploadFile = File(...), user_id: int = 1):
     """Upload file and process asynchronously"""
 
     # Save file
-    file_path = f'/tmp/uploads/{file.filename}'
+    file_path = f"/tmp/uploads/{file.filename}"
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
-    async with aiofiles.open(file_path, 'wb') as f:
+    async with aiofiles.open(file_path, "wb") as f:
         content = await file.read()
         await f.write(content)
 
     # Enqueue processing job
     job_id = await app.state.job_client.enqueue(
-        'app.jobs.ProcessUploadJob',
+        "app.jobs.ProcessUploadJob",
         user_id=user_id,
         file_path=file_path,
-        file_type=file.filename.split('.')[-1],
-        deadline_key=f'upload:{user_id}:{file.filename}'  # Prevent duplicates
+        file_type=file.filename.split(".")[-1],
+        deadline_key=f"upload:{user_id}:{file.filename}",  # Prevent duplicates
     )
 
     return {
-        'message': 'File uploaded successfully',
-        'job_id': job_id,
-        'status': 'processing'
+        "message": "File uploaded successfully",
+        "job_id": job_id,
+        "status": "processing",
     }
+
 
 @app.get("/job/{job_id}")
 async def get_job_status(job_id: int):
@@ -124,13 +124,9 @@ async def get_job_status(job_id: int):
     job = await app.state.job_client.get_job(job_id)
 
     if not job:
-        return {'error': 'Job not found'}, 404
+        return {"error": "Job not found"}, 404
 
-    return {
-        'job_id': job.id,
-        'state': job.state,
-        'created': job.created.isoformat()
-    }
+    return {"job_id": job.id, "state": job.state, "created": job.created.isoformat()}
 ```
 
 ---
@@ -144,6 +140,7 @@ async def get_job_status(job_id: int):
 from datetime import datetime, date
 import asyncpg
 
+
 class ExtractSalesDataJob:
     """Extract sales data from external API"""
 
@@ -153,19 +150,20 @@ class ExtractSalesDataJob:
         # Call external API
         async with httpx.AsyncClient() as client:
             response = await client.get(
-                f'https://api.example.com/sales',
-                params={'date': date, 'source': source}
+                f"https://api.example.com/sales",
+                params={"date": date, "source": source},
             )
             data = response.json()
 
         # Store raw data
         conn = await asyncpg.connect(...)
         await conn.copy_records_to_table(
-            'raw_sales',
+            "raw_sales",
             records=[(date, source, json.dumps(item)) for item in data],
-            columns=['date', 'source', 'data']
+            columns=["date", "source", "data"],
         )
         await conn.close()
+
 
 class TransformSalesDataJob:
     """Transform and validate sales data"""
@@ -174,7 +172,8 @@ class TransformSalesDataJob:
         conn = await asyncpg.connect(...)
 
         # Transform raw data
-        await conn.execute("""
+        await conn.execute(
+            """
             INSERT INTO staging_sales (date, product_id, quantity, amount)
             SELECT
                 date,
@@ -184,20 +183,26 @@ class TransformSalesDataJob:
             FROM raw_sales
             WHERE date = $1
               AND data IS NOT NULL
-        """, date)
+        """,
+            date,
+        )
 
         # Validate totals
-        result = await conn.fetchrow("""
+        result = await conn.fetchrow(
+            """
             SELECT
                 COUNT(*) as count,
                 SUM(amount) as total
             FROM staging_sales
             WHERE date = $1
-        """, date)
+        """,
+            date,
+        )
 
         print(f"Transformed {result['count']} records, total: ${result['total']}")
 
         await conn.close()
+
 
 class LoadToWarehouseJob:
     """Load validated data to warehouse"""
@@ -206,7 +211,8 @@ class LoadToWarehouseJob:
         conn = await asyncpg.connect(...)
 
         # Upsert into warehouse
-        await conn.execute(f"""
+        await conn.execute(
+            f"""
             INSERT INTO {table} (date, product_id, quantity, amount)
             SELECT date, product_id, quantity, amount
             FROM staging_sales
@@ -215,9 +221,12 @@ class LoadToWarehouseJob:
             SET quantity = EXCLUDED.quantity,
                 amount = EXCLUDED.amount,
                 updated_at = NOW()
-        """, date)
+        """,
+            date,
+        )
 
         await conn.close()
+
 
 class RefreshAnalyticsJob:
     """Refresh analytics materialized views"""
@@ -239,6 +248,7 @@ import asyncio
 from datetime import datetime, timedelta
 from pyjobby.client import JobClient
 
+
 async def run_daily_etl(date: date = None):
     """Run daily ETL pipeline"""
 
@@ -247,38 +257,38 @@ async def run_daily_etl(date: date = None):
 
     date_str = date.isoformat()
 
-    async with await JobClient.from_config('./pyjobby.conf.py') as client:
-
+    async with await JobClient.from_config("./pyjobby.conf.py") as client:
         # Create ETL pipeline
-        pipeline_jobs = await client.create_pipeline([
-            # Extract
-            ('jobs.etl_pipeline.ExtractSalesDataJob', {
-                'date': date_str,
-                'source': 'shopify'
-            }),
-
-            # Transform
-            ('jobs.etl_pipeline.TransformSalesDataJob', {
-                'date': date_str
-            }),
-
-            # Load
-            ('jobs.etl_pipeline.LoadToWarehouseJob', {
-                'date': date_str,
-                'table': 'warehouse.sales_daily'
-            }),
-
-            # Analytics
-            ('jobs.etl_pipeline.RefreshAnalyticsJob', {
-                'views': ['sales_by_product', 'revenue_by_date']
-            }),
-        ], queue='etl', priority=300)
+        pipeline_jobs = await client.create_pipeline(
+            [
+                # Extract
+                (
+                    "jobs.etl_pipeline.ExtractSalesDataJob",
+                    {"date": date_str, "source": "shopify"},
+                ),
+                # Transform
+                ("jobs.etl_pipeline.TransformSalesDataJob", {"date": date_str}),
+                # Load
+                (
+                    "jobs.etl_pipeline.LoadToWarehouseJob",
+                    {"date": date_str, "table": "warehouse.sales_daily"},
+                ),
+                # Analytics
+                (
+                    "jobs.etl_pipeline.RefreshAnalyticsJob",
+                    {"views": ["sales_by_product", "revenue_by_date"]},
+                ),
+            ],
+            queue="etl",
+            priority=300,
+        )
 
         print(f"ETL pipeline created for {date}: {pipeline_jobs}")
 
         return pipeline_jobs
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     asyncio.run(run_daily_etl())
 ```
 
@@ -306,15 +316,16 @@ pj-admin schedule add daily-etl \
 from PIL import Image
 import os
 
+
 class ResizeImageJob:
     """Resize image to specific dimensions"""
 
     async def run(self, image_path: str, size: str, output_dir: str):
         sizes = {
-            'thumbnail': (150, 150),
-            'small': (300, 300),
-            'medium': (800, 800),
-            'large': (1200, 1200)
+            "thumbnail": (150, 150),
+            "small": (300, 300),
+            "medium": (800, 800),
+            "large": (1200, 1200),
         }
 
         if size not in sizes:
@@ -331,6 +342,7 @@ class ResizeImageJob:
 
         return output_path
 
+
 class CreateGalleryJob:
     """Create image gallery after all images processed"""
 
@@ -339,18 +351,22 @@ class CreateGalleryJob:
 
         # Get all processed images
         images = []
-        for size in ['thumbnail', 'small', 'medium', 'large']:
-            images.extend([
-                f for f in os.listdir(output_dir)
-                if f.startswith(f"{size}_")
-            ])
+        for size in ["thumbnail", "small", "medium", "large"]:
+            images.extend(
+                [f for f in os.listdir(output_dir) if f.startswith(f"{size}_")]
+            )
 
         # Store in database
         conn = await asyncpg.connect(...)
-        await conn.execute("""
+        await conn.execute(
+            """
             INSERT INTO user_galleries (user_id, image_count, images, created_at)
             VALUES ($1, $2, $3, NOW())
-        """, user_id, image_count, images)
+        """,
+            user_id,
+            image_count,
+            images,
+        )
         await conn.close()
 
         print(f"Gallery created for user {user_id}: {image_count} images")
@@ -363,71 +379,61 @@ class CreateGalleryJob:
 from pyjobby.client import JobClient
 from typing import List
 
+
 class ImageProcessingService:
     def __init__(self, client: JobClient):
         self.client = client
 
     async def process_upload(
-        self,
-        user_id: int,
-        image_paths: List[str],
-        output_dir: str = '/var/images'
+        self, user_id: int, image_paths: List[str], output_dir: str = "/var/images"
     ):
         """Process uploaded images in parallel"""
 
         # Create fan-out jobs for each size
         all_jobs = []
-        sizes = ['thumbnail', 'small', 'medium', 'large']
+        sizes = ["thumbnail", "small", "medium", "large"]
 
         for image_path in image_paths:
             items = [
-                {
-                    'image_path': image_path,
-                    'size': size,
-                    'output_dir': output_dir
-                }
+                {"image_path": image_path, "size": size, "output_dir": output_dir}
                 for size in sizes
             ]
 
             job_ids, group_id = await self.client.create_fan_out(
-                'jobs.image_processing.ResizeImageJob',
+                "jobs.image_processing.ResizeImageJob",
                 items,
-                queue='images',
-                priority=100
+                queue="images",
+                priority=100,
             )
 
-            all_jobs.append({
-                'image': image_path,
-                'group_id': group_id,
-                'resize_jobs': job_ids
-            })
+            all_jobs.append(
+                {"image": image_path, "group_id": group_id, "resize_jobs": job_ids}
+            )
 
         # Create gallery job that waits for ALL images
         gallery_job = await self.client.enqueue(
-            'jobs.image_processing.CreateGalleryJob',
-            waitfor_group=all_jobs[-1]['group_id'],  # Wait for last group
+            "jobs.image_processing.CreateGalleryJob",
+            waitfor_group=all_jobs[-1]["group_id"],  # Wait for last group
             user_id=user_id,
             image_count=len(image_paths),
-            output_dir=output_dir
+            output_dir=output_dir,
         )
 
-        return {
-            'processing_jobs': all_jobs,
-            'gallery_job': gallery_job
-        }
+        return {"processing_jobs": all_jobs, "gallery_job": gallery_job}
+
 
 # Usage
 async def main():
-    async with await JobClient.from_config('./pyjobby.conf.py') as client:
+    async with await JobClient.from_config("./pyjobby.conf.py") as client:
         service = ImageProcessingService(client)
 
         result = await service.process_upload(
             user_id=123,
             image_paths=[
-                '/tmp/uploads/photo1.jpg',
-                '/tmp/uploads/photo2.jpg',
-                '/tmp/uploads/photo3.jpg'
-            ]
+                "/tmp/uploads/photo1.jpg",
+                "/tmp/uploads/photo2.jpg",
+                "/tmp/uploads/photo3.jpg",
+            ],
         )
 
         print(f"Gallery job: {result['gallery_job']}")
@@ -444,21 +450,24 @@ async def main():
 import asyncio
 from typing import List, Dict
 
+
 class SendCampaignEmailJob:
     """Send single campaign email"""
 
-    async def run(self, recipient: str, campaign_id: int, template: str, variables: Dict):
+    async def run(
+        self, recipient: str, campaign_id: int, template: str, variables: Dict
+    ):
         import sendgrid
         from sendgrid.helpers.mail import Mail
 
-        sg = sendgrid.SendGridAPIClient(api_key=os.environ.get('SENDGRID_API_KEY'))
+        sg = sendgrid.SendGridAPIClient(api_key=os.environ.get("SENDGRID_API_KEY"))
 
         # Render template
         message = Mail(
-            from_email='campaigns@example.com',
+            from_email="campaigns@example.com",
             to_emails=recipient,
-            subject=variables.get('subject', 'Newsletter'),
-            html_content=self.render_template(template, variables)
+            subject=variables.get("subject", "Newsletter"),
+            html_content=self.render_template(template, variables),
         )
 
         # Send
@@ -471,18 +480,24 @@ class SendCampaignEmailJob:
         # Simple template rendering
         result = template
         for key, value in variables.items():
-            result = result.replace(f'{{{{{key}}}}}', str(value))
+            result = result.replace(f"{{{{{key}}}}}", str(value))
         return result
 
     async def log_send(self, campaign_id: int, recipient: str, status_code: int):
         import asyncpg
 
         conn = await asyncpg.connect(...)
-        await conn.execute("""
+        await conn.execute(
+            """
             INSERT INTO campaign_sends (campaign_id, recipient, status_code, sent_at)
             VALUES ($1, $2, $3, NOW())
-        """, campaign_id, recipient, status_code)
+        """,
+            campaign_id,
+            recipient,
+            status_code,
+        )
         await conn.close()
+
 
 class CampaignSummaryJob:
     """Generate campaign summary after all emails sent"""
@@ -493,17 +508,21 @@ class CampaignSummaryJob:
         conn = await asyncpg.connect(...)
 
         # Get send statistics
-        stats = await conn.fetchrow("""
+        stats = await conn.fetchrow(
+            """
             SELECT
                 COUNT(*) as sent,
                 COUNT(*) FILTER (WHERE status_code = 200) as delivered,
                 COUNT(*) FILTER (WHERE status_code >= 400) as failed
             FROM campaign_sends
             WHERE campaign_id = $1
-        """, campaign_id)
+        """,
+            campaign_id,
+        )
 
         # Update campaign
-        await conn.execute("""
+        await conn.execute(
+            """
             UPDATE campaigns
             SET status = 'completed',
                 sent_count = $2,
@@ -511,11 +530,18 @@ class CampaignSummaryJob:
                 failed_count = $4,
                 completed_at = NOW()
             WHERE id = $1
-        """, campaign_id, stats['sent'], stats['delivered'], stats['failed'])
+        """,
+            campaign_id,
+            stats["sent"],
+            stats["delivered"],
+            stats["failed"],
+        )
 
         await conn.close()
 
-        print(f"Campaign {campaign_id} complete: {stats['delivered']}/{total_recipients} delivered")
+        print(
+            f"Campaign {campaign_id} complete: {stats['delivered']}/{total_recipients} delivered"
+        )
 ```
 
 ### Campaign Launcher
@@ -524,6 +550,7 @@ class CampaignSummaryJob:
 # services/campaign_service.py
 from pyjobby.client import JobClient
 from datetime import datetime, timedelta
+
 
 class CampaignService:
     def __init__(self, client: JobClient):
@@ -535,7 +562,7 @@ class CampaignService:
         recipients: List[str],
         template: str,
         variables: Dict,
-        send_time: datetime = None
+        send_time: datetime = None,
     ):
         """Launch email campaign with rate limiting"""
 
@@ -546,22 +573,24 @@ class CampaignService:
         # Create jobs for each recipient
         jobs = []
         for recipient in recipients:
-            jobs.append((
-                'jobs.email_campaigns.SendCampaignEmailJob',
-                {
-                    'recipient': recipient,
-                    'campaign_id': campaign_id,
-                    'template': template,
-                    'variables': {**variables, 'recipient': recipient}
-                }
-            ))
+            jobs.append(
+                (
+                    "jobs.email_campaigns.SendCampaignEmailJob",
+                    {
+                        "recipient": recipient,
+                        "campaign_id": campaign_id,
+                        "template": template,
+                        "variables": {**variables, "recipient": recipient},
+                    },
+                )
+            )
 
         # Enqueue all emails with run_group (for tracking)
         job_ids = await self.client.enqueue_batch(
             jobs,
-            queue='emails',
+            queue="emails",
             priority=50,  # Low priority
-            run_after=send_time
+            run_after=send_time,
         )
 
         # Note: Worker should have rate limiting configured
@@ -571,29 +600,30 @@ class CampaignService:
         # Note: Need to track group_id for waitfor_group
         # For simplicity, schedule summary for later
         summary_job = await self.client.enqueue(
-            'jobs.email_campaigns.CampaignSummaryJob',
+            "jobs.email_campaigns.CampaignSummaryJob",
             campaign_id=campaign_id,
             total_recipients=len(recipients),
             run_after=send_time + timedelta(hours=2),  # 2 hours later
-            queue='reports'
+            queue="reports",
         )
 
         return {
-            'campaign_id': campaign_id,
-            'email_jobs': job_ids,
-            'summary_job': summary_job,
-            'scheduled_for': send_time.isoformat()
+            "campaign_id": campaign_id,
+            "email_jobs": job_ids,
+            "summary_job": summary_job,
+            "scheduled_for": send_time.isoformat(),
         }
+
 
 # Usage
 async def main():
-    async with await JobClient.from_config('./pyjobby.conf.py') as client:
+    async with await JobClient.from_config("./pyjobby.conf.py") as client:
         service = CampaignService(client)
 
         # Get recipients from database
         recipients = [
-            'user1@example.com',
-            'user2@example.com',
+            "user1@example.com",
+            "user2@example.com",
             # ... potentially 100,000+ recipients
         ]
 
@@ -601,16 +631,12 @@ async def main():
         result = await service.launch_campaign(
             campaign_id=42,
             recipients=recipients,
-            template='''
+            template="""
                 <h1>Hi {{name}}!</h1>
                 <p>Check out our {{promotion}} - {{discount}}% off!</p>
-            ''',
-            variables={
-                'name': 'there',
-                'promotion': 'Summer Sale',
-                'discount': 25
-            },
-            send_time=datetime.now() + timedelta(hours=24)  # Tomorrow
+            """,
+            variables={"name": "there", "promotion": "Summer Sale", "discount": 25},
+            send_time=datetime.now() + timedelta(hours=24),  # Tomorrow
         )
 
         print(f"Campaign scheduled: {result['email_jobs'][:5]}...")  # First 5
@@ -627,20 +653,21 @@ async def main():
 import subprocess
 import os
 
+
 class TranscodeVideoJob:
     """Transcode video to specific format"""
 
     async def run(self, video_path: str, format: str, resolution: str, output_dir: str):
         formats = {
-            'mp4': {'codec': 'libx264', 'ext': 'mp4'},
-            'webm': {'codec': 'libvpx-vp9', 'ext': 'webm'},
-            'hls': {'codec': 'libx264', 'ext': 'm3u8'},
+            "mp4": {"codec": "libx264", "ext": "mp4"},
+            "webm": {"codec": "libvpx-vp9", "ext": "webm"},
+            "hls": {"codec": "libx264", "ext": "m3u8"},
         }
 
         resolutions = {
-            '480p': '854x480',
-            '720p': '1280x720',
-            '1080p': '1920x1080',
+            "480p": "854x480",
+            "720p": "1280x720",
+            "1080p": "1920x1080",
         }
 
         if format not in formats or resolution not in resolutions:
@@ -653,12 +680,15 @@ class TranscodeVideoJob:
 
         # Transcode using ffmpeg
         cmd = [
-            'ffmpeg',
-            '-i', video_path,
-            '-vcodec', formats[format]['codec'],
-            '-s', resolutions[resolution],
-            '-y',  # Overwrite
-            output_path
+            "ffmpeg",
+            "-i",
+            video_path,
+            "-vcodec",
+            formats[format]["codec"],
+            "-s",
+            resolutions[resolution],
+            "-y",  # Overwrite
+            output_path,
         ]
 
         result = subprocess.run(cmd, capture_output=True)
@@ -670,11 +700,12 @@ class TranscodeVideoJob:
         file_size = os.path.getsize(output_path)
 
         return {
-            'output_path': output_path,
-            'size_bytes': file_size,
-            'format': format,
-            'resolution': resolution
+            "output_path": output_path,
+            "size_bytes": file_size,
+            "format": format,
+            "resolution": resolution,
         }
+
 
 class VideoProcessingCompleteJob:
     """Update video record after all transcoding complete"""
@@ -686,13 +717,17 @@ class VideoProcessingCompleteJob:
         files = os.listdir(output_dir)
 
         conn = await asyncpg.connect(...)
-        await conn.execute("""
+        await conn.execute(
+            """
             UPDATE videos
             SET status = 'ready',
                 transcoded_files = $2,
                 processed_at = NOW()
             WHERE id = $1
-        """, video_id, files)
+        """,
+            video_id,
+            files,
+        )
         await conn.close()
 
         print(f"Video {video_id} processing complete: {len(files)} formats")
@@ -704,6 +739,7 @@ class VideoProcessingCompleteJob:
 # services/video_service.py
 from pyjobby.client import JobClient
 
+
 class VideoProcessingService:
     def __init__(self, client: JobClient):
         self.client = client
@@ -712,56 +748,57 @@ class VideoProcessingService:
         """Process uploaded video - transcode to multiple formats"""
 
         formats = [
-            {'format': 'mp4', 'resolution': '480p'},
-            {'format': 'mp4', 'resolution': '720p'},
-            {'format': 'mp4', 'resolution': '1080p'},
-            {'format': 'webm', 'resolution': '720p'},
-            {'format': 'hls', 'resolution': '720p'},
+            {"format": "mp4", "resolution": "480p"},
+            {"format": "mp4", "resolution": "720p"},
+            {"format": "mp4", "resolution": "1080p"},
+            {"format": "webm", "resolution": "720p"},
+            {"format": "hls", "resolution": "720p"},
         ]
 
         # Create transcode jobs
         items = [
             {
-                'video_path': video_path,
-                'format': fmt['format'],
-                'resolution': fmt['resolution'],
-                'output_dir': output_dir
+                "video_path": video_path,
+                "format": fmt["format"],
+                "resolution": fmt["resolution"],
+                "output_dir": output_dir,
             }
             for fmt in formats
         ]
 
         # Fan-out: Transcode in parallel (use GPU workers)
         job_ids, group_id = await self.client.create_fan_out(
-            'jobs.video_processing.TranscodeVideoJob',
+            "jobs.video_processing.TranscodeVideoJob",
             items,
-            queue='video-gpu',  # Dedicated queue for GPU workers
-            priority=200
+            queue="video-gpu",  # Dedicated queue for GPU workers
+            priority=200,
         )
 
         # Fan-in: Update status after all complete
         complete_job = await self.client.enqueue(
-            'jobs.video_processing.VideoProcessingCompleteJob',
+            "jobs.video_processing.VideoProcessingCompleteJob",
             waitfor_group=group_id,
             video_id=video_id,
             output_dir=output_dir,
-            queue='video-postprocess'
+            queue="video-postprocess",
         )
 
         return {
-            'transcode_jobs': job_ids,
-            'group_id': group_id,
-            'complete_job': complete_job
+            "transcode_jobs": job_ids,
+            "group_id": group_id,
+            "complete_job": complete_job,
         }
+
 
 # Usage
 async def main():
-    async with await JobClient.from_config('./pyjobby.conf.py') as client:
+    async with await JobClient.from_config("./pyjobby.conf.py") as client:
         service = VideoProcessingService(client)
 
         result = await service.process_upload(
             video_id=789,
-            video_path='/uploads/vacation.mp4',
-            output_dir='/var/videos/789'
+            video_path="/uploads/vacation.mp4",
+            output_dir="/var/videos/789",
         )
 
         print(f"Processing {len(result['transcode_jobs'])} formats")
@@ -779,40 +816,42 @@ async def main():
 
 ```python
 # Just enqueue and forget
-await client.enqueue('MyJob', arg=value)
+await client.enqueue("MyJob", arg=value)
 ```
 
 ### Pattern 2: Scheduled Execution
 
 ```python
 # Run later
-await client.enqueue('MyJob', run_after=future_time, arg=value)
+await client.enqueue("MyJob", run_after=future_time, arg=value)
 ```
 
 ### Pattern 3: Sequential Pipeline
 
 ```python
 # A → B → C
-job_ids = await client.create_pipeline([
-    ('JobA', {'data': x}),
-    ('JobB', {'data': y}),
-    ('JobC', {'data': z}),
-])
+job_ids = await client.create_pipeline(
+    [
+        ("JobA", {"data": x}),
+        ("JobB", {"data": y}),
+        ("JobC", {"data": z}),
+    ]
+)
 ```
 
 ### Pattern 4: Parallel + Aggregate
 
 ```python
 # Many jobs → Summary
-job_ids, group_id = await client.create_fan_out('ProcessItem', items)
-summary = await client.enqueue('Summary', waitfor_group=group_id)
+job_ids, group_id = await client.create_fan_out("ProcessItem", items)
+summary = await client.enqueue("Summary", waitfor_group=group_id)
 ```
 
 ### Pattern 5: Batch Processing
 
 ```python
 # Efficient bulk enqueue
-jobs = [('Job', {'id': i}) for i in range(10000)]
+jobs = [("Job", {"id": i}) for i in range(10000)]
 job_ids = await client.enqueue_batch(jobs)
 ```
 
@@ -820,23 +859,23 @@ job_ids = await client.enqueue_batch(jobs)
 
 ```python
 # Prevent duplicates
-await client.enqueue('Job', deadline_key=f'unique:{id}', data=value)
+await client.enqueue("Job", deadline_key=f"unique:{id}", data=value)
 ```
 
 ### Pattern 7: Priority Queue
 
 ```python
 # High priority first
-await client.enqueue('UrgentJob', priority=500)
-await client.enqueue('NormalJob', priority=100)
-await client.enqueue('LowPriorityJob', priority=10)
+await client.enqueue("UrgentJob", priority=500)
+await client.enqueue("NormalJob", priority=100)
+await client.enqueue("LowPriorityJob", priority=10)
 ```
 
 ### Pattern 8: Capability Routing
 
 ```python
 # Route to specific workers
-await client.enqueue('GPUJob', capability='gpu', model=...)
+await client.enqueue("GPUJob", capability="gpu", model=...)
 ```
 
 ---

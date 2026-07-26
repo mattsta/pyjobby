@@ -137,6 +137,7 @@ Abstract base class that all user job workers inherit from:
 ```python
 from pyjobby.pj import Job
 
+
 class MyJob(Job):
     def task(self, **kwargs):
         # Your job logic here
@@ -295,12 +296,17 @@ Let's trace a job from submission to completion:
 import asyncpg
 
 conn = await asyncpg.connect(**db_params)
-await conn.execute("""
+await conn.execute(
+    """
     INSERT INTO jorb (job_class, kwargs, queue, prio, uid)
     VALUES ($1, $2, $3, $4, $5)
-""", "job.email.SendEmail",
+""",
+    "job.email.SendEmail",
     '{"to": "user@example.com", "subject": "Hello"}',
-    "default", 0, 12345)
+    "default",
+    0,
+    12345,
+)
 ```
 
 Database state:
@@ -344,7 +350,7 @@ job_instance.s = self  # Inject JobSystem reference
 job_instance.job = job_data  # Inject job row data
 
 # Update state to 'running'
-await conn.execute("run", job_data['id'])
+await conn.execute("run", job_data["id"])
 
 # Execute the job
 result = await job_instance.run()  # Calls task(**kwargs)
@@ -362,10 +368,10 @@ run_at: 2025-11-18 10:00:05
 
 ```python
 # If successful
-await conn.execute("finished", job_data['id'], orjson.dumps(result))
+await conn.execute("finished", job_data["id"], orjson.dumps(result))
 
 # Trigger any dependent jobs
-await conn.execute("enqueue-next-self-finished", job_data['id'])
+await conn.execute("enqueue-next-self-finished", job_data["id"])
 ```
 
 Final database state:
@@ -386,11 +392,11 @@ try:
     result = await job_instance.run()
 except Exception as e:
     backtrace = traceback.format_exc()
-    await conn.execute("crash", job_data['id'], str(e), backtrace)
+    await conn.execute("crash", job_data["id"], str(e), backtrace)
 
     # Reschedule with exponential backoff
-    delay = await job_instance.rescheduleBackoff(job_data['attempt'])
-    await conn.execute("reschedule", job_data['id'], delay)
+    delay = await job_instance.rescheduleBackoff(job_data["attempt"])
+    await conn.execute("reschedule", job_data["id"], delay)
 ```
 
 Database state after crash:
@@ -468,18 +474,22 @@ Within a single machine:
 
 ```python
 # Job 1: Process uploaded file
-job1_id = await addJob(db,
+job1_id = await addJob(
+    db,
     job_class="job.file.Upload",
     kwargs={"filepath": "/tmp/upload.jpg"},
-    queue="default")
+    queue="default",
+)
 
 # Job 2: Generate thumbnail (waits for Job 1)
-await addJob(db,
+await addJob(
+    db,
     job_class="job.image.Thumbnail",
     kwargs={"filepath": "/tmp/upload.jpg"},
-    state="waiting",         # ← Must start in 'waiting' state
-    waitfor_job=job1_id,     # ← Depends on Job 1
-    queue="default")
+    state="waiting",  # ← Must start in 'waiting' state
+    waitfor_job=job1_id,  # ← Depends on Job 1
+    queue="default",
+)
 ```
 
 When Job 1 finishes, the `enqueue-next-self-finished` statement automatically moves Job 2 from `waiting` → `queued`.
@@ -488,23 +498,28 @@ When Job 1 finishes, the `enqueue-next-self-finished` statement automatically mo
 
 ```python
 import secrets
+
 group_id = secrets.randbits(63)  # Generate unique group ID
 
 # Create 3 parallel jobs in a group
 for task in ["hash", "exif", "upload"]:
-    await addJob(db,
+    await addJob(
+        db,
         job_class=f"job.image.{task.capitalize()}",
         kwargs={"filepath": "/tmp/upload.jpg"},
         run_group=group_id,  # ← All part of same group
-        queue="default")
+        queue="default",
+    )
 
 # Create job that waits for ALL group members to finish
-await addJob(db,
+await addJob(
+    db,
     job_class="job.email.NotifyComplete",
     kwargs={"user_id": 123},
-    state="waiting",              # ← Starts in waiting
-    waitfor_group=group_id,       # ← Waits for entire group
-    queue="default")
+    state="waiting",  # ← Starts in waiting
+    waitfor_group=group_id,  # ← Waits for entire group
+    queue="default",
+)
 ```
 
 The `enqueue-next-if-peer-group-is-finished` statement checks if all jobs with `run_group=group_id` have reached `state='finished'`, then moves waiting jobs to `queued`.
@@ -515,16 +530,13 @@ Lower `prio` values are selected first:
 
 ```python
 # High priority (paid users)
-await addJob(db, job_class="job.email.SendEmail",
-             kwargs={...}, prio=-10)
+await addJob(db, job_class="job.email.SendEmail", kwargs={...}, prio=-10)
 
 # Normal priority (default)
-await addJob(db, job_class="job.email.SendEmail",
-             kwargs={...}, prio=0)
+await addJob(db, job_class="job.email.SendEmail", kwargs={...}, prio=0)
 
 # Low priority (background cleanup)
-await addJob(db, job_class="job.cleanup.TempFiles",
-             kwargs={...}, prio=100)
+await addJob(db, job_class="job.cleanup.TempFiles", kwargs={...}, prio=100)
 ```
 
 Within the same priority level, jobs are processed FIFO (by `id` ascending).
@@ -535,16 +547,17 @@ Route jobs to workers with specific resources:
 
 ```python
 # Job requiring GPU
-await addJob(db,
-    job_class="job.ml.TrainModel",
-    kwargs={...},
-    capability="gpu")  # ← Only runs on workers with "gpu" capability
+await addJob(
+    db, job_class="job.ml.TrainModel", kwargs={...}, capability="gpu"
+)  # ← Only runs on workers with "gpu" capability
 
 # Job requiring specific server (local files)
-await addJob(db,
+await addJob(
+    db,
     job_class="job.file.Process",
     kwargs={...},
-    capability=f"hostname:{platform.node()}")
+    capability=f"hostname:{platform.node()}",
+)
 ```
 
 Start workers with matching capabilities:
@@ -568,20 +581,24 @@ Prevent duplicate scheduled jobs:
 
 ```python
 # User uploads file at 10:00 AM
-await addJob(db,
+await addJob(
+    db,
     job_class="job.billing.UpdateUsage",
     kwargs={"user_id": 123},
     deadline_key=f"billing:123:2025-11-18",  # ← Unique key
-    run_after="2025-11-18 23:59:00",         # ← Run at midnight
-    queue="default")
+    run_after="2025-11-18 23:59:00",  # ← Run at midnight
+    queue="default",
+)
 
 # User uploads another file at 11:00 AM
-await addJob(db,
+await addJob(
+    db,
     job_class="job.billing.UpdateUsage",
     kwargs={"user_id": 123},
     deadline_key=f"billing:123:2025-11-18",  # ← Same key
     run_after="2025-11-18 23:59:00",
-    queue="default")
+    queue="default",
+)
 # ↑ This INSERT will fail (unique constraint violation)
 # Only one billing update will run at midnight
 ```
@@ -607,11 +624,13 @@ import datetime
 tomorrow_9am = datetime.datetime.now() + datetime.timedelta(days=1)
 tomorrow_9am = tomorrow_9am.replace(hour=9, minute=0, second=0)
 
-await addJob(db,
+await addJob(
+    db,
     job_class="job.reports.DailyReport",
     kwargs={},
     run_after=tomorrow_9am,
-    queue="default")
+    queue="default",
+)
 ```
 
 Jobs remain in `queued` state until `run_after` timestamp passes, then become eligible for claiming.
@@ -626,13 +645,13 @@ Jobs can be invoked directly via HTTP, bypassing the queue:
 # pyjobby.conf.py
 web_listen = {
     "sites": [
-        {"host": "127.0.0.1", "port": 8080},    # TCP socket
-        {"path": "/tmp/pyjobby.sock"}           # Unix socket
+        {"host": "127.0.0.1", "port": 8080},  # TCP socket
+        {"path": "/tmp/pyjobby.sock"},  # Unix socket
     ],
     "paths": {
         "job.image.Thumbnail",  # Only these job classes
-        "job.email.SendEmail"   # are exposed via web
-    }
+        "job.email.SendEmail",  # are exposed via web
+    },
 }
 ```
 
@@ -641,13 +660,13 @@ web_listen = {
 ```python
 from aiohttp import web
 
+
 class Thumbnail(Job):
     async def web(self, request: web.Request) -> web.Response:
         """Handle direct HTTP request (no queue)"""
         data = await request.json()
         result = await self.task(**data)
-        return web.Response(text=orjson.dumps(result),
-                          content_type="application/json")
+        return web.Response(text=orjson.dumps(result), content_type="application/json")
 
     async def task(self, filepath: str) -> dict:
         """Also callable via queue"""
@@ -710,7 +729,8 @@ When a job raises an exception, Phase 1 implements a robust retry mechanism:
 
 4. **New Retry Job Created** (Separate database row):
    ```python
-   retry_job_id = await conn.fetchval("""
+   retry_job_id = await conn.fetchval(
+       """
        INSERT INTO jorb (job_class, kwargs, queue, prio, uid, capability,
                         run_after, run_group, admin_data, state, error_count)
        SELECT job_class, kwargs, queue, prio, uid, capability,
@@ -721,7 +741,11 @@ When a job raises an exception, Phase 1 implements a robust retry mechanism:
               $3                     -- error_count incremented
        FROM jorb WHERE id = $1
        RETURNING id
-   """, job_id, delay, current_error_count)
+   """,
+       job_id,
+       delay,
+       current_error_count,
+   )
    ```
 
 **Result**:
@@ -750,7 +774,7 @@ class MyJob(Job):
             return result
         except TemporaryError:
             # Retry in 5 minutes
-            await self.reschedule(5, 'minutes')
+            await self.reschedule(5, "minutes")
             raise  # Still mark as crashed
         except PermanentError:
             # Don't retry, mark as crashed
@@ -794,20 +818,17 @@ db_params = {
     "password": "secret",
     "host": "localhost",  # Or "/tmp" for Unix socket
     "port": 5432,
-    "min_size": 2,        # Connection pool minimum
-    "max_size": 10        # Connection pool maximum
+    "min_size": 2,  # Connection pool minimum
+    "max_size": 10,  # Connection pool maximum
 }
 
 # Web server configuration (optional)
 web_listen = {
     "sites": [
         {"host": "127.0.0.1", "port": 8080},
-        {"path": "/var/run/pyjobby.sock", "backlog": 128}
+        {"path": "/var/run/pyjobby.sock", "backlog": 128},
     ],
-    "paths": {
-        "job.image.Thumbnail",
-        "job.api.Webhook"
-    }
+    "paths": {"job.image.Thumbnail", "job.api.Webhook"},
 }
 
 # Custom settings (available as config.*)
@@ -885,6 +906,7 @@ Pyjobby uses Python's standard logging:
 ```python
 import logging
 
+
 # In your job
 class MyJob(Job):
     def task(self, **kwargs):
@@ -897,9 +919,9 @@ Configure logging in your application:
 
 ```python
 import logging
+
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(process)d] %(levelname)s: %(message)s'
+    level=logging.INFO, format="%(asctime)s [%(process)d] %(levelname)s: %(message)s"
 )
 ```
 
@@ -911,17 +933,16 @@ Track worker performance:
 class MetricsJob(Job):
     def task(self, **kwargs):
         # Access shared cache for metrics
-        metrics = self.s.cache.setdefault('metrics', {
-            'jobs_processed': 0,
-            'total_duration': 0.0
-        })
+        metrics = self.s.cache.setdefault(
+            "metrics", {"jobs_processed": 0, "total_duration": 0.0}
+        )
 
         start = time.time()
         # Do work...
         duration = time.time() - start
 
-        metrics['jobs_processed'] += 1
-        metrics['total_duration'] += duration
+        metrics["jobs_processed"] += 1
+        metrics["total_duration"] += duration
 ```
 
 ## Comparison to Other Systems

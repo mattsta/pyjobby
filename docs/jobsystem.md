@@ -24,21 +24,21 @@ class JobSystem:
     If a task throws an exception, the exception is saved to the job row
     and job is marked as 'crashed' for future inspection."""
 
-    dsn: dict[str, str]          # Database connection parameters
-    qname: str                    # Queue name this worker processes
-    capabilities: tuple[str]      # Capabilities this worker advertises
-    workerId: int                 # Unique worker ID (0, 1, 2, ...)
-    checkInterval: int = 5        # Seconds between job polls
+    dsn: dict[str, str]  # Database connection parameters
+    qname: str  # Queue name this worker processes
+    capabilities: tuple[str]  # Capabilities this worker advertises
+    workerId: int  # Unique worker ID (0, 1, 2, ...)
+    checkInterval: int = 5  # Seconds between job polls
     webPort: Optional[dict] = None  # Web server configuration
-    prio: int = 1000              # Maximum job priority to claim
-    stop: bool = False            # Shutdown flag
-    pid: int                      # Process ID
-    node: str                     # Hostname
-    cache: dict[str, Any]         # Worker-local cache
+    prio: int = 1000  # Maximum job priority to claim
+    stop: bool = False  # Shutdown flag
+    pid: int  # Process ID
+    node: str  # Hostname
+    cache: dict[str, Any]  # Worker-local cache
 
     # Phase 1 Improvements: Self-Healing and Fault Tolerance
-    max_retries: int = 10         # Maximum retry attempts before permanent failure
-    default_timeout: int = 3600   # Default job timeout in seconds (1 hour)
+    max_retries: int = 10  # Maximum retry attempts before permanent failure
+    default_timeout: int = 3600  # Default job timeout in seconds (1 hour)
     enable_recovery: bool = True  # Enable abandoned job recovery on startup
 ```
 
@@ -49,15 +49,15 @@ JobSystem instances are created by the `workit()` CLI function and run in separa
 ```python
 # From pyjobby/pj.py:586-603
 runner = JobSystem(
-    dsn=db_params,            # asyncpg connection parameters
-    qname="default",          # Queue name
+    dsn=db_params,  # asyncpg connection parameters
+    qname="default",  # Queue name
     capabilities=("gpu", "host:web-1"),  # Worker capabilities
-    workerId=0,               # Worker index
-    checkInterval=5,          # Poll every 5 seconds
-    webPort=web_config,       # Optional web server config
-    max_retries=10,           # Maximum retry attempts (default: 10)
-    default_timeout=3600,     # Default job timeout in seconds (default: 1 hour)
-    enable_recovery=True,     # Enable crash recovery (default: True)
+    workerId=0,  # Worker index
+    checkInterval=5,  # Poll every 5 seconds
+    webPort=web_config,  # Optional web server config
+    max_retries=10,  # Maximum retry attempts (default: 10)
+    default_timeout=3600,  # Default job timeout in seconds (default: 1 hour)
+    enable_recovery=True,  # Enable crash recovery (default: True)
 )
 
 signal.signal(signal.SIGTERM, runner.shutdown)
@@ -103,9 +103,7 @@ async def run(self) -> None:
 
     # 2. Connect to database
     self.cxn = await asyncpg.connect(**self.dsn)
-    await self.cxn.set_type_codec('json',
-                                   encoder=orjson.dumps,
-                                   decoder=orjson.loads)
+    await self.cxn.set_type_codec("json", encoder=orjson.dumps, decoder=orjson.loads)
 
     # 3. Prepare statements
     self.stmts = {}
@@ -114,12 +112,9 @@ async def run(self) -> None:
 
     # 4. Poll for jobs
     while not self.stop:
-        jobs = await self.ex("claim",
-                            self.pid,
-                            self.node,
-                            self.qname,
-                            self.capabilities,
-                            self.prio)
+        jobs = await self.ex(
+            "claim", self.pid, self.node, self.qname, self.capabilities, self.prio
+        )
 
         if jobs:
             job = jobs[0]
@@ -130,8 +125,9 @@ async def run(self) -> None:
             # Trigger dependent jobs
             await self.ex("enqueue-next-self-finished", job["id"])
             if job["run_group"]:
-                await self.ex("enqueue-next-if-peer-group-is-finished",
-                            job["run_group"])
+                await self.ex(
+                    "enqueue-next-if-peer-group-is-finished", job["run_group"]
+                )
         else:
             # Sleep 5-6 seconds with jitter
             await asyncio.sleep(5 + random.uniform(0, 0.001))
@@ -159,12 +155,14 @@ Execute a prepared statement by name.
 
 ```python
 # Claim a job
-jobs = await self.ex("claim",
-                     os.getpid(),           # worker_pid
-                     platform.node(),       # worker_host
-                     "default",             # queue
-                     ["gpu", "host:ml-1"],  # capabilities
-                     1000)                  # max priority
+jobs = await self.ex(
+    "claim",
+    os.getpid(),  # worker_pid
+    platform.node(),  # worker_host
+    "default",  # queue
+    ["gpu", "host:ml-1"],  # capabilities
+    1000,
+)  # max priority
 
 # Mark job finished
 await self.ex("finished", job_id, {"status": "ok"})
@@ -174,6 +172,7 @@ await self.ex("crash", job_id, "Connection timeout", full_traceback)
 
 # Reschedule job for future
 import datetime
+
 await self.ex("reschedule", job_id, datetime.timedelta(minutes=5))
 ```
 
@@ -219,13 +218,16 @@ class TestJob(Job):
     def task(self):
         return "v1"
 
+
 # Worker claims and runs job -> returns "v1"
+
 
 # Edit job file while worker is running
 # job/test.py
 class TestJob(Job):
     def task(self):
         return "v2"  # Changed!
+
 
 # Worker claims another job -> returns "v2" (automatically picked up changes!)
 ```
@@ -244,20 +246,21 @@ Handle HTTP requests to invoke jobs directly without queueing.
 # Configuration
 web_listen = {
     "sites": [{"host": "localhost", "port": 8080}],
-    "paths": {"job.email.SendEmail"}  # Whitelist
+    "paths": {"job.email.SendEmail"},  # Whitelist
 }
+
 
 # Job implementation
 class SendEmail(Job):
     async def web(self, request: web.Request) -> web.Response:
         data = await request.json()
         result = await self.task(**data)
-        return web.Response(text=orjson.dumps(result),
-                          content_type="application/json")
+        return web.Response(text=orjson.dumps(result), content_type="application/json")
 
     async def task(self, to: str, subject: str, body: str):
         # Send email...
         return {"status": "sent", "message_id": "abc123"}
+
 
 # HTTP request
 # POST http://localhost:8080/job.email.SendEmail
@@ -376,6 +379,7 @@ class EmailJob(Job):
         # Get cached SMTP connection (create if doesn't exist)
         if "smtp" not in self.s.cache:
             import smtplib
+
             self.s.cache["smtp"] = smtplib.SMTP("localhost")
             logger.info("Created new SMTP connection")
 
@@ -401,14 +405,13 @@ web_listen = {
     "sites": [
         # TCP socket (Linux: load-balanced across workers)
         {"host": "0.0.0.0", "port": 8080},
-
         # Unix socket (one per worker: path-{workerId})
         {"path": "/var/run/pyjobby.sock"},
     ],
     "paths": {
         "job.api.WebhookHandler",
         "job.image.Thumbnail",
-    }
+    },
 }
 ```
 
@@ -471,6 +474,7 @@ db_params = {
 import smtplib
 from pyjobby.pj import Job
 
+
 class SendEmail(Job):
     def task(self, to: str, subject: str, body: str, uid: int):
         # Reuse SMTP connection from cache
@@ -484,6 +488,7 @@ class SendEmail(Job):
 
         return {"status": "sent", "timestamp": datetime.utcnow()}
 
+
 # Start workers
 # $ pj --queue email --workers 4
 ```
@@ -493,20 +498,26 @@ class SendEmail(Job):
 ```python
 import asyncpg
 
+
 async def send_welcome_email(user_id: int, email: str):
     conn = await asyncpg.connect(**db_params)
-    await conn.execute("""
+    await conn.execute(
+        """
         INSERT INTO jorb (job_class, kwargs, queue, uid)
         VALUES ($1, $2, $3, $4)
-    """, "job.email.SendEmail",
-        orjson.dumps({
-            "to": email,
-            "subject": "Welcome!",
-            "body": "Thanks for signing up.",
-            "uid": user_id
-        }),
+    """,
+        "job.email.SendEmail",
+        orjson.dumps(
+            {
+                "to": email,
+                "subject": "Welcome!",
+                "body": "Thanks for signing up.",
+                "uid": user_id,
+            }
+        ),
         "email",
-        user_id)
+        user_id,
+    )
 ```
 
 ### Example 2: Image Processing Pipeline
@@ -518,6 +529,7 @@ async def send_welcome_email(user_id: int, email: str):
 from PIL import Image
 from pyjobby.pj import Job
 import hashlib
+
 
 class GenerateThumbnail(Job):
     async def task(self, filepath: str, sizes: list[int]):
@@ -533,21 +545,26 @@ class GenerateThumbnail(Job):
 
         return {"thumbnails": thumbnails}
 
+
 class HashFile(Job):
     def task(self, filepath: str):
-        with open(filepath, 'rb') as f:
+        with open(filepath, "rb") as f:
             return {"sha256": hashlib.sha256(f.read()).hexdigest()}
+
 
 class ExtractEXIF(Job):
     def task(self, filepath: str):
         from PIL.ExifTags import TAGS
+
         img = Image.open(filepath)
         exif = {TAGS.get(k, k): v for k, v in (img._getexif() or {}).items()}
         return {"exif": exif}
 
+
 class UploadToS3(Job):
     async def task(self, filepath: str, thumbnails: list[str]):
         import boto3
+
         s3 = self.s.cache.setdefault("s3", boto3.client("s3"))
 
         # Upload original
@@ -558,6 +575,7 @@ class UploadToS3(Job):
             s3.upload_file(thumb, "my-bucket", f"thumbs/{thumb}")
 
         return {"s3_key": f"originals/{filepath}"}
+
 
 class NotifyComplete(Job):
     async def task(self, user_id: int, filepath: str):
@@ -573,41 +591,66 @@ import secrets
 import asyncpg
 import orjson
 
+
 async def process_upload(user_id: int, filepath: str):
     conn = await asyncpg.connect(**db_params)
     group_id = secrets.randbits(63)
 
     # Step 1: Create dependent jobs (all run in parallel)
     jobs_config = [
-        ("job.image.GenerateThumbnail", {"filepath": filepath, "sizes": [150, 300, 800]}),
+        (
+            "job.image.GenerateThumbnail",
+            {"filepath": filepath, "sizes": [150, 300, 800]},
+        ),
         ("job.image.HashFile", {"filepath": filepath}),
         ("job.image.ExtractEXIF", {"filepath": filepath}),
     ]
 
     for job_class, kwargs in jobs_config:
-        await conn.execute("""
+        await conn.execute(
+            """
             INSERT INTO jorb (job_class, kwargs, queue, uid, run_group, prio,
                             capability)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
-        """, job_class, orjson.dumps(kwargs), "default", user_id, group_id, 0,
-            f"host:{platform.node()}")  # Pin to current server (local files)
+        """,
+            job_class,
+            orjson.dumps(kwargs),
+            "default",
+            user_id,
+            group_id,
+            0,
+            f"host:{platform.node()}",
+        )  # Pin to current server (local files)
 
     # Step 2: Upload to S3 (waits for thumbnail job)
-    thumb_job_id = await conn.fetchval("""
+    thumb_job_id = await conn.fetchval(
+        """
         INSERT INTO jorb (job_class, kwargs, queue, uid, state, waitfor_group)
         VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING id
-    """, "job.image.UploadToS3",
+    """,
+        "job.image.UploadToS3",
         orjson.dumps({"filepath": filepath, "thumbnails": []}),
-        "default", user_id, "waiting", group_id)
+        "default",
+        user_id,
+        "waiting",
+        group_id,
+    )
 
     # Step 3: Notify user (waits for S3 upload)
-    await conn.execute("""
+    await conn.execute(
+        """
         INSERT INTO jorb (job_class, kwargs, queue, uid, state, waitfor_job)
         VALUES ($1, $2, $3, $4, $5, $6)
-    """, "job.image.NotifyComplete",
+    """,
+        "job.image.NotifyComplete",
         orjson.dumps({"user_id": user_id, "filepath": filepath}),
-        "default", user_id, "waiting", thumb_job_id)
+        "default",
+        user_id,
+        "waiting",
+        thumb_job_id,
+    )
+
 
 # Execution flow:
 # 1. GenerateThumbnail, HashFile, ExtractEXIF run in parallel
@@ -624,16 +667,21 @@ async def process_upload(user_id: int, filepath: str):
 from pyjobby.pj import Job
 import datetime
 
+
 class DailyUserReport(Job):
     async def task(self, user_id: int, report_date: str):
         # Generate report for ALL activity on report_date
         # (even if user triggered this multiple times)
 
-        activities = await self.s.cache["db"].fetch("""
+        activities = await self.s.cache["db"].fetch(
+            """
             SELECT * FROM activities
             WHERE user_id = $1
               AND date = $2
-        """, user_id, report_date)
+        """,
+            user_id,
+            report_date,
+        )
 
         report = {
             "user_id": user_id,
@@ -664,17 +712,24 @@ async def schedule_report(user_id: int):
     deadline_key = f"daily-report:{user_id}:{tomorrow.isoformat()}"
 
     try:
-        await conn.execute("""
+        await conn.execute(
+            """
             INSERT INTO jorb (job_class, kwargs, queue, uid, run_after, deadline_key)
             VALUES ($1, $2, $3, $4, $5, $6)
-        """, "job.reports.DailyUserReport",
+        """,
+            "job.reports.DailyUserReport",
             orjson.dumps({"user_id": user_id, "report_date": tomorrow.isoformat()}),
-            "default", user_id, tomorrow_midnight, deadline_key)
+            "default",
+            user_id,
+            tomorrow_midnight,
+            deadline_key,
+        )
 
         logger.info(f"Scheduled report for user {user_id} at {tomorrow_midnight}")
     except asyncpg.UniqueViolationError:
         # Report already scheduled for this user/date - ignore
         logger.info(f"Report already scheduled for user {user_id}")
+
 
 # User uploads 10 files throughout the day
 for _ in range(10):
@@ -691,6 +746,7 @@ for _ in range(10):
 # job/ml.py
 from pyjobby.pj import Job
 import torch
+
 
 class ImageClassification(Job):
     def task(self, image_url: str):
@@ -732,13 +788,17 @@ $ pj --queue default --workers 8
 ```python
 async def classify_image(image_url: str):
     conn = await asyncpg.connect(**db_params)
-    await conn.execute("""
+    await conn.execute(
+        """
         INSERT INTO jorb (job_class, kwargs, queue, capability)
         VALUES ($1, $2, $3, $4)
-    """, "job.ml.ImageClassification",
+    """,
+        "job.ml.ImageClassification",
         orjson.dumps({"image_url": image_url}),
-        "ml",      # Route to ML queue
-        "gpu")     # Requires GPU capability
+        "ml",  # Route to ML queue
+        "gpu",
+    )  # Requires GPU capability
+
 
 # This job will ONLY run on the GPU server!
 ```
@@ -751,7 +811,7 @@ async def classify_image(image_url: str):
 # pyjobby.conf.py
 web_listen = {
     "sites": [{"host": "0.0.0.0", "port": 8080}],
-    "paths": {"job.webhooks.StripeWebhook"}
+    "paths": {"job.webhooks.StripeWebhook"},
 }
 
 # job/webhooks.py
@@ -759,6 +819,7 @@ from pyjobby.pj import Job
 from aiohttp import web
 import hmac
 import hashlib
+
 
 class StripeWebhook(Job):
     async def web(self, request: web.Request) -> web.Response:
@@ -884,8 +945,8 @@ $ pj --workers 8
 db_params = {
     "database": "myapp",
     "user": "pyjobby",
-    "min_size": 1,    # Minimum pool size per worker
-    "max_size": 5,    # Maximum pool size per worker
+    "min_size": 1,  # Minimum pool size per worker
+    "max_size": 5,  # Maximum pool size per worker
 }
 
 # With 10 workers: total 10-50 connections to PostgreSQL
@@ -909,15 +970,12 @@ JobSystem uses loguru with process-aware formatting:
 from loguru import logger
 
 # Add file logging
-logger.add("/var/log/pyjobby/worker.log",
-          rotation="500 MB",
-          retention="10 days",
-          level="INFO")
+logger.add(
+    "/var/log/pyjobby/worker.log", rotation="500 MB", retention="10 days", level="INFO"
+)
 
 # Add structured logging
-logger.add(lambda msg: send_to_datadog(msg),
-          format="{message}",
-          level="WARNING")
+logger.add(lambda msg: send_to_datadog(msg), format="{message}", level="WARNING")
 ```
 
 ### Metrics Collection
@@ -926,11 +984,14 @@ logger.add(lambda msg: send_to_datadog(msg),
 class MetricsJob(Job):
     def task(self, **kwargs):
         # Initialize metrics
-        metrics = self.s.cache.setdefault("metrics", {
-            "jobs_processed": 0,
-            "total_duration": 0.0,
-            "errors": 0,
-        })
+        metrics = self.s.cache.setdefault(
+            "metrics",
+            {
+                "jobs_processed": 0,
+                "total_duration": 0.0,
+                "errors": 0,
+            },
+        )
 
         start = time.time()
         try:
@@ -1024,6 +1085,7 @@ class MyJob(Job):
             self.s.cache["redis"] = redis.Redis()
         return self.s.cache["redis"].get("key")
 
+
 # Bad: Create new connection every time
 class MyJob(Job):
     def task(self):
@@ -1035,12 +1097,15 @@ class MyJob(Job):
 
 ```python
 # Job requires local file access
-await conn.execute("""
+await conn.execute(
+    """
     INSERT INTO jorb (job_class, kwargs, capability)
     VALUES ($1, $2, $3)
-""", "job.file.Process",
+""",
+    "job.file.Process",
     '{"filepath": "/local/file.txt"}',
-    f"host:{platform.node()}")  # Must run on this specific host
+    f"host:{platform.node()}",
+)  # Must run on this specific host
 ```
 
 ### 3. Use Priorities for Urgency
@@ -1065,8 +1130,8 @@ Jobs may be retried, so ensure they're safe to run multiple times:
 class UpdateUser(Job):
     def task(self, user_id: int, email: str):
         # Safe to run multiple times
-        await db.execute("UPDATE users SET email = $1 WHERE id = $2",
-                        email, user_id)
+        await db.execute("UPDATE users SET email = $1 WHERE id = $2", email, user_id)
+
 
 # Bad: Not idempotent
 class SendWelcomeEmail(Job):
@@ -1074,15 +1139,18 @@ class SendWelcomeEmail(Job):
         # User might receive multiple emails if job retries!
         await send_email(user_id, "Welcome!")
 
+
 # Better: Check if already sent
 class SendWelcomeEmail(Job):
     def task(self, user_id: int):
         sent = await db.fetchval(
-            "SELECT welcome_sent FROM users WHERE id = $1", user_id)
+            "SELECT welcome_sent FROM users WHERE id = $1", user_id
+        )
         if not sent:
             await send_email(user_id, "Welcome!")
             await db.execute(
-                "UPDATE users SET welcome_sent = true WHERE id = $1", user_id)
+                "UPDATE users SET welcome_sent = true WHERE id = $1", user_id
+            )
 ```
 
 ### 5. Use Deadline Keys for Deduplication
@@ -1090,11 +1158,17 @@ class SendWelcomeEmail(Job):
 ```python
 # Prevent duplicate scheduled jobs
 deadline_key = f"billing-update:{user_id}:{date.today()}"
-await conn.execute("""
+await conn.execute(
+    """
     INSERT INTO jorb (job_class, kwargs, deadline_key, run_after)
     VALUES ($1, $2, $3, $4)
     ON CONFLICT (queue, deadline_key) WHERE state = 'queued' DO NOTHING
-""", "job.billing.Update", ..., deadline_key, tomorrow_midnight)
+""",
+    "job.billing.Update",
+    ...,
+    deadline_key,
+    tomorrow_midnight,
+)
 ```
 
 ### 6. Handle Web Requests Separately from Queue

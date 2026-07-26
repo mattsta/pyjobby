@@ -14,8 +14,8 @@ class Job:
     User jobs subclass Job and override the task() method to
     run operations as needed."""
 
-    s: JobSystem                # Reference to the JobSystem instance
-    job: dict[str, Any]         # Job row data from database
+    s: JobSystem  # Reference to the JobSystem instance
+    job: dict[str, Any]  # Job row data from database
 ```
 
 **Key Attributes**:
@@ -70,6 +70,7 @@ Location: `pyjobby/pj.py:513-519`
 class SyncJob(Job):
     def task(self, url: str) -> dict:
         import requests
+
         response = requests.get(url)
         return response.json()
 ```
@@ -80,6 +81,7 @@ class SyncJob(Job):
 class AsyncJob(Job):
     async def task(self, url: str) -> dict:
         import aiohttp
+
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as response:
                 return await response.json()
@@ -94,6 +96,7 @@ class StreamingJob(Job):
             data = await fetch_url(url)
             yield data  # Partial progress
             await asyncio.sleep(0.1)
+
 
 # JobSystem collects all yielded values into a list
 ```
@@ -167,12 +170,11 @@ class MyJob(Job):
             await self.reschedule(e.retry_after_seconds, "seconds")
             raise
 
+
 # Advanced: Multiple units
-await self.reschedule(deltas={
-    "days": 1,
-    "hours": 6,
-    "minutes": 30
-})  # 1 day, 6 hours, 30 minutes from now
+await self.reschedule(
+    deltas={"days": 1, "hours": 6, "minutes": 30}
+)  # 1 day, 6 hours, 30 minutes from now
 ```
 
 **How it Works**:
@@ -215,7 +217,9 @@ attempt = 6+: 1024s (2^10) = ~17 minutes (capped)
 **Implementation**:
 
 ```python
-def rescheduleBackoff(self, attempt: Optional[int] = None) -> Awaitable[datetime.timedelta]:
+def rescheduleBackoff(
+    self, attempt: Optional[int] = None
+) -> Awaitable[datetime.timedelta]:
     if attempt is None:
         attempt = self.job["error_count"]
 
@@ -295,12 +299,16 @@ Let's trace a job from creation to completion:
 
 ```python
 # 1. Job Submission
-await db.execute("""
+await db.execute(
+    """
     INSERT INTO jorb (job_class, kwargs, queue, uid)
     VALUES ($1, $2, $3, $4)
-""", "job.email.SendEmail",
+""",
+    "job.email.SendEmail",
     '{"to": "user@example.com", "subject": "Hello"}',
-    "default", 12345)
+    "default",
+    12345,
+)
 
 # Database row created:
 # {
@@ -351,6 +359,7 @@ class EmailJob(Job):
         smtp = await connect_smtp()
         raise smtplib.SMTPServerDisconnected("Connection lost")  # Error!
 
+
 # 2. Exception Caught by JobSystem
 try:
     result = await klass.run()
@@ -377,8 +386,7 @@ except Exception as e:
 class MyJob(Job):
     async def task(self, user_id: int):
         # Execute raw SQL
-        user = await self.s.cxn.fetchrow(
-            "SELECT * FROM users WHERE id = $1", user_id)
+        user = await self.s.cxn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
 
         # Use prepared statements
         result = await self.s.ex("custom-query", user_id)
@@ -446,12 +454,14 @@ class MyJob(Job):
 # job/hello.py
 from pyjobby.pj import Job
 
+
 class HelloWorld(Job):
     def task(self, name: str = "World"):
         """Synchronous job (no async needed)"""
         message = f"Hello, {name}!"
         print(message)
         return {"message": message}
+
 
 # Submit job
 await db.execute("""
@@ -467,6 +477,7 @@ await db.execute("""
 from pyjobby.pj import Job
 import aiohttp
 
+
 class FetchWeather(Job):
     async def task(self, city: str, country_code: str = "US"):
         """Fetch weather data from external API"""
@@ -479,11 +490,7 @@ class FetchWeather(Job):
 
         api_key = self.s.config.openweather_api_key
         url = f"https://api.openweathermap.org/data/2.5/weather"
-        params = {
-            "q": f"{city},{country_code}",
-            "appid": api_key,
-            "units": "metric"
-        }
+        params = {"q": f"{city},{country_code}", "appid": api_key, "units": "metric"}
 
         try:
             async with session.get(url, params=params) as response:
@@ -502,6 +509,7 @@ class FetchWeather(Job):
             logger.error(f"Failed to fetch weather for {city}: {e}")
             raise
 
+
 # Submit job
 await db.execute("""
     INSERT INTO jorb (job_class, kwargs, queue)
@@ -518,6 +526,7 @@ await db.execute("""
 from pyjobby.pj import Job
 import asyncio
 
+
 class ProcessBatch(Job):
     async def task(self, item_ids: list[int]):
         """Process items in batches, yielding progress"""
@@ -531,8 +540,8 @@ class ProcessBatch(Job):
             yield {
                 "item_id": item_id,
                 "result": result,
-                "progress": f"{i+1}/{total}",
-                "percent": (i+1) / total * 100
+                "progress": f"{i + 1}/{total}",
+                "percent": (i + 1) / total * 100,
             }
 
             # Small delay to avoid overwhelming downstream services
@@ -543,17 +552,18 @@ class ProcessBatch(Job):
 
     async def process_item(self, item_id: int):
         # Fetch item from database
-        item = await self.s.cxn.fetchrow(
-            "SELECT * FROM items WHERE id = $1", item_id)
+        item = await self.s.cxn.fetchrow("SELECT * FROM items WHERE id = $1", item_id)
 
         # Do some processing
         await asyncio.sleep(0.5)  # Simulate work
 
         # Update item status
         await self.s.cxn.execute(
-            "UPDATE items SET processed = true WHERE id = $1", item_id)
+            "UPDATE items SET processed = true WHERE id = $1", item_id
+        )
 
         return {"id": item_id, "status": "processed"}
+
 
 # Submit job
 await db.execute("""
@@ -578,6 +588,7 @@ await db.execute("""
 # job/api_call.py
 from pyjobby.pj import Job
 import aiohttp
+
 
 class CallExternalAPI(Job):
     async def task(self, endpoint: str, data: dict):
@@ -618,17 +629,22 @@ class CallExternalAPI(Job):
         async with session.post(
             f"{api_base}/{endpoint}",
             json=data,
-            headers={"Authorization": f"Bearer {api_key}"}
+            headers={"Authorization": f"Bearer {api_key}"},
         ) as response:
             response.raise_for_status()
             return await response.json()
 
     async def mark_as_permanent_failure(self, endpoint: str, status: int):
         # Record permanent failure in database
-        await self.s.cxn.execute("""
+        await self.s.cxn.execute(
+            """
             INSERT INTO api_failures (job_id, endpoint, status_code, timestamp)
             VALUES ($1, $2, $3, NOW())
-        """, self.job["id"], endpoint, status)
+        """,
+            self.job["id"],
+            endpoint,
+            status,
+        )
 
     async def rescheduleBackoff(self, attempt: int = None) -> datetime.timedelta:
         """Custom backoff: give up after 5 attempts"""
@@ -651,6 +667,7 @@ class CallExternalAPI(Job):
 # job/transfer.py
 from pyjobby.pj import Job
 
+
 class TransferFunds(Job):
     async def task(self, from_account: int, to_account: int, amount: float):
         """Transfer funds between accounts (atomic transaction)"""
@@ -659,8 +676,8 @@ class TransferFunds(Job):
         async with self.s.cxn.transaction():
             # Check source balance
             balance = await self.s.cxn.fetchval(
-                "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE",
-                from_account)
+                "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE", from_account
+            )
 
             if balance < amount:
                 raise ValueError(f"Insufficient funds: {balance} < {amount}")
@@ -668,26 +685,35 @@ class TransferFunds(Job):
             # Debit source
             await self.s.cxn.execute(
                 "UPDATE accounts SET balance = balance - $1 WHERE id = $2",
-                amount, from_account)
+                amount,
+                from_account,
+            )
 
             # Credit destination
             await self.s.cxn.execute(
                 "UPDATE accounts SET balance = balance + $1 WHERE id = $2",
-                amount, to_account)
+                amount,
+                to_account,
+            )
 
             # Record transaction
-            tx_id = await self.s.cxn.fetchval("""
+            tx_id = await self.s.cxn.fetchval(
+                """
                 INSERT INTO transactions (from_account, to_account, amount, timestamp)
                 VALUES ($1, $2, $3, NOW())
                 RETURNING id
-            """, from_account, to_account, amount)
+            """,
+                from_account,
+                to_account,
+                amount,
+            )
 
         return {
             "transaction_id": tx_id,
             "from_account": from_account,
             "to_account": to_account,
             "amount": amount,
-            "status": "completed"
+            "status": "completed",
         }
 ```
 
@@ -699,6 +725,7 @@ from pyjobby.pj import Job
 from aiohttp import web
 from PIL import Image
 import io
+
 
 class GenerateThumbnail(Job):
     async def web(self, request: web.Request) -> web.Response:
@@ -719,10 +746,12 @@ class GenerateThumbnail(Job):
         return web.Response(
             body=thumbnail,
             content_type="image/jpeg",
-            headers={"Content-Disposition": f"attachment; filename=thumbnail.jpg"}
+            headers={"Content-Disposition": f"attachment; filename=thumbnail.jpg"},
         )
 
-    async def task(self, image_data: bytes = None, filepath: str = None, size: int = 300):
+    async def task(
+        self, image_data: bytes = None, filepath: str = None, size: int = 300
+    ):
         """Can also be called via queue with filepath"""
 
         # Load image from data or file
@@ -742,6 +771,7 @@ class GenerateThumbnail(Job):
         output.seek(0)
 
         return output.read()
+
 
 # Configuration (in pyjobby.conf.py)
 # web_listen = {
@@ -763,6 +793,7 @@ class GenerateThumbnail(Job):
 from pyjobby.pj import Job
 import secrets
 
+
 class DataPipeline(Job):
     async def task(self, dataset_id: int, operations: list[str]):
         """Coordinate parallel data processing pipeline"""
@@ -772,46 +803,62 @@ class DataPipeline(Job):
 
         # Fan-out: Create parallel jobs for each operation
         for operation in operations:
-            await self.s.cxn.execute("""
+            await self.s.cxn.execute(
+                """
                 INSERT INTO jorb (job_class, kwargs, queue, run_group, uid)
                 VALUES ($1, $2, $3, $4, $5)
-            """, f"job.data.{operation}",
+            """,
+                f"job.data.{operation}",
                 orjson.dumps({"dataset_id": dataset_id}),
-                "default", group_id, self.job["uid"])
+                "default",
+                group_id,
+                self.job["uid"],
+            )
 
         # Fan-in: Create aggregation job that waits for all operations
-        await self.s.cxn.execute("""
+        await self.s.cxn.execute(
+            """
             INSERT INTO jorb (job_class, kwargs, queue, state, waitfor_group, uid)
             VALUES ($1, $2, $3, $4, $5, $6)
-        """, "job.data.AggregateResults",
+        """,
+            "job.data.AggregateResults",
             orjson.dumps({"dataset_id": dataset_id, "group_id": group_id}),
-            "default", "waiting", group_id, self.job["uid"])
+            "default",
+            "waiting",
+            group_id,
+            self.job["uid"],
+        )
 
         return {"group_id": group_id, "operations": operations}
+
 
 class AggregateResults(Job):
     async def task(self, dataset_id: int, group_id: int):
         """Aggregate results from all parallel operations"""
 
         # Fetch results from all jobs in group
-        results = await self.s.cxn.fetch("""
+        results = await self.s.cxn.fetch(
+            """
             SELECT job_class, result
             FROM jorb
             WHERE run_group = $1 AND state = 'finished'
-        """, group_id)
+        """,
+            group_id,
+        )
 
         # Combine results
-        aggregated = {
-            row["job_class"]: row["result"]
-            for row in results
-        }
+        aggregated = {row["job_class"]: row["result"] for row in results}
 
         # Store final result
-        await self.s.cxn.execute("""
+        await self.s.cxn.execute(
+            """
             UPDATE datasets
             SET processed_data = $1, status = 'complete'
             WHERE id = $2
-        """, orjson.dumps(aggregated), dataset_id)
+        """,
+            orjson.dumps(aggregated),
+            dataset_id,
+        )
 
         return aggregated
 ```
@@ -822,6 +869,7 @@ class AggregateResults(Job):
 # job/cron.py
 from pyjobby.pj import Job
 import datetime
+
 
 class DailyReport(Job):
     async def task(self, report_type: str):
@@ -841,12 +889,17 @@ class DailyReport(Job):
         deadline_key = f"{report_type}:{tomorrow.isoformat()}"
 
         try:
-            await self.s.cxn.execute("""
+            await self.s.cxn.execute(
+                """
                 INSERT INTO jorb (job_class, kwargs, queue, run_after, deadline_key)
                 VALUES ($1, $2, $3, $4, $5)
-            """, "job.cron.DailyReport",
+            """,
+                "job.cron.DailyReport",
                 orjson.dumps({"report_type": report_type}),
-                "default", tomorrow_midnight, deadline_key)
+                "default",
+                tomorrow_midnight,
+                deadline_key,
+            )
         except:
             # Already scheduled
             pass
@@ -869,6 +922,7 @@ class DailyReport(Job):
 from pyjobby.pj import Job
 import time
 
+
 class ResilientAPICall(Job):
     async def task(self, endpoint: str, data: dict):
         """API call with circuit breaker pattern"""
@@ -876,12 +930,15 @@ class ResilientAPICall(Job):
         circuit_key = f"circuit:{endpoint}"
 
         # Check circuit breaker state
-        circuit = self.s.cache.get(circuit_key, {
-            "state": "closed",  # closed = normal, open = failing
-            "failures": 0,
-            "last_failure": 0,
-            "opened_at": 0
-        })
+        circuit = self.s.cache.get(
+            circuit_key,
+            {
+                "state": "closed",  # closed = normal, open = failing
+                "failures": 0,
+                "last_failure": 0,
+                "opened_at": 0,
+            },
+        )
 
         # If circuit is open, check if we should try again
         if circuit["state"] == "open":
@@ -927,28 +984,33 @@ class ResilientAPICall(Job):
 class UpdateUserEmail(Job):
     def task(self, user_id: int, new_email: str):
         await self.s.cxn.execute(
-            "UPDATE users SET email = $1 WHERE id = $2",
-            new_email, user_id)
+            "UPDATE users SET email = $1 WHERE id = $2", new_email, user_id
+        )
+
 
 # Bad: Creates duplicate records on retry
 class CreateUser(Job):
     def task(self, username: str, email: str):
         await self.s.cxn.execute(
-            "INSERT INTO users (username, email) VALUES ($1, $2)",
-            username, email)  # Fails on retry (unique constraint)
+            "INSERT INTO users (username, email) VALUES ($1, $2)", username, email
+        )  # Fails on retry (unique constraint)
+
 
 # Better: Check if exists first
 class CreateUser(Job):
     def task(self, username: str, email: str):
         existing = await self.s.cxn.fetchval(
-            "SELECT id FROM users WHERE username = $1", username)
+            "SELECT id FROM users WHERE username = $1", username
+        )
 
         if existing:
             return {"id": existing, "created": False}
 
         user_id = await self.s.cxn.fetchval(
             "INSERT INTO users (username, email) VALUES ($1, $2) RETURNING id",
-            username, email)
+            username,
+            email,
+        )
 
         return {"id": user_id, "created": True}
 ```
@@ -962,6 +1024,7 @@ class MyJob(Job):
         if "db_pool" not in self.s.cache:
             self.s.cache["db_pool"] = create_pool()
         return self.s.cache["db_pool"].query(...)
+
 
 # Bad: Create new connection every time
 class MyJob(Job):
@@ -981,8 +1044,9 @@ class ProcessOrder(Job):
             "status": "shipped",
             "tracking_number": "1Z999AA10123456784",
             "timestamp": datetime.utcnow().isoformat(),
-            "items_count": 3
+            "items_count": 3,
         }
+
 
 # Bad: No useful information
 class ProcessOrder(Job):

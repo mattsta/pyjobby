@@ -131,16 +131,14 @@ Open `frontend/live-dashboard.html` in your browser.
 from pyjobby.client import JobClient
 import asyncio
 
+
 async def test_live_updates():
-    async with await JobClient.from_config('./pyjobby.conf.py') as client:
+    async with await JobClient.from_config("./pyjobby.conf.py") as client:
         # Enqueue jobs - watch them appear in dashboard!
         for i in range(10):
-            await client.enqueue(
-                'test.DemoJob',
-                task_id=i,
-                queue='default'
-            )
+            await client.enqueue("test.DemoJob", task_id=i, queue="default")
             await asyncio.sleep(0.5)
+
 
 asyncio.run(test_live_updates())
 ```
@@ -608,21 +606,22 @@ import asyncio
 import websockets
 import json
 
+
 async def monitor():
     uri = "ws://localhost:8082/ws"
 
     async with websockets.connect(uri) as ws:
         # Subscribe
-        await ws.send(json.dumps({
-            'action': 'subscribe',
-            'channels': ['jobs', 'queues:default']
-        }))
+        await ws.send(
+            json.dumps({"action": "subscribe", "channels": ["jobs", "queues:default"]})
+        )
 
         # Receive events
         async for message in ws:
             event = json.loads(message)
             print(f"Event: {event['event']}")
             print(f"Data: {event['data']}")
+
 
 asyncio.run(monitor())
 ```

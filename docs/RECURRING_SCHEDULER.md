@@ -49,23 +49,20 @@ import asyncio
 import asyncpg
 from pyjobby.admin_api import AdminAPI
 
+
 async def create_schedule():
-    conn = await asyncpg.connect(
-        host='localhost',
-        database='pyjobby',
-        user='postgres'
-    )
+    conn = await asyncpg.connect(host="localhost", database="pyjobby", user="postgres")
 
     api = AdminAPI(conn)
 
     # Create schedule
     schedule = await api.create_schedule(
-        name='daily-cleanup',
-        job_class='myapp.jobs.CleanupJob',
-        cron_expr='0 2 * * *',  # 2am daily
-        queue='cleanup',
-        kwargs={'days': 30},  # Job arguments
-        description='Daily cleanup of old data',
+        name="daily-cleanup",
+        job_class="myapp.jobs.CleanupJob",
+        cron_expr="0 2 * * *",  # 2am daily
+        queue="cleanup",
+        kwargs={"days": 30},  # Job arguments
+        description="Daily cleanup of old data",
         max_concurrent_jobs=1,  # Only 1 at a time
         jitter_seconds=300,  # Random 0-5min delay
         backpressure_threshold=1000,  # Skip if queue > 1000
@@ -76,6 +73,7 @@ async def create_schedule():
     print(f"Next run: {schedule['next_run']}")
 
     await conn.close()
+
 
 asyncio.run(create_schedule())
 ```
@@ -349,10 +347,10 @@ Pass configuration via kwargs:
 
 ```python
 await api.create_schedule(
-    name='cleanup-old-data',
-    job_class='CleanupJob',
-    cron_expr='0 2 * * *',
-    kwargs={'days': 30, 'batch_size': 1000}  # Job-specific config
+    name="cleanup-old-data",
+    job_class="CleanupJob",
+    cron_expr="0 2 * * *",
+    kwargs={"days": 30, "batch_size": 1000},  # Job-specific config
 )
 ```
 
@@ -369,10 +367,10 @@ Schedules use UTC by default. To use a different timezone:
 
 ```python
 await api.create_schedule(
-    name='daily-report',
-    job_class='ReportJob',
-    cron_expr='0 9 * * *',  # 9am
-    timezone='America/New_York'  # Eastern time
+    name="daily-report",
+    job_class="ReportJob",
+    cron_expr="0 9 * * *",  # 9am
+    timezone="America/New_York",  # Eastern time
 )
 ```
 

@@ -30,10 +30,7 @@ import asyncpg
 
 # Connect to database
 conn = await asyncpg.connect(
-    database="pyjobby",
-    user="pyjobby",
-    password="password",
-    host="localhost"
+    database="pyjobby", user="pyjobby", password="password", host="localhost"
 )
 
 # Create API instance
@@ -49,13 +46,13 @@ api = AdminAPI(conn)
 jobs = await api.list_jobs(limit=50)
 
 # Filter by queue
-jobs = await api.list_jobs(queue='default')
+jobs = await api.list_jobs(queue="default")
 
 # Filter by state
-jobs = await api.list_jobs(state='crashed')
+jobs = await api.list_jobs(state="crashed")
 
 # Filter by job class (supports LIKE patterns)
-jobs = await api.list_jobs(job_class='job.email%')
+jobs = await api.list_jobs(job_class="job.email%")
 
 # Filter by user ID
 jobs = await api.list_jobs(uid=123)
@@ -64,7 +61,7 @@ jobs = await api.list_jobs(uid=123)
 jobs = await api.list_jobs(limit=25, offset=50)
 
 # Custom ordering
-jobs = await api.list_jobs(order_by='created', order_dir='DESC')
+jobs = await api.list_jobs(order_by="created", order_dir="DESC")
 ```
 
 #### Get Job Details
@@ -76,7 +73,7 @@ if job:
     print(f"Job {job['id']}: {job['state']}")
     print(f"Class: {job['job_class']}")
     print(f"Args: {job['kwargs']}")
-    if job['error_message']:
+    if job["error_message"]:
         print(f"Error: {job['error_message']}")
 ```
 
@@ -90,7 +87,7 @@ print(f"Retry queued as job {result['new_job_id']}")
 # Retry multiple jobs
 results = await api.retry_jobs([12345, 12346, 12347])
 for r in results:
-    if r['status'] == 'error':
+    if r["status"] == "error":
         print(f"Failed: {r['error']}")
     else:
         print(f"Job {r['original_job_id']} → {r['new_job_id']}")
@@ -113,11 +110,7 @@ results = await api.cancel_jobs([12345, 12346])
 deleted = await api.delete_job(job_id=12345)
 
 # Bulk delete
-count = await api.delete_jobs(
-    queue='test',
-    state='finished',
-    older_than_days=30
-)
+count = await api.delete_jobs(queue="test", state="finished", older_than_days=30)
 print(f"Deleted {count} jobs")
 ```
 
@@ -144,24 +137,20 @@ for s in stats:
     print(f"  Total: {s['total']}")
 
 # Specific queue
-stats = await api.queue_stats(queue='default')
+stats = await api.queue_stats(queue="default")
 ```
 
 #### Clear Queue
 
 ```python
 # Clear all jobs in queue
-count = await api.clear_queue(queue='test')
+count = await api.clear_queue(queue="test")
 
 # Clear only finished jobs
-count = await api.clear_queue(queue='default', state='finished')
+count = await api.clear_queue(queue="default", state="finished")
 
 # Clear old jobs
-count = await api.clear_queue(
-    queue='default',
-    state='finished',
-    older_than_days=7
-)
+count = await api.clear_queue(queue="default", state="finished", older_than_days=7)
 ```
 
 ### Worker Management
@@ -183,7 +172,7 @@ for w in workers:
 stats = await api.worker_stats()
 
 print(f"Active Workers: {stats['active_workers']}")
-for w in stats['workers']:
+for w in stats["workers"]:
     print(f"  {w['host']}:{w['pid']} - {w['job_count']} jobs")
 ```
 
@@ -203,15 +192,15 @@ print(f"Crashed: {metrics['crashed_count']}")
 print(f"Avg Duration: {metrics['avg_duration_seconds']:.2f}s")
 
 # State counts
-for state, count in metrics['state_counts'].items():
+for state, count in metrics["state_counts"].items():
     print(f"  {state}: {count}")
 
 # Top errors
-for error in metrics['top_errors'][:5]:
+for error in metrics["top_errors"][:5]:
     print(f"  {error['job_class']}: {error['error_count']} errors")
 
 # Specific queue
-metrics = await api.get_metrics(since=since, queue='priority')
+metrics = await api.get_metrics(since=since, queue="priority")
 ```
 
 ### Dead Letter Queue
@@ -243,37 +232,34 @@ import asyncio
 import asyncpg
 from pyjobby.admin_api import AdminAPI
 
+
 async def manage_jobs():
     # Connect
     conn = await asyncpg.connect(
-        database="pyjobby",
-        user="pyjobby",
-        password="password"
+        database="pyjobby", user="pyjobby", password="password"
     )
 
     try:
         api = AdminAPI(conn)
 
         # Check crashed jobs
-        crashed = await api.list_jobs(state='crashed', limit=10)
+        crashed = await api.list_jobs(state="crashed", limit=10)
         print(f"Found {len(crashed)} crashed jobs")
 
         # Retry them
         if crashed:
-            job_ids = [j['id'] for j in crashed]
+            job_ids = [j["id"] for j in crashed]
             results = await api.retry_jobs(job_ids)
-            success = sum(1 for r in results if r['status'] != 'error')
+            success = sum(1 for r in results if r["status"] != "error")
             print(f"Retried {success}/{len(job_ids)} jobs")
 
         # Clean up old finished jobs
-        count = await api.delete_jobs(
-            state='finished',
-            older_than_days=30
-        )
+        count = await api.delete_jobs(state="finished", older_than_days=30)
         print(f"Cleaned up {count} old jobs")
 
     finally:
         await conn.close()
+
 
 asyncio.run(manage_jobs())
 ```
@@ -625,16 +611,14 @@ The web interface can be extended by modifying `pyjobby/web_admin.py`:
 from pyjobby.web_admin import WebAdminServer
 
 # Custom configuration
-server = WebAdminServer(
-    db_params=db_params,
-    host='0.0.0.0',
-    port=8081
-)
+server = WebAdminServer(db_params=db_params, host="0.0.0.0", port=8081)
+
 
 # Add custom routes
-@server.app.router.add_get('/custom')
+@server.app.router.add_get("/custom")
 async def custom_route(request):
-    return web.Response(text='Custom page')
+    return web.Response(text="Custom page")
+
 
 # Start server
 await server.start()

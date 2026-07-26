@@ -41,10 +41,16 @@ import datetime
 tomorrow_9am = datetime.datetime.now() + datetime.timedelta(days=1)
 tomorrow_9am = tomorrow_9am.replace(hour=9, minute=0, second=0)
 
-await conn.execute("""
+await conn.execute(
+    """
     INSERT INTO jorb (job_class, kwargs, run_after, queue)
     VALUES ($1, $2, $3, $4)
-""", 'job.reports.DailyReport', '{}', tomorrow_9am, 'default')
+""",
+    "job.reports.DailyReport",
+    "{}",
+    tomorrow_9am,
+    "default",
+)
 ```
 
 **How it works**:
@@ -81,17 +87,28 @@ Wait for a specific job to finish before running:
 
 ```python
 # Job 1: Upload file
-job1_id = await conn.fetchval("""
+job1_id = await conn.fetchval(
+    """
     INSERT INTO jorb (job_class, kwargs, queue, state)
     VALUES ($1, $2, $3, 'queued')
     RETURNING id
-""", 'job.file.Upload', '{"filepath": "/tmp/file.jpg"}', 'default')
+""",
+    "job.file.Upload",
+    '{"filepath": "/tmp/file.jpg"}',
+    "default",
+)
 
 # Job 2: Process file (waits for Job 1 to finish)
-await conn.execute("""
+await conn.execute(
+    """
     INSERT INTO jorb (job_class, kwargs, queue, state, waitfor_job)
     VALUES ($1, $2, $3, 'waiting', $4)
-""", 'job.file.Process', '{"filepath": "/tmp/file.jpg"}', 'default', job1_id)
+""",
+    "job.file.Process",
+    '{"filepath": "/tmp/file.jpg"}',
+    "default",
+    job1_id,
+)
 ```
 
 When Job 1 finishes, the system **automatically** moves Job 2 from `waiting` → `queued`:
@@ -117,21 +134,33 @@ Run jobs in parallel, then wait for ALL to finish before running next stage:
 
 ```python
 import secrets
+
 group_id = secrets.randbits(63)
 
 # Stage 1: Create 4 parallel jobs in a group
-for task in ['upload', 'hash', 'exif', 'thumbnail']:
-    await conn.execute("""
+for task in ["upload", "hash", "exif", "thumbnail"]:
+    await conn.execute(
+        """
         INSERT INTO jorb (job_class, kwargs, queue, run_group, state)
         VALUES ($1, $2, $3, $4, 'queued')
-    """, f'job.image.{task.capitalize()}', '{"filepath": "/tmp/image.jpg"}',
-        'default', group_id)
+    """,
+        f"job.image.{task.capitalize()}",
+        '{"filepath": "/tmp/image.jpg"}',
+        "default",
+        group_id,
+    )
 
 # Stage 2: Job that waits for ALL group members to finish
-await conn.execute("""
+await conn.execute(
+    """
     INSERT INTO jorb (job_class, kwargs, queue, waitfor_group, state)
     VALUES ($1, $2, $3, $4, 'waiting')
-""", 'job.email.NotifyComplete', '{"user_id": 123}', 'default', group_id)
+""",
+    "job.email.NotifyComplete",
+    '{"user_id": 123}',
+    "default",
+    group_id,
+)
 ```
 
 When **all** jobs with `run_group=group_id` reach `state='finished'`, the system automatically moves waiting jobs to `queued`:
@@ -188,22 +217,40 @@ Jobs with lower `prio` values are claimed first:
 
 ```python
 # High priority (paid users)
-await conn.execute("""
+await conn.execute(
+    """
     INSERT INTO jorb (job_class, kwargs, prio, queue)
     VALUES ($1, $2, $3, $4)
-""", 'job.email.SendEmail', '{}', -10, 'default')
+""",
+    "job.email.SendEmail",
+    "{}",
+    -10,
+    "default",
+)
 
 # Normal priority
-await conn.execute("""
+await conn.execute(
+    """
     INSERT INTO jorb (job_class, kwargs, prio, queue)
     VALUES ($1, $2, $3, $4)
-""", 'job.email.SendEmail', '{}', 0, 'default')
+""",
+    "job.email.SendEmail",
+    "{}",
+    0,
+    "default",
+)
 
 # Low priority (background cleanup)
-await conn.execute("""
+await conn.execute(
+    """
     INSERT INTO jorb (job_class, kwargs, prio, queue)
     VALUES ($1, $2, $3, $4)
-""", 'job.cleanup.TempFiles', '{}', 100, 'default')
+""",
+    "job.cleanup.TempFiles",
+    "{}",
+    100,
+    "default",
+)
 ```
 
 **Claim ordering** (pj.py:119):
@@ -238,16 +285,28 @@ Route jobs to workers with specific resources (GPU, hostname, etc.):
 
 ```python
 # Job requiring GPU
-await conn.execute("""
+await conn.execute(
+    """
     INSERT INTO jorb (job_class, kwargs, capability, queue)
     VALUES ($1, $2, $3, $4)
-""", 'job.ml.TrainModel', '{}', 'gpu', 'default')
+""",
+    "job.ml.TrainModel",
+    "{}",
+    "gpu",
+    "default",
+)
 
 # Job must run on specific server (where files are located)
-await conn.execute("""
+await conn.execute(
+    """
     INSERT INTO jorb (job_class, kwargs, capability, queue)
     VALUES ($1, $2, $3, $4)
-""", 'job.file.Process', '{}', f'hostname:{platform.node()}', 'default')
+""",
+    "job.file.Process",
+    "{}",
+    f"hostname:{platform.node()}",
+    "default",
+)
 ```
 
 **Worker capabilities** (pj.py:800-806):
@@ -294,18 +353,30 @@ Prevent duplicate scheduled jobs via unique constraint:
 
 ```python
 # User uploads file at 10:00 AM
-await conn.execute("""
+await conn.execute(
+    """
     INSERT INTO jorb (job_class, kwargs, deadline_key, run_after, queue)
     VALUES ($1, $2, $3, $4, $5)
-""", 'job.billing.UpdateUsage', '{"user_id": 123}',
-    'billing:123:2025-11-18', '2025-11-18 23:59:00', 'default')
+""",
+    "job.billing.UpdateUsage",
+    '{"user_id": 123}',
+    "billing:123:2025-11-18",
+    "2025-11-18 23:59:00",
+    "default",
+)
 
 # User uploads another file at 11:00 AM
-await conn.execute("""
+await conn.execute(
+    """
     INSERT INTO jorb (job_class, kwargs, deadline_key, run_after, queue)
     VALUES ($1, $2, $3, $4, $5)
-""", 'job.billing.UpdateUsage', '{"user_id": 123}',
-    'billing:123:2025-11-18', '2025-11-18 23:59:00', 'default')
+""",
+    "job.billing.UpdateUsage",
+    '{"user_id": 123}',
+    "billing:123:2025-11-18",
+    "2025-11-18 23:59:00",
+    "default",
+)
 # ↑ This INSERT will fail (unique constraint violation)
 ```
 
@@ -403,7 +474,8 @@ When workers crash, abandoned jobs are recovered on startup:
 ```python
 async def recover_abandoned_jobs(self):
     """Recover jobs left in claimed/running state when worker crashed."""
-    recovered = await conn.execute("""
+    recovered = await conn.execute(
+        """
         UPDATE jorb
         SET state = 'queued',
             run_after = TIMEZONE('utc', clock_timestamp())
@@ -411,7 +483,10 @@ async def recover_abandoned_jobs(self):
           AND state IN ('claimed', 'running')
           AND updated < TIMEZONE('utc', clock_timestamp()) - $2::interval
         RETURNING id, job_class
-    """, self.node, recovery_interval)
+    """,
+        self.node,
+        recovery_interval,
+    )
 
     logger.warning(f"Recovered {len(recovered)} abandoned jobs")
 ```
@@ -529,10 +604,7 @@ Jobs can be invoked via HTTP, bypassing the queue:
 ```python
 # pyjobby.conf.py
 web_listen = {
-    "sites": [
-        {"host": "127.0.0.1", "port": 6661},
-        {"path": "/tmp/pj.socket"}
-    ],
+    "sites": [{"host": "127.0.0.1", "port": 6661}, {"path": "/tmp/pj.socket"}],
     "paths": set(["job.image.thumbnails.Thumbnails"]),
 }
 ```
@@ -583,15 +655,24 @@ Track which jobs belong to which customers:
 
 ```python
 # Submit job for specific user
-await conn.execute("""
+await conn.execute(
+    """
     INSERT INTO jorb (job_class, kwargs, uid, queue)
     VALUES ($1, $2, $3, $4)
-""", 'job.email.SendEmail', '{}', user.id, 'default')
+""",
+    "job.email.SendEmail",
+    "{}",
+    user.id,
+    "default",
+)
 
 # Query jobs for specific user
-jobs = await conn.fetch("""
+jobs = await conn.fetch(
+    """
     SELECT * FROM jorb WHERE uid = $1
-""", user.id)
+""",
+    user.id,
+)
 ```
 
 **Schema**:
@@ -675,10 +756,15 @@ pj workers list
 # This works: Schedule job for tomorrow at 9 AM (ONE TIME)
 tomorrow_9am = datetime.datetime.now() + datetime.timedelta(days=1)
 tomorrow_9am = tomorrow_9am.replace(hour=9, minute=0, second=0)
-await conn.execute("""
+await conn.execute(
+    """
     INSERT INTO jorb (job_class, kwargs, run_after)
     VALUES ($1, $2, $3)
-""", 'job.DailyReport', '{}', tomorrow_9am)
+""",
+    "job.DailyReport",
+    "{}",
+    tomorrow_9am,
+)
 ```
 
 **What's NOT possible**:
@@ -750,8 +836,8 @@ ORDER BY updated DESC
 ```python
 from pyjobby import Client
 
-client = Client('postgresql://...')
-job_id = await client.enqueue('job.MyJob', {'arg': 'value'})
+client = Client("postgresql://...")
+job_id = await client.enqueue("job.MyJob", {"arg": "value"})
 result = await client.wait(job_id, timeout=30)
 ```
 
@@ -808,6 +894,7 @@ class LoggingMiddleware:
 
     async def after(self, job, result):
         logger.info(f"Finished job {job['id']}")
+
 
 js = JobSystem(...)
 js.use(LoggingMiddleware())

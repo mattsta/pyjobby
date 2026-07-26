@@ -47,7 +47,7 @@ db_params = {
 # Optional: Web server
 web_listen = {
     "sites": [{"host": "127.0.0.1", "port": 8080}],
-    "paths": set()  # Add job classes that can be called via web
+    "paths": set(),  # Add job classes that can be called via web
 }
 ```
 
@@ -56,6 +56,7 @@ web_listen = {
 ```python
 # job/hello.py
 from pyjobby.pj import Job
+
 
 class HelloWorld(Job):
     def task(self, name: str = "World"):
@@ -79,21 +80,23 @@ import asyncio
 import asyncpg
 import orjson
 
-async def submit_test_job():
-    conn = await asyncpg.connect(
-        database="pyjobby_dev",
-        user="youruser",
-        host="/tmp"
-    )
 
-    job_id = await conn.fetchval("""
+async def submit_test_job():
+    conn = await asyncpg.connect(database="pyjobby_dev", user="youruser", host="/tmp")
+
+    job_id = await conn.fetchval(
+        """
         INSERT INTO jorb (job_class, kwargs)
         VALUES ($1, $2)
         RETURNING id
-    """, "job.hello.HelloWorld", orjson.dumps({"name": "Alice"}))
+    """,
+        "job.hello.HelloWorld",
+        orjson.dumps({"name": "Alice"}),
+    )
 
     print(f"Submitted job {job_id}")
     await conn.close()
+
 
 asyncio.run(submit_test_job())
 ```
@@ -135,8 +138,8 @@ db_params = {
     "password": "...",  # Use env var or secrets manager
     "host": "postgres.internal",
     "port": 5432,
-    "min_size": 2,      # Minimum connections per worker
-    "max_size": 10,     # Maximum connections per worker
+    "min_size": 2,  # Minimum connections per worker
+    "max_size": 10,  # Maximum connections per worker
     "command_timeout": 60,  # Query timeout (seconds)
 }
 
@@ -445,10 +448,12 @@ data:
 import os
 import json
 
+
 # Load secrets from file (Kubernetes secret, AWS Secrets Manager, etc.)
 def load_secret(path):
     with open(path) as f:
         return json.load(f)
+
 
 secrets = load_secret(os.environ.get("SECRETS_FILE", "/run/secrets/pyjobby.json"))
 
@@ -464,14 +469,11 @@ db_params = {
 
 # Optional web server
 web_listen = {
-    "sites": [
-        {"host": "0.0.0.0", "port": 8080},
-        {"path": "/var/run/pyjobby.sock"}
-    ],
+    "sites": [{"host": "0.0.0.0", "port": 8080}, {"path": "/var/run/pyjobby.sock"}],
     "paths": {
         "job.webhooks.StripeWebhook",
         "job.api.PublicAPI",
-    }
+    },
 }
 
 # Application secrets (accessible via self.s.config in jobs)
@@ -496,7 +498,7 @@ logger.remove()  # Remove default handler
 logger.add(
     sys.stderr,
     format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-    level="INFO"
+    level="INFO",
 )
 
 # File logging (for bare metal/VMs)
@@ -505,7 +507,7 @@ logger.add(
     rotation="500 MB",
     retention="30 days",
     compression="gz",
-    level="INFO"
+    level="INFO",
 )
 
 # Error-only file
@@ -513,7 +515,7 @@ logger.add(
     "/var/log/pyjobby/error-{time}.log",
     rotation="100 MB",
     retention="90 days",
-    level="ERROR"
+    level="ERROR",
 )
 
 # JSON logging for external aggregation
@@ -521,7 +523,7 @@ logger.add(
     "/var/log/pyjobby/json-{time}.log",
     serialize=True,  # JSON format
     rotation="500 MB",
-    level="INFO"
+    level="INFO",
 )
 ```
 
@@ -533,11 +535,9 @@ import datadog
 
 logger.add(
     lambda msg: datadog.api.Event.create(
-        title="Pyjobby Log",
-        text=msg,
-        tags=["env:prod", "service:pyjobby"]
+        title="Pyjobby Log", text=msg, tags=["env:prod", "service:pyjobby"]
     ),
-    level="WARNING"
+    level="WARNING",
 )
 
 # Send to Sentry
@@ -545,10 +545,7 @@ import sentry_sdk
 
 sentry_sdk.init(dsn="https://...")
 
-logger.add(
-    lambda msg: sentry_sdk.capture_message(msg),
-    level="ERROR"
-)
+logger.add(lambda msg: sentry_sdk.capture_message(msg), level="ERROR")
 ```
 
 ### Monitoring
@@ -560,15 +557,19 @@ logger.add(
 from pyjobby.pj import Job
 import time
 
+
 class BaseMetricJob(Job):
     """Base class with metrics collection"""
 
     def run(self):
-        metrics = self.s.cache.setdefault("metrics", {
-            "jobs_processed": 0,
-            "total_duration": 0.0,
-            "errors": 0,
-        })
+        metrics = self.s.cache.setdefault(
+            "metrics",
+            {
+                "jobs_processed": 0,
+                "total_duration": 0.0,
+                "errors": 0,
+            },
+        )
 
         start = time.time()
         try:
@@ -589,6 +590,7 @@ class BaseMetricJob(Job):
     def flush_metrics(self, metrics):
         # Push to Prometheus Pushgateway
         import requests
+
         requests.post(
             "http://pushgateway:9091/metrics/job/pyjobby",
             data=f"""
@@ -600,7 +602,7 @@ pyjobby_total_duration_seconds {metrics["total_duration"]}
 
 # TYPE pyjobby_errors_total counter
 pyjobby_errors_total {metrics["errors"]}
-            """
+            """,
         )
 ```
 
@@ -631,6 +633,7 @@ Create monitoring script:
 import asyncpg
 import asyncio
 
+
 async def check_health():
     conn = await asyncpg.connect(...)
 
@@ -656,6 +659,7 @@ async def check_health():
     """)
     if recent_errors > 10:
         alert("High error rate", f"{recent_errors} errors in last 5 min")
+
 
 asyncio.run(check_health())
 ```
@@ -689,7 +693,7 @@ class SecureJob(Job):
         # Use parameterized queries
         await self.s.cxn.execute(
             "INSERT INTO logs (data) VALUES ($1)",
-            user_input  # Safe from SQL injection
+            user_input,  # Safe from SQL injection
         )
 
     def validate_input(self, data: str) -> bool:

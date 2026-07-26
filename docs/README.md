@@ -161,13 +161,19 @@ pj -v
 import asyncpg
 import orjson
 
+
 async def submit_job(job_class: str, kwargs: dict):
     conn = await asyncpg.connect(**db_params)
-    job_id = await conn.fetchval("""
+    job_id = await conn.fetchval(
+        """
         INSERT INTO jorb (job_class, kwargs, queue)
         VALUES ($1, $2, $3)
         RETURNING id
-    """, job_class, orjson.dumps(kwargs), "default")
+    """,
+        job_class,
+        orjson.dumps(kwargs),
+        "default",
+    )
     return job_id
 ```
 
@@ -175,6 +181,7 @@ async def submit_job(job_class: str, kwargs: dict):
 
 ```python
 from pyjobby.pj import Job
+
 
 class MyJob(Job):
     def task(self, arg1: str, arg2: int):
@@ -248,6 +255,7 @@ class SendEmail(Job):
         send_email(to, subject)
         return {"sent": True}
 
+
 # 2. Start workers
 # $ pj --queue email --workers 2
 
@@ -267,17 +275,28 @@ await db.execute("""
 group_id = secrets.randbits(63)
 
 # Create 3 parallel jobs (all in same group)
-for job in ['Hash', 'Thumbnail', 'EXIF']:
-    await db.execute("""
+for job in ["Hash", "Thumbnail", "EXIF"]:
+    await db.execute(
+        """
         INSERT INTO jorb (job_class, kwargs, run_group)
         VALUES ($1, $2, $3)
-    """, f'job.{job}', '{"file": "/tmp/upload.jpg"}', group_id)
+    """,
+        f"job.{job}",
+        '{"file": "/tmp/upload.jpg"}',
+        group_id,
+    )
 
 # Create aggregator (waits for all 3 to finish)
-await db.execute("""
+await db.execute(
+    """
     INSERT INTO jorb (job_class, kwargs, state, waitfor_group)
     VALUES ($1, $2, $3, $4)
-""", 'job.Aggregate', '{}', 'waiting', group_id)
+""",
+    "job.Aggregate",
+    "{}",
+    "waiting",
+    group_id,
+)
 
 # Execution: Hash, Thumbnail, EXIF run in parallel
 #            → When ALL finish, Aggregate runs

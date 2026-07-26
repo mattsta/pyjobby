@@ -398,7 +398,7 @@ class JobSystem:
         while not self.stop:
             try:
                 await self._hb_cxn.execute(WORKER_HEARTBEAT_SQL, self.worker_id)
-            except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError):
+            except asyncpg.PostgresError, asyncpg.InterfaceError, OSError:
                 with contextlib.suppress(Exception):
                     self._hb_cxn = await db.connect(**self.dsn)
             await asyncio.sleep(self.heartbeat_interval)

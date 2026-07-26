@@ -41,15 +41,16 @@ Jobs are durable workflows, not opaque function calls. Inside any job:
 ```python
 from pyjobby import Job
 
+
 class ProcessOrder(Job):
     async def task(self, order_id: int):
         # Checkpointed steps: a completed step NEVER re-executes, even
         # across retries, worker crashes, or host loss. A job that dies at
         # step 3 resumes at step 3.
         order = await self.step("load", self._load, order_id)
-        charge = await self.step("charge", self._charge, order)   # exactly once
-        await self.sleep(24 * 3600)          # durable: lives in the DB,
-                                             # holds no worker, survives restarts
+        charge = await self.step("charge", self._charge, order)  # exactly once
+        await self.sleep(24 * 3600)  # durable: lives in the DB,
+        # holds no worker, survives restarts
         await self.step("follow-up", self._follow_up, order)
 
         await self.set_event("progress", {"stage": "done"})  # observable state
@@ -101,20 +102,22 @@ Clean, high-performance Python client with:
 ```python
 from pyjobby import JobClient
 
-async with await JobClient.from_config('./pyjobby.conf.py') as client:
+async with await JobClient.from_config("./pyjobby.conf.py") as client:
     # Simple job
-    job_id = await client.enqueue('myapp.jobs.SendEmail', to='user@example.com')
+    job_id = await client.enqueue("myapp.jobs.SendEmail", to="user@example.com")
 
     # Batch (1000 jobs, 1 database round-trip)
-    jobs = [('myapp.jobs.ProcessItem', {'item_id': i}) for i in range(1000)]
+    jobs = [("myapp.jobs.ProcessItem", {"item_id": i}) for i in range(1000)]
     job_ids = await client.enqueue_batch(jobs)
 
     # Pipeline
-    job_ids = await client.create_pipeline([
-        ('FetchData', {'source': 'api'}),
-        ('TransformData', {'format': 'json'}),
-        ('LoadData', {'destination': 'db'}),
-    ])
+    job_ids = await client.create_pipeline(
+        [
+            ("FetchData", {"source": "api"}),
+            ("TransformData", {"format": "json"}),
+            ("LoadData", {"destination": "db"}),
+        ]
+    )
 ```
 
 See [docs/CLIENT_LIBRARY.md](docs/CLIENT_LIBRARY.md) for complete documentation.
@@ -237,15 +240,15 @@ Production-grade features for complex workflows:
 ```python
 # Results are stored by default (save_result=True); opt out per job:
 job_id = await client.enqueue(
-    'myapp.jobs.FetchData',
-    save_result=False  # Don't persist this job's return value
+    "myapp.jobs.FetchData",
+    save_result=False,  # Don't persist this job's return value
 )
 
 # Pass results between jobs: combine use_result_from with waitfor_job
-job_id = await client.enqueue('myapp.jobs.FetchData')
+job_id = await client.enqueue("myapp.jobs.FetchData")
 pipeline_job = await client.enqueue(
-    'myapp.jobs.ProcessData',
-    waitfor_job=job_id,      # Run only after the upstream job finishes
+    "myapp.jobs.ProcessData",
+    waitfor_job=job_id,  # Run only after the upstream job finishes
     use_result_from=job_id,  # Worker injects kwargs['upstream_result']
 )
 ```
@@ -259,10 +262,10 @@ job's stored result as `kwargs['upstream_result']`.
 ```python
 # Exponential backoff: 1s, 2s, 4s, 8s, 16s...
 await client.enqueue(
-    'myapp.jobs.ApiCall',
-    retry_strategy='exponential',
+    "myapp.jobs.ApiCall",
+    retry_strategy="exponential",
     max_retries=10,
-    initial_retry_delay=1
+    initial_retry_delay=1,
 )
 
 # Also supports: 'linear', 'fibonacci', 'quadratic', 'fixed' (constant)
@@ -463,16 +466,13 @@ from pyjobby import Job
 from dataclasses import dataclass
 import smtplib
 
+
 @dataclass
 class SendEmailJob(Job):
     async def task(self, to: str, subject: str, body: str):
         # Send email
-        server = smtplib.SMTP('localhost')
-        server.sendmail(
-            'noreply@example.com',
-            to,
-            f'Subject: {subject}\n\n{body}'
-        )
+        server = smtplib.SMTP("localhost")
+        server.sendmail("noreply@example.com", to, f"Subject: {subject}\n\n{body}")
         server.quit()
 
         print(f"Email sent to {to}")
@@ -509,15 +509,17 @@ pj --config ./pyjobby.conf.py --queue default --workers 4
 from pyjobby import JobClient
 import asyncio
 
+
 async def main():
-    async with await JobClient.from_config('./pyjobby.conf.py') as client:
+    async with await JobClient.from_config("./pyjobby.conf.py") as client:
         job_id = await client.enqueue(
-            'jobs.email.SendEmailJob',
-            to='user@example.com',
-            subject='Welcome!',
-            body='Thanks for signing up!'
+            "jobs.email.SendEmailJob",
+            to="user@example.com",
+            subject="Welcome!",
+            body="Thanks for signing up!",
         )
         print(f"Job enqueued: {job_id}")
+
 
 asyncio.run(main())
 ```
@@ -528,23 +530,21 @@ asyncio.run(main())
 import asyncpg
 import json
 
-async def enqueue_job():
-    conn = await asyncpg.connect(
-        database='pyjobby',
-        user='postgres',
-        host='localhost'
-    )
 
-    job_id = await conn.fetchval("""
+async def enqueue_job():
+    conn = await asyncpg.connect(database="pyjobby", user="postgres", host="localhost")
+
+    job_id = await conn.fetchval(
+        """
         INSERT INTO jorb (job_class, kwargs, queue, prio, state)
         VALUES ($1, $2::jsonb, $3, $4, $5)
         RETURNING id
     """,
-        'jobs.email.SendEmailJob',
-        json.dumps({'to': 'user@example.com', 'subject': 'Hi', 'body': 'Hello!'}),
-        'default',
+        "jobs.email.SendEmailJob",
+        json.dumps({"to": "user@example.com", "subject": "Hi", "body": "Hello!"}),
+        "default",
         100,
-        'queued'
+        "queued",
     )
 
     await conn.close()
@@ -558,7 +558,7 @@ async def enqueue_job():
 ### Simple Job
 
 ```python
-await client.enqueue('MyJob', arg='value')
+await client.enqueue("MyJob", arg="value")
 ```
 
 ### Scheduled Job
@@ -567,9 +567,7 @@ await client.enqueue('MyJob', arg='value')
 from datetime import datetime, timedelta
 
 await client.enqueue(
-    'MyJob',
-    run_after=datetime.now() + timedelta(hours=1),
-    arg='value'
+    "MyJob", run_after=datetime.now() + timedelta(hours=1), arg="value"
 )
 ```
 
@@ -577,32 +575,31 @@ await client.enqueue(
 
 ```python
 # A → B → C
-job_ids = await client.create_pipeline([
-    ('FetchData', {'source': 'api'}),
-    ('TransformData', {'format': 'json'}),
-    ('LoadData', {'destination': 'db'}),
-])
+job_ids = await client.create_pipeline(
+    [
+        ("FetchData", {"source": "api"}),
+        ("TransformData", {"format": "json"}),
+        ("LoadData", {"destination": "db"}),
+    ]
+)
 ```
 
 ### Fan-Out / Fan-In (Parallel + Aggregate)
 
 ```python
 # Process 1000 items in parallel
-items = [{'item_id': i} for i in range(1000)]
-job_ids, group_id = await client.create_fan_out('ProcessItem', items)
+items = [{"item_id": i} for i in range(1000)]
+job_ids, group_id = await client.create_fan_out("ProcessItem", items)
 
 # Aggregate results after all complete
-summary_job = await client.enqueue(
-    'SummarizeResults',
-    waitfor_group=group_id
-)
+summary_job = await client.enqueue("SummarizeResults", waitfor_group=group_id)
 ```
 
 ### Batch Enqueueing
 
 ```python
 # Efficiently enqueue 10,000 jobs
-jobs = [('ProcessItem', {'id': i}) for i in range(10000)]
+jobs = [("ProcessItem", {"id": i}) for i in range(10000)]
 job_ids = await client.enqueue_batch(jobs)
 ```
 
@@ -610,10 +607,10 @@ job_ids = await client.enqueue_batch(jobs)
 
 ```python
 await client.enqueue(
-    'ProcessPayment',
-    deadline_key=f'payment:{payment_id}',
+    "ProcessPayment",
+    deadline_key=f"payment:{payment_id}",
     payment_id=payment_id,
-    amount=99.99
+    amount=99.99,
 )
 ```
 
@@ -622,20 +619,16 @@ await client.enqueue(
 ```python
 # LOWER number = MORE urgent. Workers only claim jobs with
 # prio <= the worker's priority ceiling (default 1000).
-await client.enqueue('UrgentTask', priority=10)       # Most urgent
-await client.enqueue('NormalTask', priority=100)      # Normal (default)
-await client.enqueue('BackgroundTask', priority=500)  # Least urgent
+await client.enqueue("UrgentTask", priority=10)  # Most urgent
+await client.enqueue("NormalTask", priority=100)  # Normal (default)
+await client.enqueue("BackgroundTask", priority=500)  # Least urgent
 ```
 
 ### Capability-Based Routing
 
 ```python
 # Route to GPU workers
-await client.enqueue(
-    'TrainModel',
-    capability='gpu',
-    model='resnet50'
-)
+await client.enqueue("TrainModel", capability="gpu", model="resnet50")
 ```
 
 ---
