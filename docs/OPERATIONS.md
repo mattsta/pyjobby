@@ -118,3 +118,45 @@ automatically and re-prepare their statements; nothing needs a restart.
 | Throughput/error rates | `/metrics` counters + duration quantiles |
 | Live event stream | `pj-ws` + `frontend/live-dashboard.html` |
 | Progress of a running job | `client.get_event(job_id, "progress")` (if the job publishes) |
+
+## Queue controls: what the limits actually promise
+
+`max_concurrency` and `rate_limit` are enforced by `claim_jorb()` in the
+database, not by the workers, so they bind every claimer — a worker, a
+script, anything that admits a job. Two consequences worth knowing:
+
+* **The limits are exact, not approximate.** Claims for a queue that has
+  either limit set are serialized against each other, so simultaneous
+  claims cannot each read a stale count and admit past the cap.
+* **They cost nothing when unset.** A queue with no limits never takes the
+  lock and claims exactly as fast as it did before.
+
+`rate_limit` counts **admissions** in the trailing `rate_period_seconds`
+window — jobs picked up by a worker, not jobs that reached `running`. The two
+differ by one statement, and counting the latter let a burst slip through.
+
+## Retry vs. re-run
+
+Two different verbs, because they carry different risk:
+
+* **Retry** — `pj-admin jobs retry ID`, `pj-admin dlq retry ID`. For a job
+  that did *not* succeed (`crashed` or `cancelled`).
+* **Re-run** — `pj-admin jobs requeue ID`. Also accepts a **finished** job.
+  Running successful work again repeats its side effects, so it is a
+  separate verb rather than a permissive retry.
+
+Add `--fresh` to a re-run to drop the DXE step checkpoints and start from
+step 1; without it, completed steps fast-forward and the job resumes.
+
+## Reading the latency numbers
+
+`pj-admin metrics` reports queue wait and execution duration separately:
+
+* **Avg/Max Queue Wait** — how long jobs sat before a worker picked them up
+  (`claimed_at - run_after`). Rising wait with flat duration is a **capacity**
+  problem: add workers, or raise `max_concurrency`.
+* **Avg Duration** — how long jobs ran once picked up (`finished - started`).
+  Rising duration is a **code or dependency** problem.
+
+A single blended "how long did the job take" number cannot tell these apart,
+which is why it is not reported.

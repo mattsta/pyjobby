@@ -197,8 +197,9 @@ CLI (pj) → spawns workers (multiprocessing), each registers in jorb_worker
     ↓
 Worker sleeps on LISTEN jorb_enqueued (poll is the fallback)
     ↓
-Claim: UPDATE ... FOR UPDATE SKIP LOCKED, honoring jorb_queue
-       (paused / max_concurrency / rate_limit), bumping run_epoch
+Claim: claim_jorb() — FOR UPDATE SKIP LOCKED, enforcing jorb_queue
+       (paused / max_concurrency / rate_limit), stamping claimed_at
+       and bumping run_epoch
     ↓
 claimed → running (records `started`; timeouts key off this)
     ↓
