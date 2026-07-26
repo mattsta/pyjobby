@@ -17,7 +17,6 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
-import pytz
 
 from pyjobby.scheduler import (
     ScheduleExecutionResult,
@@ -369,7 +368,7 @@ class TestScheduleManager:
         """Test calculating next run for every minute cron."""
         next_run = ScheduleManager.calculate_next_run("* * * * *", "UTC")
 
-        now = datetime.now(pytz.UTC)
+        now = datetime.now(UTC)
 
         # Next run should be within next 2 minutes
         assert next_run > now
@@ -379,7 +378,7 @@ class TestScheduleManager:
         """Test calculating next run for daily at midnight."""
         next_run = ScheduleManager.calculate_next_run("0 0 * * *", "UTC")
 
-        now = datetime.now(pytz.UTC)
+        now = datetime.now(UTC)
 
         # Should be midnight
         assert next_run.hour == 0
@@ -400,7 +399,7 @@ class TestScheduleManager:
 
     def test_calculate_next_run_invalid_cron(self):
         """Test that invalid cron expression raises ValueError."""
-        with pytest.raises(ValueError, match="Invalid cron expression"):
+        with pytest.raises(ValueError, match="malformed cron expression"):
             ScheduleManager.calculate_next_run("invalid cron", "UTC")
 
     @pytest.mark.asyncio

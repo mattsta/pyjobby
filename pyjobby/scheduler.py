@@ -23,6 +23,8 @@ from typing import Any
 import asyncpg  # type: ignore[import-untyped]
 from loguru import logger
 
+from .cron import next_cron_run
+
 
 @dataclass
 class ScheduleExecutionResult:
@@ -224,28 +226,11 @@ class ScheduleManager:
         Raises:
             ValueError: If cron expression is invalid
         """
-        try:
-            import pytz  # type: ignore[import-untyped]
-            from croniter import croniter  # type: ignore[import-untyped]
-
-            # Get timezone
-            tz = pytz.timezone(timezone)
-
-            # Get current time in schedule's timezone
-            now = datetime.now(tz)
-
-            # Calculate next run
-            cron = croniter(cron_expr, now)
-            next_run: datetime = cron.get_next(datetime)
-
-            logger.debug(
-                f"Calculated next run: {next_run} (cron: {cron_expr}, tz: {timezone})"
-            )
-
-            return next_run
-
-        except Exception as e:
-            raise ValueError(f"Invalid cron expression '{cron_expr}': {e}")
+        next_run = next_cron_run(cron_expr, timezone)
+        logger.debug(
+            f"Calculated next run: {next_run} (cron: {cron_expr}, tz: {timezone})"
+        )
+        return next_run
 
     async def create_schedule(
         self, name: str, job_class: str, cron_expr: str, **kwargs: Any

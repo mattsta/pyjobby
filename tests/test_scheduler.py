@@ -118,7 +118,7 @@ class TestScheduleManagerCalculateNextRun:
         """Test invalid cron expression raises ValueError."""
         with pytest.raises(ValueError) as excinfo:
             ScheduleManager.calculate_next_run("not a valid cron")
-        assert "Invalid cron expression" in str(excinfo.value)
+        assert "malformed cron expression" in str(excinfo.value)
 
 
 class TestScheduleSafetyManagerIntegration:
