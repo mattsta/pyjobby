@@ -103,21 +103,34 @@ invisible to a serial benchmark (3% there) and invisible to a bulk benchmark,
 and it only appears under concurrent commits — which is exactly the production
 shape.
 
-### The other per-job costs
+### What the history trigger costs
 
-The history trigger writes a row per transition, which is why `jorb_history`
-becomes the largest table in the system. That much is certain, and it is a
-storage and retention problem rather than a throughput one.
+Now measured under the production shape, 16 concurrent connections, one
+transaction per job, median of 3 (`pj-bench enqueue --allow-trigger-toggle`):
 
-What its *throughput* cost is remains **unmeasured under the production
-shape**. Isolating it in a bulk benchmark suggests it dominates the non-NOTIFY
-cost, but that is the same methodology that overstated enqueue headroom by 6×,
-so the figure is not quoted here and no design decision rests on it. `pj-bench
-enqueue` measures it concurrently, one transaction per job; that is the number
-to act on.
+| | jobs/s |
+|---|---|
+| as shipped | 29,768 |
+| history trigger off | 41,431 |
+| all NOTIFY off | 36,238 |
+| all NOTIFY **and** history off | 42,112 |
 
-This is deliberate: a plausible number measured the wrong way is more dangerous
-than no number, because it gets optimised against.
+So history costs roughly **1.4×** — real, but nowhere near what isolating it in
+a bulk benchmark implied. That earlier reading was the same methodology that
+overstated enqueue headroom by 6×, and it is the reason no design decision was
+allowed to rest on it until now.
+
+**Decision: keep it, unchanged.** At ~100× headroom the throughput cost buys a
+complete, reliable audit trail, and the alternatives are all worse trades —
+sampling makes the trail untrustworthy exactly when you need it, and writing it
+asynchronously loses rows on the crashes it exists to explain. `jorb_history`
+is still the largest table in the system, but that is a **storage** problem and
+retention already answers it.
+
+Note the spread on these runs is 16–34%. At this rate the measurement is noisy
+enough that the history and NOTIFY figures overlap at the edges — treat them as
+"about 1.4×" and "about 1.2×", not as three significant figures, and re-measure
+on your own hardware rather than trusting these.
 
 ---
 
