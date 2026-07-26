@@ -11,6 +11,7 @@ connection behavior is uniform everywhere:
 
 from __future__ import annotations
 
+import datetime
 import enum
 from typing import Any
 
@@ -50,56 +51,89 @@ async def register_json_codecs(conn: asyncpg.Connection) -> None:
         )
 
 
-def build_retry_sql(allowed_states: tuple[str, ...] = ("crashed",)) -> str:
-    """SQL that inserts a fresh retry copy of a job (audit-preserving retry).
+def utcnow() -> datetime.datetime:
+    """The current instant as an aware UTC datetime (the platform's only
+    Python-side time representation; every schema column is timestamptz)."""
+    return datetime.datetime.now(datetime.UTC)
 
-    This is THE retry statement — the worker, client library, admin API, and
-    websocket server all use it so retry rows always look the same.
 
-    Parameters: $1 job_id, $2 retry delay (interval), $3 error_count for the
-    new row. The original row is left untouched (its terminal state is the
-    audit trail); the copy gets both ``admin_data.parent_job_id`` and
-    ``admin_data.retry_of`` stamped with the original id.
+def build_requeue_sql(allowed_states: tuple[str, ...] = ("crashed",)) -> str:
+    """SQL that puts a terminal/in-flight job back in the queue.
+
+    Jobs keep ONE row for life: a retry (automatic or operator-driven)
+    requeues the same row, the per-attempt audit trail lives in
+    jorb_history, and run_epoch (bumped at claim) fences any stale
+    execution out of writing results or checkpoints.
+
+    Parameters: $1 job_id, $2 delay (interval), $3 reset_errors (bool).
     """
     states = ", ".join(f"'{s}'" for s in allowed_states)
-    return f"""INSERT INTO jorb (
-                job_class, kwargs, queue, prio, uid, capability,
-                run_after, run_group, admin_data, state, error_count
-            )
-            SELECT
-                job_class, kwargs, queue, prio, uid, capability,
-                TIMEZONE('utc', clock_timestamp()) + $2::interval AS run_after,
-                run_group,
-                (COALESCE(admin_data::text::jsonb, '{{}}'::jsonb)
-                    || jsonb_build_object(
-                        'parent_job_id', $1::bigint,
-                        'retry_of', $1::bigint))::json AS admin_data,
-                'queued' AS state,
-                $3 AS error_count
-            FROM jorb
+    return f"""UPDATE jorb
+            SET state = 'queued',
+                run_after = now() + $2::interval,
+                error_count = CASE WHEN $3 THEN 0 ELSE error_count END,
+                error_message = CASE WHEN $3 THEN NULL ELSE error_message END,
+                error_backtrace = CASE WHEN $3 THEN NULL ELSE error_backtrace END,
+                result = NULL,
+                finished = NULL,
+                timeout_at = NULL,
+                cancel_requested = FALSE,
+                updated = now()
             WHERE id = $1::bigint
               AND state IN ({states})
             RETURNING id"""
 
 
-async def create_retry_job(
+async def requeue_job(
     conn: asyncpg.Connection | asyncpg.Pool,
     job_id: int,
     *,
-    delay: Any = None,
-    error_count: int = 0,
-    allowed_states: tuple[str, ...] = ("crashed",),
+    delay: datetime.timedelta | None = None,
+    reset_errors: bool = True,
+    allowed_states: tuple[str, ...] = ("crashed", "cancelled", "finished"),
 ) -> int | None:
-    """Insert a retry copy of ``job_id``; returns the new job id or None
-    if the original is missing / not in an allowed state."""
-    import datetime
-
+    """Requeue ``job_id`` for another run (the retry/re-run primitive shared
+    by the admin API, client library, and websocket server). Returns the job
+    id, or None if it wasn't in an allowed state."""
     if delay is None:
         delay = datetime.timedelta(0)
-    new_job_id: int | None = await conn.fetchval(
-        build_retry_sql(allowed_states), job_id, delay, error_count
+    requeued: int | None = await conn.fetchval(
+        build_requeue_sql(allowed_states), job_id, delay, reset_errors
     )
-    return new_job_id
+    return requeued
+
+
+CANCEL_SQL = """UPDATE jorb
+        SET state = CASE WHEN state IN ('queued', 'waiting')
+                         THEN 'cancelled'::jorbstate ELSE state END,
+            cancel_requested = CASE WHEN state IN ('claimed', 'running')
+                                    THEN TRUE ELSE cancel_requested END,
+            finished = CASE WHEN state IN ('queued', 'waiting')
+                            THEN now() ELSE finished END,
+            updated = now()
+        WHERE id = $1
+          AND state IN ('queued', 'waiting', 'claimed', 'running')
+        RETURNING state, cancel_requested"""
+
+
+async def cancel_job(
+    conn: asyncpg.Connection | asyncpg.Pool, job_id: int
+) -> str | None:
+    """Cancel a job wherever it is in its lifecycle (the one cancel path
+    shared by the client, admin API, and websocket server).
+
+    Queued/waiting jobs are cancelled immediately. Claimed/running jobs get
+    cancel_requested set — the jorb_cancel NOTIFY reaches the executing
+    worker, which cancels the task at its next await point.
+
+    Returns 'cancelled', 'cancel_requested', or None (job not cancellable).
+    """
+    row = await conn.fetchrow(CANCEL_SQL, job_id)
+    if row is None:
+        return None
+    if row["state"] == "cancelled":
+        return "cancelled"
+    return "cancel_requested"
 
 
 async def connect(*args: Any, **kwargs: Any) -> asyncpg.Connection:

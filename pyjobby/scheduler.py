@@ -21,7 +21,6 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import asyncpg  # type: ignore[import-untyped]
-import pytz  # type: ignore[import-untyped]
 from loguru import logger
 
 
@@ -492,11 +491,8 @@ class SchedulerWorker:
             "scheduled_time": scheduled_time.isoformat(),
         }
 
-        # Convert scheduled_time to naive UTC if it's timezone-aware
+        # run_after is timestamptz: aware datetimes pass through unchanged
         run_after_time = scheduled_time
-        if hasattr(scheduled_time, "tzinfo") and scheduled_time.tzinfo is not None:
-            # Convert to UTC and remove timezone info
-            run_after_time = scheduled_time.astimezone(pytz.UTC).replace(tzinfo=None)
 
         if jitter_seconds > 0:
             run_after_time = run_after_time + timedelta(seconds=jitter_seconds)

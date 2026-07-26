@@ -374,17 +374,11 @@ class WebSocketServer:
         assert self.db_pool is not None
         try:
             async with self.db_pool.acquire() as conn:
-                result = await conn.execute(
-                    """
-                    UPDATE jorb
-                    SET state = 'cancelled'
-                    WHERE id = $1
-                      AND state IN ('queued', 'waiting')
-                """,
-                    job_id,
-                )
+                # shared cancel path: immediate for queued/waiting, delivered
+                # to the executing worker for claimed/running
+                outcome = await db.cancel_job(conn, job_id)
 
-                if result == "UPDATE 0":
+                if outcome is None:
                     await self.send_error(
                         ws, f"Job {job_id} not found or cannot be cancelled"
                     )
@@ -394,10 +388,10 @@ class WebSocketServer:
                         {
                             "event": "job_cancelled",
                             "timestamp": datetime.now(UTC).isoformat(),
-                            "data": {"job_id": job_id, "success": True},
+                            "data": {"job_id": job_id, "status": outcome},
                         },
                     )
-                    logger.info(f"Job {job_id} cancelled via WebSocket")
+                    logger.info(f"Job {job_id} cancel outcome: {outcome}")
 
         except Exception as e:
             logger.error(f"Error cancelling job: {e}")
@@ -417,9 +411,9 @@ class WebSocketServer:
         assert self.db_pool is not None
         try:
             async with self.db_pool.acquire() as conn:
-                # shared retry statement — identical rows to every other path
-                new_job_id = await db.create_retry_job(
-                    conn, job_id, allowed_states=("crashed", "finished")
+                # shared requeue statement — jobs keep their ids across retries
+                new_job_id = await db.requeue_job(
+                    conn, job_id, allowed_states=("crashed", "cancelled", "finished")
                 )
 
                 if new_job_id:
@@ -429,13 +423,12 @@ class WebSocketServer:
                             "event": "job_retried",
                             "timestamp": datetime.now(UTC).isoformat(),
                             "data": {
-                                "original_job_id": job_id,
-                                "new_job_id": new_job_id,
+                                "job_id": job_id,
                                 "success": True,
                             },
                         },
                     )
-                    logger.info(f"Job {job_id} retried as {new_job_id} via WebSocket")
+                    logger.info(f"Job {job_id} requeued via WebSocket")
                 else:
                     await self.send_error(
                         ws, f"Job {job_id} not found or cannot be retried"

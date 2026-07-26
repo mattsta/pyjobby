@@ -281,8 +281,7 @@ def jobs_retry(ctx: click.Context, job_ids: tuple[int, ...]) -> None:
                 try:
                     result = await api.retry_job(job_ids[0])
                     print_success(
-                        f"Job {result['original_job_id']} retry queued as "
-                        f"job {result['new_job_id']}"
+                        f"Job {result['job_id']} requeued for retry"
                     )
                 except ValueError as e:
                     print_error(str(e))
@@ -296,11 +295,11 @@ def jobs_retry(ctx: click.Context, job_ids: tuple[int, ...]) -> None:
                 for result in results:
                     if result["status"] == "error":
                         print_error(
-                            f"Job {result['original_job_id']}: {result['error']}"
+                            f"Job {result['job_id']}: {result['error']}"
                         )
                     else:
                         print_success(
-                            f"Job {result['original_job_id']} → {result['new_job_id']}"
+                            f"Job {result['job_id']} requeued"
                         )
 
                 click.echo(f"\n{Colors.BOLD}Summary:{Colors.ENDC}")
@@ -686,8 +685,7 @@ def dlq_retry(ctx: click.Context, job_id: int) -> None:
             result = await api.retry_from_dlq(job_id)
 
             print_success(
-                f"DLQ job {result['original_job_id']} retry queued as "
-                f"job {result['new_job_id']} (error count reset to 0)"
+                f"DLQ job {result['job_id']} requeued (error count reset to 0)"
             )
 
         except ValueError as e:
@@ -1599,7 +1597,7 @@ def jobs_retry_stats(
 
             if since_hours:
                 where_clauses.append(
-                    "created > TIMEZONE('utc', clock_timestamp()) - $1::interval"
+                    "created > now() - $1::interval"
                 )
                 params.append(f"{since_hours} hours")
 
@@ -1726,7 +1724,7 @@ def jobs_timeout_stats(
 
             if since_hours:
                 where_clauses.append(
-                    "created > TIMEZONE('utc', clock_timestamp()) - $1::interval"
+                    "created > now() - $1::interval"
                 )
                 params.append(f"{since_hours} hours")
 

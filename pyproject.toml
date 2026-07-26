@@ -5,13 +5,11 @@ description = "PostgreSQL Job Consumer Platform"
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "Matt Stancliff", email = "matt@genges.com" }]
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Topic :: System :: Distributed Computing",
     "Framework :: AsyncIO",
@@ -35,7 +33,7 @@ pj-admin = "pyjobby.cli:cli"
 pj-web = "pyjobby.web_admin:main"
 pj-scheduler = "pyjobby.scheduler:main"
 pj-ws = "pyjobby.websocket_server:main"
-pj-timeout-monitor = "pyjobby.timeout_monitor:cli"
+pj-monitor = "pyjobby.monitor:cli"
 
 [dependency-groups]
 test = [

@@ -526,7 +526,7 @@ class WebAdminServer:
             format_type = request.query.get("format", "json")
 
             # jorb timestamps are naive-UTC, so compare with a naive-UTC value
-            since = datetime.now(UTC).replace(tzinfo=None) - timedelta(
+            since = datetime.now(UTC) - timedelta(
                 hours=since_hours
             )
             metrics = await api.get_metrics(since=since, queue=queue)

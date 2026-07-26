@@ -310,7 +310,7 @@ class JobClient:
 
         # Default run_after to now if not specified
         if run_after is None:
-            run_after = datetime.now(UTC).replace(tzinfo=None)
+            run_after = datetime.now(UTC)
 
         # Determine initial state
         state = "waiting" if waitfor_job or waitfor_group else "queued"
@@ -411,7 +411,7 @@ class JobClient:
             return []
 
         if run_after is None:
-            run_after = datetime.now(UTC).replace(tzinfo=None)
+            run_after = datetime.now(UTC)
 
         # Prepare values for batch insert
         values = []
@@ -448,7 +448,7 @@ class JobClient:
                     $2::text[],
                     $3::text[],
                     $4::int[],
-                    $5::timestamp[],
+                    $5::timestamptz[],
                     $6::bigint[]
                 ) AS t(job_class, kwargs, queue, prio, run_after, run_group)
                 RETURNING id
@@ -497,54 +497,52 @@ class JobClient:
 
         return JobInfo(**dict(row))
 
-    async def cancel_job(self, job_id: int) -> bool:
+    async def cancel_job(self, job_id: int) -> str | None:
         """
-        Cancel a job (if not already running).
+        Cancel a job wherever it is in its lifecycle.
+
+        Queued/waiting jobs are cancelled immediately. Claimed/running jobs
+        get a cancellation request delivered to their worker, which cancels
+        the task at its next await point.
 
         Args:
             job_id: Job ID
 
         Returns:
-            True if cancelled, False if not found or already running
+            'cancelled' (done now), 'cancel_requested' (running; delivery in
+            progress), or None (not found / already terminal)
 
         Example:
-            if await client.cancel_job(12345):
-                print("Job cancelled")
+            outcome = await client.cancel_job(12345)
+            if outcome:
+                print(f"Cancel: {outcome}")
         """
         async with self.pool.acquire() as conn:
-            result: str = await conn.execute(
-                """
-                UPDATE jorb
-                SET state = 'cancelled'
-                WHERE id = $1
-                  AND state IN ('queued', 'waiting')
-            """,
-                job_id,
-            )
-
-        return result != "UPDATE 0"
+            return await db.cancel_job(conn, job_id)
 
     async def retry_job(self, job_id: int) -> int | None:
         """
-        Retry a failed/crashed job (creates a new job).
+        Retry a crashed/cancelled/finished job by requeuing it.
+
+        The job keeps its id (retries reuse the same row; per-attempt
+        history lives in jorb_history).
 
         Args:
             job_id: Job ID to retry
 
         Returns:
-            New job ID, or None if original job not found
+            The job id if requeued, or None if it wasn't retriable
 
         Example:
-            new_job_id = await client.retry_job(12345)
-            if new_job_id:
-                print(f"Created retry job: {new_job_id}")
+            if await client.retry_job(12345):
+                print("Job requeued")
         """
         async with self.pool.acquire() as conn:
-            new_job_id = await db.create_retry_job(
-                conn, job_id, allowed_states=("crashed", "finished")
+            requeued = await db.requeue_job(
+                conn, job_id, allowed_states=("crashed", "cancelled", "finished")
             )
 
-        return new_job_id
+        return requeued
 
     # =========================================================================
     # Queue Operations
@@ -1107,18 +1105,18 @@ class JobClient:
         if not job_ids:
             return []
 
-        # one shared retry statement per job (see db.build_retry_sql) so
-        # bulk-created retry rows are identical to every other retry path
-        new_ids = []
+        # one shared requeue statement per job (see db.build_requeue_sql):
+        # jobs keep their ids across retries
+        requeued_ids = []
         async with self.pool.acquire() as conn:
             for job_id in job_ids:
-                new_id = await db.create_retry_job(
-                    conn, job_id, allowed_states=("crashed", "finished")
+                requeued = await db.requeue_job(
+                    conn, job_id, allowed_states=("crashed", "cancelled", "finished")
                 )
-                if new_id is not None:
-                    new_ids.append(new_id)
+                if requeued is not None:
+                    requeued_ids.append(requeued)
 
-        return new_ids
+        return requeued_ids
 
     async def bulk_delete(self, job_ids: list[int]) -> int:
         """

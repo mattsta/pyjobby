@@ -237,13 +237,16 @@ class AdminAPI:
 
     async def retry_job(self, job_id: int) -> dict[str, Any]:
         """
-        Retry a crashed or failed job by creating a new retry job.
+        Retry a crashed or cancelled job by requeuing it.
+
+        The job keeps its id: retries reuse the same row (the per-attempt
+        audit trail lives in jorb_history).
 
         Args:
             job_id: ID of job to retry
 
         Returns:
-            Dictionary with original_job_id and new_job_id
+            Dictionary with job_id and status
 
         Raises:
             ValueError: If job not found or not in retriable state
@@ -260,16 +263,11 @@ class AdminAPI:
                 f"can only retry crashed or cancelled jobs"
             )
 
-        # Create retry job using the shared retry statement (db module)
-        new_job_id = await db.create_retry_job(
+        await db.requeue_job(
             self.conn, job_id, allowed_states=("crashed", "cancelled")
         )
 
-        return {
-            "original_job_id": job_id,
-            "new_job_id": new_job_id,
-            "status": "retry_queued",
-        }
+        return {"job_id": job_id, "status": "requeued"}
 
     async def retry_jobs(self, job_ids: list[int]) -> list[dict[str, Any]]:
         """
@@ -288,49 +286,40 @@ class AdminAPI:
                 results.append(result)
             except ValueError as e:
                 results.append(
-                    {"original_job_id": job_id, "status": "error", "error": str(e)}
+                    {"job_id": job_id, "status": "error", "error": str(e)}
                 )
         return results
 
     async def cancel_job(self, job_id: int) -> dict[str, Any]:
         """
-        Cancel a queued or waiting job.
+        Cancel a job wherever it is in its lifecycle.
+
+        Queued/waiting jobs are cancelled immediately; claimed/running jobs
+        get a cancellation request delivered to their worker.
 
         Args:
             job_id: ID of job to cancel
 
         Returns:
-            Dictionary with job_id and status
+            Dictionary with job_id and status ('cancelled' or
+            'cancel_requested')
 
         Raises:
-            ValueError: If job not found or not cancellable
+            ValueError: If job not found or already terminal
         """
-        result = await self.conn.fetchrow(
-            """
-            UPDATE jorb
-            SET state = 'cancelled',
-                updated = TIMEZONE('utc', clock_timestamp())
-            WHERE id = $1
-              AND state IN ('queued', 'waiting')
-            RETURNING id, state
-        """,
-            job_id,
-        )
+        outcome = await db.cancel_job(self.conn, job_id)
 
-        if not result:
-            # Check if job exists
+        if outcome is None:
             job = await self.conn.fetchrow(
                 "SELECT id, state FROM jorb WHERE id = $1", job_id
             )
             if not job:
                 raise ValueError(f"Job {job_id} not found")
-            else:
-                raise ValueError(
-                    f"Job {job_id} is in state '{job['state']}', "
-                    f"can only cancel queued or waiting jobs"
-                )
+            raise ValueError(
+                f"Job {job_id} is in state '{job['state']}' and cannot be cancelled"
+            )
 
-        return {"job_id": job_id, "status": "cancelled"}
+        return {"job_id": job_id, "status": outcome}
 
     async def cancel_jobs(self, job_ids: list[int]) -> list[dict[str, Any]]:
         """
@@ -402,7 +391,7 @@ class AdminAPI:
 
         if older_than_days:
             where_clauses.append(
-                f"updated < (TIMEZONE('utc', clock_timestamp()) - ${param_idx}::interval)"
+                f"updated < (now() - ${param_idx}::interval)"
             )
             params.append(timedelta(days=older_than_days))
             param_idx += 1
@@ -460,7 +449,7 @@ class AdminAPI:
                 state,
                 COUNT(*) as count,
                 MIN(CASE WHEN state = 'queued'
-                    THEN EXTRACT(EPOCH FROM (TIMEZONE('utc', clock_timestamp()) - created))
+                    THEN EXTRACT(EPOCH FROM (now() - created))
                     ELSE NULL END) as oldest_queued_age_seconds
             FROM jorb
             {where_sql}
@@ -723,9 +712,10 @@ class AdminAPI:
             job_id: ID of DLQ job to retry
 
         Returns:
-            Dictionary with original_job_id and new_job_id
+            Dictionary with job_id and status
         """
-        # Same as regular retry, but reset error_count
+        # Same as regular retry, but errors reset to zero (fresh attempt
+        # budget for the operator-driven re-run)
         job = await self.conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
 
         if not job:
@@ -734,29 +724,11 @@ class AdminAPI:
         if job["state"] != "crashed":
             raise ValueError(f"Job {job_id} is not in DLQ (state: {job['state']})")
 
-        # Create retry job with error_count reset to 0 using the shared
-        # retry statement, then stamp the DLQ provenance marker on the copy
-        new_job_id = await db.create_retry_job(
-            self.conn, job_id, allowed_states=("crashed",)
+        await db.requeue_job(
+            self.conn, job_id, reset_errors=True, allowed_states=("crashed",)
         )
-        if new_job_id is not None:
-            await self.conn.execute(
-                """
-                UPDATE jorb
-                SET admin_data = jsonb_set(
-                    COALESCE(admin_data::text::jsonb, '{}'::jsonb),
-                    '{dlq_retry_from}', to_jsonb($2::bigint))::json
-                WHERE id = $1
-                """,
-                new_job_id,
-                job_id,
-            )
 
-        return {
-            "original_job_id": job_id,
-            "new_job_id": new_job_id,
-            "status": "retry_queued_from_dlq",
-        }
+        return {"job_id": job_id, "status": "requeued_from_dlq"}
 
     # =========================================================================
     # Schedule Management
