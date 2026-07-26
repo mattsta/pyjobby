@@ -602,10 +602,10 @@ class TestJobReschedule:
 
 
 class WebEnabledJob(Job):
-    """Job that has a web() method for handling HTTP requests."""
+    """Job that overrides web() to serve HTTP requests directly."""
 
     @classmethod
-    def web(cls, request):
+    async def web(cls, request):
         from aiohttp import web as aiohttp_web
 
         return aiohttp_web.Response(text="web_job_response")
@@ -676,7 +676,7 @@ class TestWebHandler:
         request = make_mocked_request("GET", "/invalid.path.NotFound")
         response = await system.webHandler(request)
 
-        assert response.status == 200
+        assert response.status == 404
         assert response.text == "not so fast!"
 
 

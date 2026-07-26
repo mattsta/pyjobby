@@ -475,7 +475,9 @@ class TestJobRescheduling:
                 "test.Job",
                 {},
                 unique_queue,
-                "queued",
+                # a task can only reschedule ITSELF, so the row is running:
+                # reschedule is fenced to the live attempt
+                "running",
                 100,
             )
             job = await db_pool.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
@@ -504,7 +506,9 @@ class TestJobRescheduling:
                 "test.Job",
                 {},
                 unique_queue,
-                "queued",
+                # a task can only reschedule ITSELF, so the row is running:
+                # reschedule is fenced to the live attempt
+                "running",
                 100,
             )
             job = await db_pool.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)

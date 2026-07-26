@@ -353,11 +353,14 @@ async def test_unregistered_claim_is_reclaimed_only_after_the_grace_period(
 #: testable rather than aspirational.
 EPOCH_FENCED = ("run", "set-timeout", "finished", "retry", "crashed", "cancelled")
 
-STALE_WRITE_CASES = (*EPOCH_FENCED[1:], "record-step")
+STALE_WRITE_CASES = (*EPOCH_FENCED, "record-step")
 
 
 async def apply_fenced_statement(pool, name: str, job_id: int, epoch: int) -> int:
     """Run one epoch-fenced statement; return how many rows it wrote."""
+    if name == "run":
+        rows = await pool.fetch(STMTS[name], job_id, epoch)
+        return len(rows)
     if name == "finished":
         rows = await pool.fetch(STMTS[name], job_id, {"wrote": name}, epoch)
         return len(rows)
@@ -482,48 +485,60 @@ async def test_stale_step_cannot_overwrite_the_live_attempts_checkpoint(
     ] == [(1, "work", {"by": "current"}, None, current)]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: STMTS['reschedule'] (durable sleep replay and Job.reschedule) "
-    "has neither an epoch fence nor a state guard, so a superseded attempt can "
-    "push a job the CURRENT attempt is running back to 'queued' — after which "
-    "the winner's epoch-fenced completion no-ops and the job runs again",
-)
 async def test_stale_reschedule_cannot_requeue_the_live_attempt(db_pool, unique_queue):
     """A stale attempt's reschedule must not disturb the running attempt.
 
-    xfail is STRICT: the statement takes no epoch parameter at all, so this
-    can only start passing when the fence is added.
+    reschedule carries the same epoch fence and state guard as every other
+    state-changing write, so the superseded attempt's requeue simply does
+    not apply.
     """
-    job_id, _stale, current = await superseded_job(db_pool, unique_queue)
+    job_id, stale, current = await superseded_job(db_pool, unique_queue)
     started = await db_pool.fetch(STMTS["run"], job_id, current)
     assert [r["state"] for r in started] == ["running"]
 
-    # the zombie from the superseded attempt reschedules itself
-    await db_pool.execute(STMTS["reschedule"], job_id, datetime.timedelta(seconds=60))
+    # the zombie from the superseded attempt tries to reschedule itself
+    applied = await db_pool.fetch(
+        STMTS["reschedule"], job_id, datetime.timedelta(seconds=60), stale
+    )
+    assert applied == []
 
     row = await db_pool.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
     assert row["state"] == "running"
+    assert row["run_epoch"] == current
 
 
-async def test_stale_reschedule_makes_the_live_completion_a_noop(db_pool, unique_queue):
-    """The consequence of the unfenced reschedule, pinned as it stands today.
+async def test_live_completion_survives_a_stale_reschedule(db_pool, unique_queue):
+    """The blast radius the fence closes: the winner's result is kept.
 
-    Once a stale attempt has rescheduled the row, the CURRENT attempt's
-    completion is fenced out by its own state guard: the finished result is
-    dropped and the job is left queued to run a second time. This test
-    documents the blast radius of the bug above; fixing the fence turns the
-    xfail above green and makes this scenario unreachable, so both tests move
-    together.
+    Before the fence, a stale reschedule left the row 'queued', which fenced
+    the CURRENT attempt's completion out by its own state guard -- the result
+    was dropped and the job ran a second time. Now the stale reschedule is a
+    no-op, so the live attempt still finishes normally.
     """
-    job_id, _stale, current = await superseded_job(db_pool, unique_queue)
+    job_id, stale, current = await superseded_job(db_pool, unique_queue)
     await db_pool.fetch(STMTS["run"], job_id, current)
-    await db_pool.execute(STMTS["reschedule"], job_id, datetime.timedelta(seconds=60))
+    await db_pool.fetch(
+        STMTS["reschedule"], job_id, datetime.timedelta(seconds=60), stale
+    )
 
     completion = await db_pool.fetch(STMTS["finished"], job_id, {"real": True}, current)
-    assert completion == []
+    assert [r["state"] for r in completion] == ["finished"]
+
+    row = await db_pool.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+    assert row["state"] == "finished"
+    assert row["result"] == {"real": True}
+
+
+async def test_live_attempt_can_still_reschedule_itself(db_pool, unique_queue):
+    """The fence blocks stale attempts only -- the current one still works."""
+    job_id, _stale, current = await superseded_job(db_pool, unique_queue)
+    await db_pool.fetch(STMTS["run"], job_id, current)
+
+    applied = await db_pool.fetch(
+        STMTS["reschedule"], job_id, datetime.timedelta(seconds=60), current
+    )
+    assert [r["id"] for r in applied] == [job_id]
 
     row = await db_pool.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
     assert row["state"] == "queued"
-    assert row["result"] is None
     assert row["run_after"] > row["started"]

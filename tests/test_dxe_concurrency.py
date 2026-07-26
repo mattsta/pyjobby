@@ -13,10 +13,10 @@ and "the property held" come apart. The properties under test:
 * cancellation lands cleanly mid-step and during a durable sleep, leaving the
   completed checkpoints intact and recording nothing for work that never ran;
 * the queue control plane (``max_concurrency``, ``rate_limit``) under real
-  concurrent claims — where two admission-control bugs live: each limit gets a
-  strict test for the part that holds, a load test marked xfail for the part
-  that does not, and a deterministic ``xfail(strict=True)`` test pinning the
-  exact mechanism so a fix flips it;
+  concurrent claims: each limit is checked three ways — that a capped queue
+  still drains, that the cap is never exceeded under load, and a deterministic
+  mechanism test that admission cannot be fooled by an invisible competing
+  claim or by a job that has been admitted but has not started yet;
 * concurrent monitor sweeps handle an overdue job exactly once.
 
 Job classes are defined at module level so the workers can resolve them by
@@ -575,7 +575,7 @@ async def test_max_concurrency_queue_drains_and_runs_at_the_cap(
 
     This is the part of the ``max_concurrency`` contract that survives
     concurrent claims: no work is lost or duplicated, and the cap is the level
-    the queue actually runs at. Never EXCEEDING the cap is the xfail below.
+    the queue actually runs at. Never EXCEEDING it is the test below.
     """
     await db_pool.execute(
         "INSERT INTO jorb_queue (name, max_concurrency) VALUES ($1, 2)", unique_queue
@@ -602,12 +602,6 @@ async def test_max_concurrency_queue_drains_and_runs_at_the_cap(
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(
-    reason="BUG: max_concurrency admission counts only COMMITTED claimed/running "
-    "rows, so simultaneous claims from several workers all pass the check and "
-    "over-admit (see the strict mechanism test below)",
-    strict=False,  # how far over the cap it goes depends on claim interleaving
-)
 async def test_max_concurrency_is_never_exceeded_under_load(
     live_worker, unique_queue, db_pool
 ):
@@ -625,23 +619,17 @@ async def test_max_concurrency_is_never_exceeded_under_load(
     assert max(samples) == 2
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: a concurrent claim is admitted past max_concurrency because the "
-    "cap subquery cannot see another transaction's uncommitted claim",
-)
 async def test_max_concurrency_cap_holds_against_a_concurrent_claim(
     db_pool, db_params, unique_queue
 ):
-    """The mechanism behind the over-admission, with zero timing dependence.
+    """The cap holds even when the competing claim is invisible, and without
+    ever blocking.
 
-    Claim #1 runs inside an open transaction; claim #2 (another connection)
-    cannot see it under READ COMMITTED, so its ``max_concurrency`` subquery
-    counts zero in-flight jobs and admits a second job past a cap of 1.
-
-    xfail is STRICT: the visibility rule is deterministic, so an unexpected
-    pass means the claim grew real mutual exclusion (an advisory lock, or a
-    lock on the jorb_queue row) and this test should become a plain assertion.
+    Claim #1 runs inside an open transaction, so under READ COMMITTED claim
+    #2 cannot see it and a plain count would admit a second job past a cap of
+    1. claim_jorb serializes claims for a capped queue instead of counting
+    blind -- and it does so with a TRY lock, so claim #2 returns empty-handed
+    immediately rather than stalling behind the open transaction.
     """
     await db_pool.execute(
         "INSERT INTO jorb_queue (name, max_concurrency) VALUES ($1, 1)", unique_queue
@@ -716,12 +704,6 @@ async def test_rate_limit_admits_exactly_its_budget_then_stops_the_queue(
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(
-    reason="BUG: the rate window counts jorb.started, which the worker only "
-    "writes AFTER its claim commits, so every claim overlapping that gap is "
-    "admitted (see the strict mechanism test below)",
-    strict=False,  # how far over budget it goes depends on claim interleaving
-)
 async def test_rate_limit_is_never_exceeded_under_load(
     live_worker, unique_queue, db_pool
 ):
@@ -775,22 +757,16 @@ async def test_rate_limit_refuses_a_claim_once_a_start_is_recorded(
     assert second is None
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: rate_limit counts jorb.started, so a claimed-but-not-yet-started "
-    "job does not consume the budget and the next claim is admitted",
-)
 async def test_rate_limit_budget_counts_claims_not_only_starts(
     db_pool, db_params, unique_queue
 ):
     """With ``rate_limit = 1``, the second claim must be refused.
 
-    No concurrency at all here: two SEQUENTIAL claims on ONE connection are
-    both admitted today, because nothing has reached 'running' yet.
-
-    xfail is STRICT: the gap between the claim and the 'run' statement is
-    unconditional, so an unexpected pass means admission started counting
-    claims (or the claim started recording ``started`` itself).
+    No concurrency at all here -- this is about WHICH timestamp the budget
+    counts. Counting jorb.started admitted both of two SEQUENTIAL claims on
+    ONE connection, because the worker writes `started` in a later statement
+    and nothing had reached 'running' yet. The budget counts admissions
+    (jorb.claimed_at, stamped by the claim itself), so the gap is closed.
     """
     await db_pool.execute(
         """INSERT INTO jorb_queue (name, rate_limit, rate_period_seconds)

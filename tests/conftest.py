@@ -13,6 +13,7 @@ This architecture supports concurrent test execution.
 
 import asyncio
 import contextlib
+import hashlib
 import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -111,33 +112,70 @@ def _dsn_params(dsn: str) -> dict[str, str | int]:
     }
 
 
-def _create_worker_database(base: dict[str, str | int], name: str) -> None:
-    """Create `name` (if absent) and install the schema into it.
+def _schema_fingerprint() -> str:
+    """Content hash of the canonical schema."""
+    return hashlib.sha256(SCHEMA_PATH.read_bytes()).hexdigest()
+
+
+async def _install_schema(params: dict[str, str | int]) -> None:
+    """Make this database match the CURRENT schema.sql, rebuilding if it does not.
+
+    pyjobby is forward-only with one canonical schema file, so a test database
+    installed from an older revision of that file is simply wrong -- and it
+    fails in a way that looks like a product bug ("function does not exist",
+    "column does not exist") rather than a stale fixture. Fingerprinting the
+    file and reinstalling on any change means editing schema.sql is all a
+    schema change ever requires.
+    """
+    from pyjobby import db as pjdb
+    from pyjobby import migrations
+
+    conn = await pjdb.connect(**params)
+    try:
+        installed = (
+            await conn.fetchval(
+                "SELECT fingerprint FROM test_schema_fingerprint LIMIT 1"
+            )
+            if await conn.fetchval("SELECT to_regclass('test_schema_fingerprint')")
+            else None
+        )
+
+        want = _schema_fingerprint()
+        if installed != want:
+            await conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
+            await migrations.migrate(conn)
+            await conn.execute(
+                "CREATE TABLE test_schema_fingerprint (fingerprint TEXT NOT NULL)"
+            )
+            await conn.execute("INSERT INTO test_schema_fingerprint VALUES ($1)", want)
+    finally:
+        await conn.close()
+
+
+def _create_worker_database(
+    base: dict[str, str | int], name: str | None = None
+) -> None:
+    """Create `name` (if given and absent) and install the current schema into it.
 
     Synchronous on purpose: this runs once per xdist worker during session
     setup, before any event loop exists.
     """
     import asyncio
 
-    from pyjobby import db as pjdb
-    from pyjobby import migrations
-
     async def _setup() -> None:
-        admin = await asyncpg.connect(**base)
-        try:
-            exists = await admin.fetchval(
-                "SELECT 1 FROM pg_database WHERE datname = $1", name
-            )
-            if not exists:
-                await admin.execute(f'CREATE DATABASE "{name}"')
-        finally:
-            await admin.close()
+        if name is not None:
+            admin = await asyncpg.connect(**base)
+            try:
+                exists = await admin.fetchval(
+                    "SELECT 1 FROM pg_database WHERE datname = $1", name
+                )
+                if not exists:
+                    await admin.execute(f'CREATE DATABASE "{name}"')
+            finally:
+                await admin.close()
 
-        conn = await pjdb.connect(**{**base, "database": name})
-        try:
-            await migrations.migrate(conn)
-        finally:
-            await conn.close()
+        target = base if name is None else {**base, "database": name}
+        await _install_schema(target)
 
     asyncio.run(_setup())
 
@@ -154,6 +192,7 @@ def db_params(worker_id: str) -> dict[str, str | int]:
     """
     base = _dsn_params(TEST_DSN)
     if worker_id == "master":
+        _create_worker_database(base)
         return base
 
     per_worker = f"{base['database']}_{worker_id}"

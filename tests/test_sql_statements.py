@@ -457,12 +457,33 @@ class TestRescheduleStatement:
         job_id = claimed["id"]
         await db_connection.execute(STMTS["run"], job_id, claimed["run_epoch"])
 
-        # Reschedule to run in 1 hour
-        await db_connection.execute(STMTS["reschedule"], job_id, timedelta(hours=1))
+        # Reschedule to run in 1 hour (fenced to this attempt, like every
+        # other state-changing statement)
+        applied = await db_connection.fetch(
+            STMTS["reschedule"], job_id, timedelta(hours=1), claimed["run_epoch"]
+        )
+        assert [r["id"] for r in applied] == [job_id]
 
         job = await get_job(db_connection, job_id)
         assert job["state"] == "queued"
         assert job["run_after"] > datetime.now(UTC)
+
+    async def test_reschedule_from_a_superseded_attempt_is_a_noop(
+        self, db_connection, unique_queue
+    ):
+        """A stale attempt may not requeue a job the live attempt is running."""
+        await create_job(
+            db_connection, queue=unique_queue, state="queued", run_after=past()
+        )
+        claimed = await claim(db_connection, unique_queue)
+        job_id = claimed["id"]
+        await db_connection.execute(STMTS["run"], job_id, claimed["run_epoch"])
+
+        applied = await db_connection.fetch(
+            STMTS["reschedule"], job_id, timedelta(hours=1), claimed["run_epoch"] - 1
+        )
+        assert applied == []
+        assert (await get_job(db_connection, job_id))["state"] == "running"
 
 
 class TestSetTimeoutStatement:

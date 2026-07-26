@@ -63,6 +63,7 @@ CREATE TABLE jorb (
     created         TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated         TIMESTAMPTZ NOT NULL DEFAULT now(),
     run_after       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    claimed_at      TIMESTAMPTZ,
     started         TIMESTAMPTZ,
     finished        TIMESTAMPTZ,
     timeout_at      TIMESTAMPTZ
@@ -70,6 +71,7 @@ CREATE TABLE jorb (
 
 COMMENT ON TABLE jorb IS 'Jobs. One row per job for its whole life; retries re-queue the same row.';
 COMMENT ON COLUMN jorb.prio IS 'Lower numbers are more urgent; workers claim jobs with prio <= their ceiling.';
+COMMENT ON COLUMN jorb.claimed_at IS 'When this attempt was admitted by a worker. Rate limits count admissions, not execution starts: started is written after the claim commits, so counting it lets a claim miss the claim before it.';
 COMMENT ON COLUMN jorb.run_epoch IS 'Fencing token: incremented on each claim; stale executions may not write results or checkpoints.';
 COMMENT ON COLUMN jorb.waitfor_group IS 'Becomes queued only when ALL jobs with run_group = this value are finished.';
 COMMENT ON COLUMN jorb.waitfor_job IS 'Becomes queued only when the job with this id is finished.';
@@ -77,7 +79,10 @@ COMMENT ON COLUMN jorb.waitfor_job IS 'Becomes queued only when the job with thi
 -- the poll/claim path
 CREATE INDEX jorb_claim_idx ON jorb (queue, prio, run_after)
     WHERE state = 'queued';
--- rate limiting counts recent starts per queue
+-- rate limiting counts recent admissions per queue
+CREATE INDEX jorb_claimed_at_idx ON jorb (queue, claimed_at)
+    WHERE claimed_at IS NOT NULL;
+-- duration/throughput reporting
 CREATE INDEX jorb_started_idx ON jorb (queue, started)
     WHERE started IS NOT NULL;
 -- reaper scans
@@ -108,7 +113,89 @@ CREATE TABLE jorb_queue (
     updated             TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-COMMENT ON TABLE jorb_queue IS 'Per-queue controls enforced inside the claim statement; rows are optional (missing queue = unpaused, unlimited).';
+COMMENT ON TABLE jorb_queue IS 'Per-queue controls enforced by claim_jorb(); rows are optional (missing queue = unpaused, unlimited).';
+
+-- ============================================================================
+-- The claim path
+-- ============================================================================
+-- Claiming lives in the database, not in the worker, so that the queue's
+-- controls are enforced for EVERY claimer rather than only for clients that
+-- remember to enforce them.
+--
+-- Why the advisory lock: under READ COMMITTED a statement sees the snapshot
+-- taken when it began, so two simultaneous claims cannot see each other's
+-- uncommitted rows and a cap of 1 would admit both. Serializing claims for a
+-- controlled queue fixes that -- and because PL/pgSQL takes a new snapshot per
+-- statement, the counts below run AFTER the lock and therefore see every claim
+-- that has already committed. Uncontrolled queues (the common case) never take
+-- the lock and keep the lock-free fast path.
+CREATE FUNCTION claim_jorb(
+    p_queue        TEXT,
+    p_capabilities TEXT[],
+    p_max_prio     INTEGER,
+    p_worker_pid   INTEGER,
+    p_worker_host  TEXT,
+    p_worker_id    BIGINT
+) RETURNS SETOF jorb
+LANGUAGE plpgsql AS $$
+DECLARE
+    q jorb_queue%ROWTYPE;
+BEGIN
+    SELECT * INTO q FROM jorb_queue WHERE name = p_queue;
+
+    IF COALESCE(q.paused, FALSE) THEN
+        RETURN;
+    END IF;
+
+    IF q.max_concurrency IS NOT NULL OR q.rate_limit IS NOT NULL THEN
+        -- Non-blocking on purpose: a claimer that cannot take the lock right
+        -- now reports nothing claimable and polls again, so a claim held open
+        -- by a slow or stuck transaction can never freeze the whole queue.
+        IF NOT pg_try_advisory_xact_lock(
+                   hashtext('pyjobby.claim:' || p_queue)) THEN
+            RETURN;
+        END IF;
+
+        IF q.max_concurrency IS NOT NULL AND q.max_concurrency <= (
+               SELECT count(*) FROM jorb
+               WHERE queue = p_queue AND state IN ('claimed', 'running')) THEN
+            RETURN;
+        END IF;
+
+        IF q.rate_limit IS NOT NULL AND q.rate_limit <= (
+               SELECT count(*) FROM jorb
+               WHERE queue = p_queue
+                 AND claimed_at > now()
+                     - make_interval(secs => q.rate_period_seconds)) THEN
+            RETURN;
+        END IF;
+    END IF;
+
+    RETURN QUERY
+    UPDATE jorb
+       SET state      = 'claimed',
+           worker_pid = p_worker_pid,
+           worker_host= p_worker_host,
+           claimed_by = p_worker_id,
+           claimed_at = now(),
+           run_count  = run_count + 1,
+           run_epoch  = run_epoch + 1,
+           updated    = now()
+     WHERE id = (
+           SELECT j.id FROM jorb j
+            WHERE j.queue = p_queue
+              AND (j.capability = ANY(p_capabilities) OR j.capability IS NULL)
+              AND j.prio <= p_max_prio
+              AND j.run_after <= now()
+              AND j.state = 'queued'
+            ORDER BY j.prio, j.run_after
+              FOR UPDATE OF j SKIP LOCKED
+            LIMIT 1)
+    RETURNING *;
+END;
+$$;
+
+COMMENT ON FUNCTION claim_jorb IS 'Atomically admit at most one queued job for a worker, enforcing the queue pause/concurrency/rate controls. Returns zero rows when nothing is claimable.';
 
 -- ============================================================================
 -- Worker registry (exact liveness; replaces pid/grace guessing)

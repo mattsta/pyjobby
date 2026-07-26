@@ -82,41 +82,15 @@ logger = logger.patch(cleanupLogLengths)  # type: ignore
 STMTS: dict[str, str] = {}
 
 # Claim the single most-urgent runnable job in our queue, honoring the
-# jorb_queue control plane (absent row = unpaused / unlimited):
-#   * paused queues yield nothing
-#   * max_concurrency caps claimed+running rows for the queue
-#   * rate_limit caps executions STARTED within the trailing rate period
+# Claiming lives in claim_jorb() (see sql/schema.sql), so the queue control
+# plane -- paused / max_concurrency / rate_limit -- is enforced for every
+# claimer rather than re-implemented by each one. Enforcing it there is also
+# the only way it can be CORRECT: the caps need claims for a controlled queue
+# serialized against each other, which a single statement cannot do.
 # run_epoch increments on every claim: it is the fencing token that keeps a
 # superseded execution from writing results/checkpoints later.
-STMTS["claim"] = """UPDATE jorb
-              SET state = 'claimed',
-                  worker_pid = $1,
-                  worker_host = $2,
-                  claimed_by = $6,
-                  run_count = run_count + 1,
-                  run_epoch = run_epoch + 1,
-                  updated = now()
-              WHERE id = (
-                 SELECT j.id FROM jorb j
-                 LEFT JOIN jorb_queue q ON q.name = j.queue
-                 WHERE j.queue = $3
-                     AND NOT COALESCE(q.paused, FALSE)
-                     AND (q.max_concurrency IS NULL OR q.max_concurrency > (
-                          SELECT count(*) FROM jorb c
-                          WHERE c.queue = $3 AND c.state IN ('claimed', 'running')))
-                     AND (q.rate_limit IS NULL OR q.rate_limit > (
-                          SELECT count(*) FROM jorb s
-                          WHERE s.queue = $3
-                            AND s.started > now() - make_interval(secs => q.rate_period_seconds)))
-                     AND (j.capability = ANY($4::text[]) OR j.capability IS NULL)
-                     AND j.prio <= $5
-                     AND j.run_after <= now()
-                     AND j.state = 'queued'
-                 ORDER BY j.prio, j.run_after
-                 FOR UPDATE OF j SKIP LOCKED
-                 LIMIT 1
-              )
-              RETURNING *"""
+# Argument order is the worker's, not the function's.
+STMTS["claim"] = """SELECT * FROM claim_jorb($3, $4::text[], $5, $1, $2, $6)"""
 
 STMTS["get"] = """SELECT * FROM jorb
                      WHERE id = $1
@@ -196,12 +170,19 @@ STMTS["cancelled"] = """UPDATE jorb
                 AND run_epoch = $2
           RETURNING *"""
 
-# Job.reschedule(): the task asked to run again later; wins over completion.
+# Job.reschedule() and durable sleep: the task asked to run again later, so
+# the requeue wins over normal completion. Fenced like every other
+# state-changing write: a superseded attempt must not be able to requeue a
+# job the live attempt is still running (the winner's fenced completion
+# would then no-op and its result would be lost).
 STMTS["reschedule"] = """UPDATE jorb
               SET state = 'queued',
                   run_after = now() + $2::interval,
                   updated = now()
-              WHERE id = $1"""
+              WHERE id = $1
+                AND state IN ('claimed', 'running')
+                AND run_epoch = $3
+          RETURNING id"""
 
 # Wake jobs waiting on a group: when ZERO jobs in run_group $1 are
 # unfinished, everything waiting on that group becomes claimable.
@@ -1016,9 +997,7 @@ class Job:
             if remaining <= 0:
                 return  # slept enough on a previous attempt; continue
             # woken early (operator requeue): go back to sleep for the rest
-            await self.s.ex(
-                "reschedule", self.job["id"], datetime.timedelta(seconds=remaining)
-            )
+            await self._reschedule(datetime.timedelta(seconds=remaining))
             raise dxe.DurableSleep(wake_at)
 
         wake_at = db.utcnow() + datetime.timedelta(seconds=seconds)
@@ -1036,10 +1015,22 @@ class Job:
             raise dxe.StaleExecutionError(
                 f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
             )
-        await self.s.ex(
-            "reschedule", self.job["id"], datetime.timedelta(seconds=seconds)
-        )
+        await self._reschedule(datetime.timedelta(seconds=seconds))
         raise dxe.DurableSleep(wake_at)
+
+    async def _reschedule(self, interval: datetime.timedelta) -> None:
+        """Requeue this job for a future run, fenced to THIS attempt.
+
+        Raises StaleExecutionError if this execution has been superseded,
+        so a stale attempt can neither requeue a live one nor keep running.
+        """
+        applied = await self.s.ex(
+            "reschedule", self.job["id"], interval, self._dxe_epoch
+        )
+        if not applied:
+            raise dxe.StaleExecutionError(
+                f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
+            )
 
     async def set_event(self, key: str, value: Any) -> None:
         """Publish a key/value event on this job (idempotent upsert).
@@ -1152,7 +1143,7 @@ class Job:
         ds = {str(u): r for u, r in deltas.items()}
 
         interval = datetime.timedelta(**ds)
-        await self.s.ex("reschedule", self.job["id"], interval)
+        await self._reschedule(interval)
 
         return interval
 

@@ -427,8 +427,11 @@ class TestJobScheduling:
 
         before = datetime.now(UTC)
 
-        # Reschedule for 2 hours later — wins over completion
-        await db_connection.execute(STMTS["reschedule"], job_id, timedelta(hours=2))
+        # Reschedule for 2 hours later — wins over completion, and is fenced
+        # to the attempt that asked for it
+        await db_connection.execute(
+            STMTS["reschedule"], job_id, timedelta(hours=2), claimed["run_epoch"]
+        )
 
         job = await get_job(db_connection, job_id)
         assert job["state"] == "queued"
