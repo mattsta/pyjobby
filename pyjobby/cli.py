@@ -2055,10 +2055,14 @@ def dag_visualize(ctx: click.Context, dag_id: int) -> None:
                 level = [job_id for job_id in remaining if in_degree[job_id] == 0]
 
                 if not level:
-                    click.echo(
-                        f"{Colors.FAIL}ERROR: Cycle detected in DAG!{Colors.ENDC}"
+                    # A cyclic DAG can never run. Rendering the acyclic part
+                    # and exiting 0 would tell a script it is fine, so name
+                    # the jobs still in the cycle and fail.
+                    stuck = ", ".join(str(job_id) for job_id in sorted(remaining))
+                    fail(
+                        "Cycle detected in DAG: these jobs depend on each "
+                        f"other and can never run: {stuck}"
                     )
-                    break
 
                 levels.append(level)
 
