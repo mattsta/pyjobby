@@ -1,5 +1,4 @@
 dist/
-poetry.lock
 
 # Python
 __pycache__/
@@ -21,6 +20,8 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.venv/
+tags
 
 # Testing
 .pytest_cache/
@@ -33,12 +34,13 @@ coverage.xml
 *.cover
 .hypothesis/
 
-# Type checking
+# Type checking / linting
 .mypy_cache/
 .dmypy.json
 dmypy.json
 .pyre/
 .pytype/
+.ruff_cache/
 
 # IDEs
 .vscode/
@@ -50,3 +52,6 @@ dmypy.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Local reference checkouts (e.g. ref/dbos-transact-py for parity work)
+ref/

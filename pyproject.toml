@@ -1,38 +1,57 @@
-[tool.poetry]
+[project]
 name = "pyjobby"
 version = "1.2.3"
 description = "PostgreSQL Job Consumer Platform"
-authors = ["Matt Stancliff <matt@genges.com>"]
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Matt Stancliff", email = "matt@genges.com" }]
+requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Distributed Computing",
+    "Framework :: AsyncIO",
+]
+dependencies = [
+    "orjson>=3.9",
+    "click>=8.1",
+    "asyncpg>=0.30",
+    "loguru>=0.7",
+    "aiohttp>=3.9",
+    "croniter>=2.0",
+    "pytz>=2024.1",
+]
 
-[tool.poetry.dependencies]
-python = ">3.12"
-orjson = ">3.5.0"
-click = ">8.0.0"
-asyncpg = ">0.30.0"
-loguru = "*"
-aiohttp = ">3.7.3"
-croniter = "*"
-pytz = "*"
+[project.urls]
+Repository = "https://github.com/mattsta/pyjobby"
 
-[tool.poetry.scripts]
+[project.scripts]
 pj = "pyjobby.pj:workit"
 pj-admin = "pyjobby.cli:cli"
 pj-web = "pyjobby.web_admin:main"
+pj-scheduler = "pyjobby.scheduler:main"
+pj-ws = "pyjobby.websocket_server:main"
 pj-timeout-monitor = "pyjobby.timeout_monitor:cli"
 
-[tool.poetry.group.test.dependencies]
-pytest = "^9.0.1"
-pytest-asyncio = "^1.3.0"
-pytest-cov = "^7.0.0"
-pytest-timeout = "^2.2"
-pytest-xdist = "^3.5"
-hypothesis = "^6.148.2"
-
-[tool.poetry.group.dev.dependencies]
-mypy = ">1.8"
-ruff = ">0.14.5"
-types-orjson = "^3.6"
-pytest-aiohttp = "^1.1.0"
+[dependency-groups]
+test = [
+    "pytest>=9.0.1",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.0.0",
+    "pytest-timeout>=2.2",
+    "pytest-xdist>=3.5",
+    "pytest-aiohttp>=1.1.0",
+    "hypothesis>=6.148.2",
+]
+dev = [
+    { include-group = "test" },
+    "mypy>=1.8",
+    "ruff>=0.14.5",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -44,10 +63,6 @@ addopts = [
     "-ra",
     "--strict-markers",
     "--strict-config",
-    "--cov=pyjobby",
-    "--cov-report=term-missing:skip-covered",
-    "--cov-report=html",
-    "--cov-report=xml",
 ]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
@@ -78,7 +93,8 @@ exclude_lines = [
 ]
 
 [tool.mypy]
-python_version = "3.14"
+python_version = "3.12"
+pretty = true
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
@@ -91,9 +107,9 @@ warn_no_return = true
 strict_equality = true
 
 [tool.ruff]
-target-version = "py314"
+target-version = "py312"
 lint.select = ["I", "FURB", "UP", "C4", "SIM", "F401"]
 
 [build-system]
-requires = ["poetry-core>=1.0.0"]
+requires = ["poetry-core>=2.1.0"]
 build-backend = "poetry.core.masonry.api"

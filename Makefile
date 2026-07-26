@@ -1,4 +1,4 @@
-.PHONY: help install install-postgres test test-fast test-parallel coverage lint format type-check clean setup-db stop-db reset-db
+.PHONY: help install install-postgres test test-fast test-parallel coverage lint format type-check clean setup-db stop-db reset-db ci
 
 help:  ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -16,7 +16,7 @@ setup-db:  ## Create test database
 	@./scripts/setup-test-db.sh
 
 stop-db:  ## Stop PostgreSQL service (caution: affects all databases)
-	@./scripts/stop-db.sh
+	@./scripts/stop-test-db.sh
 
 reset-db:  ## Reset test database (wipe all data)
 	@./scripts/reset-test-db.sh
@@ -31,7 +31,7 @@ test-parallel:  ## Run tests in parallel
 	@./scripts/run-tests.sh --parallel
 
 coverage:  ## Run tests with coverage report
-	@./scripts/run-tests.sh --cov --cov-report=html
+	@./scripts/run-tests.sh --cov=pyjobby --cov-report=term-missing:skip-covered --cov-report=html
 	@echo ""
 	@echo "Coverage report generated in htmlcov/index.html"
 
@@ -39,9 +39,10 @@ lint:  ## Run linter (ruff)
 	@echo "Running ruff..."
 	poetry run ruff check pyjobby/ tests/
 
-format:  ## Format code with black
+format:  ## Format code with ruff
 	@echo "Formatting code..."
-	poetry run black pyjobby/ tests/
+	poetry run ruff format pyjobby/ tests/
+	poetry run ruff check --fix pyjobby/ tests/
 
 type-check:  ## Run type checker (mypy)
 	@echo "Running mypy..."
