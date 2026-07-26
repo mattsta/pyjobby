@@ -284,10 +284,9 @@ class TestQueuesAPI:
             )
 
         resp = await web_admin_client.get("/api/queues")
-        # Returns list of queue stats
-        assert (
-            resp.status == 200 or resp.status == 500
-        )  # May fail if DB connection issue
+        # Returns list of queue stats — a 500 is never an acceptable answer.
+        assert resp.status == 200
+        assert queue in {row["queue"] for row in await resp.json()}
 
     @pytest.mark.asyncio
     async def test_api_queue_stats(self, web_admin_client, db_pool):

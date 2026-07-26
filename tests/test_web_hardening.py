@@ -32,7 +32,11 @@ from aiohttp.test_utils import TestClient
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from pyjobby.web_admin import WebAdminServer
+from pyjobby.web_admin import (
+    MAX_QUEUE_NAME_LENGTH,
+    MAX_SINCE_HOURS,
+    WebAdminServer,
+)
 
 # =============================================================================
 # Harness
@@ -715,8 +719,8 @@ MISSING_ID = 987654321
 
 class TestMissingIdBehavior:
     """Specification of what every JSON endpoint does with an id that does
-    not exist. Rows marked BUG return 500 today (see module docstring of the
-    report): an unhandled ValueError/KeyError reaching aiohttp."""
+    not exist. The rule is uniform: "does not exist" is 404 everywhere, and
+    400 is reserved for malformed input (see TestMalformedInput)."""
 
     # (method, url template, expected status, note)
     CASES: tuple[tuple[str, str, int, str], ...] = (
@@ -724,17 +728,18 @@ class TestMissingIdBehavior:
         ("GET", "/api/jobs/{id}/history", 404, "ok"),
         ("GET", "/api/jobs/{id}/steps", 404, "ok"),
         ("DELETE", "/api/jobs/{id}", 404, "ok"),
-        # retry/cancel report a missing job as a *client* error, not 404.
-        ("POST", "/api/jobs/{id}/retry", 400, "400 not 404 (inconsistent)"),
-        ("POST", "/api/jobs/{id}/cancel", 400, "400 not 404 (inconsistent)"),
-        ("POST", "/api/dlq/{id}/retry", 400, "400 not 404 (inconsistent)"),
+        # Mutations agree with the reads: a missing job is 404, not 400.
+        ("POST", "/api/jobs/{id}/retry", 404, "ok"),
+        ("POST", "/api/jobs/{id}/cancel", 404, "ok"),
+        ("POST", "/api/dlq/{id}/retry", 404, "ok"),
         ("GET", "/api/schedules/{id}", 404, "ok"),
-        # BUG: AdminAPI raises ValueError('Schedule N not found'); the web
-        # handler does not catch it, so aiohttp answers 500.
-        ("POST", "/api/schedules/{id}/enable", 500, "BUG: uncaught ValueError"),
-        ("POST", "/api/schedules/{id}/disable", 500, "BUG: uncaught ValueError"),
-        ("DELETE", "/api/schedules/{id}", 500, "BUG: uncaught ValueError"),
-        # No existence check at all: an empty history for a missing schedule.
+        # AdminAPI raises ValueError('Schedule N not found'); the handlers
+        # check existence first so this is a 404 like the sibling GET.
+        ("POST", "/api/schedules/{id}/enable", 404, "ok"),
+        ("POST", "/api/schedules/{id}/disable", 404, "ok"),
+        ("DELETE", "/api/schedules/{id}", 404, "ok"),
+        # Deliberate exception: an unknown schedule's log is empty, not an
+        # error (documented in api_schedule_history).
         ("GET", "/api/schedules/{id}/history", 200, "200 with []"),
     )
 
@@ -749,6 +754,18 @@ class TestMissingIdBehavior:
 
         expected = [(m, t, s) for m, t, s, _ in self.CASES]
         assert actual == expected
+
+    @pytest.mark.asyncio
+    async def test_missing_id_404s_carry_a_json_error_body(self, web: Harness):
+        """A 404 is not an empty aiohttp error page: it names the row."""
+        for method, template, expected, _note in self.CASES:
+            if expected != 404:
+                continue
+            url = template.format(id=MISSING_ID)
+            resp = await web.client.request(method, url)
+            assert resp.content_type == "application/json", url
+            body = await resp.json()
+            assert str(MISSING_ID) in body["error"], (url, body)
 
     @pytest.mark.asyncio
     async def test_missing_schedule_history_is_empty_list(self, web: Harness):
@@ -767,9 +784,9 @@ class TestMissingIdBehavior:
     async def test_pause_creates_control_row_for_unknown_queue(
         self, web: Harness, db_pool: asyncpg.Pool, test_id: str
     ):
-        """A mutation against a queue that does not exist *creates* it. This is
-        by design (queues are implicit), but it means an anonymous client can
-        add unbounded rows to jorb_queue."""
+        """A mutation against a queue that does not exist *creates* it. Kept
+        deliberately: queues are implicit, and pre-emptively pausing one before
+        its first job is a legitimate operation (documented in the handler)."""
         queue = f"ghost_{test_id}"
         resp = await web.client.post(f"/api/queues/{queue}/pause")
         assert resp.status == 200
@@ -782,6 +799,38 @@ class TestMissingIdBehavior:
                 )
                 is True
             )
+
+    @pytest.mark.asyncio
+    async def test_queue_name_length_is_bounded_on_every_queue_route(
+        self, web: Harness, db_pool: asyncpg.Pool
+    ):
+        """Pre-emptive pause is allowed, so the row an anonymous client can
+        insert is bounded instead: a name over MAX_QUEUE_NAME_LENGTH is 400 on
+        every queue route and writes nothing."""
+        long_name = "q" * (MAX_QUEUE_NAME_LENGTH + 1)
+        at_limit = f"{'q' * (MAX_QUEUE_NAME_LENGTH - 9)}{uuid.uuid4().hex[:9]}"
+
+        for method, url in (
+            ("POST", f"/api/queues/{long_name}/pause"),
+            ("POST", f"/api/queues/{long_name}/resume"),
+            ("GET", f"/api/queues/{long_name}/stats"),
+        ):
+            resp = await web.client.request(method, url)
+            assert resp.status == 400, url
+            assert "queue name" in (await resp.json())["error"]
+
+        async with db_pool.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT COUNT(*) FROM jorb_queue WHERE length(name) > $1",
+                    MAX_QUEUE_NAME_LENGTH,
+                )
+                == 0
+            )
+
+        # Exactly at the bound still works: the limit is not a moved goalpost.
+        resp = await web.client.post(f"/api/queues/{at_limit}/pause")
+        assert resp.status == 200
 
     @pytest.mark.asyncio
     async def test_failed_mutations_have_no_side_effects(
@@ -801,7 +850,7 @@ class TestMissingIdBehavior:
         ):
             resp = await web.client.request(method, url)
             await resp.read()
-            assert resp.status in (400, 404, 500), f"{method} {url} -> {resp.status}"
+            assert resp.status == 404, f"{method} {url} -> {resp.status}"
 
         async with db_pool.acquire() as conn:
             assert await conn.fetchval("SELECT COUNT(*) FROM jorb") == before_jobs
@@ -812,30 +861,35 @@ class TestMissingIdBehavior:
 
 
 class TestMalformedInput:
-    """Path ids and query parameters are parsed with bare int(); this pins the
-    resulting behavior. Every 500 below is a robustness bug: unvalidated input
-    reaches int()/PostgreSQL and the exception escapes the handler."""
+    """Path ids and query parameters go through two shared parsers
+    (``_path_id``/``_query_int``), so malformed input never reaches ``int()``
+    or PostgreSQL: it is a 400 with a JSON body naming the parameter. Nothing
+    is silently clamped — a clamped limit/offset would return the wrong page
+    of results while claiming success."""
 
     NON_INTEGER_PATHS: tuple[tuple[str, str, int], ...] = (
-        ("GET", "/api/jobs/abc", 500),
-        ("GET", "/api/jobs/1.5", 500),
-        ("GET", "/api/jobs/abc/history", 500),
-        ("GET", "/api/jobs/abc/steps", 500),
-        ("POST", "/api/jobs/abc/retry", 500),
-        ("POST", "/api/jobs/abc/cancel", 500),
-        ("DELETE", "/api/jobs/abc", 500),
-        ("POST", "/api/dlq/abc/retry", 500),
-        ("GET", "/api/schedules/abc", 500),
-        ("POST", "/api/schedules/abc/enable", 500),
-        ("POST", "/api/schedules/abc/disable", 500),
-        ("DELETE", "/api/schedules/abc", 500),
-        ("GET", "/api/schedules/abc/history", 500),
+        ("GET", "/api/jobs/abc", 400),
+        ("GET", "/api/jobs/1.5", 400),
+        ("GET", "/api/jobs/-1", 400),
+        ("GET", "/api/jobs/1_0", 400),
+        ("GET", "/api/jobs/9223372036854775808", 400),
+        ("GET", "/api/jobs/abc/history", 400),
+        ("GET", "/api/jobs/abc/steps", 400),
+        ("POST", "/api/jobs/abc/retry", 400),
+        ("POST", "/api/jobs/abc/cancel", 400),
+        ("DELETE", "/api/jobs/abc", 400),
+        ("POST", "/api/dlq/abc/retry", 400),
+        ("GET", "/api/schedules/abc", 400),
+        ("POST", "/api/schedules/abc/enable", 400),
+        ("POST", "/api/schedules/abc/disable", 400),
+        ("DELETE", "/api/schedules/abc", 400),
+        ("GET", "/api/schedules/abc/history", 400),
     )
 
     @pytest.mark.asyncio
     async def test_non_integer_path_ids(self, web: Harness):
-        """BUG: `int(request.match_info[...])` raises ValueError -> 500.
-        These should be 400/404."""
+        """A path id that is not a decimal integer inside the bigint range is
+        malformed input: 400, on every per-id route."""
         actual = []
         for method, url, _expected in self.NON_INTEGER_PATHS:
             resp = await web.client.request(method, url)
@@ -843,25 +897,38 @@ class TestMalformedInput:
             actual.append((method, url, resp.status))
         assert actual == list(self.NON_INTEGER_PATHS)
 
+    @pytest.mark.asyncio
+    async def test_malformed_path_id_says_which_id(self, web: Harness):
+        resp = await web.client.get("/api/jobs/abc/history")
+        assert resp.status == 400
+        assert (await resp.json())["error"] == (
+            "Malformed job_id: 'abc' is not a valid id"
+        )
+
     QUERY_CASES: tuple[tuple[str, int, str], ...] = (
-        # BUG: int('abc') -> ValueError -> 500 (should be 400).
-        ("/api/jobs?limit=abc", 500, "BUG: unvalidated int()"),
-        ("/api/jobs?offset=abc", 500, "BUG: unvalidated int()"),
-        ("/api/dlq?limit=abc", 500, "BUG: unvalidated int()"),
-        ("/api/metrics?since_hours=abc", 500, "BUG: unvalidated int()"),
-        (f"/api/schedules/{MISSING_ID}/history?limit=abc", 500, "BUG: int()"),
-        # BUG: negative LIMIT/OFFSET reaches PostgreSQL -> 500.
-        ("/api/jobs?limit=-1", 500, "BUG: negative LIMIT hits PostgreSQL"),
-        ("/api/jobs?offset=-1", 500, "BUG: negative OFFSET hits PostgreSQL"),
-        ("/api/dlq?limit=-1", 500, "BUG: negative LIMIT hits PostgreSQL"),
-        # BUG: absurd values overflow the bigint bind / the datetime math.
-        ("/api/jobs?limit=99999999999999999999", 500, "BUG: int64 overflow"),
-        ("/api/metrics?since_hours=999999999999", 500, "BUG: timedelta overflow"),
-        # Clamped/benign cases that DO work:
+        # Non-integers are rejected by the parser, not by int().
+        ("/api/jobs?limit=abc", 400, "not an integer"),
+        ("/api/jobs?offset=abc", 400, "not an integer"),
+        ("/api/dlq?limit=abc", 400, "not an integer"),
+        ("/api/metrics?since_hours=abc", 400, "not an integer"),
+        (f"/api/schedules/{MISSING_ID}/history?limit=abc", 400, "not an integer"),
+        # Negative LIMIT/OFFSET never reaches PostgreSQL.
+        ("/api/jobs?limit=-1", 400, "below minimum"),
+        ("/api/jobs?offset=-1", 400, "below minimum"),
+        ("/api/dlq?limit=-1", 400, "below minimum"),
+        # Absurd values are refused instead of overflowing the bigint bind or
+        # the datetime arithmetic.
+        ("/api/jobs?limit=99999999999999999999", 400, "above int64"),
+        ("/api/metrics?since_hours=999999999999", 400, "above MAX_SINCE_HOURS"),
+        # Invalid enum is checked against db.JobState before the query runs.
+        ("/api/jobs?state=not_a_state", 400, "invalid state"),
+        # Benign cases that DO work, unchanged:
         ("/api/jobs?limit=0", 200, "LIMIT 0 -> empty list"),
         ("/api/jobs?limit=9223372036854775807", 200, "max bigint accepted"),
+        ("/api/jobs?limit=", 200, "empty value -> default"),
         ("/api/metrics?since_hours=0", 200, "no window"),
-        ("/api/jobs?state=not_a_state", 500, "BUG: invalid enum hits PostgreSQL"),
+        (f"/api/metrics?since_hours={MAX_SINCE_HOURS}", 200, "widest window"),
+        ("/api/jobs?state=crashed", 200, "valid state"),
         ("/api/jobs?format=bogus", 200, "unknown format falls back to JSON"),
         ("/api/schedules?enabled=maybe", 200, "unparsable bool -> False"),
     )
@@ -874,6 +941,48 @@ class TestMalformedInput:
             await resp.read()
             actual.append((url, resp.status))
         assert actual == [(u, s) for u, s, _ in self.QUERY_CASES]
+
+    @pytest.mark.asyncio
+    async def test_rejected_query_parameters_name_themselves(self, web: Harness):
+        """The 400 body is useful: it names the parameter and the bound."""
+        body = await (await web.client.get("/api/jobs?limit=abc")).json()
+        assert body["error"] == "Invalid limit: 'abc' is not an integer"
+
+        body = await (await web.client.get("/api/jobs?offset=-1")).json()
+        assert body["error"].startswith("Invalid offset: -1 is out of range")
+
+        body = await (await web.client.get("/api/jobs?state=not_a_state")).json()
+        assert body["error"].startswith("Invalid state: 'not_a_state'")
+        assert "crashed" in body["error"]  # the valid set is spelled out
+
+    @pytest.mark.asyncio
+    async def test_out_of_range_values_never_reach_postgresql(
+        self, web: Harness, db_pool: asyncpg.Pool, unique_queue: str
+    ):
+        """A rejected request runs no query at all, so a hostile limit cannot
+        be used to make PostgreSQL do work."""
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                VALUES ('RangeJob', '{}', $1, 100, 'queued')
+                """,
+                unique_queue,
+            )
+        for url in (
+            "/api/jobs?limit=-1",
+            "/api/jobs?limit=99999999999999999999",
+            "/api/metrics?since_hours=999999999999",
+            "/api/jobs?state=not_a_state",
+        ):
+            resp = await web.client.get(url)
+            assert resp.status == 400, url
+            assert (await resp.json())["error"], url
+
+        # The pool is untouched and the next real request still works.
+        resp = await web.client.get(f"/api/jobs?queue={unique_queue}")
+        assert resp.status == 200
+        assert len(await resp.json()) == 1
 
     @pytest.mark.asyncio
     async def test_limit_zero_returns_empty_list(
@@ -900,12 +1009,27 @@ class TestMalformedInput:
 
     @pytest.mark.asyncio
     async def test_schedule_create_missing_required_field(self, web: Harness):
-        """BUG: api_schedule_create reads data['name'] directly, so a form
-        without it raises KeyError -> 500. Only ValueError is caught (400)."""
+        """A form without a required field is a 400 that names the field, not
+        a KeyError escaping as a 500."""
         resp = await web.client.post(
             "/api/schedules", data={"job_class": "NoName", "cron_expr": "0 * * * *"}
         )
-        assert resp.status == 500
+        assert resp.status == 400
+        assert (await resp.json())["error"] == "Missing required field(s): name"
+
+        resp = await web.client.post("/api/schedules", data={})
+        assert resp.status == 400
+        assert (await resp.json())["error"] == (
+            "Missing required field(s): name, job_class, cron_expr"
+        )
+
+        # A present-but-empty field is as useless as an absent one.
+        resp = await web.client.post(
+            "/api/schedules",
+            data={"name": "", "job_class": "NoName", "cron_expr": "0 * * * *"},
+        )
+        assert resp.status == 400
+        assert (await resp.json())["error"] == "Missing required field(s): name"
 
     @pytest.mark.asyncio
     async def test_schedule_create_non_integer_prio_is_400(self, web: Harness):
@@ -938,9 +1062,10 @@ class TestMalformedInput:
         assert "Invalid cron expression" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
-    async def test_duplicate_schedule_name_is_500(self, web: Harness):
-        """BUG: the UNIQUE(name) violation is an asyncpg error, not a
-        ValueError, so it escapes as 500 instead of 409/400."""
+    async def test_duplicate_schedule_name_is_409(
+        self, web: Harness, db_pool: asyncpg.Pool
+    ):
+        """The UNIQUE(name) violation is a conflict, not a server error."""
         name = f"dupe_{uuid.uuid4().hex[:8]}"
         form: dict[str, Any] = {
             "name": name,
@@ -950,7 +1075,17 @@ class TestMalformedInput:
         first = await web.client.post("/api/schedules", data=form)
         assert first.status == 200
         second = await web.client.post("/api/schedules", data=form)
-        assert second.status == 500
+        assert second.status == 409
+        assert name in (await second.json())["error"]
+
+        # And the conflict left exactly one row behind.
+        async with db_pool.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT COUNT(*) FROM jorb_schedule WHERE name = $1", name
+                )
+                == 1
+            )
 
     @pytest.mark.asyncio
     async def test_unknown_route_is_404_and_bad_method_is_405(self, web: Harness):

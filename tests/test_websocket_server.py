@@ -429,8 +429,15 @@ class FakeWS:
         self.sent.append(event)
 
 
+GET_STATS_FRAME = json.dumps({"action": "get_stats"})
+
+
 class TestRateLimiting:
-    """Test sliding-window per-client action rate limiting."""
+    """Test sliding-window per-client action rate limiting.
+
+    Metering lives in handle_text_frame, ahead of json.loads and the action
+    lookup, so these drive raw frames rather than decoded messages.
+    """
 
     @pytest.mark.asyncio
     async def test_burst_over_limit_rejected(self, db_params):
@@ -442,12 +449,12 @@ class TestRateLimiting:
         client = ClientConnection(ws=ws, channels=set(), connected_at=time.time())
 
         for _ in range(server.max_actions_per_second):
-            await server.handle_message(ws, client, {"action": "get_stats"})
+            await server.handle_text_frame(ws, client, GET_STATS_FRAME)
 
         assert all(e["event"] == "stats" for e in ws.sent)
 
         # 11th action within the same second must be rejected
-        await server.handle_message(ws, client, {"action": "get_stats"})
+        await server.handle_text_frame(ws, client, GET_STATS_FRAME)
         assert ws.sent[-1]["event"] == "error"
         assert "Rate limit" in ws.sent[-1]["data"]["message"]
 
@@ -464,7 +471,7 @@ class TestRateLimiting:
         now = time.time()
         client.action_times.extend([now - 0.5] * server.max_actions_per_second)
 
-        await server.handle_message(ws, client, {"action": "get_stats"})
+        await server.handle_text_frame(ws, client, GET_STATS_FRAME)
         assert ws.sent[-1]["event"] == "error"
         assert "Rate limit" in ws.sent[-1]["data"]["message"]
 
@@ -481,10 +488,26 @@ class TestRateLimiting:
         now = time.time()
         client.action_times.extend([now - 1.5] * server.max_actions_per_second)
 
-        await server.handle_message(ws, client, {"action": "get_stats"})
+        await server.handle_text_frame(ws, client, GET_STATS_FRAME)
         assert ws.sent[-1]["event"] == "stats"
         # Expired entries pruned; only the new action remains
         assert len(client.action_times) == 1
+
+    @pytest.mark.asyncio
+    async def test_unparseable_frame_costs_a_token(self, db_params):
+        """A frame that never parses is metered all the same."""
+        import time
+
+        server = WebSocketServer(db_params, max_actions_per_second=1)
+        ws = FakeWS()
+        client = ClientConnection(ws=ws, channels=set(), connected_at=time.time())
+
+        await server.handle_text_frame(ws, client, "{not json")
+        assert ws.sent[-1]["data"]["message"] == "Invalid JSON"
+        assert len(client.action_times) == 1
+
+        await server.handle_text_frame(ws, client, GET_STATS_FRAME)
+        assert ws.sent[-1]["data"]["message"] == "Rate limit exceeded"
 
 
 class TestNotificationTaskTracking:

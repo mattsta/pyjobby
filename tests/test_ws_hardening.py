@@ -33,7 +33,12 @@ import pytest_asyncio
 from aiohttp import web
 from aiohttp.test_utils import TestClient
 
-from pyjobby.websocket_server import WebSocketServer
+from pyjobby.websocket_server import (
+    MAX_CHANNEL_NAME_LENGTH,
+    MAX_ERROR_MESSAGE_LENGTH,
+    MAX_MESSAGE_LENGTH,
+    WebSocketServer,
+)
 from tests.utils.processes import wait_until
 
 # =============================================================================
@@ -250,29 +255,64 @@ class TestRateLimiterUnderAdversarialTraffic:
             assert (await ask(victim, PING))["event"] == "subscribed"
 
     @pytest.mark.asyncio
-    async def test_unparseable_frames_bypass_the_limiter(self, ws_factory):
-        """Documented behavior: the limiter runs *after* JSON parsing and the
-        'action' lookup, so frames that fail those checks are unmetered. A
-        flood of invalid JSON is bounded only by the socket, not by
-        max_actions_per_second."""
+    async def test_unparseable_frames_are_metered_before_parsing(self, ws_factory):
+        """Every inbound frame is metered *before* json.loads and before the
+        action lookup, so the cheapest frames to send are limited exactly like
+        valid requests. With a limit of 1, the first invalid frame is answered
+        and every subsequent one is refused."""
         h = await ws_factory(max_actions_per_second=1, pool=False)
         ws = await h.connect()
 
-        for _ in range(20):
+        assert (await ask(ws, "{not json"))["data"]["message"] == "Invalid JSON"
+
+        for _ in range(19):
             reply = await ask(ws, "{not json")
-            assert reply["data"]["message"] == "Invalid JSON"
+            assert reply["data"]["message"] == "Rate limit exceeded"
 
         client = h.server.clients[h.server_side()]
-        assert len(client.action_times) == 0
-        # A metered action is still available afterwards.
-        assert (await ask(ws, PING))["event"] == "subscribed"
+        assert len(client.action_times) == 1
+        # The budget really is spent: a valid action is refused as well.
+        assert (await ask(ws, PING))["data"]["message"] == "Rate limit exceeded"
+
+    @pytest.mark.asyncio
+    async def test_unknown_action_flood_is_metered(self, ws_factory):
+        """The other unmetered path: a frame that parses but names no known
+        action still costs a token."""
+        h = await ws_factory(max_actions_per_second=2, pool=False)
+        ws = await h.connect()
+
+        for _ in range(2):
+            reply = await ask(ws, {"action": "nope"})
+            assert reply["data"]["message"] == "Unknown action: nope"
+
+        assert (await ask(ws, {"action": "nope"}))["data"]["message"] == (
+            "Rate limit exceeded"
+        )
+
+    @pytest.mark.asyncio
+    async def test_oversized_frames_are_metered(self, ws_factory):
+        """So is a frame that is refused for its size."""
+        h = await ws_factory(max_actions_per_second=2, pool=False)
+        ws = await h.connect()
+        blob = {"action": "x" * (MAX_MESSAGE_LENGTH + 1)}
+
+        for _ in range(2):
+            reply = await ask(ws, blob)
+            assert reply["data"]["message"].startswith("Message too large")
+
+        assert (await ask(ws, blob))["data"]["message"] == "Rate limit exceeded"
 
 
 # =============================================================================
 # 2. Malformed and hostile frames
 # =============================================================================
 
-# (frame, exact reply message) — frames whose reply is fully deterministic.
+JOB_ID_RANGE_ERROR = "job_id must be between 0 and 9223372036854775807"
+PRIORITY_RANGE_ERROR = "new_priority must be between -2147483648 and 2147483647"
+
+# (frame, exact reply message). Every malformed frame now has a deterministic
+# reply: validation happens in the dispatcher, so no hostile value reaches
+# asyncpg and no reply carries a driver/PostgreSQL message.
 EXACT_FRAME_CASES: tuple[tuple[Any, str], ...] = (
     ("not json at all", "Invalid JSON"),
     ("{not json", "Invalid JSON"),
@@ -291,37 +331,42 @@ EXACT_FRAME_CASES: tuple[tuple[Any, str], ...] = (
     ({"action": "ENQUEUE"}, "Unknown action: ENQUEUE"),
     ({"action": ["subscribe"]}, "Unknown action: ['subscribe']"),
     ({"action": "cancel_job"}, "Missing job_id"),
-    ({"action": "cancel_job", "job_id": 0}, "Missing job_id"),
     ({"action": "cancel_job", "job_id": None}, "Missing job_id"),
+    # job_id 0 is well-formed (just not a real id): an explicit None check
+    # distinguishes "absent" from "falsy".
+    ({"action": "cancel_job", "job_id": 0}, "Job 0 not found or cannot be cancelled"),
+    ({"action": "cancel_job", "job_id": False}, "job_id must be an integer"),
+    ({"action": "cancel_job", "job_id": "abc"}, "job_id must be an integer"),
+    ({"action": "cancel_job", "job_id": "1"}, "job_id must be an integer"),
+    ({"action": "cancel_job", "job_id": 1.5}, "job_id must be an integer"),
+    ({"action": "cancel_job", "job_id": [1, 2]}, "job_id must be an integer"),
+    ({"action": "cancel_job", "job_id": {"a": 1}}, "job_id must be an integer"),
+    ({"action": "cancel_job", "job_id": -1}, JOB_ID_RANGE_ERROR),
+    ({"action": "cancel_job", "job_id": 2**63}, JOB_ID_RANGE_ERROR),
     ({"action": "retry_job"}, "Missing job_id"),
-    ({"action": "retry_job", "job_id": 0}, "Missing job_id"),
-    ({"action": "adjust_priority"}, "Missing job_id or new_priority"),
-    ({"action": "adjust_priority", "job_id": 1}, "Missing job_id or new_priority"),
-    (
-        {"action": "adjust_priority", "new_priority": 1},
-        "Missing job_id or new_priority",
-    ),
-    ({"action": "subscribe", "channels": "notalist"}, "channels must be an array"),
-    ({"action": "subscribe", "channels": 7}, "channels must be an array"),
-    ({"action": "unsubscribe", "channels": 7}, "Error: 'int' object is not iterable"),
-)
-
-# (frame, reply message prefix) — the tail is a PostgreSQL/driver message.
-PREFIX_FRAME_CASES: tuple[tuple[dict[str, Any], str], ...] = (
-    ({"action": "cancel_job", "job_id": "abc"}, "Failed to cancel job: "),
-    ({"action": "cancel_job", "job_id": [1, 2]}, "Failed to cancel job: "),
-    ({"action": "cancel_job", "job_id": {"a": 1}}, "Failed to cancel job: "),
-    ({"action": "cancel_job", "job_id": 2**63}, "Failed to cancel job: "),
-    ({"action": "retry_job", "job_id": "abc"}, "Failed to retry job: "),
-    ({"action": "retry_job", "job_id": 2**63}, "Failed to retry job: "),
+    ({"action": "retry_job", "job_id": 0}, "Job 0 not found or cannot be retried"),
+    ({"action": "retry_job", "job_id": "abc"}, "job_id must be an integer"),
+    ({"action": "retry_job", "job_id": 2**63}, JOB_ID_RANGE_ERROR),
+    ({"action": "adjust_priority"}, "Missing job_id"),
+    ({"action": "adjust_priority", "job_id": 1}, "Missing new_priority"),
+    ({"action": "adjust_priority", "new_priority": 1}, "Missing job_id"),
     (
         {"action": "adjust_priority", "job_id": 1, "new_priority": "high"},
-        "Failed to adjust priority: ",
+        "new_priority must be an integer",
+    ),
+    (
+        {"action": "adjust_priority", "job_id": 1, "new_priority": True},
+        "new_priority must be an integer",
     ),
     (
         {"action": "adjust_priority", "job_id": 1, "new_priority": 2**40},
-        "Failed to adjust priority: ",
+        PRIORITY_RANGE_ERROR,
     ),
+    ({"action": "subscribe", "channels": "notalist"}, "channels must be an array"),
+    ({"action": "subscribe", "channels": 7}, "channels must be an array"),
+    ({"action": "unsubscribe", "channels": 7}, "channels must be an array"),
+    ({"action": "subscribe", "channels": [1]}, "channel names must be strings"),
+    ({"action": "unsubscribe", "channels": [None]}, "channel names must be strings"),
 )
 
 
@@ -338,11 +383,6 @@ class TestHostileFrames:
             reply = await ask(ws, frame)
             assert reply["event"] == "error", (frame, reply)
             assert reply["data"]["message"] == expected, frame
-
-        for frame, prefix in PREFIX_FRAME_CASES:
-            reply = await ask(ws, frame)
-            assert reply["event"] == "error", (frame, reply)
-            assert reply["data"]["message"].startswith(prefix), (frame, reply)
 
         # After every hostile frame the socket is still fully usable.
         assert not ws.closed
@@ -389,54 +429,80 @@ class TestHostileFrames:
         assert h.server.stats["messages_received"] == 1
 
     @pytest.mark.asyncio
-    async def test_one_megabyte_frame_is_handled_and_echoed_back(self, ws_factory):
-        """A 1 MiB frame is accepted. Note the amplification: the unknown
-        action is echoed verbatim, so a 1 MiB request produces a >1 MiB
-        response. Nothing truncates client-supplied text in error messages."""
+    async def test_one_megabyte_frame_is_refused_without_amplification(
+        self, ws_factory
+    ):
+        """A frame over MAX_MESSAGE_LENGTH is refused before it is parsed, and
+        no reply ever echoes an unbounded amount of client text: an error is
+        capped at MAX_ERROR_MESSAGE_LENGTH characters, so a big request can
+        never buy a bigger response."""
         h = await ws_factory(max_actions_per_second=10_000, pool=False)
         ws = await h.connect()
 
         blob = "A" * (1024 * 1024)
         reply = await ask(ws, {"action": blob})
         assert reply["event"] == "error"
-        assert reply["data"]["message"] == f"Unknown action: {blob}"
-        assert len(reply["data"]["message"]) > 1024 * 1024
+        assert reply["data"]["message"] == (
+            f"Message too large (max {MAX_MESSAGE_LENGTH} characters)"
+        )
+
+        # A frame that fits, but whose echoed action is still large: the reply
+        # is truncated rather than mirrored.
+        big_action = "B" * (MAX_MESSAGE_LENGTH // 2)
+        reply = await ask(ws, {"action": big_action})
+        message = reply["data"]["message"]
+        assert message.startswith("Unknown action: BBB")
+        assert len(message) == MAX_ERROR_MESSAGE_LENGTH
+        assert message.endswith("…")
 
         assert not ws.closed
         assert (await ask(ws, PING))["event"] == "subscribed"
 
     @pytest.mark.asyncio
-    async def test_one_megabyte_channel_name_is_stored_verbatim(self, ws_factory):
-        """A 1 MiB channel name is accepted and retained in server memory:
-        subscription channel names are unvalidated and unbounded in length."""
+    async def test_channel_names_are_length_bounded(self, ws_factory):
+        """Channel names become dict keys in server memory, so their length is
+        bounded: one character over the limit is refused, exactly the limit is
+        accepted, and a 1 MiB name cannot even arrive."""
         h = await ws_factory(pool=False)
         ws = await h.connect()
 
-        blob = "C" * (1024 * 1024)
-        reply = await ask(ws, {"action": "subscribe", "channels": [blob]})
+        too_long = "C" * (MAX_CHANNEL_NAME_LENGTH + 1)
+        reply = await ask(ws, {"action": "subscribe", "channels": [too_long]})
+        assert reply["event"] == "error"
+        assert reply["data"]["message"] == (
+            f"Channel name too long (max {MAX_CHANNEL_NAME_LENGTH} characters)"
+        )
+        assert h.server.subscriptions == {}
+        assert h.server.clients[h.server_side()].channels == set()
+
+        at_limit = "C" * MAX_CHANNEL_NAME_LENGTH
+        reply = await ask(ws, {"action": "subscribe", "channels": [at_limit]})
         assert reply["event"] == "subscribed"
-        assert reply["data"]["channels"] == [blob]
-        assert blob in h.server.subscriptions
-        assert len(h.server.subscriptions[blob]) == 1
+        assert list(h.server.subscriptions) == [at_limit]
+
+        huge = "D" * (1024 * 1024)
+        reply = await ask(ws, {"action": "subscribe", "channels": [huge]})
+        assert reply["data"]["message"].startswith("Message too large")
+        assert list(h.server.subscriptions) == [at_limit]
 
     @pytest.mark.asyncio
-    async def test_float_job_id_is_silently_truncated_to_another_job(
+    async def test_float_job_id_is_rejected_not_truncated(
         self, ws_factory, db_pool, unique_queue
     ):
-        """BUG (reported): job_id is never validated as an integer, and asyncpg
-        truncates a float bound to a bigint parameter. ``job_id: N + 0.9``
-        therefore acts on job N while the reply echoes back ``N + 0.9`` — a UI
-        would report success against a job id that does not exist."""
+        """asyncpg truncates a float bound to a bigint parameter, so an
+        unvalidated ``job_id: N + 0.9`` would cancel job N while reporting
+        ``N + 0.9``. The dispatcher validates the id instead: nothing is
+        touched and the reply names the problem."""
         h = await ws_factory()
         ws = await h.connect()
         target = await make_job(db_pool, unique_queue, "queued")
         other = await make_job(db_pool, unique_queue, "queued")
 
         reply = await ask(ws, {"action": "cancel_job", "job_id": target + 0.9})
-        assert reply["event"] == "job_cancelled"
-        assert reply["data"] == {"job_id": target + 0.9, "status": "cancelled"}
+        assert reply["event"] == "error"
+        assert reply["data"]["message"] == "job_id must be an integer"
 
-        assert (await job_row(db_pool, target))["state"] == "cancelled"
+        assert (await job_row(db_pool, target))["state"] == "queued"
         assert (await job_row(db_pool, other))["state"] == "queued"
 
     @pytest.mark.asyncio
@@ -543,7 +609,8 @@ class TestSubscriptionLimits:
         assert reply["event"] == "unsubscribed"
         assert reply["data"]["channels"] == ["jobs"]
         assert h.server.clients[server_ws].channels == set()
-        assert h.server.subscriptions["jobs"] == set()
+        # The last subscriber leaving takes the channel key with it.
+        assert "jobs" not in h.server.subscriptions
 
         # Unsubscribing twice, and from a channel never subscribed, are both
         # no-ops that still acknowledge (echoing back what was requested).
@@ -578,12 +645,37 @@ class TestSubscriptionLimits:
             server_ws in subscribers for subscribers in h.server.subscriptions.values()
         )
 
-        # KNOWN LEAK (reported, not fixed here): the channel *keys* survive as
-        # empty sets. Channel names are attacker-chosen and unvalidated, so a
-        # client can add max_subscriptions keys, disconnect, and repeat — the
-        # dict only ever grows.
-        assert sorted(h.server.subscriptions) == sorted(channels)
-        assert all(v == set() for v in h.server.subscriptions.values())
+        # The channel *keys* go too. Channel names are attacker-chosen, so
+        # empty sets left behind would be a memory-growth primitive: subscribe
+        # to max_subscriptions unique names, disconnect, repeat.
+        assert h.server.subscriptions == {}
+        assert channels  # the channels really were subscribed above
+
+    @pytest.mark.asyncio
+    async def test_repeated_connect_subscribe_disconnect_does_not_grow_state(
+        self, ws_factory
+    ):
+        """The growth loop, run five times: every round adds 20 fresh channel
+        names and every round leaves the server with nothing."""
+        h = await ws_factory(max_subscriptions=100, pool=False)
+
+        for round_no in range(5):
+            ws = await h.connect()
+            server_ws = h.server_side()
+            names = [f"ghost:{round_no}:{i}" for i in range(20)]
+            await ask(ws, {"action": "subscribe", "channels": names})
+            assert sorted(h.server.subscriptions) == sorted(names)
+
+            await ws.close()
+            await wait_until(
+                lambda ws=server_ws: asyncio.sleep(
+                    0, result=ws not in h.server.clients
+                ),
+                timeout=5.0,
+                what="server-side cleanup",
+            )
+            assert h.server.subscriptions == {}
+            assert h.server.clients == {}
 
     @pytest.mark.asyncio
     async def test_broadcast_reaches_only_subscribers(self, ws_factory):

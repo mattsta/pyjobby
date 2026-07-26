@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import html as html_mod
 import json
+import re
 import urllib.parse
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -22,6 +23,117 @@ from aiohttp import web
 
 from . import db
 from .admin_api import AdminAPI
+
+# =============================================================================
+# Request parsing
+#
+# The admin surface is unauthenticated, so every path id and query parameter is
+# hostile input. Parsing lives in the four helpers below rather than in the
+# handlers: a handler added later inherits the bounds by using them.
+#
+# Policy: malformed or out-of-range input is a 400 with a JSON body naming the
+# parameter. Nothing is silently clamped, because a clamped limit/offset
+# silently returns the wrong page of results. "Does not exist" is always 404.
+# =============================================================================
+
+MAX_BIGINT = 2**63 - 1
+# jorb_queue.name is free-form text and pausing an unknown queue inserts a row
+# (see api_queue_pause), so the name an anonymous client can store is bounded.
+MAX_QUEUE_NAME_LENGTH = 255
+# `datetime.now(UTC) - timedelta(hours=N)` must stay inside datetime's range; a
+# century of history is far more than any dashboard window asks for.
+MAX_SINCE_HOURS = 24 * 365 * 100
+
+_ID_RE = re.compile(r"^[0-9]+$")
+_INT_RE = re.compile(r"^[+-]?[0-9]+$")
+
+
+def _api_error(status_cls: type[web.HTTPException], message: str) -> web.HTTPException:
+    """Build an HTTP error whose body matches the handlers' JSON error shape."""
+    return status_cls(
+        text=json.dumps({"error": message}), content_type="application/json"
+    )
+
+
+def _path_id(request: web.Request, name: str) -> int:
+    """Parse a row id out of the path, or raise 400.
+
+    Ids are decimal digits inside the bigint range: anything else (``abc``,
+    ``1.5``, ``-1``, ``1_0``, 2**63) is malformed input that must never reach
+    ``int()`` or a bigint bind parameter.
+    """
+    raw = request.match_info[name]
+    # MAX_BIGINT is 19 digits, so a longer string is out of range by
+    # inspection — and never reaches int() (which refuses huge literals).
+    if not _ID_RE.match(raw) or len(raw) > 19 or int(raw) > MAX_BIGINT:
+        raise _api_error(
+            web.HTTPBadRequest,
+            f"Malformed {name}: {raw!r} is not a valid id",
+        )
+    return int(raw)
+
+
+def _query_int(
+    request: web.Request,
+    name: str,
+    default: int,
+    *,
+    minimum: int = 0,
+    maximum: int = MAX_BIGINT,
+) -> int:
+    """Parse an integer query parameter, or raise 400.
+
+    A missing or empty parameter yields ``default``. Non-integers and values
+    outside ``[minimum, maximum]`` are rejected rather than clamped.
+    """
+    raw = request.query.get(name)
+    if raw is None or raw == "":
+        return default
+    if not _INT_RE.match(raw):
+        raise _api_error(
+            web.HTTPBadRequest, f"Invalid {name}: {raw!r} is not an integer"
+        )
+    try:
+        value = int(raw)
+    except ValueError:  # absurdly long digit strings
+        raise _api_error(
+            web.HTTPBadRequest, f"Invalid {name}: {raw[:32]!r} is not an integer"
+        ) from None
+    if not minimum <= value <= maximum:
+        raise _api_error(
+            web.HTTPBadRequest,
+            f"Invalid {name}: {value} is out of range [{minimum}, {maximum}]",
+        )
+    return value
+
+
+def _query_job_state(request: web.Request) -> str | None:
+    """Parse the ``state`` filter against the JobState enum, or raise 400.
+
+    Without this an unknown state reaches PostgreSQL as a ``jorbstate`` cast
+    and the InvalidTextRepresentation error escapes as a 500.
+    """
+    raw = request.query.get("state")
+    if raw is None or raw == "":
+        return None
+    try:
+        return str(db.JobState(raw))
+    except ValueError:
+        valid = ", ".join(s.value for s in db.JobState)
+        raise _api_error(
+            web.HTTPBadRequest, f"Invalid state: {raw!r} (expected one of: {valid})"
+        ) from None
+
+
+def _path_queue_name(request: web.Request) -> str:
+    """Parse the ``queue`` path segment, or raise 400 if it is over-long."""
+    queue = request.match_info["queue"]
+    if len(queue) > MAX_QUEUE_NAME_LENGTH:
+        raise _api_error(
+            web.HTTPBadRequest,
+            f"Invalid queue name: longer than {MAX_QUEUE_NAME_LENGTH} characters",
+        )
+    return queue
 
 
 class WebAdminServer:
@@ -117,6 +229,30 @@ class WebAdminServer:
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             yield AdminAPI(conn)
+
+    @staticmethod
+    async def _job_or_404(api: AdminAPI, job_id: int) -> dict[str, Any]:
+        """Return the job row, or raise 404.
+
+        Every handler that acts on a job id checks existence here, so "no such
+        job" is a 404 on every route (400 is reserved for malformed input).
+        """
+        job = await api.get_job(job_id)
+        if not job:
+            raise _api_error(web.HTTPNotFound, f"Job {job_id} not found")
+        return job
+
+    @staticmethod
+    async def _schedule_or_404(api: AdminAPI, schedule_id: int) -> dict[str, Any]:
+        """Return the schedule row, or raise 404."""
+        # AdminAPI.get_schedule treats a falsy id as "no lookup key given", so
+        # id 0 (never a real bigserial value) is answered as missing here.
+        schedule = (
+            await api.get_schedule(schedule_id=schedule_id) if schedule_id else None
+        )
+        if not schedule:
+            raise _api_error(web.HTTPNotFound, f"Schedule {schedule_id} not found")
+        return schedule
 
     async def close(self) -> None:
         """Close the connection pool (if it was created)."""
@@ -568,12 +704,11 @@ class WebAdminServer:
 
     async def api_jobs_list(self, request: web.Request) -> web.Response:
         """List jobs (JSON or HTML)"""
+        queue = request.query.get("queue")
+        state = _query_job_state(request)
+        limit = _query_int(request, "limit", 50)
+        offset = _query_int(request, "offset", 0)
         async with self.api() as api:
-            # Parse query parameters
-            queue = request.query.get("queue")
-            state = request.query.get("state")
-            limit = int(request.query.get("limit", 50))
-            offset = int(request.query.get("offset", 0))
             format_type = request.query.get("format", "json")
 
             jobs = await api.list_jobs(
@@ -624,37 +759,31 @@ class WebAdminServer:
 
     async def api_job_get(self, request: web.Request) -> web.Response:
         """Get single job"""
-        job_id = int(request.match_info["job_id"])
+        job_id = _path_id(request, "job_id")
         async with self.api() as api:
-            job = await api.get_job(job_id)
-            if not job:
-                return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response(job)
+            return web.json_response(await self._job_or_404(api, job_id))
 
     async def api_job_history(self, request: web.Request) -> web.Response:
         """Get a job's full transition history (jorb_history, oldest first)"""
-        job_id = int(request.match_info["job_id"])
+        job_id = _path_id(request, "job_id")
         async with self.api() as api:
-            job = await api.get_job(job_id)
-            if not job:
-                return web.json_response({"error": "Job not found"}, status=404)
+            await self._job_or_404(api, job_id)
             history = await api.get_job_history(job_id)
             return web.json_response(history)
 
     async def api_job_steps(self, request: web.Request) -> web.Response:
         """Get a job's DXE step checkpoints (jorb_step, in sequence order)"""
-        job_id = int(request.match_info["job_id"])
+        job_id = _path_id(request, "job_id")
         async with self.api() as api:
-            job = await api.get_job(job_id)
-            if not job:
-                return web.json_response({"error": "Job not found"}, status=404)
+            await self._job_or_404(api, job_id)
             steps = await api.get_job_steps(job_id)
             return web.json_response(steps)
 
     async def api_job_retry(self, request: web.Request) -> web.Response:
-        """Retry a job"""
-        job_id = int(request.match_info["job_id"])
+        """Retry a job (404 if it does not exist, 400 if its state forbids it)"""
+        job_id = _path_id(request, "job_id")
         async with self.api() as api:
+            await self._job_or_404(api, job_id)
             try:
                 result = await api.retry_job(job_id)
                 return web.json_response(result)
@@ -662,9 +791,10 @@ class WebAdminServer:
                 return web.json_response({"error": str(e)}, status=400)
 
     async def api_job_cancel(self, request: web.Request) -> web.Response:
-        """Cancel a job"""
-        job_id = int(request.match_info["job_id"])
+        """Cancel a job (404 if it does not exist, 400 if it is terminal)"""
+        job_id = _path_id(request, "job_id")
         async with self.api() as api:
+            await self._job_or_404(api, job_id)
             try:
                 result = await api.cancel_job(job_id)
                 return web.json_response(result)
@@ -673,13 +803,12 @@ class WebAdminServer:
 
     async def api_job_delete(self, request: web.Request) -> web.Response:
         """Delete a job"""
-        job_id = int(request.match_info["job_id"])
+        job_id = _path_id(request, "job_id")
         async with self.api() as api:
             deleted = await api.delete_job(job_id)
             if deleted:
                 return web.json_response({"status": "deleted", "job_id": job_id})
-            else:
-                return web.json_response({"error": "Job not found"}, status=404)
+            raise _api_error(web.HTTPNotFound, f"Job {job_id} not found")
 
     def _render_queues_table(self, stats: list[dict[str, Any]]) -> str:
         """Render queue stats + control plane as an HTML fragment."""
@@ -765,7 +894,7 @@ class WebAdminServer:
 
     async def api_queue_stats(self, request: web.Request) -> web.Response:
         """Get stats for specific queue"""
-        queue = request.match_info["queue"]
+        queue = _path_queue_name(request)
         async with self.api() as api:
             stats = await api.queue_stats(queue=queue)
             return web.json_response(
@@ -773,8 +902,17 @@ class WebAdminServer:
             )
 
     async def api_queue_pause(self, request: web.Request) -> web.Response:
-        """Pause a queue (workers stop claiming from it immediately)"""
-        queue = request.match_info["queue"]
+        """Pause a queue (workers stop claiming from it immediately).
+
+        Queues are implicit — they exist because a job names them — so pausing
+        a queue that has never been used is *deliberately* allowed: it is how
+        an operator stops work before the first job is enqueued. The upsert
+        therefore creates the jorb_queue control row on demand. Because this
+        route is anonymous, the queue name is length-bounded
+        (MAX_QUEUE_NAME_LENGTH) so pre-emptive pausing cannot be turned into
+        unbounded row insertion.
+        """
+        queue = _path_queue_name(request)
         async with self.api() as api:
             control = await api.pause_queue(queue)
             if request.query.get("format") == "html":
@@ -785,8 +923,9 @@ class WebAdminServer:
             return web.json_response(control)
 
     async def api_queue_resume(self, request: web.Request) -> web.Response:
-        """Resume a paused queue"""
-        queue = request.match_info["queue"]
+        """Resume a paused queue (creates the control row if absent, exactly
+        like api_queue_pause, and bounds the queue name the same way)"""
+        queue = _path_queue_name(request)
         async with self.api() as api:
             control = await api.resume_queue(queue)
             if request.query.get("format") == "html":
@@ -901,8 +1040,8 @@ class WebAdminServer:
 
     async def api_dlq_list(self, request: web.Request) -> web.Response:
         """List Dead Letter Queue jobs (terminal crashed state)"""
+        limit = _query_int(request, "limit", 100)
         async with self.api() as api:
-            limit = int(request.query.get("limit", 100))
             jobs = await api.list_dlq(limit=limit)
             if request.query.get("format") == "html":
                 return web.Response(
@@ -911,9 +1050,13 @@ class WebAdminServer:
             return web.json_response(jobs)
 
     async def api_dlq_retry(self, request: web.Request) -> web.Response:
-        """Retry job from DLQ (requeues the same row with errors reset)"""
-        job_id = int(request.match_info["job_id"])
+        """Retry job from DLQ (requeues the same row with errors reset).
+
+        404 if the job does not exist, 400 if it exists but is not in the DLQ.
+        """
+        job_id = _path_id(request, "job_id")
         async with self.api() as api:
+            await self._job_or_404(api, job_id)
             try:
                 result = await api.retry_from_dlq(job_id)
             except ValueError as e:
@@ -928,8 +1071,8 @@ class WebAdminServer:
 
     async def api_metrics(self, request: web.Request) -> web.Response:
         """Get system metrics"""
+        since_hours = _query_int(request, "since_hours", 24, maximum=MAX_SINCE_HOURS)
         async with self.api() as api:
-            since_hours = int(request.query.get("since_hours", 24))
             queue = request.query.get("queue")
             format_type = request.query.get("format", "json")
 
@@ -1318,24 +1461,29 @@ class WebAdminServer:
 
     async def api_schedule_get(self, request: web.Request) -> web.Response:
         """Get single schedule"""
+        schedule_id = _path_id(request, "schedule_id")
         async with self.api() as api:
-            schedule_id = int(request.match_info["schedule_id"])
-            schedule = await api.get_schedule(schedule_id=schedule_id)
-
-            if not schedule:
-                return web.json_response({"error": "Schedule not found"}, status=404)
-
+            schedule = await self._schedule_or_404(api, schedule_id)
             return web.json_response(
                 schedule, dumps=lambda x: json.dumps(x, default=str)
             )
 
     async def api_schedule_create(self, request: web.Request) -> web.Response:
-        """Create new schedule"""
+        """Create new schedule.
+
+        400 for a missing/unparseable field, 409 when the name is taken.
+        """
+        data = await request.post()
+        missing = [f for f in ("name", "job_class", "cron_expr") if not data.get(f)]
+        if missing:
+            raise _api_error(
+                web.HTTPBadRequest,
+                f"Missing required field(s): {', '.join(missing)}",
+            )
+
         async with self.api() as api:
             try:
-                data = await request.post()
-
-                schedule = await api.create_schedule(
+                await api.create_schedule(
                     name=cast(str, data["name"]),
                     job_class=cast(str, data["job_class"]),
                     cron_expr=cast(str, data["cron_expr"]),
@@ -1360,40 +1508,51 @@ class WebAdminServer:
                 return web.Response(text=html, content_type="text/html")
             except ValueError as e:
                 return web.json_response({"error": str(e)}, status=400)
+            except asyncpg.UniqueViolationError:
+                return web.json_response(
+                    {"error": f"Schedule {data['name']!r} already exists"}, status=409
+                )
 
     async def api_schedule_enable(self, request: web.Request) -> web.Response:
-        """Enable schedule"""
-        schedule_id = int(request.match_info["schedule_id"])
+        """Enable schedule (404 if it does not exist, like the sibling GET)"""
+        schedule_id = _path_id(request, "schedule_id")
         async with self.api() as api:
+            await self._schedule_or_404(api, schedule_id)
             await api.enable_schedule(schedule_id)
 
         # Return refreshed list
         return await self.api_schedules_list(request)
 
     async def api_schedule_disable(self, request: web.Request) -> web.Response:
-        """Disable schedule"""
-        schedule_id = int(request.match_info["schedule_id"])
+        """Disable schedule (404 if it does not exist, like the sibling GET)"""
+        schedule_id = _path_id(request, "schedule_id")
         async with self.api() as api:
+            await self._schedule_or_404(api, schedule_id)
             await api.disable_schedule(schedule_id)
 
         # Return refreshed list
         return await self.api_schedules_list(request)
 
     async def api_schedule_delete(self, request: web.Request) -> web.Response:
-        """Delete schedule"""
-        schedule_id = int(request.match_info["schedule_id"])
+        """Delete schedule (404 if it does not exist, like the sibling GET)"""
+        schedule_id = _path_id(request, "schedule_id")
         async with self.api() as api:
+            await self._schedule_or_404(api, schedule_id)
             await api.delete_schedule(schedule_id)
 
         # Return refreshed list
         return await self.api_schedules_list(request)
 
     async def api_schedule_history(self, request: web.Request) -> web.Response:
-        """Get schedule execution history"""
-        async with self.api() as api:
-            schedule_id = int(request.match_info["schedule_id"])
-            limit = int(request.query.get("limit", 50))
+        """Get schedule execution history.
 
+        Deliberately does not check that the schedule exists: an unknown id
+        answers 200 with an empty log, the same as a schedule that has never
+        run.
+        """
+        schedule_id = _path_id(request, "schedule_id")
+        limit = _query_int(request, "limit", 50)
+        async with self.api() as api:
             # Query directly: jorb_schedule_log is ordered by id (schema v1
             # has actual_time, not a 'created' column)
             records = await api.conn.fetch(

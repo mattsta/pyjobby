@@ -42,6 +42,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# Bounds on client-supplied input
+#
+# The /ws endpoint is unauthenticated: every frame is hostile input. Each of
+# these bounds exists because an unbounded value on this surface is an
+# amplification or memory-growth primitive, not because of a protocol limit.
+# =============================================================================
+
+#: Largest inbound TEXT frame accepted, in characters. Bigger frames are
+#: refused before they are parsed.
+MAX_MESSAGE_LENGTH = 64 * 1024
+#: Longest channel name accepted. Channel names become dict keys in
+#: ``WebSocketServer.subscriptions``, so their length is server memory.
+MAX_CHANNEL_NAME_LENGTH = 255
+#: Error replies quote client-supplied text (an unknown action, a channel
+#: name); truncating bounds the reply so a big frame cannot amplify.
+MAX_ERROR_MESSAGE_LENGTH = 200
+
+MAX_BIGINT = 2**63 - 1
+MIN_INT32 = -(2**31)
+MAX_INT32 = 2**31 - 1
+
+
+class InvalidMessage(ValueError):
+    """A client message rejected by validation.
+
+    ``str(exc)`` is the message sent back to the client, so it must be safe to
+    show and must not embed unbounded client text.
+    """
+
 
 @dataclass
 class ClientConnection:
@@ -233,15 +263,7 @@ class WebSocketServer:
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     self.stats["messages_received"] += 1
-                    try:
-                        data = json.loads(msg.data)
-                        await self.handle_message(ws, client, data)
-                    except json.JSONDecodeError:
-                        await self.send_error(ws, "Invalid JSON")
-                    except Exception as e:
-                        logger.error(f"Error handling message: {e}")
-                        await self.send_error(ws, f"Error: {str(e)}")
-                        self.stats["errors"] += 1
+                    await self.handle_text_frame(ws, client, msg.data)
 
                 elif msg.type == aiohttp.WSMsgType.ERROR:
                     logger.error(f"WebSocket error: {ws.exception()}")
@@ -253,10 +275,15 @@ class WebSocketServer:
             logger.error(f"WebSocket error: {e}")
             self.stats["errors"] += 1
         finally:
-            # Cleanup
+            # Cleanup. Channel names are attacker-chosen, so an empty channel
+            # must lose its dict *key* too: leaving the key behind lets a
+            # client subscribe-disconnect-repeat until self.subscriptions
+            # exhausts memory.
             self.clients.pop(ws, None)
-            for channel_subs in self.subscriptions.values():
+            for channel, channel_subs in list(self.subscriptions.items()):
                 channel_subs.discard(ws)
+                if not channel_subs:
+                    del self.subscriptions[channel]
             self.stats["current_connections"] -= 1
 
             logger.info(
@@ -265,25 +292,134 @@ class WebSocketServer:
 
         return ws
 
+    def is_rate_limited(self, client: ClientConnection) -> bool:
+        """Charge one token to the client's sliding 1-second window.
+
+        Returns True (and charges nothing) when the window is already full.
+        """
+        now = time.time()
+        window = client.action_times
+        while window and now - window[0] > 1.0:
+            window.popleft()
+        if len(window) >= self.max_actions_per_second:
+            return True
+        window.append(now)
+        return False
+
+    async def handle_text_frame(
+        self, ws: web.WebSocketResponse, client: ClientConnection, raw: str
+    ) -> None:
+        """Meter, size-check, parse and dispatch one inbound TEXT frame.
+
+        Metering happens FIRST, before parsing and before the action lookup:
+        every frame costs one token, so a flood of invalid JSON or unknown
+        actions is limited exactly like a flood of valid requests. Metering
+        after the parse would leave the cheapest-to-send frames unmetered.
+        """
+        if self.is_rate_limited(client):
+            await self.send_error(ws, "Rate limit exceeded")
+            return
+
+        if len(raw) > MAX_MESSAGE_LENGTH:
+            await self.send_error(
+                ws, f"Message too large (max {MAX_MESSAGE_LENGTH} characters)"
+            )
+            return
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            await self.send_error(ws, "Invalid JSON")
+            return
+
+        try:
+            await self.handle_message(ws, client, data)
+        except Exception as e:
+            logger.error(f"Error handling message: {e}")
+            await self.send_error(ws, f"Error: {str(e)}")
+            self.stats["errors"] += 1
+
+    @staticmethod
+    def validate_channels(channels: Any) -> list[str]:
+        """Validate a subscribe/unsubscribe channel list."""
+        if not isinstance(channels, list):
+            raise InvalidMessage("channels must be an array")
+        for channel in channels:
+            if not isinstance(channel, str):
+                raise InvalidMessage("channel names must be strings")
+            if len(channel) > MAX_CHANNEL_NAME_LENGTH:
+                raise InvalidMessage(
+                    f"Channel name too long (max {MAX_CHANNEL_NAME_LENGTH} characters)"
+                )
+        return channels
+
+    @staticmethod
+    def validate_job_id(job_id: Any) -> int:
+        """Validate a job id: a non-negative integer inside the bigint range.
+
+        Nothing else may reach the database. asyncpg silently *truncates* a
+        float bound to a bigint parameter, so an unvalidated ``job_id`` of
+        ``N + 0.9`` would act on job N while the reply echoed ``N + 0.9``.
+        Booleans are rejected explicitly (``bool`` is an ``int`` subclass), and
+        absence is an explicit ``None`` check so that ``job_id: 0`` is reported
+        as a missing job rather than as a missing field.
+        """
+        if job_id is None:
+            raise InvalidMessage("Missing job_id")
+        if isinstance(job_id, bool) or not isinstance(job_id, int):
+            raise InvalidMessage("job_id must be an integer")
+        value: int = job_id
+        if not 0 <= value <= MAX_BIGINT:
+            raise InvalidMessage(f"job_id must be between 0 and {MAX_BIGINT}")
+        return value
+
+    @staticmethod
+    def validate_priority(new_priority: Any) -> int:
+        """Validate a priority: an int32, the width of the jorb.prio column."""
+        if new_priority is None:
+            raise InvalidMessage("Missing new_priority")
+        if isinstance(new_priority, bool) or not isinstance(new_priority, int):
+            raise InvalidMessage("new_priority must be an integer")
+        value: int = new_priority
+        if not MIN_INT32 <= value <= MAX_INT32:
+            raise InvalidMessage(
+                f"new_priority must be between {MIN_INT32} and {MAX_INT32}"
+            )
+        return value
+
+    def validate_message(self, action: Any, data: dict[str, Any]) -> None:
+        """Validate and normalize one message in place, before dispatch.
+
+        All per-action input validation lives here rather than in the
+        handlers, so an action added to the dispatcher inherits the bounds by
+        naming its parameters here — and no handler can forget a check.
+        """
+        if action in ("subscribe", "unsubscribe"):
+            data["channels"] = self.validate_channels(data.get("channels", []))
+        if action in ("cancel_job", "retry_job", "adjust_priority"):
+            data["job_id"] = self.validate_job_id(data.get("job_id"))
+        if action == "adjust_priority":
+            data["new_priority"] = self.validate_priority(data.get("new_priority"))
+
     async def handle_message(
         self, ws: web.WebSocketResponse, client: ClientConnection, data: dict[str, Any]
     ) -> None:
-        """Handle incoming client message"""
+        """Validate and dispatch one decoded client message.
+
+        Rate limiting happens upstream in :meth:`handle_text_frame`: by the
+        time a message gets here it has already been metered.
+        """
         action = data.get("action")
 
         if not action:
             await self.send_error(ws, "Missing 'action' field")
             return
 
-        # Rate limiting: sliding 1-second window of action timestamps
-        now = time.time()
-        window = client.action_times
-        while window and now - window[0] > 1.0:
-            window.popleft()
-        if len(window) >= self.max_actions_per_second:
-            await self.send_error(ws, "Rate limit exceeded")
+        try:
+            self.validate_message(action, data)
+        except InvalidMessage as e:
+            await self.send_error(ws, str(e))
             return
-        window.append(now)
 
         # Handle different actions
         if action == "subscribe":
@@ -310,12 +446,9 @@ class WebSocketServer:
     async def handle_subscribe(
         self, ws: web.WebSocketResponse, client: ClientConnection, data: dict[str, Any]
     ) -> None:
-        """Handle channel subscription"""
+        """Handle channel subscription (channels validated by
+        validate_message: a list of strings, each length-bounded)"""
         channels = data.get("channels", [])
-
-        if not isinstance(channels, list):
-            await self.send_error(ws, "channels must be an array")
-            return
 
         # Check subscription limit
         if len(client.channels) + len(channels) > self.max_subscriptions:
@@ -344,13 +477,20 @@ class WebSocketServer:
     async def handle_unsubscribe(
         self, ws: web.WebSocketResponse, client: ClientConnection, data: dict[str, Any]
     ) -> None:
-        """Handle channel unsubscription"""
+        """Handle channel unsubscription (channels validated by
+        validate_message)"""
         channels = data.get("channels", [])
 
         for channel in channels:
             if channel in client.channels:
                 client.channels.discard(channel)
-                self.subscriptions.get(channel, set()).discard(ws)
+                subscribers = self.subscriptions.get(channel)
+                if subscribers is not None:
+                    subscribers.discard(ws)
+                    # Drop the key with the last subscriber: an empty set left
+                    # behind is unbounded, attacker-controlled memory.
+                    if not subscribers:
+                        del self.subscriptions[channel]
 
         await self.send_to_client(
             ws,
@@ -364,12 +504,9 @@ class WebSocketServer:
     async def handle_cancel_job(
         self, ws: web.WebSocketResponse, client: ClientConnection, data: dict[str, Any]
     ) -> None:
-        """Handle job cancellation request"""
-        job_id = data.get("job_id")
-
-        if not job_id:
-            await self.send_error(ws, "Missing job_id")
-            return
+        """Handle job cancellation request (job_id validated by
+        validate_message)"""
+        job_id = data["job_id"]
 
         assert self.db_pool is not None
         try:
@@ -401,20 +538,15 @@ class WebSocketServer:
     async def handle_retry_job(
         self, ws: web.WebSocketResponse, client: ClientConnection, data: dict[str, Any]
     ) -> None:
-        """Handle job retry request"""
-        job_id = data.get("job_id")
-
-        if not job_id:
-            await self.send_error(ws, "Missing job_id")
-            return
+        """Handle job retry request (job_id validated by validate_message)"""
+        job_id = data["job_id"]
 
         assert self.db_pool is not None
         try:
             async with self.db_pool.acquire() as conn:
-                # shared requeue statement — jobs keep their ids across retries
-                requeued = await db.requeue_job(
-                    conn, job_id, allowed_states=("crashed", "cancelled", "finished")
-                )
+                # shared re-run verb — jobs keep their ids across retries, and
+                # this surface deliberately allows re-running finished jobs
+                requeued = await db.rerun_job(conn, job_id)
 
                 if requeued:
                     await self.send_to_client(
@@ -442,13 +574,10 @@ class WebSocketServer:
     async def handle_adjust_priority(
         self, ws: web.WebSocketResponse, client: ClientConnection, data: dict[str, Any]
     ) -> None:
-        """Handle priority adjustment request"""
-        job_id = data.get("job_id")
-        new_priority = data.get("new_priority")
-
-        if not job_id or new_priority is None:
-            await self.send_error(ws, "Missing job_id or new_priority")
-            return
+        """Handle priority adjustment request (job_id and new_priority
+        validated by validate_message)"""
+        job_id = data["job_id"]
+        new_priority = data["new_priority"]
 
         assert self.db_pool is not None
         try:
@@ -566,6 +695,8 @@ class WebSocketServer:
         for ws in dead_clients:
             subscribers.discard(ws)
             self.clients.pop(ws, None)
+        if not subscribers:
+            self.subscriptions.pop(channel, None)
 
     async def send_to_client(
         self, ws: web.WebSocketResponse, event: dict[str, Any]
@@ -575,7 +706,15 @@ class WebSocketServer:
         self.stats["messages_sent"] += 1
 
     async def send_error(self, ws: web.WebSocketResponse, message: str) -> None:
-        """Send error message to client"""
+        """Send an error to the client, bounding what is echoed back.
+
+        Error text quotes client-supplied values (an unknown action name, a
+        driver message), so every error is truncated to
+        MAX_ERROR_MESSAGE_LENGTH characters: a large frame must never buy a
+        larger reply.
+        """
+        if len(message) > MAX_ERROR_MESSAGE_LENGTH:
+            message = message[: MAX_ERROR_MESSAGE_LENGTH - 1] + "…"
         await self.send_to_client(
             ws,
             {
