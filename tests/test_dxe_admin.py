@@ -20,7 +20,7 @@ from pyjobby import db
 from pyjobby.admin_api import AdminAPI
 from pyjobby.cli import cli
 
-from .conftest import TEST_DSN, wait_for_job_state
+from .conftest import wait_for_job_state
 
 
 async def _insert_job(
@@ -309,14 +309,30 @@ async def test_requeue_resume_keeps_checkpoints_fresh_wipes_them(
         assert [s["step_seq"] for s in steps] == [1, 2, 3]
 
 
+@pytest.fixture
+def dsn(db_params: dict) -> str:
+    """The DSN of THIS session's database.
+
+    Not the module-level TEST_DSN: under xdist every worker gets its own
+    database, so a CLI invoked against the base DSN inspects a database the
+    test never wrote to -- and one that conftest never re-installs the schema
+    into, so it silently lags behind schema.sql. These tests were passing only
+    because the two happened to agree.
+    """
+    return (
+        f"postgresql://{db_params['user']}:{db_params['password']}"
+        f"@{db_params['host']}:{db_params['port']}/{db_params['database']}"
+    )
+
+
 # ============================================================================
 # CLI (sync tests: click commands drive their own event loop)
 # ============================================================================
 
 
-def test_doctor_healthy_database_exits_zero():
+def test_doctor_healthy_database_exits_zero(dsn):
     runner = CliRunner()
-    result = runner.invoke(cli, ["--dsn", TEST_DSN, "doctor"], obj={})
+    result = runner.invoke(cli, ["--dsn", dsn, "doctor"], obj={})
     assert result.exit_code == 0, result.output
     assert "PASS database: connected" in result.output
     assert "PASS schema" in result.output
@@ -324,11 +340,11 @@ def test_doctor_healthy_database_exits_zero():
     assert "FAIL" not in result.output
 
 
-def test_doctor_thresholds_accept_options():
+def test_doctor_thresholds_accept_options(dsn):
     runner = CliRunner()
     result = runner.invoke(
         cli,
-        ["--dsn", TEST_DSN, "doctor", "--max-depth", "1", "--max-age-minutes", "1"],
+        ["--dsn", dsn, "doctor", "--max-depth", "1", "--max-age-minutes", "1"],
         obj={},
     )
     # thresholds only produce WARNs, never FAILs
@@ -336,11 +352,11 @@ def test_doctor_thresholds_accept_options():
     assert "FAIL" not in result.output
 
 
-def test_cli_queue_controls_roundtrip():
+def test_cli_queue_controls_roundtrip(dsn):
     runner = CliRunner()
     qname = f"cliq_{uuid.uuid4().hex[:8]}"
 
-    result = runner.invoke(cli, ["--dsn", TEST_DSN, "queues", "pause", qname], obj={})
+    result = runner.invoke(cli, ["--dsn", dsn, "queues", "pause", qname], obj={})
     assert result.exit_code == 0, result.output
     assert "paused" in result.output
 
@@ -348,7 +364,7 @@ def test_cli_queue_controls_roundtrip():
         cli,
         [
             "--dsn",
-            TEST_DSN,
+            dsn,
             "queues",
             "limits",
             qname,
@@ -363,32 +379,30 @@ def test_cli_queue_controls_roundtrip():
     )
     assert result.exit_code == 0, result.output
 
-    result = runner.invoke(cli, ["--dsn", TEST_DSN, "queues", "show", qname], obj={})
+    result = runner.invoke(cli, ["--dsn", dsn, "queues", "show", qname], obj={})
     assert result.exit_code == 0, result.output
     assert "yes" in result.output  # paused
     assert "4" in result.output  # max concurrency
 
-    result = runner.invoke(cli, ["--dsn", TEST_DSN, "queues", "resume", qname], obj={})
+    result = runner.invoke(cli, ["--dsn", dsn, "queues", "resume", qname], obj={})
     assert result.exit_code == 0, result.output
 
-    result = runner.invoke(cli, ["--dsn", TEST_DSN, "queues", "list"], obj={})
+    result = runner.invoke(cli, ["--dsn", dsn, "queues", "list"], obj={})
     assert result.exit_code == 0, result.output
     assert qname in result.output
 
 
-def test_cli_workers_and_jobs_commands_run():
+def test_cli_workers_and_jobs_commands_run(dsn):
     runner = CliRunner()
 
-    result = runner.invoke(cli, ["--dsn", TEST_DSN, "workers", "list"], obj={})
+    result = runner.invoke(cli, ["--dsn", dsn, "workers", "list"], obj={})
     assert result.exit_code == 0, result.output
 
-    result = runner.invoke(cli, ["--dsn", TEST_DSN, "workers", "stats"], obj={})
+    result = runner.invoke(cli, ["--dsn", dsn, "workers", "stats"], obj={})
     assert result.exit_code == 0, result.output
     assert "Live workers" in result.output
 
     # requeueing a nonexistent job fails cleanly
-    result = runner.invoke(
-        cli, ["--dsn", TEST_DSN, "jobs", "requeue", "999999999"], obj={}
-    )
+    result = runner.invoke(cli, ["--dsn", dsn, "jobs", "requeue", "999999999"], obj={})
     assert result.exit_code == 1
     assert "not found" in result.output
