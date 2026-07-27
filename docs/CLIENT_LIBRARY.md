@@ -951,5 +951,5 @@ if __name__ == "__main__":
 
 - See [ADMIN_TOOLS.md](ADMIN_TOOLS.md) for CLI and web interface documentation
 - See [RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md) for cron-based scheduling
-- See [ARCHITECTURE_CAPABILITIES.md](ARCHITECTURE_CAPABILITIES.md) for system design
+- See [ARCHITECTURE.md](ARCHITECTURE.md) for system design
 - See [examples/](../examples/) for more real-world usage patterns

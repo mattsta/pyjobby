@@ -21,7 +21,7 @@ Pyjobby now includes critical production-ready improvements:
 
 ### Getting Started
 
-1. **[Architecture Overview](architecture.md)** - Complete system design, components, and data flow
+1. **[Architecture](ARCHITECTURE.md)** - Components, the life of a job, and why the system is shaped this way
    - System architecture and design philosophy
    - Component breakdown and relationships
    - Data flow examples
@@ -51,7 +51,7 @@ Pyjobby now includes critical production-ready improvements:
 
 ### Core Components
 
-5. **[JobSystem Class](jobsystem.md)** - The orchestrator that runs on each worker
+5. **[Operations](OPERATIONS.md)** - Running the fleet: queue controls, retention, timeouts, playbooks
    - Class definition and initialization
    - Key methods and their usage
    - Database operations and prepared statements
@@ -60,7 +60,7 @@ Pyjobby now includes critical production-ready improvements:
    - Real-world usage examples
    - Performance tuning
 
-6. **[Job Base Class](job-class.md)** - How to write job workers
+6. **[Writing Jobs](writing-jobs.md)** - Which durable primitive to reach for, and what each one guarantees
    - Class interface and attributes
    - Core methods (task, run, reschedule)
    - Job lifecycle and state transitions
@@ -69,7 +69,7 @@ Pyjobby now includes critical production-ready improvements:
    - Advanced patterns
    - Best practices
 
-7. **[Database Schema](database-schema.md)** - PostgreSQL table structure
+7. **[The schema itself](../pyjobby/sql/schema.sql)** - The canonical source, commented end to end; see also [DXE.md](DXE.md) and [SCALE.md](SCALE.md)
    - Complete column reference
    - State machine and transitions
    - Indexes and their purposes
@@ -85,19 +85,19 @@ Pyjobby now includes critical production-ready improvements:
    - Custom application settings
    - Environment-specific configs
 
-9. **Job Dependencies** _(Covered in architecture.md and job-class.md)_ - waitfor_job and waitfor_group
+9. **Job Dependencies** _(Covered in [ARCHITECTURE.md](ARCHITECTURE.md))_ - waitfor_job and waitfor_group
    - Single job dependencies
    - Group dependencies (fan-out/fan-in)
    - Complex workflow examples
    - Best practices
 
-10. **Web Server Integration** _(Covered in jobsystem.md)_ - Direct HTTP job invocation
+10. **Web Server Integration** _(`web_listen` in the worker config)_ - Direct HTTP job invocation
    - Configuration and setup
    - Job web() method
    - Load balancing strategies
    - Security considerations
 
-11. **Retry and Backoff** _(Covered in job-class.md)_ - Automatic error handling
+11. **Retry and Backoff** _(Covered in [writing-jobs.md](writing-jobs.md))_ - Automatic error handling
    - Exponential backoff algorithm
    - Custom retry logic
    - Manual rescheduling
@@ -413,10 +413,10 @@ Inspired by:
 
 ## Next Steps
 
-1. Read [Architecture Overview](architecture.md) for system design
+1. Read [Architecture](ARCHITECTURE.md) for system design
 2. Follow [Deployment Guide](deployment-guide.md) to get started
-3. Study [Job Class](job-class.md) to write your first job
-4. Review [Database Schema](database-schema.md) for job submission
-5. Check [JobSystem](jobsystem.md) for advanced features
+3. Study [Writing Jobs](writing-jobs.md) to write your first job
+4. Review [Client Library](CLIENT_LIBRARY.md) for job submission
+5. Check [DXE.md](DXE.md) for durable execution: checkpoints, fencing, exactly-once
 
 Happy job processing! 🚀

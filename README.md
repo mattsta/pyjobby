@@ -355,7 +355,7 @@ Reference:
 - [ADMIN_TOOLS.md](docs/ADMIN_TOOLS.md) - CLI, Web UI, and Admin API
 - [RECURRING_SCHEDULER.md](docs/RECURRING_SCHEDULER.md) - Cron scheduling guide
 - [WEBSOCKET_DASHBOARD.md](docs/WEBSOCKET_DASHBOARD.md) - Realtime websocket dashboard
-- [ARCHITECTURE_CAPABILITIES.md](docs/ARCHITECTURE_CAPABILITIES.md) - System design
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) - What the moving parts are and why
 - [TESTING.md](docs/TESTING.md) - How the suite is structured, and why coverage
   is a diagnostic rather than a target
 
@@ -650,7 +650,7 @@ await client.enqueue("TrainModel", capability="gpu", model="resnet50")
 - **[Real-World Examples](docs/EXAMPLES.md)** - Web apps, ETL pipelines, image processing, email campaigns, etc.
 - **[Admin Tools](docs/ADMIN_TOOLS.md)** - CLI, Web UI, and Admin API documentation
 - **[Recurring Scheduler](docs/RECURRING_SCHEDULER.md)** - Cron-based scheduling with safety features
-- **[Architecture & Capabilities](docs/ARCHITECTURE_CAPABILITIES.md)** - System design and technical details
+- **[Architecture](docs/ARCHITECTURE.md)** - Components, the life of a job, and the design principle behind the write path
 - **[Websocket Dashboard](docs/WEBSOCKET_DASHBOARD.md)** - Realtime event-stream dashboard (`pj-ws`)
 
 ---

@@ -900,4 +900,4 @@ await client.enqueue("GPUJob", capability="gpu", model=...)
 - [CLIENT_LIBRARY.md](CLIENT_LIBRARY.md) - Complete client API reference
 - [ADMIN_TOOLS.md](ADMIN_TOOLS.md) - CLI and web interface
 - [RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md) - Cron-based scheduling
-- [ARCHITECTURE_CAPABILITIES.md](ARCHITECTURE_CAPABILITIES.md) - System design
+- [ARCHITECTURE.md](ARCHITECTURE.md) - System design
