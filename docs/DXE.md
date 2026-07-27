@@ -32,7 +32,7 @@ class ChargeAndShip(Job):
 | `await self.sleep(seconds)` | `jorb_step` | the job resumes after the delay **without occupying a worker** |
 | `await self.set_event(key, value)` | `jorb_event` | a durable key/value another job or an operator can read |
 | `await self.get_event(key)` | `jorb_event` | reads one back — this job's, or another's by id. **Not a step**: an event is durable state, so reading it is a query, and recording the answer would freeze the first value read into every later replay |
-| `await self.send(job_id, msg)` / `await self.recv(topic)` | `jorb_mailbox` | a durable mailbox; each message is consumed exactly once |
+| `await self.send(job_id, msg)` / `await self.recv(topic)` | `jorb_mailbox` | a durable mailbox, **exactly-once on both ends**: a send commits with its checkpoint (it runs through `transaction()`), and a recv consumes and checkpoints in one statement — no crash timing can deliver twice, consume twice, or eat a message unrecorded |
 | `await self.compact()` | `jorb_step` | discards this job's checkpoint log and restarts its step sequence, bounding replay for a job that lives indefinitely |
 | `self.cancelled` | `jorb.cancel_requested` | cooperative cancellation for long synchronous loops |
 
@@ -356,8 +356,12 @@ returns, and it tries to write results for a job another worker has taken over.
 
 `jorb.run_epoch` is the fencing token that makes those writes impossible.
 
-* It **advances whenever the job enters an attempt** (claim) **or is abandoned
-  by one** (retry, monitor requeue, operator requeue).
+* It **advances whenever the job enters an attempt** (claim) **or leaves
+  one** — finish, crash, cancel, retry, reschedule, monitor requeue, operator
+  requeue. Leaving covers the terminal writes too: the execution a terminal
+  state ends may still be alive (a synchronous task in a thread is
+  unstoppable), and it must not keep writing checkpoints, events, or mail
+  for a job the platform has moved past.
 * It is **not an attempt counter** — `run_count` is. It is monotonic and
   carries no other meaning.
 * Every state-changing statement carries `AND run_epoch = $n`, so a statement
@@ -404,8 +408,11 @@ step the old attempts completed.
 
    That window is narrow but real, and it is inherent to any step whose work
    happens outside the checkpoint's transaction — calling an external API,
-   sending mail, writing to another database. For those, `step()` is
-   **at-least-once**, and the step should be made idempotent by the caller.
+   writing to another database. For those, `step()` is **at-least-once**, and
+   the step should be made idempotent by the caller. (The built-in mailbox
+   primitives are NOT in this class: `send()` runs through `transaction()`,
+   and `recv()` consumes and checkpoints in one statement, so both are
+   exactly-once.)
 
    For work against *this* database the window is closed, not merely narrow:
    `transaction()` writes the effect and the checkpoint in one transaction on

@@ -22,6 +22,60 @@ import asyncpg  # type: ignore[import-untyped]
 from pyjobby.pj import STMTS, Job
 
 
+class _ConnStatement:
+    """A prepared-statement stand-in bound to ONE connection.
+
+    ``transaction()`` records its checkpoint through
+    ``self.s.stmts["record-step"].fetch(...)`` precisely so the write joins
+    the transaction already open on the worker's connection; a stand-in that
+    routed through a pool would commit the checkpoint outside that
+    transaction and silently void the atomicity under test.
+    """
+
+    def __init__(self, conn: asyncpg.Connection, sql: str) -> None:
+        self._conn = conn
+        self._sql = sql
+
+    async def fetch(self, *args: Any) -> list[asyncpg.Record]:
+        return list(await self._conn.fetch(self._sql, *args))
+
+
+class ConnectionBoundSystem:
+    """``PoolBoundSystem``'s sibling for primitives that need a CONNECTION.
+
+    ``transaction()`` — and ``send()``, which runs through it — uses
+    ``s.cxn`` for its transaction scope and ``s.stmts`` for the atomic
+    checkpoint write. Everything else still goes through ``ex``, on the
+    same connection, so a test drives exactly the statements the worker
+    would issue in exactly the transaction scopes it would issue them in.
+    """
+
+    def __init__(self, conn: asyncpg.Connection) -> None:
+        self.cxn = conn
+        self._cancel_current = False
+        self.stmts = {name: _ConnStatement(conn, sql) for name, sql in STMTS.items()}
+
+    async def ex(self, name: str, *args: Any) -> list[asyncpg.Record]:
+        return list(await self.cxn.fetch(STMTS[name], *args))
+
+
+async def connection_bound_job(
+    conn: asyncpg.Connection, job_row: Any, epoch: int | None = None
+) -> Job[Any]:
+    """A `Job` for `job_row` on one real connection, transaction-capable.
+
+    Same contract as ``bound_job`` — real statements, real rows, recorded
+    checkpoints loaded and bound — but ``transaction()`` and ``send()``
+    work, because the system exposes the connection they scope to.
+    """
+    system = ConnectionBoundSystem(conn)
+    job = Job(s=system, job=dict(job_row))  # type: ignore[arg-type]
+    resolved = job_row["run_epoch"] if epoch is None else epoch
+    checkpoints = await conn.fetch(STMTS["load-steps"], job_row["id"])
+    job._dxe_bind(list(checkpoints), resolved)
+    return job
+
+
 class PoolBoundSystem:
     """The slice of `JobSystem` the DXE primitives actually reach for.
 

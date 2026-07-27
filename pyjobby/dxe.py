@@ -177,16 +177,61 @@ SEND_SQL = """INSERT INTO jorb_mailbox (dest_job_id, topic, message)
         WHERE EXISTS (SELECT 1 FROM jorb WHERE id = $4 AND run_epoch = $5)
         RETURNING id"""
 
-# Consume exactly one pending message (oldest first) for this job/topic.
-RECV_SQL = """UPDATE jorb_mailbox
-        SET consumed_at = now()
-        WHERE id = (
-            SELECT id FROM jorb_mailbox
-            WHERE dest_job_id = $1
-              AND ($2::text IS NULL OR topic = $2)
-              AND consumed_at IS NULL
-            ORDER BY id
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1
+# Consume one pending message (oldest first) AND checkpoint it, atomically.
+#
+# One statement, because a consumed-but-unrecorded message is a lost message:
+# the consume stamps the only copy, and only the checkpoint lets a retry see
+# it again. Two commits would leave a crash window between them; a single
+# statement has none.
+#
+# Fenced on the consumer's own epoch, exactly like SEND_SQL is fenced on the
+# sender's: a superseded execution must not eat a message the live attempt
+# is entitled to. `fenced` is returned separately so the caller can tell
+# "superseded" from "mailbox empty" — those need opposite responses.
+#
+# The `prior` guard makes the statement idempotent: if this (job, seq)
+# already has a successful checkpoint — a replay after a commit raced a lost
+# connection — nothing is consumed and the recorded answer comes back. The
+# recorded answer may itself be NULL (a timed-out recv), which is why
+# `replayed` is a separate flag rather than inferred from the output.
+#
+# Params: $1 dest/consumer job id, $2 step seq, $3 topic, $4 step name,
+#         $5 run_epoch, $6 started timestamp.
+RECV_SQL = """WITH prior AS (
+            SELECT output FROM jorb_step
+            WHERE job_id = $1 AND step_seq = $2 AND error IS NULL
+        ), fence AS (
+            SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $5
+        ), msg AS (
+            UPDATE jorb_mailbox
+            SET consumed_at = now()
+            WHERE id = (
+                SELECT id FROM jorb_mailbox
+                WHERE dest_job_id = $1
+                  AND ($3::text IS NULL OR topic = $3)
+                  AND consumed_at IS NULL
+                  AND EXISTS (SELECT 1 FROM fence)
+                  AND NOT EXISTS (SELECT 1 FROM prior)
+                ORDER BY id
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            )
+            RETURNING message
+        ), step AS (
+            INSERT INTO jorb_step
+                (job_id, step_seq, name, output, error, run_epoch,
+                 started, finished)
+            SELECT $1, $2, $4, msg.message, NULL, $5, $6, now() FROM msg
+            ON CONFLICT (job_id, step_seq) DO UPDATE
+                SET output = EXCLUDED.output,
+                    error = NULL,
+                    run_epoch = EXCLUDED.run_epoch,
+                    started = EXCLUDED.started,
+                    finished = EXCLUDED.finished
+            RETURNING 1
         )
-        RETURNING message"""
+        SELECT (SELECT count(*) FROM fence) AS fenced,
+               (SELECT count(*) FROM prior) AS replayed,
+               (SELECT output FROM prior) AS prior_output,
+               (SELECT count(*) FROM msg) AS consumed,
+               (SELECT message FROM msg) AS message"""

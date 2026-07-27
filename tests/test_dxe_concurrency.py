@@ -313,7 +313,9 @@ async def test_every_job_runs_exactly_once_across_four_workers(
     ]
     assert [r["result"] for r in rows] == [{"doubled": n * 2} for n in range(12)]
     assert [r["run_count"] for r in rows] == [1] * 12
-    assert [r["run_epoch"] for r in rows] == [1] * 12
+    # each ran exactly one attempt at epoch 1; each terminal write then
+    # advanced the fence one past it
+    assert [r["run_epoch"] for r in rows] == [2] * 12
     assert [r["error_count"] for r in rows] == [0] * 12
 
     counts = await db_pool.fetch(
@@ -392,7 +394,8 @@ async def test_stale_execution_cannot_overwrite_the_winning_result(
     row = await wait_for_job_state(db_pool, job_id, ("finished",), timeout=20)
     assert row["result"] == {"epoch": winner_epoch}  # B's result, never A's
     assert row["result"] != {"epoch": running["run_epoch"]}, "A's result won"
-    assert row["run_epoch"] == winner_epoch
+    # B's terminal write advanced the fence one past B's own epoch
+    assert row["run_epoch"] == winner_epoch + 1
     assert row["error_count"] == 0
 
     assert await history_events(db_pool, job_id) == [
@@ -441,7 +444,10 @@ async def test_cancel_mid_step_keeps_finished_checkpoints_and_records_no_more(
     assert await db.cancel_job(db_pool, job_id) == "cancel_requested"
 
     row = await wait_for_job_state(db_pool, job_id, ("cancelled",), timeout=15)
-    assert row["run_epoch"] == 1
+    # the attempt ran at epoch 1; the cancel fenced it out by advancing to 2
+    # ("honored" is the worker's view — a thread that ignored the
+    # cancellation must not keep writing checkpoints for a cancelled job)
+    assert row["run_epoch"] == 2
     assert row["error_count"] == 0
     assert row["cancel_requested"] is True
     assert row["finished"] > row["started"]
@@ -498,7 +504,10 @@ async def test_cancel_during_durable_sleep_is_immediate_and_keeps_checkpoint(
     row = await db_pool.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
     assert row["state"] == "cancelled"
     assert row["run_count"] == 1
-    assert row["run_epoch"] == 1
+    # the sleeping attempt ran at epoch 1 and its self-reschedule advanced
+    # the fence to 2 on its way out; cancelling a QUEUED row (no execution
+    # to fence) advances nothing further
+    assert row["run_epoch"] == 2
     assert row["cancel_requested"] is False  # the queued path never asks nicely
 
     sleep_steps = await db_pool.fetch(
@@ -528,7 +537,7 @@ async def test_cancel_during_durable_sleep_is_immediate_and_keeps_checkpoint(
     assert (after["state"], after["run_count"], after["run_epoch"]) == (
         "cancelled",
         1,
-        1,
+        2,  # the sleeping attempt's self-reschedule advanced the fence
     )
     assert await history_events(db_pool, job_id) == [
         "enqueued",

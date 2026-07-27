@@ -141,9 +141,18 @@ STMTS["set-timeout"] = """UPDATE jorb
 
 # Terminal success. Epoch-fenced: if the reaper or an operator requeued this
 # job while we ran, our (stale) completion is a no-op.
+#
+# Every transition OUT of an attempt (finished/crashed/cancelled/retry/
+# reschedule) advances run_epoch, for the reason db.build_requeue_sql
+# documents: statements guarded ONLY by the epoch — checkpoints, events,
+# mailbox sends, set-timeout — must stop applying the moment the row leaves
+# the attempt, and a state guard alone does not stop them. The concrete
+# leak this closes: a synchronous job thread the worker had to abandon is
+# unstoppable and still holds a then-valid epoch.
 STMTS["finished"] = """UPDATE jorb
               SET state = 'finished',
                   result = $2,
+                  run_epoch = run_epoch + 1,
                   finished = now(),
                   timeout_at = NULL,
                   updated = now()
@@ -172,12 +181,14 @@ STMTS["retry"] = """UPDATE jorb
           RETURNING *"""
 
 # Terminal failure: retries exhausted (or on_timeout='fail'). state='crashed'
-# IS the dead letter queue.
+# IS the dead letter queue. Bumps run_epoch (see STMTS["finished"]): the
+# execution being dead-lettered may still be alive in a thread.
 STMTS["crashed"] = """UPDATE jorb
               SET state = 'crashed',
                   error_message = $2,
                   error_backtrace = $3,
                   error_count = error_count + 1,
+                  run_epoch = run_epoch + 1,
                   finished = now(),
                   timeout_at = NULL,
                   updated = now()
@@ -186,9 +197,13 @@ STMTS["crashed"] = """UPDATE jorb
                 AND run_epoch = $4
           RETURNING *"""
 
-# A running job whose cancellation was requested and honored.
+# A running job whose cancellation was requested and honored. Bumps
+# run_epoch (see STMTS["finished"]): "honored" is the worker's view — a
+# synchronous task that ignored the cancellation is still running in its
+# thread, and this is what fences its writes out.
 STMTS["cancelled"] = """UPDATE jorb
               SET state = 'cancelled',
+                  run_epoch = run_epoch + 1,
                   finished = now(),
                   timeout_at = NULL,
                   updated = now()
@@ -202,8 +217,13 @@ STMTS["cancelled"] = """UPDATE jorb
 # state-changing write: a superseded attempt must not be able to requeue a
 # job the live attempt is still running (the winner's fenced completion
 # would then no-op and its result would be lost).
+# Bumps run_epoch (see STMTS["finished"]): the row is back in the queue the
+# moment this commits, so the execution that asked to be rescheduled is no
+# longer entitled to write — "run me again later, from the top" abandons
+# the current attempt by definition.
 STMTS["reschedule"] = """UPDATE jorb
               SET state = 'queued',
+                  run_epoch = run_epoch + 1,
                   run_after = now() + $2::interval,
                   updated = now()
               WHERE id = $1
@@ -1804,11 +1824,18 @@ class Job:
         self, dest_job_id: int, message: Any, topic: str | None = None
     ) -> None:
         """Send a durable message to another job's mailbox — exactly once
-        across retries (the send is a checkpointed step)."""
+        across retries.
 
-        async def _do_send() -> int | None:
-            rows = await self.s.ex(
-                "send",
+        The mailbox insert is a write to this same database, which is
+        precisely the case ``transaction()`` exists for: the insert and its
+        checkpoint commit together, so there is no crash window in which the
+        message was delivered but unrecorded (a retry would re-send) or
+        recorded but undelivered. The insert is additionally fenced on the
+        SENDER's epoch, so a superseded execution delivers nothing."""
+
+        async def _do_send(conn: asyncpg.Connection) -> int:
+            rows = await conn.fetch(
+                dxe.SEND_SQL,
                 dest_job_id,
                 topic,
                 message,
@@ -1821,7 +1848,7 @@ class Job:
                 )
             return int(rows[0]["id"])
 
-        await self.step(f"dxe.send:{dest_job_id}:{topic or ''}", _do_send)
+        await self.transaction(f"dxe.send:{dest_job_id}:{topic or ''}", _do_send)
 
     async def recv(
         self,
@@ -1830,8 +1857,15 @@ class Job:
         poll_interval: float = 0.25,
     ) -> Any | None:
         """Await one durable message for this job (oldest first), or None on
-        timeout. The consumed message is checkpointed, so a retry of this
-        job sees the same message again instead of consuming a second one."""
+        timeout. Consuming a message and checkpointing it are ONE statement,
+        so there is no crash window in which a message was consumed but not
+        recorded: a retry of this job either replays the recorded message or
+        finds it still pending — never neither. The consume is fenced on this
+        execution's epoch, so a superseded attempt cannot eat a message the
+        live attempt is entitled to.
+
+        A recv that times out records None as this call site's answer; on
+        replay that recorded None comes back without waiting again."""
         seq = self._dxe_next_seq()
         prior = self._dxe_steps.get(seq)
         name = f"dxe.recv:{topic or ''}"
@@ -1845,32 +1879,53 @@ class Job:
             if prior["error"] is None:
                 return prior["output"]
 
-        deadline = db.utcnow() + datetime.timedelta(seconds=timeout)
-        message: Any | None = None
+        started = db.utcnow()
+        deadline = started + datetime.timedelta(seconds=timeout)
         while True:
-            rows = await self.s.ex("recv", self.job["id"], topic)
-            if rows:
-                message = rows[0]["message"]
-                break
+            row = (
+                await self.s.ex(
+                    "recv",
+                    self.job["id"],
+                    seq,
+                    topic,
+                    name,
+                    self._dxe_epoch,
+                    started,
+                )
+            )[0]
+            if not row["fenced"]:
+                raise dxe.StaleExecutionError(
+                    f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
+                )
+            if row["replayed"]:
+                # this seq already holds a committed answer (a lost
+                # connection raced an earlier commit of this very call);
+                # nothing was consumed just now
+                return row["prior_output"]
+            if row["consumed"]:
+                return row["message"]
             if db.utcnow() >= deadline:
                 break
             await asyncio.sleep(poll_interval)
 
+        # Timed out with nothing pending: record None as this call site's
+        # durable answer. There is no effect to pair with, so the plain
+        # (fenced, idempotent) checkpoint write suffices.
         recorded = await self.s.ex(
             "record-step",
             self.job["id"],
             seq,
             name,
-            message,
+            None,
             None,
             self._dxe_epoch,
-            db.utcnow(),
+            started,
         )
         if not recorded:
             raise dxe.StaleExecutionError(
                 f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
             )
-        return message
+        return None
 
     async def rescheduleBackoff(self, attempt: int | None = None) -> datetime.timedelta:
         """Calculate this job's retry delay from its admin_data strategy.

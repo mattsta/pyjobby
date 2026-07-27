@@ -71,8 +71,11 @@ whose keys it is already holding. Measured on four of these sweeps, at
 delete rows it had already identified — and it grows with the table forever,
 while a batch does not.
 
-Requeues bump nothing themselves: the next claim increments ``run_epoch``,
-which fences any still-running stale execution out of the row.
+Every requeue and every dead-letter here bumps ``run_epoch`` itself (see
+db.build_requeue_sql for the argument): the abandoned execution may still be
+running, and epoch-only-guarded writes — checkpoints, events, mailbox sends —
+must stop applying the moment the row leaves its attempt, not at the next
+claim.
 
 Run it: ``pj-monitor --config ./pyjobby.conf.py`` (one instance is enough;
 several are safe — every sweep is a single atomic statement or a
@@ -440,6 +443,40 @@ SWEEP_MAILBOX_SQL = """
 #: ...and the delete, by the primary key's leading column.
 DELETE_MAILBOX_SQL = "DELETE FROM jorb_mailbox WHERE id = ANY($1::bigint[])"
 
+#: Requeue one timed-out job for another attempt. Bumps run_epoch: the
+#: execution that blew the deadline may still be running, and its
+#: epoch-only-guarded writes must stop applying now, not at the next claim.
+#: ($1 job_id, $2 error message, $3 retry delay interval)
+RETRY_TIMED_OUT_SQL = """
+    UPDATE jorb
+    SET state = 'queued',
+        run_epoch = run_epoch + 1,
+        timeout_at = NULL,
+        error_count = error_count + 1,
+        error_message = $2,
+        run_after = now() + $3::interval,
+        updated = now()
+    WHERE id = $1
+      AND state = 'running'
+"""
+
+#: Dead-letter one timed-out job (retries exhausted or on_timeout='fail').
+#: Bumps run_epoch for the same reason RETRY_TIMED_OUT_SQL does — this is
+#: the abandonment with the LONGEST-lived zombie, since nothing will ever
+#: reclaim the row and re-fence it. ($1 job_id, $2 error message)
+DEADLETTER_TIMED_OUT_SQL = """
+    UPDATE jorb
+    SET state = 'crashed',
+        run_epoch = run_epoch + 1,
+        timeout_at = NULL,
+        error_count = error_count + 1,
+        error_message = $2,
+        finished = now(),
+        updated = now()
+    WHERE id = $1
+      AND state = 'running'
+"""
+
 
 async def handle_timed_out_job(
     conn: asyncpg.Pool | asyncpg.Connection,
@@ -469,18 +506,7 @@ async def handle_timed_out_job(
         retry_delay = calculate_retry_from_job(dict(job), attempt)
 
         await conn.execute(
-            """
-            UPDATE jorb
-            SET state = 'queued',
-                run_epoch = run_epoch + 1,
-                timeout_at = NULL,
-                error_count = error_count + 1,
-                error_message = $2,
-                run_after = now() + $3::interval,
-                updated = now()
-            WHERE id = $1
-              AND state = 'running'
-            """,
+            RETRY_TIMED_OUT_SQL,
             job_id,
             "Timeout exceeded - retrying",
             retry_delay,
@@ -493,17 +519,7 @@ async def handle_timed_out_job(
         reason = "max retries exceeded" if attempt >= max_retries else "on_timeout=fail"
 
         await conn.execute(
-            """
-            UPDATE jorb
-            SET state = 'crashed',
-                timeout_at = NULL,
-                error_count = error_count + 1,
-                error_message = $2,
-                finished = now(),
-                updated = now()
-            WHERE id = $1
-              AND state = 'running'
-            """,
+            DEADLETTER_TIMED_OUT_SQL,
             job_id,
             f"Timeout exceeded - dead-lettered ({reason})",
         )

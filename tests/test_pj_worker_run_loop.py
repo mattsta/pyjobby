@@ -184,7 +184,8 @@ class TestWorkerRunLoop:
         job = await wait_for_job_state(db_pool, job_id, ("finished",))
         assert job["result"] == "quick: test1"
         assert job["run_count"] == 1
-        assert job["run_epoch"] == 1
+        # claimed at epoch 1; the terminal write advanced the fence to 2
+        assert job["run_epoch"] == 2
         assert job["worker_pid"] is not None
 
     async def test_worker_processes_multiple_jobs(
@@ -281,7 +282,9 @@ class TestWorkerTimeoutHandling:
         # first timeout dead-letters immediately (no retry allowed)
         job = await wait_for_job_state(db_pool, job_id, ("crashed",), timeout=15)
         assert job["error_count"] == 1
-        assert job["run_epoch"] == 1
+        # dead-lettering fences out the abandoned (possibly still running)
+        # execution by advancing the epoch past the attempt's own
+        assert job["run_epoch"] == 2
 
         # never requeued: no 'queued' transition after the initial enqueue
         requeues = await db_pool.fetchval(

@@ -32,6 +32,7 @@ import re
 
 import pytest
 
+from pyjobby.db import build_requeue_sql
 from pyjobby.lifecycle import (
     JOB_STATES,
     LEGAL_TRANSITIONS,
@@ -40,6 +41,7 @@ from pyjobby.lifecycle import (
     illegal_transitions,
     is_legal,
 )
+from pyjobby.monitor import DEADLETTER_TIMED_OUT_SQL, RETRY_TIMED_OUT_SQL
 from pyjobby.pj import STMTS
 
 #: `SET state = 'x'` — what a statement moves a job TO.
@@ -105,6 +107,41 @@ def test_no_statement_realises_an_undeclared_transition(statement):
         f"STMTS[{statement!r}] moves {illegal} -> {target!r}, which "
         f"pyjobby.lifecycle.LEGAL_TRANSITIONS does not permit"
     )
+
+
+def test_every_statement_leaving_an_attempt_bumps_the_fence():
+    """Any transition OUT of claimed/running advances ``run_epoch``.
+
+    Leaving those states ends or abandons the current execution — and that
+    execution may still be alive (an unstoppable synchronous thread, a
+    worker mid-crash). Statements guarded ONLY by the epoch — checkpoints,
+    events, mailbox sends, set-timeout — must stop applying the moment the
+    row leaves the attempt, and a state guard alone does not stop them.
+    The rule is stated in ``db.build_requeue_sql``'s docstring and in the
+    schema's ``run_epoch`` comment; this makes it structural: a new
+    statement that forgets the bump fails here.
+    """
+    attempt_states = {"claimed", "running"}
+    leaving = {
+        name
+        for name, (sources, target) in statement_transitions().items()
+        if sources <= attempt_states and target not in attempt_states
+    }
+    assert {"finished", "retry", "crashed", "cancelled", "reschedule"} <= leaving
+    for name in leaving:
+        assert "run_epoch = run_epoch + 1" in STMTS[name], (
+            f"STMTS[{name!r}] moves a job out of its attempt without "
+            f"advancing run_epoch; the abandoned execution's epoch-guarded "
+            f"writes would keep applying"
+        )
+    # The monitor's two timeout outcomes and the shared operator requeue
+    # leave an attempt the same way and follow the same rule.
+    for sql in (
+        RETRY_TIMED_OUT_SQL,
+        DEADLETTER_TIMED_OUT_SQL,
+        build_requeue_sql(("crashed",)),
+    ):
+        assert "run_epoch = run_epoch + 1" in sql
 
 
 def test_every_declared_state_is_reachable_and_leaves_somewhere():

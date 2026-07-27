@@ -33,7 +33,8 @@ async def test_success_path_records_full_history(live_worker, unique_queue, db_p
     assert row["result"] == {"doubled": 42}
     assert row["started"] is not None
     assert row["finished"] is not None
-    assert row["run_epoch"] == 1
+    # the attempt ran at epoch 1; its terminal write advanced the fence to 2
+    assert row["run_epoch"] == 2
 
     events = [
         r["event"]

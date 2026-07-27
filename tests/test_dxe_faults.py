@@ -28,13 +28,17 @@ import datetime
 
 import pytest
 
-from pyjobby import db
-from pyjobby.monitor import sweep_dead_workers, sweep_unregistered_claims
+from pyjobby import db, dxe
+from pyjobby.monitor import (
+    handle_timed_out_job,
+    sweep_dead_workers,
+    sweep_unregistered_claims,
+)
 from pyjobby.pj import STMTS, Job
 from pyjobby.procs import spawn, terminate, wait_until
 
 from .conftest import wait_for_job_state
-from .utils.dxe import bound_job
+from .utils.dxe import bound_job, connection_bound_job
 from .utils.faults import (
     age_claim,
     age_worker_heartbeats,
@@ -207,9 +211,11 @@ async def test_worker_reconnects_after_its_backends_are_killed_mid_job(
     assert await kill_backends(db_pool, worker_pids) == 2
 
     # the SAME attempt still records its result once the worker reconnects
+    # (the result proves it ran at epoch 1; the terminal write then advanced
+    # the row's fence one past the attempt)
     row = await wait_for_job_state(db_pool, job_id, ("finished",), timeout=30)
     assert row["result"] == {"marker": "survivor", "epoch": 1}
-    assert row["run_epoch"] == 1
+    assert row["run_epoch"] == 2
     assert row["run_count"] == 1
     assert row["error_count"] == 0
     assert await history_events(db_pool, job_id) == [
@@ -320,7 +326,9 @@ async def test_sigkilled_worker_is_reclaimed_and_resumes_from_its_checkpoint(
         "first": {"stamp": "first-done"},
         "second": {"stamp": "second-done"},
     }
-    recovery_epoch = row["run_epoch"]
+    # the terminal write advances the fence one past the attempt that ran,
+    # so the recovery attempt's own epoch is the row's final epoch minus one
+    recovery_epoch = row["run_epoch"] - 1
     assert recovery_epoch > requeued["run_epoch"]
     assert row["error_count"] == 0
 
@@ -459,7 +467,9 @@ async def test_kill_between_the_write_and_the_checkpoint(
     assert [(s["step_seq"], s["name"], s["error"]) for s in steps] == [
         (1, "write", None)
     ]
-    assert steps[0]["run_epoch"] == row["run_epoch"]
+    # the checkpoint carries the epoch of the attempt that recorded it; the
+    # terminal write then advanced the row's fence one past it
+    assert steps[0]["run_epoch"] == row["run_epoch"] - 1
 
 
 # ============================================================================
@@ -526,7 +536,7 @@ async def test_unregistered_claim_is_reclaimed_only_after_the_grace_period(
 #: testable rather than aspirational.
 EPOCH_FENCED = ("run", "set-timeout", "finished", "retry", "crashed", "cancelled")
 
-STALE_WRITE_CASES = (*EPOCH_FENCED, "record-step", "set-event", "send")
+STALE_WRITE_CASES = (*EPOCH_FENCED, "record-step", "set-event", "send", "recv")
 
 
 async def apply_fenced_statement(pool, name: str, job_id: int, epoch: int) -> int:
@@ -576,6 +586,22 @@ async def apply_fenced_statement(pool, name: str, job_id: int, epoch: int) -> in
             STMTS[name], job_id, "stale-topic", {"v": 1}, job_id, epoch
         )
         return len(rows)
+    if name == "recv":
+        # a pending message must exist so the live control has something to
+        # consume; the stale attempt must leave it untouched
+        await pool.execute(
+            "INSERT INTO jorb_mailbox (dest_job_id, topic, message)"
+            " VALUES ($1, $2, $3)",
+            job_id,
+            "fence",
+            {"v": 1},
+        )
+        row = (
+            await pool.fetch(
+                STMTS[name], job_id, 1, "fence", "dxe.recv:fence", epoch, db.utcnow()
+            )
+        )[0]
+        return int(row["consumed"])
     raise AssertionError(f"unhandled statement {name}")
 
 
@@ -606,6 +632,10 @@ async def test_every_state_changing_statement_carries_the_fence():
     # checkpoint -- the effect escaping while the record of it was refused.
     assert "run_epoch = $4" in STMTS["set-event"]
     assert "run_epoch = $5" in STMTS["send"]
+    # recv was the LAST durable-mailbox write with no fence: a superseded
+    # execution could consume (and then fail to checkpoint) a message the
+    # live attempt was entitled to -- the message eaten by a zombie.
+    assert "run_epoch = $5" in STMTS["recv"]
 
 
 @pytest.mark.parametrize("statement", STALE_WRITE_CASES)
@@ -828,3 +858,163 @@ async def test_live_attempt_can_still_reschedule_itself(db_pool, unique_queue):
     row = await db_pool.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
     assert row["state"] == "queued"
     assert row["run_after"] > row["started"]
+
+
+# ============================================================================
+# 13. the mailbox has no crash window and no zombie window
+# ============================================================================
+
+
+async def test_recv_consume_and_checkpoint_are_one_statement(db_pool, unique_queue):
+    """Replaying recv's statement at the same seq fast-forwards; it never
+    consumes a second message.
+
+    Consume and checkpoint commit together in one statement, so re-executing
+    it — a reconnect replaying a statement whose reply was lost, or a retry
+    reaching the same call site — finds the recorded answer instead of
+    eating the next message. This is the property that makes a worker crash
+    unable to lose mail: there is no state in which a message is consumed
+    but unrecorded.
+    """
+    job_id = await enqueue(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {"x": 1})
+    claimed = await claim_once(db_pool, unique_queue)
+    epoch = claimed["run_epoch"]
+    for n in (1, 2):
+        await db_pool.execute(
+            "INSERT INTO jorb_mailbox (dest_job_id, message) VALUES ($1, $2)",
+            job_id,
+            {"n": n},
+        )
+
+    first = (
+        await db_pool.fetch(
+            STMTS["recv"], job_id, 1, None, "dxe.recv:", epoch, db.utcnow()
+        )
+    )[0]
+    assert first["fenced"] == 1
+    assert first["consumed"] == 1
+    assert first["message"] == {"n": 1}
+
+    replay = (
+        await db_pool.fetch(
+            STMTS["recv"], job_id, 1, None, "dxe.recv:", epoch, db.utcnow()
+        )
+    )[0]
+    assert replay["replayed"] == 1
+    assert replay["prior_output"] == {"n": 1}
+    assert replay["consumed"] == 0
+
+    # the second message is still pending — the replay ate nothing
+    pending = await db_pool.fetchval(
+        "SELECT count(*) FROM jorb_mailbox"
+        " WHERE dest_job_id = $1 AND consumed_at IS NULL",
+        job_id,
+    )
+    assert pending == 1
+
+    step = await db_pool.fetchrow(
+        "SELECT name, output FROM jorb_step WHERE job_id = $1 AND step_seq = 1",
+        job_id,
+    )
+    assert step["name"] == "dxe.recv:"
+    assert step["output"] == {"n": 1}
+
+
+async def test_send_and_its_checkpoint_commit_together(db_pool, unique_queue):
+    """send() is exactly-once: delivery and checkpoint are one commit, and a
+    replay of the same call site fast-forwards instead of re-sending."""
+    job_id = await enqueue(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {"x": 1})
+    claimed = await claim_once(db_pool, unique_queue)
+
+    async with db_pool.acquire() as conn:
+        job = await connection_bound_job(conn, claimed)
+        await job.send(job_id, {"hello": 1}, topic="t")
+
+        delivered = await conn.fetch(
+            "SELECT id, message FROM jorb_mailbox WHERE dest_job_id = $1", job_id
+        )
+        assert [r["message"] for r in delivered] == [{"hello": 1}]
+        step = await conn.fetchrow(
+            "SELECT name, output FROM jorb_step WHERE job_id = $1", job_id
+        )
+        assert step["name"] == f"dxe.send:{job_id}:t"
+        assert step["output"] == delivered[0]["id"]
+
+        # a retried attempt reaches the same call site: the recorded
+        # checkpoint answers and no second message is delivered
+        retried = await connection_bound_job(conn, claimed)
+        await retried.send(job_id, {"hello": 1}, topic="t")
+        count = await conn.fetchval(
+            "SELECT count(*) FROM jorb_mailbox WHERE dest_job_id = $1", job_id
+        )
+        assert count == 1
+
+
+async def test_superseded_send_delivers_nothing_and_records_nothing(
+    db_pool, unique_queue
+):
+    """A zombie's send is refused ATOMICALLY: no mailbox row escapes and no
+    checkpoint claims one did — the rollback takes both."""
+    job_id, stale, _current = await superseded_job(db_pool, unique_queue)
+    row = await db_pool.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+
+    async with db_pool.acquire() as conn:
+        zombie = await connection_bound_job(conn, row, epoch=stale)
+        with pytest.raises(dxe.StaleExecutionError):
+            await zombie.send(job_id, {"from": "zombie"}, topic="t")
+
+    assert (
+        await db_pool.fetchval(
+            "SELECT count(*) FROM jorb_mailbox WHERE dest_job_id = $1", job_id
+        )
+        == 0
+    )
+    assert (
+        await db_pool.fetchval(
+            "SELECT count(*) FROM jorb_step WHERE job_id = $1", job_id
+        )
+        == 0
+    )
+
+
+async def test_dead_lettering_fences_the_execution_it_abandons(db_pool, unique_queue):
+    """The monitor's dead-letter write bumps run_epoch, so the timed-out
+    execution — possibly still alive in an unstoppable thread — can no
+    longer write checkpoints, events, or mail for a job the platform has
+    given up on. (Its retry sibling always did this; the dead-letter path
+    is the abandonment with the longest-lived zombie, since nothing will
+    ever reclaim the row and re-fence it.)"""
+    job_id = await enqueue(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {"x": 1})
+    claimed = await claim_once(db_pool, unique_queue)
+    epoch = claimed["run_epoch"]
+    started = await db_pool.fetch(STMTS["run"], job_id, epoch)
+    assert [r["state"] for r in started] == ["running"]
+
+    await handle_timed_out_job(
+        db_pool, job_id, "tests.dxe_jobs.OkJob", {"on_timeout": "fail"}, 0
+    )
+
+    row = await db_pool.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+    assert row["state"] == "crashed"
+    assert row["run_epoch"] > epoch
+
+    # the abandoned execution's epoch-only-guarded writes are all refused
+    assert (
+        await db_pool.fetch(
+            STMTS["set-event"], job_id, "zombie", {"v": 1}, epoch
+        )
+        == []
+    )
+    assert (
+        await db_pool.fetch(
+            STMTS["record-step"],
+            job_id,
+            1,
+            "zombie-step",
+            {"v": 1},
+            None,
+            epoch,
+            db.utcnow(),
+        )
+        == []
+    )

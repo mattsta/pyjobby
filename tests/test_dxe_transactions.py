@@ -240,7 +240,9 @@ async def test_stale_epoch_rolls_back_the_transactions_write(
     assert [(s["step_seq"], s["name"], s["output"], s["error"]) for s in steps] == [
         (1, "write", {"attempt": 2}, None)
     ]
-    assert steps[0]["run_epoch"] == row["run_epoch"]
+    # the checkpoint carries the recording attempt's epoch; the terminal
+    # write then advanced the row's fence one past it
+    assert steps[0]["run_epoch"] == row["run_epoch"] - 1
 
 
 # ============================================================================
@@ -280,7 +282,9 @@ async def test_failed_transaction_rolls_back_its_write_and_records_the_error(
     assert step["name"] == "write"
     assert step["output"] is None
     assert step["error"] == "RuntimeError: boom after the write"
-    assert step["run_epoch"] == row["run_epoch"]
+    # the error checkpoint carries the failing attempt's epoch; dead-lettering
+    # then advanced the row's fence one past it
+    assert step["run_epoch"] == row["run_epoch"] - 1
 
 
 async def test_failed_transaction_re_executes_on_the_next_attempt(

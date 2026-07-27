@@ -265,7 +265,8 @@ async def test_a_swallowed_deadline_dead_letters_under_on_timeout_fail(
         "Timeout error - job exceeded maximum execution time"
     )
     assert row["error_count"] == 1
-    assert row["run_epoch"] == 1
+    # dead-lettering fences out the abandoned execution (epoch 1 -> 2)
+    assert row["run_epoch"] == 2
     assert row["timeout_at"] is None
 
     # the job really did catch its cancellation, once, at the deadline
@@ -339,7 +340,8 @@ async def test_cleaning_up_and_re_raising_behaves_exactly_as_before(
     assert row["result"] is None
     assert row["error_message"] == "Job timed out after 1s"
     assert row["error_count"] == 1
-    assert row["run_epoch"] == 1
+    # dead-lettering fences out the abandoned execution (epoch 1 -> 2)
+    assert row["run_epoch"] == 2
 
     assert CLEANED[job_id] == ["closed"]  # cleanup ran, once
     assert len(CAUGHT[job_id]) == 1

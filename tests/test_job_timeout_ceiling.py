@@ -306,7 +306,8 @@ async def test_a_synchronous_timeout_can_dead_letter_on_the_first_overrun(
     row = await wait_for_job_state(db_pool, job_id, ("crashed",), timeout=20)
     assert row["error_message"] == "Job timed out after 1s"
     assert row["error_count"] == 1
-    assert row["run_epoch"] == 1
+    # dead-lettering fences out the abandoned execution (epoch 1 -> 2)
+    assert row["run_epoch"] == 2
 
     requeued = await db_pool.fetchval(
         "SELECT count(*) FROM jorb_history WHERE job_id = $1 AND event = 'queued'",
