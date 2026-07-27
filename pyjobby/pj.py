@@ -53,6 +53,7 @@ from aiohttp import web
 from loguru import logger
 
 from . import db, dxe
+from .client import DEFAULT_PRIO_CEILING
 from .configloader import load_config_from_file
 
 fmt = (
@@ -99,6 +100,19 @@ STMTS: dict[str, str] = {}
 # superseded execution from writing results/checkpoints later.
 # Argument order is the worker's, not the function's.
 STMTS["claim"] = """SELECT * FROM claim_jorb($3, $4::text[], $5, $1, $2, $6)"""
+
+# Runnable work in this queue that this worker's ceiling hides from it.
+# Only ever run by an IDLE worker, at most once a minute (see
+# _report_unclaimable_priorities): a job above every live worker's ceiling
+# is otherwise completely silent -- queued forever, never failing, absent
+# from the DLQ -- so this is the one place the platform can notice it.
+# Served by jorb_claim_idx (queue, prio, run_after) WHERE state = 'queued'.
+STMTS["above-ceiling"] = """SELECT count(*) AS above, min(prio) AS lowest
+                              FROM jorb
+                             WHERE queue = $1
+                               AND state = 'queued'
+                               AND prio > $2
+                               AND run_after <= now()"""
 
 STMTS["get"] = """SELECT * FROM jorb
                      WHERE id = $1
@@ -287,7 +301,11 @@ class JobSystem:
     workerId: int
     checkInterval: float = 5  # seconds
     webPort: dict[str, list[dict[str, Any]] | set[str]] | None = None
-    prio: int = 1000
+    # This worker's priority CEILING: it claims jobs with prio <= this and
+    # is blind to everything above it (lower prio is more urgent). Set from
+    # `pj --max-prio`; the default is shared with the client, which refuses
+    # to enqueue above it (see client.DEFAULT_PRIO_CEILING).
+    prio: int = DEFAULT_PRIO_CEILING
     stop: bool = False
     pid: int = field(default_factory=lambda: os.getpid())
     node: str = field(default_factory=lambda: platform.node())
@@ -345,6 +363,9 @@ class JobSystem:
     # last said so (see _too_many_abandoned_threads)
     _refusing_since: float | None = None
     _refusal_logged: float = 0.0
+    # when this worker last reported queued work above its priority ceiling
+    # (see _report_unclaimable_priorities)
+    _ceiling_reported: float = 0.0
 
     async def ex(self, op: str, *args: Any) -> list[asyncpg.Record]:
         """Execute prepared statement ``op`` with *args, reconnecting (and
@@ -457,7 +478,7 @@ class JobSystem:
                     self.job_threads,
                     self._abandoned_job_threads(),
                 )
-            except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError):
+            except asyncpg.PostgresError, asyncpg.InterfaceError, OSError:
                 with contextlib.suppress(Exception):
                     self._hb_cxn = await db.connect(**self.dsn)
             await asyncio.sleep(self.heartbeat_interval)
@@ -605,6 +626,60 @@ class JobSystem:
                 now - self._refusing_since,
             )
         return True
+
+    # ------------------------------------------------------------------
+    # the priority ceiling: saying so when work is hiding above it
+    # ------------------------------------------------------------------
+
+    async def _report_unclaimable_priorities(self) -> None:
+        """Say when this queue holds runnable work above this worker's
+        ceiling.
+
+        A job with ``prio`` above every live worker's ceiling is the quietest
+        failure this platform has: ``claim_jorb`` filters it out, so it never
+        runs, never errors, never retries, never reaches the DLQ and never
+        ages into any check that looks at *terminal* states. It is simply
+        ``queued``, forever, and the ordering being inverted (LOWER is MORE
+        urgent) is what walks people into it — ``priority=5000`` reads as
+        "whenever you get to it" and means "never".
+
+        The client refuses to enqueue above its declared ceiling
+        (``client.validate_priority``), which is where the caller can still
+        be told. This is the other half, for the jobs that got in anyway —
+        raw SQL, another tool, a schedule, a client that declared a higher
+        ceiling than the workers actually run with.
+
+        Run only by an IDLE worker (nothing was claimable, so this costs no
+        throughput) and at most once a minute. It reports what is true of
+        THIS worker; a fleet may legitimately run a higher-ceiling worker
+        elsewhere, which the message says rather than assumes."""
+        now = time.monotonic()
+        # 0.0 means "never reported": a monotonic clock has no fixed epoch,
+        # so an elapsed-time test against it would be a guess about uptime
+        if self._ceiling_reported and now - self._ceiling_reported < 60:
+            return
+        self._ceiling_reported = now
+
+        rows = await self.ex("above-ceiling", self.qname, self.prio)
+        above = rows[0]["above"] if rows else 0
+        if not above:
+            return
+        logger.warning(
+            "[{}:{}] {} runnable job(s) on this queue are ABOVE this worker's "
+            "priority ceiling of {} (least-urgent claimable prio; the lowest "
+            "blocked one is {}) and will never be claimed here. Lower prio is "
+            "MORE urgent, so a big number is not 'later', it is 'never': "
+            "unless another worker on this queue runs with a higher "
+            "--max-prio, those jobs stay queued forever. Fix by lowering "
+            "their prio (client.update_job_priority) or by running a worker "
+            "with --max-prio at or above {}.",
+            self.qname,
+            self.prio,
+            above,
+            self.prio,
+            rows[0]["lowest"],
+            rows[0]["lowest"],
+        )
 
     async def _deregister_worker(self) -> None:
         if self._hb_task is not None:
@@ -811,6 +886,9 @@ class JobSystem:
                     jobs = await self.ex("claim", *claim_args)
 
                 if not jobs:
+                    # nothing claimable: the one moment worth asking whether
+                    # something is sitting just above our ceiling, unseen
+                    await self._report_unclaimable_priorities()
                     sleepytime = True
                     continue
 
@@ -1762,8 +1840,14 @@ def runAndDone(
     check_interval: float = 5,
     reload_jobs: bool = False,
     job_threads: int = 8,
+    max_prio: int = DEFAULT_PRIO_CEILING,
 ) -> None:
-    """Run the JobSystem for this worker process"""
+    """Run the JobSystem for this worker process.
+
+    ``max_prio`` is this worker's priority ceiling. It is passed explicitly
+    because it used to be dropped here: whatever `pj` was told, every worker
+    it launched ran at the dataclass default, so no operator could run a
+    worker for low-urgency work at all."""
     configure_worker_logging()
     # our parent right now IS the launcher; if it dies we should too
     launcher_pid = os.getppid()
@@ -1774,6 +1858,7 @@ def runAndDone(
         workerId=n,
         checkInterval=check_interval,
         webPort=web_listen,
+        prio=max_prio,
         max_retries=max_retries,
         default_timeout=default_timeout,
         reload_jobs=reload_jobs,
@@ -1795,7 +1880,10 @@ def runAndDone(
     "--queue",
     default=["default"],
     multiple=True,
-    help="Queue to process (can be multiple)",
+    help="Queue to process. Repeatable: EVERY named queue gets its own full "
+    "set of --workers processes (2 queues x --workers 4 = 8 processes). "
+    "Repeating the same name changes nothing. No worker is ever started on "
+    "a queue you did not name.",
     show_default=True,
 )
 @click.option(
@@ -1808,7 +1896,17 @@ def runAndDone(
 @click.option(
     "--workers",
     default=(os.cpu_count() or 2) // 2,
-    help="Worker count",
+    help="Worker processes to start PER --queue (total = this x the number "
+    "of distinct queues named)",
+    show_default=True,
+)
+@click.option(
+    "--max-prio",
+    default=DEFAULT_PRIO_CEILING,
+    help="Priority CEILING for these workers: they claim jobs whose prio is "
+    "<= this and are blind to everything above it. LOWER prio is MORE "
+    "urgent, so raising this makes a worker take LESS urgent work as well; "
+    "a job above every worker's ceiling is never claimed at all",
     show_default=True,
 )
 @click.option(
@@ -1868,6 +1966,7 @@ def workit(
     queue: tuple[str],
     cap: tuple[str],
     workers: int,
+    max_prio: int,
     path: str,
     max_retries: int,
     default_timeout: int,
@@ -1877,6 +1976,15 @@ def workit(
     v: bool,
     config: str,
 ) -> None:
+    """Launch a fleet of workers: --workers processes on EACH --queue.
+
+    `--workers` is per queue. It used to be a total, with the queue list
+    padded out to it using the literal "default" -- so `pj --queue emails
+    --workers 4` ran one worker on `emails` and three on a queue the
+    operator never named, silently. Per-queue is the only reading under
+    which naming another queue cannot change the capacity of the queues you
+    already named, and it makes a worker on an unnamed queue impossible
+    rather than merely unlikely."""
     from pyjobby import __version__ as localver
 
     if v:
@@ -1895,12 +2003,12 @@ def workit(
         logger.error("Failed to load config {}: {}", config, e)
         sys.exit(1)
 
-    # If queue requests are less than total worker count, pad out the queue
-    # workers with default listeners up to the requested worker count.
-    lqueue = list(queue)
+    # One full set of workers per DISTINCT named queue. Duplicates collapse
+    # (asking for the same queue twice asks for the same set twice), which
+    # also means `--queue Q --queue Q --workers 2` is two workers on Q
+    # rather than four.
+    queues = list(dict.fromkeys(queue))
     lcap = list(cap)
-    if len(queue) < workers:
-        lqueue.extend(["default"] * (workers - len(queue)))
 
     # capability includes this hostname specification by default
     lcap.append(f"host:{platform.node()}")
@@ -1909,9 +2017,21 @@ def workit(
         # Also use requested directories as paths for job class lookups
         sys.path.append(pth)
 
-    logger.info(f"[{localver}] Launching {len(lqueue)} workers...")
+    logger.info(
+        "[{}] Launching {} worker(s) on each of {} queue(s) [{}] at priority "
+        "ceiling {}: {} processes",
+        localver,
+        workers,
+        len(queues),
+        ", ".join(queues),
+        max_prio,
+        workers * len(queues),
+    )
     launched = set()
-    for idx, q in enumerate(lqueue):
+    # worker ids are unique across the whole fleet, not per queue: they name
+    # this process's per-worker web listen socket (see _start_web_listener)
+    fleet = [q for q in queues for _ in range(workers)]
+    for idx, q in enumerate(fleet):
         p = Process(
             target=runAndDone,
             args=(
@@ -1920,16 +2040,19 @@ def workit(
                 idx,
                 loadedConfig["db_params"],
                 loadedConfig["web_listen"],
-                max_retries,
-                default_timeout,
-                check_interval,
-                reload_jobs,
-                job_threads,
             ),
+            kwargs={
+                "max_retries": max_retries,
+                "default_timeout": default_timeout,
+                "check_interval": check_interval,
+                "reload_jobs": reload_jobs,
+                "job_threads": job_threads,
+                "max_prio": max_prio,
+            },
         )
         p.start()
         launched.add(p)
-        logger.info(f"[{p.pid}] Launched...")
+        logger.info(f"[{p.pid}] Launched on queue {q}...")
 
         # random delay before launching next worker so job checks are
         # staggered instead of bunching at the same start microsecond.

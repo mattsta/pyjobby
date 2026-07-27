@@ -7,11 +7,27 @@ wrong. The executable version of the health section is `pj-admin doctor`.
 
 | Process | Command | Count | Purpose |
 |---|---|---|---|
-| Workers | `pj --config ./pyjobby.conf.py --queue Q --workers N` | per queue/host as needed | claim + execute jobs |
+| Workers | `pj --config ./pyjobby.conf.py --queue Q --workers N` | N processes **per named queue**, per host | claim + execute jobs |
 | Monitor | `pj-monitor --config ./pyjobby.conf.py` | 1 (more are safe) | timeout enforcement, dead-worker reclaim |
 | Scheduler | `pj-scheduler --config ./pyjobby.conf.py` | 1 (more are safe) | fires cron schedules |
 | Web admin | `pj-web ./pyjobby.conf.py --host 127.0.0.1 --port 8081` | optional | HTML admin + `/metrics` |
 | Websocket | `pj-ws ./pyjobby.conf.py --port 8082` | optional | realtime dashboard feed |
+
+`--workers N` is **per queue**, and a worker is never started on a queue you
+did not name:
+
+```bash
+pj --queue emails --workers 4                  # 4 workers, all on `emails`
+pj --queue emails --queue billing --workers 4  # 4 on each: 8 processes
+pj --queue emails --queue emails --workers 4   # 4 — a repeat asks for nothing extra
+```
+
+Naming another queue therefore never changes the capacity of the queues you
+already named. (It used to be a total, with the list padded out using the
+literal `default`: `--queue emails --workers 4` ran ONE worker on `emails`
+and three on a queue nobody asked for.) Scale a single queue by raising
+`--workers`, or by starting another `pj` — nothing coordinates between
+launchers.
 
 Start order does not matter — every process connects independently and
 tolerates the database being briefly unavailable. One command installs or
@@ -196,6 +212,49 @@ pj-admin queues show NAME
 Controls live in `jorb_queue` and are enforced inside the worker's claim
 statement — changes take effect on the next claim attempt (sub-second).
 
+## Priority, and the ceiling a worker claims under
+
+`jorb.prio` is **inverted**: LOWER is MORE urgent. 100 is the default, 10
+jumps the queue, 900 is background work. Every worker also has a **ceiling**
+— `pj --max-prio`, default 1000 — and claims only `prio <= ceiling`.
+
+A priority above every live worker's ceiling is therefore not "very low
+priority", it is **unclaimable**: the job is never claimed, never runs, never
+fails, never retries, never reaches the DLQ, and no age-based check sees it,
+because none of them look at `queued`. It simply sits there. Two things stop
+that happening quietly:
+
+* **The client refuses the enqueue.** `client.enqueue(..., priority=5000)`
+  raises `ValueError` naming the ceiling — at the caller, where it can still
+  be fixed. The ceiling is a *worker* setting the client cannot observe, so a
+  deployment that really runs less-urgent work declares it once, and in both
+  places:
+
+  ```bash
+  pj --config ./pyjobby.conf.py --queue backfill --max-prio 5000
+  ```
+  ```python
+  client = JobClient(pool, prio_ceiling=5000)   # or JobClient.create(..., prio_ceiling=5000)
+  ```
+
+  Both halves are required. Declaring it on the client alone gets the job
+  written and still never claimed; the flag alone is enough for a worker but
+  the client will keep refusing to feed it.
+
+* **An idle worker reports what is hiding above it.** For rows that arrived
+  another way — raw SQL, a schedule, a tool — a worker with nothing to claim
+  logs this at most once a minute, and never while it has work to do:
+
+  ```
+  [backfill:1000] 3 runnable job(s) on this queue are ABOVE this worker's priority
+  ceiling of 1000 ... the lowest blocked one is 4200 ... unless another worker on
+  this queue runs with a higher --max-prio, those jobs stay queued forever.
+  ```
+
+To fix jobs already in that state: lower their priority
+(`client.update_job_priority(id, 900)`, which is refused above the ceiling
+for the same reason), or start a worker whose `--max-prio` covers them.
+
 ## Retention: what it deletes, and what it refuses to
 
 Retention is **on by default** (`--retention-days 30`) and runs in the
@@ -273,9 +332,11 @@ code fix, `pj-admin dlq retry ID` (fresh attempt budget).
 job-threads` names any worker that is alive and claiming nothing);
 `pj-admin queues show NAME` (paused? limits hit?); `pj-admin workers list`
 (any live workers on that queue, and is any of them `not claiming`?); the
-workers' own logs for `NOT CLAIMING` (abandoned job threads — see above);
-remember jobs with `prio` above the workers' ceiling (default 1000) or
-`capability` no worker advertises are invisible to those workers.
+workers' own logs for `NOT CLAIMING` (abandoned job threads — see above) and
+for `ABOVE this worker's priority ceiling` (jobs whose `prio` exceeds
+`--max-prio` — see [Priority, and the ceiling a worker claims
+under](#priority-and-the-ceiling-a-worker-claims-under)); and remember that a
+`capability` no worker advertises is invisible in the same way.
 
 **The scheduler missed fires** (was down at fire time). Missed ticks are
 skipped, not backfilled; `next_run` advances from now. Check

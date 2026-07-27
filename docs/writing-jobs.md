@@ -142,6 +142,16 @@ Enqueue-time options (queue, priority, `run_after`, `deadline_key`,
 `waitfor_job`, `capability`, retries, timeouts, tags) are documented in
 [CLIENT_LIBRARY.md](CLIENT_LIBRARY.md#enqueuejob_class-kwargs).
 
+One of them reads backwards: **`priority` is inverted — LOWER is MORE
+urgent** (100 is the default, 10 goes first, 900 is background work), and a
+worker claims only jobs at or below its own ceiling (`pj --max-prio`,
+default 1000). `priority=5000` is therefore not "whenever you get around to
+it" but a job no ordinary worker will ever claim, so the client refuses that
+enqueue instead of writing a row nothing would run. If you really do run
+workers for less-urgent work, say so on both sides —
+`pj --max-prio 5000` and `JobClient(pool, prio_ceiling=5000)`; see
+[OPERATIONS.md](OPERATIONS.md#priority-and-the-ceiling-a-worker-claims-under).
+
 ---
 
 ## Which primitive, and when

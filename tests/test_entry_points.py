@@ -10,13 +10,23 @@ group and asserts an OBSERVABLE EFFECT in the database or over the network
 
 from __future__ import annotations
 
+import asyncio
 import json
+import uuid
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 
 import aiohttp
 import pytest
 
-from pyjobby.procs import daemon, dsn_from, free_port, port_is_open, wait_until
+from pyjobby.procs import (
+    daemon,
+    dsn_from,
+    free_port,
+    port_is_open,
+    terminate,
+    wait_until,
+)
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -100,6 +110,240 @@ class TestWorkerEntryPoint:
             timeout=20,
             what="workers deregistered after shutdown",
         )
+
+
+# ============================================================================
+# pj — which queues the fleet actually lands on
+#
+# `--workers N` used to be a TOTAL, with the queue list padded out to it
+# using the literal "default": `pj --queue emails --workers 4` started one
+# worker on `emails` and three on a queue the operator never named. These
+# tests drive the real launcher and read jorb_worker, because the registry is
+# the only place that answers "where did those processes actually go".
+# ============================================================================
+
+
+async def registered_fleet(db_pool, marker: str, at_least: int = 1):
+    """Live registry rows for the workers tagged with this test's marker.
+
+    A `--cap` unique to one launch is what makes the assertion exact under
+    xdist: every other test's workers are invisible to it, including any on
+    the shared `default` queue.
+    """
+    rows = await db_pool.fetch(
+        """SELECT queue, pid FROM jorb_worker
+           WHERE $1 = ANY(capabilities) AND shutdown_at IS NULL""",
+        marker,
+    )
+    return rows if len(rows) >= at_least else None
+
+
+class TestWorkerFleetPlacement:
+    async def test_workers_flag_puts_every_worker_on_the_named_queue(
+        self, db_pool, unique_queue, dsn, tmp_path
+    ):
+        """One `--queue`, `--workers 4`: four workers, all on that queue."""
+        marker = f"fleet:{uuid.uuid4().hex}"
+        async with daemon(
+            "pj",
+            "--config",
+            str(write_config(tmp_path, dsn)),
+            "--queue",
+            unique_queue,
+            "--cap",
+            marker,
+            "--workers",
+            "4",
+            "--check-interval",
+            "1",
+        ):
+            await wait_until(
+                lambda: registered_fleet(db_pool, marker, 4),
+                what="four workers registered",
+            )
+            # settle, so a fifth process landing anywhere would be counted
+            await asyncio.sleep(1.5)
+            rows = await registered_fleet(db_pool, marker)
+
+        assert Counter(r["queue"] for r in rows) == {unique_queue: 4}
+        assert len({r["pid"] for r in rows}) == 4  # four real processes
+
+    async def test_workers_flag_is_per_queue_for_several_queues(
+        self, db_pool, unique_queue, dsn, tmp_path
+    ):
+        """Two `--queue`s and `--workers 2` is two workers on EACH: the flag
+        is per queue, so naming another queue never changes the capacity of
+        the queues already named."""
+        marker = f"fleet:{uuid.uuid4().hex}"
+        other_queue = f"{unique_queue}_b"
+        async with daemon(
+            "pj",
+            "--config",
+            str(write_config(tmp_path, dsn)),
+            "--queue",
+            unique_queue,
+            "--queue",
+            other_queue,
+            "--cap",
+            marker,
+            "--workers",
+            "2",
+            "--check-interval",
+            "1",
+        ):
+            await wait_until(
+                lambda: registered_fleet(db_pool, marker, 4),
+                what="two workers on each of two queues",
+            )
+            await asyncio.sleep(1.5)
+            rows = await registered_fleet(db_pool, marker)
+
+        assert Counter(r["queue"] for r in rows) == {unique_queue: 2, other_queue: 2}
+
+    async def test_repeating_a_queue_name_asks_for_nothing_extra(
+        self, db_pool, unique_queue, dsn, tmp_path
+    ):
+        """`--queue Q --queue Q --workers 2` is two workers, not four.
+
+        This is exactly the invocation `pj-bench e2e` builds (it repeats
+        `--queue` once per worker to work around the old padding), so the
+        de-duplication is what keeps the benchmark measuring the fleet size
+        it asked for."""
+        marker = f"fleet:{uuid.uuid4().hex}"
+        async with daemon(
+            "pj",
+            "--config",
+            str(write_config(tmp_path, dsn)),
+            "--queue",
+            unique_queue,
+            "--queue",
+            unique_queue,
+            "--cap",
+            marker,
+            "--workers",
+            "2",
+            "--check-interval",
+            "1",
+        ):
+            await wait_until(
+                lambda: registered_fleet(db_pool, marker, 2),
+                what="two workers registered",
+            )
+            await asyncio.sleep(1.5)
+            rows = await registered_fleet(db_pool, marker)
+
+        assert Counter(r["queue"] for r in rows) == {unique_queue: 2}
+
+
+class TestWorkerPriorityCeiling:
+    async def test_max_prio_claims_what_a_default_worker_will_not(
+        self, db_pool, unique_queue, dsn, tmp_path
+    ):
+        """`--max-prio` reaches the worker; without it, nothing does.
+
+        `runAndDone` dropped the ceiling entirely, so every `pj`-launched
+        worker ran at the dataclass default and a job above it was
+        unclaimable by any process an operator could start.
+        """
+        config = str(write_config(tmp_path, dsn))
+        low_urgency = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, kwargs, queue, prio)
+               VALUES ('tests.dxe_jobs.OkJob', $1, $2, 5000) RETURNING id""",
+            {"x": 1},
+            unique_queue,
+        )
+        normal = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, kwargs, queue, prio)
+               VALUES ('tests.dxe_jobs.OkJob', $1, $2, 100) RETURNING id""",
+            {"x": 2},
+            unique_queue,
+        )
+
+        async with daemon(
+            "pj",
+            "--config",
+            config,
+            "--queue",
+            unique_queue,
+            "--workers",
+            "1",
+            "--check-interval",
+            "1",
+        ):
+            await wait_until(
+                lambda: db_pool.fetchrow(
+                    "SELECT id FROM jorb WHERE id = $1 AND state = 'finished'",
+                    normal,
+                ),
+                what="the default-ceiling worker ran the prio-100 job",
+            )
+            assert (
+                await db_pool.fetchval(
+                    "SELECT state FROM jorb WHERE id = $1", low_urgency
+                )
+                == "queued"
+            )
+
+        async with daemon(
+            "pj",
+            "--config",
+            config,
+            "--queue",
+            unique_queue,
+            "--workers",
+            "1",
+            "--max-prio",
+            "5000",
+            "--check-interval",
+            "1",
+        ):
+            row = await wait_until(
+                lambda: db_pool.fetchrow(
+                    "SELECT state, result FROM jorb WHERE id = $1 "
+                    "AND state = 'finished'",
+                    low_urgency,
+                ),
+                what="the raised-ceiling worker ran the prio-5000 job",
+            )
+        assert row["result"] == {"doubled": 2}
+
+    async def test_an_idle_worker_reports_work_above_its_ceiling(
+        self, db_pool, unique_queue, dsn, tmp_path
+    ):
+        """The other half of the black hole: jobs that got in anyway.
+
+        The client refuses to enqueue above its declared ceiling, but raw
+        SQL, another tool or a schedule can still create one. An idle worker
+        says so rather than sitting quietly next to work it will never take.
+        """
+        await db_pool.execute(
+            """INSERT INTO jorb (job_class, kwargs, queue, prio)
+               VALUES ('tests.dxe_jobs.OkJob', $1, $2, 4200)""",
+            {"x": 3},
+            unique_queue,
+        )
+
+        async with daemon(
+            "pj",
+            "--config",
+            str(write_config(tmp_path, dsn)),
+            "--queue",
+            unique_queue,
+            "--workers",
+            "1",
+            "--check-interval",
+            "1",
+            capture=True,
+        ) as proc:
+            await asyncio.sleep(3)
+            # reap the whole group first: the workers share the launcher's
+            # stderr pipe, so communicate() only returns once they are gone
+            terminate(proc)
+            _, err = proc.communicate(timeout=15)
+
+        log = err.decode(errors="replace")
+        assert "ABOVE this worker's priority ceiling of 1000" in log
+        assert "the lowest blocked one is 4200" in log
 
 
 # ============================================================================

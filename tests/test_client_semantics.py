@@ -13,6 +13,8 @@ Covered:
 - bulk_cancel() is cancel_job() applied to a list (running jobs included)
 - a closed client opens nothing new (no leaked LISTEN connection)
 - an unstorable argument is the enqueuer's error, not a worker's
+- a priority above the workers' claim ceiling is refused at every door
+  rather than becoming a job nothing will ever claim
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
-from pyjobby import Job, JobClient
+from pyjobby import Job, JobClient, db
 
 from .conftest import wait_for_job_state
 
@@ -244,3 +246,139 @@ class TestEnqueueValidation:
             )
         assert type(excinfo.value).__name__ in ("TypeError", "DataError")
         assert await client.queue_depth(unique_queue) == 0
+
+
+class TestPriorityCeiling:
+    """A priority above the workers' ceiling is refused at every door.
+
+    Workers claim `prio <= their ceiling` (`pj --max-prio`, default 1000),
+    and LOWER is MORE urgent — so "low priority, whenever" gets written as a
+    big number and means NEVER: queued forever, no error, no retry, no DLQ,
+    nothing in `doctor`. The client cannot see the fleet's ceiling, so it
+    takes the deployment's word for it and refuses everything above.
+    """
+
+    async def test_enqueue_refuses_and_writes_nothing(self, client, unique_queue):
+        with pytest.raises(ValueError) as refused:
+            await client.enqueue(
+                "tests.test_client_semantics.CountJob",
+                queue=unique_queue,
+                priority=1001,
+                n=1,
+            )
+        assert "priority 1001 is above the worker priority ceiling (1000)" in str(
+            refused.value
+        )
+        assert await client.queue_depth(unique_queue) == 0
+
+        # the ceiling itself is claimable, and therefore allowed
+        job_id = await client.enqueue(
+            "tests.test_client_semantics.CountJob",
+            queue=unique_queue,
+            priority=1000,
+            n=1,
+        )
+        assert (
+            await client.pool.fetchval("SELECT prio FROM jorb WHERE id = $1", job_id)
+        ) == 1000
+
+    async def test_a_batch_is_refused_before_any_row_is_written(
+        self, client, unique_queue
+    ):
+        with pytest.raises(ValueError) as refused:
+            await client.enqueue_batch(
+                [("tests.test_client_semantics.CountJob", {"n": i}) for i in range(50)],
+                queue=unique_queue,
+                priority=5000,
+            )
+        assert "above the worker priority ceiling (1000)" in str(refused.value)
+        assert await client.queue_depth(unique_queue) == 0
+
+    async def test_changing_a_priority_cannot_hide_a_job_either(
+        self, client, unique_queue
+    ):
+        """The same black hole through a different door: a queued job moved
+        above the ceiling is exactly as unclaimable as one enqueued there."""
+        job_id = await client.enqueue(
+            "tests.test_client_semantics.CountJob",
+            queue=unique_queue,
+            priority=100,
+            n=1,
+        )
+
+        with pytest.raises(ValueError):
+            await client.update_job_priority(job_id, 2000)
+        with pytest.raises(ValueError):
+            await client.bulk_update_priority([job_id], 2000)
+        assert (
+            await client.pool.fetchval("SELECT prio FROM jorb WHERE id = $1", job_id)
+        ) == 100
+
+        # a legal move still works
+        assert await client.update_job_priority(job_id, 900) is True
+        assert (
+            await client.pool.fetchval("SELECT prio FROM jorb WHERE id = $1", job_id)
+        ) == 900
+
+    async def test_a_declared_ceiling_permits_exactly_what_it_declares(
+        self, client, unique_queue
+    ):
+        """`prio_ceiling` is the deployment saying what its workers run with:
+        it moves the line, it does not remove it."""
+        loud = JobClient(pool=client.pool, prio_ceiling=5000)
+        job_id = await loud.enqueue(
+            "tests.test_client_semantics.CountJob",
+            queue=unique_queue,
+            priority=5000,
+            n=1,
+        )
+        assert (
+            await client.pool.fetchval("SELECT prio FROM jorb WHERE id = $1", job_id)
+        ) == 5000
+
+        with pytest.raises(ValueError) as refused:
+            await loud.enqueue(
+                "tests.test_client_semantics.CountJob",
+                queue=unique_queue,
+                priority=5001,
+                n=1,
+            )
+        assert "above the worker priority ceiling (5000)" in str(refused.value)
+
+        # ...and one call can declare it without changing the client
+        one_off = await client.enqueue(
+            "tests.test_client_semantics.CountJob",
+            queue=unique_queue,
+            priority=5000,
+            prio_ceiling=5000,
+            n=1,
+        )
+        assert (
+            await client.pool.fetchval("SELECT prio FROM jorb WHERE id = $1", one_off)
+        ) == 5000
+
+    async def test_the_outbox_path_gets_the_platform_default(
+        self, db_params, unique_queue
+    ):
+        """`enqueue_in_transaction` is static — there is no client to hold a
+        declared ceiling, so the platform default applies and the caller's
+        transaction never sees an INSERT."""
+        conn = await db.connect(**db_params)
+        try:
+            with pytest.raises(ValueError):
+                async with conn.transaction():
+                    await JobClient.enqueue_in_transaction(
+                        conn,
+                        "tests.test_client_semantics.CountJob",
+                        queue=unique_queue,
+                        priority=5000,
+                        n=1,
+                    )
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM jorb WHERE queue = $1", unique_queue
+                )
+                == 0
+            )
+        finally:
+            await conn.close()

@@ -154,7 +154,11 @@ class TestEnqueueProperties:
         suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     @given(
-        job_count=st.integers(min_value=1, max_value=20), priority=priority_strategy()
+        job_count=st.integers(min_value=1, max_value=20),
+        # the whole ascending run below has to stay claimable: the client
+        # refuses a priority above the workers' ceiling (1000), so the base
+        # leaves room for the last job's offset rather than walking past it
+        priority=st.integers(min_value=1, max_value=800),
     )
     async def test_enqueue_preserves_priority_order(
         self, db_pool, job_client, job_count, priority

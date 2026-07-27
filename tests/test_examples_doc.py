@@ -623,37 +623,85 @@ async def test_a_lower_priority_number_is_claimed_first(
     assert [r["prio"] for r in order] == [10, 100, 900]
 
 
-async def test_a_priority_above_the_ceiling_is_never_claimed(
-    client, live_worker, unique_queue
-):
-    """The trap on the other end: a worker's ceiling is 1000, always.
+async def test_a_priority_above_the_ceiling_is_refused_at_enqueue(client, unique_queue):
+    """The trap on the other end, closed where the caller can still see it.
 
-    ``JobSystem.prio`` defaults to 1000 and ``pj`` exposes no flag for it, so
-    a job enqueued above that is not "low priority" -- it is unclaimable, and
-    it sits queued while every worker ignores it.
+    Workers claim ``prio <= their ceiling`` (1000 by default), so a job
+    enqueued above that is not "low priority" -- it is unclaimable, and it
+    would sit queued while every worker ignores it, with no error, no retry
+    and no DLQ entry. The client refuses it instead, and says what to do.
     """
-    unclaimable = await client.enqueue(
-        "tests.test_examples_doc.ResizeImage",
-        queue=unique_queue,
-        priority=5000,
-        image="never.png",
-        size="thumb",
+    with pytest.raises(ValueError) as refused:
+        await client.enqueue(
+            "tests.test_examples_doc.ResizeImage",
+            queue=unique_queue,
+            priority=5000,
+            image="never.png",
+            size="thumb",
+        )
+    message = str(refused.value)
+    assert "priority 5000 is above the worker priority ceiling (1000)" in message
+    assert "prio_ceiling=5000" in message  # and how to allow it deliberately
+
+    # refused means NOT WRITTEN: no row to find later and wonder about
+    assert (
+        await client.pool.fetchval(
+            "SELECT count(*) FROM jorb WHERE queue = $1", unique_queue
+        )
+        == 0
     )
-    claimable = await client.enqueue(
+
+    # exactly at the ceiling is fine, and is what "least urgent" means here
+    at_ceiling = await client.enqueue(
         "tests.test_examples_doc.ResizeImage",
         queue=unique_queue,
-        priority=1000,  # exactly at the ceiling, and therefore fine
+        priority=1000,
         image="ok.png",
         size="thumb",
     )
-
-    await live_worker()
-
-    await wait_for_job_state(client.pool, claimable, ("finished",), timeout=20)
     assert (
-        await client.pool.fetchval("SELECT state FROM jorb WHERE id=$1", unclaimable)
+        await client.pool.fetchval("SELECT prio FROM jorb WHERE id=$1", at_ceiling)
+        == 1000
+    )
+
+
+async def test_a_raised_ceiling_is_declared_by_the_client_and_the_worker(
+    client, live_worker, unique_queue
+):
+    """A deployment that really runs high-ceiling workers says so twice.
+
+    The ceiling is a WORKER setting the client cannot observe, so the client
+    takes it as a declaration (``prio_ceiling=``) and the fleet takes it as a
+    flag (``pj --max-prio``). Declaring it on the client alone does not make
+    the job runnable -- only a worker at that ceiling claims it.
+    """
+    loud = JobClient(pool=client.pool, prio_ceiling=5000)
+    low_urgency = await loud.enqueue(
+        "tests.test_examples_doc.ResizeImage",
+        queue=unique_queue,
+        priority=5000,
+        image="eventually.png",
+        size="thumb",
+    )
+
+    # a default-ceiling worker is blind to it
+    await live_worker()
+    normal = await client.enqueue(
+        "tests.test_examples_doc.ResizeImage",
+        queue=unique_queue,
+        priority=100,
+        image="now.png",
+        size="thumb",
+    )
+    await wait_for_job_state(client.pool, normal, ("finished",), timeout=20)
+    assert (
+        await client.pool.fetchval("SELECT state FROM jorb WHERE id=$1", low_urgency)
         == "queued"
     )
+
+    # a worker whose ceiling covers it runs it
+    await live_worker(prio=5000)
+    await wait_for_job_state(client.pool, low_urgency, ("finished",), timeout=20)
 
 
 async def test_a_capability_job_is_ignored_by_a_worker_without_it(

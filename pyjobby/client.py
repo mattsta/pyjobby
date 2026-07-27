@@ -44,7 +44,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import TracebackType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 import asyncpg  # type: ignore[import-untyped]
 
@@ -106,6 +106,48 @@ _TAG_VALUE_TYPES = (str, int, float, bool, type(None))
 # unrecognized value is not ignored -- it dead-letters the job on its first
 # overrun. Checked at enqueue, where the caller is still there to be told.
 _ON_TIMEOUT_POLICIES = frozenset({"retry", "fail"})
+
+# The priority ceiling a worker claims under, and the default for `pj
+# --max-prio`. `claim_jorb()` takes only jobs whose `prio <= the claiming
+# worker's ceiling`, so a job above every live worker's ceiling is never
+# claimed, never fails, never reaches the DLQ and never shows up in
+# `doctor`: it is simply `queued` forever. The number lives HERE, on the
+# enqueue side, because this is the only place a caller can still be told --
+# and `pj` imports it for `JobSystem.prio` and its own flag default, so the
+# two halves of the contract cannot drift apart.
+DEFAULT_PRIO_CEILING: Final = 1000
+
+
+def validate_priority(priority: int, ceiling: int = DEFAULT_PRIO_CEILING) -> int:
+    """Refuse a priority no worker at `ceiling` could ever claim.
+
+    The ordering is inverted from the intuition -- LOWER is MORE urgent --
+    so "low priority, whenever you get to it" is written as a big number by
+    everyone who has not read the schema, and a big number is not slow: it
+    is *unclaimable*, permanently, with no signal anywhere.
+
+    This is deliberately checked against a number the client was TOLD rather
+    than one it can observe: the ceiling belongs to the worker fleet
+    (``pj --max-prio``) and nothing about it is visible from a connection.
+    A deployment that raises it says so once, when it builds the client
+    (``JobClient(pool, prio_ceiling=N)``), which is where deployment facts
+    already live. The asymmetry is what settles it: a wrong refusal is loud,
+    immediate and a one-line fix at the call site, while a wrong acceptance
+    is a job that is silently never run.
+    """
+    if priority > ceiling:
+        raise ValueError(
+            f"priority {priority} is above the worker priority ceiling "
+            f"({ceiling}): workers claim only jobs with prio <= their "
+            f"ceiling, so this job would sit 'queued' forever -- no error, "
+            f"no retry, no DLQ. LOWER numbers are MORE urgent, so "
+            f"least-urgent work wants a priority just UNDER the ceiling "
+            f"(e.g. {ceiling - 100}), not a large one. If this deployment "
+            f"really runs its workers with `pj --max-prio {priority}` (or "
+            f"higher), declare it once: JobClient(pool, "
+            f"prio_ceiling={priority})."
+        )
+    return priority
 
 
 def validate_tags(tags: dict[str, Any] | None) -> dict[str, Any]:
@@ -226,6 +268,7 @@ class JobClient:
         self,
         pool: asyncpg.Pool,
         db_params: dict[str, Any] | str | None = None,
+        prio_ceiling: int = DEFAULT_PRIO_CEILING,
     ):
         """
         Initialize client with connection pool.
@@ -237,10 +280,17 @@ class JobClient:
                 shared LISTEN connection that powers wait_for_result() and
                 get_event(). When omitted (pool-only construction) those
                 methods still work but fall back to pure polling.
+            prio_ceiling: the priority ceiling THIS deployment's workers run
+                with (`pj --max-prio`, default 1000). Every enqueue and
+                priority change through this client is refused above it,
+                because a job above the fleet's ceiling is never claimed and
+                says so nowhere. Raise it only to match workers you actually
+                run at that ceiling.
 
         Note: Use JobClient.create() or JobClient.from_config() instead
         """
         self.pool = pool
+        self.prio_ceiling = prio_ceiling
         self._closed = False
         self._db_params = db_params
         self._listener_conn: asyncpg.Connection | None = None
@@ -259,6 +309,7 @@ class JobClient:
         password: str | None = None,
         min_size: int = 5,
         max_size: int = 20,
+        prio_ceiling: int = DEFAULT_PRIO_CEILING,
         **kwargs: Any,
     ) -> JobClient:
         """
@@ -272,6 +323,9 @@ class JobClient:
             password: Database password (default: None)
             min_size: Minimum pool size (default: 5)
             max_size: Maximum pool size (default: 20)
+            prio_ceiling: this fleet's worker priority ceiling
+                (`pj --max-prio`, default 1000); enqueueing above it is
+                refused. See JobClient.__init__.
             **kwargs: Additional asyncpg.create_pool parameters
 
         Returns:
@@ -302,11 +356,15 @@ class JobClient:
             "user": user,
             "password": password,
         }
-        return cls(pool, db_params=db_params)
+        return cls(pool, db_params=db_params, prio_ceiling=prio_ceiling)
 
     @classmethod
     async def from_config(
-        cls, config_path: str, min_size: int = 5, max_size: int = 20
+        cls,
+        config_path: str,
+        min_size: int = 5,
+        max_size: int = 20,
+        prio_ceiling: int = DEFAULT_PRIO_CEILING,
     ) -> JobClient:
         """
         Create client from pyjobby config file.
@@ -315,6 +373,9 @@ class JobClient:
             config_path: Path to pyjobby.conf.py
             min_size: Minimum pool size (default: 5)
             max_size: Maximum pool size (default: 20)
+            prio_ceiling: this fleet's worker priority ceiling
+                (`pj --max-prio`, default 1000); enqueueing above it is
+                refused. See JobClient.__init__.
 
         Returns:
             JobClient instance
@@ -328,7 +389,7 @@ class JobClient:
         db_params = config.get("db_params", {})
 
         pool = await db.create_pool(min_size=min_size, max_size=max_size, **db_params)
-        return cls(pool, db_params=db_params)
+        return cls(pool, db_params=db_params, prio_ceiling=prio_ceiling)
 
     async def close(self) -> None:
         """Close the shared LISTEN connection (if open) and the pool.
@@ -388,6 +449,7 @@ class JobClient:
         # Phase 2: Timeout Enforcement
         timeout_seconds: int | None = None,
         on_timeout: str = "retry",
+        prio_ceiling: int | None = None,
         **kwargs: Any,
     ) -> int:
         """
@@ -397,7 +459,12 @@ class JobClient:
             job_class: Python class path (e.g., 'myapp.jobs.SendEmail')
             queue: Queue name (default: 'default')
             priority: Priority — LOWER numbers are more urgent; workers only
-                claim jobs with priority <= their own ceiling (default: 100)
+                claim jobs with priority <= their own ceiling (default: 100).
+                Above the ceiling this client was built with (see
+                prio_ceiling) the enqueue is REFUSED rather than accepted
+                into a job nothing would ever claim.
+            prio_ceiling: override this client's ceiling for this one call
+                (default: the client's, itself defaulting to 1000)
             run_after: When to run (default: now)
             capability: Required worker capability (default: None)
             uid: User/tenant ID (default: None)
@@ -437,8 +504,9 @@ class JobClient:
         Raises:
             asyncpg.UniqueViolationError: If deadline_key already exists
             ValueError: If both waitfor_job and waitfor_group specified, if
-                on_timeout is neither 'retry' nor 'fail', or if tags are not
-                a flat dict of string keys to scalar values
+                on_timeout is neither 'retry' nor 'fail', if priority is
+                above this client's worker priority ceiling, or if tags are
+                not a flat dict of string keys to scalar values
 
         Examples:
             # Simple job
@@ -508,6 +576,9 @@ class JobClient:
                 max_retry_delay=max_retry_delay,
                 timeout_seconds=timeout_seconds,
                 on_timeout=on_timeout,
+                prio_ceiling=(
+                    self.prio_ceiling if prio_ceiling is None else prio_ceiling
+                ),
                 **kwargs,
             )
 
@@ -535,6 +606,11 @@ class JobClient:
         Accepts the same keyword arguments as enqueue() (queue, priority,
         run_after, ..., plus job kwargs). The connection must have pyjobby's
         JSON codecs registered (any connection from pyjobby.db does).
+
+        Being static, there is no client here holding this deployment's
+        declared worker priority ceiling, so `priority` is checked against
+        the platform default (see validate_priority); a fleet running a
+        raised ceiling passes `prio_ceiling=` with the call.
 
         Example:
             async with conn.transaction():
@@ -570,13 +646,20 @@ class JobClient:
         max_retry_delay: int = 3600,
         timeout_seconds: int | None = None,
         on_timeout: str = "retry",
+        prio_ceiling: int = DEFAULT_PRIO_CEILING,
         **kwargs: Any,
     ) -> list[Any]:
         """Validate enqueue options and build the parameter row for
         _ENQUEUE_SQL — the single construction path shared by enqueue()
-        and enqueue_in_transaction()."""
+        and enqueue_in_transaction().
+
+        ``prio_ceiling`` is the fleet's worker ceiling; enqueue() passes the
+        client's, and the static/outbox path (which has no client) gets the
+        platform default. See validate_priority."""
         if waitfor_job and waitfor_group:
             raise ValueError("Cannot specify both waitfor_job and waitfor_group")
+
+        validate_priority(priority, prio_ceiling)
 
         if on_timeout not in _ON_TIMEOUT_POLICIES:
             raise ValueError(
@@ -655,6 +738,7 @@ class JobClient:
         priority: int = 100,
         run_after: datetime | None = None,
         run_group: int | None = None,
+        prio_ceiling: int | None = None,
     ) -> list[int]:
         """
         Enqueue multiple jobs efficiently in a single transaction.
@@ -665,9 +749,15 @@ class JobClient:
             priority: Priority for all jobs (default: 100)
             run_after: When to run all jobs (default: now)
             run_group: Group ID for all jobs (default: None)
+            prio_ceiling: override this client's worker priority ceiling for
+                this call (default: the client's; see validate_priority)
 
         Returns:
             List of job IDs
+
+        Raises:
+            ValueError: If priority is above the worker priority ceiling —
+                every job in the batch would be unclaimable
 
         Example:
             # Enqueue 1000 jobs efficiently
@@ -686,6 +776,10 @@ class JobClient:
         """
         if not jobs:
             return []
+
+        validate_priority(
+            priority, self.prio_ceiling if prio_ceiling is None else prio_ceiling
+        )
 
         if run_after is None:
             run_after = datetime.now(UTC)
@@ -1332,11 +1426,18 @@ class JobClient:
         Returns:
             True if updated, False if not found or already running
 
+        Raises:
+            ValueError: If new_priority is above this client's worker
+                priority ceiling — the same black hole as enqueueing there,
+                reached by a different door (see validate_priority)
+
         Example:
             # Make job higher priority
             if await client.update_job_priority(12345, 500):
                 print("Priority updated")
         """
+        validate_priority(new_priority, self.prio_ceiling)
+
         async with self.pool.acquire() as conn:
             result: str = await conn.execute(
                 """
@@ -1710,12 +1811,18 @@ class JobClient:
         Returns:
             Number of jobs updated
 
+        Raises:
+            ValueError: If new_priority is above this client's worker
+                priority ceiling (see validate_priority)
+
         Example:
             updated = await client.bulk_update_priority([123, 456], 500)
             print(f"Updated {updated} jobs to priority 500")
         """
         if not job_ids:
             return 0
+
+        validate_priority(new_priority, self.prio_ceiling)
 
         async with self.pool.acquire() as conn:
             result = await conn.execute(
@@ -2043,6 +2150,7 @@ class SyncJobClient:
         *,
         min_size: int = 1,
         max_size: int = 4,
+        prio_ceiling: int = DEFAULT_PRIO_CEILING,
         **connect_kwargs: Any,
     ):
         """
@@ -2050,13 +2158,17 @@ class SyncJobClient:
             dsn: PostgreSQL DSN string, or None to use **connect_kwargs
             min_size: pool minimum size (default: 1)
             max_size: pool maximum size (default: 4)
+            prio_ceiling: this fleet's worker priority ceiling
+                (`pj --max-prio`, default 1000); enqueueing above it is
+                refused. Named explicitly rather than left to
+                **connect_kwargs, which would hand it to asyncpg.
             **connect_kwargs: asyncpg.connect kwargs (host, port, database,
                 user, password, ...) used when no DSN is given
         """
         self._loop = asyncio.new_event_loop()
         self._closed = False
         self._client: JobClient = self._loop.run_until_complete(
-            self._create(dsn, connect_kwargs, min_size, max_size)
+            self._create(dsn, connect_kwargs, min_size, max_size, prio_ceiling)
         )
 
     @staticmethod
@@ -2065,14 +2177,17 @@ class SyncJobClient:
         connect_kwargs: dict[str, Any],
         min_size: int,
         max_size: int,
+        prio_ceiling: int = DEFAULT_PRIO_CEILING,
     ) -> JobClient:
         if dsn is not None:
             pool = await db.create_pool(dsn, min_size=min_size, max_size=max_size)
-            return JobClient(pool, db_params=dsn)
+            return JobClient(pool, db_params=dsn, prio_ceiling=prio_ceiling)
         pool = await db.create_pool(
             min_size=min_size, max_size=max_size, **connect_kwargs
         )
-        return JobClient(pool, db_params=dict(connect_kwargs))
+        return JobClient(
+            pool, db_params=dict(connect_kwargs), prio_ceiling=prio_ceiling
+        )
 
     def _run(self, coro: Awaitable[Any]) -> Any:
         if self._closed:
