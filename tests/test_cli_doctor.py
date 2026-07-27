@@ -32,6 +32,7 @@ from click.testing import CliRunner
 
 from pyjobby import migrations
 from pyjobby.cli import DOCTOR_REQUIRED_TRIGGERS, cli
+from tests.schema_fixtures import install_legacy_schema
 
 pytestmark = pytest.mark.asyncio
 
@@ -90,14 +91,20 @@ async def scratch_db(db_params: dict):
     admin = await asyncpg.connect(**db_params)
     created: list[str] = []
 
-    async def _make(*, schema: bool = True) -> str:
+    async def _make(*, schema: bool = True, legacy: bool = False) -> str:
+        """`legacy=True` installs the frozen pre-migration schema instead of
+        the current one -- a database an older pyjobby release created, which
+        is the shape doctor used to certify and then die on."""
         name = f"pj_doctor_{uuid.uuid4().hex[:12]}"
         await admin.execute(f'CREATE DATABASE "{name}"')
         created.append(name)
         if schema:
             conn = await asyncpg.connect(**{**db_params, "database": name})
             try:
-                await migrations.migrate(conn)
+                if legacy:
+                    await install_legacy_schema(conn)
+                else:
+                    await migrations.migrate(conn)
             finally:
                 await conn.close()
         return dsn_for(db_params, name)
@@ -210,28 +217,127 @@ class TestDoctorSchema:
         # the command returns immediately: nothing else can be checked
         assert set(checks) == {"database", "schema"}
 
-    async def test_untracked_install_reports_baseline(
-        self, scratch_db: ScratchFactory, db_params
+    async def test_fresh_install_reports_the_migrations_it_recorded(
+        self, scratch_db: ScratchFactory
     ):
-        """Schema present with an empty schema_migrations table -> 'baseline'."""
+        """A fresh install carries every shipped migration by construction --
+        schema.sql already contains their effects -- so it reports them as
+        applied rather than as 'baseline'."""
         fresh = await scratch_db()
+        versions = [m.version for m in migrations.available_migrations()]
 
         result = await run_doctor(fresh)
 
         assert result.exit_code == 0, result.output
         checks = parse_checks(result.output)
-        assert checks["schema"] == ("PASS", "installed, migrations current (baseline)")
+        assert checks["schema"] == (
+            "PASS",
+            f"installed, migrations current ({versions})",
+        )
         assert checks["triggers"] == (
             "PASS",
-            f"all NOTIFY triggers present ({len(DOCTOR_REQUIRED_TRIGGERS)})",
+            f"all schema triggers present ({len(DOCTOR_REQUIRED_TRIGGERS)})",
         )
+
+    async def test_stale_database_fails_and_names_the_remedy(
+        self, scratch_db: ScratchFactory
+    ):
+        """THE regression this whole check exists for.
+
+        A database installed by an older release has `jorb`, so the old check
+        ("is jorb there, is anything pending") reported PASS schema -- and the
+        very next check died on `column "job_threads" does not exist`. The
+        health probe certified a database it could not use. Now the check is
+        the SHAPE, it FAILs, it names objects the operator can look up, and it
+        names the command that fixes it.
+        """
+        stale = await scratch_db(legacy=True)
+
+        result = await run_doctor(stale)
+
+        assert result.exit_code == 1, result.output
+        checks = parse_checks(result.output)
+        status, message = checks["schema"]
+        assert status == "FAIL"
+        assert "object(s) this release needs are missing" in message
+        assert "column jorb_worker.job_threads" in message
+        assert "run: pj-admin db migrate" in message
+        # It stops there on purpose: every check below queries something this
+        # one just reported missing, and doctor must not end in a traceback.
+        assert set(checks) == {"database", "schema"}
+        assert "Traceback" not in result.output + result.stderr
+
+    async def test_a_stale_database_passes_once_it_is_migrated(
+        self, scratch_db: ScratchFactory
+    ):
+        """The other half of the contract: FAIL has to be actionable, and the
+        action is one documented command."""
+        stale = await scratch_db(legacy=True)
+        conn = await asyncpg.connect(stale)
+        try:
+            await migrations.migrate(conn)
+        finally:
+            await conn.close()
+
+        result = await run_doctor(stale)
+
+        assert result.exit_code == 0, result.output
+        assert parse_checks(result.output)["schema"][0] == "PASS"
+
+    async def test_a_single_dropped_object_is_enough_to_fail(
+        self, scratch_db: ScratchFactory
+    ):
+        """The shape check is not a proxy for "was migrate ever run" -- it is
+        a statement about the objects the running code addresses, so one of
+        them going missing is a FAIL even on a perfectly tracked database."""
+        damaged = await scratch_db()
+        conn = await asyncpg.connect(damaged)
+        try:
+            await conn.execute("ALTER TABLE jorb DROP COLUMN tags")
+        finally:
+            await conn.close()
+
+        result = await run_doctor(damaged)
+
+        assert result.exit_code == 1, result.output
+        status, message = parse_checks(result.output)["schema"]
+        assert status == "FAIL"
+        assert "column jorb.tags" in message
+
+    async def test_unrecorded_but_complete_schema_passes_and_says_so(
+        self, scratch_db: ScratchFactory
+    ):
+        """A database installed from the CURRENT schema.sql by a release that
+        did not record migrations: every object is present, so it runs the
+        code correctly and doctor must not page anyone -- but the record is
+        what the next upgrade reads, so it does not go silently either.
+        """
+        installed = await scratch_db()
+        conn = await asyncpg.connect(installed)
+        try:
+            await conn.execute("DELETE FROM schema_migrations")
+        finally:
+            await conn.close()
+
+        result = await run_doctor(installed)
+
+        assert result.exit_code == 0, result.output
+        checks = parse_checks(result.output)
+        status, message = checks["schema"]
+        assert status == "PASS"
+        assert "are not recorded yet" in message
+        assert "run: pj-admin db migrate" in message
+        # and unlike a FAIL it does not stop the report
+        assert "dlq" in checks
 
     async def test_applied_versions_are_listed(self, scratch_db: ScratchFactory):
         installed = await scratch_db()
         conn = await asyncpg.connect(installed)
         try:
+            # a version this release does not ship, recorded by a newer one
             await conn.execute(
-                "INSERT INTO schema_migrations (version, name) VALUES (1, '001_x.sql')"
+                "INSERT INTO schema_migrations (version, name) "
+                "VALUES (99, '099_from_the_future.sql')"
             )
         finally:
             await conn.close()
@@ -239,41 +345,38 @@ class TestDoctorSchema:
         result = await run_doctor(installed)
 
         assert result.exit_code == 0, result.output
+        versions = [m.version for m in migrations.available_migrations()]
         assert parse_checks(result.output)["schema"] == (
             "PASS",
-            "installed, migrations current ([1])",
+            f"installed, migrations current ({sorted([*versions, 99])})",
         )
 
-    async def test_pending_migrations_branch_is_unreachable_at_schema_v1(
-        self, scratch_db: ScratchFactory
-    ):
-        """Documents why doctor's 'pending migrations' FAIL has no test.
-
-        `pending` is (files shipped in pyjobby/sql/migrations) minus (rows in
-        schema_migrations). Schema v1 ships zero migration files, so pending
-        is always empty and the FAIL branch cannot be reached without adding
-        a migration file to the package. When the first migration lands this
-        test fails, which is the reminder to cover that branch.
-        """
-        assert migrations.available_migrations() == []
-
-        installed = await scratch_db()
-        conn = await asyncpg.connect(installed)
-        try:
-            info = await migrations.status(conn)
-        finally:
-            await conn.close()
-
-        assert info["base_schema_installed"] is True
-        assert info["pending"] == []
-
 
 # ============================================================================
-# NOTIFY triggers
+# Triggers
 # ============================================================================
+
+#: Which table each required trigger lives on, so a test can drop them all.
+#: Kept here rather than in the manifest: doctor looks triggers up by name
+#: across the whole schema, and only a test needs to name their tables.
+TRIGGER_TABLES = {
+    "jorb_enqueued_notify": "jorb",
+    "jorb_done_notify": "jorb",
+    "jorb_cancel_notify": "jorb",
+    "jorb_history_record": "jorb",
+    "jorb_dag_complete": "jorb",
+    "jorb_event_notify": "jorb_event",
+    "schedule_executed_notify": "jorb_schedule_log",
+}
 
 
 class TestDoctorTriggers:
+    async def test_every_required_trigger_is_covered_by_this_file(self):
+        """The drop-them-all test below is only exhaustive if this mapping is:
+        a trigger added to the schema without a table here would silently stop
+        being exercised."""
+        assert set(TRIGGER_TABLES) == set(DOCTOR_REQUIRED_TRIGGERS)
+
     async def test_one_missing_trigger_fails_by_name(self, scratch_db: ScratchFactory):
         damaged = await scratch_db()
         conn = await asyncpg.connect(damaged)
@@ -288,7 +391,7 @@ class TestDoctorTriggers:
         checks = parse_checks(result.output)
         assert checks["triggers"] == (
             "FAIL",
-            "missing NOTIFY triggers: jorb_enqueued_notify",
+            "missing triggers: jorb_enqueued_notify (run: pj-admin db migrate)",
         )
         # a trigger FAIL must not stop the remaining checks
         assert checks["workers"][0] == "WARN"
@@ -298,8 +401,8 @@ class TestDoctorTriggers:
         damaged = await scratch_db()
         conn = await asyncpg.connect(damaged)
         try:
-            for trigger in DOCTOR_REQUIRED_TRIGGERS:
-                await conn.execute(f"DROP TRIGGER {trigger} ON jorb")
+            for trigger, table in TRIGGER_TABLES.items():
+                await conn.execute(f"DROP TRIGGER {trigger} ON {table}")
         finally:
             await conn.close()
 
@@ -308,8 +411,10 @@ class TestDoctorTriggers:
         assert result.exit_code == 1, result.output
         assert parse_checks(result.output)["triggers"] == (
             "FAIL",
-            "missing NOTIFY triggers: "
-            + ", ".join(DOCTOR_REQUIRED_TRIGGERS),  # reported in required order
+            "missing triggers: "
+            # reported in required order
+            + ", ".join(DOCTOR_REQUIRED_TRIGGERS)
+            + " (run: pj-admin db migrate)",
         )
 
 
@@ -675,7 +780,7 @@ class TestDoctorExitCode:
         assert checks["database"] == ("PASS", "connected")
         assert checks["triggers"] == (
             "FAIL",
-            "missing NOTIFY triggers: jorb_done_notify",
+            "missing triggers: jorb_done_notify (run: pj-admin db migrate)",
         )
         assert checks["dlq"][0] == "WARN"
         assert result.exit_code == 1, result.output

@@ -25,6 +25,7 @@ from click.testing import CliRunner
 
 from pyjobby import migrations
 from pyjobby.cli import cli
+from tests.schema_fixtures import install_legacy_schema
 
 pytestmark = pytest.mark.asyncio
 
@@ -84,14 +85,19 @@ async def scratch_db(db_params: dict):
     admin = await asyncpg.connect(**db_params)
     created: list[str] = []
 
-    async def _make(*, schema: bool = False) -> str:
+    async def _make(*, schema: bool = False, legacy: bool = False) -> str:
+        """`legacy=True` installs the frozen pre-migration schema: a database
+        an older pyjobby release created and this one cannot address."""
         name = f"pj_err_{uuid.uuid4().hex[:12]}"
         await admin.execute(f'CREATE DATABASE "{name}"')
         created.append(name)
-        if schema:
+        if schema or legacy:
             conn = await asyncpg.connect(**{**db_params, "database": name})
             try:
-                await migrations.migrate(conn)
+                if legacy:
+                    await install_legacy_schema(conn)
+                else:
+                    await migrations.migrate(conn)
             finally:
                 await conn.close()
         return name
@@ -990,7 +996,30 @@ class TestDbCommands:
         assert result.exit_code == 0, result.output
         assert "Base schema installed: no" in result.output
         assert "Applied migrations:    none" in result.output
+        # Nothing is pending and nothing is missing on a database with no
+        # schema: `db migrate` installs schema.sql -- which already contains
+        # every migration's effect -- and records them without running one.
         assert "Pending migrations:    none" in result.output
+        assert "Missing objects:       none" in result.output
+
+    async def test_status_on_a_stale_database_lists_what_is_missing(
+        self, db_params, scratch_db
+    ):
+        """The line that answers the question the other three cannot.
+
+        A database installed before the migration runner existed records
+        nothing, so "Applied: none / Pending: none" is literally true of it
+        and of a perfectly current database alike. Only the object list tells
+        them apart."""
+        name = await scratch_db(legacy=True)
+
+        result = await run_cli("--dsn", dsn_for(db_params, name), "db", "status")
+
+        assert result.exit_code == 0, result.output
+        assert "Base schema installed: yes" in result.output
+        assert "Pending migrations:    [1]" in result.output
+        assert "column jorb_worker.job_threads" in result.output
+        assert "function claim_jorb" in result.output
 
     async def test_migrate_without_create_privilege_fails(
         self, db_params, scratch_db, db_pool
@@ -1043,6 +1072,94 @@ class TestDbCommands:
 
         assert result.exit_code == 0, result.output
         assert "Database schema is up to date" in result.output
+
+
+# ============================================================================
+# A schema that is missing or out of date
+# ============================================================================
+
+
+class TestStaleSchemaMessages:
+    """What an operator sees when the database is not the shape this release
+    needs, from commands that are not `doctor`.
+
+    Every one of these used to print ~40 lines of asyncpg stack ending in
+    `column "job_threads" does not exist` -- true, and useless: it names a
+    column nobody asked for, does not say the schema is out of date, and does
+    not name the command that fixes it. The exit code was already 1, so
+    scripts were safe; only the human was not.
+
+    Three different command groups are covered because the handler is on the
+    root group, not on the commands: if it regresses, it regresses for all of
+    them at once, and a single-command test would be as likely to be checking
+    a coincidence.
+    """
+
+    STALE_MESSAGE = "Error: The database schema is missing or out of date:"
+    STALE_REMEDY = (
+        "Error: Install or upgrade it with `pj-admin db migrate`, then confirm "
+        "with `pj-admin doctor`."
+    )
+
+    def assert_clean_failure(self, result) -> None:
+        assert result.exit_code == 1, result.output
+        assert self.STALE_MESSAGE in result.stderr
+        assert self.STALE_REMEDY in result.stderr
+        assert "Traceback" not in result.output
+        assert "Traceback" not in result.stderr
+        # The asyncpg exception must not escape as the command's result
+        # either: `pj-admin` is a program, and an unhandled exception is a
+        # crash however it is rendered.
+        assert not isinstance(result.exception, asyncpg.PostgresError)
+
+    async def test_workers_list_on_a_stale_database(self, db_params, scratch_db):
+        name = await scratch_db(legacy=True)
+
+        result = await run_cli("--dsn", dsn_for(db_params, name), "workers", "list")
+
+        self.assert_clean_failure(result)
+        assert "job_threads" in result.stderr  # the underlying cause is kept
+
+    async def test_jobs_tag_filter_on_a_stale_database(self, db_params, scratch_db):
+        name = await scratch_db(legacy=True)
+
+        result = await run_cli(
+            "--dsn", dsn_for(db_params, name), "jobs", "list", "--tag", "customer=acme"
+        )
+
+        self.assert_clean_failure(result)
+        assert "tags" in result.stderr
+
+    async def test_metrics_on_a_stale_database(self, db_params, scratch_db):
+        name = await scratch_db(legacy=True)
+
+        result = await run_cli("--dsn", dsn_for(db_params, name), "metrics")
+
+        self.assert_clean_failure(result)
+
+    async def test_a_database_with_no_schema_at_all(self, db_params, scratch_db):
+        """The same message, and deliberately so: "there is no schema" and
+        "the schema is too old" have one remedy, and inventing a second
+        vocabulary for them would only make the runbook longer."""
+        name = await scratch_db()
+
+        result = await run_cli("--dsn", dsn_for(db_params, name), "jobs", "list")
+
+        self.assert_clean_failure(result)
+
+    async def test_the_same_commands_work_once_migrated(self, db_params, scratch_db):
+        """Control: the failures above are about the schema, and `db migrate`
+        is genuinely the remedy the message names."""
+        name = await scratch_db(legacy=True)
+        dsn = dsn_for(db_params, name)
+
+        migrated = await run_cli("--dsn", dsn, "db", "migrate")
+        assert migrated.exit_code == 0, migrated.output
+        assert "Applied migrations: [1]" in migrated.output
+
+        for args in (["workers", "list"], ["metrics"], ["jobs", "list"]):
+            result = await run_cli("--dsn", dsn, *args)
+            assert result.exit_code == 0, f"{args}: {result.output}"
 
 
 # ============================================================================
@@ -1106,7 +1223,8 @@ class TestFlagValidation:
         result = await run_cli("--dsn", dsn, "jobs", "list", "--nope")
 
         assert result.exit_code == 2
-        assert "Error: No such option: --nope" in result.stderr
+        # click's own wording, quoted since 8.2
+        assert "Error: No such option '--nope'." in result.stderr
 
     async def test_queues_clear_requires_a_queue_argument(self, dsn):
         result = await run_cli("--dsn", dsn, "queues", "clear")

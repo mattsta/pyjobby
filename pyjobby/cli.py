@@ -17,7 +17,7 @@ from typing import Any, NoReturn
 import asyncpg  # type: ignore[import-untyped]
 import click
 
-from . import db
+from . import db, migrations
 from .admin_api import UNSET, AdminAPI, Unset
 from .configloader import load_config_from_file
 from .db import JobState
@@ -108,6 +108,51 @@ def fail(
     for message in messages:
         print_error(message)
     raise problem(code)
+
+
+#: The errors PostgreSQL raises when the code addresses an object the database
+#: does not have. Every one of them means the same thing here -- this database
+#: was installed from a different revision of schema.sql, or from none at all
+#: -- and none of them means the operator typed something wrong.
+SCHEMA_ERRORS = (
+    asyncpg.UndefinedTableError,
+    asyncpg.UndefinedColumnError,
+    asyncpg.UndefinedFunctionError,
+    asyncpg.UndefinedObjectError,
+    asyncpg.InvalidSchemaNameError,
+)
+
+
+class PyjobbyCLI(click.Group):
+    """The root group, with one job beyond click's: turning a missing or stale
+    schema into an answer instead of a stack trace.
+
+    Every command here opens a connection and immediately queries a table,
+    column or function that `pj-admin db migrate` is responsible for creating.
+    When one of them is absent, asyncpg raises from deep inside the driver and
+    the operator gets forty lines of traceback whose last line is
+    `column "job_threads" does not exist` -- true, and useless: it names a
+    column nobody asked for by name, does not say the schema is out of date,
+    and does not name the command that fixes it.
+
+    Catching it HERE rather than in each command is deliberate: click routes
+    every subcommand and subgroup invocation through this method, so one
+    handler covers `jobs`, `queues`, `workers`, `dag`, `dlq`, `schedule`,
+    `stats` and everything added later -- and a new command cannot forget to
+    opt in. The exit code is unchanged (1), so scripts that already branch on
+    it keep working; only the noise is replaced.
+    """
+
+    def invoke(self, ctx: click.Context) -> Any:
+        try:
+            return super().invoke(ctx)
+        except SCHEMA_ERRORS as e:
+            fail(
+                f"The database schema is missing or out of date: {e}",
+                "Install or upgrade it with `pj-admin db migrate`, then "
+                "confirm with `pj-admin doctor`.",
+                problem=DatabaseProblem,
+            )
 
 
 def report_cancel(result: dict[str, Any]) -> None:
@@ -217,7 +262,7 @@ async def get_connection(
 # =========================================================================
 
 
-@click.group()
+@click.group(cls=PyjobbyCLI)
 @click.option("--config", "-c", default="./pyjobby.conf.py", help="Config file path")
 @click.option(
     "--dsn",
@@ -2547,11 +2592,27 @@ def jobs_timeout_stats(
 # =========================================================================
 
 
-DOCTOR_REQUIRED_TRIGGERS = (
-    "jorb_enqueued_notify",
-    "jorb_done_notify",
-    "jorb_cancel_notify",
-)
+#: Every trigger schema.sql installs, checked by name. Not a second list: it
+#: IS the migration runner's manifest, so a trigger added to the schema is
+#: checked here the moment it is declared there.
+DOCTOR_REQUIRED_TRIGGERS = migrations.REQUIRED_TRIGGERS
+
+#: How many missing objects doctor names before summarising. A database
+#: installed two releases ago is missing dozens; the operator needs to see
+#: that it is stale and what to run, not a wall of catalog names.
+DOCTOR_MISSING_NAMED = 5
+
+
+def missing_shape_summary(missing: list[str]) -> str:
+    """doctor's FAIL line for a database whose schema is the wrong shape."""
+    named = ", ".join(missing[:DOCTOR_MISSING_NAMED])
+    if len(missing) > DOCTOR_MISSING_NAMED:
+        named += f", and {len(missing) - DOCTOR_MISSING_NAMED} more"
+    return (
+        f"installed, but {len(missing)} object(s) this release needs are "
+        f"missing: {named} ({migrations.MIGRATE_REMEDY})"
+    )
+
 
 # Fill fractions of PostgreSQL's shared async-NOTIFY queue at which doctor
 # stops calling it healthy. The queue is server-wide and bounded, and it
@@ -2713,21 +2774,58 @@ def doctor(ctx: click.Context, max_depth: int, max_age_minutes: int) -> None:
         doc.report("PASS", "database", "connected")
 
         try:
-            from . import migrations
-
+            # THE SCHEMA CHECK, and the one that used to be a lie. It asked
+            # two questions -- is `jorb` there, and does schema_migrations
+            # record a version this release does not ship -- and a database
+            # installed from an OLDER schema.sql answers both the way a
+            # healthy one does: jorb exists, and it records nothing at all, so
+            # nothing is "pending". Doctor printed PASS schema and the very
+            # next check died on `column "job_threads" does not exist`.
+            #
+            # So it now asks what the operator was actually asking: can the
+            # code that is running address this database? That is the SHAPE --
+            # the tables, columns, functions, views, indexes and enum labels
+            # the release needs -- read out of the catalog and compared
+            # against migrations.py's manifest, which is machine-checked
+            # against a fresh install by the test suite.
+            #
+            # Any FAIL here returns immediately, exactly as "no schema at all"
+            # always did: every check below this line queries a column or
+            # function this one just reported missing, and a health report
+            # that crashes halfway through is worse than one that stops.
             info = await migrations.status(conn)
             if not info["base_schema_installed"]:
                 doc.report(
                     "FAIL",
                     "schema",
-                    "base schema not installed (run: pj-admin db migrate)",
+                    f"base schema not installed ({migrations.MIGRATE_REMEDY})",
                 )
                 return 1  # nothing else can be checked
+            if info["missing"]:
+                doc.report("FAIL", "schema", missing_shape_summary(info["missing"]))
+                return 1
             if info["pending"]:
+                # PASS, and the reasoning is the same one that made the check
+                # above a FAIL. This check answers "can the code that is
+                # running address this database", and the shape check just
+                # proved that every object the pending files install is
+                # already here -- so the answer is yes, and only the
+                # BOOKKEEPING is behind. That is what a database installed
+                # from the current schema.sql by a release that did not record
+                # migrations looks like, and waking someone at 3am over a
+                # missing row in schema_migrations is how a health probe
+                # teaches people to ignore it.
+                #
+                # It is still said out loud, because the record is what the
+                # NEXT upgrade reads: until `db migrate` runs, a later release
+                # cannot tell this database from one that never applied the
+                # migration at all.
                 doc.report(
-                    "FAIL",
+                    "PASS",
                     "schema",
-                    f"pending migrations: {info['pending']} (run: pj-admin db migrate)",
+                    f"installed and complete; migrations {info['pending']} "
+                    f"are not recorded yet, which the next upgrade reads "
+                    f"({migrations.MIGRATE_REMEDY})",
                 )
             else:
                 applied = info["applied"] or "baseline"
@@ -2735,7 +2833,11 @@ def doctor(ctx: click.Context, max_depth: int, max_age_minutes: int) -> None:
                     "PASS", "schema", f"installed, migrations current ({applied})"
                 )
 
-            # NOTIFY triggers
+            # Triggers, checked by name for the same reason the shape is:
+            # nothing raises when one is missing, the platform just stops
+            # doing something. A dropped jorb_history_record loses the audit
+            # trail silently; a dropped NOTIFY trigger degrades every waiter
+            # to its polling fallback.
             rows = await conn.fetch(
                 "SELECT tgname FROM pg_trigger WHERE tgname = ANY($1::text[])",
                 list(DOCTOR_REQUIRED_TRIGGERS),
@@ -2745,8 +2847,8 @@ def doctor(ctx: click.Context, max_depth: int, max_age_minutes: int) -> None:
             doc.check(
                 not missing,
                 "triggers",
-                f"all NOTIFY triggers present ({len(DOCTOR_REQUIRED_TRIGGERS)})",
-                f"missing NOTIFY triggers: {', '.join(missing)}",
+                f"all schema triggers present ({len(DOCTOR_REQUIRED_TRIGGERS)})",
+                f"missing triggers: {', '.join(missing)} ({migrations.MIGRATE_REMEDY})",
             )
 
             # NOTIFY queue saturation. Checked right after the triggers that
@@ -2873,11 +2975,9 @@ def db_migrate(ctx: click.Context) -> None:
     """Install the base schema if missing, then apply pending migrations"""
 
     async def _migrate() -> None:
-        from . import migrations
-
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
-            applied = await migrations.migrate(conn)
+            result = await migrations.migrate(conn)
         except asyncpg.InsufficientPrivilegeError as e:
             fail(
                 f"Not permitted to install the schema: {e}",
@@ -2886,9 +2986,21 @@ def db_migrate(ctx: click.Context) -> None:
         except asyncpg.PostgresError as e:
             fail(f"Migration failed: {e}", "The database was left unchanged.")
         else:
-            if applied:
-                print_success(f"Applied migrations: {applied}")
-            else:
+            # Reported distinctly, because "applied" and "recorded" are
+            # different events and an operator reading a deploy log needs to
+            # tell them apart: a fresh install RECORDS every migration without
+            # running any of them (schema.sql already contains their effects),
+            # and saying "applied" there would claim DDL that never ran.
+            if result.installed_base:
+                print_success("Installed base schema")
+                if result.recorded:
+                    print_success(
+                        f"Recorded migrations {result.recorded} "
+                        f"(already contained in the base schema)"
+                    )
+            if result.applied:
+                print_success(f"Applied migrations: {result.applied}")
+            elif not result.installed_base:
                 print_success("Database schema is up to date")
         finally:
             await conn.close()
@@ -2902,8 +3014,6 @@ def db_status(ctx: click.Context) -> None:
     """Show applied vs pending schema migrations"""
 
     async def _status() -> None:
-        from . import migrations
-
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             info = await migrations.status(conn)
@@ -2912,6 +3022,17 @@ def db_status(ctx: click.Context) -> None:
             )
             click.echo(f"Applied migrations:    {info['applied'] or 'none'}")
             click.echo(f"Pending migrations:    {info['pending'] or 'none'}")
+            # The line that answers the question the other three cannot: a
+            # database installed before the runner existed records nothing,
+            # so "pending: none" is true and meaningless on it.
+            missing = info["missing"]
+            click.echo(
+                f"Missing objects:       {len(missing)}"
+                if missing
+                else "Missing objects:       none"
+            )
+            for name in missing:
+                click.echo(f"  {name}")
         finally:
             await conn.close()
 

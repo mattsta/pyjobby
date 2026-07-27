@@ -32,36 +32,84 @@ Installing puts seven commands on `PATH`:
 
 ## The database
 
-One command installs the schema, and it is the only supported way to do it:
+One command installs the schema, and the same command upgrades it. It is the
+only supported way to do either:
 
 ```console
 $ pj-admin --dsn "$PYJOBBY_DSN" db migrate
-Installing base schema (jorb table not found)
-Database schema is up to date
+Installed base schema
+Recorded migrations [1] (already contained in the base schema)
 ```
 
 ```console
 $ pj-admin --dsn "$PYJOBBY_DSN" db status
 Base schema installed: yes
-Applied migrations:    none
+Applied migrations:    [1]
 Pending migrations:    none
+Missing objects:       none
 ```
 
-`db migrate` installs `schema.sql` when the `jorb` table is absent, then
-applies every numbered file in `pyjobby/sql/migrations/` this database has
-not already recorded in `schema_migrations`. It is idempotent, so running it
-on every deploy is the intended usage — but run it from **one** place, as a
-deploy step or an init container, not from every worker's startup. It takes
-no lock, so two processes installing a fresh schema at the same instant will
-race and one will fail.
+**A fresh database** gets `schema.sql` — the whole current schema, one file —
+and every numbered file in `pyjobby/sql/migrations/` is then *recorded*
+without being run, because `schema.sql` already contains their effects. That
+is why the output says "recorded" and not "applied": no migration DDL
+executed.
 
-Schema v1 is the baseline and ships no migration files, so on a database
-that already has `jorb` the command reports "up to date" and changes
-nothing. **A database installed from a different revision of `schema.sql`
-is therefore not brought forward by it.** The platform will fail on the
-columns that revision did not have — and it fails at the first statement
-that needs one, not at startup. Re-create the database, or install into a
-fresh one and cut over.
+**An existing database** gets the numbered files it has not recorded in
+`schema_migrations`, oldest first, one transaction each. A database installed
+before the migration runner existed has no `schema_migrations` table at all,
+which reads as "has recorded nothing", so it receives every migration from
+001 — which is correct, because it was installed from an older revision of
+`schema.sql`.
+
+```console
+$ pj-admin --dsn "$PYJOBBY_DSN" db migrate       # a database from an older release
+Applied migrations: [1]
+```
+
+It is idempotent, so running it on every deploy is the intended usage, and it
+takes a PostgreSQL advisory lock for the duration — two hosts running their
+deploy step at the same instant serialise, one does the work and the other
+waits and then finds nothing to do. Prefer running it from **one** place, as
+a deploy step or an init container, rather than from every worker's startup:
+concurrency is safe, but a hundred workers queued behind one lock is a slow
+rollout.
+
+**Upgrades take locks on the tables they change.** A migration may add an
+index, and `CREATE INDEX CONCURRENTLY` is not available to a migration runner
+(it cannot run inside a transaction, and a half-applied migration is worse
+than a blocking one). On a large `jorb` this is a maintenance-window
+operation: writes to a table block while its index builds. Read the migration
+files for the release you are moving to — they are plain SQL in
+`pyjobby/sql/migrations/` — and size the window from the tables they touch.
+
+**Verify before you cut traffic over.** `pj-admin doctor`'s schema check reads
+the catalog and compares it against every object this release needs, so it
+FAILs by name on a database that is present but stale, and `db status` lists
+the same objects:
+
+```console
+$ pj-admin --dsn "$PYJOBBY_DSN" doctor
+PASS database: connected
+FAIL schema: installed, but 19 object(s) this release needs are missing: column jorb.awaited, column jorb.claimed_at, column jorb.tags, column jorb_worker.idle, column jorb_worker.job_threads, and 14 more (run: pj-admin db migrate)
+```
+
+Doctor stops there rather than continuing into checks that would fail on the
+columns it has just reported missing. Every other `pj-admin` command reports
+the same condition in one line, naming the same remedy, instead of a
+traceback:
+
+```console
+$ pj-admin --dsn "$PYJOBBY_DSN" workers list
+Error: The database schema is missing or out of date: column w.job_threads does not exist
+Error: Install or upgrade it with `pj-admin db migrate`, then confirm with `pj-admin doctor`.
+```
+
+One case reports PASS while still asking for `db migrate`: a database whose
+objects are all present but whose `schema_migrations` rows are not, which is
+what a database installed from the current `schema.sql` by an older release
+looks like. It runs the current code correctly — hence PASS — but the record
+is what the *next* upgrade reads, so run `db migrate` once to write it.
 
 Do not hand-write DDL, and do not load the schema from a copy checked into
 your own repository. The schema is one file, it is versioned with the code
