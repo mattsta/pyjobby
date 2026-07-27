@@ -31,6 +31,8 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
+from pyjobby.lifecycle import HISTORY_ORIGIN, TERMINAL_STATES, is_legal
+
 from .conftest import wait_for_job_state
 
 
@@ -49,26 +51,12 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.hypothesis]
 # ============================================================================
 # The state machine the platform actually defines
 # ============================================================================
-# Derived from pyjobby/pj.py (claim/run/finished/retry/crashed/cancelled),
-# pyjobby/monitor.py (requeue sweeps), and pyjobby/db.py (cancel/requeue).
-LEGAL_TRANSITIONS: dict[str, set[str]] = {
-    # a fresh row is 'enqueued' as queued (claimable) or waiting (blocked)
-    "enqueued": {"queued", "waiting", "claimed", "running"},
-    "waiting": {"queued", "cancelled"},
-    "queued": {"claimed", "cancelled"},
-    # claimed -> running normally; the monitor may requeue it, and a
-    # cancel/failure can land before execution starts
-    "claimed": {"running", "queued", "cancelled", "crashed"},
-    # running -> terminal, or back to queued (retry backoff, self-reschedule,
-    # durable sleep, monitor requeue)
-    "running": {"finished", "crashed", "cancelled", "queued"},
-    # terminal states are final EXCEPT for an explicit operator requeue
-    "finished": {"queued"},
-    "crashed": {"queued"},
-    "cancelled": {"queued"},
-}
-
-TERMINAL = {"finished", "crashed", "cancelled"}
+# The declaration lives in `pyjobby.lifecycle` and is imported, not restated.
+# It used to be a copy here, which meant the shipped platform had no single
+# place saying what its own machine is -- the rules were spread across the
+# `AND state IN (...)` predicates of eight statements, and the only written
+# form of them was in a test that the package could not see.
+TERMINAL = set(TERMINAL_STATES)
 
 
 async def assert_history_is_a_legal_walk(pool, job_ids: list[int]) -> None:
@@ -79,15 +67,16 @@ async def assert_history_is_a_legal_walk(pool, job_ids: list[int]) -> None:
             job_id,
         )
         assert rows, f"job {job_id} has no history (the trigger must record it)"
-        assert rows[0]["event"] == "enqueued", (
-            f"job {job_id} history starts with {rows[0]['event']!r}, not 'enqueued'"
+        assert rows[0]["event"] == HISTORY_ORIGIN, (
+            f"job {job_id} history starts with {rows[0]['event']!r}, "
+            f"not {HISTORY_ORIGIN!r}"
         )
 
-        previous = "enqueued"
+        previous = HISTORY_ORIGIN
         epochs = []
         for row in rows[1:]:
             event = row["event"]
-            assert event in LEGAL_TRANSITIONS[previous], (
+            assert is_legal(previous, event), (
                 f"job {job_id}: illegal transition {previous!r} -> {event!r} "
                 f"(history: {[r['event'] for r in rows]})"
             )

@@ -22,6 +22,7 @@ import re
 
 import pytest
 
+from pyjobby.lifecycle import TERMINAL_STATES
 from pyjobby.monitor import (
     DELETE_MAILBOX_SQL,
     DELETE_RETIRED_WORKERS_SQL,
@@ -30,7 +31,6 @@ from pyjobby.monitor import (
     SWEEP_ORPHANED_DAGS_SQL,
     SWEEP_RETIRED_WORKERS_SQL,
     SWEEP_SCHEDULE_LOG_SQL,
-    TERMINAL_STATES,
 )
 from pyjobby.scheduler import CONCURRENCY_COUNT_SQL
 from tests.utils.plans import (

@@ -89,6 +89,7 @@ import asyncpg  # type: ignore[import-untyped]
 from loguru import logger
 
 from . import db
+from .lifecycle import TERMINAL_STATES
 
 # =========================================================================
 # The sweep statements
@@ -105,11 +106,6 @@ from . import db
 # The `_TERMINAL_STATES_SQL` interpolation below is a module constant, never
 # user input; see its own comment for why the states are inlined rather than
 # bound.
-
-#: The states a job never leaves. Only these are ever eligible for deletion:
-#: a queued/claimed/running/waiting job is live work however old it looks
-#: (a job parked on a dependency can legitimately outlive any window).
-TERMINAL_STATES = ("finished", "crashed", "cancelled")
 
 #: The same list inlined into SQL, because ``jorb_retention_idx`` is PARTIAL
 #: on exactly this predicate. A bound ``state = ANY($1)`` reads fine under the
