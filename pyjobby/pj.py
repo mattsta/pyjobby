@@ -2075,12 +2075,19 @@ def workit(
         time.sleep(random.uniform(0.001, 0.010))
 
     def signalBroadcast(signum: int, frame: Any) -> None:
-        """Forward main interrupt to child processes"""
-        try:
-            for p in launched:
-                os.kill(p.pid, signum)  # type: ignore[arg-type]
-        except OSError:
-            pass
+        """Forward main interrupt to every child, including after one is gone.
+
+        The suppression is PER CHILD, not around the loop. A worker that has
+        already exited raises ProcessLookupError from os.kill, and catching
+        that outside the loop abandoned the broadcast there -- so one dead
+        child silenced the signal for every worker after it, and the survivors
+        only noticed at their next orphan check, up to a poll interval later.
+        """
+        for p in launched:
+            if p.pid is None:  # never started, or already reaped
+                continue
+            with contextlib.suppress(OSError):
+                os.kill(p.pid, signum)
 
     signal.signal(signal.SIGTERM, signalBroadcast)
     for l in launched:

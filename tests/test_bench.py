@@ -218,8 +218,16 @@ class TestSubcommandsEmitDocumentedJson:
             assert data["claims"] == 20
             assert data["claims_per_second"]["median"] > 0
             assert 0.0 <= data["lock_miss_rate"] <= 1.0
-        # an uncapped queue never takes the advisory lock, so it cannot miss it
-        assert payload["modes"]["uncapped"]["empty_claims_with_work_available"] == 0
+        # NOT asserted: that the uncapped arm's empty-claim count is zero.
+        # An uncapped queue never takes the advisory lock, so it cannot miss
+        # it -- but that counter does not only count lock misses. It counts
+        # any claim that came back empty while work was queued, and on an
+        # uncapped queue that is FOR UPDATE SKIP LOCKED doing its job: every
+        # remaining candidate was locked by a concurrent claimer. It is zero
+        # on an idle box and nonzero on a busy one, so asserting zero tests
+        # the machine rather than the code (observed: 5, on a load-10 box).
+        # What matters is already asserted above -- every job was claimed
+        # exactly once, and the rate is a valid fraction.
 
     async def test_notify(self, db_params):
         code, payload, _ = await run_bench(
