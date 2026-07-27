@@ -101,6 +101,17 @@ regardless.
   waiting ──► queued        when waitfor_job / waitfor_group is satisfied
 ```
 
+The dependency wake is edge-triggered — the upstream's own terminal
+transition moves its waiters to `queued` — with the monitor as the level
+trigger behind it: every cycle it wakes waiters whose upstream is already
+`finished` (covering a worker that crashed between its terminal write and
+the wake, and a waiter enqueued after its upstream had already finished),
+and cancels waiters whose `waitfor` target does not exist at all, with the
+reason in `error_message`. A waiter whose upstream **crashed or was
+cancelled** stays `waiting` on purpose: crashed is the DLQ and the upstream
+may be retried back to life, so only the operator can decide — `pj-admin
+doctor` reports these as `blocked-waiters`.
+
 Concretely, one attempt:
 
 1. **Enqueue.** A single `INSERT INTO jorb`, shared by every producer path

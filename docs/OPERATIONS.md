@@ -8,7 +8,7 @@ wrong. The executable version of the health section is `pj-admin doctor`.
 | Process | Command | Count | Purpose |
 |---|---|---|---|
 | Workers | `pj --config ./pyjobby.conf.py --queue Q --workers N` | N processes **per named queue**, per host | claim + execute jobs |
-| Monitor | `pj-monitor --config ./pyjobby.conf.py` | 1 (more are safe) | timeout enforcement, dead-worker reclaim |
+| Monitor | `pj-monitor --config ./pyjobby.conf.py` | 1 (more are safe) | timeout enforcement, dead-worker reclaim, stranded-waiter recovery |
 | Scheduler | `pj-scheduler --config ./pyjobby.conf.py` | 1 (more are safe) | fires cron schedules |
 | Web admin | `pj-web ./pyjobby.conf.py --host 127.0.0.1 --port 8081` | optional | HTML admin + `/metrics` |
 | Websocket | `pj-ws ./pyjobby.conf.py --port 8082` | optional | realtime dashboard feed |

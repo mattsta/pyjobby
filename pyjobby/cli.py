@@ -2963,6 +2963,33 @@ def doctor(ctx: click.Context, max_depth: int, max_age_minutes: int) -> None:
                     f"age {max_age_minutes}m)",
                 )
 
+            # Waiters parked on failed upstreams. The monitor deliberately
+            # leaves these alone -- a crashed upstream is retryable (crashed
+            # IS the DLQ), so only the operator knows whether it will be
+            # revived -- which makes this check the ONLY place the condition
+            # is visible. Bounded by the waiting set via the two partial
+            # waitfor indexes, never by the table.
+            blocked = await conn.fetchval("""
+                SELECT COUNT(*) FROM jorb w
+                WHERE w.state = 'waiting'
+                  AND ((w.waitfor_job IS NOT NULL AND EXISTS (
+                            SELECT 1 FROM jorb u
+                            WHERE u.id = w.waitfor_job
+                              AND u.state IN ('crashed', 'cancelled')))
+                    OR (w.waitfor_group IS NOT NULL AND EXISTS (
+                            SELECT 1 FROM jorb g
+                            WHERE g.run_group = w.waitfor_group
+                              AND g.state IN ('crashed', 'cancelled'))))
+            """)
+            doc.warn_if(
+                bool(blocked),
+                "blocked-waiters",
+                "no waiting jobs blocked on failed upstreams",
+                f"{blocked} waiting job(s) blocked on a crashed/cancelled "
+                f"upstream; retry the upstream (pj-admin dlq retry) or "
+                f"cancel the waiter (pj-admin jobs cancel)",
+            )
+
             # DLQ ('crashed' is the terminal dead-letter state)
             dlq_count = await conn.fetchval(
                 "SELECT COUNT(*) FROM jorb WHERE state = 'crashed'"

@@ -233,6 +233,12 @@ STMTS["reschedule"] = """UPDATE jorb
 
 # Wake jobs waiting on a group: when ZERO jobs in run_group $1 are
 # unfinished, everything waiting on that group becomes claimable.
+#
+# NOT EXISTS, never `0 = count(*)`: a count must visit EVERY member of the
+# group before it can say zero, and this statement runs on the completion
+# path of every grouped job — count made a fan-out of N cost O(N²) index
+# reads across its lifetime. NOT EXISTS stops at the first unfinished
+# member, which is O(1) for all N-1 completions that don't wake anyone.
 STMTS["enqueue-next-if-peer-group-is-finished"] = """ UPDATE jorb
             SET state = 'queued',
                 updated = now()
@@ -240,14 +246,14 @@ STMTS["enqueue-next-if-peer-group-is-finished"] = """ UPDATE jorb
                 SELECT id FROM jorb
                 WHERE waitfor_group = $1
                    AND state = 'waiting'
-                   AND 0 = (
-                       SELECT count(*) FROM jorb
-                       WHERE run_group = $1
-                          AND state != 'finished'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM jorb g
+                       WHERE g.run_group = $1
+                          AND g.state != 'finished'
                    )
                 FOR UPDATE SKIP LOCKED
             )
-            RETURNING *"""
+            RETURNING id"""
 
 # Wake jobs waiting on a single upstream job we just finished.
 STMTS["enqueue-next-self-finished"] = """ UPDATE jorb
@@ -257,14 +263,14 @@ STMTS["enqueue-next-self-finished"] = """ UPDATE jorb
                 SELECT id FROM jorb
                 WHERE waitfor_job = $1
                    AND state = 'waiting'
-                   AND 0 = (
-                       SELECT count(*) FROM jorb
-                       WHERE id = $1
-                          AND state != 'finished'
+                   AND EXISTS (
+                       SELECT 1 FROM jorb u
+                       WHERE u.id = $1
+                          AND u.state = 'finished'
                    )
                 FOR UPDATE SKIP LOCKED
             )
-            RETURNING *"""
+            RETURNING id"""
 
 # DXE primitives (see pyjobby/dxe.py for semantics)
 STMTS["load-steps"] = dxe.LOAD_STEPS_SQL

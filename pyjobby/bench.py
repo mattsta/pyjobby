@@ -130,6 +130,11 @@ SCALE_TARGET_RATE = 278.0
 #: workers and by ``max_concurrency``, so it does not grow with the table.
 PLAN_IN_FLIGHT = 200
 
+#: Group-flavor waiting rows the plan seed adds for the stranded-waiter
+#: sweeps (the job-flavor slice reuses the in-flight count, for the same
+#: bounded-by-workload reason).
+PLAN_GROUP_WAITERS = 30
+
 #: One job in this many gets DXE checkpoints, and one DAG in this many keeps a
 #: job. Both sweeps have to walk past the rest to fill a batch, which is the
 #: shape that catches an index scan doing a table's worth of work — seeding
@@ -2013,6 +2018,29 @@ SWEEP_GATES: dict[str, SweepGate] = {
         # registry reference -- the overwhelmingly normal case.
         backlog_discards=PLAN_IN_FLIGHT_BUDGET,
     ),
+    "SWEEP_SATISFIED_JOB_WAITERS_SQL": SweepGate(
+        "monitor stranded-waiter wake, single-job flavor (missed wake edges)",
+        ("jorb",),
+        takes_window=False,
+        # Walks the waiting set via jorb_waitfor_job_idx and probes each
+        # upstream by key, discarding waiters whose upstream is still live —
+        # bounded by parked work, never by the table.
+        caught_up_discards=PLAN_IN_FLIGHT_BUDGET,
+    ),
+    "SWEEP_SATISFIED_GROUP_WAITERS_SQL": SweepGate(
+        "monitor stranded-waiter wake, group flavor (missed wake edges)",
+        ("jorb",),
+        takes_window=False,
+        caught_up_discards=PLAN_IN_FLIGHT_BUDGET,
+    ),
+    "SWEEP_UNSATISFIABLE_WAITERS_SQL": SweepGate(
+        "monitor unsatisfiable-waiter cancel (waitfor target does not exist)",
+        ("jorb",),
+        takes_window=False,
+        # Discards are every waiter whose target DOES exist — the
+        # overwhelmingly normal case, and the honest cost of asking.
+        caught_up_discards=PLAN_IN_FLIGHT_BUDGET,
+    ),
     "SWEEP_EXPIRED_JOBS_SQL": SweepGate(
         "monitor job retention sweep (every cycle, forever)",
         ("jorb",),
@@ -2379,10 +2407,81 @@ async def seed_plan_data(
         queue,
         in_flight,
     )
+    # Waiting rows for the stranded-waiter sweeps, at IN-FLIGHT scale for the
+    # same reason the claimed/running slice is fixed: parked waiters are
+    # bounded by the workload's dependency structure, not by the table.
+    # Thirds by upstream state: FINISHED (the satisfied probe's hits),
+    # RUNNING (its discards — the honest cost of asking), and an id that
+    # cannot exist (the unsatisfiable probe's hits). A separate slice waits
+    # on groups: one fully finished (hit), one with an unfinished member
+    # (discard), one with no members at all (unsatisfiable).
+    await conn.execute(
+        """
+        WITH upstream AS (
+            SELECT (SELECT min(id) FROM jorb
+                     WHERE queue = $2 AND state = 'finished') AS done,
+                   (SELECT min(id) FROM jorb
+                     WHERE queue = $2 AND state = 'running') AS live
+        )
+        INSERT INTO jorb (job_class, kwargs, queue, state, waitfor_job,
+                          created, updated)
+        SELECT $1, '{}'::jsonb, $2, 'waiting',
+               CASE WHEN i % 3 = 0 THEN upstream.done
+                    WHEN i % 3 = 1 THEN upstream.live
+                    ELSE -i END,
+               now(), now()
+        FROM generate_series(1, $3::int) i, upstream
+        """,
+        BENCH_JOB_CLASS,
+        queue,
+        in_flight,
+    )
     job_ids = await conn.fetch(
         "SELECT id FROM jorb WHERE queue = $1 ORDER BY id LIMIT 200", queue
     )
     anchor = int(job_ids[0]["id"])
+    # Two run_groups for the group-waiter probes: one whose members are all
+    # finished (the satisfied probe's hit), one holding a running member
+    # (its discard). Waiters on a group NOBODY belongs to are seeded by the
+    # third arm of the insert below. Group ids are anchored to this queue's
+    # own id range, matching the run_group convention (a group is named by
+    # its leader's job id).
+    await conn.execute(
+        """
+        UPDATE jorb SET run_group = $2
+        WHERE id IN (SELECT id FROM jorb
+                      WHERE queue = $1 AND state = 'finished'
+                      ORDER BY id LIMIT 20)
+        """,
+        queue,
+        anchor,
+    )
+    await conn.execute(
+        """
+        UPDATE jorb SET run_group = $2
+        WHERE id IN (SELECT id FROM jorb
+                      WHERE queue = $1 AND state = 'running'
+                      ORDER BY id LIMIT 5)
+        """,
+        queue,
+        anchor + 1,
+    )
+    await conn.execute(
+        """
+        INSERT INTO jorb (job_class, kwargs, queue, state, waitfor_group,
+                          created, updated)
+        SELECT $1, '{}'::jsonb, $2, 'waiting',
+               CASE WHEN i % 3 = 0 THEN $4::bigint
+                    WHEN i % 3 = 1 THEN $4::bigint + 1
+                    ELSE -i END,
+               now(), now()
+        FROM generate_series(1, $3::int) i
+        """,
+        BENCH_JOB_CLASS,
+        queue,
+        PLAN_GROUP_WAITERS,
+        anchor,
+    )
     # One job in PLAN_STEP_EVERY gets checkpoints, and the checkpointed
     # FRACTION is what the sweep's cost turns on: it walks past step-less
     # jobs to fill a batch, so capping the insert at a flat few thousand

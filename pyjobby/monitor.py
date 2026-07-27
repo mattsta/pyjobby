@@ -443,6 +443,115 @@ SWEEP_MAILBOX_SQL = """
 #: ...and the delete, by the primary key's leading column.
 DELETE_MAILBOX_SQL = "DELETE FROM jorb_mailbox WHERE id = ANY($1::bigint[])"
 
+#: Waiting jobs whose single-job dependency is already satisfied. ($1 batch)
+#:
+#: The wake is normally edge-triggered: the upstream's terminal transition
+#: moves its waiters to 'queued' in the statement right after `finished`
+#: commits. An edge can be missed two ways — the worker died in the window
+#: between its terminal write and the wake, or the waiter was ENQUEUED after
+#: the upstream had already finished, so the edge had already fired with
+#: nobody listening. This probe is the level trigger that makes both
+#: self-heal within a monitor cycle.
+#:
+#: One flavor per statement (job here, group below) because each maps to its
+#: own partial index (``jorb_waitfor_job_idx`` / ``jorb_waitfor_group_idx``,
+#: both ``WHERE state = 'waiting'``); an OR spanning the two flavors matches
+#: neither index cleanly. Both scan only 'waiting' rows — live work, bounded
+#: by what is actually parked, never by the size of jorb.
+SWEEP_SATISFIED_JOB_WAITERS_SQL = """
+    SELECT w.id
+    FROM jorb w
+    WHERE w.state = 'waiting'
+      AND w.waitfor_job IS NOT NULL
+      AND EXISTS (
+          SELECT 1 FROM jorb u
+          WHERE u.id = w.waitfor_job AND u.state = 'finished'
+      )
+    ORDER BY w.id
+    FOR UPDATE SKIP LOCKED
+    LIMIT $1
+"""
+
+#: ...the group flavor: every member finished (and the group is not empty —
+#: an empty group is unsatisfiable, which is the sweep below's business).
+#: NOT EXISTS stops at the first unfinished member, exactly like the wake
+#: statement it backs up.
+SWEEP_SATISFIED_GROUP_WAITERS_SQL = """
+    SELECT w.id
+    FROM jorb w
+    WHERE w.state = 'waiting'
+      AND w.waitfor_group IS NOT NULL
+      AND EXISTS (
+          SELECT 1 FROM jorb g WHERE g.run_group = w.waitfor_group
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM jorb g
+          WHERE g.run_group = w.waitfor_group AND g.state != 'finished'
+      )
+    ORDER BY w.id
+    FOR UPDATE SKIP LOCKED
+    LIMIT $1
+"""
+
+#: ...and the wake both flavors share. Guarded on 'waiting' so a row that
+#: moved (a concurrent cancel, the edge-triggered wake beating us) is left
+#: alone; the loser of that race loses quietly, as everywhere else.
+WAKE_WAITERS_SQL = """
+    UPDATE jorb
+    SET state = 'queued',
+        updated = now()
+    WHERE id = ANY($1::bigint[])
+      AND state = 'waiting'
+"""
+
+#: Waiting jobs that can never be woken: their waitfor target does not
+#: exist. ($1 batch)
+#:
+#: Nothing but a terminal transition of the upstream ever wakes a waiter,
+#: and a job that does not exist will never have one — so without this,
+#: a typo'd waitfor_job id (or a waiter enqueued after retention deleted
+#: its upstream) parks a row in 'waiting' forever, invisibly. Waiters of a
+#: CRASHED or CANCELLED upstream are deliberately NOT here: crashed is the
+#: DLQ and the upstream may be retried back to life, so those stay parked
+#: and are surfaced by ``pj-admin doctor`` for the operator to decide.
+SWEEP_UNSATISFIABLE_WAITERS_SQL = """
+    SELECT w.id
+    FROM jorb w
+    WHERE w.state = 'waiting'
+      AND ((w.waitfor_job IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM jorb u WHERE u.id = w.waitfor_job))
+        OR (w.waitfor_group IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM jorb g WHERE g.run_group = w.waitfor_group
+            )))
+    ORDER BY w.id
+    FOR UPDATE SKIP LOCKED
+    LIMIT $1
+"""
+
+#: The cancellation those rows get, with the reason written where every
+#: surface shows it. waiting -> cancelled is the lifecycle's declared edge
+#: for "this parked work is not going to happen"; crashed would be wrong
+#: because a DLQ retry re-queues the row and it would then RUN with its
+#: dependency unsatisfied.
+CANCEL_UNSATISFIABLE_WAITERS_SQL = """
+    UPDATE jorb
+    SET state = 'cancelled',
+        error_message = CASE
+            WHEN waitfor_job IS NOT NULL THEN
+                'cancelled by the monitor: waitfor_job ' || waitfor_job
+                || ' does not exist'
+            ELSE
+                'cancelled by the monitor: waitfor_group ' || waitfor_group
+                || ' has no jobs'
+        END,
+        finished = now(),
+        updated = now()
+    WHERE id = ANY($1::bigint[])
+      AND state = 'waiting'
+    RETURNING id
+"""
+
 #: Requeue one timed-out job for another attempt. Bumps run_epoch: the
 #: execution that blew the deadline may still be running, and its
 #: epoch-only-guarded writes must stop applying now, not at the next claim.
@@ -548,6 +657,52 @@ async def sweep_timed_out_jobs(pool: asyncpg.Pool, batch_size: int = 100) -> int
             )
 
     return len(timed_out)
+
+
+async def sweep_stranded_waiters(pool: asyncpg.Pool, batch_size: int = 500) -> int:
+    """Wake waiting jobs whose dependency is satisfied, and cancel the ones
+    whose dependency can never be.
+
+    The level trigger behind the edge-triggered wake: a worker crash between
+    its terminal write and the wake statement, or a waiter enqueued after
+    its upstream already finished, both leave a row in 'waiting' that no
+    edge will ever move again — this moves it. A waiter whose target simply
+    does not exist is cancelled with the reason in ``error_message``.
+
+    Waiters of a crashed or cancelled upstream are left alone on purpose:
+    the upstream is retryable (crashed IS the DLQ), so the platform cannot
+    know whether the operator intends to revive it. ``pj-admin doctor``
+    surfaces those.
+
+    Each probe holds its row locks for the paired update only, the same
+    two-statement shape as every other sweep here; safe with concurrent
+    monitors via FOR UPDATE SKIP LOCKED.
+    """
+    moved = 0
+    for probe in (SWEEP_SATISFIED_JOB_WAITERS_SQL, SWEEP_SATISFIED_GROUP_WAITERS_SQL):
+        async with pool.acquire() as conn, conn.transaction():
+            rows = await conn.fetch(probe, batch_size)
+            if rows:
+                ids = [r["id"] for r in rows]
+                await conn.execute(WAKE_WAITERS_SQL, ids)
+                logger.warning(
+                    f"Woke {len(ids)} waiting jobs whose dependency was "
+                    f"already satisfied (missed wake): {ids[:10]}"
+                )
+                moved += len(ids)
+
+    async with pool.acquire() as conn, conn.transaction():
+        rows = await conn.fetch(SWEEP_UNSATISFIABLE_WAITERS_SQL, batch_size)
+        if rows:
+            ids = [r["id"] for r in rows]
+            cancelled = await conn.fetch(CANCEL_UNSATISFIABLE_WAITERS_SQL, ids)
+            logger.error(
+                f"Cancelled {len(cancelled)} waiting jobs whose waitfor "
+                f"target does not exist: {[r['id'] for r in cancelled][:10]}"
+            )
+            moved += len(cancelled)
+
+    return moved
 
 
 async def sweep_dead_workers(
@@ -1000,6 +1155,10 @@ async def monitor(
             await _run_sweep(
                 "unregistered claims",
                 lambda: sweep_unregistered_claims(pool, claimed_grace_seconds),
+            )
+            await _run_sweep(
+                "stranded waiters",
+                lambda: sweep_stranded_waiters(pool, batch_size),
             )
 
             if checkpoint_retention_days:

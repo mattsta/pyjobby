@@ -33,6 +33,7 @@ from pyjobby.monitor import (
     SWEEP_RETIRED_WORKERS_SQL,
     SWEEP_SCHEDULE_LOG_SQL,
 )
+from pyjobby.pj import STMTS
 from pyjobby.scheduler import CONCURRENCY_COUNT_SQL
 from tests.utils.plans import (
     assert_no_seq_scan,
@@ -896,6 +897,80 @@ class TestCascadeIndexes:
             f"cascade delete would sequentially scan: {unindexed} "
             "— add an index on the referencing column"
         )
+
+
+class TestGroupWakePlan:
+    """The group wake runs on the completion path of EVERY grouped job.
+
+    Its gate ("is any member still unfinished?") is NOT EXISTS, which stops
+    at the first witness. The `0 = count(*)` form it replaced had to visit
+    every member before it could say no, so an N-job fan-out paid O(N²)
+    index reads across its lifetime — half a million for the documented
+    1,000-item `create_fan_out` example, on the hot path of live workers.
+    """
+
+    GROUP_SIZE = 3_000
+
+    async def seed(self, pool, queue: str) -> int:
+        """A large group with EVERY member unfinished, plus one waiter.
+
+        All-running is the common case for the statement (N-1 of N
+        completions have unfinished peers), and it is the case where the
+        early exit matters: any member is a witness, so the probe should
+        touch a handful of rows however large the group is.
+
+        Seeded on top of the standard 20k-row table: against the group
+        alone the planner rightly seq-scans a tiny table and the test
+        proves nothing (see the module comment on ROWS)."""
+        await seed_terminal_jobs(pool, queue)
+        leader = await pool.fetchval(
+            """INSERT INTO jorb (job_class, kwargs, queue, state)
+               VALUES ('scale.Job', '{}', $1, 'running') RETURNING id""",
+            queue,
+        )
+        await pool.execute("UPDATE jorb SET run_group = $1 WHERE id = $1", leader)
+        await pool.execute(
+            """
+            INSERT INTO jorb (job_class, kwargs, queue, state, run_group,
+                              claimed_at, started)
+            SELECT 'scale.Job', '{}', $1, 'running', $2, now(), now()
+            FROM generate_series(1, $3) i
+            """,
+            queue,
+            leader,
+            self.GROUP_SIZE - 1,
+        )
+        await pool.execute(
+            """INSERT INTO jorb (job_class, kwargs, queue, state, waitfor_group)
+               VALUES ('scale.Job', '{}', $1, 'waiting', $2)""",
+            queue,
+            leader,
+        )
+        await settle(pool)
+        return int(leader)
+
+    async def test_the_gate_stops_at_the_first_unfinished_member(
+        self, db_pool, unique_queue
+    ):
+        group = await self.seed(db_pool, unique_queue)
+
+        plan = await explain_rolled_back(
+            db_pool, STMTS["enqueue-next-if-peer-group-is-finished"], group
+        )
+
+        assert_no_seq_scan(plan)
+        # The probe found a witness without walking the group: the whole
+        # statement — gate probe included — reads and discards a small
+        # multiple of nothing, not a multiple of GROUP_SIZE. This is the
+        # assertion the count(*) form fails: a count cannot answer without
+        # visiting every member.
+        removed = rows_removed_by_filter(plan)
+        assert removed * 100 < self.GROUP_SIZE, (
+            f"the wake gate read and discarded {removed} rows against a "
+            f"{self.GROUP_SIZE}-member group: that is a count wearing an "
+            f"EXISTS\n{plan}"
+        )
+        await assert_reads_far_less_than_a_scan(db_pool, plan)
 
 
 class TestCompactionPlan:

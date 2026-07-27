@@ -367,6 +367,10 @@ class TestSubcommandsEmitDocumentedJson:
             "dead_worker_jobs_backlog",
             "unregistered_claims",
             "unregistered_claims_backlog",
+            # the stranded-waiter sweeps take no window, so no _backlog state
+            "satisfied_job_waiters",
+            "satisfied_group_waiters",
+            "unsatisfiable_waiters",
             "expired_jobs",
             "expired_jobs_backlog",
             "checkpoint_jobs",
@@ -408,9 +412,13 @@ class TestSubcommandsEmitDocumentedJson:
         assert payload["queries"]["concurrency_cap"]["indexes"], payload["queries"][
             "concurrency_cap"
         ]
-        # the gate seeds 20k rows; leaving them behind would poison every
+        # the gate seeds 20k rows plus the waiter slices for the
+        # stranded-waiter sweeps; leaving any behind would poison every
         # later measurement taken on the same database
-        assert payload["cleanup"]["jobs_deleted"] == PLAN_SEED
+        assert (
+            payload["cleanup"]["jobs_deleted"]
+            == PLAN_SEED + bench.PLAN_IN_FLIGHT + bench.PLAN_GROUP_WAITERS
+        )
         assert await db_pool.fetchval("SELECT count(*) FROM jorb") == 0
 
     async def test_resolve(self, db_params):

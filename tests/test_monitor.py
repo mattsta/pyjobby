@@ -44,6 +44,7 @@ from pyjobby.monitor import (
     sweep_orphaned_dags,
     sweep_retired_workers,
     sweep_schedule_log,
+    sweep_stranded_waiters,
     sweep_timed_out_jobs,
     sweep_unregistered_claims,
 )
@@ -71,16 +72,21 @@ async def insert_job(
     run_epoch: int = 0,
     claimed_by: int | None = None,
     timeout_at_offset_seconds: float | None = None,
+    waitfor_job: int | None = None,
+    waitfor_group: int | None = None,
+    run_group: int | None = None,
 ) -> int:
     """Insert one jorb row in the state a test needs (JSONB never NULL)."""
     return await pool.fetchval(
         """
         INSERT INTO jorb (job_class, kwargs, queue, admin_data, state,
                           error_count, run_epoch, claimed_by, worker_host,
-                          worker_pid, timeout_at)
+                          worker_pid, timeout_at, waitfor_job, waitfor_group,
+                          run_group)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'test-host', 4242,
                 CASE WHEN $9::float8 IS NULL THEN NULL
-                     ELSE now() + make_interval(secs => $9) END)
+                     ELSE now() + make_interval(secs => $9) END,
+                $10, $11, $12)
         RETURNING id
         """,
         job_class,
@@ -92,6 +98,9 @@ async def insert_job(
         run_epoch,
         claimed_by,
         timeout_at_offset_seconds,
+        waitfor_job,
+        waitfor_group,
+        run_group,
     )
 
 
@@ -529,6 +538,152 @@ class TestSweepTimedOutJobs:
 # ============================================================================
 # dead-worker reclaim
 # ============================================================================
+
+
+class TestSweepStrandedWaiters:
+    """The level trigger behind the edge-triggered dependency wake.
+
+    The wake normally fires in the statement after the upstream's terminal
+    write; these are the cases where that edge was missed (worker crash in
+    the window, waiter enqueued after the upstream finished) or where no
+    edge will ever fire (the target does not exist). Assertions are on the
+    specific rows, never on global sweep counts: the sweep is global, and a
+    parallel test's rows may legitimately ride along.
+    """
+
+    async def test_wakes_a_waiter_whose_upstream_already_finished(
+        self, db_pool, unique_queue
+    ):
+        """The enqueue-after-terminal race, and the crash-window strand:
+        both look identical from the database — waiting on a finished
+        upstream — and both must self-heal."""
+        upstream = await insert_job(db_pool, unique_queue, state="finished")
+        waiter = await insert_job(
+            db_pool, unique_queue, state="waiting", waitfor_job=upstream
+        )
+
+        await sweep_stranded_waiters(db_pool)
+
+        assert (await get_job(db_pool, waiter))["state"] == "queued"
+
+    async def test_leaves_a_waiter_whose_upstream_is_still_running(
+        self, db_pool, unique_queue
+    ):
+        upstream = await insert_job(db_pool, unique_queue, state="running")
+        waiter = await insert_job(
+            db_pool, unique_queue, state="waiting", waitfor_job=upstream
+        )
+
+        await sweep_stranded_waiters(db_pool)
+
+        assert (await get_job(db_pool, waiter))["state"] == "waiting"
+
+    async def test_leaves_a_waiter_of_a_crashed_upstream_for_the_operator(
+        self, db_pool, unique_queue
+    ):
+        """Crashed IS the DLQ: the upstream may be retried back to life, so
+        the platform must not decide for the operator. The condition is
+        surfaced by `pj-admin doctor` instead."""
+        upstream = await insert_job(db_pool, unique_queue, state="crashed")
+        waiter = await insert_job(
+            db_pool, unique_queue, state="waiting", waitfor_job=upstream
+        )
+
+        await sweep_stranded_waiters(db_pool)
+
+        row = await get_job(db_pool, waiter)
+        assert row["state"] == "waiting"
+
+    async def test_wakes_a_group_waiter_once_every_member_is_finished(
+        self, db_pool, unique_queue
+    ):
+        leader = await insert_job(db_pool, unique_queue, state="finished")
+        await db_pool.execute(
+            "UPDATE jorb SET run_group = $1 WHERE id = $1", leader
+        )
+        await insert_job(
+            db_pool, unique_queue, state="finished", run_group=leader
+        )
+        waiter = await insert_job(
+            db_pool, unique_queue, state="waiting", waitfor_group=leader
+        )
+
+        await sweep_stranded_waiters(db_pool)
+
+        assert (await get_job(db_pool, waiter))["state"] == "queued"
+
+    async def test_leaves_a_group_waiter_while_any_member_is_unfinished(
+        self, db_pool, unique_queue
+    ):
+        leader = await insert_job(db_pool, unique_queue, state="finished")
+        await db_pool.execute(
+            "UPDATE jorb SET run_group = $1 WHERE id = $1", leader
+        )
+        await insert_job(
+            db_pool, unique_queue, state="running", run_group=leader
+        )
+        waiter = await insert_job(
+            db_pool, unique_queue, state="waiting", waitfor_group=leader
+        )
+
+        await sweep_stranded_waiters(db_pool)
+
+        assert (await get_job(db_pool, waiter))["state"] == "waiting"
+
+    async def test_cancels_a_waiter_whose_upstream_does_not_exist(
+        self, db_pool, unique_queue
+    ):
+        """Nothing will ever wake it, so 'waiting' would be forever and
+        invisible; cancelled-with-reason is the defined outcome. (Crashed
+        would be wrong: a DLQ retry would then RUN the job with its
+        dependency unsatisfied.)"""
+        ghost = await insert_job(db_pool, unique_queue, state="finished")
+        await db_pool.execute("DELETE FROM jorb WHERE id = $1", ghost)
+        waiter = await insert_job(
+            db_pool, unique_queue, state="waiting", waitfor_job=ghost
+        )
+
+        await sweep_stranded_waiters(db_pool)
+
+        row = await get_job(db_pool, waiter)
+        assert row["state"] == "cancelled"
+        assert f"waitfor_job {ghost} does not exist" in row["error_message"]
+        assert row["finished"] is not None
+
+    async def test_cancels_a_waiter_on_a_group_with_no_members(
+        self, db_pool, unique_queue
+    ):
+        ghost = await insert_job(db_pool, unique_queue, state="finished")
+        await db_pool.execute("DELETE FROM jorb WHERE id = $1", ghost)
+        waiter = await insert_job(
+            db_pool, unique_queue, state="waiting", waitfor_group=ghost
+        )
+
+        await sweep_stranded_waiters(db_pool)
+
+        row = await get_job(db_pool, waiter)
+        assert row["state"] == "cancelled"
+        assert f"waitfor_group {ghost} has no jobs" in row["error_message"]
+
+    async def test_woken_waiter_is_claimable_and_actually_runs(
+        self, db_pool, unique_queue, live_worker
+    ):
+        """End to end: a stranded waiter, once woken, is ordinary queued
+        work — claimed, executed, finished."""
+        upstream = await insert_job(db_pool, unique_queue, state="finished")
+        waiter = await insert_job(
+            db_pool,
+            unique_queue,
+            state="waiting",
+            waitfor_job=upstream,
+            kwargs={"x": 4},
+        )
+
+        await sweep_stranded_waiters(db_pool)
+        await live_worker()
+
+        row = await wait_for_job_state(db_pool, waiter, ("finished",), timeout=20)
+        assert row["result"] == {"doubled": 8}
 
 
 class TestSweepDeadWorkers:
