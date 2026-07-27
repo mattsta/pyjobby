@@ -13,6 +13,7 @@ below is a file you can open.
 | write your first job | [writing-jobs.md](writing-jobs.md) |
 | submit jobs from your application | [CLIENT_LIBRARY.md](CLIENT_LIBRARY.md) |
 | see whole applications, not snippets | [EXAMPLES.md](EXAMPLES.md) |
+| model a workflow as a state machine | [STATECHARTS.md](STATECHARTS.md) |
 | run and watch the fleet | [OPERATIONS.md](OPERATIONS.md) |
 | find out why something is broken | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
 
@@ -46,31 +47,36 @@ below is a file you can open.
 7. **[RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md)** — cron schedules:
    `pj-scheduler`, timezones and DST, and the five safety features
    (circuit breaker, max concurrent, backpressure, jitter, deadline keys).
+8. **[STATECHARTS.md](STATECHARTS.md)** — durable state machines: declaring
+   one with `StateMachineJob`, driving it with the `MachineHandle` client
+   API, and running the queue they live on. A machine survives a crash,
+   fences a stale worker, runs each action once, and can wait months — all
+   on the existing schema.
 
 ### Running it
 
-8. **[deployment-guide.md](deployment-guide.md)** — install, the database,
+9. **[deployment-guide.md](deployment-guide.md)** — install, the database,
    configuration, the processes to run, systemd, containers, Kubernetes,
    exposure, backup/restore and how to verify a deployment.
-9. **[OPERATIONS.md](OPERATIONS.md)** — the runbook: the process
-   inventory, `pj-admin doctor`, the state machine, timeouts, abandoned job
-   threads, live queue controls, priority and the worker ceiling,
-   retention, and the failure playbooks.
-10. **[ADMIN_TOOLS.md](ADMIN_TOOLS.md)** — the reference for *what exists*:
+10. **[OPERATIONS.md](OPERATIONS.md)** — the runbook: the process
+    inventory, `pj-admin doctor`, the state machine, timeouts, abandoned job
+    threads, live queue controls, priority and the worker ceiling,
+    retention, and the failure playbooks.
+11. **[ADMIN_TOOLS.md](ADMIN_TOOLS.md)** — the reference for *what exists*:
     every `pj-admin` command with real output, `pj-web`, and the
     `AdminAPI` Python interface.
-11. **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — the symptom index. Start
+12. **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — the symptom index. Start
     at `pj-admin doctor`, then jump to the entry for what you are seeing.
-12. **[WEBSOCKET_DASHBOARD.md](WEBSOCKET_DASHBOARD.md)** — `pj-ws` and
+13. **[WEBSOCKET_DASHBOARD.md](WEBSOCKET_DASHBOARD.md)** — `pj-ws` and
     `frontend/live-dashboard.html`: live aggregates, per-job watches, and
     the demand-gated channels behind them.
 
 ### Changing it
 
-13. **[TESTING.md](TESTING.md)** — running the suite against any database,
+14. **[TESTING.md](TESTING.md)** — running the suite against any database,
     the shared fixtures (`live_worker`, `wait_for_job_state`), and why
     coverage is a diagnostic rather than a target.
-14. **[The schema itself](../pyjobby/sql/schema.sql)** — the canonical
+15. **[The schema itself](../pyjobby/sql/schema.sql)** — the canonical
     source, commented end to end, including the measurements behind the
     indexes and autovacuum settings.
 

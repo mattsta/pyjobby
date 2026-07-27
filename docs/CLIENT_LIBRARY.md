@@ -18,6 +18,7 @@ Clean, well-encapsulated Python client for job submission and management with fu
 - [Core Concepts](#core-concepts)
 - [API Reference](#api-reference)
 - [Common Patterns](#common-patterns)
+- [State Machines](#state-machines)
 - [Advanced Usage](#advanced-usage)
 - [Performance Tips](#performance-tips)
 
@@ -671,6 +672,101 @@ Tagging costs the write path nothing measurable — the index is partial
 (`WHERE tags <> '{}'`), so an untagged job never touches it, and a tagged
 enqueue measures within noise of an untagged one. `tests/test_job_tags.py`
 holds the measurement.
+
+---
+
+## State Machines
+
+A long-running workflow with named states — an order, an onboarding, an
+approval, anything that waits for the outside world between steps — is a
+[durable state machine](STATECHARTS.md). It is an ordinary job, so everything
+above still applies; what follows is the vocabulary that makes driving one
+readable.
+
+### Starting one
+
+```python
+from myapp.orders import Order  # a StateMachineJob subclass
+
+order = await client.start_machine(Order, kwargs={"customer": 42})
+print(order.id)  # an ordinary job id
+```
+
+Pass the class when you can import it: the handle then holds the transition
+table and can check events locally. `client.start_machine("myapp.orders.Order")`
+works when you only have the name, at the cost of those checks.
+
+Machines default to a **`machines` queue**. They park waiting for events, and
+a worker parked on a machine is a worker not running ordinary jobs — so keep
+them off the queues that serve your latency-sensitive work. Pass `queue=` to
+choose another.
+
+### Driving one
+
+```python
+await order.send("paid", amount=100)  # payload is yours
+state = await order.wait_for_state("shipped", "refunded", timeout=600)
+result = await order.result()  # {"final_state": "shipped"}
+```
+
+`wait_for_state()` waits for a **state**, not a transition, so it returns
+immediately if the machine is already there — and raises rather than hanging
+if the machine crashes or is cancelled on the way.
+
+### Why `send()` refuses events
+
+```python
+await order.send("packed")
+# UnhandledEventError: machine 41 is in 'awaiting_payment', which has no
+# transition for 'packed'; it accepts ['cancel', 'paid']
+```
+
+This is not a nicety borrowed from in-process FSM libraries. There, an
+unhandled event raises on the machine's thread and your event is still in your
+hand. Here the event travels through a durable mailbox, and the machine
+*consumes* the message and checkpoints having consumed it whether or not any
+transition fires. An event sent to the wrong state is not deferred, not
+re-queued and not returned — it is gone, and the only symptom is that nothing
+happened.
+
+The check costs one read of the machine's state. Ask directly with
+`await order.may("paid")`, or skip it with `send(..., check=False)` when you
+are deliberately racing the machine or do not have the class.
+
+### Reconnecting to one
+
+A machine outlives the process that started it — usually by a lot. The normal
+case is a handle rebuilt from an id you stored:
+
+```python
+order = client.machine(order_id, Order)  # cheap, no I/O
+await order.send("cancel")
+```
+
+### Inspecting one
+
+```python
+await order.state()  # "packing"
+await order.history()  # this turn's transitions, from jorb_step
+order.diagram()  # Mermaid, rendered from the declaration
+```
+
+`history()` is the *current turn*: the machine compacts its checkpoint log at
+each turn boundary so that replay stays bounded no matter how long it lives
+(see [DXE.md](DXE.md#bounding-replay-compact)). For a permanent audit trail,
+publish one — as machine events, or into your own table from inside a
+`transaction()`.
+
+### Synchronously
+
+`SyncJobClient.start_machine()` and `.machine()` return a `SyncMachine` with
+the same methods, blocking:
+
+```python
+order = client.start_machine(Order)
+order.send("paid", amount=100)
+order.wait_for_state("shipped", timeout=600)
+```
 
 ---
 

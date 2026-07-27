@@ -48,7 +48,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 import asyncpg  # type: ignore[import-untyped]
 
-from . import db
+from . import db, fsm, lifecycle
 
 if TYPE_CHECKING:
     from .dag import DAGBuilder
@@ -78,6 +78,12 @@ class JobCancelledError(JobError):
 # Sentinel returned by poll callbacks when the awaited condition is not yet
 # satisfied (None is a legitimate job result / event value).
 _PENDING: Any = object()
+
+# The states from which no further event will ever be published, so a waiter
+# on a value that has not arrived can stop rather than time out. Imported
+# rather than restated: `pyjobby.lifecycle` is the declaration, and it has no
+# imports of its own, so the client can read it without a cycle.
+_TERMINAL_JOB_STATES = frozenset(lifecycle.TERMINAL_STATES)
 
 # The single enqueue INSERT shared by every enqueue path (pool-based
 # enqueue(), caller-transaction enqueue_in_transaction(), handles).
@@ -116,6 +122,13 @@ _ON_TIMEOUT_POLICIES = frozenset({"retry", "fail"})
 # and `pj` imports it for `JobSystem.prio` and its own flag default, so the
 # two halves of the contract cannot drift apart.
 DEFAULT_PRIO_CEILING: Final = 1000
+
+#: Where `start_machine()` puts a machine unless told otherwise. Machines park
+#: on `recv()` waiting for events, so a machine on the default queue is a
+#: worker slot held indefinitely against ordinary work. Defaulting them
+#: elsewhere makes the safe arrangement the one you get without reading
+#: anything; `queue=` overrides it.
+DEFAULT_MACHINE_QUEUE: Final = "machines"
 
 
 def validate_priority(priority: int, ceiling: int = DEFAULT_PRIO_CEILING) -> int:
@@ -242,6 +255,236 @@ class JobHandle:
     async def event(self, key: str, timeout: float | None = None) -> Any:
         """Wait for a jorb_event published by this job; see get_event()."""
         return await self.client.get_event(self.id, key, timeout=timeout)
+
+
+class UnhandledEventError(JobError):
+    """An event was refused because the machine's current state has no edge
+    for it — raised BEFORE the message is sent.
+
+    This is the whole reason `MachineHandle.send()` checks. Once a message
+    reaches the mailbox, the machine's `recv()` consumes it and checkpoints
+    the consumption whether or not any transition fires, so an event sent to
+    the wrong state is not queued, not deferred and not returned: it is gone.
+    In-process FSM libraries can afford to raise on the machine's own thread
+    and leave the caller's event intact; a durable mailbox cannot.
+    """
+
+    def __init__(self, job_id: int, state: str, event: str, accepted: list[str]):
+        self.job_id = job_id
+        self.state = state
+        self.event = event
+        self.accepted = accepted
+        super().__init__(
+            f"machine {job_id} is in {state!r}, which has no transition for "
+            f"{event!r}"
+            + (f"; it accepts {accepted}" if accepted else " (a final state)")
+        )
+
+
+@dataclass
+class MachineHandle:
+    """A durable state machine, driven from outside the worker.
+
+    Everything here is built on the ordinary client API — `enqueue`,
+    `send_message`, `get_event` — because a machine *is* an ordinary job.
+    What this adds is the vocabulary: it knows the mailbox topic, the payload
+    field naming the event, and the reserved state key, so callers do not
+    have to hold those three strings correctly at every call site.
+
+    Pass `machine=YourMachineClass` and it can also answer from the
+    declaration, locally and without a round trip: which states exist, what
+    the diagram is, and — the one that matters — whether an event would be
+    accepted right now, checked before the send rather than discovered
+    afterwards by its absence.
+    """
+
+    id: int
+    client: JobClient
+    machine: type[Any] | None = None
+
+    @property
+    def _state_key(self) -> str:
+        return self.machine.state_key if self.machine is not None else fsm.STATE_KEY
+
+    @property
+    def _topic(self) -> str:
+        return self.machine.topic if self.machine is not None else fsm.EVENT_TOPIC
+
+    async def state(self, timeout: float | None = None) -> str:
+        """The machine's current state.
+
+        With `timeout=None` this returns immediately if the state has been
+        published and waits forever if it has not — a machine that has been
+        enqueued but not yet claimed has no state row at all. Pass a timeout
+        to bound that wait.
+        """
+        published = await self.client.get_event(
+            self.id, self._state_key, timeout=timeout
+        )
+        state = _machine_state_of(published)
+        if state is None:
+            raise JobError(
+                f"job {self.id} published {self._state_key!r} as {published!r}, "
+                f"which is not a machine state"
+            )
+        return state
+
+    async def wait_for_state(self, *states: str, timeout: float | None = None) -> str:
+        """Block until the machine is in one of `states`, and return which.
+
+        Waits on a *state*, not on a transition: a caller waiting for
+        "shipped" wants to stop when the machine IS shipped, including when it
+        got there before this call — which an edge subscription would miss
+        forever.
+
+        The predicate goes down into the client's notification wait rather
+        than being checked in a loop up here. That difference is not
+        cosmetic: a loop calling `state()` re-registers demand on every pass,
+        and demand registration is an `UPDATE` on the `jorb` row, so a 4 Hz
+        waiter would write to the hottest table in the system four times a
+        second to ask something a NOTIFY answers for free.
+        """
+        wanted = set(states)
+        value = await self.client.wait_for_event(
+            self.id,
+            self._state_key,
+            accept=lambda published: _machine_state_of(published) in wanted,
+            timeout=timeout,
+        )
+        return str(_machine_state_of(value))
+
+    async def may(self, event: str) -> bool:
+        """Would `event` be accepted in the machine's current state?
+
+        Requires the declaration (`machine=`); without it there is nothing to
+        check against, because the transition table lives in the code rather
+        than in a row.
+        """
+        if self.machine is None:
+            raise ValueError(
+                "may() needs the machine class: MachineHandle(..., machine=Order)"
+            )
+        return bool(self.machine.may(await self.state(), event))
+
+    async def send(self, event: str, *, check: bool = True, **payload: Any) -> int:
+        """Deliver a transition event, refusing one the current state drops.
+
+        `check` is on by default and needs the declaration; it costs one read
+        of the state event. Turn it off for a machine you do not hold the
+        class for, or when racing the machine deliberately — but understand
+        what you are turning off: an unaccepted event is consumed and
+        discarded, so without the check a typo in an event name is silent.
+        """
+        if check and self.machine is not None:
+            current = await self.state()
+            if not self.machine.may(current, event):
+                raise UnhandledEventError(
+                    self.id,
+                    current,
+                    event,
+                    sorted(self.machine.edges.get(current, {})),
+                )
+        return await self.client.send_message(
+            self.id, {fsm.EVENT_FIELD: event, **payload}, topic=self._topic
+        )
+
+    async def history(self) -> list[dict[str, Any]]:
+        """The machine's own transition log, oldest first.
+
+        Read from `jorb_step`, not `jorb_history`: the latter records the
+        JOB's lifecycle (claimed, running, queued...), which for a machine is
+        mostly the wake/sleep cycle. The transitions are the checkpointed
+        actions, named `source--event->target` by the loop.
+
+        Compaction discards steps once they can no longer be replayed, so this
+        is the log of the CURRENT turn, not of all time. A machine that needs
+        a permanent audit trail should publish one — as its own events, or in
+        its own table from inside a `transaction()`.
+        """
+        return await self.client.get_steps(self.id)
+
+    async def result(self, timeout: float | None = None) -> Any:
+        """Wait for the machine to reach a final state and return its result."""
+        return await self.client.wait_for_result(self.id, timeout=timeout)
+
+    async def cancel(self) -> str | None:
+        """Stop the machine wherever it is. Its last state stays published."""
+        return await self.client.cancel_job(self.id)
+
+    def diagram(self) -> str:
+        """The declaration as Mermaid. Local, needs no database."""
+        if self.machine is None:
+            raise ValueError(
+                "diagram() needs the machine class: MachineHandle(..., machine=Order)"
+            )
+        return str(self.machine.to_mermaid())
+
+
+def _machine_state_of(published: Any) -> str | None:
+    """The state name out of a published `machine.state` value.
+
+    Tolerant on purpose: the key is reserved but writable, so a caller may
+    find something that is not the `{"state": ...}` shape a machine writes.
+    Returning None makes that a state no predicate matches, rather than a
+    `TypeError` from inside a notification callback where it would be hard to
+    attribute.
+    """
+    if isinstance(published, dict):
+        state = published.get("state")
+        return None if state is None else str(state)
+    return None
+
+
+@dataclass
+class SyncMachine:
+    """Blocking mirror of `MachineHandle`, for scripts and cron jobs.
+
+    Written out rather than generated, because a synchronous API whose
+    methods only exist at runtime is one no editor can complete and no type
+    checker can check — which defeats the point of having a declaration in
+    the first place.
+    """
+
+    handle: MachineHandle
+    _run: Callable[[Awaitable[Any]], Any]
+
+    @property
+    def id(self) -> int:
+        return self.handle.id
+
+    def state(self, timeout: float | None = None) -> str:
+        """Blocking MachineHandle.state()."""
+        return str(self._run(self.handle.state(timeout=timeout)))
+
+    def wait_for_state(self, *states: str, timeout: float | None = None) -> str:
+        """Blocking MachineHandle.wait_for_state()."""
+        return str(self._run(self.handle.wait_for_state(*states, timeout=timeout)))
+
+    def may(self, event: str) -> bool:
+        """Blocking MachineHandle.may()."""
+        return bool(self._run(self.handle.may(event)))
+
+    def send(self, event: str, *, check: bool = True, **payload: Any) -> int:
+        """Blocking MachineHandle.send()."""
+        return int(self._run(self.handle.send(event, check=check, **payload)))
+
+    def history(self) -> list[dict[str, Any]]:
+        """Blocking MachineHandle.history()."""
+        rows: list[dict[str, Any]] = self._run(self.handle.history())
+        return rows
+
+    def result(self, timeout: float | None = None) -> Any:
+        """Blocking MachineHandle.result()."""
+        return self._run(self.handle.result(timeout=timeout))
+
+    def cancel(self) -> str | None:
+        """Blocking MachineHandle.cancel()."""
+        state: str | None = self._run(self.handle.cancel())
+        return state
+
+    def diagram(self) -> str:
+        """The declaration as Mermaid. Local, needs no database or loop."""
+        return self.handle.diagram()
 
 
 class JobClient:
@@ -592,6 +835,45 @@ class JobClient:
         """
         job_id = await self.enqueue(job_class, **options)
         return JobHandle(id=job_id, client=self)
+
+    async def start_machine(
+        self, machine: type[Any] | str, **options: Any
+    ) -> MachineHandle:
+        """Start a durable state machine and return a handle to drive it.
+
+        `machine` is the class itself when the caller can import it — which is
+        the better way round, because the handle can then check events against
+        the declaration before sending them. A dotted string works too, for a
+        caller that only knows the name.
+
+        Machines default to their own queue for the reason in
+        `pyjobby.statemachine`: they park on `recv()` waiting for events, and
+        a worker parked on a machine is a worker not running ordinary jobs.
+        Pass `queue=` to override.
+
+        Example:
+            from myapp.orders import Order
+
+            order = await client.start_machine(Order, kwargs={'customer': 42})
+            await order.send('paid', amount=100)
+            await order.wait_for_state('shipped', timeout=300)
+        """
+        if isinstance(machine, str):
+            job_class, declaration = machine, None
+        else:
+            job_class = f"{machine.__module__}.{machine.__qualname__}"
+            declaration = machine
+        options.setdefault("queue", DEFAULT_MACHINE_QUEUE)
+        job_id = await self.enqueue(job_class, **options)
+        return MachineHandle(id=job_id, client=self, machine=declaration)
+
+    def machine(self, job_id: int, machine: type[Any] | None = None) -> MachineHandle:
+        """A handle for a machine that is already running.
+
+        Cheap and synchronous: a handle is an id, a client and an optional
+        declaration. Nothing is read until a method is called.
+        """
+        return MachineHandle(id=job_id, client=self, machine=machine)
 
     @staticmethod
     async def enqueue_in_transaction(
@@ -1144,6 +1426,78 @@ class JobClient:
             f"event {key!r} on job {job_id}",
             job_id=job_id,
         )
+
+    async def wait_for_event(
+        self,
+        job_id: int,
+        key: str,
+        accept: Callable[[Any], bool] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        """Wait until a job's event exists *and* its value satisfies `accept`.
+
+        `get_event()` answers "has this key been published yet", which is the
+        right question for a key written once. It is the wrong question for one
+        written repeatedly — a machine's state, a progress counter — because it
+        returns on the first publish and every later caller has to loop.
+
+        Looping outside is expensive in a way that is not obvious: each pass
+        through `get_event()` re-registers demand, which is an `UPDATE` on the
+        `jorb` row. A 4 Hz caller doing that is writing to the hottest table in
+        the system four times a second to ask a question that a NOTIFY would
+        have answered. Passing the predicate in keeps the wait inside
+        `_poll_until`, where it sleeps on the notification and falls back to a
+        2-second poll instead.
+
+        Raises `JobError` if the job reaches a terminal state without ever
+        satisfying `accept` — otherwise a caller waiting on a state a crashed
+        job will now never reach waits for its whole timeout, or forever.
+        Both values are read in ONE query, so they are a consistent snapshot:
+        a job cannot appear terminal alongside a stale event.
+        """
+
+        async def check() -> Any:
+            row = await self.pool.fetchrow(
+                """SELECT (SELECT value FROM jorb_event
+                            WHERE job_id = $1 AND key = $2) AS value,
+                          (SELECT state FROM jorb WHERE id = $1) AS job_state""",
+                job_id,
+                key,
+            )
+            value = row["value"] if row is not None else None
+            if value is not None and (accept is None or accept(value)):
+                return value
+            # Terminal without a match: nothing will publish this key again.
+            if row is not None and row["job_state"] in _TERMINAL_JOB_STATES:
+                raise JobError(
+                    f"job {job_id} ended in {row['job_state']!r} without "
+                    f"event {key!r} reaching an accepted value "
+                    f"(last: {value!r})"
+                )
+            return _PENDING
+
+        return await self._poll_until(
+            self._event_waiters,
+            (job_id, key),
+            check,
+            timeout,
+            f"event {key!r} on job {job_id}",
+            job_id=job_id,
+        )
+
+    async def get_steps(self, job_id: int) -> list[dict[str, Any]]:
+        """A job's recorded DXE checkpoints, oldest first.
+
+        Note that `compact()` discards checkpoints a job can no longer replay,
+        so for a long-lived job this is the current stretch of work rather than
+        its whole history. See `docs/DXE.md`.
+        """
+        rows = await self.pool.fetch(
+            """SELECT step_seq, name, output, error, started, finished
+                 FROM jorb_step WHERE job_id = $1 ORDER BY step_seq""",
+            job_id,
+        )
+        return [dict(row) for row in rows]
 
     async def send_message(
         self, dest_job_id: int, message: Any, topic: str | None = None
@@ -2230,6 +2584,21 @@ class SyncJobClient:
             self._client.send_message(dest_job_id, message, topic=topic)
         )
         return message_id
+
+    # ---------------------------------------------------------------------
+    # State machines
+    # ---------------------------------------------------------------------
+
+    def start_machine(self, machine: type[Any] | str, **options: Any) -> SyncMachine:
+        """Synchronous JobClient.start_machine()."""
+        handle: MachineHandle = self._run(
+            self._client.start_machine(machine, **options)
+        )
+        return SyncMachine(handle, self._run)
+
+    def machine(self, job_id: int, machine: type[Any] | None = None) -> SyncMachine:
+        """Synchronous JobClient.machine()."""
+        return SyncMachine(self._client.machine(job_id, machine), self._run)
 
     def close(self) -> None:
         """Close the underlying client (pool + listener) and the loop."""
