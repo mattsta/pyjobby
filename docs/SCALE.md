@@ -594,7 +594,7 @@ rollup above: not "is it cheap", but *who pays when it is unused*.
 2. **The cap count losing its index.** The `count(*)` over
    `state IN ('claimed','running')` runs *inside* the lock, so it is subtracted
    from the queue's whole throughput rather than from one timer. It is gated as
-   `concurrency_cap` by `pj-bench plans`, which measured it at **23 buffers**
+   `concurrency_cap` by `pj-bench plans`, which measures it at **33–34 buffers**
    through `jorb_inflight_idx` with 200 jobs in flight in a 200k-row table.
    That plan holds while in-flight is a small fraction of the table, which is
    what a cap *makes* it. Drive in-flight up to the whole table and the planner

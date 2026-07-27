@@ -192,7 +192,7 @@ of those measurements.
 | `pj-bench claim` | claim throughput through the real `claim_jorb()`, lock contention, and what a capped queue *sustains* — five interleaved arms |
 | `pj-bench e2e` | real `pj` worker processes: completed jobs/s, plus `enqueue_to_finished` and `claim_to_finished` latency separately |
 | `pj-bench notify` | notifications per job lifecycle, **unobserved and observed**, because on a demand-gated schema that question has two correct answers |
-| `pj-bench plans` | `EXPLAIN (ANALYZE, BUFFERS)` every hot query; **exits non-zero on a `Seq Scan on jorb`** |
+| `pj-bench plans` | `EXPLAIN (ANALYZE, BUFFERS)` every hot query in **two states** (caught up and backlogged); **exits non-zero on a sequential scan of any gated table, or on a discard budget overrun**. Its sweep cases are derived from monitor.py's `SWEEP_*_SQL` constants, so a new sweep with no gate entry is an error rather than a gap |
 | `pj-bench all` | everything, with one summary table |
 
 `pj-bench plans --force` **is the CI gate** (`.github/workflows/ci.yml`), and
