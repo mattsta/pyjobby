@@ -19,14 +19,14 @@ events are `jorb_mailbox` rows, actions are DXE steps, and waiting is a durable
 from pyjobby.registry import job
 from pyjobby.statemachine import StateMachineJob
 
+
 @job
 class Order(StateMachineJob):
     initial = "awaiting_payment"
     final = frozenset({"shipped", "refunded"})
     transitions = {
-        "awaiting_payment": {"paid": ("packing", "charge"),
-                             "cancel": "refunded"},
-        "packing":          {"packed": ("shipped", "buy_label")},
+        "awaiting_payment": {"paid": ("packing", "charge"), "cancel": "refunded"},
+        "packing": {"packed": ("shipped", "buy_label")},
     }
 
     async def charge(self, event, payload): ...
@@ -84,7 +84,7 @@ order = await client.start_machine(Order, kwargs={"customer": 42})
 
 await order.send("paid", amount=100)
 await order.wait_for_state("shipped", timeout=600)
-result = await order.result()          # {"final_state": "shipped", "turns": 2}
+result = await order.result()  # {"final_state": "shipped", "turns": 2}
 ```
 
 | Call | Does |
