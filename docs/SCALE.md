@@ -269,9 +269,18 @@ no limits never take the lock at all and are unaffected by any of this.
 
 A capped queue runs at `1 / (critical section)`, and **no lock strategy changes
 that** — it is set by the serialised section itself. Do not put a
-million-jobs-per-hour queue under a cap and expect uncapped throughput; raising
-the ceiling would take claiming a *batch* per lock acquisition, which is a
-change to the one-job-at-a-time worker model, not a lock tweak.
+million-jobs-per-hour queue under a cap and expect uncapped throughput.
+
+Measured, on the shape where the lock is the only thing binding — a cap too
+high to refuse, short jobs, claimers to spare — that ceiling is **3,211
+claims/s, 11.6× the reference workload**, so it is a caveat and not a wall.
+Raising it further would take claiming a *batch* per lock acquisition; that was
+measured against this number and [rejected](#claiming-a-batch-per-lock-acquisition-rejected-on-the-measurement),
+along with what would change the answer.
+
+A cap that is *low* is a different thing entirely and no claim strategy touches
+it: `max_concurrency` bounds in-flight work, so the queue permits
+`cap / job duration` and that is the whole story.
 
 What the lock choice *does* decide is what happens to a claimer that loses it.
 The lock waits up to 50ms rather than failing instantly, and the reason is
@@ -340,7 +349,9 @@ the numbers can be re-taken on your hardware and re-checked after a change:
 ```
 pj-bench enqueue    # write throughput; bulk vs serial vs concurrent, and the
                     # per-NOTIFY-channel breakdown that shows the commit lock
-pj-bench claim      # claim throughput and advisory-lock contention
+pj-bench claim      # claim throughput, advisory-lock contention, and what a
+                    # capped queue sustains with short jobs at a high and a
+                    # low cap (--hold-ms / --high-cap / --low-cap)
 pj-bench e2e        # completed jobs/sec and enqueue->finished p50/p95/p99
 pj-bench notify     # notifications per lifecycle, per channel, + queue usage
 pj-bench plans      # EXPLAINs every hot query; exits non-zero on a seq scan
@@ -426,3 +437,80 @@ Counters were therefore **renamed** rather than re-typed in place, so a
 dashboard using `rate(pyjobby_jobs_crashed_total[5m])` breaks loudly with a
 missing series instead of quietly reporting garbage. A metric that lies is
 worse than one that is absent.
+
+### Claiming a batch per lock acquisition: rejected, on the measurement
+
+`claim_jorb()` admits **one** job per advisory-lock acquisition, so a capped
+queue's claims serialise and its ceiling is `1 / (critical section)`. Claiming
+N jobs under one acquisition would divide the serialised part by N. The
+proposal is sound; it is the requirement that is missing.
+
+Measured with `pj-bench claim --workers 8 --jobs 2000 --repeat 7`, all arms
+**interleaved** (median of 7, PostgreSQL 18.3, 10-core box under load ~4):
+
+| arm | claimers | cap | job | claims/s | vs 278/s |
+|---|---|---|---|---|---|
+| uncapped, no completion | 8 | none | — | 19,037 | 68× |
+| capped, no completion | 8 | 3,000 | — | 2,953 | 10.6× |
+| uncapped, short jobs | 32 | none | 5 ms | 5,042 | 18× |
+| **capped, short jobs** | 32 | 1,000 | 5 ms | **3,211** | **11.6×** |
+| capped, short jobs | 2 | 2 | 5 ms | 236 | 0.85× |
+
+The fourth row is the whole question: a cap too high to ever refuse, jobs short
+enough that admission is all the work there is, and enough claimers that the
+serialised section is the only thing left binding. It sustains **11.6× the
+reference workload**. One capped queue would have to run **11.5M jobs/hour on
+its own** before the lock is what stops it, against a platform target of
+1M/hour across all queues. Exactness costs 0.64–0.68× against the same shape
+with no cap (row 4 vs row 3) — that is the price of the lock, paid, and it is
+already priced in above.
+
+**Read these to one significant figure.** Repeat runs of the capped short-job
+arm land at 2,969–3,260 claims/s (10.7–11.7×), and its *within-run* spread was
+16% on one run and 89% on another on the same unchanged schema — it is the
+noisiest arm here, because it is the one whose rate is set by a serialised
+section competing with everything else on the box. That is survivable for this
+decision and would not be for a 1.2× one: nothing at 10× turns into a problem
+at 20% noise. The low-cap and uncapped-churn arms are quiet by comparison
+(6–14%) because their rate is set by the cap and the round trips rather than by
+contention.
+
+**A low cap does not need batching; it forbids it.** `max_concurrency` bounds
+in-flight work, so the rate it permits is `cap / duration` and nothing else —
+row 5 is cap 2 on 5 ms jobs, which permits 400/s in theory and measures
+210–236/s because the claim and completion round trips land *on top of* the
+job, not inside it. A batch cannot admit more than the cap has slots for. When a capped
+queue is too slow, the cap is the thing that is too small; every other answer
+is arithmetic denial.
+
+**Who pays when it is unused.** Uncapped queues — the common case, which never
+takes the lock at all — would still get the batch worker model, and everything
+the one-at-a-time model gets for free becomes something that has to be
+maintained: a worker holding N claimed jobs strands N when it dies rather than
+one, `run_epoch` fencing, cancellation and per-job timeouts have to stay
+per-job while admission became per-batch, and "how big a batch, and does one
+greedy worker starve the others" turns into a policy with a tuning knob and a
+fairness bug waiting in it. That is a permanent tax on the entire worker model
+to speed up the one shape that already has 11.6× headroom. Same test as the
+rollup above: not "is it cheap", but *who pays when it is unused*.
+
+**What would change this answer**, in the order it is likely to arrive:
+
+1. A single capped queue that genuinely needs more than ~3,000 claims/s
+   sustained — 11M jobs/hour through one cap. Two capped queues at half the
+   rate are not this: the lock is per queue.
+2. **The cap count losing its index.** The `count(*)` over
+   `state IN ('claimed','running')` runs *inside* the lock, so it is subtracted
+   from the queue's whole throughput rather than from one timer. It is gated as
+   `concurrency_cap` by `pj-bench plans`, which measured it at **23 buffers**
+   through `jorb_inflight_idx` with 200 jobs in flight in a 200k-row table.
+   That plan holds while in-flight is a small fraction of the table, which is
+   what a cap *makes* it. Drive in-flight up to the whole table and the planner
+   correctly switches to a scan: 20,000 jobs claimed and none completing
+   measured **581 claims/s** — still 2.1× the requirement, but that is the
+   number that falls with *table* size instead of with the queue's own load.
+   A capped queue holding tens of thousands of jobs in flight means jobs are
+   not finishing; fix the count, or the workers, before touching the claim.
+
+Until one of those is a measurement rather than a worry, the ceiling is not
+where this platform runs out.

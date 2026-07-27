@@ -342,6 +342,7 @@ class TestSubcommandsEmitDocumentedJson:
         assert payload["seq_scan_offenders"] == []
         assert set(payload["queries"]) == {
             "claim",
+            "concurrency_cap",
             "retention_probe",
             "checkpoint_sweep",
             "mailbox_sweep",
@@ -355,6 +356,14 @@ class TestSubcommandsEmitDocumentedJson:
         # the two paths docs/SCALE.md names must reach their own index
         assert "jorb_claim_idx" in payload["queries"]["claim"]["indexes"]
         assert "jorb_retention_idx" in payload["queries"]["retention_probe"]["indexes"]
+        # The concurrency-cap count runs inside the per-queue advisory lock,
+        # so it is the one query here whose cost is subtracted from a capped
+        # queue's entire throughput rather than from one timer. It must reach
+        # an index: a scan there sets the capped ceiling by TABLE size, which
+        # a capped queue's own workload does not control.
+        assert payload["queries"]["concurrency_cap"]["indexes"], payload["queries"][
+            "concurrency_cap"
+        ]
         # the gate seeds 20k rows; leaving them behind would poison every
         # later measurement taken on the same database
         assert payload["cleanup"]["jobs_deleted"] == PLAN_SEED

@@ -8,7 +8,9 @@ about, and the next bottleneck hunt starts from a running tool rather than
 from zero.
 
     pj-bench enqueue --concurrency 16 enqueue throughput + NOTIFY commit lock
-    pj-bench claim   --workers 8      claim throughput and lock contention
+    pj-bench claim   --workers 8      claim throughput, lock contention, and
+                                      what a capped queue SUSTAINS with short
+                                      jobs at a high and at a low cap
     pj-bench e2e     --jobs 200       real worker processes, real latency
     pj-bench notify                   notifications per job lifecycle
     pj-bench plans   --seed 20000     EXPLAIN every hot query (CI gate)
@@ -107,12 +109,17 @@ from .monitor import (
     SWEEP_MAILBOX_SQL,
     TERMINAL_STATES,
 )
-from .pj import Job
+from .pj import STMTS, Job
 
 DEFAULT_CONFIG = "./pyjobby.conf.py"
 
 #: Reference workload from docs/SCALE.md: 1,000,000 jobs/hour.
 SCALE_TARGET_RATE = 278.0
+
+#: Jobs left in flight (claimed/running) by ``pj-bench plans``. Deliberately a
+#: constant and not a fraction of the seed: in-flight work is bounded by the
+#: workers and by ``max_concurrency``, so it does not grow with the table.
+PLAN_IN_FLIGHT = 200
 
 #: docs/SCALE.md's claims, carried here so a run can say "agrees" or
 #: "DISAGREES" instead of leaving the reader to diff two documents.
@@ -900,7 +907,139 @@ def _notify_commit_lock_cost(modes: dict[str, Any]) -> dict[str, Any]:
 # 2. claim — throughput through the real claim_jorb(), and contention
 # =========================================================================
 
-CLAIM_SQL = "SELECT id FROM claim_jorb($1, $2::text[], $3, $4, $5, $6)"
+CLAIM_SQL = "SELECT id, run_epoch FROM claim_jorb($1, $2::text[], $3, $4, $5, $6)"
+
+#: What a real worker writes the instant its job returns -- the worker's own
+#: epoch-fenced terminal statement, not an approximation of it, so a churn arm
+#: pays the same triggers, history row and page writes production pays.
+FINISH_SQL = STMTS["finished"]
+
+
+@dataclass(frozen=True)
+class ClaimArm:
+    """One shape the claim path gets measured in.
+
+    ``max_concurrency`` of None means the queue has no control row at all, so
+    ``claim_jorb`` never takes the advisory lock: the lock-free fast path.
+
+    ``finish`` separates a DRAIN arm from a CHURN arm, and it is the whole
+    reason this dataclass exists. A drain arm never completes anything, so
+    its in-flight count only grows -- under a cap that can bind it would
+    admit exactly ``cap`` jobs and then spin until the deadline, and under a
+    cap that cannot bind it makes the cap's own ``count(*)`` more expensive
+    with every claim it makes. A churn arm hands the slot back immediately,
+    which is the only shape in which a capped queue is a *queue* rather than
+    a one-shot admission of ``cap`` jobs.
+
+    ``hold_seconds`` stands in for the job itself, and a cap is meaningless
+    without it: ``max_concurrency`` bounds in-flight work, so the throughput
+    a cap permits is ``cap / duration``. With an instantaneous job even a cap
+    of 1 permits thousands per second, so a cap benchmarked against zero-cost
+    jobs measures the lock and reports it as the cap.
+
+    ``claimers`` is per-arm because a cap is a SIZING decision: nobody runs
+    32 workers against a cap of 2. A low-cap arm runs one claimer per slot,
+    so what it reports is the ceiling the cap imposes rather than the cost of
+    thirty workers being told no.
+    """
+
+    key: str
+    what: str
+    max_concurrency: int | None
+    claimers: int
+    hold_seconds: float
+    finish: bool
+
+    @property
+    def cap_can_bind(self) -> bool:
+        """Can this arm's cap ever refuse a claim?
+
+        In-flight work can never exceed the claimer count, so a cap at or
+        above it is decorative: it costs the advisory lock and the count, and
+        refuses nothing. That distinction decides what an empty-handed return
+        MEANS here, and conflating a cap doing its job with a lost lock would
+        credit the lock for work the cap correctly refused.
+        """
+        return self.max_concurrency is not None and self.max_concurrency < self.claimers
+
+    @property
+    def cap_ceiling_per_second(self) -> float | None:
+        """The rate the cap alone permits, ``cap / duration``.
+
+        None when there is no cap, or when the arm holds nothing and the
+        "duration" is a round trip rather than a job.
+        """
+        if self.max_concurrency is None or not self.hold_seconds:
+            return None
+        return self.max_concurrency / self.hold_seconds
+
+
+def claim_arms(
+    *, workers: int, jobs: int, low_cap: int, high_cap: int, hold_ms: float
+) -> tuple[ClaimArm, ...]:
+    """The five shapes, and why each one is here.
+
+    The first two are the drain arms this benchmark has always run. The three
+    churn arms exist to answer one question the drain arms cannot: a capped
+    queue's *sustained* admission rate, which is what a 278/s requirement is
+    stated in. They are sized so that each one has exactly one candidate
+    bottleneck -- the low-cap arm is provisioned to its cap so the cap binds,
+    the high-cap arm is provisioned far past the measured lock ceiling so the
+    LOCK binds, and the uncapped churn arm is the same claimers with no lock
+    at all, which is what the other two are read against.
+    """
+    hold = hold_ms / 1000.0
+    # 4x, because a churn claimer spends most of its cycle holding a job
+    # rather than claiming one: it takes that many to keep the serialised
+    # section busy, and if it does not the arm reports the claimer count.
+    churn_claimers = workers * 4
+    return (
+        ClaimArm(
+            "uncapped",
+            "no control row: the lock-free fast path",
+            None,
+            workers,
+            0.0,
+            False,
+        ),
+        ClaimArm(
+            "capped",
+            "cap far above the job count and nothing completes, so every "
+            "empty-handed return is a lost lock and never a refusal",
+            jobs + 1000,
+            workers,
+            0.0,
+            False,
+        ),
+        ClaimArm(
+            "churn_uncapped",
+            "short jobs, completed and the slot returned, no lock: the "
+            "control the two capped churn arms are read against",
+            None,
+            churn_claimers,
+            hold,
+            True,
+        ),
+        ClaimArm(
+            "churn_cap_high",
+            "short jobs under a cap too high to ever refuse: the serialised "
+            "section is the only constraint left, which is the shape a batch "
+            "claim would exist to speed up",
+            high_cap,
+            churn_claimers,
+            hold,
+            True,
+        ),
+        ClaimArm(
+            "churn_cap_low",
+            "short jobs under a cap sized to bind, one claimer per slot: the "
+            "cap is the constraint and no claim strategy can lift it",
+            low_cap,
+            low_cap,
+            hold,
+            True,
+        ),
+    )
 
 
 async def _claim_loop(
@@ -909,19 +1048,23 @@ async def _claim_loop(
     worker_index: int,
     deadline: float,
     remaining: dict[str, int],
+    arm: ClaimArm,
 ) -> dict[str, int]:
     """One claimer, hammering ``claim_jorb`` until the queue is empty.
 
     Counts the empty-handed returns separately from the claims: for a queue
-    with a concurrency cap that has not been reached, an empty return means
-    the claimer lost the per-queue advisory try-lock, and that ratio is the
-    number that says a capped queue is thrashing rather than working.
+    whose cap cannot bind (see ``ClaimArm.cap_can_bind``), an empty return
+    means the claimer lost the per-queue advisory lock, and that ratio is the
+    number that says a capped queue is thrashing rather than working. For an
+    arm whose cap CAN bind the same return also happens when the cap refuses,
+    and the two are not separable from out here -- which is why only the
+    non-binding arms report it as a lock miss.
     """
     claims = 0
     empty_with_work = 0
     async with pool.acquire() as conn:
         while time.monotonic() < deadline and remaining["left"] > 0:
-            row = await conn.fetchval(
+            row = await conn.fetchrow(
                 CLAIM_SQL, queue, ["bench"], 1000, worker_index, "pj-bench", None
             )
             if row is None:
@@ -938,6 +1081,10 @@ async def _claim_loop(
             else:
                 claims += 1
                 remaining["left"] -= 1
+                if arm.finish:
+                    if arm.hold_seconds:
+                        await asyncio.sleep(arm.hold_seconds)
+                    await conn.execute(FINISH_SQL, row["id"], "{}", row["run_epoch"])
     return {"claims": claims, "empty_with_work": empty_with_work}
 
 
@@ -947,7 +1094,7 @@ async def _seed_claimable(conn: asyncpg.Connection, queue: str, jobs: int) -> No
 
 
 async def _claim_round(
-    pool: asyncpg.Pool, conn: asyncpg.Connection, queue: str, jobs: int, workers: int
+    pool: asyncpg.Pool, conn: asyncpg.Connection, queue: str, jobs: int, arm: ClaimArm
 ) -> dict[str, Any]:
     await _seed_claimable(conn, queue, jobs)
     remaining = {"left": jobs}
@@ -955,8 +1102,8 @@ async def _claim_round(
     started = time.perf_counter()
     results = await asyncio.gather(
         *(
-            _claim_loop(pool, queue, index, deadline, remaining)
-            for index in range(workers)
+            _claim_loop(pool, queue, index, deadline, remaining, arm)
+            for index in range(arm.claimers)
         )
     )
     elapsed = time.perf_counter() - started
@@ -982,32 +1129,38 @@ async def run_claim(
     warmup: bool,
     max_existing_jobs: int,
     force: bool,
+    low_cap: int = 2,
+    high_cap: int = 1000,
+    hold_ms: float = 5.0,
 ) -> dict[str, Any]:
-    """Claim throughput on an uncapped queue and on a capped one.
+    """Claim throughput on an uncapped queue and on capped ones.
 
-    The capped run sets ``max_concurrency`` far above the job count on
-    purpose. The cap is then never the binding constraint, so every
-    empty-handed claim it records is a MISSED ADVISORY TRY-LOCK and nothing
-    else — which is exactly the "capped queue is thrashing" signal, and is
-    impossible to separate from legitimate cap refusals if the cap can bind.
+    Five arms (see ``claim_arms``), all interleaved. The two drain arms
+    answer "what does one claim cost", the three churn arms answer "what rate
+    can a capped queue SUSTAIN", which is the only form in which the 278/s
+    reference workload can be compared against a cap at all.
     """
+    arms = claim_arms(
+        workers=workers, jobs=jobs, low_cap=low_cap, high_cap=high_cap, hold_ms=hold_ms
+    )
+    connections = max(max(a.claimers for a in arms), 2)
     queue = bench_queue("claim")
     conn = await open_connection(target)
     pool = await db.create_pool(
-        **target.params, min_size=workers, max_size=max(workers, 2)
+        **target.params, min_size=min(workers, connections), max_size=connections
     )
     modes: dict[str, Any] = {}
     result: dict[str, Any] = {}
     try:
         guard = await guard_busy_database(conn, limit=max_existing_jobs, force=force)
 
-        async def arm(mode: str) -> None:
+        async def install(arm: ClaimArm) -> None:
             await conn.execute("DELETE FROM jorb_queue WHERE name = $1", queue)
-            if mode == "capped":
+            if arm.max_concurrency is not None:
                 await conn.execute(
                     "INSERT INTO jorb_queue (name, max_concurrency) VALUES ($1, $2)",
                     queue,
-                    jobs + 1000,
+                    arm.max_concurrency,
                 )
 
         # INTERLEAVED, not one mode then the other. Running every uncapped
@@ -1018,23 +1171,24 @@ async def run_claim(
         # uncapped rate 15x on an unchanged schema, purely because the box
         # picked up load between the two halves. Alternating rounds makes
         # drift show up as spread in both modes instead of as a result in one.
-        by_mode: dict[str, list[dict[str, Any]]] = {"uncapped": [], "capped": []}
+        by_mode: dict[str, list[dict[str, Any]]] = {arm.key: [] for arm in arms}
         if warmup:
-            for mode in ("uncapped", "capped"):
-                await arm(mode)
-                await _claim_round(pool, conn, queue, min(jobs, 100), workers)
+            for arm in arms:
+                await install(arm)
+                await _claim_round(pool, conn, queue, min(jobs, 100), arm)
         for _ in range(repeat):
-            for mode in ("uncapped", "capped"):
-                await arm(mode)
-                by_mode[mode].append(
-                    await _claim_round(pool, conn, queue, jobs, workers)
+            for arm in arms:
+                await install(arm)
+                by_mode[arm.key].append(
+                    await _claim_round(pool, conn, queue, jobs, arm)
                 )
 
-        for mode in ("uncapped", "capped"):
-            rounds = by_mode[mode]
+        for arm in arms:
+            rounds = by_mode[arm.key]
             rates = [r["claims_per_second"] for r in rounds]
             summary = summarize(rates)
-            modes[mode] = {
+            modes[arm.key] = {
+                "what": arm.what,
                 "claims_per_second": summary,
                 "seconds": summarize([r["seconds"] for r in rounds]),
                 "claims": rounds[-1]["claims"] if rounds else 0,
@@ -1046,11 +1200,25 @@ async def run_claim(
                 )
                 if rounds
                 else 0.0,
-                "max_concurrency": (jobs + 1000) if mode == "capped" else None,
+                "empty_returns_mean": (
+                    "cap refusals AND lock misses, not separable"
+                    if arm.cap_can_bind
+                    else "lost advisory locks only: this cap cannot refuse"
+                ),
+                "max_concurrency": arm.max_concurrency,
+                "claimers": arm.claimers,
+                "hold_ms": arm.hold_seconds * 1000.0,
+                "completes_jobs": arm.finish,
+                "cap_ceiling_per_second": arm.cap_ceiling_per_second,
+                "headroom_vs_target_rate": (
+                    summary["median"] / SCALE_TARGET_RATE if summary["median"] else 0.0
+                ),
             }
 
         uncapped = modes["uncapped"]["claims_per_second"]["median"]
         capped = modes["capped"]["claims_per_second"]["median"]
+        churn_uncapped = modes["churn_uncapped"]["claims_per_second"]["median"]
+        churn_high = modes["churn_cap_high"]["claims_per_second"]["median"]
         result.update(
             {
                 "benchmark": "claim",
@@ -1059,13 +1227,27 @@ async def run_claim(
                 "workers": workers,
                 "jobs": jobs,
                 "repeat": repeat,
+                "hold_ms": hold_ms,
+                "low_cap": low_cap,
+                "high_cap": high_cap,
                 "guard": guard,
                 "modes": modes,
                 "capped_throughput_ratio": (capped / uncapped) if uncapped else 0.0,
+                # What serialising costs a queue whose cap never refuses: the
+                # price of exactness, isolated from the cap itself.
+                "churn_capped_throughput_ratio": (
+                    (churn_high / churn_uncapped) if churn_uncapped else 0.0
+                ),
                 "claims_per_second": uncapped,
                 "target_rate": SCALE_TARGET_RATE,
                 "headroom_vs_target_rate": (
                     uncapped / SCALE_TARGET_RATE if uncapped else 0.0
+                ),
+                # The one number the batch-claim question turns on: what a
+                # capped queue sustains when the LOCK, not the cap, is what
+                # is left binding.
+                "capped_headroom_vs_target_rate": (
+                    churn_high / SCALE_TARGET_RATE if churn_high else 0.0
                 ),
             }
         )
@@ -1647,6 +1829,19 @@ CLAIM_PROBE_SQL = """
      LIMIT 1
 """
 
+#: claim_jorb's max_concurrency check, copied from sql/schema.sql. This one
+#: runs INSIDE the per-queue advisory lock, which makes it the most expensive
+#: place in the system for a query to be slow: every millisecond it takes is a
+#: millisecond no other claimer on that queue can be admitted, so the capped
+#: queue's whole ceiling is 1/(this + the claiming UPDATE). It is gated here
+#: because count(*) is O(rows matched) however good the index is -- the plan
+#: decides only whether that is "rows in flight on this queue" or "every row
+#: this queue ever claimed".
+CAP_COUNT_SQL = """
+    SELECT count(*) FROM jorb
+     WHERE queue = $1 AND state IN ('claimed', 'running')
+"""
+
 METRICS_COMPLETIONS_SQL = f"""
     SELECT count(*) AS terminal_count,
            count(*) FILTER (WHERE state = 'finished') AS finished_count
@@ -1695,6 +1890,12 @@ def hot_queries() -> tuple[HotQuery, ...]:
             "claim_jorb's claimable-row probe (every worker poll)",
             CLAIM_PROBE_SQL,
             claim_args,
+        ),
+        HotQuery(
+            "concurrency_cap",
+            "claim_jorb's max_concurrency count, inside the serialised section",
+            CAP_COUNT_SQL,
+            lambda queue: [queue],
         ),
         HotQuery(
             "retention_probe",
@@ -1827,6 +2028,18 @@ async def seed_plan_data(
     pass for the wrong reason. Jobs are spread over 60 days and across
     terminal and live states so a reporting window covers a slice rather
     than the whole table.
+
+    A small FIXED number of them are then put in flight, because one of the
+    gated queries is the concurrency-cap count and it reads exactly those
+    rows. The number is fixed rather than proportional on purpose: in-flight
+    work is bounded by the workers and the cap, not by the table, so a queue
+    holds tens or hundreds of ``claimed``/``running`` rows whether the table
+    has twenty thousand or twenty million. Seeding a *fraction* instead would
+    make the count match a third of the table, the planner would rightly
+    choose a sequential scan, and the gate would report a design flaw that
+    only its own seeding created. ``claimed_at`` is set with them: a real
+    claimed row always has one, and without it the row is missing from an
+    index the planner may want.
     """
     await conn.execute(
         """
@@ -1841,6 +2054,20 @@ async def seed_plan_data(
         BENCH_JOB_CLASS,
         queue,
         rows,
+    )
+    in_flight = min(PLAN_IN_FLIGHT, max(rows // 10, 1))
+    await conn.execute(
+        """
+        UPDATE jorb SET state = CASE WHEN id % 2 = 0 THEN 'claimed'
+                                     ELSE 'running' END::jorbstate,
+                        claimed_at = now(),
+                        started = CASE WHEN id % 2 = 1 THEN now() END
+         WHERE id IN (SELECT id FROM jorb
+                       WHERE queue = $1 AND state = 'queued'
+                       ORDER BY id LIMIT $2)
+        """,
+        queue,
+        in_flight,
     )
     job_ids = await conn.fetch(
         "SELECT id FROM jorb WHERE queue = $1 ORDER BY id LIMIT 200", queue
@@ -1882,7 +2109,12 @@ async def seed_plan_data(
     await conn.execute("VACUUM (ANALYZE) jorb")
     await conn.execute("VACUUM (ANALYZE) jorb_step")
     await conn.execute("VACUUM (ANALYZE) jorb_mailbox")
-    return {"jobs": rows, "steps": steps, "mailbox": mailbox}
+    return {
+        "jobs": rows,
+        "steps": steps,
+        "mailbox": mailbox,
+        "in_flight": in_flight,
+    }
 
 
 async def run_plans(
@@ -2217,6 +2449,24 @@ def enqueue_table(result: dict[str, Any]) -> list[list[str]]:
 @timing_options
 @click.option("--workers", default=8, show_default=True, help="Concurrent claimers")
 @click.option("--jobs", default=2000, show_default=True, help="Jobs to drain per run")
+@click.option(
+    "--hold-ms",
+    default=5.0,
+    show_default=True,
+    help="Simulated job duration for the churn arms; a cap permits cap/duration",
+)
+@click.option(
+    "--low-cap",
+    default=2,
+    show_default=True,
+    help="max_concurrency for the arm sized so the cap binds",
+)
+@click.option(
+    "--high-cap",
+    default=1000,
+    show_default=True,
+    help="max_concurrency for the arm sized so only the claim lock binds",
+)
 @click.pass_context
 def claim_cmd(
     ctx: click.Context,
@@ -2229,6 +2479,9 @@ def claim_cmd(
     warmup: bool,
     workers: int,
     jobs: int,
+    hold_ms: float,
+    low_cap: int,
+    high_cap: int,
 ) -> None:
     """Claim throughput and contention through the real claim_jorb()."""
     target = resolve_target(pick(ctx, config, "config"), pick(ctx, dsn, "dsn"))
@@ -2241,19 +2494,44 @@ def claim_cmd(
             warmup=warmup,
             max_existing_jobs=max_existing_jobs,
             force=force,
+            low_cap=low_cap,
+            high_cap=high_cap,
+            hold_ms=hold_ms,
         )
     )
-    uncapped = result["modes"]["uncapped"]
     capped = result["modes"]["capped"]
+    rows: list[list[str]] = []
+    for key, data in result["modes"].items():
+        rate = data["claims_per_second"]
+        cap = data["max_concurrency"]
+        rows.append(
+            [
+                f"{key} claims/s",
+                f"{rate['median']:,.0f}  "
+                f"({data['headroom_vs_target_rate']:.1f}x the {result['target_rate']:,.0f}/s "
+                f"target, spread {rate['spread_pct']:.0f}%, "
+                f"{data['claimers']} claimers, cap {cap if cap is not None else 'none'})",
+            ]
+        )
     emit(
         result,
         output_json,
         [
             ["claimers", fmt(result["workers"])],
-            ["uncapped claims/s", fmt(uncapped["claims_per_second"]["median"])],
-            ["uncapped spread", f"{uncapped['claims_per_second']['spread_pct']:.0f}%"],
-            ["capped claims/s", fmt(capped["claims_per_second"]["median"])],
-            ["capped / uncapped", f"{result['capped_throughput_ratio']:.2f}x"],
+            ["short-job hold", f"{result['hold_ms']:.0f} ms (churn arms)"],
+            *rows,
+            ["capped / uncapped (drain)", f"{result['capped_throughput_ratio']:.2f}x"],
+            [
+                "capped / uncapped (churn)",
+                f"{result['churn_capped_throughput_ratio']:.2f}x — what exact "
+                "caps cost when the cap itself refuses nothing",
+            ],
+            [
+                "what the low cap permits",
+                f"{result['modes']['churn_cap_low']['cap_ceiling_per_second'] or 0:,.0f}/s "
+                f"= cap {result['low_cap']} / {result['hold_ms']:.0f} ms. A cap IS a "
+                "throughput limit; no claim strategy raises it",
+            ],
             [
                 "capped advisory-lock misses",
                 f"{capped['empty_claims_with_work_available']:,} "
@@ -2611,6 +2889,14 @@ def all_cmd(
         [
             "claim/s (capped)",
             fmt(results["claim"]["modes"]["capped"]["claims_per_second"]["median"]),
+        ],
+        [
+            "claim/s (capped, short jobs)",
+            fmt(
+                results["claim"]["modes"]["churn_cap_high"]["claims_per_second"][
+                    "median"
+                ]
+            ),
         ],
         ["e2e jobs/s", fmt(results["e2e"]["jobs_per_second"]["median"], 2)],
         [

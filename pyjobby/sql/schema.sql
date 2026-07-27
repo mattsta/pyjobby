@@ -232,6 +232,15 @@ COMMENT ON TABLE jorb_queue IS 'Per-queue controls enforced by claim_jorb(); row
 -- capped ceiling means a cheaper critical section, or more than one claim per
 -- acquisition (batching) -- a worker-model change, not a lock change.
 --
+-- Batching was then measured and REJECTED, and the numbers are in
+-- docs/SCALE.md ("Claiming a batch per lock acquisition"): the shape where
+-- this lock is the only constraint left -- a cap too high to refuse, short
+-- jobs, claimers to spare -- sustains 3,211 claims/s, 11.6x the 278/s
+-- reference workload, and a LOW cap is bounded by cap/job-duration where no
+-- claim strategy reaches. Do not reopen this without a capped queue that
+-- needs 11M jobs/hour on its own, or a `pj-bench plans` run showing the
+-- concurrency-cap count below has stopped using an index.
+--
 -- Why its own function rather than SET LOCAL inside claim_jorb: a function's
 -- SET clause is applied on entry and restored by PostgreSQL on exit, error or
 -- not, so the timeout covers the lock acquisition and NOTHING else. Putting
