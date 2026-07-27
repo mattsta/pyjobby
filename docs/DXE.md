@@ -16,10 +16,10 @@ die at any instant and another worker resumes the job correctly.
 ```python
 class ChargeAndShip(Job):
     async def task(self, order_id: int) -> dict:
-        charge   = await self.step("charge", self.charge_card, order_id, timeout=30)
-        label    = await self.step("label",  self.buy_label,   order_id)
-        await self.sleep(3600)                      # durable: holds no worker
-        await self.set_event("shipped", label)      # readable by others
+        charge = await self.step("charge", self.charge_card, order_id, timeout=30)
+        label = await self.step("label", self.buy_label, order_id)
+        await self.sleep(3600)  # durable: holds no worker
+        await self.set_event("shipped", label)  # readable by others
         note = await self.recv("support", timeout=60)
         return {"charge": charge, "label": label, "note": note}
 ```
@@ -67,9 +67,9 @@ step 2 was 'charge' on a previous attempt but is 'refund' now
 So this is a bug DXE catches for you:
 
 ```python
-if random.random() < 0.5:               # ← changes the step sequence
+if random.random() < 0.5:  # ← changes the step sequence
     await self.step("maybe", ...)
-await self.step("always", ...)          # ← becomes step 1 or 2 depending
+await self.step("always", ...)  # ← becomes step 1 or 2 depending
 ```
 
 Put the nondeterminism *inside* a step, where its result is checkpointed:
@@ -120,6 +120,7 @@ checkpoint in the *same* transaction, so they commit or roll back together.
 async def task(self, order_id: int) -> dict:
     # exactly-once: the row insert and the checkpoint are one commit
     await self.transaction("charge", self.charge, order_id)
+
 
 async def charge(self, conn, order_id: int) -> dict:
     await conn.execute("INSERT INTO charges (order_id) VALUES ($1)", order_id)
@@ -180,11 +181,11 @@ therefore take a budget of their own:
 
 ```python
 class ChargeAndShip(Job):
-    step_timeout = 30                      # default for every step here
+    step_timeout = 30  # default for every step here
 
     async def task(self, order_id: int) -> dict:
         charge = await self.step("charge", self.charge_card, order_id, timeout=5)
-        label  = await self.step("label",  self.buy_label,   order_id)   # 30s
+        label = await self.step("label", self.buy_label, order_id)  # 30s
         await self.transaction("record", self.write_row, order_id, timeout=2)
 ```
 
