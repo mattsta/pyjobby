@@ -190,11 +190,11 @@ Enqueue a single job.
 job_id = await client.enqueue("myapp.jobs.SendEmail", to="user@example.com")
 
 # Scheduled job (run in 1 hour)
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 job_id = await client.enqueue(
     "myapp.jobs.DailyReport",
-    run_after=datetime.now() + timedelta(hours=1),
+    run_after=datetime.now(UTC) + timedelta(hours=1),
     report_type="sales",
 )
 
@@ -244,35 +244,45 @@ job_id = await client.enqueue(
 )
 ```
 
-#### `enqueue_batch(jobs, queue='default', priority=100, run_after=None, run_group=None)`
+#### `enqueue_batch(jobs, **options)`
 
-Enqueue multiple jobs efficiently in a single transaction.
+Enqueue multiple jobs in one INSERT, with the **same option set as
+`enqueue()`** — retry strategy, timeout policy, tags, `deadline_key`,
+`capability`, dependencies. A batched job means exactly what the same
+single enqueue means.
 
 **Parameters:**
 
-- `jobs` (List[Tuple[str, Dict]]): List of (job_class, kwargs) tuples
-- `queue` (str): Queue name for all jobs
-- `priority` (int): Priority for all jobs
-- `run_after` (datetime): When to run all jobs
-- `run_group` (int): Group ID for all jobs
+- `jobs`: a list of `(job_class, kwargs)` tuples, or
+  `(job_class, kwargs, per_job_options)` — the third element is a dict of
+  `enqueue()` options applying to that job only, layered over the shared
+  ones. Per-job options are how a batch carries a per-item `deadline_key`,
+  `tags`, or `waitfor_job`.
+- `**options`: any `enqueue()` option (`queue`, `priority`, `run_after`,
+  `run_group`, `tags`, `max_retries`, `timeout_seconds`, ...), applied to
+  every job in the batch.
 
-**Returns:** List of job IDs
+Payload and options never collide: the `kwargs` dict is delivered to the
+job verbatim, even if it contains keys named like options.
+
+**Returns:** List of job IDs, in the order given
 
 **Examples:**
 
 ```python
-# Enqueue 1000 jobs efficiently
+# Enqueue 1000 jobs efficiently, each with its own idempotency key
 jobs = [
-    ("myapp.jobs.ProcessItem", {"item_id": i, "action": "process"}) for i in range(1000)
+    ("myapp.jobs.ProcessItem", {"item_id": i}, {"deadline_key": f"item:{i}"})
+    for i in range(1000)
 ]
-job_ids = await client.enqueue_batch(jobs, queue="processing")
+job_ids = await client.enqueue_batch(jobs, queue="processing", max_retries=5)
 
-# Batch with scheduling
-from datetime import datetime, timedelta
+# Batch with scheduling (always timezone-aware datetimes)
+from datetime import UTC, datetime, timedelta
 
 jobs = [("myapp.jobs.SendReminder", {"user_id": user_id}) for user_id in user_ids]
 job_ids = await client.enqueue_batch(
-    jobs, run_after=datetime.now() + timedelta(hours=24), queue="notifications"
+    jobs, run_after=datetime.now(UTC) + timedelta(hours=24), queue="notifications"
 )
 
 # Batch with group tracking
@@ -475,24 +485,26 @@ async def process_user_uploads(client, user_id, image_urls):
 Schedule jobs to run at specific times.
 
 ```python
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
-# Run in 1 hour
+# Run in 1 hour. Always pass an AWARE datetime: a naive one is encoded as
+# UTC by the driver, so "an hour from now" written on a UTC+2 machine
+# actually runs three hours late.
 await client.enqueue(
     "myapp.jobs.SendReminder",
-    run_after=datetime.now() + timedelta(hours=1),
+    run_after=datetime.now(UTC) + timedelta(hours=1),
     user_id=123,
 )
 
-# Run tomorrow at 9am
-tomorrow_9am = datetime.now().replace(
+# Run tomorrow at 9am UTC
+tomorrow_9am = datetime.now(UTC).replace(
     hour=9, minute=0, second=0, microsecond=0
 ) + timedelta(days=1)
 
 await client.enqueue(
     "myapp.jobs.DailyReport",
     run_after=tomorrow_9am,
-    report_date=(datetime.now() - timedelta(days=1)).date(),
+    report_date=(datetime.now(UTC) - timedelta(days=1)).date(),
 )
 ```
 
@@ -516,7 +528,7 @@ except asyncpg.UniqueViolationError:
     print("Payment already processing")
 
 # Daily reports - one per day
-date = datetime.now().date()
+date = datetime.now(UTC).date()
 try:
     job_id = await client.enqueue(
         "myapp.jobs.DailyReport", deadline_key=f"daily_report:{date}", report_date=date
@@ -1046,14 +1058,16 @@ class OrderProcessor:
         """
 
         jobs = []
-        send_time = datetime.now() + timedelta(hours=24)
+        send_time = datetime.now(UTC) + timedelta(hours=24)
 
         for cart_id in cart_ids:
-            # Use deadline key to prevent duplicate reminders
+            # The per-job options dict carries each job's own deadline_key,
+            # so a cart already scheduled is not scheduled twice
             jobs.append(
                 (
                     "myapp.jobs.SendAbandonedCartEmail",
-                    {"cart_id": cart_id, "deadline_key": f"cart_reminder:{cart_id}"},
+                    {"cart_id": cart_id},
+                    {"deadline_key": f"cart_reminder:{cart_id}"},
                 )
             )
 

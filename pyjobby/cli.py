@@ -2011,11 +2011,17 @@ def dag() -> None:
 
 
 def _dag_state(status: dict) -> str:
-    """Derive a DAG's overall state from the jorb_dag_status counts."""
+    """Derive a DAG's overall state from the jorb_dag_status counts.
+
+    Cancelled counts as failed, exactly as `dag.wait_for_dag` judges it: a
+    cancelled member blocks everything downstream of it forever, so the DAG
+    did not run to completion — an operator reading "complete" here would
+    ship a partially-executed pipeline.
+    """
     total = status["total_jobs"] or 0
     if total == 0:
         return "empty"
-    if status["crashed_jobs"]:
+    if status["crashed_jobs"] or status["cancelled_jobs"]:
         return "failed"
     if (status["pending_jobs"] or 0) > 0:
         return "running"

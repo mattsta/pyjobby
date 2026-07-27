@@ -574,9 +574,10 @@ class TestWaitForDAG:
 
     @pytest.mark.asyncio
     async def test_wait_for_dag_not_found(self, db_pool):
-        """Test wait_for_dag with non-existent DAG - covers lines 378-382."""
-        result = await wait_for_dag(db_pool, -99999, timeout=1, poll_interval=0.1)
-        assert result is False
+        """A nonexistent DAG raises immediately: nothing will ever complete
+        it, and a False would be indistinguishable from a real failure."""
+        with pytest.raises(LookupError):
+            await wait_for_dag(db_pool, -99999, timeout=1, poll_interval=0.1)
 
     @pytest.mark.asyncio
     async def test_wait_for_dag_timeout(self, db_pool):
@@ -592,11 +593,11 @@ class TestWaitForDAG:
             {"test": True},
         )
 
-        # Wait with very short timeout
-        result = await wait_for_dag(db_pool, dag_id, timeout=0.1, poll_interval=0.05)
-
-        # Should timeout (return False) because DAG never completes
-        assert result is False
+        # A timeout is NOT an outcome — the DAG could still go either way —
+        # so it raises instead of returning a False that would read as
+        # "the DAG failed"
+        with pytest.raises(TimeoutError):
+            await wait_for_dag(db_pool, dag_id, timeout=0.1, poll_interval=0.05)
 
 
 class TestDAGBuilderWithJobOptions:

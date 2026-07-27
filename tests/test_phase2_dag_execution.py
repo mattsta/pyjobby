@@ -752,9 +752,9 @@ class TestDAGHelperFunctions:
             dag_id,
         )
 
-        # Should timeout
-        result = await wait_for_dag(db_pool, dag_id, timeout=1, poll_interval=0.5)
-        assert result is False
+        # A timeout raises — it is not an outcome, the DAG is still running
+        with pytest.raises(TimeoutError):
+            await wait_for_dag(db_pool, dag_id, timeout=1, poll_interval=0.5)
 
 
 class TestDAGVisualization:

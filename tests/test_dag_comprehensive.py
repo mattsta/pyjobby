@@ -765,8 +765,10 @@ class TestDAGHelperFunctions:
         dag.add("test.Job1", {"arg": 1})
         result = await dag.execute(job_client)
 
-        # Get DAG ID
-        dag_id = await db_pool.fetchval("SELECT MAX(id) FROM jorb_dag")
+        # execute() records the created DAG's id on the builder — no raw
+        # SQL against internal columns needed
+        dag_id = dag.dag_id
+        assert dag_id is not None
 
         # Leave jobs in running state (not finished, not crashed)
         async with db_pool.acquire() as conn:
@@ -779,22 +781,18 @@ class TestDAGHelperFunctions:
                 dag_id,
             )
 
-        # Wait with very short timeout
-        success = await wait_for_dag(db_pool, dag_id, timeout=0.2, poll_interval=0.05)
-
-        # Should timeout and return False
-        assert success is False
+        # A timeout raises — it is not an outcome, the DAG is still running
+        with pytest.raises(TimeoutError):
+            await wait_for_dag(db_pool, dag_id, timeout=0.2, poll_interval=0.05)
 
     @pytest.mark.asyncio
     async def test_wait_for_dag_not_found(self, db_pool):
-        """Test wait_for_dag returns False when DAG doesn't exist."""
+        """A nonexistent DAG raises immediately rather than reading as a
+        real failure."""
         from pyjobby.dag import wait_for_dag
 
-        # Wait for non-existent DAG
-        success = await wait_for_dag(db_pool, 999999, timeout=1, poll_interval=0.1)
-
-        # Should return False immediately
-        assert success is False
+        with pytest.raises(LookupError):
+            await wait_for_dag(db_pool, 999999, timeout=1, poll_interval=0.1)
 
 
 class TestDAGCompletionTrigger:

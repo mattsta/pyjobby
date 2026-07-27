@@ -76,6 +76,10 @@ class DAGBuilder:
         self.name = name
         self.common_options = common_options
         self.nodes: list[DAGNode] = []
+        #: Set by execute(): the jorb_dag row this run created. This is the
+        #: handle wait_for_dag()/get_dag_status() take — without it a caller
+        #: had to dig dag_id out of a job row with raw SQL.
+        self.dag_id: int | None = None
 
     def add(
         self,
@@ -396,6 +400,7 @@ class DAGBuilder:
             f"(job IDs: {sorted(node_to_job.values())})"
         )
 
+        self.dag_id = dag_id
         return node_to_job
 
     def visualize(self) -> str:
@@ -455,31 +460,45 @@ async def get_dag_status(pool: asyncpg.Pool, dag_id: int) -> dict[str, Any]:
 
 
 async def wait_for_dag(
-    pool: asyncpg.Pool, dag_id: int, timeout: int = 3600, poll_interval: int = 1
+    pool: asyncpg.Pool,
+    dag_id: int,
+    timeout: float | None = None,
+    poll_interval: float = 1.0,
 ) -> bool:
     """
-    Wait for DAG to complete.
+    Wait for a DAG to reach its outcome.
+
+    The three ways this can end are three different answers, and they are
+    reported as three different things so no caller has to guess which one
+    a `False` meant:
+
+    * every job finished           -> returns True
+    * a job crashed or cancelled   -> returns False (the DAG's outcome:
+      everything downstream stays blocked, so waiting longer cannot help;
+      get_dag_status() has the counts)
+    * `timeout` elapsed first      -> raises TimeoutError (NOT an outcome:
+      the DAG is still running and may yet go either way)
+    * the DAG does not exist       -> raises LookupError immediately
 
     Args:
         pool: Database connection pool
-        dag_id: DAG ID
-        timeout: Maximum wait time in seconds
+        dag_id: DAG ID (``builder.dag_id`` after ``execute()``)
+        timeout: Maximum wait in seconds (default: wait forever, like every
+            other wait in the client)
         poll_interval: How often to check status (seconds)
-
-    Returns:
-        True if DAG completed successfully, False if failed or timeout
     """
     import asyncio
     import time
 
-    start = time.time()
+    start = time.monotonic()
 
     while True:
         status = await get_dag_status(pool, dag_id)
 
         if "error" in status:
-            logger.error(f"DAG {dag_id} not found")
-            return False
+            raise LookupError(
+                f"DAG {dag_id} does not exist, so it can never complete"
+            )
 
         # Derive terminal state from the jorb_dag_status counts. A crashed or
         # cancelled job means the DAG did not run to completion: everything
@@ -500,12 +519,11 @@ async def wait_for_dag(
             )
             return True
 
-        if time.time() - start > timeout:
-            logger.error(
-                f"DAG {dag_id} timeout after {timeout}s: "
+        if timeout is not None and time.monotonic() - start > timeout:
+            raise TimeoutError(
+                f"DAG {dag_id} still running after {timeout}s: "
                 f"{status['finished_jobs']}/{status['total_jobs']} finished, "
                 f"{status['pending_jobs']} still pending"
             )
-            return False
 
         await asyncio.sleep(poll_interval)

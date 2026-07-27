@@ -14,7 +14,7 @@ Features:
 - Async context manager support
 
 Example:
-    async with JobClient.from_config('./pyjobby.conf.py') as client:
+    async with await JobClient.from_config('./pyjobby.conf.py') as client:
         # Simple job
         job_id = await client.enqueue('myapp.jobs.SendEmail', to='user@example.com')
 
@@ -496,7 +496,7 @@ class JobClient:
 
     Usage:
         # Context manager (recommended)
-        async with JobClient.from_config('./pyjobby.conf.py') as client:
+        async with await JobClient.from_config('./pyjobby.conf.py') as client:
             job_id = await client.enqueue('MyJob', arg=123)
 
         # Manual lifecycle
@@ -517,7 +517,9 @@ class JobClient:
         Initialize client with connection pool.
 
         Args:
-            pool: asyncpg connection pool
+            pool: asyncpg connection pool. It remains the CALLER's: close()
+                will not close a pool it did not create (create() and
+                from_config() build their own and do close them).
             db_params: optional connection parameters — a dict of
                 asyncpg.connect kwargs or a DSN string — used to open the
                 shared LISTEN connection that powers wait_for_result() and
@@ -535,6 +537,12 @@ class JobClient:
         self.pool = pool
         self.prio_ceiling = prio_ceiling
         self._closed = False
+        # A pool handed to the constructor belongs to the CALLER — a web app
+        # routinely shares one pool between its ORM and this client, and
+        # close() closing it would take the whole process's database access
+        # down with one client. The create()/from_config() constructors set
+        # this True for the pools they build themselves.
+        self._owns_pool = False
         self._db_params = db_params
         self._listener_conn: asyncpg.Connection | None = None
         self._listener_lock = asyncio.Lock()
@@ -599,7 +607,9 @@ class JobClient:
             "user": user,
             "password": password,
         }
-        return cls(pool, db_params=db_params, prio_ceiling=prio_ceiling)
+        client = cls(pool, db_params=db_params, prio_ceiling=prio_ceiling)
+        client._owns_pool = True
+        return client
 
     @classmethod
     async def from_config(
@@ -632,10 +642,18 @@ class JobClient:
         db_params = config.get("db_params", {})
 
         pool = await db.create_pool(min_size=min_size, max_size=max_size, **db_params)
-        return cls(pool, db_params=db_params, prio_ceiling=prio_ceiling)
+        client = cls(pool, db_params=db_params, prio_ceiling=prio_ceiling)
+        client._owns_pool = True
+        return client
 
     async def close(self) -> None:
-        """Close the shared LISTEN connection (if open) and the pool.
+        """Close the shared LISTEN connection (if open), and the pool IF
+        this client created it.
+
+        A pool passed to the constructor is the caller's: it may be shared
+        with the rest of their application, so closing it here would take
+        that application's database access down with one client. Pools built
+        by create()/from_config() are this client's own and are closed.
 
         Holds the listener lock so a wait starting concurrently cannot open a
         replacement listener that nothing would ever close.
@@ -647,7 +665,8 @@ class JobClient:
                     with contextlib.suppress(Exception):
                         await self._listener_conn.close()
                     self._listener_conn = None
-            await self.pool.close()
+            if self._owns_pool:
+                await self.pool.close()
 
     async def __aenter__(self) -> JobClient:
         """Context manager entry"""
@@ -929,15 +948,29 @@ class JobClient:
         timeout_seconds: int | None = None,
         on_timeout: str = "retry",
         prio_ceiling: int = DEFAULT_PRIO_CEILING,
+        job_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> list[Any]:
         """Validate enqueue options and build the parameter row for
-        _ENQUEUE_SQL — the single construction path shared by enqueue()
-        and enqueue_in_transaction().
+        _ENQUEUE_SQL — the single construction path shared by enqueue(),
+        enqueue_batch() and enqueue_in_transaction().
+
+        The job's payload arrives one of two ways: as the leftover **kwargs
+        (enqueue()'s historical shared namespace), or explicitly as
+        ``job_kwargs`` — which keeps payload and options in separate
+        namespaces, so a payload key named like an option is delivered
+        instead of colliding. When ``job_kwargs`` is given, leftover
+        **kwargs can only be misspelled options and are refused by name.
 
         ``prio_ceiling`` is the fleet's worker ceiling; enqueue() passes the
         client's, and the static/outbox path (which has no client) gets the
         platform default. See validate_priority."""
+        if job_kwargs is not None and kwargs:
+            raise ValueError(
+                f"unknown enqueue options: {sorted(kwargs)} — with a "
+                f"kwargs dict provided, job arguments go in it and options "
+                f"are passed by name"
+            )
         if waitfor_job and waitfor_group:
             raise ValueError("Cannot specify both waitfor_job and waitfor_group")
 
@@ -998,7 +1031,7 @@ class JobClient:
 
         return [
             job_class,
-            kwargs,  # Dict - custom codec handles conversion
+            kwargs if job_kwargs is None else job_kwargs,  # codec converts
             queue,
             priority,
             run_after,
@@ -1015,103 +1048,91 @@ class JobClient:
 
     async def enqueue_batch(
         self,
-        jobs: list[tuple[str, dict[str, Any]]],
-        queue: str = "default",
-        priority: int = 100,
-        run_after: datetime | None = None,
-        run_group: int | None = None,
+        jobs: list[tuple[Any, ...]],
         prio_ceiling: int | None = None,
+        **options: Any,
     ) -> list[int]:
         """
-        Enqueue multiple jobs efficiently in a single transaction.
+        Enqueue multiple jobs in one INSERT, with the SAME option set as
+        enqueue().
+
+        Every row is built by the same construction path as a single
+        enqueue, so a batch job loses nothing by being batched: retry
+        strategy, timeout policy, tags, deadline_key, capability — all of
+        it applies. (An earlier version wrote only six columns, so batched
+        jobs silently ran with worker-default retry/timeout policy and no
+        deadline_key; converting a loop of enqueue() calls into a batch for
+        speed must not change what the jobs mean.)
 
         Args:
-            jobs: List of (job_class, kwargs) tuples
-            queue: Queue name for all jobs (default: 'default')
-            priority: Priority for all jobs (default: 100)
-            run_after: When to run all jobs (default: now)
-            run_group: Group ID for all jobs (default: None)
+            jobs: a list of ``(job_class, kwargs)`` tuples, or
+                ``(job_class, kwargs, per_job_options)`` — the third element
+                is a dict of enqueue() options applying to that job only,
+                layered over the shared ones. Per-job options are how a
+                batch carries per-item ``deadline_key``/``tags``/``uid``.
             prio_ceiling: override this client's worker priority ceiling for
                 this call (default: the client's; see validate_priority)
+            **options: any enqueue() option (queue, priority, run_after,
+                run_group, tags, retry_strategy, timeout_seconds, ...),
+                applied to every job in the batch.
 
         Returns:
-            List of job IDs
+            List of job IDs, in the order given
 
         Raises:
-            ValueError: If priority is above the worker priority ceiling —
-                every job in the batch would be unclaimable
+            ValueError: an invalid option — priority above the worker
+                ceiling, bad tag shape, unknown on_timeout — reported
+                before ANY row is written
 
         Example:
-            # Enqueue 1000 jobs efficiently
-            jobs = [
-                ('myapp.jobs.ProcessItem', {'item_id': i})
-                for i in range(1000)
-            ]
-            job_ids = await client.enqueue_batch(jobs, queue='processing')
-
-            # Pipeline: enqueue all at once, they'll wait for previous group
-            job_ids = await client.enqueue_batch([
-                ('Step1', {'data': x}),
-                ('Step2', {'data': y}),
-                ('Step3', {'data': z}),
-            ], run_group=123)
+            # 1000 jobs, each with its own idempotency key
+            job_ids = await client.enqueue_batch(
+                [
+                    ('myapp.jobs.ProcessItem', {'item_id': i},
+                     {'deadline_key': f'item:{i}'})
+                    for i in range(1000)
+                ],
+                queue='processing',
+                max_retries=5,
+            )
         """
         if not jobs:
             return []
 
-        validate_priority(
-            priority, self.prio_ceiling if prio_ceiling is None else prio_ceiling
-        )
-
-        if run_after is None:
-            run_after = datetime.now(UTC)
-
-        # Prepare values for batch insert
-        values = []
-        for job_class, kwargs in jobs:
-            values.append(
-                (
+        ceiling = self.prio_ceiling if prio_ceiling is None else prio_ceiling
+        rows = []
+        for item in jobs:
+            job_class, kwargs, *rest = item
+            per_job = rest[0] if rest else {}
+            rows.append(
+                self._build_enqueue_row(
                     job_class,
-                    json.dumps(kwargs),
-                    queue,
-                    priority,
-                    run_after,
-                    run_group,
+                    prio_ceiling=ceiling,
+                    job_kwargs=kwargs,
+                    **{**options, **per_job},
                 )
             )
 
-        # Execute batch INSERT
+        columns = list(zip(*rows, strict=True))
         async with self.pool.acquire() as conn:
-            # Use unnest for efficient bulk insert
             job_ids = await conn.fetch(
                 """
                 INSERT INTO jorb (
-                    job_class, kwargs, queue, prio, run_after, run_group, state
+                    job_class, kwargs, queue, prio, run_after,
+                    capability, uid, run_group,
+                    waitfor_job, waitfor_group,
+                    deadline_key, admin_data, tags, state
                 )
-                SELECT
-                    job_class,
-                    kwargs::jsonb,
-                    queue,
-                    prio,
-                    run_after,
-                    run_group,
-                    'queued'::jorbstate as state
-                FROM UNNEST(
-                    $1::text[],
-                    $2::text[],
-                    $3::text[],
-                    $4::int[],
-                    $5::timestamptz[],
-                    $6::bigint[]
-                ) AS t(job_class, kwargs, queue, prio, run_after, run_group)
+                SELECT * FROM UNNEST(
+                    $1::text[], $2::jsonb[], $3::text[], $4::int[],
+                    $5::timestamptz[], $6::text[], $7::bigint[],
+                    $8::bigint[], $9::bigint[], $10::bigint[],
+                    $11::text[], $12::jsonb[], $13::jsonb[],
+                    $14::jorbstate[]
+                )
                 RETURNING id
             """,
-                [v[0] for v in values],  # job_class
-                [v[1] for v in values],  # kwargs
-                [v[2] for v in values],  # queue
-                [v[3] for v in values],  # prio
-                [v[4] for v in values],  # run_after
-                [v[5] for v in values],  # run_group
+                *columns,
             )
 
         return [row["id"] for row in job_ids]
@@ -1405,18 +1426,41 @@ class JobClient:
 
         Raises:
             TimeoutError: `timeout` elapsed before the event was published
+            JobError: the job does not exist, or ended without ever
+                publishing this key — in both cases nothing will ever
+                publish it, so waiting (the default is forever) only delays
+                the same answer
 
         Example:
             phase = await client.get_event(job_id, 'phase', timeout=30)
         """
 
         async def check() -> Any:
+            # One snapshot for all three answers, so a job cannot look
+            # absent or terminal while its event is still readable.
             row = await self.pool.fetchrow(
-                "SELECT value FROM jorb_event WHERE job_id = $1 AND key = $2",
+                """SELECT EXISTS (SELECT 1 FROM jorb_event
+                                   WHERE job_id = $1 AND key = $2) AS present,
+                          (SELECT value FROM jorb_event
+                            WHERE job_id = $1 AND key = $2) AS value,
+                          (SELECT state FROM jorb WHERE id = $1) AS job_state""",
                 job_id,
                 key,
             )
-            return row["value"] if row is not None else _PENDING
+            if row["present"]:
+                return row["value"]
+            job_state = row["job_state"]
+            if job_state is None:
+                raise JobError(
+                    f"job {job_id} does not exist, so event {key!r} will "
+                    f"never be published"
+                )
+            if job_state in _TERMINAL_JOB_STATES:
+                raise JobError(
+                    f"job {job_id} ended in {job_state!r} without publishing "
+                    f"event {key!r}"
+                )
+            return _PENDING
 
         return await self._poll_until(
             self._event_waiters,
@@ -1458,16 +1502,22 @@ class JobClient:
 
         async def check() -> Any:
             row = await self.pool.fetchrow(
-                """SELECT (SELECT value FROM jorb_event
+                """SELECT EXISTS (SELECT 1 FROM jorb_event
+                                   WHERE job_id = $1 AND key = $2) AS present,
+                          (SELECT value FROM jorb_event
                             WHERE job_id = $1 AND key = $2) AS value,
                           (SELECT state FROM jorb WHERE id = $1) AS job_state""",
                 job_id,
                 key,
             )
-            value = row["value"] if row is not None else None
-            if value is not None and (accept is None or accept(value)):
+            value = row["value"]
+            # Row PRESENCE is what "published" means, not non-null value: a
+            # job may legitimately publish None (set_event(key, None)), and
+            # a waiter keyed on `value is not None` would starve on an event
+            # that was published long ago.
+            if row["present"] and (accept is None or accept(value)):
                 return value
-            job_state = row["job_state"] if row is not None else None
+            job_state = row["job_state"]
             # Terminal without a match: nothing will publish this key again.
             if job_state in _TERMINAL_JOB_STATES:
                 raise JobError(
@@ -2400,34 +2450,30 @@ class JobClient:
 
         return await get_dag_status(self.pool, dag_id)
 
-    async def wait_for_dag(self, dag_id: int, timeout: int = 3600) -> bool:
+    async def wait_for_dag(self, dag_id: int, timeout: float | None = None) -> bool:
         """
-        Wait for DAG to complete.
+        Wait for a DAG to reach its outcome.
+
+        Returns True when every job finished, False when a job crashed or
+        was cancelled (the DAG cannot complete; get_dag_status() has the
+        counts). Raises TimeoutError if `timeout` elapses first — a timeout
+        is not an outcome, the DAG is still running — and LookupError for a
+        dag_id that does not exist.
 
         Args:
-            dag_id: DAG ID
-            timeout: Maximum wait time in seconds (default: 3600)
-
-        Returns:
-            True if DAG completed successfully, False if failed or timeout
+            dag_id: DAG ID — `dag.dag_id` after `execute()`
+            timeout: Maximum wait in seconds (default: wait forever)
 
         Example:
-            # Execute DAG
             dag = client.dag(name='Pipeline')
             # ... build DAG ...
             node_to_job = await dag.execute(client)
 
-            # Get DAG ID from any job
-            dag_id = await client.pool.fetchval(
-                "SELECT dag_id FROM jorb WHERE id = $1",
-                list(node_to_job.values())[0]
-            )
-
-            # Wait for completion
-            if await client.wait_for_dag(dag_id, timeout=1800):
+            if await client.wait_for_dag(dag.dag_id, timeout=1800):
                 print("DAG completed successfully!")
             else:
-                print("DAG failed or timed out")
+                status = await client.get_dag_status(dag.dag_id)
+                print(f"DAG failed: {status['crashed_jobs']} crashed")
         """
         from .dag import wait_for_dag
 
