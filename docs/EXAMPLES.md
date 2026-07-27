@@ -1,903 +1,620 @@
-# Pyjobby Real-World Examples
+# Examples
 
-Complete, production-ready examples demonstrating common use cases and architectural patterns.
+Complete applications, not snippets: how jobs are composed into a pipeline, a
+fan-out, an outbox, a schedule.
 
-## Table of Contents
+**Every complete example below is executed against a real worker by
+`tests/test_examples_doc.py`.** The document is written from that file, so an
+API change breaks the examples here instead of leaving your first copy-paste
+quietly broken. The handful of snippets that need a service this repository
+does not have — a web framework, a payment provider — are marked
+**fragment** and are the only code here that is not run on every test run.
 
-1. [Web Application Integration](#1-web-application-integration)
-2. [Data Processing Pipeline](#2-data-processing-pipeline)
-3. [Image Processing Service](#3-image-processing-service)
-4. [Email Campaign System](#4-email-campaign-system)
-5. [Video Transcoding Service](#5-video-transcoding-service)
-6. [Microservices Orchestration](#6-microservices-orchestration)
-7. [Batch Import System](#7-batch-import-system)
-8. [Scheduled Reports](#8-scheduled-reports)
-9. [Rate-Limited API Integration](#9-rate-limited-api-integration)
-10. [Machine Learning Pipeline](#10-machine-learning-pipeline)
+Its companions:
+
+* **[writing-jobs.md](writing-jobs.md)** — what goes *inside* one job, and
+  which durable primitive to reach for. This document applies those choices
+  rather than re-explaining them; when an example uses `step()` or
+  `transaction()`, the reasoning is there.
+* **[CLIENT_LIBRARY.md](CLIENT_LIBRARY.md)** — the full enqueue API, every
+  option, and the sync client.
+* **[RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md)** — cron schedules.
+* **[OPERATIONS.md](OPERATIONS.md)** — running the workers these examples
+  assume are already running.
+
+## Contents
+
+1. [Web application: accept now, work later](#1-web-application-accept-now-work-later)
+2. [ETL: a sequential pipeline that hands results forward](#2-etl-a-sequential-pipeline-that-hands-results-forward)
+3. [Fan-out / fan-in](#3-fan-out--fan-in)
+4. [The transactional outbox](#4-the-transactional-outbox)
+5. [A rate-limited third-party API](#5-a-rate-limited-third-party-api)
+6. [Human in the loop](#6-human-in-the-loop)
+7. [Batch import](#7-batch-import)
+8. [Priority and capability routing](#8-priority-and-capability-routing)
+9. [A recurring report](#9-a-recurring-report)
+10. [Waiting for the answer](#10-waiting-for-the-answer)
 
 ---
 
-## 1. Web Application Integration
+## 1. Web application: accept now, work later
 
-**Use Case**: FastAPI web app that processes user uploads asynchronously.
-
-### Setup
+A request handler's job is to accept the work and return. The expensive part
+runs on a worker, and the request supplies an idempotency key so a retried
+`POST` cannot start it twice.
 
 ```python
-# app/jobs.py
-class ProcessUploadJob:
-    """Process user file upload"""
+class ProcessUpload(Job):
+    """Parse an uploaded batch once, then record it exactly once."""
 
-    async def run(self, user_id: int, file_path: str, file_type: str):
-        # Validate file
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"File not found: {file_path}")
+    async def task(self, batch: str, raw: list[str]) -> dict[str, Any]:
+        rows = await self.step("parse", self.parse, raw)
+        await self.transaction("store", self.store, batch, rows)
+        return {"batch": batch, "rows": len(rows)}
 
-        # Process based on type
-        if file_type == "csv":
-            await self.process_csv(file_path, user_id)
-        elif file_type == "image":
-            await self.process_image(file_path, user_id)
+    def parse(self, raw: list[str]) -> list[dict[str, Any]]:
+        return [
+            {"sku": sku, "units": int(units)}
+            for sku, units in (line.split(",") for line in raw)
+        ]
 
-        # Clean up
-        os.remove(file_path)
-
-    async def process_csv(self, file_path: str, user_id: int):
-        import csv
-        import asyncpg
-
-        conn = await asyncpg.connect(...)
-
-        with open(file_path) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                await conn.execute(
-                    "INSERT INTO user_data (...) VALUES (...)", user_id, ...
+    async def store(self, conn, batch: str, rows: list[dict[str, Any]]) -> list[int]:
+        written = []
+        for row in rows:
+            written.append(
+                await conn.fetchval(
+                    "INSERT INTO example_row (batch, sku, units) "
+                    "VALUES ($1, $2, $3) RETURNING id",
+                    batch,
+                    row["sku"],
+                    row["units"],
                 )
-
-        await conn.close()
-
-    async def process_image(self, file_path: str, user_id: int):
-        from PIL import Image
-
-        # Create thumbnail
-        img = Image.open(file_path)
-        img.thumbnail((300, 300))
-        img.save(f"/var/thumbnails/{user_id}_{os.path.basename(file_path)}")
+            )
+        return written
 ```
 
-### FastAPI Integration
+Two primitives, two different reasons. The parse is a `step()` so a retry
+does not redo it; the write is a `transaction()` so a retry cannot double the
+batch — the INSERTs and the checkpoint are one commit. The test crashes the
+job between the write and the commit and asserts the table ends with exactly
+the two rows.
+
+The web layer only enqueues:
 
 ```python
-# app/main.py
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks
-from pyjobby.client import JobClient
-import aiofiles
-import os
+# fragment: FastAPI wiring
+from contextlib import asynccontextmanager
 
-app = FastAPI()
-
-
-# Create client on startup
-@app.on_event("startup")
-async def startup():
-    app.state.job_client = await JobClient.from_config("./pyjobby.conf.py")
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    await app.state.job_client.close()
-
-
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...), user_id: int = 1):
-    """Upload file and process asynchronously"""
-
-    # Save file
-    file_path = f"/tmp/uploads/{file.filename}"
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-
-    async with aiofiles.open(file_path, "wb") as f:
-        content = await file.read()
-        await f.write(content)
-
-    # Enqueue processing job
-    job_id = await app.state.job_client.enqueue(
-        "app.jobs.ProcessUploadJob",
-        user_id=user_id,
-        file_path=file_path,
-        file_type=file.filename.split(".")[-1],
-        deadline_key=f"upload:{user_id}:{file.filename}",  # Prevent duplicates
-    )
-
-    return {
-        "message": "File uploaded successfully",
-        "job_id": job_id,
-        "status": "processing",
-    }
-
-
-@app.get("/job/{job_id}")
-async def get_job_status(job_id: int):
-    """Check job status"""
-
-    job = await app.state.job_client.get_job(job_id)
-
-    if not job:
-        return {"error": "Job not found"}, 404
-
-    return {"job_id": job.id, "state": job.state, "created": job.created.isoformat()}
-```
-
----
-
-## 2. Data Processing Pipeline
-
-**Use Case**: ETL pipeline for daily data processing with multiple stages.
-
-```python
-# jobs/etl_pipeline.py
-from datetime import datetime, date
+from fastapi import FastAPI, HTTPException, UploadFile
+from pyjobby import JobClient
 import asyncpg
 
 
-class ExtractSalesDataJob:
-    """Extract sales data from external API"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.jobs = await JobClient.from_config("./pyjobby.conf.py")
+    yield
+    await app.state.jobs.close()
 
-    async def run(self, date: str, source: str):
-        import httpx
 
-        # Call external API
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"https://api.example.com/sales",
-                params={"date": date, "source": source},
-            )
-            data = response.json()
+app = FastAPI(lifespan=lifespan)
 
-        # Store raw data
-        conn = await asyncpg.connect(...)
-        await conn.copy_records_to_table(
-            "raw_sales",
-            records=[(date, source, json.dumps(item)) for item in data],
-            columns=["date", "source", "data"],
+
+@app.post("/uploads/{batch}")
+async def accept_upload(batch: str, file: UploadFile):
+    raw = (await file.read()).decode().splitlines()
+    try:
+        job_id = await app.state.jobs.enqueue(
+            "myapp.jobs.ProcessUpload",
+            queue="uploads",
+            deadline_key=f"upload:{batch}",  # the retried POST is a no-op
+            batch=batch,
+            raw=raw,
         )
-        await conn.close()
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(409, "that upload is already being processed")
+    return {"job_id": job_id, "state": "accepted"}
 
 
-class TransformSalesDataJob:
-    """Transform and validate sales data"""
-
-    async def run(self, date: str):
-        conn = await asyncpg.connect(...)
-
-        # Transform raw data
-        await conn.execute(
-            """
-            INSERT INTO staging_sales (date, product_id, quantity, amount)
-            SELECT
-                date,
-                (data->>'product_id')::int,
-                (data->>'quantity')::int,
-                (data->>'amount')::numeric
-            FROM raw_sales
-            WHERE date = $1
-              AND data IS NOT NULL
-        """,
-            date,
-        )
-
-        # Validate totals
-        result = await conn.fetchrow(
-            """
-            SELECT
-                COUNT(*) as count,
-                SUM(amount) as total
-            FROM staging_sales
-            WHERE date = $1
-        """,
-            date,
-        )
-
-        print(f"Transformed {result['count']} records, total: ${result['total']}")
-
-        await conn.close()
-
-
-class LoadToWarehouseJob:
-    """Load validated data to warehouse"""
-
-    async def run(self, date: str, table: str):
-        conn = await asyncpg.connect(...)
-
-        # Upsert into warehouse
-        await conn.execute(
-            f"""
-            INSERT INTO {table} (date, product_id, quantity, amount)
-            SELECT date, product_id, quantity, amount
-            FROM staging_sales
-            WHERE date = $1
-            ON CONFLICT (date, product_id) DO UPDATE
-            SET quantity = EXCLUDED.quantity,
-                amount = EXCLUDED.amount,
-                updated_at = NOW()
-        """,
-            date,
-        )
-
-        await conn.close()
-
-
-class RefreshAnalyticsJob:
-    """Refresh analytics materialized views"""
-
-    async def run(self, views: list):
-        conn = await asyncpg.connect(...)
-
-        for view in views:
-            await conn.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {view}")
-
-        await conn.close()
+@app.get("/uploads/{job_id}")
+async def upload_status(job_id: int):
+    info = await app.state.jobs.get_job(job_id)
+    if not info:
+        raise HTTPException(404)
+    return {"id": info.id, "state": info.state, "created": info.created.isoformat()}
 ```
 
-### Pipeline Orchestration
+`deadline_key` is a unique index on `(deadline_key, queue)` **over `queued`
+rows only**, so the duplicate enqueue *raises* rather than returning the first
+id — catch `asyncpg.UniqueViolationError` and treat it as success. Two
+consequences worth knowing: the same key in a different queue is a different
+job, and once the first job leaves `queued` the key is free again, so it
+deduplicates concurrent submissions rather than remembering forever.
 
-```python
-# scripts/run_daily_etl.py
-import asyncio
-from datetime import datetime, timedelta
-from pyjobby.client import JobClient
-
-
-async def run_daily_etl(date: date = None):
-    """Run daily ETL pipeline"""
-
-    if date is None:
-        date = datetime.now().date() - timedelta(days=1)
-
-    date_str = date.isoformat()
-
-    async with await JobClient.from_config("./pyjobby.conf.py") as client:
-        # Create ETL pipeline
-        pipeline_jobs = await client.create_pipeline(
-            [
-                # Extract
-                (
-                    "jobs.etl_pipeline.ExtractSalesDataJob",
-                    {"date": date_str, "source": "shopify"},
-                ),
-                # Transform
-                ("jobs.etl_pipeline.TransformSalesDataJob", {"date": date_str}),
-                # Load
-                (
-                    "jobs.etl_pipeline.LoadToWarehouseJob",
-                    {"date": date_str, "table": "warehouse.sales_daily"},
-                ),
-                # Analytics
-                (
-                    "jobs.etl_pipeline.RefreshAnalyticsJob",
-                    {"views": ["sales_by_product", "revenue_by_date"]},
-                ),
-            ],
-            queue="etl",
-            priority=300,
-        )
-
-        print(f"ETL pipeline created for {date}: {pipeline_jobs}")
-
-        return pipeline_jobs
-
-
-if __name__ == "__main__":
-    asyncio.run(run_daily_etl())
-```
-
-### Recurring Schedule (via CLI)
-
-```bash
-# Schedule daily ETL for 2am
-pj-admin schedule add daily-etl \
-    jobs.etl_pipeline.RunDailyETL \
-    "0 2 * * *" \
-    --description "Daily ETL pipeline at 2am" \
-    --queue etl \
-    --max-concurrent 1 \
-    --circuit-breaker 3
-```
+`get_job()` returns a `JobInfo` with `id`, `job_class`, `queue`, `priority`,
+`state` and `created`.
 
 ---
 
-## 3. Image Processing Service
+## 2. ETL: a sequential pipeline that hands results forward
 
-**Use Case**: Resize uploaded images to multiple sizes in parallel.
-
-```python
-# jobs/image_processing.py
-from PIL import Image
-import os
-
-
-class ResizeImageJob:
-    """Resize image to specific dimensions"""
-
-    async def run(self, image_path: str, size: str, output_dir: str):
-        sizes = {
-            "thumbnail": (150, 150),
-            "small": (300, 300),
-            "medium": (800, 800),
-            "large": (1200, 1200),
-        }
-
-        if size not in sizes:
-            raise ValueError(f"Unknown size: {size}")
-
-        # Open and resize
-        img = Image.open(image_path)
-        img.thumbnail(sizes[size], Image.Resampling.LANCZOS)
-
-        # Save
-        filename = f"{size}_{os.path.basename(image_path)}"
-        output_path = os.path.join(output_dir, filename)
-        img.save(output_path, quality=85, optimize=True)
-
-        return output_path
-
-
-class CreateGalleryJob:
-    """Create image gallery after all images processed"""
-
-    async def run(self, user_id: int, image_count: int, output_dir: str):
-        import asyncpg
-
-        # Get all processed images
-        images = []
-        for size in ["thumbnail", "small", "medium", "large"]:
-            images.extend(
-                [f for f in os.listdir(output_dir) if f.startswith(f"{size}_")]
-            )
-
-        # Store in database
-        conn = await asyncpg.connect(...)
-        await conn.execute(
-            """
-            INSERT INTO user_galleries (user_id, image_count, images, created_at)
-            VALUES ($1, $2, $3, NOW())
-        """,
-            user_id,
-            image_count,
-            images,
-        )
-        await conn.close()
-
-        print(f"Gallery created for user {user_id}: {image_count} images")
-```
-
-### Service Implementation
+Three stages, each starting only when the one before it finished, each
+reading the previous stage's stored result.
 
 ```python
-# services/image_service.py
-from pyjobby.client import JobClient
-from typing import List
-
-
-class ImageProcessingService:
-    def __init__(self, client: JobClient):
-        self.client = client
-
-    async def process_upload(
-        self, user_id: int, image_paths: List[str], output_dir: str = "/var/images"
-    ):
-        """Process uploaded images in parallel"""
-
-        # Create fan-out jobs for each size
-        all_jobs = []
-        sizes = ["thumbnail", "small", "medium", "large"]
-
-        for image_path in image_paths:
-            items = [
-                {"image_path": image_path, "size": size, "output_dir": output_dir}
-                for size in sizes
-            ]
-
-            job_ids, group_id = await self.client.create_fan_out(
-                "jobs.image_processing.ResizeImageJob",
-                items,
-                queue="images",
-                priority=100,
-            )
-
-            all_jobs.append(
-                {"image": image_path, "group_id": group_id, "resize_jobs": job_ids}
-            )
-
-        # Create gallery job that waits for ALL images
-        gallery_job = await self.client.enqueue(
-            "jobs.image_processing.CreateGalleryJob",
-            waitfor_group=all_jobs[-1]["group_id"],  # Wait for last group
-            user_id=user_id,
-            image_count=len(image_paths),
-            output_dir=output_dir,
+class ExtractSales(Job):
+    async def task(self, day: str, count: int = 4) -> dict[str, Any]:
+        rows = await self.step(
+            "fetch", lambda: [{"sku": f"sku-{i}", "units": i + 1} for i in range(count)]
         )
-
-        return {"processing_jobs": all_jobs, "gallery_job": gallery_job}
-
-
-# Usage
-async def main():
-    async with await JobClient.from_config("./pyjobby.conf.py") as client:
-        service = ImageProcessingService(client)
-
-        result = await service.process_upload(
-            user_id=123,
-            image_paths=[
-                "/tmp/uploads/photo1.jpg",
-                "/tmp/uploads/photo2.jpg",
-                "/tmp/uploads/photo3.jpg",
-            ],
-        )
-
-        print(f"Gallery job: {result['gallery_job']}")
-```
-
----
-
-## 4. Email Campaign System
-
-**Use Case**: Send bulk email campaigns with rate limiting.
-
-```python
-# jobs/email_campaigns.py
-import asyncio
-from typing import List, Dict
+        return {"day": day, "rows": rows}
 
 
-class SendCampaignEmailJob:
-    """Send single campaign email"""
+class TransformSales(Job):
+    """Stage two: reads stage one's result out of ``upstream_result``."""
 
-    async def run(
-        self, recipient: str, campaign_id: int, template: str, variables: Dict
-    ):
-        import sendgrid
-        from sendgrid.helpers.mail import Mail
-
-        sg = sendgrid.SendGridAPIClient(api_key=os.environ.get("SENDGRID_API_KEY"))
-
-        # Render template
-        message = Mail(
-            from_email="campaigns@example.com",
-            to_emails=recipient,
-            subject=variables.get("subject", "Newsletter"),
-            html_content=self.render_template(template, variables),
-        )
-
-        # Send
-        response = sg.send(message)
-
-        # Log result
-        await self.log_send(campaign_id, recipient, response.status_code)
-
-    def render_template(self, template: str, variables: Dict) -> str:
-        # Simple template rendering
-        result = template
-        for key, value in variables.items():
-            result = result.replace(f"{{{{{key}}}}}", str(value))
-        return result
-
-    async def log_send(self, campaign_id: int, recipient: str, status_code: int):
-        import asyncpg
-
-        conn = await asyncpg.connect(...)
-        await conn.execute(
-            """
-            INSERT INTO campaign_sends (campaign_id, recipient, status_code, sent_at)
-            VALUES ($1, $2, $3, NOW())
-        """,
-            campaign_id,
-            recipient,
-            status_code,
-        )
-        await conn.close()
-
-
-class CampaignSummaryJob:
-    """Generate campaign summary after all emails sent"""
-
-    async def run(self, campaign_id: int, total_recipients: int):
-        import asyncpg
-
-        conn = await asyncpg.connect(...)
-
-        # Get send statistics
-        stats = await conn.fetchrow(
-            """
-            SELECT
-                COUNT(*) as sent,
-                COUNT(*) FILTER (WHERE status_code = 200) as delivered,
-                COUNT(*) FILTER (WHERE status_code >= 400) as failed
-            FROM campaign_sends
-            WHERE campaign_id = $1
-        """,
-            campaign_id,
-        )
-
-        # Update campaign
-        await conn.execute(
-            """
-            UPDATE campaigns
-            SET status = 'completed',
-                sent_count = $2,
-                delivered_count = $3,
-                failed_count = $4,
-                completed_at = NOW()
-            WHERE id = $1
-        """,
-            campaign_id,
-            stats["sent"],
-            stats["delivered"],
-            stats["failed"],
-        )
-
-        await conn.close()
-
-        print(
-            f"Campaign {campaign_id} complete: {stats['delivered']}/{total_recipients} delivered"
-        )
-```
-
-### Campaign Launcher
-
-```python
-# services/campaign_service.py
-from pyjobby.client import JobClient
-from datetime import datetime, timedelta
-
-
-class CampaignService:
-    def __init__(self, client: JobClient):
-        self.client = client
-
-    async def launch_campaign(
-        self,
-        campaign_id: int,
-        recipients: List[str],
-        template: str,
-        variables: Dict,
-        send_time: datetime = None,
-    ):
-        """Launch email campaign with rate limiting"""
-
-        # Schedule for specific time (or now)
-        if send_time is None:
-            send_time = datetime.now()
-
-        # Create jobs for each recipient
-        jobs = []
-        for recipient in recipients:
-            jobs.append(
-                (
-                    "jobs.email_campaigns.SendCampaignEmailJob",
-                    {
-                        "recipient": recipient,
-                        "campaign_id": campaign_id,
-                        "template": template,
-                        "variables": {**variables, "recipient": recipient},
-                    },
-                )
-            )
-
-        # Enqueue all emails with run_group (for tracking)
-        job_ids = await self.client.enqueue_batch(
-            jobs,
-            queue="emails",
-            priority=50,  # Low priority
-            run_after=send_time,
-        )
-
-        # Note: Worker should have rate limiting configured
-        # to prevent overwhelming email service
-
-        # Create summary job (waits for all to complete)
-        # Note: Need to track group_id for waitfor_group
-        # For simplicity, schedule summary for later
-        summary_job = await self.client.enqueue(
-            "jobs.email_campaigns.CampaignSummaryJob",
-            campaign_id=campaign_id,
-            total_recipients=len(recipients),
-            run_after=send_time + timedelta(hours=2),  # 2 hours later
-            queue="reports",
-        )
-
+    async def task(self, upstream_result: dict[str, Any]) -> dict[str, Any]:
+        rows = upstream_result["rows"]
         return {
-            "campaign_id": campaign_id,
-            "email_jobs": job_ids,
-            "summary_job": summary_job,
-            "scheduled_for": send_time.isoformat(),
+            "day": upstream_result["day"],
+            "rows": [r for r in rows if r["units"] > 1],
         }
 
 
-# Usage
-async def main():
-    async with await JobClient.from_config("./pyjobby.conf.py") as client:
-        service = CampaignService(client)
+class LoadWarehouse(Job):
+    """Stage three: the write, so it lands exactly once."""
 
-        # Get recipients from database
-        recipients = [
-            "user1@example.com",
-            "user2@example.com",
-            # ... potentially 100,000+ recipients
-        ]
+    async def task(self, batch: str, upstream_result: dict[str, Any]) -> dict[str, Any]:
+        return await self.transaction("load", self.load, batch, upstream_result["rows"])
 
-        # Launch campaign
-        result = await service.launch_campaign(
-            campaign_id=42,
-            recipients=recipients,
-            template="""
-                <h1>Hi {{name}}!</h1>
-                <p>Check out our {{promotion}} - {{discount}}% off!</p>
-            """,
-            variables={"name": "there", "promotion": "Summer Sale", "discount": 25},
-            send_time=datetime.now() + timedelta(hours=24),  # Tomorrow
-        )
-
-        print(f"Campaign scheduled: {result['email_jobs'][:5]}...")  # First 5
+    async def load(self, conn, batch: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        for row in rows:
+            await conn.execute(
+                "INSERT INTO example_row (batch, sku, units) VALUES ($1, $2, $3)",
+                batch,
+                row["sku"],
+                row["units"],
+            )
+        return {"loaded": len(rows)}
 ```
 
----
-
-## 5. Video Transcoding Service
-
-**Use Case**: Transcode uploaded videos to multiple formats in parallel.
+The wiring is two options on the enqueue, and they are separate concerns:
+`waitfor_job` is the *ordering* edge, `use_result_from` is the *data* edge.
 
 ```python
-# jobs/video_processing.py
-import subprocess
-import os
-
-
-class TranscodeVideoJob:
-    """Transcode video to specific format"""
-
-    async def run(self, video_path: str, format: str, resolution: str, output_dir: str):
-        formats = {
-            "mp4": {"codec": "libx264", "ext": "mp4"},
-            "webm": {"codec": "libvpx-vp9", "ext": "webm"},
-            "hls": {"codec": "libx264", "ext": "m3u8"},
-        }
-
-        resolutions = {
-            "480p": "854x480",
-            "720p": "1280x720",
-            "1080p": "1920x1080",
-        }
-
-        if format not in formats or resolution not in resolutions:
-            raise ValueError(f"Invalid format or resolution")
-
-        # Build output filename
-        base_name = os.path.splitext(os.path.basename(video_path))[0]
-        output_file = f"{base_name}_{resolution}.{formats[format]['ext']}"
-        output_path = os.path.join(output_dir, output_file)
-
-        # Transcode using ffmpeg
-        cmd = [
-            "ffmpeg",
-            "-i",
-            video_path,
-            "-vcodec",
-            formats[format]["codec"],
-            "-s",
-            resolutions[resolution],
-            "-y",  # Overwrite
-            output_path,
-        ]
-
-        result = subprocess.run(cmd, capture_output=True)
-
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed: {result.stderr.decode()}")
-
-        # Get file size
-        file_size = os.path.getsize(output_path)
-
-        return {
-            "output_path": output_path,
-            "size_bytes": file_size,
-            "format": format,
-            "resolution": resolution,
-        }
-
-
-class VideoProcessingCompleteJob:
-    """Update video record after all transcoding complete"""
-
-    async def run(self, video_id: int, output_dir: str):
-        import asyncpg
-
-        # Find all transcoded files
-        files = os.listdir(output_dir)
-
-        conn = await asyncpg.connect(...)
-        await conn.execute(
-            """
-            UPDATE videos
-            SET status = 'ready',
-                transcoded_files = $2,
-                processed_at = NOW()
-            WHERE id = $1
-        """,
-            video_id,
-            files,
-        )
-        await conn.close()
-
-        print(f"Video {video_id} processing complete: {len(files)} formats")
-```
-
-### Video Service
-
-```python
-# services/video_service.py
-from pyjobby.client import JobClient
-
-
-class VideoProcessingService:
-    def __init__(self, client: JobClient):
-        self.client = client
-
-    async def process_upload(self, video_id: int, video_path: str, output_dir: str):
-        """Process uploaded video - transcode to multiple formats"""
-
-        formats = [
-            {"format": "mp4", "resolution": "480p"},
-            {"format": "mp4", "resolution": "720p"},
-            {"format": "mp4", "resolution": "1080p"},
-            {"format": "webm", "resolution": "720p"},
-            {"format": "hls", "resolution": "720p"},
-        ]
-
-        # Create transcode jobs
-        items = [
-            {
-                "video_path": video_path,
-                "format": fmt["format"],
-                "resolution": fmt["resolution"],
-                "output_dir": output_dir,
-            }
-            for fmt in formats
-        ]
-
-        # Fan-out: Transcode in parallel (use GPU workers)
-        job_ids, group_id = await self.client.create_fan_out(
-            "jobs.video_processing.TranscodeVideoJob",
-            items,
-            queue="video-gpu",  # Dedicated queue for GPU workers
-            priority=200,
-        )
-
-        # Fan-in: Update status after all complete
-        complete_job = await self.client.enqueue(
-            "jobs.video_processing.VideoProcessingCompleteJob",
-            waitfor_group=group_id,
-            video_id=video_id,
-            output_dir=output_dir,
-            queue="video-postprocess",
-        )
-
-        return {
-            "transcode_jobs": job_ids,
-            "group_id": group_id,
-            "complete_job": complete_job,
-        }
-
-
-# Usage
-async def main():
-    async with await JobClient.from_config("./pyjobby.conf.py") as client:
-        service = VideoProcessingService(client)
-
-        result = await service.process_upload(
-            video_id=789,
-            video_path="/uploads/vacation.mp4",
-            output_dir="/var/videos/789",
-        )
-
-        print(f"Processing {len(result['transcode_jobs'])} formats")
-```
-
----
-
-## 6-10... [Additional examples would continue with similar detailed patterns for Microservices, Batch Imports, Scheduled Reports, Rate-Limited APIs, and ML Pipelines]
-
----
-
-## Common Patterns Summary
-
-### Pattern 1: Simple Queue
-
-```python
-# Just enqueue and forget
-await client.enqueue("MyJob", arg=value)
-```
-
-### Pattern 2: Scheduled Execution
-
-```python
-# Run later
-await client.enqueue("MyJob", run_after=future_time, arg=value)
-```
-
-### Pattern 3: Sequential Pipeline
-
-```python
-# A → B → C
-job_ids = await client.create_pipeline(
-    [
-        ("JobA", {"data": x}),
-        ("JobB", {"data": y}),
-        ("JobC", {"data": z}),
-    ]
+extract = await client.enqueue(
+    "myapp.etl.ExtractSales", queue="etl", day="2026-07-01", count=4
+)
+transform = await client.enqueue(
+    "myapp.etl.TransformSales",
+    queue="etl",
+    waitfor_job=extract,  # do not start until it finished
+    use_result_from=extract,  # ...and inject its result as `upstream_result`
+)
+load = await client.enqueue(
+    "myapp.etl.LoadWarehouse",
+    queue="etl",
+    waitfor_job=transform,
+    use_result_from=transform,
+    batch="2026-07-01",
 )
 ```
 
-### Pattern 4: Parallel + Aggregate
+Both downstream rows are created in state `waiting`, not `queued`: no worker
+can see them until their dependency finishes. The result is injected at
+*run* time from the upstream row, so if retention has already deleted that
+row the job fails with a `LookupError` rather than computing a wrong answer
+from a missing input. Use `save_result=False` only on jobs nothing reads.
+
+When nothing has to flow between the stages, `create_pipeline()` builds the
+same chain in one call:
 
 ```python
-# Many jobs → Summary
-job_ids, group_id = await client.create_fan_out("ProcessItem", items)
-summary = await client.enqueue("Summary", waitfor_group=group_id)
+ids = await client.create_pipeline(
+    [
+        ("myapp.etl.ExtractSales", {"day": "2026-07-01"}),
+        ("myapp.etl.ExtractSales", {"day": "2026-07-02"}),
+        ("myapp.etl.ExtractSales", {"day": "2026-07-03"}),
+    ],
+    queue="etl",
+)
+# ids[1] waits for ids[0]; ids[2] waits for ids[1]
 ```
 
-### Pattern 5: Batch Processing
+To run this every night, give it a [schedule](#9-a-recurring-report) rather
+than a crontab entry.
+
+---
+
+## 3. Fan-out / fan-in
+
+Many independent units in parallel, then one job that runs when *all* of them
+have finished.
 
 ```python
-# Efficient bulk enqueue
-jobs = [("Job", {"id": i}) for i in range(10000)]
-job_ids = await client.enqueue_batch(jobs)
+class ResizeImage(Job):
+    """One image, one size — the unit of the fan-out."""
+
+    async def task(self, image: str, size: str) -> dict[str, Any]:
+        return {"image": image, "size": size}
+
+
+class BuildGallery(Job):
+    """Fan-in: runs only once every resize in the group has finished."""
+
+    async def task(self, batch: str, expected: int) -> dict[str, Any]:
+        return {"batch": batch, "expected": expected}
 ```
 
-### Pattern 6: Idempotent Jobs
-
 ```python
-# Prevent duplicates
-await client.enqueue("Job", deadline_key=f"unique:{id}", data=value)
+items = [
+    {"image": image, "size": size}
+    for image in ("a.png", "b.png")
+    for size in ("thumb", "small", "large")
+]
+resize_ids, group_id = await client.create_fan_out(
+    "myapp.images.ResizeImage", items, queue="images"
+)
+
+gallery = await client.enqueue(
+    "myapp.images.BuildGallery",
+    queue="images",
+    waitfor_group=group_id,  # every job in the group, not just the last
+    batch="2026-07-01",
+    expected=len(items),
+)
 ```
 
-### Pattern 7: Priority Queue
+`create_fan_out()` returns `(job_ids, group_id)`; the group id is what
+`waitfor_group` takes. The test asserts the gallery is `waiting` while the
+resizes run and that it *started* only after the last one's `finished`
+timestamp — so this is a real barrier, not a race you usually win.
+
+`waitfor_job` and `waitfor_group` are mutually exclusive: passing both raises
+`ValueError`.
+
+---
+
+## 4. The transactional outbox
+
+The classic failure: you commit an order, then the enqueue fails — or you
+enqueue, then the order rolls back and a worker picks up a job for an order
+that does not exist. `enqueue_in_transaction()` runs the same INSERT on a
+connection you control, so the job becomes visible **if and only if** your
+transaction commits.
 
 ```python
-# High priority first
-await client.enqueue("UrgentJob", priority=500)
-await client.enqueue("NormalJob", priority=100)
-await client.enqueue("LowPriorityJob", priority=10)
+async with client.pool.acquire() as conn, conn.transaction():
+    await conn.execute(
+        "INSERT INTO example_order (ref, cents) VALUES ($1, $2)", ref, 1999
+    )
+    job_id = await JobClient.enqueue_in_transaction(
+        conn, "myapp.orders.FulfillOrder", queue="orders", ref=ref
+    )
 ```
 
-### Pattern 8: Capability Routing
+It is a `@staticmethod` — it needs a connection, not a client — and it takes
+the same keyword arguments as `enqueue()`. The connection must have pyjobby's
+JSON codecs registered, which every connection from `pyjobby.db` (and from a
+`JobClient` pool) has.
+
+The test proves both halves: the committed transaction produces a job that
+runs, and a transaction that raises after the enqueue leaves **no order row
+and no job row**.
+
+---
+
+## 5. A rate-limited third-party API
+
+The provider allows one call per second and dedupes on an idempotency key.
+Sleeping in the job would hold a worker for the whole run; `self.sleep()`
+checkpoints a wake time and hands the worker back.
 
 ```python
-# Route to specific workers
-await client.enqueue("GPUJob", capability="gpu", model=...)
+class ChargeCards(Job):
+    """Paces its calls to a rate-limited provider, one per second."""
+
+    async def task(self, refs: list[str], cents: int) -> dict[str, Any]:
+        for i, ref in enumerate(refs):
+            if i:
+                await self.sleep(1)  # the provider's rate limit, durably
+            await self.step(f"charge-{ref}", self.charge, ref, cents)
+        return {"charged": len(refs), "cents": cents}
+
+    def charge(self, ref: str, cents: int) -> dict[str, Any]:
+        # fragment: the test counts calls here instead of holding a card
+        return provider.charge(idempotency_key=ref, cents=cents)
+```
+
+Three things are load-bearing here:
+
+* **The loop is deterministic.** Its length comes from `refs`, a checkpointed
+  argument, so every attempt makes the same sequence of `sleep()` and
+  `step()` calls. `sleep()` consumes a sequence number exactly like `step()`
+  does, so a loop whose length depends on the clock, or a `sleep()` inside an
+  `if self.job["error_count"] == 0:`, dead-letters with a
+  `NondeterminismError`. See
+  [the determinism obligation](writing-jobs.md#the-determinism-obligation).
+* **Each charge is its own step**, so the retry after a provider error
+  re-sends only the call that failed. The test fails the second card once and
+  asserts the ledger reads `[a, b, b, c]` — `b` retried, `a` not resent.
+* **The idempotency key is still required.** `step()` is at-least-once for
+  anything outside this database: the charge lands, then the checkpoint does,
+  and a crash in that window re-sends it. Only the provider can close that
+  window, which is what the key is for.
+
+While it paces, the job is `queued` with a future `run_after` — no worker, no
+connection. The test asserts exactly that before waiting for the finish.
+
+---
+
+## 6. Human in the loop
+
+A job that cannot finish without a decision publishes what it needs and
+blocks on its mailbox. Anyone can answer: another job with `send()`, or an
+operator through the client.
+
+```python
+class AwaitRefundApproval(Job):
+    """Publishes what it needs, then blocks on its mailbox."""
+
+    async def task(self, ref: str, timeout: float = 25) -> dict[str, Any]:
+        await self.set_event("awaiting", {"ref": ref})
+        decision = await self.recv(topic="refund", timeout=timeout)
+        return {"ref": ref, "approved": bool(decision and decision.get("ok"))}
+```
+
+```python
+job_id = await client.enqueue(
+    "myapp.refunds.AwaitRefundApproval",
+    queue="refunds",
+    tags={"ref": ref, "needs": "approval"},  # so a dashboard can find it
+    ref=ref,
+)
+
+# the dashboard, later:
+pending = await client.search_jobs(tags={"needs": "approval"})
+await client.get_event(job_id, "awaiting", timeout=10)
+await client.send_message(job_id, {"ok": True}, topic="refund")
+```
+
+`tags` are your own labels and are indexed for `search_jobs()` and
+`pj-admin jobs list --tag needs=approval`. They are matched by containment,
+so extra tags never disqualify a job.
+
+`recv()` **occupies a worker while it waits** — it polls — so keep its
+timeout to minutes, not days, and give jobs that block a queue of their own
+so they cannot starve the rest. For plain "run after that one" ordering use
+`waitfor_job` instead, which costs nothing while it waits.
+
+---
+
+## 7. Batch import
+
+`enqueue_batch()` inserts every row in one statement inside one transaction.
+That amortises the commit — and the commit-lock cost of the enqueue
+notification — over the whole batch, which is why it is the right tool for
+tens of thousands of rows and the wrong one for three.
+
+```python
+rows = [
+    ("myapp.imports.ImportRow", {"sku": f"sku-{i}", "units": i}) for i in range(200)
+]
+ids = await client.enqueue_batch(rows, queue="imports")
+
+stats = await client.queue_stats("imports")  # {'queued': …, 'finished': …, …}
+```
+
+The trade is that a batch is uniform: `queue`, `priority`, `run_after` and
+`run_group` apply to every row, and per-row options — `deadline_key`,
+`waitfor_job`, `tags`, timeouts — are not available. When you need those, loop
+over `enqueue()`, or use `create_fan_out()`, which is `enqueue_batch()` plus a
+group id.
+
+Register the job class with `@job` and the producer gets its arguments checked
+before anything reaches the database:
+
+```python
+@job
+class ImportRow(Job):
+    async def task(self, sku: str, units: int) -> dict[str, Any]:
+        return {"sku": sku, "units": units}
+
+
+await ImportRow.enqueue(client, queue="imports", sku="x", unts=1)  # TypeError
 ```
 
 ---
 
-## Best Practices
+## 8. Priority and capability routing
 
-1. **Use batch operations** for bulk enqueueing (1000x faster)
-2. **Use deadline keys** to prevent duplicate job creation
-3. **Organize queues** by priority and resource requirements
-4. **Monitor queue depth** and alert on backups
-5. **Use fan-out/fan-in** for parallelizable tasks
-6. **Keep job arguments small** - store large data externally
-7. **Use appropriate priorities** - don't abuse high priority
-8. **Implement idempotency** in job handlers
-9. **Add monitoring** and alerting for failed jobs
-10. **Use recurring schedules** for periodic tasks instead of cron
+**Lower numbers are more urgent.** This is the one that reads backwards:
+`priority=10` is claimed before `priority=100`, and the default is 100.
+
+```python
+await client.enqueue("myapp.Job", priority=10, ...)  # ahead of everything normal
+await client.enqueue("myapp.Job", ...)  # 100, the default
+await client.enqueue("myapp.Job", priority=900, ...)  # backfill
+```
+
+Claiming is `ORDER BY prio, run_after`, and the test starts a worker after
+enqueueing all three and asserts they *started* in exactly that order.
+
+There is a second consequence of the direction, and it is a trap: a worker
+claims only jobs whose priority is **at or below its own ceiling**, which is
+1000 and is not settable from `pj`. A job enqueued at `priority=5000` is not
+"very low priority" — it is **unclaimable**, and it sits `queued` forever
+while every worker ignores it. The test pins that too. Keep priorities inside
+1..1000, and use a separate queue rather than a large number when you want
+work to be genuinely deferrable.
+
+`capability` routes by hardware rather than by urgency. A job that names one
+is invisible to every worker that does not advertise it:
+
+```python
+await client.enqueue("myapp.ml.Embed", queue="ml", capability="gpu", model="e5")
+```
+
+```bash
+pj --queue ml --cap gpu --cap cpu     # this worker can take it
+pj --queue ml --cap cpu               # this one never will
+```
+
+The test enqueues a `gpu` job and a plain one, runs a worker without the
+capability — the plain job finishes, the GPU job stays `queued` — then starts
+a worker that advertises `gpu` and watches it drain. A capability nobody
+advertises is a job that waits forever, which is the intended behavior and
+also the most common way to lose one.
 
 ---
 
-## See Also
+## 9. A recurring report
 
-- [CLIENT_LIBRARY.md](CLIENT_LIBRARY.md) - Complete client API reference
-- [ADMIN_TOOLS.md](ADMIN_TOOLS.md) - CLI and web interface
-- [RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md) - Cron-based scheduling
-- [ARCHITECTURE.md](ARCHITECTURE.md) - System design
+Use a schedule, not a crontab entry: the schedule is a row, so it has
+history, statistics, an enable/disable switch, and the safety features in
+[RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md).
+
+```python
+class DailyRevenueReport(Job):
+    """The job a cron schedule creates; it reads its own schedule metadata."""
+
+    async def task(self, region: str) -> dict[str, Any]:
+        return {
+            "region": region,
+            "schedule": self.job["admin_data"].get("schedule_name"),
+        }
+```
+
+```bash
+pj-admin schedule add daily-revenue \
+    myapp.reports.DailyRevenueReport \
+    "0 2 * * *" \
+    --timezone America/New_York \
+    --queue reports \
+    --kwargs '{"region": "emea"}' \
+    --max-concurrent 1 \
+    --circuit-breaker 3 \
+    --description "Daily revenue report at 2am Eastern"
+```
+
+or, from Python:
+
+```python
+from pyjobby.admin_api import AdminAPI
+
+schedule = await AdminAPI(conn).create_schedule(
+    name="daily-revenue",
+    job_class="myapp.reports.DailyRevenueReport",
+    cron_expr="0 2 * * *",  # 02:00 every day...
+    timezone="America/New_York",  # ...in Eastern wall-clock time
+    queue="reports",
+    kwargs={"region": "emea"},
+    max_concurrent_jobs=1,
+    circuit_breaker_threshold=3,
+    description="Daily revenue report at 2am Eastern",
+)
+```
+
+`conn` must come from `pyjobby.db.connect()` (or a `JobClient` pool), not from
+bare `asyncpg.connect()`: `kwargs` is a JSONB column and needs pyjobby's
+codecs. A malformed cron expression or an unknown timezone is rejected here,
+at creation, rather than silently never firing.
+
+A separate process fires the due schedules:
+
+```bash
+pj-scheduler --config ./pyjobby.conf.py
+```
+
+Each firing creates an ordinary job carrying
+`admin_data.schedule_id` / `schedule_name` / `scheduled_time` and a deadline
+key of `schedule:<id>:<scheduled_time>`, so a second scheduler instance is a
+no-op rather than a duplicate. The test drives the whole path — create the
+schedule, run one poll, watch a worker execute the created job — and asserts
+`next_run` advanced to the following 02:00 Eastern.
+
+Timezone-aware schedules are the subtle part: what `0 2 * * *` means on the
+two days a year the clock moves is in
+[RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md#daylight-saving-time).
+
+---
+
+## 10. Waiting for the answer
+
+Most enqueues are fire-and-forget. When the caller does want the value back,
+`enqueue_handle()` returns a handle that can wait on it, read its progress
+events, and cancel it.
+
+```python
+class Estimate(Job):
+    async def task(self, cents: int) -> dict[str, Any]:
+        await self.set_event("progress", {"pct": 50})
+        return {"total": cents * 2}
+```
+
+```python
+handle = await client.enqueue_handle(
+    "myapp.quotes.Estimate", queue="quotes", cents=250
+)
+
+await handle.event("progress", timeout=15)  # {'pct': 50}
+result = await handle.wait(timeout=20)  # {'total': 500}
+await handle.status()  # 'finished'
+```
+
+Both waits are `LISTEN`-driven on a client built by `from_config()` or
+`create()`, with a polling fallback, so they cost a connection rather than a
+spin; a client constructed from a bare pool polls. `handle.wait()` raises
+`JobFailedError` if the job dead-letters — the test asserts the provider's
+message comes back with it — and `JobCancelledError` if it is cancelled.
+
+This is a synchronous request wearing an asynchronous coat, so it is worth
+being deliberate: a web request that waits for a job holds a worker
+*and* an HTTP connection for the whole run. Prefer accepting the job and
+polling — example 1 — for anything that is not fast and bounded.
+
+---
+
+## Patterns at a glance
+
+| You want | Reach for |
+|---|---|
+| fire and forget | `enqueue(...)` |
+| run later | `enqueue(..., run_after=when)` |
+| never twice for the same request | `enqueue(..., deadline_key=key)`, catch `UniqueViolationError` |
+| A then B then C | `waitfor_job=`, or `create_pipeline([...])` |
+| B needs A's result | `waitfor_job=a, use_result_from=a` → `upstream_result` |
+| many in parallel, then one | `create_fan_out(...)` → `enqueue(..., waitfor_group=g)` |
+| thousands of identical rows | `enqueue_batch([...])` |
+| the job must not outlive its order | `JobClient.enqueue_in_transaction(conn, ...)` |
+| this one first | `priority=` **lower** than 100 |
+| only on that hardware | `capability="gpu"`, and `pj --cap gpu` |
+| every night at 2am | `pj-admin schedule add` + `pj-scheduler` |
+| the caller wants the value | `enqueue_handle(...)` → `await handle.wait()` |
+| find it later | `tags={...}` → `search_jobs(tags=...)` |
+
+## Practices these examples are built on
+
+1. **Arguments are JSON-serializable ids**, not ORM objects and not
+   `datetime`s. A retry six hours later gets the same arguments.
+2. **Results are small.** Return an S3 key or a row id; enqueue with
+   `save_result=False` when nothing reads the result at all.
+3. **Every external effect is idempotent, or it is a `transaction()`** on
+   this database. `step()` is at-least-once for everything else.
+4. **Queues are separated by what they need**, not by importance: a queue for
+   blocking jobs, a queue for GPU jobs, a queue for the slow nightly batch.
+   Priority orders work *within* a queue; it does not isolate it.
+5. **Duplicates are prevented at enqueue** with `deadline_key`, so the
+   producer's own retry is free.
+6. **Failures are visible.** `crashed` is the dead-letter state; the row keeps
+   its arguments, its backtrace and its checkpoints, and
+   `pj-admin jobs requeue <id>` resumes from the last completed step.
+
+## See also
+
+* [writing-jobs.md](writing-jobs.md) — what goes inside a job
+* [CLIENT_LIBRARY.md](CLIENT_LIBRARY.md) — the complete client API
+* [RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md) — cron scheduling
+* [ADMIN_TOOLS.md](ADMIN_TOOLS.md) — `pj-admin` and the web interface
+* [OPERATIONS.md](OPERATIONS.md) — running and watching the workers
+* [ARCHITECTURE.md](ARCHITECTURE.md) — how the platform is built
