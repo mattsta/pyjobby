@@ -136,9 +136,9 @@ db_params = {
     "database": "pyjobby",
     "user": "pyjobby",
     "password": os.environ["PYJOBBY_DB_PASSWORD"],
-    "host": "postgres.internal",   # or a directory for a unix socket
+    "host": "postgres.internal",  # or a directory for a unix socket
     "port": 5432,
-    "command_timeout": 60,         # optional
+    "command_timeout": 60,  # optional
 }
 ```
 
@@ -263,23 +263,22 @@ Falling behind is reported at WARNING; see
 
 ```bash
 pj --config /etc/pyjobby/pyjobby.conf.py \
-   --queue reports --queue reports --queue reports --queue reports --workers 4 \
+   --queue reports --workers 4 \
    --max-retries 10 --default-timeout 3600 --job-threads 8
 ```
 
-**`--queue` is per worker process, not per command.** `pj` forks one
-process per entry in the `--queue` list, pairs process *i* with queue *i*,
-and pads the list to `--workers` with **`default`**. So
-`--queue reports --workers 4` starts one worker on `reports` and three on
-`default` — a queue you did not ask for. Repeat `--queue` once per worker,
-as above, or run one command per queue with `--workers 1`. The process
-count is `max(len(--queue), --workers)`.
+**`--workers` is per queue.** That command starts four workers on `reports`
+and nothing anywhere else. Naming a second queue adds four more on it —
+`--queue reports --queue exports --workers 4` is eight processes, four on
+each — so adding a queue never changes the capacity of the queues you already
+named.
 
 | Flag | Default | What it decides |
 |---|---|---|
-| `--queue` | `default` | the queue for one worker process; repeat per worker |
+| `--queue` | `default` | a queue to staff; repeatable, duplicates collapse |
 | `--cap` | none | capabilities this host advertises; repeatable |
-| `--workers` | CPU count / 2 | worker processes forked by this command |
+| `--workers` | CPU count / 2 | worker processes **per queue** |
+| `--max-prio` | 1000 | priority ceiling; jobs above it are not claimed |
 | `--max-retries` | 10 | attempts before a job is dead-lettered (`crashed`) |
 | `--default-timeout` | 3600 | fallback job timeout in seconds; `0` disables |
 | `--check-interval` | 5.0 | idle poll interval; LISTEN/NOTIFY wakes workers sooner |
@@ -355,10 +354,10 @@ Type=simple
 User=pyjobby
 WorkingDirectory=/opt/pyjobby
 Environment="PYTHONPATH=/opt/pyjobby"
-# --queue once per worker process: pj pads a short list with `default`
+# %i is the queue name: `systemctl start pyjobby-worker@reports`
 ExecStart=/opt/pyjobby/.venv/bin/pj \
     --config /etc/pyjobby/pyjobby.conf.py \
-    --queue %i --queue %i --queue %i --queue %i --workers 4
+    --queue %i --workers 4
 Restart=always
 RestartSec=10s
 LimitNOFILE=65536
