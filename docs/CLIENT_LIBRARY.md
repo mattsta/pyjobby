@@ -138,7 +138,9 @@ Enqueue a single job.
 
 - `job_class` (str): Full Python class path (e.g., `'myapp.jobs.SendEmail'`)
 - `queue` (str): Queue name (default: `'default'`)
-- `priority` (int): Priority (higher = more urgent, default: 100)
+- `priority` (int): Priority — **LOWER numbers are MORE urgent** (default: 100).
+  Workers claim in ascending `prio` order and only take jobs at or below
+  their ceiling (1000), so a priority above that is never claimed.
 - `run_after` (datetime): When to run (default: now)
 - `capability` (str): Required worker capability (default: None)
 - `uid` (int): User/tenant ID for multi-tenancy (default: None)
@@ -185,10 +187,10 @@ job_id = await client.enqueue(
     report_type="sales",
 )
 
-# High priority job
+# High priority job — LOWER is more urgent
 job_id = await client.enqueue(
     "myapp.jobs.UrgentTask",
-    priority=500,  # Higher than default 100
+    priority=10,  # ahead of the default 100
     task_id=12345,
 )
 
@@ -517,14 +519,16 @@ except asyncpg.UniqueViolationError:
 Queue urgent jobs ahead of others.
 
 ```python
-# Normal priority (100 is default)
-await client.enqueue("myapp.jobs.ProcessData", priority=100)
+# Lower numbers are more urgent. Think "priority 1" as in first place,
+# not "priority 500" as in a big important number.
+await client.enqueue("myapp.jobs.ProcessData", priority=100)      # default
 
-# High priority - processes first
-await client.enqueue("myapp.jobs.UrgentTask", priority=500)
+await client.enqueue("myapp.jobs.UrgentTask", priority=10)        # goes first
 
-# Low priority - processes last
-await client.enqueue("myapp.jobs.BackgroundCleanup", priority=10)
+await client.enqueue("myapp.jobs.BackgroundCleanup", priority=900)  # goes last
+
+# Anything above a worker's ceiling (1000) is NEVER claimed — it sits
+# `queued` forever with no error. Keep background work well under it.
 ```
 
 ### 6. Multi-Tenant Jobs
