@@ -34,6 +34,7 @@ from pyjobby.pj import STMTS, Job
 from pyjobby.procs import spawn, terminate, wait_until
 
 from .conftest import wait_for_job_state
+from .utils.dxe import bound_job
 from .utils.faults import (
     age_claim,
     age_worker_heartbeats,
@@ -634,6 +635,97 @@ async def test_stale_epoch_write_is_a_noop(db_pool, unique_queue, statement):
 
     # positive control: the live attempt's write lands
     assert await apply_fenced_statement(db_pool, statement, job_id, current) == 1
+
+
+async def test_a_superseded_attempt_cannot_compact_a_live_ones_checkpoints(
+    db_pool, unique_queue
+):
+    """Compaction DELETES checkpoints, so it is the fence's sharpest test.
+
+    It cannot join STALE_WRITE_CASES because the statement returns exactly
+    one row either way, by design: a bare DELETE cannot distinguish "nothing
+    to remove" from "superseded", and those need opposite responses. The
+    `fenced` column is what carries the answer, so that is what is asserted.
+    """
+    job_id, stale, current = await superseded_job(db_pool, unique_queue)
+
+    for seq in (1, 2, 3):
+        await db_pool.fetch(
+            STMTS["record-step"],
+            job_id,
+            seq,
+            f"work-{seq}",
+            {"by": "current"},
+            None,
+            current,
+            db.utcnow(),
+        )
+
+    zombie = await db_pool.fetchrow(STMTS["compact-steps"], job_id, stale)
+    assert zombie["fenced"] == 0, "a stale epoch must not own the job"
+    assert zombie["removed"] == 0
+    surviving = await db_pool.fetchval(
+        "SELECT count(*) FROM jorb_step WHERE job_id = $1", job_id
+    )
+    assert surviving == 3, "the zombie deleted the live attempt's checkpoints"
+
+    # positive control: the live attempt's own compaction does the work
+    live = await db_pool.fetchrow(STMTS["compact-steps"], job_id, current)
+    assert (live["fenced"], live["removed"]) == (1, 3)
+    assert (
+        await db_pool.fetchval(
+            "SELECT count(*) FROM jorb_step WHERE job_id = $1", job_id
+        )
+        == 0
+    )
+
+
+async def test_compact_refuses_while_a_previous_attempts_log_is_unreplayed(
+    db_pool, unique_queue
+):
+    """Compacting mid-replay would silently re-execute completed work.
+
+    The guard is on the Job object rather than in SQL because it is a
+    statement about THIS attempt's progress, which the database cannot see:
+    the rows exist either way, and what matters is whether this execution has
+    caught up to them yet.
+    """
+    job_id = await enqueue(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {"x": 1})
+    claimed = await claim_once(db_pool, unique_queue)
+    epoch = claimed["run_epoch"]
+    for seq in (1, 2, 3):
+        await db_pool.fetch(
+            STMTS["record-step"],
+            job_id,
+            seq,
+            f"work-{seq}",
+            {"n": seq},
+            None,
+            epoch,
+            db.utcnow(),
+        )
+
+    job = await bound_job(db_pool, claimed, epoch)
+
+    # Sequence is at 0; three steps are recorded. Nothing has been replayed.
+    assert await job.compact() is False
+    assert (
+        await db_pool.fetchval(
+            "SELECT count(*) FROM jorb_step WHERE job_id = $1", job_id
+        )
+        == 3
+    )
+
+    # Catch up to the last recorded step, and it becomes safe.
+    job._dxe_seq = 3
+    assert await job.compact() is True
+    assert (
+        await db_pool.fetchval(
+            "SELECT count(*) FROM jorb_step WHERE job_id = $1", job_id
+        )
+        == 0
+    )
+    assert job._dxe_seq == 0, "the sequence restarts, or the next step collides"
 
 
 async def test_stale_step_cannot_overwrite_the_live_attempts_checkpoint(

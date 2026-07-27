@@ -31,7 +31,9 @@ class ChargeAndShip(Job):
 | `timeout=` on either of those (or `step_timeout` on the class) | `jorb_step` | one step is bounded on its own; blowing the budget records a **timeout against that step** and retries the job |
 | `await self.sleep(seconds)` | `jorb_step` | the job resumes after the delay **without occupying a worker** |
 | `await self.set_event(key, value)` | `jorb_event` | a durable key/value another job or an operator can read |
+| `await self.get_event(key)` | `jorb_event` | reads one back — this job's, or another's by id. **Not a step**: an event is durable state, so reading it is a query, and recording the answer would freeze the first value read into every later replay |
 | `await self.send(job_id, msg)` / `await self.recv(topic)` | `jorb_mailbox` | a durable mailbox; each message is consumed exactly once |
+| `await self.compact()` | `jorb_step` | discards this job's checkpoint log and restarts its step sequence, bounding replay for a job that lives indefinitely |
 | `self.cancelled` | `jorb.cancel_requested` | cooperative cancellation for long synchronous loops |
 
 ---
@@ -456,8 +458,55 @@ pj-admin jobs requeue <id> --fresh
 ```
 
 Use `--fresh` when the recorded results are *wrong* rather than merely
-incomplete — after fixing a bug in a step, for instance. It is the only
-operation that discards checkpoints for a job that is going to run again.
+incomplete — after fixing a bug in a step, for instance. It is the operator's
+way to discard checkpoints for a job that is going to run again.
+
+---
+
+## Bounding replay: `compact()`
+
+A resume loads **every step the job has ever recorded** and fast-forwards
+through the completed prefix. `pj-bench replay` measures what that costs:
+**0.9 µs and 260 bytes per checkpoint, linear from 1k to 100k**. So 10k
+checkpoints resume in 8 ms and 100k in 75 ms and 26 MB resident — per job,
+times however many such jobs a worker runs at once.
+
+Almost no job needs to care. A job's step count tracks the work it does, and
+work that takes 10,000 checkpointed steps takes long enough that 8 ms is
+nothing. The exception is a job whose step count tracks **elapsed time** rather
+than work — a state machine that wakes, finds no message, sleeps, and repeats,
+recording a `recv` and a `sleep` on every wake. Woken every five minutes, that
+is ~210,000 checkpoints a year, none of which record anything happening.
+
+`compact()` bounds it:
+
+```python
+while True:
+    await self.compact()  # at a loop boundary, not mid-turn
+    message = await self.recv(topic="work", timeout=30)
+    ...
+```
+
+It deletes the job's checkpoints and restarts the step sequence at 1.
+
+**The contract you take on by calling it.** The checkpoint log is what stops
+completed work re-running after a crash, so discarding it is only safe where
+your code can re-derive its position from durable state it wrote itself. A
+machine that reads back its own `set_event("machine.state")` at entry can. A
+linear `task()` that relies on replay to skip the first nine of ten steps
+cannot, and calling `compact()` there means step one runs twice.
+
+It returns `False` and does nothing while a previous attempt's log is still
+being replayed, because compacting mid-replay would delete checkpoints this
+attempt has not yet caught up to. That is what makes a loop boundary the right
+call site: call it every time round, and it takes effect on the first pass that
+owes nothing to a previous attempt.
+
+Fenced like every other durable write — a superseded execution cannot delete a
+live one's checkpoints.
+
+[`StateMachineJob`](../pyjobby/statemachine.py) does all of this for you; see
+[STATECHARTS.md](STATECHARTS.md).
 
 ---
 

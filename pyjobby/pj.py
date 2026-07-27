@@ -249,7 +249,9 @@ STMTS["enqueue-next-self-finished"] = """ UPDATE jorb
 # DXE primitives (see pyjobby/dxe.py for semantics)
 STMTS["load-steps"] = dxe.LOAD_STEPS_SQL
 STMTS["record-step"] = dxe.RECORD_STEP_SQL
+STMTS["compact-steps"] = dxe.COMPACT_STEPS_SQL
 STMTS["set-event"] = dxe.SET_EVENT_SQL
+STMTS["get-event"] = dxe.GET_EVENT_SQL
 STMTS["send"] = dxe.SEND_SQL
 STMTS["recv"] = dxe.RECV_SQL
 
@@ -1715,6 +1717,50 @@ class Job:
         await self._reschedule(datetime.timedelta(seconds=seconds))
         raise dxe.DurableSleep(wake_at)
 
+    async def compact(self) -> bool:
+        """Discard this job's checkpoint log and restart its step sequence.
+
+        Replay costs about 0.9 us and 260 bytes per recorded step, linearly
+        (``pj-bench replay``). A job whose step count tracks *work done* never
+        notices. A job whose step count tracks *elapsed time* — a state
+        machine that wakes, finds no mail, sleeps, and repeats — pays a little
+        more on every wake, forever. This is what bounds that: after
+        compaction the log is empty and the next ``step()`` is sequence 1
+        again, so a machine's replay cost is one turn's worth of checkpoints
+        rather than its whole life's.
+
+        **The contract you take on by calling this.** The checkpoint log is
+        what stops completed work re-running after a crash. Throwing it away
+        is only safe where your code can re-derive its position from durable
+        state it wrote itself — a machine that reads its own
+        ``set_event("machine.state")`` at entry can; a linear ``task()`` that
+        relies on replay to skip the first nine of ten steps cannot, and
+        calling this there means step one runs twice.
+
+        Returns False and does nothing while a previous attempt's log is
+        still being replayed, because compacting mid-replay would delete
+        checkpoints this attempt has not yet caught up to and silently
+        re-execute them. That makes the safe call site a loop boundary: call
+        it each time round, and it takes effect on the first pass that owes
+        nothing to a previous attempt.
+
+        Fenced like every other durable write: a superseded execution cannot
+        delete a live one's checkpoints.
+        """
+        if self._dxe_steps and self._dxe_seq < max(self._dxe_steps):
+            return False
+        rows = await self.s.ex("compact-steps", self.job["id"], self._dxe_epoch)
+        if not rows or not rows[0]["fenced"]:
+            raise dxe.StaleExecutionError(
+                f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
+            )
+        removed = int(rows[0]["removed"])
+        self._dxe_steps.clear()
+        self._dxe_seq = 0
+        if removed:
+            logger.debug(f"[job {self.job['id']}] compacted {removed} checkpoints")
+        return True
+
     async def _reschedule(self, interval: datetime.timedelta) -> None:
         """Requeue this job for a future run, fenced to THIS attempt.
 
@@ -1740,6 +1786,19 @@ class Job:
             raise dxe.StaleExecutionError(
                 f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
             )
+
+    async def get_event(self, key: str, job_id: int | None = None) -> Any | None:
+        """Read a published event — this job's by default, another job's by
+        id. Returns None when the key has never been set.
+
+        Deliberately NOT a checkpointed step. An event is durable state, so
+        reading it is a query rather than an effect, and recording the answer
+        would freeze the first value read into every later replay — which is
+        the opposite of what a caller re-deriving its position after a crash
+        wants. The value returned is the one committed now.
+        """
+        rows = await self.s.ex("get-event", job_id or self.job["id"], key)
+        return rows[0]["value"] if rows else None
 
     async def send(
         self, dest_job_id: int, message: Any, topic: str | None = None

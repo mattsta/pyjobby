@@ -144,6 +144,29 @@ SET_EVENT_SQL = """INSERT INTO jorb_event (job_id, key, value)
 
 GET_EVENT_SQL = """SELECT value FROM jorb_event WHERE job_id = $1 AND key = $2"""
 
+# Discard a job's whole checkpoint log so its step sequence can restart at 1.
+#
+# Replay is O(steps ever recorded): pj-bench replay measures 0.9 us and 260
+# bytes per checkpoint, dead linear, so 100k checkpoints cost 75ms and 26MB
+# resident PER JOB, on every wake. A job whose step count tracks work done
+# never gets near that; one whose step count tracks elapsed time -- a state
+# machine that wakes, finds no mail and sleeps, forever -- gets there on a
+# schedule. This is what bounds it.
+#
+# Written as one statement returning exactly one row because a bare DELETE
+# cannot distinguish "nothing to remove" from "superseded", and those need
+# opposite responses. `fenced` answers the second question; `removed` the
+# first.
+COMPACT_STEPS_SQL = """WITH fence AS (
+            SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $2
+        ), gone AS (
+            DELETE FROM jorb_step
+            WHERE job_id = $1 AND EXISTS (SELECT 1 FROM fence)
+            RETURNING 1
+        )
+        SELECT (SELECT count(*) FROM fence) AS fenced,
+               (SELECT count(*) FROM gone) AS removed"""
+
 # Fenced on the SENDER, not the destination: the question is whether this
 # execution is still entitled to act. Unfenced, a zombie delivered the message
 # and only then raised on its own checkpoint -- the effect escaping while the
