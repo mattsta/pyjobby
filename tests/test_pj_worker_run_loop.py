@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 import pytest
 
 from pyjobby.pj import Job, JobSystem
+from tests.utils.retries import assert_jittered
 
 from .conftest import wait_for_job_state
 
@@ -502,10 +503,11 @@ class TestRescheduleBackoffEdgeCases:
         # Should use attempt=1, NOT error_count=5
         delay = await Job(s=None, job=job_dict).rescheduleBackoff(attempt=1)
 
-        # With exponential and attempt=1, should be 1 second (2^0 = 1)
-        assert delay.total_seconds() == 1.0, (
-            f"Expected 1s for attempt=1, got {delay.total_seconds()}s"
-        )
+        # With exponential and attempt=1 the base is 1 second (2^0 = 1), plus
+        # jitter -- so it is a window, not an equality. This asserted == 1.0
+        # back when the delay was truncated to whole seconds, which is exactly
+        # the truncation that quantized the jitter away.
+        assert_jittered(delay, 1)
 
 
 # ============================================================================

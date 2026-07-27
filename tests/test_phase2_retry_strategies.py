@@ -19,21 +19,7 @@ from pyjobby.retry_strategies import (
     get_retry_config,
 )
 from tests.utils.factories import create_job, get_job
-
-
-def assert_jittered(delay: timedelta, base: float) -> None:
-    """The delay is `base` plus jitter -- which only ever runs UPWARD.
-
-    A symmetric window around `base` is the wrong assertion and passed only
-    while the delay was truncated with `int()`, which floored every sample
-    back onto the base second. The real contract is
-    `base <= delay <= base + min(base * 0.1, 5)`.
-    """
-    ceiling = base + min(base * 0.1, 5)
-    seconds = delay.total_seconds()
-    assert base <= seconds <= ceiling, (
-        f"{seconds}s is outside the jitter window [{base}, {ceiling}]"
-    )
+from tests.utils.retries import assert_jittered
 
 
 class TestRetryDelayCalculation:
