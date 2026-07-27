@@ -446,31 +446,28 @@ operation that discards checkpoints for a job that is going to run again.
 
 ---
 
-## Retention: checkpoints do not expire on their own
+## Retention: checkpoints outlive the run, but not the job
 
-`jorb_step`, `jorb_history`, `jorb_event` and `jorb_mailbox` are all
-`ON DELETE CASCADE` from `jorb`. They therefore live **exactly as long as the
-job row**, and nothing shortens that automatically:
+A checkpoint exists to make a job **resumable**. The moment a job reaches a
+terminal state, resume is impossible and every checkpoint it holds is audit
+material only — which is why checkpoints have their own, much shorter life
+than the job row.
 
-* A finished job keeps its full checkpoint set indefinitely.
-* `jorb_history` gains a row per state transition per attempt.
-* Deleting the job deletes all of it, atomically, via the cascade.
-
-Checkpoints are kept after success on purpose — they are the audit trail of
-what a job actually did, and `pj-admin jobs steps` reads them — but that means
-**an installation that never deletes jobs grows without bound.**
-
-Retention is the operator's call:
+Both sweeps run in `pj-monitor` and both are **on by default**:
 
 ```
-pj-monitor --retention-days 30              # automatic sweep (opt-in)
-pj-monitor --retention-days 30 --retention-batch-size 500
-pj-admin queues clear <queue> --state finished --older-than-days 30
-pj-admin jobs delete <id>
+--retention-days 30              delete terminal jobs, with their history,
+                                 events, mailbox and checkpoints
+--checkpoint-retention-days 1    delete the CHECKPOINTS of terminal jobs,
+                                 keeping the job row itself
 ```
 
-The automatic sweep is **off by default** — a fresh install must not silently
-delete an operator's history — and it is deliberately conservative:
+Pass `0` to either to keep that data forever. So by default a finished job
+keeps its step checkpoints for a day — long enough to answer "which step
+failed, and why" after an incident — and the job row, its result and its
+history for thirty.
+
+The job sweep is deliberately conservative:
 
 * it removes only jobs in a **terminal** state (`finished`, `crashed`,
   `cancelled`) past the window. A `queued`, `claimed`, `running` or `waiting`
@@ -478,12 +475,21 @@ delete an operator's history — and it is deliberately conservative:
   legitimately be very old.
 * it will not delete a terminal job that a `waiting` job still depends on
   (via `waitfor_job` or `waitfor_group`), which would strand the waiter.
-* it deletes in **bounded batches** so the reaper never takes a long lock.
-* consumed mailbox messages are pruned on the same window even when their job
-  is still alive — a long-running workflow reads messages for months, and the
-  job-scoped cascade would never reach them.
+* it **drains** rather than taking one batch per cycle — a sweep that deletes
+  slower than jobs arrive is retention in name only — under a per-cycle time
+  budget so it can never starve the latency-critical sweeps.
+* consumed mailbox messages are pruned even when their job is still alive: a
+  long-running workflow reads messages for months and the job-scoped cascade
+  would never reach them.
 
 The child rows go with the job through `ON DELETE CASCADE`.
+
+Operators can also delete explicitly:
+
+```
+pj-admin queues clear <queue> --state finished --older-than-days 30
+pj-admin jobs delete <id>
+```
 
 Sizing rule of thumb: budget one `jorb_step` row per `step()` call per job, and
 roughly four `jorb_history` rows per attempt.
