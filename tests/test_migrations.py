@@ -201,6 +201,8 @@ class TestUpgradeFromLegacySchema:
             assert "function claim_jorb" in missing
             assert "function jorb_notify" in missing
             assert "index jorb_tags_idx" in missing
+            assert "column jorb.schedule_id" in missing
+            assert "index jorb_schedule_id_idx" in missing
             # ... and it is a database no version number can tell apart from a
             # current one: it records nothing, so nothing is "pending".
             assert await migrations.applied_versions(conn) == set()
@@ -264,6 +266,71 @@ class TestUpgradeFromLegacySchema:
             assert row["tags"] == {}
             assert row["awaited"] is False
             assert row["claimed_at"] is None
+        finally:
+            await conn.close()
+
+    async def test_upgrade_moves_schedule_provenance_out_of_admin_data(
+        self, scratch: ScratchDatabases
+    ):
+        """002 relocates `admin_data->>'schedule_id'` to `jorb.schedule_id`.
+
+        The backfill is a CORRECTNESS step, not tidiness. The concurrency
+        check reads the column the instant the new code is deployed, so a
+        schedule whose jobs are still in flight -- old jsonb key, NULL column
+        -- would count ZERO of them and fire again while already at its
+        limit, which is the runaway max_concurrent_jobs exists to prevent.
+
+        And the key is removed rather than left beside the column, because
+        two copies of one fact are two things that can disagree.
+        """
+        conn = await connect(await scratch.create(install="legacy"))
+        try:
+            live = await conn.fetchval(
+                "INSERT INTO jorb (queue, job_class, state, admin_data) "
+                "VALUES ('sched', 'J', 'running', $1) RETURNING id",
+                {"schedule_id": "7", "schedule_name": "nightly"},
+            )
+            plain = await conn.fetchval(
+                "INSERT INTO jorb (queue, job_class, admin_data) "
+                "VALUES ('sched', 'J', $1) RETURNING id",
+                {"max_retries": 3},
+            )
+
+            await migrations.migrate(conn)
+
+            moved = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", live)
+            assert moved["schedule_id"] == 7
+            assert moved["admin_data"] == {"schedule_name": "nightly"}
+            # a job no schedule created is untouched and stays out of the index
+            untouched = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", plain)
+            assert untouched["schedule_id"] is None
+            assert untouched["admin_data"] == {"max_retries": 3}
+        finally:
+            await conn.close()
+
+    async def test_upgrade_leaves_an_unreadable_schedule_id_alone(
+        self, scratch: ScratchDatabases
+    ):
+        """admin_data is free-form jsonb, so the key may hold anything.
+
+        Casting it blindly aborts the whole upgrade on one hand-edited row.
+        Deleting it blindly is worse -- the migration would destroy the only
+        copy of something it could not understand -- so such a row keeps both
+        its key and its NULL column, where a human can still see it.
+        """
+        conn = await connect(await scratch.create(install="legacy"))
+        try:
+            odd = await conn.fetchval(
+                "INSERT INTO jorb (queue, job_class, admin_data) "
+                "VALUES ('sched', 'J', $1) RETURNING id",
+                {"schedule_id": "not-a-number"},
+            )
+
+            await migrations.migrate(conn)
+
+            row = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", odd)
+            assert row["schedule_id"] is None
+            assert row["admin_data"] == {"schedule_id": "not-a-number"}
         finally:
             await conn.close()
 

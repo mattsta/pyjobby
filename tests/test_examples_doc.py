@@ -798,8 +798,8 @@ async def test_a_schedule_creates_and_runs_its_job(
     assert after["next_run"] > utcnow()  # advanced to the following 02:00
 
     job_id = await client.pool.fetchval(
-        "SELECT id FROM jorb WHERE admin_data->>'schedule_id' = $1",
-        str(schedule["id"]),
+        "SELECT id FROM jorb WHERE schedule_id = $1",
+        schedule["id"],
     )
     row = await wait_for_job_state(client.pool, job_id, ("finished",), timeout=30)
     assert row["result"] == {

@@ -260,7 +260,10 @@ class TestDoctorSchema:
         status, message = checks["schema"]
         assert status == "FAIL"
         assert "object(s) this release needs are missing" in message
-        assert "column jorb_worker.job_threads" in message
+        # The message names the first few by name and counts the rest, so the
+        # one asserted here has to be one that sorts near the front and will
+        # stay there: jorb's own columns precede every other table's.
+        assert "column jorb.tags" in message
         assert "run: pj-admin db migrate" in message
         # It stops there on purpose: every check below queries something this
         # one just reported missing, and doctor must not end in a traceback.

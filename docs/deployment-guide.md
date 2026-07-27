@@ -38,13 +38,13 @@ only supported way to do either:
 ```console
 $ pj-admin --dsn "$PYJOBBY_DSN" db migrate
 Installed base schema
-Recorded migrations [1] (already contained in the base schema)
+Recorded migrations [1, 2] (already contained in the base schema)
 ```
 
 ```console
 $ pj-admin --dsn "$PYJOBBY_DSN" db status
 Base schema installed: yes
-Applied migrations:    [1]
+Applied migrations:    [1, 2]
 Pending migrations:    none
 Missing objects:       none
 ```
@@ -64,7 +64,7 @@ which reads as "has recorded nothing", so it receives every migration from
 
 ```console
 $ pj-admin --dsn "$PYJOBBY_DSN" db migrate       # a database from an older release
-Applied migrations: [1]
+Applied migrations: [1, 2]
 ```
 
 It is idempotent, so running it on every deploy is the intended usage, and it

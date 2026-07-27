@@ -145,8 +145,8 @@ class TestScheduleSafetyManagerIntegration:
                 name,
             )
             await conn.execute(
-                "INSERT INTO jorb (job_class, kwargs, state, admin_data) VALUES ('TestJob', '{}', 'running', $1)",
-                {"schedule_id": str(schedule_id)},
+                "INSERT INTO jorb (job_class, kwargs, state, schedule_id) VALUES ('TestJob', '{}', 'running', $1)",
+                schedule_id,
             )
             manager = ScheduleSafetyManager(conn)
             is_safe, count = await manager.check_concurrency(
@@ -166,8 +166,8 @@ class TestScheduleSafetyManagerIntegration:
             )
             for _ in range(3):
                 await conn.execute(
-                    "INSERT INTO jorb (job_class, kwargs, state, admin_data) VALUES ('TestJob', '{}', 'running', $1)",
-                    {"schedule_id": str(schedule_id)},
+                    "INSERT INTO jorb (job_class, kwargs, state, schedule_id) VALUES ('TestJob', '{}', 'running', $1)",
+                    schedule_id,
                 )
             manager = ScheduleSafetyManager(conn)
             is_safe, count = await manager.check_concurrency(

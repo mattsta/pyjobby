@@ -48,6 +48,9 @@ CREATE TABLE jorb (
     -- idempotent enqueue: one queued row per (deadline_key, queue)
     deadline_key    TEXT,
 
+    -- provenance: the recurring schedule that fired this job into existence
+    schedule_id     BIGINT,
+
     -- execution bookkeeping
     run_count       INTEGER     NOT NULL DEFAULT 0,
     error_count     INTEGER     NOT NULL DEFAULT 0,
@@ -79,9 +82,10 @@ COMMENT ON COLUMN jorb.prio IS 'Lower numbers are more urgent; workers claim job
 COMMENT ON COLUMN jorb.claimed_at IS 'When this attempt was admitted by a worker. Rate limits count admissions, not execution starts: started is written after the claim commits, so counting it lets a claim miss the claim before it.';
 COMMENT ON COLUMN jorb.run_epoch IS 'Fencing token, NOT an attempt counter (that is run_count). Advances whenever the job enters an attempt (claim) or is abandoned by one (retry/requeue), so a superseded execution may not write results or checkpoints.';
 COMMENT ON COLUMN jorb.awaited IS 'Someone has waited on this job (wait_for_result/get_event). Set by the waiter BEFORE it looks at the state, and never cleared: it is the demand signal that switches the jorb_done and jorb_event notifications on for this job, and it costs one HOT update per job that is ever awaited.';
-COMMENT ON COLUMN jorb.tags IS 'The CALLER''s labels (customer, region, batch), flat key -> scalar, for filtering jobs by something the application means. Deliberately NOT admin_data: that column is the platform''s own execution config (max_retries, timeout_seconds, save_result, schedule metadata), which nobody filters on, so indexing it would tax every enqueue to make no query faster.';
+COMMENT ON COLUMN jorb.tags IS 'The CALLER''s labels (customer, region, batch), flat key -> scalar, for filtering jobs by something the application means. Deliberately NOT admin_data: that column is the platform''s own execution config (max_retries, timeout_seconds, save_result, schedule metadata), which nobody filters on, so indexing it would tax every enqueue to make no query faster. The one thing anybody DID filter admin_data by is now jorb.schedule_id: a fact worth querying by is worth a column, because the alternative is an expression index over a jsonb blob written by every job to answer a question asked about a handful of them.';
 COMMENT ON COLUMN jorb.waitfor_group IS 'Becomes queued only when ALL jobs with run_group = this value are finished.';
 COMMENT ON COLUMN jorb.waitfor_job IS 'Becomes queued only when the job with this id is finished.';
+COMMENT ON COLUMN jorb.schedule_id IS 'The jorb_schedule row that fired this job, NULL for every job enqueued directly. This is the SOLE source of that fact -- it used to live in admin_data->>''schedule_id'', which no index could serve, so the scheduler''s max_concurrent_jobs check scanned the whole job table on every firing. Deliberately NOT a foreign key: jobs outlive the schedules that made them (deleting a schedule must not delete or rewrite its history), and a REFERENCES here would need an index over EVERY schedule-created job to serve the cascade, undoing the point of the partial index below.';
 
 -- the poll/claim path
 CREATE INDEX jorb_claim_idx ON jorb (queue, prio, run_after)
@@ -147,6 +151,43 @@ CREATE INDEX jorb_dag_idx           ON jorb (dag_id) WHERE dag_id IS NOT NULL;
 -- correct and sequentially scans the table. Every tag filter in this codebase
 -- is therefore built by client.tags_filter_sql, which emits both clauses.
 CREATE INDEX jorb_tags_idx ON jorb USING GIN (tags) WHERE tags <> '{}';
+-- The scheduler's max_concurrent_jobs check: "how many of MY jobs are still
+-- in flight?", asked once per firing of every schedule. Partial on BOTH
+-- clauses, and each one is doing separate work.
+--
+--   schedule_id IS NOT NULL keeps the overwhelming majority of jobs -- every
+--   one a client enqueued -- out of the index entirely, so the hot enqueue
+--   path evaluates a null check and writes nothing. Same trade as
+--   jorb_run_group_idx, jorb_uid_idx and jorb_tags_idx above, and measured
+--   the same way: 27,941 vs 28,010 jobs/s across nine INTERLEAVED
+--   `pj-bench enqueue --concurrency 16 --repeat 3` pairs, which is no
+--   difference at all against a within-run spread of 10-33%
+--   (docs/RECURRING_SCHEDULER.md#performance carries the numbers, and
+--   tests/test_scale_plans.py asserts the index does not grow by one page
+--   when 20,000 client-enqueued jobs are inserted).
+--
+--   state IN (...) is what stops this becoming the very problem it fixes. A
+--   schedule accumulates jobs forever -- a minutely one writes ~525k a year --
+--   so an index on schedule_id alone would hand the check every job the
+--   schedule has EVER created and make it discard the terminal ones. That
+--   costs a scan and passes a no-seq-scan check, which is exactly the failure
+--   tests/utils/plans.rows_removed_by_filter exists to catch. Restricted to
+--   the live states the index holds only in-flight work, which the limit
+--   itself bounds: the check's cost tracks the schedule's own concurrency and
+--   not the age of the install.
+--
+-- state is already a predicate column of jorb_claim_idx, jorb_inflight_idx
+-- and jorb_retention_idx, so the transitions that move a row in and out of
+-- this index were non-HOT before it existed and remain exactly as non-HOT.
+--
+-- THE COST OF PARTIAL is the same one jorb_tags_idx documents: a query may
+-- use this index only when its own clauses syntactically IMPLY the predicate,
+-- so the concurrency check must spell out the same state list. It does
+-- (pyjobby/scheduler.py, ScheduleSafetyManager.check_concurrency), and
+-- tests/test_scale_plans.py fails if that stops being true.
+CREATE INDEX jorb_schedule_id_idx ON jorb (schedule_id)
+    WHERE schedule_id IS NOT NULL
+      AND state IN ('queued', 'claimed', 'running', 'waiting');
 -- idempotent enqueue
 CREATE UNIQUE INDEX jorb_deadline_idx ON jorb (deadline_key, queue)
     WHERE state = 'queued' AND deadline_key IS NOT NULL;

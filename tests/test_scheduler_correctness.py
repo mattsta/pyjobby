@@ -20,6 +20,7 @@ from pyjobby.scheduler import (
     ScheduleExecutionResult,
     ScheduleManager,
     SchedulerWorker,
+    ScheduleSafetyManager,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -188,3 +189,184 @@ class TestGracefulShutdown:
                 pytest.fail("run() did not return after stop()")
 
             assert time.monotonic() - started < 5.0
+
+
+class TestConcurrencyLimitStillEnforces:
+    """max_concurrent_jobs is a SAFETY limit, and it was made faster.
+
+    The check moved from counting `admin_data->>'schedule_id'` -- which no
+    index could serve, so it scanned the whole job table on every firing --
+    to counting the `jorb.schedule_id` column through a partial index.
+    tests/test_scale_plans.py asserts it got cheaper. These assert it still
+    REFUSES, because a limit that has been optimised into never binding is a
+    schedule outrunning its own job with nothing in the log to say so, which
+    is the failure the limit exists to prevent.
+
+    Both directions matter and neither implies the other: a check that always
+    counted zero would pass "it fires", and a check that always counted
+    infinity would pass "it refuses".
+    """
+
+    async def _schedule_at_limit(self, conn, *, limit: int) -> dict:
+        """A schedule that is already due, with `limit` slots.
+
+        Both tests fire it by calling execute_schedule() once rather than by
+        running the poll loop, and that is not shorthand -- it is the only
+        way these assertions are FACTS. The loop advances next_run to the top
+        of the next minute, so a pass that happens to straddle a minute
+        boundary fires the schedule a second time and the counters land on
+        whatever the wall clock was doing. That is a test whose result
+        depends on when it ran, which is worse than no test: it fails for a
+        reason that has nothing to do with the limit.
+        """
+        row = await conn.fetchrow(
+            """
+            INSERT INTO jorb_schedule (name, job_class, cron_expr, next_run,
+                                       max_concurrent_jobs)
+            VALUES ($1, 'test.Job', '* * * * *', $2, $3)
+            RETURNING *
+            """,
+            f"concurrency-{uuid.uuid4().hex[:8]}",
+            datetime.now(UTC) - timedelta(minutes=5),
+            limit,
+        )
+        return dict(row)
+
+    async def test_a_schedule_at_its_limit_does_not_fire(self, db_pool):
+        async with db_pool.acquire() as conn:
+            schedule = await self._schedule_at_limit(conn, limit=2)
+            for state in ("running", "queued"):
+                await conn.execute(
+                    "INSERT INTO jorb (job_class, kwargs, state, schedule_id) "
+                    "VALUES ('test.Job', '{}', $1, $2)",
+                    state,
+                    schedule["id"],
+                )
+
+            result = await SchedulerWorker(conn).execute_schedule(schedule)
+
+            assert result.result == "skipped"
+            assert result.skip_reason == "max_concurrent"
+            assert result.concurrent_jobs == 2
+            assert result.job_id is None
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM jorb WHERE schedule_id = $1", schedule["id"]
+                )
+                == 2
+            ), "the schedule created a third job while at max_concurrent_jobs 2"
+            after = await conn.fetchrow(
+                "SELECT * FROM jorb_schedule WHERE id = $1", schedule["id"]
+            )
+            assert after["skip_count"] == 1
+            assert after["success_count"] == 0
+
+    async def test_it_fires_again_once_a_job_finishes(self, db_pool):
+        """The other direction: the refusal has to be temporary.
+
+        A terminal job is outside the index predicate entirely, which is the
+        whole reason the check reads only in-flight work -- so this also pins
+        that leaving the index means leaving the count.
+        """
+        async with db_pool.acquire() as conn:
+            schedule = await self._schedule_at_limit(conn, limit=1)
+            blocker = await conn.fetchval(
+                "INSERT INTO jorb (job_class, kwargs, state, schedule_id) "
+                "VALUES ('test.Job', '{}', 'running', $1) RETURNING id",
+                schedule["id"],
+            )
+            worker = SchedulerWorker(conn)
+
+            blocked = await worker.execute_schedule(schedule)
+            assert blocked.result == "skipped"
+            assert blocked.skip_reason == "max_concurrent"
+
+            await conn.execute(
+                "UPDATE jorb SET state = 'finished', finished = now() WHERE id = $1",
+                blocker,
+            )
+
+            freed = await worker.execute_schedule(schedule)
+
+            assert freed.result == "success", "the slot freed up and it still refused"
+            assert freed.concurrent_jobs == 0, "a finished job still counted"
+            created = await conn.fetchrow(
+                "SELECT * FROM jorb WHERE id = $1", freed.job_id
+            )
+            assert created["state"] == "queued"
+            assert created["schedule_id"] == schedule["id"]
+            after = await conn.fetchrow(
+                "SELECT * FROM jorb_schedule WHERE id = $1", schedule["id"]
+            )
+            assert after["success_count"] == 1
+            assert after["skip_count"] == 1
+
+
+class TestScheduleProvenanceHasOneSource:
+    """Which schedule made a job is the COLUMN, and only the column.
+
+    It used to be `admin_data->>'schedule_id'` as well, and keeping both would
+    have been the ordinary way to make this change safe -- which is exactly
+    how two copies of one fact start disagreeing, silently, in the direction
+    nobody checks. So the key is gone and the column is the whole answer: the
+    scheduler writes it, the concurrency check reads it, and a job reads it
+    off its own row as `self.job["schedule_id"]` rather than out of a jsonb
+    blob as a string.
+    """
+
+    async def test_the_created_job_carries_the_column_and_not_the_json_key(
+        self, db_pool
+    ):
+        async with db_pool.acquire() as conn:
+            schedule_id = await _insert_schedule(conn, cron_expr="* * * * *")
+            schedule = await conn.fetchrow(
+                "SELECT * FROM jorb_schedule WHERE id = $1", schedule_id
+            )
+
+            worker = SchedulerWorker(conn, poll_interval=0.05)
+            job_id = await worker.create_scheduled_job(
+                dict(schedule), datetime.now(UTC), jitter_seconds=0
+            )
+
+            job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+            assert job["schedule_id"] == schedule_id
+            assert "schedule_id" not in job["admin_data"], (
+                "the jsonb copy came back; two sources of one fact will "
+                "disagree eventually"
+            )
+            # the descriptive half stays in admin_data -- nothing filters on it
+            assert job["admin_data"]["schedule_name"] == schedule["name"]
+            assert "scheduled_time" in job["admin_data"]
+
+    async def test_the_concurrency_check_counts_what_the_scheduler_wrote(self, db_pool):
+        """The two halves of the contract, joined.
+
+        Writing the column and counting by it are separate lines of code, and
+        a check that counted something the scheduler does not write would be
+        a limit that never binds -- passing every test that only ever inserts
+        its own fixture rows.
+        """
+        async with db_pool.acquire() as conn:
+            schedule_id = await _insert_schedule(conn, cron_expr="* * * * *")
+            schedule = dict(
+                await conn.fetchrow(
+                    "SELECT * FROM jorb_schedule WHERE id = $1", schedule_id
+                )
+            )
+            safety = ScheduleSafetyManager(conn)
+            worker = SchedulerWorker(conn, poll_interval=0.05)
+
+            assert await safety.check_concurrency(schedule_id, 3) == (True, 0)
+
+            await worker.create_scheduled_job(
+                schedule, datetime.now(UTC), jitter_seconds=0
+            )
+            assert await safety.check_concurrency(schedule_id, 3) == (True, 1)
+
+            await worker.create_scheduled_job(
+                schedule, datetime.now(UTC) + timedelta(minutes=1), jitter_seconds=0
+            )
+            await worker.create_scheduled_job(
+                schedule, datetime.now(UTC) + timedelta(minutes=2), jitter_seconds=0
+            )
+            assert await safety.check_concurrency(schedule_id, 3) == (False, 3)

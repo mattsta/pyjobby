@@ -557,10 +557,11 @@ A separate process fires the due schedules:
 pj-scheduler --config ./pyjobby.conf.py
 ```
 
-Each firing creates an ordinary job carrying
-`admin_data.schedule_id` / `schedule_name` / `scheduled_time` and a deadline
-key of `schedule:<id>:<scheduled_time>`, so a second scheduler instance is a
-no-op rather than a duplicate. The test drives the whole path — create the
+Each firing creates an ordinary job carrying `schedule_id` — a column on
+`jorb`, which is how the scheduler counts its own in-flight work by index —
+plus `admin_data.schedule_name` / `scheduled_time`, and a deadline key of
+`schedule:<id>:<scheduled_time>`, so a second scheduler instance is a no-op
+rather than a duplicate. The test drives the whole path — create the
 schedule, run one poll, watch a worker execute the created job — and asserts
 `next_run` advanced to the following 02:00 Eastern.
 

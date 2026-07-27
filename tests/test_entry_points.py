@@ -382,7 +382,7 @@ class TestSchedulerEntryPoint:
             )
 
         assert job["job_class"] == "tests.dxe_jobs.OkJob"
-        assert job["admin_data"]["schedule_id"] == str(schedule_id)
+        assert job["schedule_id"] == schedule_id
 
         # the schedule's bookkeeping advanced
         sched = await db_pool.fetchrow(

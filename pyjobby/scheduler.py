@@ -26,6 +26,28 @@ from loguru import logger
 from .cron import next_cron_run
 from .db import utcnow
 
+#: "How many of this schedule's jobs are still in flight?", asked once per
+#: firing of every schedule by ``ScheduleSafetyManager.check_concurrency``.
+#:
+#: A module constant, and not an inline string, for the same reason the
+#: monitor's sweeps are: ``tests/test_scale_plans.py`` EXPLAINs THIS statement.
+#: A plan gate that reads a copy of the query certifies one nobody runs the
+#: moment the two drift.
+#:
+#: The state list is spelled out rather than passed as a parameter because it
+#: has to be *syntactically identical* to the predicate of
+#: ``jorb_schedule_id_idx``. PostgreSQL proves a partial index usable only by
+#: proving the query's own clauses imply its predicate, and it does that by
+#: matching expressions -- it cannot derive the list from a bound array
+#: parameter. Written as ``state = ANY($2)`` this query is correct, index-less
+#: and a sequential scan of the whole job table, which is precisely the defect
+#: the column and the index were added to fix.
+CONCURRENCY_COUNT_SQL = """
+    SELECT count(*) FROM jorb
+     WHERE schedule_id = $1
+       AND state IN ('queued', 'claimed', 'running', 'waiting')
+"""
+
 
 @dataclass
 class ScheduleExecutionResult:
@@ -74,14 +96,9 @@ class ScheduleSafetyManager:
         Returns:
             Tuple of (is_safe: bool, current_count: int)
         """
-        # Count jobs from this schedule that are still running
         count = await self.conn.fetchval(
-            """
-            SELECT COUNT(*) FROM jorb
-            WHERE admin_data->>'schedule_id' = $1
-              AND state IN ('queued', 'claimed', 'running', 'waiting')
-        """,
-            str(schedule_id),
+            CONCURRENCY_COUNT_SQL,
+            schedule_id,
         )
 
         is_safe = count < max_concurrent
@@ -506,9 +523,11 @@ class SchedulerWorker:
         # Generate deadline key to prevent duplicates
         deadline_key = f"schedule:{schedule['id']}:{scheduled_time.isoformat()}"
 
-        # Prepare admin_data with schedule metadata
+        # Which schedule made this job is a COLUMN (jorb.schedule_id), not an
+        # admin_data key: it is the one thing about a scheduled job anybody
+        # queries by, and no index could serve it while it lived in jsonb.
+        # What stays here is the descriptive half, which nothing filters on.
         admin_data = {
-            "schedule_id": str(schedule["id"]),  # Store as string for consistency
             "schedule_name": schedule["name"],
             "scheduled_time": scheduled_time.isoformat(),
         }
@@ -528,8 +547,9 @@ class SchedulerWorker:
                     """
                     INSERT INTO jorb (
                         job_class, kwargs, queue, prio, capability,
-                        deadline_key, run_after, admin_data, state
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued')
+                        deadline_key, run_after, admin_data, schedule_id,
+                        state
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued')
                     RETURNING id
                 """,
                     schedule["job_class"],
@@ -540,6 +560,7 @@ class SchedulerWorker:
                     deadline_key,
                     run_after_time,
                     admin_data,  # Dict - custom codec handles conversion
+                    schedule["id"],
                 )
 
             logger.info(

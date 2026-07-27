@@ -32,6 +32,7 @@ from pyjobby.monitor import (
     SWEEP_SCHEDULE_LOG_SQL,
     TERMINAL_STATES,
 )
+from pyjobby.scheduler import CONCURRENCY_COUNT_SQL
 from tests.utils.plans import (
     assert_no_seq_scan,
     assert_reads_far_less_than_a_scan,
@@ -698,6 +699,168 @@ class TestRetiredWorkerSweepPlan:
         assert "jorb_inflight_idx" in plan, plan
         assert_no_seq_scan(plan, "jorb")
         assert rows_scanned_by(plan, "jorb_inflight_idx") == in_flight, plan
+
+
+class TestScheduleConcurrencyPlan:
+    """The scheduler's max_concurrent_jobs check, once per firing, forever.
+
+    It is on the same timer footing as the sweeps above: every enabled
+    schedule asks it every time it comes due, and the answer it usually gives
+    is a small number. It used to ask by ``admin_data->>'schedule_id'``, which
+    no index on jorb could serve, so the cost of firing a schedule grew with
+    the JOB TABLE instead of with the schedule's own load -- fine at one
+    schedule a minute against a young install, and a full scan per firing
+    against an old one.
+
+    Two things had to be true for the fix to be a fix, and this class asserts
+    both separately because either one alone looks like success:
+
+    * the check is served by ``jorb_schedule_id_idx`` rather than by a scan;
+    * it does not READ the schedule's whole history and discard the terminal
+      part of it. That is why the index predicate carries the live states as
+      well as ``schedule_id IS NOT NULL``, and an index scan that throws away
+      everything it reads costs exactly what a scan costs while passing a
+      no-seq-scan check.
+
+    They EXPLAIN the scheduler's own ``CONCURRENCY_COUNT_SQL``, not a copy:
+    the state list in the query has to stay syntactically identical to the
+    index predicate for PostgreSQL to prove the partial index usable, so a
+    gate reading a duplicate of the statement would certify a query nobody
+    runs the moment somebody edits one of the two.
+    """
+
+    #: Firings of one schedule that have already finished. Deliberately most
+    #: of the table: this is what an install accumulates, and it is the part
+    #: the check must not read.
+    SCHEDULE_ROWS = ROWS // 2
+
+    #: Jobs of that schedule still in flight. Bounded by max_concurrent_jobs
+    #: in reality, so a handful is the honest shape.
+    LIVE_PER_SCHEDULE = 3
+
+    async def seed(self, pool, queue: str) -> tuple[int, int]:
+        """One busy schedule with a long history, one with none.
+
+        Returns (busy schedule id, quiet schedule id). The quiet one exists
+        because "nothing to count" is the case that runs on most firings and
+        the case an unindexed predicate is most expensive for: there is no
+        LIMIT to stop early on, so it examines everything to return zero.
+        """
+        await pool.execute("TRUNCATE jorb_schedule RESTART IDENTITY CASCADE")
+        make = """INSERT INTO jorb_schedule (name, job_class, cron_expr, next_run)
+                  VALUES ($1, 'plan.Job', '* * * * *', now()) RETURNING id"""
+        busy = await pool.fetchval(make, "plan-busy")
+        quiet = await pool.fetchval(make, "plan-quiet")
+        await reset_job_tables(pool)
+        # Half the table belongs to the busy schedule and is finished; the
+        # rest is ordinary client-enqueued work in a spread of states, so the
+        # planner is choosing against a realistic mix rather than against a
+        # table that is all one thing.
+        await pool.execute(
+            """
+            INSERT INTO jorb (job_class, kwargs, queue, state, schedule_id,
+                              created, updated, finished)
+            SELECT 'plan.Job', '{}', $1,
+                   CASE WHEN i > $3            THEN 'finished'
+                        WHEN i % 40 = 0        THEN 'queued'
+                        WHEN i % 400 = 1       THEN 'claimed'
+                        WHEN i % 400 = 2       THEN 'running'
+                        WHEN i % 400 = 3       THEN 'waiting'
+                        WHEN i % 40 = 3        THEN 'crashed'
+                        ELSE 'finished' END::jorbstate,
+                   CASE WHEN i > $3 THEN $4::BIGINT END,
+                   now() - (i % 60) * interval '1 day',
+                   now() - (i % 60) * interval '1 day',
+                   now() - (i % 60) * interval '1 day'
+            FROM generate_series(1, $2) i
+            """,
+            queue,
+            ROWS,
+            ROWS - self.SCHEDULE_ROWS,
+            busy,
+        )
+        await pool.execute(
+            """
+            INSERT INTO jorb (job_class, kwargs, queue, state, schedule_id)
+            SELECT 'plan.Job', '{}', $1, 'running', $2
+              FROM generate_series(1, $3) i
+            """,
+            queue,
+            busy,
+            self.LIVE_PER_SCHEDULE,
+        )
+        await settle(pool)
+        return busy, quiet
+
+    async def test_a_schedule_with_nothing_running_reads_almost_nothing(
+        self, db_pool, unique_queue
+    ):
+        """The common firing: the previous job finished, so the answer is 0.
+
+        The expensive shape, because an empty answer has nothing to stop
+        early on.
+        """
+        _, quiet = await self.seed(db_pool, unique_queue)
+
+        plan = await plan_for(db_pool, CONCURRENCY_COUNT_SQL, quiet)
+
+        assert "jorb_schedule_id_idx" in plan, plan
+        assert_no_seq_scan(plan, "jorb")
+        assert rows_removed_by_filter(plan) == 0, plan
+        await assert_reads_far_less_than_a_scan(db_pool, plan)
+
+    async def test_the_count_is_bounded_by_the_schedules_live_jobs(
+        self, db_pool, unique_queue
+    ):
+        """The assertion that actually gates the index's SHAPE.
+
+        This schedule has fired SCHEDULE_ROWS times and has
+        LIVE_PER_SCHEDULE jobs left in flight. An index on schedule_id alone
+        would be used, would report no sequential scan, and would hand the
+        check every one of those historical rows to discard -- a scan wearing
+        an index, growing with the age of the install forever. The live
+        states are in the index predicate precisely so the node reads the
+        in-flight set and nothing else.
+        """
+        busy, _ = await self.seed(db_pool, unique_queue)
+
+        plan = await plan_for(db_pool, CONCURRENCY_COUNT_SQL, busy)
+
+        assert "jorb_schedule_id_idx" in plan, plan
+        assert_no_seq_scan(plan, "jorb")
+        assert rows_scanned_by(plan, "jorb_schedule_id_idx") == self.LIVE_PER_SCHEDULE
+        assert rows_removed_by_filter(plan) == 0, plan
+        await assert_reads_far_less_than_a_scan(db_pool, plan)
+
+    async def test_the_index_holds_only_schedule_created_jobs(self, db_pool):
+        """Who pays when it is unused: nobody.
+
+        Every job a client enqueues has schedule_id NULL and never matches
+        the predicate, so the hot path writes no index entry at all. Asserted
+        as "the index does not grow", the same way tests/test_job_tags.py
+        gates jorb_tags_idx -- the enqueue-throughput half of that argument is
+        a pj-bench measurement (docs/SCALE.md), not something a plan can see.
+        """
+        await reset_job_tables(db_pool)
+        await settle(db_pool)
+        before = await db_pool.fetchval(
+            "SELECT pg_relation_size('jorb_schedule_id_idx')"
+        )
+
+        await db_pool.execute(
+            """
+            INSERT INTO jorb (job_class, kwargs, queue, state)
+            SELECT 'plan.Job', '{}', 'unscheduled', 'queued'
+              FROM generate_series(1, $1) i
+            """,
+            ROWS,
+        )
+        await settle(db_pool)
+
+        assert (
+            await db_pool.fetchval("SELECT pg_relation_size('jorb_schedule_id_idx')")
+            == before
+        ), f"{ROWS} client-enqueued jobs grew a schedule-only index"
 
 
 class TestCascadeIndexes:

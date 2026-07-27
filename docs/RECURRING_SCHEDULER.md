@@ -185,11 +185,11 @@ anchored to the wall clock, and one with a wildcard or a step is an interval.
 That is the rule vixie cron settled on, for the same reason.
 
 ```python
-is_wall_clock_anchored("30 1 * * *")    # True  — a named hour
+is_wall_clock_anchored("30 1 * * *")  # True  — a named hour
 is_wall_clock_anchored("0 2,14 * * *")  # True  — several named hours
-is_wall_clock_anchored("0 * * * *")     # False — every hour
+is_wall_clock_anchored("0 * * * *")  # False — every hour
 is_wall_clock_anchored("*/15 * * * *")  # False — every 15 minutes
-is_wall_clock_anchored("0 */2 * * *")   # False — every 2 hours
+is_wall_clock_anchored("0 */2 * * *")  # False — every 2 hours
 ```
 
 ### Falling back: the hour that happens twice
@@ -282,9 +282,18 @@ which is unique across queued rows. Two scheduler instances firing the same
 schedule at the same instant produce one job; the loser records a `duplicate`
 skip. Nothing to configure.
 
-The created job also carries `admin_data.schedule_id`, `schedule_name` and
-`scheduled_time`, which is how the concurrency check finds its own jobs and
-how a job can identify the schedule that made it.
+The created job also carries `schedule_id` — a **column** on `jorb`, not an
+`admin_data` key — plus `admin_data.schedule_name` and
+`admin_data.scheduled_time`. `schedule_id` is how the concurrency check finds
+its own jobs and how a job identifies the schedule that made it
+(`self.job["schedule_id"]`, a `bigint`, `None` for a job nobody scheduled).
+
+It is a column because it is the one thing about a scheduled job that anything
+*queries by*, and while it lived in the `admin_data` blob no index could serve
+that query — see [Performance](#performance). The `admin_data` copy is **gone**
+rather than kept alongside: two copies of one fact disagree eventually.
+`pj-admin db migrate` moves it on existing databases, including jobs that are
+still in flight.
 
 ## When a schedule cannot be evaluated
 
@@ -345,13 +354,40 @@ Finding the due schedules is a single indexed query
 is proportional to the schedules actually due, not to the number configured.
 Each firing is one short transaction, and the created job is one INSERT.
 
-The cost that does scale with the *jobs* table is the safety checks. The
-concurrency check counts `jorb` rows by `admin_data->>'schedule_id'`, for
-which there is no index, so it cannot be index-served; the backpressure check
-counts unfinished rows in the queue. Both run once per firing. That is
-unremarkable for a schedule a minute against a live set of thousands, and
-worth measuring before you put a per-second schedule on a queue with a large
-retention window.
+The safety checks run once per firing, and the concurrency one used to be the
+thing that made firing a schedule get slower forever. It counted `jorb` rows by
+`admin_data->>'schedule_id'`; no index could serve an expression inside that
+blob, so **every firing sequentially scanned the whole job table** — a cost set
+by how many jobs the install had ever run rather than by anything about the
+schedule. It is invisible on a young database and it never announces itself.
+
+`schedule_id` is now a column with a partial index over it:
+
+```sql
+CREATE INDEX jorb_schedule_id_idx ON jorb (schedule_id)
+    WHERE schedule_id IS NOT NULL
+      AND state IN ('queued', 'claimed', 'running', 'waiting');
+```
+
+Both halves of that predicate are load-bearing. `schedule_id IS NOT NULL` keeps
+every client-enqueued job out of the index, so the hot enqueue path writes
+nothing to it — measured at 27,941 vs 28,010 jobs/s across nine interleaved
+`pj-bench enqueue --concurrency 16 --repeat 3` pairs, which is no difference.
+The live-state list is what stops the fix becoming the original problem: a
+schedule accumulates jobs forever (a minutely one, ~525k a year), so an index
+on `schedule_id` alone would hand the check every job the schedule had *ever*
+created and make it discard the finished ones — an index scan that reads a
+table's worth of rows costs a table's worth. Restricted to the live states, the
+check reads only in-flight work, which `max_concurrent_jobs` itself bounds.
+
+The catch of a partial index is that a query may use it only when its own
+clauses **imply** the predicate, and PostgreSQL proves that syntactically — so
+the check spells out the same state list rather than binding it as a parameter.
+`tests/test_scale_plans.py` EXPLAINs the scheduler's own statement and fails on
+a sequential scan, on a wrong access method, and on rows read and thrown away.
+
+The backpressure check counts unfinished rows in the schedule's *queue*, which
+is a different question and unaffected by any of this.
 
 ## Migrating to it
 

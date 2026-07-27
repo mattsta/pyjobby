@@ -139,7 +139,7 @@ async def port_is_open(host: str, port: int) -> bool:
     """True once something accepts TCP connections on host:port."""
     try:
         reader, writer = await asyncio.open_connection(host, port)
-    except (ConnectionRefusedError, OSError):
+    except ConnectionRefusedError, OSError:
         return False
     writer.close()
     with contextlib.suppress(Exception):

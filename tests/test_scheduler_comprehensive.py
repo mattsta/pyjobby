@@ -336,16 +336,21 @@ class TestScheduleSafetyManager:
             return schedule_id
 
     async def _create_scheduled_job(self, client, schedule_id, state="queued"):
-        """Create a job linked to a schedule."""
-        job_id = await client.enqueue(
-            "test.Job", admin_data={"schedule_id": str(schedule_id)}
-        )
+        """Create a job linked to a schedule.
 
-        if state != "queued":
-            async with client.pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE jorb SET state = $1 WHERE id = $2", state, job_id
-                )
+        The link is jorb.schedule_id, the column the scheduler itself writes;
+        client.enqueue() has no parameter for it because a client never
+        creates a schedule's job.
+        """
+        job_id = await client.enqueue("test.Job")
+
+        async with client.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE jorb SET state = $1, schedule_id = $3 WHERE id = $2",
+                state,
+                job_id,
+                schedule_id,
+            )
 
         return job_id
 
@@ -716,7 +721,7 @@ class TestSchedulerWorker:
             assert job["queue"] == "test_queue"
             assert job["prio"] == 500
             assert job["state"] == "queued"
-            assert "schedule_id" in job["admin_data"]
+            assert job["schedule_id"] == schedule_dict["id"]
 
     @pytest.mark.asyncio
     async def test_create_scheduled_job_duplicate_prevention(self, db_pool, worker):
@@ -891,12 +896,12 @@ class TestSchedulerWorker:
 
         # Create 2 jobs already running for this schedule
         for _ in range(2):
-            job_id = await client.enqueue(
-                "test.Job", admin_data={"schedule_id": str(schedule_dict["id"])}
-            )
+            job_id = await client.enqueue("test.Job")
             async with db_pool.acquire() as conn:
                 await conn.execute(
-                    "UPDATE jorb SET state = 'running' WHERE id = $1", job_id
+                    "UPDATE jorb SET state = 'running', schedule_id = $2 WHERE id = $1",
+                    job_id,
+                    schedule_dict["id"],
                 )
 
         result = await worker.execute_schedule(schedule_dict)
@@ -1223,7 +1228,7 @@ class TestSchedulerIntegration:
 
             assert job["job_class"] == "test.LifecycleJob"
             assert job["queue"] == "test_queue"
-            assert job["admin_data"]["schedule_id"] == str(schedule_id)
+            assert job["schedule_id"] == schedule_id
 
             # 5. Verify schedule counters updated
             schedule = await conn.fetchrow(
@@ -1721,7 +1726,8 @@ class TestSchedulerMainLoop:
             # Create running job to trigger concurrency skip
             await conn.execute(
                 """
-                INSERT INTO jorb (job_class, kwargs, queue, state, prio, admin_data)
+                INSERT INTO jorb (job_class, kwargs, queue, state, prio,
+                                  schedule_id)
                 VALUES ($1, $2, $3, $4, $5, $6)
             """,
                 "test.SkipJob",
@@ -1729,7 +1735,7 @@ class TestSchedulerMainLoop:
                 "default",
                 "running",
                 100,
-                {"schedule_id": str(skip_sched_id)},
+                skip_sched_id,
             )
 
             # Create schedule 3: Will fail (monkeypatch create_scheduled_job)

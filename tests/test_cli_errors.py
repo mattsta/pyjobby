@@ -1125,7 +1125,12 @@ class TestDbCommands:
 
         assert result.exit_code == 0, result.output
         assert "Base schema installed: yes" in result.output
-        assert "Pending migrations:    [1]" in result.output
+        # Read off the shipped files rather than hardcoded: the point of this
+        # assertion is "everything is pending", which stays true as
+        # migrations are added, and a literal here turns each new one into an
+        # unrelated test failure.
+        pending = [m.version for m in migrations.available_migrations()]
+        assert f"Pending migrations:    {pending}" in result.output
         assert "column jorb_worker.job_threads" in result.output
         assert "function claim_jorb" in result.output
 
@@ -1263,7 +1268,8 @@ class TestStaleSchemaMessages:
 
         migrated = await run_cli("--dsn", dsn, "db", "migrate")
         assert migrated.exit_code == 0, migrated.output
-        assert "Applied migrations: [1]" in migrated.output
+        applied = [m.version for m in migrations.available_migrations()]
+        assert f"Applied migrations: {applied}" in migrated.output
 
         for args in (["workers", "list"], ["metrics"], ["jobs", "list"]):
             result = await run_cli("--dsn", dsn, *args)
