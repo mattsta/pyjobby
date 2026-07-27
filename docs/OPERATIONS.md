@@ -32,8 +32,9 @@ pj-admin --dsn "$PYJOBBY_DSN" doctor [--max-depth 10000] [--max-age-minutes 60]
 ```
 
 Checks (FAIL exits nonzero; WARN does not): database reachable, schema
-installed and migrations current, NOTIFY triggers present, live workers
-seen in the last 60s, per-queue depth and oldest-job age, DLQ size, overdue
+installed and migrations current, NOTIFY triggers present, NOTIFY queue
+saturation, live workers seen in the last 60s, workers that are alive but
+claiming nothing, per-queue depth and oldest-job age, DLQ size, overdue
 schedules. Run it from cron/CI as a platform health probe; scrape
 `GET /metrics` on the web admin for Prometheus.
 
@@ -134,6 +135,47 @@ default executor with the worker's own `getaddrinfo`, so a runaway job class
 could break the worker's reconnects. Now it can only exhaust the budget that
 exists for running jobs.
 
+### How you find out (without reading that worker's log)
+
+A worker in this state keeps heartbeating, so on liveness alone it is
+indistinguishable from a healthy idle one — which is the worst shape of
+outage there is. The worker therefore publishes the condition on its own
+registry row, on the heartbeat statement that already ran every cycle:
+
+| Column | Meaning |
+|---|---|
+| `jorb_worker.job_threads` | this worker's pool size (`--job-threads`) |
+| `jorb_worker.job_threads_abandoned` | live threads belonging to no job it is running |
+
+`job_threads_abandoned >= job_threads` **is** the refusing state. Both counts
+are published rather than that one boolean because the boolean hides the
+approach: 7 of 8 is one timed-out job away from a worker doing nothing, and
+reads identically to 0 of 8. A thread belonging to a job that is *currently
+running* is never counted, so a healthy worker reads 0 even mid-job.
+
+Everything else reads that row:
+
+```bash
+pj-admin doctor          # WARN job-threads: N of M live worker(s) not claiming -- worker 42 (host:pid, queue q) 8/8 job threads abandoned. ...
+pj-admin workers list    # Status "not claiming", Threads "8/8"
+```
+
+```
+pyjobby_workers_not_claiming               1   # live workers claiming nothing
+pyjobby_worker_job_threads_abandoned_max   8   # the worst one: the approach
+```
+
+Alert on `pyjobby_workers_not_claiming > 0`. It is a **WARN** in `doctor`, not
+a FAIL (exit code stays 0): the condition is self-healing — the abandoned
+threads finish and the worker resumes — and lost capacity is graded the same
+way as `no live workers seen in last 60s`. If it is actually costing
+throughput, the backlog check says so from the queue's side. The web
+dashboard's worker table shows the same status, and `/api/metrics` carries it
+under `job_threads`.
+
+`pyjobby_workers_live` still counts these workers, deliberately: they *are*
+alive. That is why the second gauge sits next to it.
+
 **If you see it:** that queue's job class blocks far past its timeout. Fix it
 with a shorter timeout, an interruptible (async, or self-clock-watching)
 implementation, or a dedicated queue and worker for it. Raising
@@ -175,12 +217,13 @@ For chronic pressure set `--max-concurrency` / `--rate-limit` instead.
 `pj-admin jobs steps ID` to see where a durable pipeline stopped. After a
 code fix, `pj-admin dlq retry ID` (fresh attempt budget).
 
-**Nothing is being claimed.** In order: `pj-admin doctor`;
+**Nothing is being claimed.** In order: `pj-admin doctor` (a `WARN
+job-threads` names any worker that is alive and claiming nothing);
 `pj-admin queues show NAME` (paused? limits hit?); `pj-admin workers list`
-(any live workers on that queue?); the workers' own logs for
-`NOT CLAIMING` (abandoned job threads — see above); remember jobs with
-`prio` above the workers' ceiling (default 1000) or `capability` no worker
-advertises are invisible to those workers.
+(any live workers on that queue, and is any of them `not claiming`?); the
+workers' own logs for `NOT CLAIMING` (abandoned job threads — see above);
+remember jobs with `prio` above the workers' ceiling (default 1000) or
+`capability` no worker advertises are invisible to those workers.
 
 **The scheduler missed fires** (was down at fire time). Missed ticks are
 skipped, not backfilled; `next_run` advances from now. Check
@@ -194,6 +237,7 @@ automatically and re-prepare their statements; nothing needs a restart.
 | Question | Answer |
 |---|---|
 | Fleet health | `pj-admin doctor`, `pj-admin workers list` |
+| A worker is alive but doing nothing | `pyjobby_workers_not_claiming`, `doctor`'s `job-threads` check |
 | Queue depths/ages | `pj-admin queues list`, `/metrics` gauges |
 | What happened to job N | `pj-admin jobs history N`, `jobs steps N` |
 | Throughput/error rates | `/metrics` counters + duration quantiles |

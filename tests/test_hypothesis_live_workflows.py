@@ -129,6 +129,7 @@ def run_worker_process(
             queue,
             list(worker.capabilities),
             __version__,
+            worker.job_threads,
         )
 
         worker.stmts = {}

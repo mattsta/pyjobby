@@ -470,6 +470,10 @@ EXPECTED_TYPES = {
     "pyjobby_queue_oldest_queued_seconds": "gauge",
     "pyjobby_queue_paused": "gauge",
     "pyjobby_workers_live": "gauge",
+    # the live workers that are nonetheless claiming nothing, and the
+    # approach to that state -- bounded by the fleet, not the job table
+    "pyjobby_workers_not_claiming": "gauge",
+    "pyjobby_worker_job_threads_abandoned_max": "gauge",
     "pyjobby_jobs_inflight": "gauge",
     "pyjobby_jobs_stuck": "gauge",
     "pyjobby_inflight_oldest_age_seconds": "gauge",

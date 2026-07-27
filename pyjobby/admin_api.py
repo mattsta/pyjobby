@@ -713,6 +713,12 @@ class AdminAPI:
         A worker is live when shutdown_at IS NULL and its heartbeat
         (last_seen) is recent; heartbeats arrive every ~10s.
 
+        `not_claiming` is the live worker that is nonetheless doing nothing:
+        abandoned job threads fill its pool, so it refuses to claim while
+        heartbeating perfectly. It is derived here rather than left to every
+        caller because `live` alone reads as healthy, which is the whole
+        problem -- see `job_thread_stats`.
+
         Args:
             stale_after_seconds: Heartbeat age past which a worker counts
                 as stale rather than live (default: 60)
@@ -726,11 +732,17 @@ class AdminAPI:
             """
             SELECT w.id, w.host, w.pid, w.queue, w.capabilities, w.version,
                    w.started, w.last_seen, w.shutdown_at,
+                   w.job_threads, w.job_threads_abandoned,
                    EXTRACT(EPOCH FROM (now() - w.last_seen))::float
                        AS last_seen_age_seconds,
                    (w.shutdown_at IS NULL
                     AND w.last_seen > now() - make_interval(secs => $1))
                        AS live,
+                   (w.shutdown_at IS NULL
+                    AND w.last_seen > now() - make_interval(secs => $1)
+                    AND w.job_threads > 0
+                    AND w.job_threads_abandoned >= w.job_threads)
+                       AS not_claiming,
                    j.id AS current_job_id,
                    j.job_class AS current_job_class,
                    j.state AS current_job_state
@@ -934,6 +946,63 @@ class AdminAPI:
             "stuck": row["stuck"] or 0,
             "stuck_after_seconds": float(stuck_after_seconds),
             "oldest_age_seconds": max(float(row["oldest_age"] or 0.0), 0.0),
+        }
+
+    async def job_thread_stats(
+        self, stale_after_seconds: float = 60.0
+    ) -> dict[str, Any]:
+        """
+        Workers that are alive and claiming nothing, and how close the rest
+        of the fleet is to joining them.
+
+        This is the saturation signal none of the others can carry. A
+        synchronous job that exceeds its deadline leaves a thread that
+        nothing can interrupt; enough of them fill the worker's pool, and the
+        worker then refuses to claim rather than admit a job it could not
+        start. It keeps heartbeating throughout -- so `worker_stats` counts
+        it live, `inflight_stats` sees no work from it (indistinguishable
+        from an idle worker), and `backlog_stats` shows only the queue
+        backing up, with nothing to say which worker stopped pulling from it.
+
+        `max_abandoned` is the approach, and it is the number worth alerting
+        on before `not_claiming` moves: a worker holding 7 abandoned threads
+        of 8 is one timed-out job away from doing nothing at all.
+
+        Cost: `jorb_worker` has one row per worker process, so this is
+        bounded by the size of the fleet at any table size, and the live
+        predicate is the one `jorb_worker_live_idx` is built for. No job rows
+        are read.
+
+        Args:
+            stale_after_seconds: Heartbeat age past which a worker is not
+                counted here at all (default: 60) -- a worker that stopped
+                beating is the monitor's problem, not this one's
+
+        Returns:
+            Dictionary with the live workers reporting a pool, how many of
+            them are refusing to claim, and the abandoned-thread totals
+        """
+        row = await self.conn.fetchrow(
+            """
+            SELECT COUNT(*)                                    AS workers,
+                   COUNT(*) FILTER (
+                       WHERE job_threads_abandoned >= job_threads
+                   )                                           AS not_claiming,
+                   COALESCE(SUM(job_threads_abandoned), 0)     AS abandoned,
+                   COALESCE(MAX(job_threads_abandoned), 0)     AS max_abandoned
+            FROM jorb_worker
+            WHERE shutdown_at IS NULL
+              AND last_seen > now() - make_interval(secs => $1)
+              AND job_threads > 0
+            """,
+            stale_after_seconds,
+        )
+
+        return {
+            "workers": row["workers"] or 0,
+            "not_claiming": row["not_claiming"] or 0,
+            "abandoned": int(row["abandoned"] or 0),
+            "max_abandoned": int(row["max_abandoned"] or 0),
         }
 
     async def storage_stats(self) -> dict[str, Any]:
@@ -1148,6 +1217,7 @@ class AdminAPI:
             queue=queue, stuck_after_seconds=stuck_after_seconds
         )
         storage = await self.storage_stats()
+        job_threads = await self.job_thread_stats()
         notify_usage = await self.notify_queue_usage()
 
         period_end = db.utcnow()
@@ -1196,6 +1266,10 @@ class AdminAPI:
             "backlog": backlog,
             "inflight": inflight,
             "storage": storage,
+            # Capacity that is registered and heartbeating but claiming
+            # nothing. Sits beside the other levels because it explains them:
+            # a backlog that will not drain with a live fleet is this.
+            "job_threads": job_threads,
             "notify_queue_usage": notify_usage,
             "top_errors": [
                 {

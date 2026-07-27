@@ -904,6 +904,25 @@ class WebAdminServer:
                     inflight["oldest_age_seconds"],
                 ),
                 (
+                    "pyjobby_workers_not_claiming",
+                    "Live workers that are claiming nothing because abandoned "
+                    "job threads fill their pool. They heartbeat normally, so "
+                    "pyjobby_workers_live counts them as capacity and every "
+                    "other signal here reads healthy -- this is the only one "
+                    "that says the work is not being picked up. Caused by "
+                    "synchronous jobs exceeding their deadline, whose threads "
+                    "cannot be interrupted; alert on it above 0.",
+                    m["job_threads"]["not_claiming"],
+                ),
+                (
+                    "pyjobby_worker_job_threads_abandoned_max",
+                    "Abandoned job threads on the worst-affected live worker: "
+                    "the approach to pyjobby_workers_not_claiming. A worker "
+                    "holding 7 of its 8 is one timed-out synchronous job away "
+                    "from doing no work at all.",
+                    m["job_threads"]["max_abandoned"],
+                ),
+                (
                     "pyjobby_notify_queue_usage_ratio",
                     "Fraction of PostgreSQL's shared async-NOTIFY queue in "
                     "use. At 1.0 every transaction issuing a NOTIFY fails, "
@@ -1222,6 +1241,7 @@ class WebAdminServer:
                 "PID",
                 "Queue",
                 "Status",
+                "Job Threads",
                 "Last Seen",
                 "Current Job",
             ):
@@ -1230,10 +1250,20 @@ class WebAdminServer:
             for w in workers:
                 if w["shutdown_at"] is not None:
                     status = '<span class="badge dead">shut down</span>'
+                elif w["not_claiming"]:
+                    # live, beating, and doing nothing: abandoned threads fill
+                    # its pool, so a "live" badge here would be a lie
+                    status = '<span class="badge crashed">not claiming</span>'
                 elif w["live"]:
                     status = '<span class="badge live">live</span>'
                 else:
                     status = '<span class="badge paused">stale</span>'
+                threads = (
+                    f"{int(w['job_threads_abandoned'])} abandoned "
+                    f"/ {int(w['job_threads'])}"
+                    if w["job_threads"]
+                    else "-"
+                )
                 age = w.get("last_seen_age_seconds")
                 age_html = f"{age:.0f}s ago" if age is not None else "-"
                 if w.get("current_job_id") is not None:
@@ -1250,6 +1280,7 @@ class WebAdminServer:
                 html += f'<td style="padding: 0.75rem;">{int(w["pid"])}</td>'
                 html += f'<td style="padding: 0.75rem;">{html_mod.escape(str(w["queue"]))}</td>'
                 html += f'<td style="padding: 0.75rem;">{status}</td>'
+                html += f'<td style="padding: 0.75rem;">{threads}</td>'
                 html += f'<td style="padding: 0.75rem;">{age_html}</td>'
                 html += f'<td style="padding: 0.75rem;">{current}</td>'
                 html += "</tr>"

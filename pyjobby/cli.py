@@ -1042,10 +1042,24 @@ def workers() -> None:
 
 
 def _worker_status(worker: dict) -> str:
-    """Human status of a registry row: live / stale / shutdown."""
+    """Human status of a registry row: live / not claiming / stale / shutdown.
+
+    "not claiming" outranks "live" because it is the more specific truth: the
+    worker is beating and would show up as fleet capacity, but abandoned job
+    threads fill its pool and it is claiming nothing (see `doctor`'s
+    job-threads check)."""
     if worker["shutdown_at"]:
         return "shutdown"
-    return "live" if worker["live"] else "stale"
+    if not worker["live"]:
+        return "stale"
+    return "not claiming" if worker["not_claiming"] else "live"
+
+
+def _worker_threads(worker: dict) -> str:
+    """`abandoned/pool` for a registry row, or `-` if it reported no pool."""
+    if not worker["job_threads"]:
+        return "-"
+    return f"{worker['job_threads_abandoned']}/{worker['job_threads']}"
 
 
 def _fmt_age(seconds: float | None) -> str:
@@ -1083,6 +1097,7 @@ def workers_list(ctx: click.Context, output_json: bool) -> None:
                     "PID",
                     "Queue",
                     "Status",
+                    "Threads",
                     "Last Seen",
                     "Current Job",
                 ]
@@ -1100,6 +1115,7 @@ def workers_list(ctx: click.Context, output_json: bool) -> None:
                             str(w["pid"]),
                             w["queue"],
                             _worker_status(w),
+                            _worker_threads(w),
                             _fmt_age(w["last_seen_age_seconds"]),
                             job,
                         ]
@@ -2567,6 +2583,46 @@ DOCTOR_NOTIFY_REMEDY = (
 )
 
 
+# A worker that is registered, heartbeating, and claiming nothing. WARN and
+# not FAIL, deliberately, and the ladder this doctor already uses is the
+# argument: FAIL is reserved for "the platform cannot function" (no schema,
+# pending migrations, missing NOTIFY triggers, a NOTIFY queue past half full),
+# while losing capacity is a WARN -- "no live workers AT ALL" is a WARN here.
+# One worker of ten refusing to claim cannot be graver than all ten being
+# gone. It is also self-healing by construction: the abandoned threads finish
+# on their own and the worker resumes, so a FAIL would exit 1 on a condition
+# that may already be over, and doctor's exit code is what wakes people up.
+# If the refusal really is costing throughput, the backlog check below says so
+# in the unit that matters, from the queue's side.
+DOCTOR_THREADS_REMEDY = (
+    "they heartbeat normally and count as live capacity, but they claim "
+    "nothing: synchronous jobs that exceeded their deadline left threads "
+    "behind, and a running thread cannot be interrupted. A worker whose pool "
+    "is full of them refuses to claim rather than admit a job it cannot "
+    "start, and recovers by itself once they finish. If it does not recover, "
+    'find the job class ("pj-admin dlq list", error "Job timed out") and give '
+    "it a shorter timeout, an interruptible implementation, or its own queue "
+    "and worker -- raising --job-threads only buys tolerance, it does not "
+    "make those threads stoppable"
+)
+
+# How many of them doctor names before summarising. Enough to see whether it
+# is one bad host or the whole fleet, short enough to stay one report line.
+DOCTOR_THREADS_NAMED = 3
+
+
+def stuck_worker_summary(rows: list[asyncpg.Record]) -> str:
+    """Name the workers that are refusing to claim, for doctor's WARN line."""
+    named = "; ".join(
+        f"worker {r['id']} ({r['host']}:{r['pid']}, queue {r['queue']}) "
+        f"{r['job_threads_abandoned']}/{r['job_threads']} job threads abandoned"
+        for r in rows[:DOCTOR_THREADS_NAMED]
+    )
+    if len(rows) > DOCTOR_THREADS_NAMED:
+        named += f"; and {len(rows) - DOCTOR_THREADS_NAMED} more"
+    return named
+
+
 def notify_queue_verdict(usage: float) -> tuple[str, str]:
     """Grade a NOTIFY-queue fill fraction into (status, message).
 
@@ -2637,8 +2693,8 @@ def doctor(ctx: click.Context, max_depth: int, max_age_minutes: int) -> None:
     """Run health checks against the job platform (exit 1 on any FAIL)
 
     Checks: database reachability, schema/migrations, NOTIFY triggers,
-    NOTIFY queue saturation, live workers, queue backlogs, the DLQ, and
-    overdue schedules.
+    NOTIFY queue saturation, live workers, workers that are alive but
+    claiming nothing, queue backlogs, the DLQ, and overdue schedules.
     """
 
     async def _doctor() -> int:
@@ -2714,6 +2770,35 @@ def doctor(ctx: click.Context, max_depth: int, max_age_minutes: int) -> None:
                 "workers",
                 f"{live_workers} live worker(s) seen in last 60s",
                 "no live workers seen in last 60s",
+            )
+
+            # Live workers that are claiming nothing. Checked immediately
+            # after the count above because it is the count above that is
+            # misleading: these workers are IN it. Every other health signal
+            # the platform has -- the heartbeat, the metrics endpoint, the
+            # dashboard, this doctor's own worker check -- reads them as fleet
+            # capacity, and until this check existed the condition was only
+            # discoverable in one worker's log.
+            #
+            # One row per worker, filtered on the same live predicate
+            # jorb_worker_live_idx exists for: bounded by fleet size, never by
+            # the job table.
+            stuck = await conn.fetch("""
+                SELECT id, host, pid, queue, job_threads, job_threads_abandoned
+                FROM jorb_worker
+                WHERE shutdown_at IS NULL
+                  AND last_seen > now() - interval '60 seconds'
+                  AND job_threads > 0
+                  AND job_threads_abandoned >= job_threads
+                ORDER BY id
+            """)
+            doc.warn_if(
+                bool(stuck),
+                "job-threads",
+                f"{live_workers} live worker(s) claiming",
+                f"{len(stuck)} of {live_workers} live worker(s) not "
+                f"claiming -- {stuck_worker_summary(stuck)}. "
+                f"{DOCTOR_THREADS_REMEDY}",
             )
 
             # Queue backlogs

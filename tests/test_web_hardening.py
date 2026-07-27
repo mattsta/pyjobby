@@ -419,6 +419,11 @@ METRIC_NAMES = {
     "pyjobby_backlog_depth",
     "pyjobby_queue_paused",
     "pyjobby_workers_live",
+    # live workers that are claiming nothing (abandoned job threads fill
+    # their pool), and the worst worker's count -- both fleet-wide scalars,
+    # deliberately unlabelled: a per-worker label would grow with the fleet
+    "pyjobby_workers_not_claiming",
+    "pyjobby_worker_job_threads_abandoned_max",
     # windowed job-outcome gauges (see tests/test_metrics_scrape_cost.py for
     # why the three *_total series they replaced could not stay counters)
     "pyjobby_jobs_started_recent",
@@ -649,6 +654,9 @@ class TestPrometheusExposition:
             "pyjobby_inflight_oldest_age_seconds",
             "pyjobby_notify_queue_usage_ratio",
             "pyjobby_jobs_enqueued_total",
+            # fleet-wide, so no queue label and no per-worker label either
+            "pyjobby_workers_not_claiming",
+            "pyjobby_worker_job_threads_abandoned_max",
         ):
             assert [s for s in samples if s[0] == unlabelled] == [(unlabelled, "")], (
                 f"{unlabelled} must be a single unlabelled series"

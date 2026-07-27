@@ -249,9 +249,21 @@ STMTS["worker-idle"] = """UPDATE jorb_worker
 
 # Worker registry (executed on the heartbeat connection, not prepared).
 WORKER_REGISTER_SQL = """INSERT INTO jorb_worker
-        (host, pid, queue, capabilities, version)
-        VALUES ($1, $2, $3, $4, $5) RETURNING id"""
-WORKER_HEARTBEAT_SQL = "UPDATE jorb_worker SET last_seen = now() WHERE id = $1"
+        (host, pid, queue, capabilities, version, job_threads)
+        VALUES ($1, $2, $3, $4, $5, $6) RETURNING id"""
+# The heartbeat carries the job-thread saturation with it. A worker whose pool
+# is full of abandoned threads refuses to claim (see _too_many_abandoned_
+# threads) but goes on beating, so every liveness signal the platform has says
+# it is fine while it does nothing -- and the only place that condition was
+# visible was that worker's own log. Publishing it HERE is what makes it
+# visible everywhere else, and it costs nothing: this UPDATE already runs
+# every heartbeat_interval, the columns are on the row being written, and
+# jorb_worker has one row per worker with no index over either column.
+WORKER_HEARTBEAT_SQL = """UPDATE jorb_worker
+           SET last_seen = now(),
+               job_threads = $2,
+               job_threads_abandoned = $3
+         WHERE id = $1"""
 # Retiring clears idle in the same statement: a worker that exits while
 # marked idle would otherwise keep this queue's notifications switched on
 # for every enqueue until the monitor swept it.
@@ -326,6 +338,9 @@ class JobSystem:
     # every thread it has started (see _live_job_threads)
     _threads: ThreadPoolExecutor | None = None
     _job_threads: list[ThreadFuture[Any]] = field(default_factory=list)
+    # the one of those futures the worker is still WAITING on, if any (see
+    # _abandoned_job_threads); None whenever no job is running here
+    _running_thread: ThreadFuture[Any] | None = None
     # monotonic instant this worker started refusing to claim, and when it
     # last said so (see _too_many_abandoned_threads)
     _refusing_since: float | None = None
@@ -421,6 +436,7 @@ class JobSystem:
                 self.qname,
                 list(self.capabilities),
                 __version__,
+                self.job_threads,
             )
             self._hb_task = asyncio.create_task(self._heartbeat_loop())
         except (OSError, asyncpg.PostgresError) as e:
@@ -432,7 +448,15 @@ class JobSystem:
         assert self._hb_cxn is not None
         while not self.stop:
             try:
-                await self._hb_cxn.execute(WORKER_HEARTBEAT_SQL, self.worker_id)
+                # One statement, three columns: liveness and the reason this
+                # worker might be alive without working. See
+                # WORKER_HEARTBEAT_SQL for why the second belongs here.
+                await self._hb_cxn.execute(
+                    WORKER_HEARTBEAT_SQL,
+                    self.worker_id,
+                    self.job_threads,
+                    self._abandoned_job_threads(),
+                )
             except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError):
                 with contextlib.suppress(Exception):
                     self._hb_cxn = await db.connect(**self.dsn)
@@ -504,6 +528,28 @@ class JobSystem:
         life of the worker."""
         self._job_threads = [t for t in self._job_threads if not t.done()]
         return len(self._job_threads)
+
+    def _abandoned_job_threads(self) -> int:
+        """How many live job threads belong to no job this worker is running.
+
+        ``_live_job_threads`` counts pool OCCUPANCY, which is the right budget
+        for the claim decision and the wrong number to publish: a synchronous
+        job running normally holds a slot for its whole duration, so a worker
+        with a small pool would report itself saturated every time it did
+        exactly the thing it exists to do. Excluding the thread the worker is
+        still waiting on leaves only the threads nothing is waiting for --
+        left behind by jobs that already ended, and therefore never going to
+        free their slot on any schedule the worker controls.
+
+        The two agree at the moment that matters. ``_too_many_abandoned_
+        threads`` runs between jobs, where there is no running thread to
+        exclude, so what the heartbeat publishes is what the refusal decided:
+        ``abandoned >= job_threads`` is the refusing state, exactly."""
+        live = self._live_job_threads()
+        running = self._running_thread
+        if running is not None and not running.done():
+            live -= 1
+        return live
 
     def _too_many_abandoned_threads(self) -> bool:
         """Should this worker refuse to claim, because timed-out synchronous
@@ -1008,10 +1054,19 @@ class JobSystem:
         default executor, and its future is kept so those abandoned threads
         can be counted: see ``_thread_pool`` and
         ``_too_many_abandoned_threads`` for what the worker does when they
-        pile up. The context copy is what ``asyncio.to_thread`` did for us."""
+        pile up, and ``_abandoned_job_threads`` for how it says so in the
+        registry. The context copy is what ``asyncio.to_thread`` did for us."""
         thread = self._thread_pool().submit(contextvars.copy_context().run, klass.run)
         self._job_threads.append(thread)
-        staged = await asyncio.wrap_future(thread)
+        self._running_thread = thread
+        try:
+            staged = await asyncio.wrap_future(thread)
+        finally:
+            # Past here the thread is nobody's: it either returned, or this
+            # scope was cancelled (the deadline) and the thread was abandoned
+            # on the spot. Either way it stops counting as ours, which is what
+            # _abandoned_job_threads publishes.
+            self._running_thread = None
         if asyncio.iscoroutine(staged):
             staged = await staged
         if inspect.isasyncgen(staged):
