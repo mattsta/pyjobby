@@ -1,373 +1,464 @@
-# Pyjobby Deployment Guide
+# Deploying pyjobby
 
-## Quick Start (Development)
+What to install, what to run, and what each process needs. Once it is
+running, [OPERATIONS.md](OPERATIONS.md) is the runbook and
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md) is the symptom index. Capacity and
+tuning evidence is in [SCALE.md](SCALE.md); this document does not repeat
+its numbers.
 
-### 1. Install Dependencies
+## Install
 
 ```bash
-# Using Poetry (recommended)
-poetry add git+https://github.com/mattsta/pyjobby.git#main
-
-# Or with pip
 pip install git+https://github.com/mattsta/pyjobby.git#main
 ```
 
-### 2. Set Up PostgreSQL Database
+Python 3.14 or newer, PostgreSQL, and nothing else — no broker, no cache, no
+sidecar. The wheel carries `pyjobby/sql/schema.sql`, so the database is
+installed by the package rather than by a file you copy around.
 
-```bash
-# Create database
-createdb pyjobby_dev
+Installing puts seven commands on `PATH`:
 
-# Load schema
-psql pyjobby_dev -f priv/schema.sql
+| Command | Role |
+|---|---|
+| `pj` | worker processes: claim and execute jobs |
+| `pj-monitor` | the reaper: timeouts, dead-worker reclaim, retention |
+| `pj-scheduler` | fires cron schedules |
+| `pj-web` | HTML admin + `/metrics` |
+| `pj-ws` | realtime dashboard feed |
+| `pj-admin` | operator CLI (see [ADMIN_TOOLS.md](ADMIN_TOOLS.md)) |
+| `pj-bench` | benchmark and plan-regression harness |
 
-# Or manually
-psql pyjobby_dev <<'EOF'
-CREATE TYPE jorb_state AS ENUM (
-    'waiting', 'queued', 'claimed', 'running',
-    'heartbeat', 'crashed', 'finished'
-);
+`pj -v` prints the version.
 
--- See docs/database-schema.md for full schema
-EOF
+## The database
+
+One command installs the schema, and it is the only supported way to do it:
+
+```console
+$ pj-admin --dsn "$PYJOBBY_DSN" db migrate
+Installing base schema (jorb table not found)
+Database schema is up to date
 ```
 
-### 3. Create Configuration File
+```console
+$ pj-admin --dsn "$PYJOBBY_DSN" db status
+Base schema installed: yes
+Applied migrations:    none
+Pending migrations:    none
+```
+
+`db migrate` installs `schema.sql` when the `jorb` table is absent, then
+applies every numbered file in `pyjobby/sql/migrations/` this database has
+not already recorded in `schema_migrations`. It is idempotent, so running it
+on every deploy is the intended usage — but run it from **one** place, as a
+deploy step or an init container, not from every worker's startup. It takes
+no lock, so two processes installing a fresh schema at the same instant will
+race and one will fail.
+
+Schema v1 is the baseline and ships no migration files, so on a database
+that already has `jorb` the command reports "up to date" and changes
+nothing. **A database installed from a different revision of `schema.sql`
+is therefore not brought forward by it.** The platform will fail on the
+columns that revision did not have — and it fails at the first statement
+that needs one, not at startup. Re-create the database, or install into a
+fresh one and cut over.
+
+Do not hand-write DDL, and do not load the schema from a copy checked into
+your own repository. The schema is one file, it is versioned with the code
+that queries it, and the test suite reinstalls it whenever its content hash
+changes — a hand-maintained duplicate is a database the platform has never
+been tested against.
+
+The schema also sets its own autovacuum thresholds and fillfactor on `jorb`
+and `jorb_history`. That is part of the install, not a step you perform: see
+[SCALE.md § Vacuum pressure](SCALE.md#4-vacuum-pressure). If you customise
+those tables, verify the settings survived.
+
+## Configuration
+
+Every process reaches the database one of two ways.
+
+**A config file** — a Python module defining `db_params`:
 
 ```python
-# pyjobby.conf.py
+# /etc/pyjobby/pyjobby.conf.py
+import os
+
 db_params = {
-    "database": "pyjobby_dev",
-    "user": "youruser",
-    "password": "",  # or your password
-    "host": "/tmp",  # Unix socket, or "localhost" for TCP
-    "port": 5432,
-}
-
-# Optional: Web server
-web_listen = {
-    "sites": [{"host": "127.0.0.1", "port": 8080}],
-    "paths": set(),  # Add job classes that can be called via web
-}
-```
-
-### 4. Create a Job
-
-```python
-# job/hello.py
-from pyjobby.pj import Job
-
-
-class HelloWorld(Job):
-    def task(self, name: str = "World"):
-        return {"message": f"Hello, {name}!"}
-```
-
-### 5. Start Workers
-
-```bash
-# Start with default settings (queue=default, workers=CPU/2)
-poetry run pj
-
-# Or with custom settings
-poetry run pj --queue default --workers 4 --config ./pyjobby.conf.py
-```
-
-### 6. Submit a Job
-
-```python
-import asyncio
-import asyncpg
-import orjson
-
-
-async def submit_test_job():
-    conn = await asyncpg.connect(database="pyjobby_dev", user="youruser", host="/tmp")
-
-    job_id = await conn.fetchval(
-        """
-        INSERT INTO jorb (job_class, kwargs)
-        VALUES ($1, $2)
-        RETURNING id
-    """,
-        "job.hello.HelloWorld",
-        orjson.dumps({"name": "Alice"}),
-    )
-
-    print(f"Submitted job {job_id}")
-    await conn.close()
-
-
-asyncio.run(submit_test_job())
-```
-
-## Production Deployment
-
-### Architecture Decisions
-
-Before deploying, decide on:
-
-1. **Number of Workers**: CPU-bound vs I/O-bound workloads
-2. **Queue Strategy**: Single queue vs multiple specialized queues
-3. **Horizontal Scaling**: Single server vs multiple servers
-4. **Database**: Dedicated PostgreSQL instance or shared
-5. **Monitoring**: Logging, metrics, alerting strategy
-
-### Production Checklist
-
-- [ ] PostgreSQL tuned for workload
-- [ ] Database backups configured
-- [ ] Workers run as systemd services (or Docker containers)
-- [ ] Configuration file secured (encrypted secrets)
-- [ ] Logging configured (file + external aggregation)
-- [ ] Monitoring and alerting set up
-- [ ] Job retention/archival policy defined
-- [ ] Dead letter queue or manual intervention process
-- [ ] Capacity planning completed
-- [ ] Runbooks created for common issues
-
-### PostgreSQL Tuning
-
-#### Connection Pooling
-
-```python
-# pyjobby.conf.py
-db_params = {
-    "database": "pyjobby_prod",
+    "database": "pyjobby",
     "user": "pyjobby",
-    "password": "...",  # Use env var or secrets manager
-    "host": "postgres.internal",
+    "password": os.environ["PYJOBBY_DB_PASSWORD"],
+    "host": "postgres.internal",   # or a directory for a unix socket
     "port": 5432,
-    "min_size": 2,  # Minimum connections per worker
-    "max_size": 10,  # Maximum connections per worker
-    "command_timeout": 60,  # Query timeout (seconds)
+    "command_timeout": 60,         # optional
 }
-
-# With 10 workers: 20-100 total connections
 ```
 
-#### PostgreSQL Configuration
+It is executed as Python, so secrets can be read from the environment, a
+mounted file, or a secrets manager at load time.
 
-```ini
-# postgresql.conf
+`db_params` is **`asyncpg.connect()` keyword arguments**, and only those.
+Do not put `min_size` or `max_size` in it: workers, the scheduler,
+`pj-admin` and `pj-bench` open a plain connection and will reject the
+unknown argument, and `pj-web` and `pj-ws` supply their own pool sizes
+alongside your dict and will reject the duplicate. Pool sizing is not
+configurable from here.
 
-# Connections
-max_connections = 200  # Enough for workers + app servers
-
-# Memory
-shared_buffers = 4GB
-effective_cache_size = 12GB
-work_mem = 16MB
-maintenance_work_mem = 512MB
-
-# WAL (Write-Ahead Log)
-wal_buffers = 16MB
-checkpoint_completion_target = 0.9
-max_wal_size = 4GB
-min_wal_size = 1GB
-
-# Vacuum (important for high job churn)
-autovacuum = on
-autovacuum_max_workers = 3
-autovacuum_vacuum_cost_limit = 1000
-
-# Query Planner
-random_page_cost = 1.1  # For SSD
-effective_io_concurrency = 200
-
-# Logging
-log_min_duration_statement = 1000  # Log slow queries (>1s)
-log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
-log_checkpoints = on
-log_connections = on
-log_disconnections = on
-log_lock_waits = on
-```
-
-#### Database Maintenance
+**A DSN** — `--dsn`, or the `PYJOBBY_DSN` environment variable:
 
 ```bash
-# Daily vacuum (cron)
-0 2 * * * psql -U pyjobby -d pyjobby_prod -c "VACUUM ANALYZE jorb;"
-
-# Weekly cleanup (archive + delete old jobs)
-0 3 * * 0 /usr/local/bin/pyjobby-cleanup.sh
-
-# Monitor table bloat
-psql -c "SELECT * FROM pgstattuple('jorb');"
+export PYJOBBY_DSN="postgresql://user:password@host:5432/pyjobby"
 ```
 
-### Systemd Service Configuration
+Which process accepts which is not uniform, and it decides how you package
+your deployment:
 
-#### `/etc/systemd/system/pyjobby@.service`
+| Process | Config file | `--dsn` / `PYJOBBY_DSN` |
+|---|---|---|
+| `pj` | `-c`, default `./pyjobby.conf.py` | no |
+| `pj-scheduler` | `-c`, default `./pyjobby.conf.py` | no |
+| `pj-web` | positional argument | no |
+| `pj-ws` | positional argument | no |
+| `pj-monitor` | `--config` | yes |
+| `pj-admin` | `-c/--config` | yes (wins over `--config`) |
+| `pj-bench` | `-c/--config` | yes (wins over `--config`) |
+
+So workers, the scheduler and the two web surfaces need a config file on
+disk. A container image that ships no config must mount one.
+
+Every entry point exits non-zero when it cannot resolve or load its
+configuration, so a supervisor's restart-on-failure and a deploy script's
+`set -e` both work:
+
+```console
+$ pj-admin -c /nonexistent.conf.py doctor
+Error: Could not load config file: /nonexistent.conf.py
+Error: '/nonexistent.conf.py' doesn't exist
+Error: Use --config to point at a pyjobby conf file, or --dsn to connect directly.
+FAIL config: unusable
+$ echo $?
+1
+```
+
+## The processes to run
+
+| Process | Count | Required? |
+|---|---|---|
+| `pj` | per queue and host as needed | yes — nothing executes without it |
+| `pj-monitor` | 1 (more are safe) | **yes** |
+| `pj-scheduler` | 1 (more are safe) | only if you use cron schedules |
+| `pj-web` | 0 or 1 | optional |
+| `pj-ws` | 0 or 1 | optional |
+
+Start order does not matter: every process connects independently and
+reconnects with backoff if the database goes away.
+
+### `pj-monitor` is not optional
+
+It is the only thing that recovers work. Without it:
+
+* a job whose worker host died stays `claimed` forever — nothing else
+  requeues it;
+* a job that blew its timeout in a way the worker could not interrupt (a
+  synchronous task, a killed process) stays `running` forever;
+* every terminal job, its history, its events, its mailbox and its
+  checkpoints accumulate without limit, because retention lives here.
+
+The worker enforces timeouts in-process as well, but only for the failures
+it survives. `pj-monitor` is the backstop for the rest, and it is a single
+process for the whole install — not one per host.
+
+```console
+$ pj-monitor --config /etc/pyjobby/pyjobby.conf.py
+Starting monitor (check every 10.0s)...
+DSN: localhost:5432/pyjobby
+Retention: jobs older than 30.0d, checkpoints 1.0d after the job terminates
+Monitor started (interval 10.0s, liveness grace 60.0s, job retention 30.0d, checkpoint retention 1.0d)
+```
+
+It states its whole policy on startup, so a misconfigured retention window
+is visible in the first four lines of the log rather than in a table six
+months later.
+
+Several instances are safe — every sweep is a single atomic statement or a
+transaction holding its own row locks.
+
+## Production settings that matter
+
+### Retention — on by default
+
+`pj-monitor` deletes terminal jobs older than `--retention-days` (**30**)
+and the DXE checkpoints of terminal jobs older than
+`--checkpoint-retention-days` (**1**). `0` on either means keep forever.
+Deleting a job takes its history, events, mailbox, checkpoints and DAG
+edges with it by `ON DELETE CASCADE`; the same window also reaps orphaned
+DAGs, the schedule log, retired worker registry rows and consumed mailbox
+messages.
+
+The defaults are on so that an install nobody revisits does not grow
+forever — they are not a guess at your storage budget. Set them
+deliberately. The design argument for the two independent windows is in
+[ARCHITECTURE.md § Retention](ARCHITECTURE.md#retention).
+
+Two knobs control how hard it works:
+
+* `--retention-batch-size` (1000) — rows per delete batch.
+* `--retention-max-seconds` (5.0) — time budget per sweep per cycle. A
+  sweep keeps taking batches until it is caught up or the budget runs out,
+  so it can catch up on a busy install without ever delaying timeout
+  enforcement or dead-worker recovery.
+
+Falling behind is reported at WARNING; see
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#retention-is-falling-behind).
+
+### Worker settings
+
+```bash
+pj --config /etc/pyjobby/pyjobby.conf.py \
+   --queue reports --queue reports --queue reports --queue reports --workers 4 \
+   --max-retries 10 --default-timeout 3600 --job-threads 8
+```
+
+**`--queue` is per worker process, not per command.** `pj` forks one
+process per entry in the `--queue` list, pairs process *i* with queue *i*,
+and pads the list to `--workers` with **`default`**. So
+`--queue reports --workers 4` starts one worker on `reports` and three on
+`default` — a queue you did not ask for. Repeat `--queue` once per worker,
+as above, or run one command per queue with `--workers 1`. The process
+count is `max(len(--queue), --workers)`.
+
+| Flag | Default | What it decides |
+|---|---|---|
+| `--queue` | `default` | the queue for one worker process; repeat per worker |
+| `--cap` | none | capabilities this host advertises; repeatable |
+| `--workers` | CPU count / 2 | worker processes forked by this command |
+| `--max-retries` | 10 | attempts before a job is dead-lettered (`crashed`) |
+| `--default-timeout` | 3600 | fallback job timeout in seconds; `0` disables |
+| `--check-interval` | 5.0 | idle poll interval; LISTEN/NOTIFY wakes workers sooner |
+| `--job-threads` | 8 | this worker's own job-thread pool |
+| `--path` | `.` | extra import paths for job classes; repeatable |
+| `--reload` | off | re-import a job module when its source changes |
+
+Leave `--reload` off in production: on it re-executes module code on every
+job.
+
+`--job-threads` is a production setting, not a performance knob. Every
+job's `run()` executes in a thread from this pool, and a synchronous job
+that blows its deadline leaves its thread running forever — nothing can
+stop it. When abandoned threads fill the pool the worker stops claiming and
+says so, while still heartbeating and still counting as live capacity.
+Raising the number buys tolerance for more simultaneously-abandoned
+threads; it does not make them stoppable. The full behaviour, the registry
+columns that expose it, and the metric to alert on are in
+[OPERATIONS.md § Abandoned job threads](OPERATIONS.md#abandoned-job-threads-when-a-worker-stops-claiming-on-purpose).
+
+### Queue caps
+
+Concurrency and rate limits live in the `jorb_queue` table, are enforced
+inside the claim statement, and change live with no restart:
+
+```bash
+pj-admin queues limits reports --max-concurrency 8 --rate-limit 100 --rate-period 60
+pj-admin queues limits reports --max-concurrency none      # clear one
+pj-admin queues show reports
+```
+
+A worked session with real output is in
+[ADMIN_TOOLS.md § queues](ADMIN_TOOLS.md#queues).
+
+Because they are enforced in the database they bind every claimer, not just
+`pj` processes. They cost nothing when unset. See
+[OPERATIONS.md § Queue controls](OPERATIONS.md#queue-controls-what-the-limits-actually-promise).
+
+### Connection budget
+
+Connection counts are fixed by the code, not by configuration, so the
+budget is arithmetic:
+
+| Process | Connections |
+|---|---|
+| each `pj` worker process | 2 (one for work, one dedicated to heartbeats) |
+| `pj-scheduler` | 1 |
+| `pj-monitor` | 1–2 (pool) |
+| `pj-web` | 1–10 (pool, lazy) |
+| `pj-ws` | 2–10 (pool) + 1 dedicated LISTEN connection |
+| each `pj-admin` invocation | 1, for its lifetime |
+
+`pj --workers N` forks N worker processes, so one such command is 2N
+connections. Add whatever your application's `JobClient` pool uses to
+enqueue, and check the total against PostgreSQL's `max_connections`.
+
+A worker's heartbeat lives on its own connection deliberately: a stale
+heartbeat is what tells the monitor that process is gone, so it must not be
+able to go stale merely because the job connection is busy.
+
+## Running under systemd
+
+A worker template, one unit per queue:
 
 ```ini
+# /etc/systemd/system/pyjobby@.service
 [Unit]
-Description=Pyjobby Worker (%i queue)
-After=network.target postgresql.service
-Requires=postgresql.service
+Description=pyjobby worker (%i)
+After=network.target
 
 [Service]
 Type=simple
 User=pyjobby
-Group=pyjobby
 WorkingDirectory=/opt/pyjobby
-
-# Environment
-Environment="PATH=/opt/pyjobby/.venv/bin:/usr/local/bin:/usr/bin"
 Environment="PYTHONPATH=/opt/pyjobby"
-
-# Security
-PrivateTmp=yes
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/var/log/pyjobby /var/run/pyjobby
-
-# Resource Limits
-LimitNOFILE=65536
-LimitNPROC=512
-
-# Start command
+# --queue once per worker process: pj pads a short list with `default`
 ExecStart=/opt/pyjobby/.venv/bin/pj \
-    --queue %i \
-    --workers 4 \
-    --config /etc/pyjobby/pyjobby.conf.py
-
-# Restart policy
+    --config /etc/pyjobby/pyjobby.conf.py \
+    --queue %i --queue %i --queue %i --queue %i --workers 4
 Restart=always
 RestartSec=10s
-StartLimitInterval=5min
-StartLimitBurst=3
-
-# Logging
-StandardOutput=append:/var/log/pyjobby/worker-%i.log
-StandardError=append:/var/log/pyjobby/worker-%i.error.log
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-#### Usage
+```ini
+# /etc/systemd/system/pyjobby-monitor.service
+[Unit]
+Description=pyjobby monitor (timeouts, dead-worker reclaim, retention)
+After=network.target
 
-```bash
-# Install service
-sudo cp pyjobby@.service /etc/systemd/system/
-sudo systemctl daemon-reload
+[Service]
+Type=simple
+User=pyjobby
+ExecStart=/opt/pyjobby/.venv/bin/pj-monitor \
+    --config /etc/pyjobby/pyjobby.conf.py \
+    --retention-days 30 --checkpoint-retention-days 1
+Restart=always
+RestartSec=10s
 
-# Start multiple queues
-sudo systemctl enable --now pyjobby@default.service
-sudo systemctl enable --now pyjobby@email.service
-sudo systemctl enable --now pyjobby@ml.service
-
-# Check status
-sudo systemctl status 'pyjobby@*'
-
-# View logs
-sudo journalctl -u 'pyjobby@*' -f
+[Install]
+WantedBy=multi-user.target
 ```
 
-### Docker Deployment
+`pj-scheduler`, `pj-web` and `pj-ws` follow the same shape. Workers exit
+non-zero on a bad config, so `Restart=always` will not mask a broken
+deploy — the unit will flap and `systemctl status` will show it.
 
-#### `Dockerfile`
+```bash
+systemctl enable --now pyjobby-monitor.service
+systemctl enable --now pyjobby@default.service pyjobby@reports.service
+journalctl -u 'pyjobby@*' -f
+```
+
+Note that abandoned job threads also delay a worker process's own exit, so
+give workers a generous `TimeoutStopSec` if your jobs are synchronous and
+long.
+
+## Containers
 
 ```dockerfile
-FROM python:3.11-slim
+FROM python:3.14-slim
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    postgresql-client \
-    && rm -rf /var/lib/apt/lists/*
-
-# Create app user
 RUN useradd -m -u 1000 pyjobby
-
-# Install application
 WORKDIR /app
-COPY pyproject.toml poetry.lock ./
-RUN pip install poetry && \
-    poetry config virtualenvs.create false && \
-    poetry install --no-dev --no-interaction
 
-# Copy application code
-COPY pyjobby/ ./pyjobby/
-COPY priv/ ./priv/
-COPY job/ ./job/  # Your job classes
+RUN pip install --no-cache-dir git+https://github.com/mattsta/pyjobby.git#main
 
-# Switch to non-root user
+COPY job/ /app/job/
 USER pyjobby
 
-# Run workers
 CMD ["pj", "--config", "/etc/pyjobby/pyjobby.conf.py"]
 ```
 
-#### `docker-compose.yml`
+The image needs your job classes on the import path and a config file
+mounted at runtime; it does not need the schema, which travels inside the
+package.
 
 ```yaml
-version: "3.8"
-
 services:
   postgres:
-    image: postgres:15
+    image: postgres:17
     environment:
       POSTGRES_DB: pyjobby
       POSTGRES_USER: pyjobby
       POSTGRES_PASSWORD: secret
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./priv/schema.sql:/docker-entrypoint-initdb.d/schema.sql
-    ports:
-      - "5432:5432"
+    volumes: [postgres_data:/var/lib/postgresql/data]
+
+  migrate:
+    build: .
+    depends_on: [postgres]
+    environment:
+      PYJOBBY_DSN: postgresql://pyjobby:secret@postgres:5432/pyjobby
+    command: ["pj-admin", "db", "migrate"]
+    restart: "no"
+
+  monitor:
+    build: .
+    depends_on: [migrate]
+    environment:
+      PYJOBBY_DSN: postgresql://pyjobby:secret@postgres:5432/pyjobby
+    command: ["pj-monitor"]
+    restart: always
 
   worker-default:
     build: .
-    depends_on:
-      - postgres
-    environment:
-      - QUEUE=default
-      - WORKERS=4
+    depends_on: [migrate]
     volumes:
       - ./pyjobby.conf.py:/etc/pyjobby/pyjobby.conf.py:ro
-      - ./job:/app/job:ro
-    command: ["pj", "--queue", "default", "--workers", "4"]
-    restart: always
-
-  worker-email:
-    build: .
-    depends_on:
-      - postgres
-    volumes:
-      - ./pyjobby.conf.py:/etc/pyjobby/pyjobby.conf.py:ro
-      - ./job:/app/job:ro
-    command: ["pj", "--queue", "email", "--workers", "2"]
-    restart: always
-
-  worker-ml:
-    build: .
-    depends_on:
-      - postgres
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    volumes:
-      - ./pyjobby.conf.py:/etc/pyjobby/pyjobby.conf.py:ro
-      - ./job:/app/job:ro
-    command: ["pj", "--queue", "ml", "--workers", "1", "--cap", "gpu"]
+    command: ["pj", "--config", "/etc/pyjobby/pyjobby.conf.py",
+              "--queue", "default", "--queue", "default",
+              "--queue", "default", "--queue", "default", "--workers", "4"]
     restart: always
 
 volumes:
   postgres_data:
 ```
 
-### Kubernetes Deployment
+`pj-monitor` takes `PYJOBBY_DSN`, so it needs no mounted config; `pj` does.
 
-#### `deployment.yaml`
+## Kubernetes
+
+Run `pj-admin db migrate` as a Job (or an init container) before the
+Deployments, one Deployment per queue, and exactly one replica of the
+monitor.
 
 ```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pyjobby-migrate
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: myregistry/pyjobby:latest
+          command: ["pj-admin", "db", "migrate"]
+          env:
+            - name: PYJOBBY_DSN
+              valueFrom:
+                secretKeyRef: {name: pyjobby-db, key: dsn}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pyjobby-monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: pyjobby-monitor}
+  template:
+    metadata:
+      labels: {app: pyjobby-monitor}
+    spec:
+      containers:
+        - name: monitor
+          image: myregistry/pyjobby:latest
+          command: ["pj-monitor"]
+          env:
+            - name: PYJOBBY_DSN
+              valueFrom:
+                secretKeyRef: {name: pyjobby-db, key: dsn}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -375,461 +466,113 @@ metadata:
 spec:
   replicas: 3
   selector:
-    matchLabels:
-      app: pyjobby-worker
-      queue: default
+    matchLabels: {app: pyjobby-worker, queue: default}
   template:
     metadata:
-      labels:
-        app: pyjobby-worker
-        queue: default
+      labels: {app: pyjobby-worker, queue: default}
     spec:
       containers:
         - name: worker
           image: myregistry/pyjobby:latest
-          command: ["pj", "--queue", "default", "--workers", "4"]
-          env:
-            - name: DB_HOST
-              valueFrom:
-                secretKeyRef:
-                  name: pyjobby-db
-                  key: host
-            - name: DB_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: pyjobby-db
-                  key: password
+          command: ["pj", "--config", "/etc/pyjobby/pyjobby.conf.py",
+                    "--queue", "default", "--queue", "default",
+                    "--queue", "default", "--queue", "default",
+                    "--workers", "4"]
           volumeMounts:
-            - name: config
-              mountPath: /etc/pyjobby
-              readOnly: true
+            - {name: config, mountPath: /etc/pyjobby, readOnly: true}
           resources:
-            requests:
-              memory: "512Mi"
-              cpu: "500m"
-            limits:
-              memory: "2Gi"
-              cpu: "2000m"
-          livenessProbe:
-            exec:
-              command:
-                - /bin/sh
-                - -c
-                - "pgrep -f 'pj --queue default' || exit 1"
-            initialDelaySeconds: 30
-            periodSeconds: 60
+            requests: {memory: "512Mi", cpu: "500m"}
+            limits:   {memory: "2Gi",   cpu: "2000m"}
       volumes:
         - name: config
-          configMap:
-            name: pyjobby-config
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: pyjobby-config
-data:
-  pyjobby.conf.py: |
-    import os
-    db_params = {
-        "database": "pyjobby",
-        "user": "pyjobby",
-        "password": os.environ["DB_PASSWORD"],
-        "host": os.environ["DB_HOST"],
-        "port": 5432,
-    }
+          configMap: {name: pyjobby-config}
 ```
 
-### Configuration Management
-
-#### Production Config Template
-
-```python
-# /etc/pyjobby/pyjobby.conf.py
-import os
-import json
-
-
-# Load secrets from file (Kubernetes secret, AWS Secrets Manager, etc.)
-def load_secret(path):
-    with open(path) as f:
-        return json.load(f)
-
-
-secrets = load_secret(os.environ.get("SECRETS_FILE", "/run/secrets/pyjobby.json"))
-
-db_params = {
-    "database": os.environ.get("DB_NAME", "pyjobby_prod"),
-    "user": os.environ.get("DB_USER", "pyjobby"),
-    "password": secrets["db_password"],
-    "host": os.environ.get("DB_HOST", "postgres.internal"),
-    "port": int(os.environ.get("DB_PORT", "5432")),
-    "min_size": 2,
-    "max_size": 10,
-}
-
-# Optional web server
-web_listen = {
-    "sites": [{"host": "0.0.0.0", "port": 8080}, {"path": "/var/run/pyjobby.sock"}],
-    "paths": {
-        "job.webhooks.StripeWebhook",
-        "job.api.PublicAPI",
-    },
-}
-
-# Application secrets (accessible via self.s.config in jobs)
-stripe_api_key = secrets["stripe_api_key"]
-aws_access_key = secrets["aws_access_key"]
-aws_secret_key = secrets["aws_secret_key"]
-```
-
-### Logging
-
-#### Structured Logging with Loguru
-
-```python
-# At the top of your job files
-from loguru import logger
-import sys
-
-# Configure logging
-logger.remove()  # Remove default handler
-
-# Console logging (for Docker/Kubernetes)
-logger.add(
-    sys.stderr,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-    level="INFO",
-)
-
-# File logging (for bare metal/VMs)
-logger.add(
-    "/var/log/pyjobby/worker-{time}.log",
-    rotation="500 MB",
-    retention="30 days",
-    compression="gz",
-    level="INFO",
-)
-
-# Error-only file
-logger.add(
-    "/var/log/pyjobby/error-{time}.log",
-    rotation="100 MB",
-    retention="90 days",
-    level="ERROR",
-)
-
-# JSON logging for external aggregation
-logger.add(
-    "/var/log/pyjobby/json-{time}.log",
-    serialize=True,  # JSON format
-    rotation="500 MB",
-    level="INFO",
-)
-```
-
-#### Integration with External Logging
-
-```python
-# Send to Datadog
-import datadog
-
-logger.add(
-    lambda msg: datadog.api.Event.create(
-        title="Pyjobby Log", text=msg, tags=["env:prod", "service:pyjobby"]
-    ),
-    level="WARNING",
-)
-
-# Send to Sentry
-import sentry_sdk
-
-sentry_sdk.init(dsn="https://...")
-
-logger.add(lambda msg: sentry_sdk.capture_message(msg), level="ERROR")
-```
-
-### Monitoring
-
-#### Metrics Collection
-
-```python
-# job/metrics.py
-from pyjobby.pj import Job
-import time
-
-
-class BaseMetricJob(Job):
-    """Base class with metrics collection"""
-
-    def run(self):
-        metrics = self.s.cache.setdefault(
-            "metrics",
-            {
-                "jobs_processed": 0,
-                "total_duration": 0.0,
-                "errors": 0,
-            },
-        )
-
-        start = time.time()
-        try:
-            result = super().run()
-            metrics["jobs_processed"] += 1
-            return result
-        except Exception as e:
-            metrics["errors"] += 1
-            raise
-        finally:
-            duration = time.time() - start
-            metrics["total_duration"] += duration
-
-            # Flush to Prometheus every 100 jobs
-            if metrics["jobs_processed"] % 100 == 0:
-                self.flush_metrics(metrics)
-
-    def flush_metrics(self, metrics):
-        # Push to Prometheus Pushgateway
-        import requests
-
-        requests.post(
-            "http://pushgateway:9091/metrics/job/pyjobby",
-            data=f"""
-# TYPE pyjobby_jobs_processed counter
-pyjobby_jobs_processed {metrics["jobs_processed"]}
-
-# TYPE pyjobby_total_duration_seconds counter
-pyjobby_total_duration_seconds {metrics["total_duration"]}
-
-# TYPE pyjobby_errors_total counter
-pyjobby_errors_total {metrics["errors"]}
-            """,
-        )
-```
-
-#### PostgreSQL Monitoring
-
-```sql
--- Monitor queue depth
-SELECT state, COUNT(*) FROM jorb GROUP BY state;
-
--- Find stuck jobs
-SELECT id, job_class, state, updated, NOW() - updated as stuck_duration
-FROM jorb
-WHERE state IN ('claimed', 'running')
-  AND updated < NOW() - INTERVAL '1 hour';
-
--- Worker activity
-SELECT worker_host, COUNT(*) as active_jobs
-FROM jorb
-WHERE state IN ('claimed', 'running')
-GROUP BY worker_host;
-```
-
-Create monitoring script:
-
-```python
-#!/usr/bin/env python3
-# /usr/local/bin/pyjobby-monitor.py
-import asyncpg
-import asyncio
-
-
-async def check_health():
-    conn = await asyncpg.connect(...)
-
-    # Check queue depth
-    queued = await conn.fetchval("SELECT COUNT(*) FROM jorb WHERE state = 'queued'")
-    if queued > 10000:
-        alert("High queue depth", f"{queued} jobs queued")
-
-    # Check stuck jobs
-    stuck = await conn.fetch("""
-        SELECT id, job_class FROM jorb
-        WHERE state IN ('claimed', 'running')
-          AND updated < NOW() - INTERVAL '1 hour'
-    """)
-    if stuck:
-        alert("Stuck jobs detected", f"{len(stuck)} jobs stuck")
-
-    # Check error rate
-    recent_errors = await conn.fetchval("""
-        SELECT COUNT(*) FROM jorb
-        WHERE state = 'crashed'
-          AND updated > NOW() - INTERVAL '5 minutes'
-    """)
-    if recent_errors > 10:
-        alert("High error rate", f"{recent_errors} errors in last 5 min")
-
-
-asyncio.run(check_health())
-```
-
-### Security
-
-#### Database Security
-
-```sql
--- Create restricted user
-CREATE USER pyjobby_worker WITH PASSWORD '...';
-
--- Grant only necessary permissions
-GRANT SELECT, INSERT, UPDATE ON jorb TO pyjobby_worker;
-GRANT USAGE, SELECT ON SEQUENCE jorb_id_seq TO pyjobby_worker;
-
--- Revoke dangerous permissions
-REVOKE DELETE, TRUNCATE ON jorb FROM pyjobby_worker;
-```
-
-#### Application Security
-
-```python
-# Validate job inputs
-class SecureJob(Job):
-    def task(self, user_input: str):
-        # Sanitize inputs
-        if not self.validate_input(user_input):
-            raise ValueError("Invalid input")
-
-        # Use parameterized queries
-        await self.s.cxn.execute(
-            "INSERT INTO logs (data) VALUES ($1)",
-            user_input,  # Safe from SQL injection
-        )
-
-    def validate_input(self, data: str) -> bool:
-        # Input validation logic
-        return len(data) < 1000 and data.isprintable()
-```
-
-### Capacity Planning
-
-#### Estimating Worker Count
-
-```python
-# Formula: Workers = (Jobs/Day) / (86400 / Avg_Job_Duration)
-
-# Example:
-jobs_per_day = 1_000_000
-avg_job_duration_seconds = 2
-
-workers_needed = (jobs_per_day * avg_job_duration_seconds) / 86400
-# = 1,000,000 * 2 / 86400 = ~23 workers
-
-# Add 20% buffer for peak load
-workers_total = workers_needed * 1.2  # = ~28 workers
-```
-
-#### Database Sizing
-
-```sql
--- Estimate table size
-SELECT pg_size_pretty(pg_total_relation_size('jorb'));
-
--- Estimate based on retention
--- Assumptions:
---   - 1M jobs/day
---   - Keep 30 days
---   - Avg row size: 500 bytes
--- Size = 1M * 30 * 500 bytes = 15 GB
--- Add indexes: ~2x = 30 GB total
-```
-
-### Disaster Recovery
-
-#### Backup Strategy
+A worker that has lost its database is still a healthy process — it
+reconnects with backoff. Do not attach a liveness probe that restarts it
+for that; restarting only abandons its in-flight jobs to the monitor. If
+you want a fleet-level probe, run `pj-admin doctor` from a CronJob and
+alert on its exit code.
+
+## Exposure and access
+
+Neither web surface authenticates anything. `pj-web` binds `127.0.0.1:8081`
+and `pj-ws` binds `127.0.0.1:8082` by default, and both say so in
+`--help`. `pj-web` can cancel, retry and delete jobs; `pj-ws` can cancel,
+retry and re-prioritise them. Keep them on localhost, behind an
+authenticating reverse proxy, or on a private network. Do not pass
+`--host 0.0.0.0` without one of those.
+
+For the database, give the platform a role that can write every `jorb*`
+table. It needs `DELETE` — retention is a delete — and it needs to create
+the schema on first deploy. Do not narrow it to `SELECT, INSERT, UPDATE`
+on `jorb` alone; the platform owns eleven tables (`jorb`, `jorb_queue`,
+`jorb_worker`, `jorb_step`, `jorb_event`, `jorb_mailbox`, `jorb_history`,
+`jorb_schedule`, `jorb_schedule_log`, `jorb_dag`, `jorb_dependencies`) plus
+`schema_migrations`, and the monitor deletes from most of them.
+
+## Backup and restore
+
+`pg_dump` the whole database. There is nothing outside PostgreSQL to back
+up, and nothing that has to be quiesced first: every state transition is a
+single committed transaction, and a restored snapshot is a consistent
+platform state.
 
 ```bash
-#!/bin/bash
-# /usr/local/bin/pyjobby-backup.sh
-
-# Full database backup
-pg_dump -U pyjobby -d pyjobby_prod -F c -f /backups/pyjobby-$(date +%Y%m%d-%H%M%S).dump
-
-# Archive old jobs before backup
-psql -U pyjobby -d pyjobby_prod <<EOF
-BEGIN;
-CREATE TABLE IF NOT EXISTS jorb_archive (LIKE jorb INCLUDING ALL);
-INSERT INTO jorb_archive SELECT * FROM jorb
-WHERE state IN ('finished', 'crashed') AND updated < NOW() - INTERVAL '30 days';
-DELETE FROM jorb
-WHERE state IN ('finished', 'crashed') AND updated < NOW() - INTERVAL '30 days';
-COMMIT;
-EOF
-
-# Upload to S3
-aws s3 cp /backups/pyjobby-*.dump s3://my-backups/pyjobby/
-
-# Clean up old local backups
-find /backups -name "pyjobby-*.dump" -mtime +7 -delete
+pg_dump -Fc -d "$PYJOBBY_DSN" -f pyjobby-$(date +%Y%m%d-%H%M%S).dump
 ```
 
-#### Recovery Procedure
+Do not write your own archive-and-delete job. Retention already deletes on
+a schedule, in retention order, through the index built for it, in bounded
+batches that cannot starve recovery. A hand-rolled `DELETE ... WHERE
+updated < ...` competes with it, misses the tables that hang off `jorb`,
+and can delete a terminal job that a `waiting` job still depends on.
+
+To restore: stop the workers, `pg_restore`, run `pj-admin db migrate` (it
+is a no-op if the dump was current), then `pj-admin doctor` before starting
+anything.
+
+## Verifying a deployment
+
+In order, on the target database:
 
 ```bash
-# 1. Stop all workers
-sudo systemctl stop 'pyjobby@*'
-
-# 2. Restore database
-pg_restore -U pyjobby -d pyjobby_prod -c /backups/pyjobby-20251118.dump
-
-# 3. Verify data
-psql -U pyjobby -d pyjobby_prod -c "SELECT COUNT(*) FROM jorb;"
-
-# 4. Restart workers
-sudo systemctl start 'pyjobby@*'
+pj-admin db status         # base schema installed, no pending migrations
+pj-admin doctor            # exits 1 on any FAIL
+pj-bench plans             # exits non-zero if any hot query lost its index
 ```
 
-### Troubleshooting
+Then start one worker and run the real end-to-end path — `pj-bench e2e`
+launches actual `pj` processes against actual jobs, in its own uniquely
+named queue that it deletes afterwards:
 
-See `docs/troubleshooting.md` for common issues and solutions.
-
-## Multi-Region Deployment
-
-### Architecture
-
-```
-Region A:                   Region B:
-┌─────────────┐            ┌─────────────┐
-│  Workers    │            │  Workers    │
-│  (4 procs)  │            │  (4 procs)  │
-└──────┬──────┘            └──────┬──────┘
-       │                          │
-       │   ┌──────────────────┐   │
-       └───┤  PostgreSQL      │───┘
-           │  (Primary)       │
-           │  Replication ──► │
-           └──────────────────┘
+```console
+$ pj-bench e2e --jobs 30000 -w 4 --repeat 1 --no-warmup --timeout 300
+metric                             value
+---------------------------------------------------------------------
+worker processes                   4
+jobs per run                       30,000
+completed jobs/s                   2,462.65
+spread                             0%
+headroom vs 278/s                  8.86x
+enqueue->finished p50/p95/p99/max  6.922 / 12.496 / 12.960 / 13.077 s
+claim->finished p50/p95/p99/max    0.001 / 0.001 / 0.002 / 0.022 s
+drained within timeout             yes
 ```
 
-Workers in both regions connect to same PostgreSQL primary. Use read replicas for read-heavy workloads.
+Those two latency rows are the ones to read: `claim->finished` is what the
+platform costs, `enqueue->finished` is queue wait on top of it, and the gap
+between them is capacity. Run this against a database that is otherwise
+idle — the command refuses by default if more than 1000 jobs are already
+there, because their contention would be measured as yours.
 
-### Region-Specific Capabilities
+`pj-bench plans` belongs in CI. It is the only check here that catches a
+problem before it reaches production.
 
-```bash
-# Region A
-pj --queue default --cap "region:us-east-1" --cap "host:$(hostname)"
+## Capacity
 
-# Region B
-pj --queue default --cap "region:eu-west-1" --cap "host:$(hostname)"
-
-# Route jobs to specific region
-await conn.execute("""
-    INSERT INTO jorb (job_class, kwargs, capability)
-    VALUES ($1, $2, $3)
-""", "job.process.Data", ..., "region:us-east-1")
-```
-
-## Summary
-
-Key deployment practices:
-
-- ✅ Use systemd/Docker/K8s for orchestration
-- ✅ Tune PostgreSQL for workload
-- ✅ Implement monitoring and alerting
-- ✅ Configure structured logging
-- ✅ Secure database access
-- ✅ Plan for capacity and scaling
-- ✅ Implement backup and recovery procedures
-- ✅ Document runbooks for common scenarios
-
-Pyjobby is designed to be simple to deploy while providing production-grade reliability.
+Sizing, throughput ceilings, what breaks first, and the pre-flight
+checklist for running at rate are all in [SCALE.md](SCALE.md). The short
+version: the wall is plans, not volume, and the three things worth alerting
+on are `notify_queue_usage`, backlog **age** (not depth), and completions
+per second against arrivals per second.

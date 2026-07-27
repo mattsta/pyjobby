@@ -1,952 +1,430 @@
-# Pyjobby Troubleshooting Guide
+# Troubleshooting pyjobby
 
-## Common Issues and Solutions
+A symptom index. Every entry names the check that confirms it and the
+document that explains it — the playbooks live in
+[OPERATIONS.md](OPERATIONS.md), the scaling failure modes in
+[SCALE.md](SCALE.md), and this file does not restate either.
 
-### Workers Not Claiming Jobs
-
-**Symptoms**:
-
-- Jobs stuck in `queued` state
-- Workers running but idle
-- No logs showing job execution
-
-**Possible Causes**:
-
-#### 1. Queue Mismatch
-
-**Diagnosis**:
-
-```sql
--- Check which queues have jobs
-SELECT queue, COUNT(*) FROM jorb WHERE state = 'queued' GROUP BY queue;
-
--- Check worker logs for queue name
-grep "Connected and waiting for jobs" /var/log/pyjobby/worker.log
-```
-
-**Solution**:
+## Start with `doctor`
 
 ```bash
-# Workers must match job queue
-pj --queue email  # If jobs are in 'email' queue
-
-# Or use multiple queues
-pj --queue default --queue email
+pj-admin --dsn "$PYJOBBY_DSN" doctor
 ```
+
+It is the executable version of "is the platform healthy", it runs in about
+a second, and it exits 1 on any FAIL — so it works as a cron probe, a CI
+gate, and a deploy smoke test. Run it before reading logs.
+
+```console
+$ pj-admin doctor
+PASS database: connected
+PASS schema: installed, migrations current (baseline)
+PASS triggers: all NOTIFY triggers present (3)
+PASS notify-queue: 0.0% full
+PASS workers: 4 live worker(s) seen in last 60s
+PASS job-threads: 4 live worker(s) claiming
+WARN queue pjbench_e2e_67f5e7c6: depth 10067, oldest queued 0m (thresholds: depth 10000, age 60m)
+PASS dlq: empty
+PASS schedules: no overdue schedules
+```
+
+FAIL means the platform cannot function and is the only thing that changes
+the exit code. Lost capacity is a WARN, deliberately: "no live workers at
+all" is a WARN, so one worker of ten refusing to claim cannot be graver.
+
+| Check | FAIL / WARN means | Go to |
+|---|---|---|
+| `database` | cannot connect with the DSN or config given | [Config and connection](#the-database-is-unreachable-or-the-config-is-wrong) |
+| `schema` | no schema, or migrations pending | [Schema is missing or stale](#the-schema-is-missing-or-stale) |
+| `triggers` | a NOTIFY trigger is missing — workers will not wake and clients will not be notified | [Schema is missing or stale](#the-schema-is-missing-or-stale) |
+| `notify-queue` | WARN at 25% full, FAIL past 50% | [NOTIFY queue saturation](#notify-queue-saturation) |
+| `workers` | no heartbeat in the last 60s | [Nothing is being claimed](#nothing-is-being-claimed) |
+| `job-threads` | live workers that claim nothing | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing) |
+| `queue <name>` | backlog past `--max-depth` (10000) or `--max-age-minutes` (60) | [The backlog is growing](#the-backlog-is-growing) |
+| `dlq` | jobs have exhausted their retries | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq) |
+| `schedules` | an enabled schedule is overdue by >5m | [A schedule is not firing](#a-schedule-is-not-firing) |
+
+Age is the more honest queue alarm than depth: a deep queue that is
+draining is fine; an old queue is not. Tune the thresholds per install with
+`--max-depth` and `--max-age-minutes`.
+
+## Symptom index
+
+| Symptom | Section |
+|---|---|
+| Jobs sit in `queued`, workers look idle | [Nothing is being claimed](#nothing-is-being-claimed) |
+| A worker heartbeats but never claims | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing) |
+| Queue depth or age climbing | [The backlog is growing](#the-backlog-is-growing) |
+| The table grows even though retention is on | [Retention is falling behind](#retention-is-falling-behind) |
+| Enqueues start failing platform-wide | [NOTIFY queue saturation](#notify-queue-saturation) |
+| A cron schedule stopped running | [A schedule is not firing](#a-schedule-is-not-firing) |
+| Jobs stuck in `claimed` or `running` | [A job is stuck](#a-job-is-stuck-in-claimed-or-running) |
+| `crashed` count rising | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq) |
+| `column ... does not exist`, `relation "jorb" does not exist` | [Schema is missing or stale](#the-schema-is-missing-or-stale) |
+| `Job class not found` | [A job class cannot be imported](#a-job-class-cannot-be-imported) |
+| A job ran twice | [A job ran more than once](#a-job-ran-more-than-once) |
+| A process exits immediately at startup | [Config and connection](#the-database-is-unreachable-or-the-config-is-wrong) |
 
 ---
 
-#### 2. Capability Mismatch
+## The database is unreachable, or the config is wrong
 
-**Diagnosis**:
+Every entry point exits non-zero when it cannot resolve or load its
+configuration, and says which of the two failed:
 
-```sql
--- Check required capabilities
-SELECT DISTINCT capability FROM jorb WHERE state = 'queued';
-
--- Check if any jobs require capabilities worker doesn't have
-SELECT id, job_class, capability
-FROM jorb
-WHERE state = 'queued'
-  AND capability IS NOT NULL
-  AND capability NOT IN ('host:your-hostname');
+```console
+$ pj-admin -c /nonexistent.conf.py doctor
+Error: Could not load config file: /nonexistent.conf.py
+Error: '/nonexistent.conf.py' doesn't exist
+Error: Use --config to point at a pyjobby conf file, or --dsn to connect directly.
+FAIL config: unusable
 ```
 
-**Solution**:
+`pj`, `pj-scheduler`, `pj-web` and `pj-ws` accept **only** a config file —
+they do not read `PYJOBBY_DSN`. A container that exports the DSN and
+mounts no config will start `pj-monitor` and `pj-admin` fine and fail every
+worker. The full matrix is in
+[deployment-guide.md § Configuration](deployment-guide.md#configuration).
+
+A database that goes away *after* startup is not an incident: workers, the
+monitor and the scheduler reconnect with backoff and re-prepare their
+statements. Nothing needs restarting, and restarting a worker only
+abandons its in-flight jobs to the monitor.
+
+## The schema is missing or stale
+
+```console
+$ pj-admin doctor
+PASS database: connected
+FAIL schema: base schema not installed (run: pj-admin db migrate)
+$ echo $?
+1
+```
+
+Fix: `pj-admin db migrate`. See
+[deployment-guide.md § The database](deployment-guide.md#the-database).
+
+A **stale** schema looks different and is worse. `doctor` only verifies
+that `jorb` exists and that no numbered migration is pending, so a database
+installed from a different revision of `schema.sql` passes that check and
+then fails at the first statement needing a column it does not have:
+
+```
+asyncpg.exceptions.UndefinedColumnError: column "job_threads" does not exist
+```
+
+```
+asyncpg.exceptions.UndefinedTableError: relation "jorb" does not exist
+```
+
+Both surface as a traceback rather than a message, from whichever command
+happened to touch that column first. Treat any `UndefinedColumnError` or
+`UndefinedTableError` naming a `jorb*` table as "this database does not
+match this version of pyjobby" and re-create it — the schema is one file
+shipped inside the package, and there is no supported way to patch a
+database into agreement with it.
+
+## Nothing is being claimed
+
+In order:
+
+1. **`pj-admin doctor`.** A `WARN job-threads` line names any worker that
+   is alive and claiming nothing — that is a different problem, below.
+2. **`pj-admin queues show NAME`.** Is it `Paused: yes`? Is
+   `Max concurrency` or `Rate limit` set and binding? Both are enforced in
+   the database, so they bind every claimer, and a paused queue stops
+   claims within a fraction of a second.
+3. **`pj-admin workers list`.** Are there live workers *on that queue*?
+   Read the Queue column, not the worker count. `--queue` is **per worker
+   process**: `pj --queue reports --workers 4` starts one worker on
+   `reports` and three on `default`, because `pj` pairs process *i* with
+   queue *i* and pads the list to `--workers` with `default`. A queue that
+   looks unserved while four workers are "live" is usually this. Repeat
+   `--queue` once per worker — see
+   [deployment-guide.md § Worker settings](deployment-guide.md#worker-settings).
+4. **Capability.** A job with a `capability` no worker advertises is
+   invisible to those workers. Workers advertise with `--cap`.
+5. **Priority.** Workers claim `prio <= 1000`, and there is no flag to
+   raise that ceiling. A job enqueued above it is invisible to every
+   worker. Lower numbers are more urgent; `pj-admin jobs inspect ID` shows
+   the job's `Priority`.
+6. **`run_after`.** A job with a future `run_after` is *supposed* to be
+   invisible — that is how retry backoff and durable sleep are
+   implemented. `pj-admin jobs inspect ID` shows it.
+7. **The worker's own log**, for `NOT CLAIMING` (next section).
+
+`pj-admin queues pause` / `resume` and `queues limits` change all of this
+live, with no restart — see
+[OPERATIONS.md § Queue controls](OPERATIONS.md#queue-controls-live-no-restarts).
+
+## A worker is alive, heartbeating, and doing nothing
+
+The worst shape of outage there is: on liveness alone this worker is
+indistinguishable from a healthy idle one. It has abandoned job threads
+filling its pool — synchronous jobs that blew their deadline, which nothing
+can interrupt — so it refuses to claim work it cannot start.
+
+`doctor` names up to three of them and then summarises, and
+`pj-admin workers list` shows the same state per worker:
+
+```
+WARN job-threads: 1 of 4 live worker(s) not claiming -- worker 42 (host-b:9910, queue heavy) 8/8 job threads abandoned. ...
+
+ID  Host      PID    Queue  Status        Threads  Last Seen  Current Job
+2   host-b    9910   heavy  not claiming  8/8      3s ago     -
+```
+
+Alert on `pyjobby_workers_not_claiming > 0`, and watch
+`pyjobby_worker_job_threads_abandoned_max` for the approach: 7 of 8 is one
+timed-out job away from a worker doing nothing and reads identically to 0
+of 8.
+
+It is a WARN, not a FAIL: the condition is self-healing — the threads
+finish and the worker resumes. If it persists, that queue's job class
+blocks far past its timeout, and the fix is a shorter timeout, an
+interruptible implementation, or a dedicated queue and worker for it.
+Raising `--job-threads` buys tolerance, not stoppability.
+
+Full behaviour, the registry columns, and why both counts are published:
+[OPERATIONS.md § Abandoned job threads](OPERATIONS.md#abandoned-job-threads-when-a-worker-stops-claiming-on-purpose).
+
+## The backlog is growing
+
+`doctor` warns per queue; `pj-admin metrics` says whether it is capacity or
+code:
+
+```
+Throughput:        0.35 jobs/s (completed)
+Arrivals:          0.35 jobs/s (created)
+Balance:           +0.00 jobs/s (keeping up)
+...
+Avg Duration:      0.00s
+Avg Queue Wait:    7.00s
+```
+
+* **Arrivals sustained above throughput** is the definition of falling
+  behind. Add workers, or raise `--max-concurrency` if a cap is binding.
+* **Rising queue wait with flat duration** is capacity.
+* **Rising duration** is a code or dependency problem — profile the job,
+  not the platform.
+
+If the backlog is a runaway producer rather than missing capacity,
+`pj-admin queues pause NAME`, triage, then resume; for chronic pressure set
+`--max-concurrency` / `--rate-limit` instead of pausing.
+
+## Retention is falling behind
+
+Retention is on by default, and a sweep that cannot keep up is worse than
+none — the dashboard says retention is enabled while the table grows
+forever. So it says so, at WARNING:
+
+```
+Retention expired jobs: deleted 5000 and stopped on its 5.0s budget with a backlog still pending — retention is falling behind
+```
+
+Caught up looks like this, at INFO:
+
+```
+Retention expired jobs: deleted 1200, caught up
+```
+
+Raise `--retention-batch-size`, or `--retention-max-seconds` if the monitor
+has headroom — but understand the trade: the budget is what stops a
+retention backlog from delaying timeout enforcement and dead-worker
+recovery, which decide how long a stuck job stays stuck. If the arrival
+rate genuinely exceeds what one monitor can delete, shorten
+`--retention-days` instead.
+
+Confirm from the storage side with `pj-admin metrics`, which reports table
+bytes and dead-tuple ratio per table. Background:
+[SCALE.md § Retention falling behind ingest](SCALE.md#2-retention-falling-behind-ingest).
+
+Do not write a cleanup cron alongside it. A hand-rolled `DELETE` competes
+with the sweeps, misses the tables that hang off `jorb`, and can delete a
+terminal job that a `waiting` job still depends on — retention refuses
+those on purpose.
+
+## NOTIFY queue saturation
+
+The highest-severity failure mode in the system, because it is a cliff
+rather than a gradient. PostgreSQL's async notification queue is
+server-wide and bounded, and **at 100% every transaction that issues a
+NOTIFY fails** — which means no job can be enqueued or completed anywhere.
+
+```
+WARN notify-queue: 31.0% full and it should be near empty -- ...
+FAIL notify-queue: 62.0% full -- at 100% every enqueue and completion fails platform-wide; ...
+```
+
+`doctor` WARNs at 25% and FAILs past 50%, well before the edge;
+`pyjobby_notify_queue_usage_ratio` is the metric to alert on.
+
+The queue drains only as fast as the **slowest connected listener**, so the
+cause is almost always a consumer that stopped reading — a wedged
+dashboard, a stuck `pj-ws`, an abandoned `LISTEN` session. Find it in
+`pg_stat_activity` and end it. There is no channel to turn off for relief:
+every remaining channel is demand-gated (an unobserved job emits none) and
+all four are load-bearing. Full argument:
+[SCALE.md § NOTIFY queue saturation](SCALE.md#3-notify-queue-saturation--the-cliff).
+
+A missing trigger is the opposite failure and `doctor` checks it
+separately — `FAIL triggers` means workers will not be woken and clients
+will not be notified. That is a stale-schema symptom; see above.
+
+## A schedule is not firing
+
+```
+WARN schedules: 1 enabled schedule(s) overdue by >5m (is pj-scheduler running?)
+```
+
+In order:
+
+1. **Is `pj-scheduler` running?** Nothing fires without it, and it is a
+   separate process from the workers.
+2. **Is the schedule enabled?** `pj-admin schedule show NAME`. Two things
+   disable a schedule on their own, and both log at ERROR:
+   * **The circuit breaker** — `Schedule 'X' disabled: Circuit breaker
+     triggered: 5 consecutive failures (threshold: 5)`. Fix the job, then
+     `pj-admin schedule enable NAME`.
+   * **Unevaluatable** — `Schedule N disabled: ...`. A cron expression or
+     timezone that cannot be evaluated can never get a new `next_run`, so
+     leaving it enabled would make it due forever and fail on every poll.
+     Disabling it is the only outcome that both stops the spin and is
+     visible. Delete and re-add it with a valid expression; `schedule add`
+     validates both up front.
+3. **Was it skipped rather than failed?** `pj-admin schedule history NAME
+   --result skipped` — `max_concurrent` and the backpressure threshold both
+   skip a fire deliberately.
+4. **Missed fires are not backfilled.** A scheduler that was down at fire
+   time skips those ticks; `next_run` advances from now.
+
+Everything a schedule means is in
+[RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md).
+
+## A job is stuck in `claimed` or `running`
+
+Usually it is not stuck — it is being handled.
 
 ```bash
-# Add required capability to worker
-pj --cap "gpu" --cap "ml-node"
-
-# Or remove capability requirement from jobs
-UPDATE jorb SET capability = NULL WHERE id = 12345;
+pj-admin jobs inspect ID
 ```
 
----
+If it is past its `timeout_at`, `pj-monitor` will retry or dead-letter it
+per its `on_timeout` policy on its next sweep (10s by default). If its
+worker's host died, the monitor requeues its in-flight jobs within
+`--liveness-grace` (60s) and the job resumes from its last completed DXE
+step. Both are automatic, and both require `pj-monitor` to actually be
+running — if it is not, nothing recovers, ever. That is the first thing to
+check.
 
-#### 3. Future `run_after` Timestamp
+To intervene now: `pj-admin jobs cancel ID`. Running jobs receive the
+cancellation within about a second and stop at their next await point.
 
-**Diagnosis**:
+**Do not requeue jobs with hand-written SQL.** An `UPDATE jorb SET state =
+'queued'` writes no history row, skips the `on_timeout` policy, and hands
+the row back to a claimer while the original execution may still be alive.
+The platform's own recovery advances `run_epoch`, which is what fences a
+superseded execution out of writing results or checkpoints; a manual update
+does not, and the two executions race. Use `pj-admin jobs requeue ID`.
 
-```sql
--- Check if jobs are scheduled for the future
-SELECT id, job_class, run_after, run_after - NOW() as time_until_run
-FROM jorb
-WHERE state = 'queued'
-  AND run_after > NOW();
-```
+A note on what a timeout can interrupt: async code is genuinely stopped at
+its await point. A *synchronous* `task()` runs in a worker thread — the
+deadline fires on time and the job is recorded as timed out, but the thread
+runs to completion and its result is discarded. That thread is the one that
+later shows up as abandoned. Details in
+[OPERATIONS.md § Timeouts](OPERATIONS.md#timeouts).
 
-**Solution**:
-Wait for timestamp to pass, or update to run immediately:
+## Jobs are landing in the DLQ
 
-```sql
-UPDATE jorb
-SET run_after = NOW()
-WHERE id = 12345;
-```
-
----
-
-#### 4. Priority Too Low
-
-**Diagnosis**:
-
-```sql
--- Check job priorities
-SELECT id, job_class, prio FROM jorb WHERE state = 'queued' ORDER BY prio;
-
--- Check worker priority limit (from logs)
-grep "prio" /var/log/pyjobby/worker.log
-```
-
-**Solution**:
+The DLQ is exactly `state = 'crashed'` — the terminal state after retries
+are exhausted. There is no separate table and no error-count heuristic.
 
 ```bash
-# Start worker with higher priority limit
-pj --prio 10000  # Process jobs with prio <= 10000
-
-# Or lower job priority
-UPDATE jorb SET prio = 0 WHERE id = 12345;
+pj-admin dlq list
+pj-admin jobs history ID     # every attempt, with its error
+pj-admin jobs steps ID       # where a durable pipeline stopped
 ```
 
----
-
-#### 5. Database Connection Issues
-
-**Diagnosis**:
-
-```bash
-# Check worker logs for connection errors
-grep -i "error" /var/log/pyjobby/worker.log
-grep -i "connection" /var/log/pyjobby/worker.log
-
-# Test database connection
-psql -h localhost -U pyjobby -d pyjobby_prod -c "SELECT 1;"
-```
-
-**Solution**:
-
-```python
-# Check config file
-cat pyjobby.conf.py
-
-# Verify credentials
-psql -h <host> -U <user> -d <database>
-
-# Check PostgreSQL logs
-tail -f /var/log/postgresql/postgresql-15-main.log
-```
-
----
-
-### Jobs Stuck in "claimed" or "running" State
-
-**Symptoms**:
-
-- Jobs never complete
-- `state` is "claimed" or "running" for hours/days
-- Worker that claimed job is no longer running
-
-**Cause**: Worker crashed before completing job (see CODE_AUDIT.md Issue #1)
-
-**Solution**:
-
-**Immediate Fix** (Manual Recovery):
-
-```sql
--- Find stuck jobs
-SELECT id, job_class, worker_host, worker_pid, updated,
-       NOW() - updated as stuck_duration
-FROM jorb
-WHERE state IN ('claimed', 'running')
-  AND updated < NOW() - INTERVAL '1 hour';
-
--- Re-queue them
-UPDATE jorb
-SET state = 'queued', run_after = NOW()
-WHERE state IN ('claimed', 'running')
-  AND updated < NOW() - INTERVAL '1 hour';
-```
-
-**Automated Solution** (Create Cron Job):
-
-```bash
-# /usr/local/bin/pyjobby-recover-stuck-jobs.sh
-#!/bin/bash
-psql -U pyjobby -d pyjobby_prod <<EOF
-UPDATE jorb
-SET state = 'queued',
-    run_after = TIMEZONE('utc', CURRENT_TIMESTAMP)
-WHERE state IN ('claimed', 'running')
-  AND updated < TIMEZONE('utc', CURRENT_TIMESTAMP) - INTERVAL '1 hour';
-EOF
-
-# Add to crontab (run every 5 minutes)
-*/5 * * * * /usr/local/bin/pyjobby-recover-stuck-jobs.sh
-```
-
-**Long-term Fix**: Implement job recovery on worker startup (see CODE_AUDIT.md)
-
----
-
-### High Error Rate
-
-**Symptoms**:
-
-- Many jobs in `crashed` state
-- Worker logs show frequent exceptions
-
-**Diagnosis**:
-
-#### 1. Identify Failing Jobs
-
-```sql
--- Recent crashes
-SELECT job_class, COUNT(*) as crash_count,
-       AVG(error_count) as avg_retries
-FROM jorb
-WHERE state = 'crashed'
-  AND updated > NOW() - INTERVAL '24 hours'
-GROUP BY job_class
-ORDER BY crash_count DESC;
-
--- View specific error messages
-SELECT id, job_class, error_message, error_backtrace
-FROM jorb
-WHERE state = 'crashed'
-ORDER BY updated DESC
-LIMIT 10;
-```
-
-#### 2. Common Error Causes
-
-**A. Bad Input Data**
-
-```sql
--- Example: Email job failing due to invalid email
-SELECT id, kwargs->>'email' as email
-FROM jorb
-WHERE job_class = 'job.email.SendEmail'
-  AND state = 'crashed';
-```
-
-**Solution**: Validate inputs before submission
-
-```python
-def validate_email(email: str) -> bool:
-    return "@" in email and "." in email.split("@")[1]
-
-
-if not validate_email(email):
-    raise ValueError(f"Invalid email: {email}")
-```
-
-**B. External Service Unavailable**
-
-```python
-# Error: Connection timeout to external API
-# Solution: Add retry logic with backoff
-class APIJob(Job):
-    async def task(self, endpoint: str):
-        for attempt in range(3):
-            try:
-                return await call_api(endpoint)
-            except aiohttp.ClientError:
-                if attempt < 2:
-                    await asyncio.sleep(2**attempt)
-                    continue
-                raise
-```
-
-**C. Resource Limits**
-
-```python
-# Error: Out of memory
-# Solution: Process data in chunks
-class ProcessLargeFile(Job):
-    def task(self, filepath: str):
-        # Bad: Load entire file into memory
-        # data = open(filepath).read()
-
-        # Good: Process in chunks
-        with open(filepath, "rb") as f:
-            while chunk := f.read(4096):
-                process_chunk(chunk)
-```
-
----
-
-### Database Performance Issues
-
-**Symptoms**:
-
-- Slow job claiming
-- Workers timing out
-- High database CPU usage
-
-**Diagnosis**:
-
-#### 1. Check Index Usage
-
-```sql
--- Are indexes being used?
-EXPLAIN ANALYZE
-SELECT id FROM jorb
-WHERE queue = 'default'
-  AND state = 'queued'
-  AND run_after <= NOW()
-ORDER BY prio, run_after
-LIMIT 1;
-
--- Should show "Index Scan using jorb_poll_idx"
--- If showing "Seq Scan", indexes are not being used!
-```
-
-**Solution** (If indexes missing):
-
-```sql
--- Recreate indexes
-CREATE INDEX jorb_poll_idx ON jorb (queue, capability, prio, run_after)
-WHERE state = 'queued' OR state = 'crashed';
-```
-
-#### 2. Table Bloat
-
-**Diagnosis**:
-
-```sql
--- Check table size
-SELECT pg_size_pretty(pg_total_relation_size('jorb'));
-
--- Check dead tuples
-SELECT n_dead_tup, n_live_tup,
-       round(100.0 * n_dead_tup / (n_live_tup + n_dead_tup), 2) as dead_pct
-FROM pg_stat_user_tables
-WHERE relname = 'jorb';
-```
-
-**Solution**:
-
-```sql
--- Vacuum the table
-VACUUM VERBOSE jorb;
-
--- Or full vacuum (requires table lock, do during maintenance window)
-VACUUM FULL jorb;
-
--- Analyze to update statistics
-ANALYZE jorb;
-```
-
-#### 3. Too Many Completed Jobs
-
-**Diagnosis**:
-
-```sql
--- Count jobs by state
-SELECT state, COUNT(*) FROM jorb GROUP BY state;
-
--- If finished/crashed count is in millions, cleanup needed
-```
-
-**Solution**:
-
-```bash
-# Archive old jobs
-psql -U pyjobby -d pyjobby_prod <<EOF
--- Archive to separate table
-CREATE TABLE IF NOT EXISTS jorb_archive (LIKE jorb INCLUDING ALL);
-
-INSERT INTO jorb_archive
-SELECT * FROM jorb
-WHERE state IN ('finished', 'crashed')
-  AND updated < NOW() - INTERVAL '30 days';
-
--- Delete archived jobs
-DELETE FROM jorb
-WHERE state IN ('finished', 'crashed')
-  AND updated < NOW() - INTERVAL '30 days';
-
--- Vacuum to reclaim space
-VACUUM ANALYZE jorb;
-EOF
-```
-
-**Automate** (Add to cron):
-
-```bash
-# /etc/cron.daily/pyjobby-cleanup
-0 2 * * * /usr/local/bin/pyjobby-archive-old-jobs.sh
-```
-
-#### 4. Connection Pool Exhaustion
-
-**Diagnosis**:
-
-```sql
--- Check current connections
-SELECT COUNT(*), state
-FROM pg_stat_activity
-WHERE datname = 'pyjobby_prod'
-GROUP BY state;
-
--- Check max connections
-SHOW max_connections;
-```
-
-**Solution**:
-
-```python
-# Reduce pool size in config
-db_params = {
-    "database": "pyjobby_prod",
-    "min_size": 1,  # Reduce from 2
-    "max_size": 5,  # Reduce from 10
-}
-
-# Or increase PostgreSQL max_connections
-# In postgresql.conf:
-max_connections = 200  # Increase from 100
-```
-
----
-
-### Worker Memory Leaks
-
-**Symptoms**:
-
-- Worker memory usage grows over time
-- Eventually crashes with OOM error
-
-**Diagnosis**:
-
-```bash
-# Monitor worker memory
-ps aux | grep pj
-
-# Watch memory over time
-watch -n 5 'ps aux | grep pj | grep -v grep'
-```
-
-**Common Causes**:
-
-#### 1. Cache Growing Unbounded
-
-**Problem**:
-
-```python
-class LeakyJob(Job):
-    def task(self, data: str):
-        # Cache grows forever!
-        cache_key = f"result:{data}"
-        self.s.cache[cache_key] = large_computation(data)
-```
-
-**Solution**:
-
-```python
-class FixedJob(Job):
-    def task(self, data: str):
-        # Limit cache size
-        MAX_CACHE_SIZE = 1000
-
-        if len(self.s.cache) > MAX_CACHE_SIZE:
-            # Clear oldest entries (simple approach)
-            self.s.cache.clear()
-
-        cache_key = f"result:{data}"
-        if cache_key not in self.s.cache:
-            self.s.cache[cache_key] = large_computation(data)
-```
-
-#### 2. Unclosed Resources
-
-**Problem**:
-
-```python
-class LeakyJob(Job):
-    async def task(self, url: str):
-        # File handle never closed!
-        f = open("/tmp/output.txt", "w")
-        f.write(await fetch(url))
-        # Missing f.close()
-```
-
-**Solution**:
-
-```python
-class FixedJob(Job):
-    async def task(self, url: str):
-        # Use context manager
-        with open("/tmp/output.txt", "w") as f:
-            f.write(await fetch(url))
-
-        # Or for async resources
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                data = await response.read()
-```
-
-#### 3. Large Result Objects
-
-**Problem**:
-
-```python
-class LeakyJob(Job):
-    def task(self, filepath: str):
-        # Returns entire file contents!
-        with open(filepath, "rb") as f:
-            return {"data": f.read()}  # Could be gigabytes!
-```
-
-**Solution**:
-
-```python
-class FixedJob(Job):
-    def task(self, filepath: str):
-        # Upload to S3, return reference only
-        s3_key = self.upload_to_s3(filepath)
-        return {"s3_key": s3_key, "size": os.path.getsize(filepath)}
-```
-
-**Monitoring**:
-
-```python
-# Add memory tracking
-import psutil
-import os
-
-
-class MonitoredJob(Job):
-    def run(self):
-        process = psutil.Process(os.getpid())
-        mem_before = process.memory_info().rss / 1024 / 1024  # MB
-
-        result = super().run()
-
-        mem_after = process.memory_info().rss / 1024 / 1024
-        mem_delta = mem_after - mem_before
-
-        if mem_delta > 100:  # More than 100MB increase
-            logger.warning(f"Job {self.job['id']} used {mem_delta:.1f}MB memory")
-
-        return result
-```
-
----
-
-### Web Endpoint Not Working
-
-**Symptoms**:
-
-- HTTP requests to job endpoints return 404 or timeout
-- Workers running but web requests not handled
-
-**Diagnosis**:
-
-#### 1. Check Web Configuration
-
-```python
-# Verify config file
-cat pyjobby.conf.py
-
-# Should have:
-web_listen = {
-    "sites": [{"host": "0.0.0.0", "port": 8080}],
-    "paths": {"job.webhook.Handler"}  # Job class must be in paths!
-}
-```
-
-**Solution**:
-
-```python
-# Add job class to paths
-web_listen = {
-    "sites": [{"host": "0.0.0.0", "port": 8080}],
-    "paths": {
-        "job.webhook.Handler",  # Add your job class here
-    },
-}
-```
-
-#### 2. Check Port Binding
-
-```bash
-# Is worker listening?
-netstat -tlnp | grep 8080
-
-# Or with ss
-ss -tlnp | grep 8080
-
-# Should show: LISTEN 0.0.0.0:8080
-```
-
-**Solution**:
-
-```bash
-# Check firewall
-sudo ufw status
-sudo ufw allow 8080
-
-# Check SELinux (if applicable)
-sudo semanage port -a -t http_port_t -p tcp 8080
-```
-
-#### 3. Test Endpoint
-
-```bash
-# Test with curl
-curl -v http://localhost:8080/job.webhook.Handler
-
-# Should NOT return "not so fast!" (that means path not in whitelist)
-
-# Check worker logs
-tail -f /var/log/pyjobby/worker.log
-```
-
----
-
-### Job Not Found Error
-
-**Symptoms**:
+`jobs history` is the useful one: the job has kept a single row since it
+was enqueued, so the per-attempt trail is the only place the earlier
+failures exist.
+
+After a code fix, `pj-admin dlq retry ID` requeues the same row with a
+fresh attempt budget. A DXE job resumes from its last completed
+checkpoint; `pj-admin jobs requeue ID --fresh` wipes the checkpoints and
+restarts from step 1.
+
+Watch `DLQ Growth` in `pj-admin metrics` and `Retry Pressure` next to it —
+retries that eventually succeed cost throughput without ever reaching the
+DLQ, so a flat DLQ with rising retry pressure is still a problem.
+
+## A job class cannot be imported
 
 ```
 FileNotFoundError: Job class not found: job.email.SendEmail; search path: [...]
+TypeError: job.email.SendEmail is not a pyjobby Job subclass (got ...)
 ```
 
-**Diagnosis**:
+The worker resolves `job_class` as a dotted path at execution time, so the
+class must be importable *by the worker process*, not by whatever enqueued
+it — and the message prints the search path it used. Check, in order: the
+dotted path recorded on the job (`pj-admin jobs inspect ID` prints it,
+case-sensitively), the worker's `--path` flags, and `PYTHONPATH` in the
+unit or container that starts it. The `TypeError` variant means the path
+resolved to something that is not a `pyjobby.pj.Job` subclass — usually a
+module, or the wrong name in the right module.
 
-#### 1. Check Job Class Exists
+This crashes the job, so it retries and eventually dead-letters — the
+signature is a whole job class arriving in the DLQ at once after a deploy
+that moved a module.
 
-```bash
-# Verify file exists
-ls -la job/email.py
+## A job ran more than once
 
-# Verify class is defined
-grep "class SendEmail" job/email.py
-```
+Retries re-run `task()` from the beginning unless the job checkpoints its
+work. That is the design: at-least-once execution, with the tools to make
+it exactly-once where it matters.
 
-**Solution**:
+* **Durable steps** — `self.step(...)` records each completed step, and a
+  completed step never runs twice, fenced by `run_epoch` against a zombie
+  execution. This is the real answer for side effects. See
+  [DXE.md](DXE.md).
+* **`deadline_key`** — a partial unique index makes one *queued* row per
+  `(deadline_key, queue)`, so duplicate submissions collapse into one job.
+  This is the enqueue-side guard, not the execution-side one.
+* **Idempotent side effects** — the fallback when neither applies.
 
-```python
-# Ensure proper structure
-# job/email.py
-from pyjobby.pj import Job
+Note that a re-run you asked for is a separate verb precisely because it
+repeats side effects: `jobs retry` refuses a finished job, `jobs requeue`
+accepts one. See
+[OPERATIONS.md § Retry vs. re-run](OPERATIONS.md#retry-vs-re-run).
 
+---
 
-class SendEmail(Job):  # Class name must match
-    def task(self, **kwargs):
-        pass
-```
+## When you still need SQL
 
-#### 2. Check Python Path
-
-```bash
-# Verify worker can import
-python3 -c "import job.email; print(job.email.SendEmail)"
-
-# Should print: <class 'job.email.SendEmail'>
-```
-
-**Solution**:
-
-```bash
-# Add path when starting worker
-pj --path /opt/myapp --path /opt/myapp/workers
-
-# Or set PYTHONPATH
-export PYTHONPATH=/opt/myapp:$PYTHONPATH
-pj
-```
-
-#### 3. Check Job Class Name in Database
+Everything above has a command, and the commands write history where hand
+SQL does not. When you genuinely need to look at the raw tables, look —
+but treat writes as out of bounds:
 
 ```sql
--- Verify spelling
-SELECT DISTINCT job_class FROM jorb;
+-- what the platform thinks it is doing, right now
+SELECT state, count(*) FROM jorb GROUP BY state;
 
--- Common mistakes:
--- "job.email.sendemail"  ✗ (lowercase)
--- "job.email.SendEmail"  ✓ (correct)
--- "jobs.email.SendEmail" ✗ (wrong package)
+-- is autovacuum keeping up on the hot table
+SELECT n_live_tup, n_dead_tup FROM pg_stat_user_tables WHERE relname = 'jorb';
+
+-- who is not draining the notification queue
+SELECT pg_notification_queue_usage();
 ```
 
----
-
-### Jobs Running Multiple Times
-
-**Symptoms**:
-
-- Same job executes multiple times
-- Duplicate side effects (emails sent twice, etc.)
-
-**Causes**:
-
-#### 1. Non-Idempotent Job Retrying
-
-**Problem**:
-
-```python
-class SendEmail(Job):
-    def task(self, to: str):
-        send_email(to, "Welcome!")
-        raise Exception("Oops!")  # Job retries, email sent again!
-```
-
-**Solution**: Make idempotent
-
-```python
-class SendEmail(Job):
-    async def task(self, to: str, message_id: str):
-        # Check if already sent
-        sent = await self.s.cxn.fetchval(
-            "SELECT 1 FROM sent_emails WHERE message_id = $1", message_id
-        )
-
-        if not sent:
-            send_email(to, "Welcome!")
-
-            # Record that we sent it
-            await self.s.cxn.execute(
-                "INSERT INTO sent_emails (message_id, sent_at) VALUES ($1, NOW())",
-                message_id,
-            )
-```
-
-#### 2. Duplicate Job Submission
-
-**Problem**:
-
-```python
-# User clicks "submit" button multiple times
-for _ in range(5):  # Oops!
-    await submit_job("job.Process", {"data": "..."})
-```
-
-**Solution**: Use deadline_key
-
-```python
-import uuid
-
-# Generate unique key for this operation
-operation_id = str(uuid.uuid4())
-
-await conn.execute(
-    """
-    INSERT INTO jorb (job_class, kwargs, deadline_key)
-    VALUES ($1, $2, $3)
-    ON CONFLICT (deadline_key, queue) WHERE state = 'queued' DO NOTHING
-""",
-    "job.Process",
-    '{"data": "..."}',
-    operation_id,
-)
-```
-
----
-
-### Slow Job Processing
-
-**Symptoms**:
-
-- Jobs taking much longer than expected
-- Queue depth growing
-
-**Diagnosis**:
-
-#### 1. Identify Slow Jobs
-
-```sql
--- Find longest-running jobs
-SELECT id, job_class,
-       EXTRACT(EPOCH FROM (NOW() - updated)) as running_seconds
-FROM jorb
-WHERE state = 'running'
-ORDER BY running_seconds DESC
-LIMIT 10;
-
--- Average duration by job class
-SELECT job_class,
-       COUNT(*) as total,
-       AVG(EXTRACT(EPOCH FROM (updated - created))) as avg_seconds
-FROM jorb
-WHERE state = 'finished'
-  AND updated > NOW() - INTERVAL '24 hours'
-GROUP BY job_class
-ORDER BY avg_seconds DESC;
-```
-
-#### 2. Optimize Jobs
-
-**Profile Job**:
-
-```python
-import time
-
-
-class SlowJob(Job):
-    def task(self, **kwargs):
-        t1 = time.time()
-        step1_result = self.step1()
-        logger.info(f"Step 1: {time.time() - t1:.2f}s")
-
-        t2 = time.time()
-        step2_result = self.step2(step1_result)
-        logger.info(f"Step 2: {time.time() - t2:.2f}s")
-
-        # Identify bottleneck, optimize that step
-```
-
-**Common Optimizations**:
-
-```python
-# Bad: N+1 queries
-for user_id in user_ids:
-    user = await fetch_user(user_id)  # 1000 queries!
-    process(user)
-
-# Good: Batch query
-users = await fetch_users(user_ids)  # 1 query
-for user in users:
-    process(user)
-
-# Bad: Blocking I/O
-result = requests.get(url)  # Blocks worker
-
-# Good: Async I/O
-async with aiohttp.ClientSession() as session:
-    async with session.get(url) as response:
-        result = await response.json()
-```
-
-#### 3. Increase Workers
-
-```bash
-# If CPU is underutilized, add more workers
-pj --workers 8  # Increase from 4
-
-# Or start multiple worker instances
-systemctl start pyjobby@default.service
-systemctl start pyjobby@queue2.service
-```
-
----
-
-### Debugging Tips
-
-#### Enable Debug Logging
-
-```python
-# In your job file or pyjobby.conf.py
-from loguru import logger
-import sys
-
-logger.remove()
-logger.add(sys.stderr, level="DEBUG")  # Show all logs
-```
-
-#### Interactive Debugging
-
-```python
-# Add breakpoint in job
-class DebugJob(Job):
-    def task(self, **kwargs):
-        import pdb
-
-        pdb.set_trace()  # Debugger
-        # Job will pause here, attach debugger
-```
-
-#### Query Job History
-
-```sql
--- Trace job through states
-SELECT id, state, updated, error_message
-FROM jorb
-WHERE id = 12345;
-
--- Find related jobs
-SELECT * FROM jorb
-WHERE run_group = (SELECT run_group FROM jorb WHERE id = 12345);
-
--- See what user's jobs are doing
-SELECT id, job_class, state, created
-FROM jorb
-WHERE uid = 123
-ORDER BY created DESC
-LIMIT 50;
-```
-
----
-
-## Getting Help
-
-If you're still stuck:
-
-1. **Check worker logs**:
-
-   ```bash
-   journalctl -u pyjobby@default -f
-   ```
-
-2. **Check PostgreSQL logs**:
-
-   ```bash
-   tail -f /var/log/postgresql/postgresql-15-main.log
-   ```
-
-3. **Enable query logging** (temporarily):
-
-   ```sql
-   ALTER DATABASE pyjobby_prod SET log_statement = 'all';
-   ```
-
-4. **Open GitHub issue** with:
-   - Pyjobby version (`pj -v`)
-   - PostgreSQL version (`SELECT version();`)
-   - Worker configuration
-   - Relevant logs
-   - Steps to reproduce
-
-5. **Community support**:
-   - GitHub Discussions
-   - Stack Overflow tag: `pyjobby`
-
----
-
-## Prevention Checklist
-
-- [ ] Monitor queue depth daily
-- [ ] Set up alerts for stuck jobs
-- [ ] Schedule regular table cleanup
-- [ ] Implement job timeout
-- [ ] Make jobs idempotent
-- [ ] Validate inputs before submission
-- [ ] Test job recovery after worker crash
-- [ ] Monitor database performance
-- [ ] Log structured errors
-- [ ] Track job metrics
-
----
-
-## Quick Reference
-
-```bash
-# View queue status
-psql -c "SELECT state, COUNT(*) FROM jorb GROUP BY state;"
-
-# Find stuck jobs
-psql -c "SELECT id, state, updated FROM jorb WHERE state IN ('claimed', 'running') AND updated < NOW() - INTERVAL '1 hour';"
-
-# Restart workers
-sudo systemctl restart 'pyjobby@*'
-
-# Clean old jobs
-psql -c "DELETE FROM jorb WHERE state = 'finished' AND updated < NOW() - INTERVAL '30 days';"
-
-# Check worker health
-ps aux | grep pj
-sudo systemctl status 'pyjobby@*'
-```
-
-Happy troubleshooting! 🔧
+`pj-bench plans` is the tool for "is a query still using its index" — it
+EXPLAINs every hot query against seeded data and exits non-zero on a
+sequential scan. Run it in CI; it is the only check that catches this class
+of problem before production.
+
+## Reporting a problem
+
+Include the version (`pj -v`), the PostgreSQL version, the full `pj-admin
+doctor` output, and — if it concerns one job — `pj-admin jobs history ID`
+and `pj-admin jobs steps ID`. Those four answer most questions without a
+round trip.

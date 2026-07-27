@@ -1,720 +1,656 @@
-# Pyjobby Admin Tools Documentation
+# The admin surface
 
-**Date**: 2025-11-18
-**Version**: 1.3.0
-**Status**: Production Ready
+Three ways to drive a running platform, over one backend:
 
----
+| | What it is | Best for |
+|---|---|---|
+| `pj-admin` | the operator CLI | everything below; scripting |
+| `pj-web` | HTML admin + `/metrics`, no auth | dashboards, browsing |
+| `pyjobby.admin_api.AdminAPI` | the Python API both of the above call | custom automation |
 
-## 📊 Overview
+This is the reference for *what exists*. What to do with it when something
+is wrong is [OPERATIONS.md](OPERATIONS.md) (playbooks) and
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md) (symptoms). Every command here was
+run against a live database; the outputs are real.
 
-Pyjobby now includes comprehensive administrative tools for managing jobs, queues, and workers:
+## Connecting
 
-1. **Backend Admin API** (`pyjobby/admin_api.py`) - Python API for all management operations
-2. **CLI Tools** (`pj-admin`) - Command-line interface for terminal management
-3. **Web Interface** (`pj-web`) - Modern web UI with htmx for browser-based management
-
-All three interfaces share the same backend API for consistency.
-
----
-
-## 🔧 Backend Admin API
-
-### Installation
-
-The Admin API is included in pyjobby. Just import it:
-
-```python
-from pyjobby.admin_api import AdminAPI
-import asyncpg
-
-# Connect to database
-conn = await asyncpg.connect(
-    database="pyjobby", user="pyjobby", password="password", host="localhost"
-)
-
-# Create API instance
-api = AdminAPI(conn)
-```
-
-### Job Management
-
-#### List Jobs
-
-```python
-# List all jobs
-jobs = await api.list_jobs(limit=50)
-
-# Filter by queue
-jobs = await api.list_jobs(queue="default")
-
-# Filter by state
-jobs = await api.list_jobs(state="crashed")
-
-# Filter by job class (supports LIKE patterns)
-jobs = await api.list_jobs(job_class="job.email%")
-
-# Filter by user ID
-jobs = await api.list_jobs(uid=123)
-
-# Pagination
-jobs = await api.list_jobs(limit=25, offset=50)
-
-# Custom ordering
-jobs = await api.list_jobs(order_by="created", order_dir="DESC")
-```
-
-#### Get Job Details
-
-```python
-job = await api.get_job(job_id=12345)
-
-if job:
-    print(f"Job {job['id']}: {job['state']}")
-    print(f"Class: {job['job_class']}")
-    print(f"Args: {job['kwargs']}")
-    if job["error_message"]:
-        print(f"Error: {job['error_message']}")
-```
-
-#### Retry Jobs
-
-```python
-# Retry single crashed job
-result = await api.retry_job(job_id=12345)
-print(f"Retry queued as job {result['new_job_id']}")
-
-# Retry multiple jobs
-results = await api.retry_jobs([12345, 12346, 12347])
-for r in results:
-    if r["status"] == "error":
-        print(f"Failed: {r['error']}")
-    else:
-        print(f"Job {r['original_job_id']} → {r['new_job_id']}")
-```
-
-#### Cancel Jobs
-
-```python
-# Cancel queued job
-result = await api.cancel_job(job_id=12345)
-
-# Cancel multiple jobs
-results = await api.cancel_jobs([12345, 12346])
-```
-
-#### Delete Jobs
-
-```python
-# Delete single job
-deleted = await api.delete_job(job_id=12345)
-
-# Bulk delete
-count = await api.delete_jobs(queue="test", state="finished", older_than_days=30)
-print(f"Deleted {count} jobs")
-```
-
-### Queue Management
-
-#### List Queues
-
-```python
-queues = await api.list_queues()
-print(f"Queues: {', '.join(queues)}")
-```
-
-#### Queue Statistics
-
-```python
-# All queues
-stats = await api.queue_stats()
-
-for s in stats:
-    print(f"Queue: {s['queue']}")
-    print(f"  Queued: {s['queued']}")
-    print(f"  Running: {s['running']}")
-    print(f"  Crashed: {s['crashed']}")
-    print(f"  Total: {s['total']}")
-
-# Specific queue
-stats = await api.queue_stats(queue="default")
-```
-
-#### Clear Queue
-
-```python
-# Clear all jobs in queue
-count = await api.clear_queue(queue="test")
-
-# Clear only finished jobs
-count = await api.clear_queue(queue="default", state="finished")
-
-# Clear old jobs
-count = await api.clear_queue(queue="default", state="finished", older_than_days=7)
-```
-
-### Worker Management
-
-#### List Active Workers
-
-```python
-workers = await api.list_workers()
-
-for w in workers:
-    print(f"Worker: {w['worker_host']}:{w['worker_pid']}")
-    print(f"  Job: {w['job_id']} ({w['job_class']})")
-    print(f"  State: {w['state']}")
-```
-
-#### Worker Statistics
-
-```python
-stats = await api.worker_stats()
-
-print(f"Active Workers: {stats['active_workers']}")
-for w in stats["workers"]:
-    print(f"  {w['host']}:{w['pid']} - {w['job_count']} jobs")
-```
-
-### Metrics & Monitoring
-
-#### System Metrics
-
-```python
-from datetime import datetime, timedelta
-
-# Last 24 hours
-since = datetime.utcnow() - timedelta(hours=24)
-metrics = await api.get_metrics(since=since)
-
-print(f"Finished: {metrics['finished_count']}")
-print(f"Crashed: {metrics['crashed_count']}")
-print(f"Avg Duration: {metrics['avg_duration_seconds']:.2f}s")
-
-# State counts
-for state, count in metrics["state_counts"].items():
-    print(f"  {state}: {count}")
-
-# Top errors
-for error in metrics["top_errors"][:5]:
-    print(f"  {error['job_class']}: {error['error_count']} errors")
-
-# Specific queue
-metrics = await api.get_metrics(since=since, queue="priority")
-```
-
-### Dead Letter Queue
-
-#### List DLQ Jobs
-
-```python
-# List permanently failed jobs (error_count >= 10)
-dlq_jobs = await api.list_dlq(limit=100)
-
-for job in dlq_jobs:
-    print(f"Job {job['id']}: {job['job_class']}")
-    print(f"  Errors: {job['error_count']}")
-    print(f"  Last Error: {job['error_message']}")
-```
-
-#### Retry from DLQ
-
-```python
-# Retry DLQ job (resets error_count to 0)
-result = await api.retry_from_dlq(job_id=12345)
-print(f"DLQ job {result['original_job_id']} → {result['new_job_id']}")
-```
-
-### Complete Example
-
-```python
-import asyncio
-import asyncpg
-from pyjobby.admin_api import AdminAPI
-
-
-async def manage_jobs():
-    # Connect
-    conn = await asyncpg.connect(
-        database="pyjobby", user="pyjobby", password="password"
-    )
-
-    try:
-        api = AdminAPI(conn)
-
-        # Check crashed jobs
-        crashed = await api.list_jobs(state="crashed", limit=10)
-        print(f"Found {len(crashed)} crashed jobs")
-
-        # Retry them
-        if crashed:
-            job_ids = [j["id"] for j in crashed]
-            results = await api.retry_jobs(job_ids)
-            success = sum(1 for r in results if r["status"] != "error")
-            print(f"Retried {success}/{len(job_ids)} jobs")
-
-        # Clean up old finished jobs
-        count = await api.delete_jobs(state="finished", older_than_days=30)
-        print(f"Cleaned up {count} old jobs")
-
-    finally:
-        await conn.close()
-
-
-asyncio.run(manage_jobs())
-```
-
----
-
-## 💻 CLI Tools (`pj-admin`)
-
-### Installation
-
-The `pj-admin` command is automatically installed with pyjobby:
+`pj-admin` takes a DSN or a config file, and a DSN wins:
 
 ```bash
-poetry add git+https://github.com/mattsta/pyjobby.git#main
+pj-admin --dsn postgresql://user:pass@host:5432/pyjobby doctor
+export PYJOBBY_DSN=postgresql://user:pass@host:5432/pyjobby   # same thing
+pj-admin -c /etc/pyjobby/pyjobby.conf.py doctor               # config file
 ```
 
-Or if developing locally:
+```console
+$ pj-admin --help
+Usage: pj-admin [OPTIONS] COMMAND [ARGS]...
+
+  Pyjobby job queue management CLI
+
+Options:
+  -c, --config TEXT  Config file path
+  --dsn TEXT         PostgreSQL DSN (overrides --config; also read from
+                     PYJOBBY_DSN)
+  --help             Show this message and exit.
+
+Commands:
+  dag       Manage DAGs (Directed Acyclic Graphs)
+  db        Manage the database schema (install / migrate / status)
+  dlq       Manage Dead Letter Queue
+  doctor    Run health checks against the job platform (exit 1 on any FAIL)
+  jobs      Manage jobs
+  metrics   Show system metrics
+  queues    Manage queues
+  schedule  Manage recurring schedules
+  workers   Manage workers
+```
+
+### Exit codes: scripts can rely on them
+
+Operator-facing failures exit non-zero. A job that does not exist, a job in
+the wrong state for the verb, an unusable config, an unreachable database,
+or any `doctor` FAIL all exit 1:
+
+```console
+$ pj-admin jobs inspect 999999999
+Error: Job 999999999 not found
+$ echo $?
+1
+```
+
+An empty *answer* is not a failure — `dlq list` on an empty DLQ, or
+`queues show` for a queue with no jobs and no control row, exit 0.
+
+Machine-readable output is `--json`, available on `jobs list`, `jobs
+inspect`, `jobs history`, `jobs steps`, `jobs retry-stats`, `jobs
+timeout-stats`, `queues list`, `queues show`, `queues stats`, `workers
+list`, `dlq list`, `metrics`, `schedule list`, `schedule show`, `schedule
+history`, `dag list` and `dag show`.
 
 ```bash
-poetry install
-```
-
-### Configuration
-
-Create a config file (`pyjobby.conf.py`):
-
-```python
-db_params = {
-    "database": "pyjobby",
-    "user": "pyjobby",
-    "password": "password",
-    "host": "localhost",
-    "port": 5432,
-}
-```
-
-### Job Commands
-
-#### List Jobs
-
-```bash
-# List all jobs
-pj-admin jobs list
-
-# Filter by queue
-pj-admin jobs list --queue default
-
-# Filter by state
-pj-admin jobs list --state crashed
-
-# Filter by job class
-pj-admin jobs list --job-class "job.email%"
-
-# Filter by user ID
-pj-admin jobs list --uid 123
-
-# Pagination
-pj-admin jobs list --limit 25 --offset 50
-
-# JSON output
-pj-admin jobs list --json
-```
-
-#### Inspect Job
-
-```bash
-# View detailed job information
-pj-admin jobs inspect 12345
-
-# JSON output
-pj-admin jobs inspect 12345 --json
-```
-
-#### Retry Jobs
-
-```bash
-# Retry single job
-pj-admin jobs retry 12345
-
-# Retry multiple jobs
-pj-admin jobs retry 12345 12346 12347
-```
-
-#### Cancel Jobs
-
-```bash
-# Cancel single job
-pj-admin jobs cancel 12345
-
-# Cancel multiple jobs
-pj-admin jobs cancel 12345 12346 12347
-```
-
-#### Delete Jobs
-
-```bash
-# Delete single job (with confirmation)
-pj-admin jobs delete 12345
-
-# Skip confirmation
-pj-admin jobs delete 12345 --force
-```
-
-### Queue Commands
-
-#### List Queues
-
-```bash
-pj-admin queues list
-```
-
-#### Queue Statistics
-
-```bash
-# All queues
-pj-admin queues stats
-
-# Specific queue
-pj-admin queues stats --queue default
-
-# JSON output
-pj-admin queues stats --json
-```
-
-#### Clear Queue
-
-```bash
-# Clear all jobs in queue (with confirmation)
-pj-admin queues clear test
-
-# Clear only finished jobs
-pj-admin queues clear default --state finished
-
-# Clear old jobs
-pj-admin queues clear default --older-than-days 30 --force
-```
-
-### Worker Commands
-
-#### List Workers
-
-```bash
-# List active workers
-pj-admin workers list
-
-# JSON output
-pj-admin workers list --json
-```
-
-#### Worker Statistics
-
-```bash
-pj-admin workers stats
-```
-
-### Dead Letter Queue Commands
-
-#### List DLQ
-
-```bash
-# List permanently failed jobs
-pj-admin dlq list
-
-# Limit results
-pj-admin dlq list --limit 50
-
-# JSON output
-pj-admin dlq list --json
-```
-
-#### Retry from DLQ
-
-```bash
-# Retry DLQ job (resets error_count)
-pj-admin dlq retry 12345
-```
-
-### Metrics Commands
-
-#### System Metrics
-
-```bash
-# Last 24 hours (default)
-pj-admin metrics
-
-# Custom time range
-pj-admin metrics --since-hours 168  # Last week
-
-# Specific queue
-pj-admin metrics --queue priority
-
-# JSON output
-pj-admin metrics --json
-```
-
-### Configuration Options
-
-All commands support:
-
-```bash
-# Custom config file
-pj-admin --config /path/to/config.py jobs list
-
-# Short form
-pj-admin -c /path/to/config.py jobs list
-```
-
-### Complete Examples
-
-```bash
-# Monitor crashed jobs
-pj-admin jobs list --state crashed | grep -c ^
-pj-admin jobs list --state crashed --limit 5
 pj-admin jobs retry $(pj-admin jobs list --state crashed --json | jq -r '.[].id')
-
-# Clean up old jobs
-pj-admin queues clear default --state finished --older-than-days 7 --force
-
-# Check system health
-pj-admin queues stats
-pj-admin workers stats
-pj-admin metrics --since-hours 24
-
-# DLQ management
-pj-admin dlq list | head -10
-pj-admin dlq retry 12345
 ```
 
----
+## `db` — schema install and upgrade
 
-## 🌐 Web Interface (`pj-web`)
-
-### Starting the Web Server
-
-```bash
-# Default config (./pyjobby.conf.py)
-pj-web
-
-# Custom config
-pj-web /path/to/config.py
+```console
+$ pj-admin db --help
+Commands:
+  migrate  Install the base schema if missing, then apply pending migrations
+  status   Show applied vs pending schema migrations
 ```
 
-The server runs at **http://localhost:8081/** by default.
+```console
+$ pj-admin db migrate
+Installing base schema (jorb table not found)
+Database schema is up to date
 
-### Features
-
-#### Dashboard
-
-- **Real-time statistics** - Auto-refreshing queue stats, worker count, and metrics
-- **Queue overview** - See job counts by state for all queues
-- **Recent activity** - View last 24 hours of job activity
-- **Recent jobs** - Latest jobs with state badges
-
-#### Jobs Page
-
-- **Job list** - View all jobs with filtering
-- **State badges** - Color-coded job states (queued, running, finished, crashed)
-- **Auto-refresh** - Updates every 5 seconds via htmx
-
-#### API Endpoints
-
-The web interface provides both JSON and HTML responses:
-
-##### Jobs
-
-```bash
-# JSON response
-curl http://localhost:8081/api/jobs
-
-# HTML fragment (for htmx)
-curl http://localhost:8081/api/jobs?format=html
-
-# Filters
-curl http://localhost:8081/api/jobs?queue=default&state=crashed&limit=25
+$ pj-admin db status
+Base schema installed: yes
+Applied migrations:    none
+Pending migrations:    none
 ```
 
-##### Queues
+Idempotent, and the only supported way to install or upgrade. Run it from
+one place per deploy — it takes no lock, so two simultaneous fresh installs
+race. See
+[deployment-guide.md § The database](deployment-guide.md#the-database) for
+what it does and does not bring forward.
 
-```bash
-# List queues
-curl http://localhost:8081/api/queues
+## `doctor` — the health entry point
 
-# Queue stats
-curl http://localhost:8081/api/queues/default/stats
+```console
+$ pj-admin doctor --help
+Usage: pj-admin doctor [OPTIONS]
+
+  Run health checks against the job platform (exit 1 on any FAIL)
+
+  Checks: database reachability, schema/migrations, NOTIFY triggers, NOTIFY
+  queue saturation, live workers, workers that are alive but claiming nothing,
+  queue backlogs, the DLQ, and overdue schedules.
+
+Options:
+  --max-depth INTEGER        WARN when a queue's backlog exceeds this many
+                             queued jobs
+  --max-age-minutes INTEGER  WARN when a queue's oldest queued job is older
+                             than this
 ```
 
-##### Workers
+A healthy platform under load:
 
-```bash
-# List active workers
-curl http://localhost:8081/api/workers
-
-# Worker stats
-curl http://localhost:8081/api/workers/stats
+```console
+$ pj-admin doctor
+PASS database: connected
+PASS schema: installed, migrations current (baseline)
+PASS triggers: all NOTIFY triggers present (3)
+PASS notify-queue: 0.0% full
+PASS workers: 4 live worker(s) seen in last 60s
+PASS job-threads: 4 live worker(s) claiming
+WARN queue pjbench_e2e_67f5e7c6: depth 10067, oldest queued 0m (thresholds: depth 10000, age 60m)
+PASS dlq: empty
+PASS schedules: no overdue schedules
 ```
 
-##### Metrics
+FAIL is reserved for "the platform cannot function" — no schema, pending
+migrations, missing NOTIFY triggers, a NOTIFY queue past half full — and is
+the only thing that changes the exit code. Lost capacity is a WARN. Which
+check means what, and what to do about each, is in
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#start-with-doctor).
 
-```bash
-# System metrics
-curl http://localhost:8081/api/metrics
+Defaults are `--max-depth 10000` and `--max-age-minutes 60`. Age is the
+more honest alarm: a deep queue that is draining is fine, an old queue is
+not.
 
-# Custom time range
-curl "http://localhost:8081/api/metrics?since_hours=168"
+## `jobs`
 
-# Specific queue
-curl "http://localhost:8081/api/metrics?queue=priority"
+```console
+$ pj-admin jobs --help
+Commands:
+  cancel         Cancel one or more jobs.
+  delete         Delete a job (permanent!)
+  history        Show a job's full transition trail (including per-attempt errors)
+  inspect        Show detailed information about a job
+  list           List jobs with optional filtering
+  requeue        Requeue a terminal job for another run (also: RESUME an interrupted job)
+  retry          Retry one or more crashed jobs
+  retry-stats    Show retry statistics from the jorb_history audit trail
+  steps          Show a job's DXE step checkpoints
+  timeout-stats  Show timeout statistics (from jorb.timeout_at/state)
 ```
 
-##### DLQ
+### Finding jobs
 
-```bash
-# List DLQ jobs
-curl http://localhost:8081/api/dlq
+```console
+$ pj-admin jobs list --limit 5
+ID     State     Queue          Job Class      Priority  Created
+----------------------------------------------------------------------
+19615  finished  pjbench_e2e_6  pyjobby.bench  100       2026-07-27T01
+19616  finished  pjbench_e2e_6  pyjobby.bench  100       2026-07-27T01
+19612  finished  pjbench_e2e_6  pyjobby.bench  100       2026-07-27T01
+19609  finished  pjbench_e2e_6  pyjobby.bench  100       2026-07-27T01
+19617  finished  pjbench_e2e_6  pyjobby.bench  100       2026-07-27T01
 
-# Retry from DLQ
-curl -X POST http://localhost:8081/api/dlq/12345/retry
+Showing 5 job(s). Use --limit and --offset for pagination.
 ```
 
-##### Job Operations
+Filters: `-q/--queue`, `-s/--state`, `--job-class` (patterns), `--uid`,
+`--tag KEY=VALUE` (repeat for AND), `-l/--limit`, `-o/--offset`, `--json`.
+The table truncates long values for width — use `--json` when you need the
+full queue name or class path.
 
-```bash
-# Get job details
-curl http://localhost:8081/api/jobs/12345
+`--tag` matches jobs *containing* the pair, so extra tags on the job are
+fine, and values are read as JSON when they look like it: `batch=7` matches
+the number 7, `batch='"7"'` the string.
 
-# Retry job
-curl -X POST http://localhost:8081/api/jobs/12345/retry
+### One job, end to end
 
-# Cancel job
-curl -X POST http://localhost:8081/api/jobs/12345/cancel
+```console
+$ pj-admin jobs inspect 48148
 
-# Delete job
-curl -X DELETE http://localhost:8081/api/jobs/12345
-```
+Job 48148 Details
+--------------------------------------------------
+State:           finished
+Queue:           pjbench_e2e_3057f4d4
+Job Class:       pyjobby.bench.BenchJob
+Priority:        100
+Created:         2026-07-27T01:34:31.958272+00:00
+Updated:         2026-07-27T01:34:40.001308+00:00
+Run After:       2026-07-27T01:34:31.958272+00:00
+Run Count:       1
+Error Count:     0
+Worker:          optionality.local:79115
 
-### Technology Stack
+Arguments:
+{
+  "n": 17748
+}
 
-- **Backend**: aiohttp (async HTTP server)
-- **Frontend**: Pure HTML/CSS/JavaScript + htmx
-- **Auto-refresh**: htmx polling (5-10 second intervals)
-- **Styling**: Modern CSS with system fonts
-- **No dependencies**: No React, Vue, or build step required
-
-### Customization
-
-The web interface can be extended by modifying `pyjobby/web_admin.py`:
-
-```python
-from pyjobby.web_admin import WebAdminServer
-
-# Custom configuration
-server = WebAdminServer(db_params=db_params, host="0.0.0.0", port=8081)
-
-
-# Add custom routes
-@server.app.router.add_get("/custom")
-async def custom_route(request):
-    return web.Response(text="Custom page")
-
-
-# Start server
-await server.start()
-```
-
----
-
-## 📊 Comparison
-
-| Feature            | Admin API           | CLI (`pj-admin`)   | Web (`pj-web`)           |
-| ------------------ | ------------------- | ------------------ | ------------------------ |
-| **Platform**       | Python library      | Terminal           | Browser                  |
-| **Best for**       | Automation, scripts | DevOps, debugging  | Monitoring, dashboards   |
-| **Real-time**      | Manual refresh      | Manual commands    | Auto-refresh (htmx)      |
-| **Filtering**      | Full control        | Command-line args  | URL parameters           |
-| **Output**         | Python dicts        | Tables, JSON       | HTML, JSON               |
-| **Batch ops**      | ✅ Yes              | ✅ Yes (multi-arg) | ⚠️ Limited               |
-| **Authentication** | App-level           | None               | None (add reverse proxy) |
-
----
-
-## 🔐 Security Considerations
-
-**Current Status**: No built-in authentication
-
-**Production Recommendations**:
-
-1. **Network isolation** - Run web interface on private network only
-2. **Reverse proxy** - Use nginx with basic auth:
-
-```nginx
-location / {
-    proxy_pass http://localhost:8081;
-    auth_basic "Pyjobby Admin";
-    auth_basic_user_file /etc/nginx/.htpasswd;
+Result:
+{
+  "n": 17748
 }
 ```
 
-3. **SSH tunneling** - Access via SSH port forwarding:
+```console
+$ pj-admin jobs history 48148
 
-```bash
-ssh -L 8081:localhost:8081 production-server
-# Then access http://localhost:8081 locally
+Job 48148 History
+At                   Event     From     Epoch  Errors  Worker                Error
+----------------------------------------------------------------------------------
+2026-07-27T01:34:31  enqueued  -        -      -       -
+2026-07-27T01:34:39  claimed   queued   1      0       optionality.local:79
+2026-07-27T01:34:40  running   claimed  1      0       optionality.local:79
+2026-07-27T01:34:40  finished  running  1      0       optionality.local:79
+
+Total: 4 transition(s)
 ```
 
-4. **VPN** - Put admin interface behind VPN
+A job keeps **one row for life**: retries requeue the same id, and `history`
+is where the per-attempt trail (and each attempt's error) lives. `Epoch` is
+the fencing token, not an attempt counter.
 
-**Future**: Built-in authentication may be added in future versions.
-
----
-
-## 🧪 Testing
-
-All admin tools have comprehensive test coverage:
-
-```bash
-# Run admin API tests
-poetry run pytest tests/test_admin_api.py -v
-
-# Results: 32/32 tests passing, 94% coverage
+```console
+$ pj-admin jobs steps 48148
+No step checkpoints for job 48148
 ```
 
-Test coverage:
+`steps` shows the DXE checkpoints of a durable job — what completed, so
+what a resume will skip. See [DXE.md](DXE.md).
 
-- Job management (18 tests)
-- Queue management (6 tests)
-- Worker management (3 tests)
-- Metrics (3 tests)
-- Dead Letter Queue (2 tests)
+### Acting on jobs
 
----
+```console
+$ pj-admin jobs requeue --help
+Usage: pj-admin jobs requeue [OPTIONS] JOB_ID
 
-## 📝 Summary
+  Requeue a terminal job for another run (also: RESUME an interrupted job)
 
-Pyjobby now provides three complementary admin interfaces:
+  By default the job keeps its DXE step checkpoints, so completed steps fast-
+  forward and execution resumes where it left off — use this to resume
+  interrupted durable jobs. Pass --fresh to wipe the checkpoints and restart
+  from step 1.
 
-1. **Admin API** - For programmatic access and automation
-2. **CLI Tools** - For terminal-based management and DevOps workflows
-3. **Web Interface** - For browser-based monitoring and dashboards
+Options:
+  --fresh  Wipe DXE checkpoints first: restart from step 1 instead of resuming
+```
 
-All three share the same backend implementation, ensuring consistency and reliability.
+* `jobs retry ID...` — for jobs that did **not** succeed (`crashed` or
+  `cancelled`). Refuses anything else.
+* `jobs requeue ID` — also accepts a **finished** job. Running successful
+  work again repeats its side effects, which is why it is a separate verb.
+* `jobs cancel ID...` — queued and waiting jobs are cancelled immediately;
+  a claimed or running job gets a cancellation *request* delivered to its
+  worker, reported distinctly, because a job whose worker has died stays
+  running with only the request recorded.
+* `jobs delete ID` — permanent, prompts unless `-f/--force`.
 
-**Next Steps**:
+The retry-versus-rerun distinction is expanded in
+[OPERATIONS.md § Retry vs. re-run](OPERATIONS.md#retry-vs-re-run).
 
-- Use `pj-admin` for daily operations and debugging
-- Use `pj-web` for monitoring and team dashboards
-- Use Admin API for custom automation and integration
+### Aggregates
 
-**Resources**:
+```console
+$ pj-admin jobs retry-stats
 
-- API Reference: `pyjobby/admin_api.py` (docstrings)
-- CLI Help: `pj-admin --help`, `pj-admin jobs --help`, etc.
-- Web API: http://localhost:8081/api/\* (JSON endpoints)
+Retry Statistics (last 24h)
+------------------------------------------------------------
+No retried jobs found
 
----
+$ pj-admin jobs timeout-stats
 
-**Version**: 1.3.0
-**Last Updated**: 2025-11-18
-**Maintainer**: Pyjobby Team
+Timeout Statistics (last 24h)
+------------------------------------------------------------
+No timeout data found
+```
+
+Both take `-q/--queue`, `--since-hours` and `--json`. `retry-stats` reads
+`jorb_history` — an attempt is a `running` event, so a job with more than
+one was retried.
+
+## `queues`
+
+```console
+$ pj-admin queues --help
+Commands:
+  clear   Clear (delete) jobs from a queue
+  limits  Set (or show, with no options) a queue's concurrency/rate limits
+  list    List all queues with their pause/limit controls
+  pause   Pause a queue (workers stop claiming from it immediately)
+  resume  Resume a paused queue
+  show    Show one queue's controls and statistics
+  stats   Show queue statistics
+```
+
+Controls are live — they are rows in `jorb_queue`, read by the claim
+statement, so a change takes effect on the next claim attempt:
+
+```console
+$ pj-admin queues pause maintenance
+Queue 'maintenance' paused
+
+$ pj-admin queues limits maintenance --max-concurrency 8 --rate-limit 100 --rate-period 60
+Queue 'maintenance' limits updated
+Paused:              yes
+Max concurrency:     8 (claimed+running cap; '-' = unlimited)
+Rate limit:          100 start(s) per 60s ('-' = unlimited)
+
+$ pj-admin queues show maintenance
+
+Queue 'maintenance'
+--------------------------------------------------
+Paused:              yes
+Max concurrency:     8 (claimed+running cap; '-' = unlimited)
+Rate limit:          100 start(s) per 60s ('-' = unlimited)
+
+Depths:
+  queued       0
+  claimed      0
+  running      0
+  waiting      0
+  finished     0
+  crashed      0
+  cancelled    0
+  total        0
+
+$ pj-admin queues resume maintenance
+Queue 'maintenance' resumed
+```
+
+`queues limits NAME --max-concurrency none` clears a limit. `queues list`
+and `queues stats` are the fleet-wide views:
+
+```console
+$ pj-admin queues stats
+Queue        Paused  Queued  Running  Waiting  Finished  Crashed  Total  Limits
+--------------------------------------------------------------------------------------
+maintenance  no      0       0        0        0         0        0      conc=8, rate=
+```
+
+`queues clear QUEUE` deletes jobs, optionally narrowed by `-s/--state` and
+`--older-than-days`, and prompts unless `-f/--force`. It is a blunt
+instrument for a test queue — routine cleanup is retention's job
+(see [deployment-guide.md § Retention](deployment-guide.md#retention--on-by-default)).
+
+## `workers`
+
+```console
+$ pj-admin workers list
+ID  Host             PID    Queue            Status  Threads  Last Seen  Current Job
+------------------------------------------------------------------------------------
+1   optionality.loc  75674  pjbench_e2e_9c5  live    0/8      5s ago     -
+2   optionality.loc  75675  pjbench_e2e_9c5  live    0/8      5s ago     -
+3   optionality.loc  75673  pjbench_e2e_9c5  live    0/8      5s ago     -
+4   optionality.loc  75676  pjbench_e2e_9c5  live    0/8      5s ago     -
+```
+
+This reads the `jorb_worker` registry: live workers plus recently
+shut-down ones, each with the job it currently holds. Two columns carry the
+important signal:
+
+* **Status** — `live`, or **`not claiming`** for a worker that heartbeats
+  perfectly and does no work, because abandoned job threads fill its pool:
+
+  ```
+  2   host-b    9910   heavy  not claiming  8/8      3s ago     -
+  ```
+
+* **Threads** — `abandoned/pool`. `8/8` *is* the refusing state; `7/8` is
+  one timed-out job away from it and reads nothing like `0/8`.
+
+Both are explained in
+[OPERATIONS.md § Abandoned job threads](OPERATIONS.md#abandoned-job-threads-when-a-worker-stops-claiming-on-purpose).
+
+```console
+$ pj-admin workers stats
+
+Worker Statistics
+--------------------------------------------------
+Live workers:      4
+Stale workers:     0
+Shut down:         0
+Total registered:  4
+
+Live Workers by Queue:
+Queue                 Live Workers
+----------------------------------
+pjbench_e2e_67f5e7c6  4
+```
+
+## `dlq` — the dead letter queue
+
+The DLQ is not a separate table or an error-count heuristic: it is exactly
+`state = 'crashed'`, the terminal state a job reaches when its retries are
+exhausted.
+
+```console
+$ pj-admin dlq list
+Dead Letter Queue is empty!
+```
+
+`dlq list` takes `--limit` and `--json`. `dlq retry ID` requeues the same
+row with a fresh error budget — the operator-driven re-run, as against
+`jobs retry`, which is the ordinary one. Triage a dead-lettered job with
+`jobs history ID` (the per-attempt errors) and `jobs steps ID` (where a
+durable pipeline stopped).
+
+<a id="schedule-management"></a>
+
+## `schedule` — schedule management
+
+```console
+$ pj-admin schedule --help
+Commands:
+  add      Create new recurring schedule
+  delete   Delete a recurring schedule
+  disable  Disable an enabled schedule
+  enable   Enable a disabled schedule
+  history  Show schedule execution history
+  list     List recurring schedules
+  show     Show schedule details
+  stats    Show execution statistics for all schedules
+```
+
+```console
+$ pj-admin schedule add nightly-cleanup examples.jobs.example_jobs.BasicJob "0 2 * * *" \
+    --queue maintenance --kwargs '{"message":"cleanup"}'
+✓ Schedule created: nightly-cleanup (ID: 1)
+  Next run: 2026-07-27 02:00:00+00:00
+  Cron:     0 2 * * *
+  Queue:    maintenance
+```
+
+`add` also takes `-p/--prio`, `--capability`, `--timezone`, `--jitter`,
+`--max-concurrent`, `--backpressure`, `--circuit-breaker`, `--description`
+and `--disabled`. The cron expression and timezone are validated at this
+point, not at fire time.
+
+```console
+$ pj-admin schedule show nightly-cleanup
+
+Schedule: nightly-cleanup
+------------------------------------------------------------
+ID:                    1
+Enabled:               ✓ Yes
+Description:           -
+
+Schedule:
+Cron Expression:       0 2 * * *
+Timezone:              UTC
+Next Run:              2026-07-27 02:00:00+00:00
+
+Job Configuration:
+Job Class:             examples.jobs.example_jobs.BasicJob
+Queue:                 maintenance
+Priority:              100
+Capability:            -
+Arguments:             {"message": "cleanup"}
+
+Safety Features:
+Max Concurrent Jobs:   1
+Jitter (seconds):      0
+Backpressure Threshold:1000
+Circuit Breaker:       5 failures
+
+Statistics:
+Total Runs:            0
+Successes:             0
+Failures:              0
+Skips:                 0
+Consecutive Failures:  0
+Last Run:              Never
+Last Success:          Never
+Last Failure:          Never
+```
+
+`schedule history NAME_OR_ID` takes `--result success|failure|skipped`,
+`-l/--limit` and `--json`; `schedule stats` is the fleet view. Prefer
+`disable` to `delete`: it keeps the execution log.
+
+Everything a schedule *means* — cron syntax, jitter, backpressure, the
+circuit breaker, timezone handling — is in
+[RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md). Nothing fires unless
+`pj-scheduler` is running; `doctor` warns about schedules overdue by more
+than five minutes for exactly that reason.
+
+## `dag`
+
+```console
+$ pj-admin dag --help
+Commands:
+  list       List DAGs
+  show       Show DAG details and job status
+  visualize  Visualize DAG structure (ASCII art)
+```
+
+`list` takes `-l/--limit` and `--json`.
+
+## `metrics`
+
+```console
+$ pj-admin metrics
+
+System Metrics (last 24h)
+--------------------------------------------------
+Throughput:        0.35 jobs/s (completed)
+Arrivals:          0.35 jobs/s (created)
+Balance:           +0.00 jobs/s (keeping up)
+Retry Pressure:    0.00 attempts/s
+DLQ Growth:        0.0000 jobs/s
+Finished:          30000
+Crashed:           0
+Cancelled:         0
+Avg Duration:      0.00s
+Avg Queue Wait:    7.00s
+Max Queue Wait:    13.09s
+Backlog:           0 claimable, oldest ready 0s
+In Flight:         0 (0 stuck > 5.0m, oldest 0s)
+NOTIFY Queue:      0.0% used
+Dead Tuples:       79.8% of jorb
+
+Storage:
+  jorb              17.2MB total (10.6MB table + 6.5MB index), dead 79.8%
+  jorb_history      35.3MB total (26.6MB table + 8.8MB index), dead 1.3%
+  jorb_step         16.0KB total (8.0KB table + 8.0KB index), dead 0.0%
+
+Jobs Created in Window, by State:
+  finished     30000
+```
+
+Takes `-q/--queue`, `--since-hours` (default 24) and `--json`. Two kinds of
+number live here and must not be confused: **rates** (`jobs/s`) are
+measured over the window and comparable across window sizes; **levels**
+(backlog, in flight, storage, NOTIFY usage) are instants.
+
+* **Throughput vs Arrivals** is the only pair that can say "falling
+  behind". Sustained arrivals above completions is the definition, and no
+  single number expresses it.
+* **Queue Wait vs Duration** are reported separately on purpose. Rising
+  wait with flat duration is a capacity problem; rising duration is a code
+  or dependency problem. A blended "how long did the job take" cannot tell
+  those apart, so it is not reported. See
+  [OPERATIONS.md § Reading the latency numbers](OPERATIONS.md#reading-the-latency-numbers).
+* **Dead Tuples** is a survival question at rate — it answers "is
+  autovacuum keeping up" and nothing else does. See
+  [SCALE.md § Vacuum pressure](SCALE.md#4-vacuum-pressure).
+
+## `pj-web` — the HTML admin
+
+```bash
+pj-web /etc/pyjobby/pyjobby.conf.py --host 127.0.0.1 --port 8081
+```
+
+It takes a config file positionally; it does not read `PYJOBBY_DSN`.
+Defaults are `127.0.0.1:8081`. **There is no authentication**, and the API
+can cancel, retry and delete jobs — bind it to localhost, or put an
+authenticating proxy in front. `--host 0.0.0.0` exposes an unauthenticated
+control plane.
+
+Pages: `/`, `/jobs`, `/queues`, `/workers`, `/dlq`, `/schedules`.
+
+JSON API:
+
+| Method | Path |
+|---|---|
+| GET | `/api/jobs`, `/api/jobs/{id}`, `/api/jobs/{id}/history`, `/api/jobs/{id}/steps` |
+| POST | `/api/jobs/{id}/retry`, `/api/jobs/{id}/cancel` |
+| DELETE | `/api/jobs/{id}` |
+| GET | `/api/queues`, `/api/queues/{queue}/stats` |
+| POST | `/api/queues/{queue}/pause`, `/api/queues/{queue}/resume` |
+| GET | `/api/workers`, `/api/workers/stats` |
+| GET | `/api/dlq` |
+| POST | `/api/dlq/{id}/retry` |
+| GET | `/api/metrics` |
+| GET/POST | `/api/schedules`, `/api/schedules/{id}` |
+
+`GET /metrics` (not `/api/metrics`) is the Prometheus scrape endpoint. The
+gauges and counters it exposes:
+
+```
+pyjobby_jobs_by_state              pyjobby_jobs_enqueued_total
+pyjobby_backlog_depth              pyjobby_queue_oldest_queued_seconds
+pyjobby_queue_paused               pyjobby_jobs_inflight
+pyjobby_jobs_stuck                 pyjobby_inflight_oldest_age_seconds
+pyjobby_jobs_started_recent        pyjobby_jobs_terminal_recent
+pyjobby_job_duration_seconds       pyjobby_throughput_jobs_per_second
+pyjobby_arrival_jobs_per_second    pyjobby_retry_attempts_per_second
+pyjobby_dlq_jobs_per_second        pyjobby_notify_queue_usage_ratio
+pyjobby_workers_live               pyjobby_workers_not_claiming
+pyjobby_worker_job_threads_abandoned_max
+pyjobby_table_bytes                pyjobby_table_index_bytes
+pyjobby_table_total_bytes          pyjobby_table_live_tuples
+pyjobby_table_dead_tuples          pyjobby_table_dead_tuple_ratio
+```
+
+The three worth alerting on first are `pyjobby_notify_queue_usage_ratio`,
+`pyjobby_queue_oldest_queued_seconds` (age, not depth) and
+`pyjobby_workers_not_claiming`.
+
+For the realtime feed — `pj-ws`, its protocol and its dashboard — see
+[WEBSOCKET_DASHBOARD.md](WEBSOCKET_DASHBOARD.md). It is unauthenticated
+too, and its actions include cancelling and re-prioritising jobs.
+
+## `AdminAPI` — the Python API
+
+Everything above is a thin shell over `pyjobby.admin_api.AdminAPI`, which
+takes an asyncpg connection:
+
+```python
+import asyncpg
+from pyjobby.admin_api import AdminAPI
+
+conn = await asyncpg.connect(dsn)
+api = AdminAPI(conn)
+
+crashed = await api.list_jobs(state="crashed", limit=10)
+for job in crashed:
+    await api.retry_job(job["id"])      # {"job_id": ..., "status": "requeued"}
+```
+
+Method groups, all `async`:
+
+* **Jobs** — `list_jobs`, `get_job`, `get_job_history`, `get_job_steps`,
+  `retry_job`, `retry_jobs`, `requeue_job`, `cancel_job`, `cancel_jobs`,
+  `delete_job`, `delete_jobs`.
+* **Queues** — `list_queues`, `queue_stats`, `clear_queue`,
+  `list_queue_controls`, `get_queue_control`, `set_queue_control`,
+  `pause_queue`, `resume_queue`.
+* **Workers** — `list_workers`, `worker_stats`, `job_thread_stats`.
+* **Health and metrics** — `get_metrics`, `backlog_stats`,
+  `inflight_stats`, `storage_stats`, `notify_queue_usage`.
+* **DLQ** — `list_dlq`, `retry_from_dlq`.
+* **Schedules** — `list_schedules`, `get_schedule`, `create_schedule`,
+  `update_schedule`, `delete_schedule`, `enable_schedule`,
+  `disable_schedule`, `get_schedule_history`, `get_schedule_stats`.
+
+Two shapes are worth stating because they are easy to assume wrong:
+
+* `retry_job` and `retry_from_dlq` return the **same** `job_id` they were
+  given. A retry requeues the row a job has had since it was enqueued;
+  there is no new id to follow.
+* `list_dlq()` is `state = 'crashed'`, ordered by `updated`. It is not
+  filtered on an error count.
+
+The docstrings in `pyjobby/admin_api.py` are the full reference, including
+the exact keys each method returns.
