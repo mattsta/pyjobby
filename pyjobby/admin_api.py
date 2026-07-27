@@ -17,7 +17,12 @@ from typing import Any
 import asyncpg  # type: ignore[import-untyped]
 
 from . import db
-from .client import tags_filter_sql, validate_tags
+from .client import (
+    DEFAULT_PRIO_CEILING,
+    tags_filter_sql,
+    validate_priority,
+    validate_tags,
+)
 from .cron import next_cron_run
 
 
@@ -163,14 +168,25 @@ class AdminAPI:
         jobs = await api.list_jobs(queue='default', state='crashed')
     """
 
-    def __init__(self, conn: asyncpg.Connection):
+    def __init__(
+        self, conn: asyncpg.Connection, prio_ceiling: int = DEFAULT_PRIO_CEILING
+    ):
         """
         Initialize AdminAPI with database connection.
 
         Args:
             conn: Active asyncpg connection
+            prio_ceiling: the priority ceiling this deployment's workers run
+                with (`pj --max-prio`, default 1000). Schedules are refused
+                above it, because a schedule mints a job on every firing and
+                a job above every worker's ceiling is never claimed -- one
+                bad number becomes an unbounded stream of jobs nobody runs.
+                Declared here for the same reason `JobClient` takes it: the
+                ceiling belongs to the worker fleet and nothing about it is
+                visible from a connection.
         """
         self.conn = conn
+        self.prio_ceiling = prio_ceiling
 
     # =========================================================================
     # Job Management
@@ -1572,6 +1588,14 @@ class AdminAPI:
         Returns:
             Created schedule dictionary
         """
+        # Refuse an unclaimable priority before the row exists, for the same
+        # reason the cron expression is checked here: a schedule that fires
+        # into nothing is worse than one that never existed. `JobClient`
+        # already refuses this at enqueue, and this is the same check against
+        # the same imported ceiling -- a schedule writes `jorb.prio` on every
+        # firing without ever passing through the client.
+        validate_priority(prio, self.prio_ceiling)
+
         # Reject the expression here rather than at fire time: a schedule
         # that cannot be evaluated is a schedule that silently never runs.
         next_run = next_cron_run(cron_expr, timezone)
@@ -1648,6 +1672,13 @@ class AdminAPI:
 
         if not updates:
             raise ValueError("No valid fields to update")
+
+        # `prio` is an updatable field, so this is the second door onto
+        # jorb_schedule.prio and it gets the same lock as create_schedule:
+        # raising an existing schedule out of every worker's reach mints the
+        # same unbounded stream of unclaimable jobs.
+        if "prio" in updates:
+            validate_priority(updates["prio"], self.prio_ceiling)
 
         # If cron_expr or timezone changed, recalculate next_run
         if "cron_expr" in updates or "timezone" in updates:

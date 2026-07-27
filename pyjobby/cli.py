@@ -19,6 +19,7 @@ import click
 
 from . import db, migrations
 from .admin_api import UNSET, AdminAPI, Unset
+from .client import DEFAULT_PRIO_CEILING, validate_priority
 from .configloader import load_config_from_file
 from .db import JobState
 
@@ -1598,7 +1599,26 @@ def schedule_show(ctx: click.Context, name_or_id: str, output_json: bool) -> Non
 @click.argument("cron_expr")
 @click.option("--queue", "-q", default="default", help="Target queue")
 @click.option("--kwargs", help="Job kwargs as JSON")
-@click.option("--prio", "-p", type=int, default=100, help="Priority (default: 100)")
+@click.option(
+    "--prio",
+    "-p",
+    type=int,
+    default=100,
+    help=(
+        "Priority, LOWER is MORE urgent (default: 100). Refused above the "
+        "worker priority ceiling -- see --max-prio"
+    ),
+)
+@click.option(
+    "--max-prio",
+    type=int,
+    default=DEFAULT_PRIO_CEILING,
+    help=(
+        f"The priority ceiling this fleet's workers run with (`pj "
+        f"--max-prio`, default {DEFAULT_PRIO_CEILING}). --prio above it is "
+        "refused: every firing would mint a job no worker can claim"
+    ),
+)
 @click.option("--capability", help="Required worker capability")
 @click.option("--timezone", default="UTC", help="Timezone (default: UTC)")
 @click.option(
@@ -1630,6 +1650,7 @@ def schedule_add(
     queue: str,
     kwargs: str | None,
     prio: int,
+    max_prio: int,
     capability: str | None,
     timezone: str,
     max_concurrent: int,
@@ -1646,12 +1667,26 @@ def schedule_add(
         pj-admin schedule add hourly-report ReportJob "0 * * * *" --queue reports
         pj-admin schedule add sync SyncJob "*/5 * * * *" --jitter 60 --max-concurrent 3
     """
+    # Checked before a connection is opened, because this failure is about
+    # the operator's arguments and not the database. The predicate and the
+    # message are the client's, so the schedule door and the enqueue door
+    # cannot drift; only the hint is CLI-shaped, since `JobClient(...)` is
+    # not the thing an operator typing this command would change.
+    try:
+        validate_priority(prio, max_prio)
+    except ValueError as e:
+        fail(
+            str(e),
+            f"If this fleet really runs `pj --max-prio {prio}` (or higher), "
+            f"say so here too: `pj-admin schedule add ... --prio {prio} "
+            f"--max-prio {prio}`.",
+        )
 
     async def _add() -> None:
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         problem: str | None = None
         try:
-            api = AdminAPI(conn)
+            api = AdminAPI(conn, prio_ceiling=max_prio)
 
             # Parse kwargs if provided
             job_kwargs = {}
@@ -1684,7 +1719,8 @@ def schedule_add(
             click.echo(f"  Queue:    {sched['queue']}")
 
         except ValueError as e:
-            # invalid cron expression or unknown timezone
+            # invalid cron expression, unknown timezone, or a priority above
+            # the ceiling (rejected up front, but the API checks it too)
             problem = str(e)
         except Exception as e:
             # duplicate name, constraint violation, ...

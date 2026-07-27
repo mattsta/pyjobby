@@ -66,6 +66,8 @@ import asyncpg  # type: ignore[import-untyped]
 from aiohttp import web
 
 from . import db
+from .client import DEFAULT_PRIO_CEILING
+from .client import validate_priority as check_prio_ceiling
 
 # Configure logging
 logging.basicConfig(
@@ -266,10 +268,18 @@ class WebSocketServer:
         max_actions_per_second: int = 10,
         snapshot_interval: float = DEFAULT_SNAPSHOT_INTERVAL,
         snapshot_window_seconds: float = DEFAULT_SNAPSHOT_WINDOW_SECONDS,
+        prio_ceiling: int = DEFAULT_PRIO_CEILING,
     ):
         self.db_params = db_params
         self.max_subscriptions = max_subscriptions
         self.max_actions_per_second = max_actions_per_second
+        # The priority ceiling this deployment's workers run with (`pj
+        # --max-prio`). `adjust_priority` writes jorb.prio directly, so a
+        # dashboard could otherwise push a job above every worker's ceiling
+        # -- where it is never claimed, never fails and never reaches the
+        # DLQ. Declared, not observed, for the reason client.py gives: the
+        # ceiling belongs to the worker fleet and is invisible from here.
+        self.prio_ceiling = prio_ceiling
         self.snapshot_interval = snapshot_interval
         self.snapshot_window = timedelta(seconds=snapshot_window_seconds)
 
@@ -546,9 +556,23 @@ class WebSocketServer:
             raise InvalidMessage(f"job_id must be between 0 and {MAX_BIGINT}")
         return value
 
-    @staticmethod
-    def validate_priority(new_priority: Any) -> int:
-        """Validate a priority: an int32, the width of the jorb.prio column."""
+    def validate_priority(self, new_priority: Any) -> int:
+        """Validate a priority: an int32 (the width of the jorb.prio column)
+        at or below this deployment's worker priority ceiling.
+
+        The column's width is not the real bound. `claim_jorb()` takes only
+        jobs whose `prio <= the claiming worker's ceiling`, so an operator
+        who raises a job above it has not deprioritized it -- they have made
+        it unclaimable, permanently, with no error, no retry and no DLQ
+        entry. `JobClient` refuses that at enqueue; this handler writes
+        `jorb.prio` with its own SQL, so it has to refuse it here.
+
+        The predicate is the client's, imported, so the two doors onto the
+        same column cannot drift apart. Only the wording is local: replies
+        are truncated at MAX_ERROR_MESSAGE_LENGTH, and the client's longer
+        message (which ends in `JobClient(...)` advice nobody clicking a
+        dashboard button can act on) would arrive cut in half.
+        """
         if new_priority is None:
             raise InvalidMessage("Missing new_priority")
         if isinstance(new_priority, bool) or not isinstance(new_priority, int):
@@ -558,6 +582,15 @@ class WebSocketServer:
             raise InvalidMessage(
                 f"new_priority must be between {MIN_INT32} and {MAX_INT32}"
             )
+        try:
+            check_prio_ceiling(value, self.prio_ceiling)
+        except ValueError:
+            raise InvalidMessage(
+                f"new_priority {value} is above the worker priority ceiling "
+                f"({self.prio_ceiling}): the job would sit 'queued' forever, "
+                f"unclaimable. LOWER is MORE urgent, so least-urgent work "
+                f"wants a value just under {self.prio_ceiling}."
+            ) from None
         return value
 
     def validate_message(self, action: Any, data: dict[str, Any]) -> None:
@@ -1193,9 +1226,14 @@ async def serve(
     host: str,
     port: int,
     snapshot_interval: float = DEFAULT_SNAPSHOT_INTERVAL,
+    prio_ceiling: int = DEFAULT_PRIO_CEILING,
 ) -> None:
     """Create and run a WebSocketServer until interrupted."""
-    server = WebSocketServer(db_params=db_params, snapshot_interval=snapshot_interval)
+    server = WebSocketServer(
+        db_params=db_params,
+        snapshot_interval=snapshot_interval,
+        prio_ceiling=prio_ceiling,
+    )
     try:
         await server.start(host=host, port=port)
     except KeyboardInterrupt:
@@ -1225,7 +1263,18 @@ def main() -> None:
         "feed's whole database cost: one query per interval, shared by every "
         "connected dashboard, and none at all while nobody is subscribed",
     )
-    def cli(config: str, host: str, port: int, snapshot_interval: float) -> None:
+    @click.option(
+        "--max-prio",
+        default=DEFAULT_PRIO_CEILING,
+        show_default=True,
+        type=int,
+        help="The priority ceiling this fleet's workers run with (`pj "
+        "--max-prio`). adjust_priority refuses anything above it: LOWER is "
+        "MORE urgent, and a job above the ceiling is never claimed at all",
+    )
+    def cli(
+        config: str, host: str, port: int, snapshot_interval: float, max_prio: int
+    ) -> None:
         """Run the realtime websocket dashboard server."""
         from .configloader import load_config_from_file
 
@@ -1237,7 +1286,7 @@ def main() -> None:
         if snapshot_interval <= 0:
             raise click.ClickException("--snapshot-interval must be positive")
 
-        asyncio.run(serve(db_params, host, port, snapshot_interval))
+        asyncio.run(serve(db_params, host, port, snapshot_interval, max_prio))
 
     cli()
 

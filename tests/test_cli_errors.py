@@ -25,6 +25,7 @@ from click.testing import CliRunner
 
 from pyjobby import migrations
 from pyjobby.cli import cli
+from pyjobby.client import DEFAULT_PRIO_CEILING
 from tests.schema_fixtures import install_legacy_schema
 
 pytestmark = pytest.mark.asyncio
@@ -941,6 +942,113 @@ class TestScheduleAddValidation:
             "Error: Invalid value for '--prio' / '-p': 'high' is not a valid integer."
             in result.stderr
         )
+
+    async def test_priority_above_the_ceiling_writes_no_schedule(
+        self, dsn, db_pool, test_id
+    ):
+        """A schedule mints a job on EVERY firing, so one unclaimable
+        priority is an unbounded stream of jobs nobody will ever run: the
+        row must not exist at all, not merely be reported."""
+        result = await run_cli(
+            "--dsn",
+            dsn,
+            "schedule",
+            "add",
+            test_id,
+            "tests.dxe_jobs.OkJob",
+            "0 2 * * *",
+            "--prio",
+            str(DEFAULT_PRIO_CEILING + 1),
+        )
+
+        assert result.exit_code == 1, result.output
+        assert (
+            f"Error: priority {DEFAULT_PRIO_CEILING + 1} is above the worker "
+            f"priority ceiling ({DEFAULT_PRIO_CEILING})" in result.stderr
+        )
+        # names the inverted ordering, which is what produces the bad value
+        assert "LOWER numbers are MORE urgent" in result.stderr
+        # and the escape hatch is the one an operator can actually type here
+        assert (
+            f"--prio {DEFAULT_PRIO_CEILING + 1} --max-prio "
+            f"{DEFAULT_PRIO_CEILING + 1}" in result.stderr
+        )
+        assert await self._count(db_pool, test_id) == 0
+
+    async def test_priority_at_the_ceiling_is_accepted(self, dsn, db_pool, test_id):
+        """The mirror: the ceiling itself is claimable, so it is allowed."""
+        result = await run_cli(
+            "--dsn",
+            dsn,
+            "schedule",
+            "add",
+            test_id,
+            "tests.dxe_jobs.OkJob",
+            "0 2 * * *",
+            "--prio",
+            str(DEFAULT_PRIO_CEILING),
+        )
+
+        assert result.exit_code == 0, result.output
+        assert f"Schedule created: {test_id}" in result.output
+        assert await self._count(db_pool, test_id) == 1
+        assert (
+            await db_pool.fetchval(
+                "SELECT prio FROM jorb_schedule WHERE name = $1", test_id
+            )
+            == DEFAULT_PRIO_CEILING
+        )
+
+    async def test_a_fleet_that_declares_a_higher_ceiling_may_use_it(
+        self, dsn, db_pool, test_id
+    ):
+        """`--max-prio` is the CLI's version of `JobClient(prio_ceiling=N)`:
+        the deployment saying what its workers actually run with."""
+        result = await run_cli(
+            "--dsn",
+            dsn,
+            "schedule",
+            "add",
+            test_id,
+            "tests.dxe_jobs.OkJob",
+            "0 2 * * *",
+            "--prio",
+            "5000",
+            "--max-prio",
+            "5000",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert (
+            await db_pool.fetchval(
+                "SELECT prio FROM jorb_schedule WHERE name = $1", test_id
+            )
+            == 5000
+        )
+
+    async def test_a_declared_ceiling_still_has_a_top(self, dsn, db_pool, test_id):
+        """Raising the declaration does not disable the check -- it moves
+        it, so `--prio 5001 --max-prio 5000` is still refused."""
+        result = await run_cli(
+            "--dsn",
+            dsn,
+            "schedule",
+            "add",
+            test_id,
+            "tests.dxe_jobs.OkJob",
+            "0 2 * * *",
+            "--prio",
+            "5001",
+            "--max-prio",
+            "5000",
+        )
+
+        assert result.exit_code == 1, result.output
+        assert (
+            "Error: priority 5001 is above the worker priority ceiling (5000)"
+            in result.stderr
+        )
+        assert await self._count(db_pool, test_id) == 0
 
     async def test_list_enabled_requires_a_boolean(self, dsn):
         result = await run_cli("--dsn", dsn, "schedule", "list", "--enabled", "maybe")

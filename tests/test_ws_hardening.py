@@ -33,6 +33,7 @@ import pytest_asyncio
 from aiohttp import web
 from aiohttp.test_utils import TestClient
 
+from pyjobby.client import DEFAULT_PRIO_CEILING
 from pyjobby.procs import wait_until
 from pyjobby.websocket_server import (
     MAX_CHANNEL_NAME_LENGTH,
@@ -310,6 +311,22 @@ class TestRateLimiterUnderAdversarialTraffic:
 JOB_ID_RANGE_ERROR = "job_id must be between 0 and 9223372036854775807"
 PRIORITY_RANGE_ERROR = "new_priority must be between -2147483648 and 2147483647"
 
+
+def priority_ceiling_error(value: int, ceiling: int = DEFAULT_PRIO_CEILING) -> str:
+    """The reply for a priority no worker at `ceiling` could ever claim.
+
+    Spelled out here rather than imported so the wording is pinned by a test:
+    it is the only thing that tells an operator the ordering is inverted, and
+    the inverted ordering is what produces the bad value.
+    """
+    return (
+        f"new_priority {value} is above the worker priority ceiling "
+        f"({ceiling}): the job would sit 'queued' forever, unclaimable. "
+        f"LOWER is MORE urgent, so least-urgent work wants a value just "
+        f"under {ceiling}."
+    )
+
+
 # (frame, exact reply message). Every malformed frame now has a deterministic
 # reply: validation happens in the dispatcher, so no hostile value reaches
 # asyncpg and no reply carries a driver/PostgreSQL message.
@@ -361,6 +378,16 @@ EXACT_FRAME_CASES: tuple[tuple[Any, str], ...] = (
     (
         {"action": "adjust_priority", "job_id": 1, "new_priority": 2**40},
         PRIORITY_RANGE_ERROR,
+    ),
+    # The int32 column is not the real bound: the worker ceiling is, and it
+    # is checked before the job is even looked up.
+    (
+        {
+            "action": "adjust_priority",
+            "job_id": 1,
+            "new_priority": DEFAULT_PRIO_CEILING + 1,
+        },
+        priority_ceiling_error(DEFAULT_PRIO_CEILING + 1),
     ),
     ({"action": "subscribe", "channels": "notalist"}, "channels must be an array"),
     ({"action": "subscribe", "channels": 7}, "channels must be an array"),
@@ -868,12 +895,92 @@ class TestUnauthenticatedMutationBoundary:
         }
         assert (await job_row(db_pool, job_id))["prio"] == -(2**31)
 
-        # And back to the least urgent value.
+        # And back to the least urgent value that is still *claimable*: the
+        # ceiling itself. int32's maximum is no longer reachable from here.
         await ask(
             ws,
-            {"action": "adjust_priority", "job_id": job_id, "new_priority": 2**31 - 1},
+            {
+                "action": "adjust_priority",
+                "job_id": job_id,
+                "new_priority": DEFAULT_PRIO_CEILING,
+            },
         )
-        assert (await job_row(db_pool, job_id))["prio"] == 2**31 - 1
+        assert (await job_row(db_pool, job_id))["prio"] == DEFAULT_PRIO_CEILING
+
+    @pytest.mark.asyncio
+    async def test_adjust_priority_refuses_above_the_worker_ceiling(
+        self, ws_factory, db_pool, unique_queue
+    ):
+        """An operator cannot push a job out of every worker's reach.
+
+        Above the ceiling `claim_jorb()` never takes the job: it would sit
+        `queued` forever with no error, no retry and no DLQ entry -- a
+        deletion that looks like a demotion. The refusal has to be an error
+        frame, not a dropped message, or the dashboard shows success.
+        """
+        h = await ws_factory()
+        ws = await h.connect()
+        job_id = await make_job(db_pool, unique_queue, "queued")
+
+        reply = await ask(
+            ws,
+            {
+                "action": "adjust_priority",
+                "job_id": job_id,
+                "new_priority": DEFAULT_PRIO_CEILING + 1,
+            },
+        )
+        assert reply["event"] == "error"
+        assert reply["data"]["message"] == priority_ceiling_error(
+            DEFAULT_PRIO_CEILING + 1
+        )
+        # The whole message arrives: an error longer than the reply bound
+        # would be cut off exactly where it explains the inverted ordering.
+        assert len(reply["data"]["message"]) <= MAX_ERROR_MESSAGE_LENGTH
+        assert (await job_row(db_pool, job_id))["prio"] == 100
+
+        # The mirror: the ceiling itself is still an allowed value.
+        allowed = await ask(
+            ws,
+            {
+                "action": "adjust_priority",
+                "job_id": job_id,
+                "new_priority": DEFAULT_PRIO_CEILING,
+            },
+        )
+        assert allowed["event"] == "priority_adjusted"
+        assert allowed["data"] == {
+            "job_id": job_id,
+            "new_priority": DEFAULT_PRIO_CEILING,
+            "success": True,
+        }
+        assert (await job_row(db_pool, job_id))["prio"] == DEFAULT_PRIO_CEILING
+
+    @pytest.mark.asyncio
+    async def test_adjust_priority_ceiling_is_declared_not_assumed(
+        self, ws_factory, db_pool, unique_queue
+    ):
+        """A fleet running `pj --max-prio 5000` says so once, here, and the
+        dashboard's ceiling moves with it -- the constant is imported from
+        the client, never re-declared, so the two doors cannot drift."""
+        h = await ws_factory(prio_ceiling=5000)
+        ws = await h.connect()
+        job_id = await make_job(db_pool, unique_queue, "queued")
+
+        allowed = await ask(
+            ws,
+            {"action": "adjust_priority", "job_id": job_id, "new_priority": 5000},
+        )
+        assert allowed["event"] == "priority_adjusted"
+        assert (await job_row(db_pool, job_id))["prio"] == 5000
+
+        refused = await ask(
+            ws,
+            {"action": "adjust_priority", "job_id": job_id, "new_priority": 5001},
+        )
+        assert refused["event"] == "error"
+        assert refused["data"]["message"] == priority_ceiling_error(5001, 5000)
+        assert (await job_row(db_pool, job_id))["prio"] == 5000
 
     @pytest.mark.asyncio
     async def test_adjust_priority_only_touches_pending_jobs(

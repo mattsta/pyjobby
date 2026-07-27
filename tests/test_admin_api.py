@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from pyjobby.admin_api import AdminAPI
+from pyjobby.client import DEFAULT_PRIO_CEILING
 
 
 @pytest.fixture
@@ -609,6 +610,105 @@ class TestDeadLetterQueue:
         assert job["error_count"] == 0
         assert job["error_message"] is None
         assert job["state"] == "queued"
+
+
+class TestSchedulePriorityCeiling:
+    """`jorb_schedule.prio` is copied onto every job the schedule mints, so
+    an unclaimable priority here is not one lost job: it is a job lost per
+    firing, forever, with nothing in the DLQ and nothing in `doctor`.
+
+    The check is the client's `validate_priority`, imported rather than
+    restated, so the schedule door and the enqueue door cannot drift.
+    """
+
+    async def _count(self, conn, name: str) -> int:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM jorb_schedule WHERE name = $1", name
+        )
+
+    async def test_create_above_ceiling_refused_and_no_row_written(
+        self, admin_api, db_connection, test_id
+    ):
+        with pytest.raises(ValueError) as exc:
+            await admin_api.create_schedule(
+                name=test_id,
+                job_class="tests.dxe_jobs.OkJob",
+                cron_expr="0 2 * * *",
+                prio=DEFAULT_PRIO_CEILING + 1,
+            )
+
+        message = str(exc.value)
+        assert (
+            f"priority {DEFAULT_PRIO_CEILING + 1} is above the worker "
+            f"priority ceiling ({DEFAULT_PRIO_CEILING})" in message
+        )
+        assert "LOWER numbers are MORE urgent" in message
+        assert await self._count(db_connection, test_id) == 0
+
+    async def test_create_at_ceiling_is_accepted(
+        self, admin_api, db_connection, test_id
+    ):
+        sched = await admin_api.create_schedule(
+            name=test_id,
+            job_class="tests.dxe_jobs.OkJob",
+            cron_expr="0 2 * * *",
+            prio=DEFAULT_PRIO_CEILING,
+        )
+
+        assert sched["prio"] == DEFAULT_PRIO_CEILING
+        assert await self._count(db_connection, test_id) == 1
+
+    async def test_declared_ceiling_moves_the_line(self, db_connection, test_id):
+        """A fleet running `pj --max-prio 5000` declares it once, here."""
+        api = AdminAPI(db_connection, prio_ceiling=5000)
+
+        sched = await api.create_schedule(
+            name=test_id,
+            job_class="tests.dxe_jobs.OkJob",
+            cron_expr="0 2 * * *",
+            prio=5000,
+        )
+        assert sched["prio"] == 5000
+
+        with pytest.raises(ValueError, match="ceiling \\(5000\\)"):
+            await api.create_schedule(
+                name=f"{test_id}_2",
+                job_class="tests.dxe_jobs.OkJob",
+                cron_expr="0 2 * * *",
+                prio=5001,
+            )
+        assert await self._count(db_connection, f"{test_id}_2") == 0
+
+    async def test_update_above_ceiling_leaves_the_row_alone(
+        self, admin_api, db_connection, test_id
+    ):
+        """The second door onto the same column: raising an existing
+        schedule out of reach mints the same unbounded stream."""
+        sched = await admin_api.create_schedule(
+            name=test_id,
+            job_class="tests.dxe_jobs.OkJob",
+            cron_expr="0 2 * * *",
+            prio=100,
+        )
+
+        with pytest.raises(ValueError) as exc:
+            await admin_api.update_schedule(sched["id"], prio=DEFAULT_PRIO_CEILING + 1)
+        assert (
+            f"priority {DEFAULT_PRIO_CEILING + 1} is above the worker "
+            f"priority ceiling ({DEFAULT_PRIO_CEILING})" in str(exc.value)
+        )
+        assert (
+            await db_connection.fetchval(
+                "SELECT prio FROM jorb_schedule WHERE id = $1", sched["id"]
+            )
+            == 100
+        )
+
+        # The mirror: at the ceiling the update goes through.
+        updated = await admin_api.update_schedule(
+            sched["id"], prio=DEFAULT_PRIO_CEILING
+        )
+        assert updated["prio"] == DEFAULT_PRIO_CEILING
 
 
 class TestJobInfoTracksTheSchema:

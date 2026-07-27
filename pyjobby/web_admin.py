@@ -23,6 +23,7 @@ from aiohttp import web
 
 from . import db
 from .admin_api import AdminAPI
+from .client import DEFAULT_PRIO_CEILING
 
 # =============================================================================
 # Request parsing
@@ -274,7 +275,13 @@ class WebAdminServer:
     Uses htmx for dynamic updates without full page reloads.
     """
 
-    def __init__(self, db_params: dict, host: str = "127.0.0.1", port: int = 8081):
+    def __init__(
+        self,
+        db_params: dict,
+        host: str = "127.0.0.1",
+        port: int = 8081,
+        prio_ceiling: int = DEFAULT_PRIO_CEILING,
+    ):
         """
         Initialize web admin server.
 
@@ -282,10 +289,15 @@ class WebAdminServer:
             db_params: Database connection parameters
             host: Host to bind to (default: 127.0.0.1)
             port: Port to listen on (default: 8081)
+            prio_ceiling: the priority ceiling this fleet's workers run with
+                (`pj --max-prio`, default 1000). Handed to every AdminAPI
+                this server builds, so the schedule form cannot create a
+                schedule whose every firing mints an unclaimable job.
         """
         self.db_params = db_params
         self.host = host
         self.port = port
+        self.prio_ceiling = prio_ceiling
         self.pool: asyncpg.Pool | None = None
         self._pool_lock = asyncio.Lock()
         self.app = web.Application()
@@ -358,7 +370,7 @@ class WebAdminServer:
         """Acquire a pooled connection wrapped in an AdminAPI for one request."""
         pool = await self._get_pool()
         async with pool.acquire() as conn:
-            yield AdminAPI(conn)
+            yield AdminAPI(conn, prio_ceiling=self.prio_ceiling)
 
     @staticmethod
     async def _job_or_404(api: AdminAPI, job_id: int) -> dict[str, Any]:
@@ -1669,7 +1681,7 @@ class WebAdminServer:
                     </div>
                     <div class="form-group">
                         <label>Priority</label>
-                        <input type="number" name="prio" value="100">
+                        <!--PRIO_FIELD-->
                     </div>
                 </div>
 
@@ -1728,6 +1740,20 @@ class WebAdminServer:
     </script>
 </body>
 </html>"""
+        # The priority field is built here rather than inlined above because
+        # it has to carry a number this server was told (the fleet's ceiling)
+        # into a page template that is otherwise a constant. The browser-side
+        # `max` is a courtesy; POST /api/schedules refuses the value anyway.
+        # The wording is the point: the ordering is inverted from everyone's
+        # intuition, and that inversion is what mints the unclaimable job.
+        html = html.replace(
+            "<!--PRIO_FIELD-->",
+            '<input type="number" name="prio" value="100" '
+            f'max="{self.prio_ceiling}">\n'
+            "                        <small>LOWER is MORE urgent. Above the "
+            f"worker priority ceiling ({self.prio_ceiling}) no worker ever "
+            f"claims the job.</small>",
+        )
         return web.Response(text=html, content_type="text/html")
 
     def _render_schedules_table(self, schedules: list[dict[str, Any]]) -> str:
@@ -1932,9 +1958,14 @@ class WebAdminServer:
             await runner.cleanup()
 
 
-async def serve(db_params: dict, host: str, port: int) -> None:
+async def serve(
+    db_params: dict,
+    host: str,
+    port: int,
+    prio_ceiling: int = DEFAULT_PRIO_CEILING,
+) -> None:
     """Create and run a WebAdminServer until interrupted."""
-    server = WebAdminServer(db_params, host=host, port=port)
+    server = WebAdminServer(db_params, host=host, port=port, prio_ceiling=prio_ceiling)
     await server.start()
 
 
@@ -1951,7 +1982,16 @@ def main() -> None:
         help="Bind address (use 0.0.0.0 to expose; the admin UI has no authentication)",
     )
     @click.option("--port", default=8081, show_default=True, help="Bind port")
-    def cli(config: str, host: str, port: int) -> None:
+    @click.option(
+        "--max-prio",
+        default=DEFAULT_PRIO_CEILING,
+        show_default=True,
+        type=int,
+        help="The priority ceiling this fleet's workers run with (`pj "
+        "--max-prio`). Schedules created here are refused above it: LOWER is "
+        "MORE urgent, and a job above the ceiling is never claimed at all",
+    )
+    def cli(config: str, host: str, port: int, max_prio: int) -> None:
         """Run the pyjobby web admin interface."""
         from .configloader import load_config_from_file
 
@@ -1960,7 +2000,7 @@ def main() -> None:
         if not db_params:
             raise click.ClickException(f"No db_params found in config: {config}")
 
-        asyncio.run(serve(db_params, host, port))
+        asyncio.run(serve(db_params, host, port, max_prio))
 
     cli()
 

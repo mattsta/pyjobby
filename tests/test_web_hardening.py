@@ -32,6 +32,7 @@ from aiohttp.test_utils import TestClient
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
+from pyjobby.client import DEFAULT_PRIO_CEILING
 from pyjobby.web_admin import (
     MAX_QUEUE_NAME_LENGTH,
     MAX_SINCE_HOURS,
@@ -1108,6 +1109,133 @@ class TestMalformedInput:
         )
         assert resp.status == 400
         assert "invalid literal for int" in (await resp.json())["error"]
+
+    @pytest.mark.asyncio
+    async def test_schedule_create_above_prio_ceiling_is_400_and_writes_no_row(
+        self, web: Harness, db_pool: asyncpg.Pool
+    ):
+        """A well-formed integer is not a claimable one. Above the worker
+        ceiling every firing of this schedule would mint a job that sits
+        `queued` forever, so the row must not be created at all."""
+        name = f"overprio_{uuid.uuid4().hex[:8]}"
+        resp = await web.client.post(
+            "/api/schedules",
+            data={
+                "name": name,
+                "job_class": "OverPrio",
+                "cron_expr": "0 * * * *",
+                "prio": str(DEFAULT_PRIO_CEILING + 1),
+            },
+        )
+        assert resp.status == 400
+        error = (await resp.json())["error"]
+        assert (
+            f"priority {DEFAULT_PRIO_CEILING + 1} is above the worker "
+            f"priority ceiling ({DEFAULT_PRIO_CEILING})" in error
+        )
+        assert "LOWER numbers are MORE urgent" in error
+
+        async with db_pool.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT COUNT(*) FROM jorb_schedule WHERE name = $1", name
+                )
+                == 0
+            )
+
+    @pytest.mark.asyncio
+    async def test_schedule_create_at_prio_ceiling_is_accepted(
+        self, web: Harness, db_pool: asyncpg.Pool
+    ):
+        """The mirror: the ceiling itself is claimable, so it goes through."""
+        name = f"atprio_{uuid.uuid4().hex[:8]}"
+        resp = await web.client.post(
+            "/api/schedules",
+            data={
+                "name": name,
+                "job_class": "AtPrio",
+                "cron_expr": "0 * * * *",
+                "prio": str(DEFAULT_PRIO_CEILING),
+            },
+        )
+        assert resp.status == 200
+
+        async with db_pool.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT prio FROM jorb_schedule WHERE name = $1", name
+                )
+                == DEFAULT_PRIO_CEILING
+            )
+
+    @pytest.mark.asyncio
+    async def test_schedule_ceiling_is_the_one_this_server_was_told(
+        self, db_params, aiohttp_client, db_pool: asyncpg.Pool
+    ):
+        """`WebAdminServer(prio_ceiling=N)` is this surface's version of
+        `JobClient(pool, prio_ceiling=N)`: a fleet running `pj --max-prio
+        5000` declares it once and the dashboard's limit moves with it."""
+        server = WebAdminServer(db_params, prio_ceiling=5000)
+        client = await aiohttp_client(server.app)
+
+        name = f"declared_{uuid.uuid4().hex[:8]}"
+        ok = await client.post(
+            "/api/schedules",
+            data={
+                "name": name,
+                "job_class": "Declared",
+                "cron_expr": "0 * * * *",
+                "prio": "5000",
+            },
+        )
+        assert ok.status == 200
+
+        refused_name = f"{name}_2"
+        refused = await client.post(
+            "/api/schedules",
+            data={
+                "name": refused_name,
+                "job_class": "Declared",
+                "cron_expr": "0 * * * *",
+                "prio": "5001",
+            },
+        )
+        assert refused.status == 400
+        assert (
+            "priority 5001 is above the worker priority ceiling (5000)"
+            in (await refused.json())["error"]
+        )
+
+        async with db_pool.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT prio FROM jorb_schedule WHERE name = $1", name
+                )
+                == 5000
+            )
+            assert (
+                await conn.fetchval(
+                    "SELECT COUNT(*) FROM jorb_schedule WHERE name = $1", refused_name
+                )
+                == 0
+            )
+
+    @pytest.mark.asyncio
+    async def test_schedule_form_states_the_ceiling_and_the_ordering(
+        self, web: Harness
+    ):
+        """The form says which way the numbers run, because the inverted
+        ordering is what produces the unclaimable value in the first place."""
+        resp = await web.client.get("/schedules")
+        assert resp.status == 200
+        body = await resp.text()
+
+        assert f'name="prio" value="100" max="{DEFAULT_PRIO_CEILING}"' in body
+        assert (
+            f"LOWER is MORE urgent. Above the worker priority ceiling "
+            f"({DEFAULT_PRIO_CEILING}) no worker ever claims the job." in body
+        )
+        assert "<!--PRIO_FIELD-->" not in body
 
     @pytest.mark.asyncio
     async def test_schedule_create_invalid_cron_is_400(self, web: Harness):
