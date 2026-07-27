@@ -23,8 +23,10 @@ import re
 import pytest
 
 from pyjobby.monitor import (
+    DELETE_MAILBOX_SQL,
     DELETE_RETIRED_WORKERS_SQL,
     SWEEP_CHECKPOINT_JOBS_SQL,
+    SWEEP_MAILBOX_SQL,
     SWEEP_ORPHANED_DAGS_SQL,
     SWEEP_RETIRED_WORKERS_SQL,
     SWEEP_SCHEDULE_LOG_SQL,
@@ -334,40 +336,127 @@ class TestMailboxSweepPlan:
     cascade cannot reach a job that is still alive -- so a durable workflow
     running for months accumulates every message it has read. This sweep runs
     every cycle forever, which makes its plan matter as much as retention's.
+
+    It was the LAST sweep still shaped as ``DELETE ... USING (CTE)``, and the
+    form cost exactly what it cost everywhere else: the probe picked its batch
+    by index and the delete then hash-joined a sequential scan of the whole
+    mailbox against keys it was already holding (measured here at a 20,000-row
+    backlog: 4,750 buffers, 331 of them the scan, to delete 1,000 rows). The
+    steady-state case planned fine, which is why it survived -- so the backlog
+    case below is the one that actually gates the shape.
     """
 
-    async def test_consumed_probe_uses_the_index(self, db_pool, unique_queue):
-        job_id = await db_pool.fetchval(
+    async def seed(self, pool, queue: str) -> None:
+        job_id = await pool.fetchval(
             """INSERT INTO jorb (job_class, kwargs, queue, state)
                VALUES ('scale.Job', '{}', $1, 'running') RETURNING id""",
-            unique_queue,
+            queue,
         )
-        await db_pool.execute(
+        await pool.execute(
             """
             INSERT INTO jorb_mailbox (dest_job_id, topic, message, consumed_at)
             SELECT $1, 't', '{}',
                    CASE WHEN i % 10 = 0 THEN NULL
                         ELSE now() - (i % 30) * interval '1 day' END
-            FROM generate_series(1, 20000) i
+            FROM generate_series(1, $2) i
             """,
             job_id,
+            ROWS,
         )
-        await db_pool.execute("ANALYZE jorb_mailbox")
+        await pool.execute("VACUUM (ANALYZE) jorb_mailbox")
 
-        plan = await plan_for(
-            db_pool,
-            """
-            SELECT id FROM jorb_mailbox
-             WHERE consumed_at IS NOT NULL
-               AND consumed_at < now() - $1::interval
-             ORDER BY consumed_at LIMIT 1000
-            """,
-            datetime.timedelta(days=3650),
+    async def explain_sweep(self, pool, retention_days: float) -> str:
+        return await explain_rolled_back(
+            pool,
+            SWEEP_MAILBOX_SQL,
+            datetime.timedelta(days=retention_days),
+            BATCH,
         )
+
+    async def test_nothing_expired_reads_almost_nothing(self, db_pool, unique_queue):
+        """The steady state, run every cycle forever."""
+        await self.seed(db_pool, unique_queue)
+
+        plan = await self.explain_sweep(db_pool, retention_days=3650)
+
+        assert "jorb_mailbox_consumed_idx" in plan, plan
+        assert_no_seq_scan(plan, "jorb_mailbox")
+        assert rows_removed_by_filter(plan) == 0, plan
+        await assert_reads_far_less_than_a_scan(db_pool, plan, "jorb_mailbox")
+
+    async def test_a_backlog_is_still_index_driven(self, db_pool, unique_queue):
+        """A full backlog: the case the CTE form got wrong.
+
+        The probe is bounded by the BATCH -- it reads a batch's worth of index
+        entries and their heap rows and stops -- so what it touches must not
+        scale with the mailbox. Unconsumed messages are not in the partial
+        index at all, so nothing is read and discarded either.
+        """
+        await self.seed(db_pool, unique_queue)
+
+        plan = await self.explain_sweep(db_pool, retention_days=0)
 
         assert "jorb_mailbox_consumed_idx" in plan, plan
         # index order means the batch needs no sort, however big the backlog
         assert "Sort" not in plan, plan
+        assert_no_seq_scan(plan, "jorb_mailbox")
+        assert rows_removed_by_filter(plan) == 0, plan
+
+    async def test_the_delete_finds_its_batch_by_primary_key(
+        self, db_pool, unique_queue
+    ):
+        """...and the second statement must not re-read the table either.
+
+        This is the assertion the CTE form could not have passed: its delete
+        stage sequentially scanned jorb_mailbox to join a batch it had just
+        been handed.
+        """
+        await self.seed(db_pool, unique_queue)
+        doomed = [
+            r["id"]
+            for r in await db_pool.fetch(
+                "SELECT id FROM jorb_mailbox WHERE consumed_at IS NOT NULL "
+                "ORDER BY consumed_at LIMIT $1",
+                BATCH,
+            )
+        ]
+
+        plan = await explain_rolled_back(db_pool, DELETE_MAILBOX_SQL, doomed)
+
+        assert "jorb_mailbox_pkey" in plan, plan
+        assert_no_seq_scan(plan, "jorb_mailbox")
+        assert rows_removed_by_filter(plan) == 0, plan
+
+    async def test_the_sweep_reaps_only_consumed_messages_past_the_window(
+        self, db_pool, unique_queue
+    ):
+        """The plan is only worth asserting if the statement is still right.
+
+        Splitting one statement into two is exactly the change that can quietly
+        stop honouring the batch bound, so the batch size is checked as well as
+        which rows survive.
+        """
+        from pyjobby.monitor import sweep_consumed_mailbox
+
+        await self.seed(db_pool, unique_queue)
+        unconsumed = await db_pool.fetchval(
+            "SELECT count(*) FROM jorb_mailbox WHERE consumed_at IS NULL"
+        )
+
+        first = await sweep_consumed_mailbox(db_pool, 0, batch_size=BATCH)
+        assert first == BATCH, "the batch bound stopped bounding the delete"
+
+        deleted = first
+        for _ in range(50):
+            batch = await sweep_consumed_mailbox(db_pool, 0, batch_size=BATCH)
+            deleted += batch
+            if not batch:
+                break
+
+        assert deleted == ROWS - unconsumed
+        assert (
+            await db_pool.fetchval("SELECT count(*) FROM jorb_mailbox") == unconsumed
+        ), "an unread message was reaped"
 
 
 class TestOrphanedDagSweepPlan:

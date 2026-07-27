@@ -1259,7 +1259,8 @@ class TestSweepConsumedMailbox:
 
 
 # ============================================================================
-# the three tables the job cascade cannot reach
+# the other three tables the job cascade cannot reach
+# (the fourth, jorb_mailbox, is above: a live job's read mail)
 # ============================================================================
 
 
@@ -1756,7 +1757,7 @@ class TestMonitorLoop:
         orphaned = await insert_job(
             db_pool, unique_queue, state="running", claimed_by=dead_worker
         )
-        # the three tables no cascade reaches share the one window, so `0`
+        # every table no cascade reaches shares the one window, so `0`
         # has to be the escape hatch for all of them too
         empty_dag = await insert_dag(db_pool, "ancient", days_ago=3650)
         schedule = await insert_schedule(db_pool, f"ancient_{unique_queue}")

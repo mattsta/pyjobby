@@ -453,11 +453,14 @@ terminal state, resume is impossible and every checkpoint it holds is audit
 material only — which is why checkpoints have their own, much shorter life
 than the job row.
 
-Both sweeps run in `pj-monitor` and both are **on by default**:
+Both windows apply in `pj-monitor` and both are **on by default**:
 
 ```
 --retention-days 30              delete terminal jobs, with their history,
-                                 events, mailbox and checkpoints
+                                 events, mailbox and checkpoints — and the
+                                 four things no cascade reaches: consumed
+                                 mail of LIVE jobs, emptied DAGs, aged
+                                 schedule executions, retired worker rows
 --checkpoint-retention-days 1    delete the CHECKPOINTS of terminal jobs,
                                  keeping the job row itself
 ```
@@ -466,6 +469,16 @@ Pass `0` to either to keep that data forever. So by default a finished job
 keeps its step checkpoints for a day — long enough to answer "which step
 failed, and why" after an incident — and the job row, its result and its
 history for thirty.
+
+`--retention-days` drives five separate sweeps, not one. Four of the tables
+it covers are not reachable from a job at all — `jorb_dag` is the *parent* of
+its jobs, `jorb_schedule_log` cascades only from `jorb_schedule`,
+`jorb_worker` is referenced by nothing, and a live job's consumed mail
+outlives no job — so deleting jobs would never free them. They share the one
+window because none of them has a lifetime of its own to argue for. What each
+sweep refuses to delete, and why, is in
+[OPERATIONS.md § Retention](OPERATIONS.md#retention-what-it-deletes-and-what-it-refuses-to);
+the DXE-relevant half is below.
 
 The job sweep is deliberately conservative:
 
@@ -478,9 +491,11 @@ The job sweep is deliberately conservative:
 * it **drains** rather than taking one batch per cycle — a sweep that deletes
   slower than jobs arrive is retention in name only — under a per-cycle time
   budget so it can never starve the latency-critical sweeps.
-* consumed mailbox messages are pruned even when their job is still alive: a
-  long-running workflow reads messages for months and the job-scoped cascade
-  would never reach them.
+* consumed mailbox messages are pruned by a sweep of their own, even when
+  their job is still alive: a long-running workflow reads messages for months
+  and the job-scoped cascade would never reach them. Only messages `recv` has
+  already consumed are candidates — unread mail is kept at any age, because it
+  is still deliverable.
 
 The child rows go with the job through `ON DELETE CASCADE`.
 

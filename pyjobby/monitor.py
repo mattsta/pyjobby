@@ -28,10 +28,13 @@ recovery:
    thing on the row with the shortest useful life. They outlive the job's
    terminal transition only far enough to debug it. ``0`` keeps them for as
    long as the job.
-6. **The three tables the job cascade cannot reach**, all on the same
+6. **The four tables the job cascade cannot reach**, all on the same
    ``--retention-days`` window, because none of them has a lifetime argument
    of its own — they are all "as long as the jobs they describe":
 
+   * ``jorb_mailbox`` — ``recv`` only stamps ``consumed_at``, and the
+     job-scoped cascade cannot reach a job that is still ALIVE, so a durable
+     workflow running for months keeps every message it has ever read.
    * ``jorb_dag`` — jobs point AT a DAG (``ON DELETE SET NULL``), so
      deleting jobs never touches it. Left alone it is not just leaked
      storage: ``jorb_dag_status`` LEFT JOINs jorb, so a DAG whose jobs aged
@@ -52,8 +55,21 @@ from delaying the latency-critical sweeps above.
 
 Every retention sweep also REFUSES to delete a row something live still
 needs, and the refusal is the interesting half of each one: a terminal job a
-'waiting' job depends on, a DAG that still has jobs, a schedule's most recent
-execution, a worker row whose jobs are still in flight.
+'waiting' job depends on, an unread message, a DAG that still has jobs, a
+schedule's most recent execution, a worker row whose jobs are still in
+flight.
+
+Every sweep's SQL is a module constant, and ``pj-bench plans`` EXPLAINs those
+exact constants as a CI gate — deriving its case list from the ``SWEEP_*_SQL``
+names defined here, so a sweep added without a gate entry fails the gate
+instead of quietly going unmeasured. All of them probe by index and then
+delete by primary key, in two statements: the one-statement
+``DELETE ... USING (CTE)`` form plans its second stage against the target's
+whole-table statistics and hash-joins a SEQUENTIAL SCAN of it against a batch
+whose keys it is already holding. Measured on four of these sweeps, at
+20,000-row seeds, that is hundreds to thousands of buffers per batch to
+delete rows it had already identified — and it grows with the table forever,
+while a batch does not.
 
 Requeues bump nothing themselves: the next claim increments ``run_epoch``,
 which fences any still-running stale execution out of the row.
@@ -395,20 +411,38 @@ DELETE_RETIRED_WORKERS_SQL = """
 """
 
 #: Consumed mailbox messages past the window. ($1 retention, $2 batch)
+#:
+#: ``consumed_at IS NOT NULL`` is written out as well as implied by the range
+#: comparison because ``jorb_mailbox_consumed_idx`` is PARTIAL on exactly that
+#: predicate: without it the planner cannot prove the index covers every row
+#: the query wants and will not use it at all.
+#:
+#: Ordered by ``consumed_at``, which that index provides directly, so the
+#: probe walks it in order and stops at the batch — no sort however large the
+#: backlog, and a two-buffer answer once caught up. Ordering by id would sort
+#: every matching row first, and that cost grows with the backlog.
+#:
+#: Probe then delete by key, the shape every other retention sweep here uses,
+#: and measured to matter for the fourth time. The one-statement
+#: ``DELETE ... USING (CTE)`` form this replaced planned its second stage
+#: against jorb_mailbox's whole-table statistics and hash-joined a SEQUENTIAL
+#: SCAN of the mailbox against a batch whose keys it was already holding:
+#: measured at 20,000 messages with a full backlog, 4,750 buffers total, 331
+#: of them the scan, to delete 1,000 rows by primary key. The steady state
+#: (nothing expired) planned fine, which is what let it survive review — the
+#: cost only appears once the sweep has work, i.e. exactly when it matters.
 SWEEP_MAILBOX_SQL = """
-    WITH doomed AS MATERIALIZED (
-        SELECT id FROM jorb_mailbox
-        WHERE consumed_at IS NOT NULL
-          AND consumed_at < now() - $1::interval
-        ORDER BY consumed_at
-        FOR UPDATE SKIP LOCKED
-        LIMIT $2
-    )
-    DELETE FROM jorb_mailbox m
-    USING doomed d
-    WHERE m.id = d.id
-    RETURNING m.id
+    SELECT m.id
+    FROM jorb_mailbox m
+    WHERE m.consumed_at IS NOT NULL
+      AND m.consumed_at < now() - $1::interval
+    ORDER BY m.consumed_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT $2
 """
+
+#: ...and the delete, by the primary key's leading column.
+DELETE_MAILBOX_SQL = "DELETE FROM jorb_mailbox WHERE id = ANY($1::bigint[])"
 
 
 async def handle_timed_out_job(
@@ -686,24 +720,35 @@ async def sweep_consumed_mailbox(
     A consumed message is unreadable (``recv`` filters ``consumed_at IS
     NULL``) and referenced by nothing, so age is the only thing to decide on.
 
-    The victims are picked in an explicitly MATERIALIZED CTE, not an
-    ``IN (SELECT ... LIMIT n)`` subquery: the planner is free to re-execute an
-    un-materialized subquery once per outer row, and each re-execution of a
-    FOR UPDATE SKIP LOCKED scan returns a *different* set — so the LIMIT stops
-    bounding the delete and the batch overruns (observed: batch_size=2
-    deleting 5 rows). MATERIALIZED forces exactly one evaluation.
+    Probe then delete by key, the same two-statement shape as every other
+    retention sweep here, and for the same measured reason. The single
+    statement it replaced — ``DELETE ... USING (materialized CTE)`` — picked
+    its batch by index perfectly well and then hash-joined a SEQUENTIAL SCAN
+    of the whole mailbox against keys it was already holding: 4,750 buffers at
+    a 20,000-message backlog to delete 1,000 rows, 331 of them pure scan, and
+    both numbers grow with the table forever. It planned correctly in the
+    steady state, so a caught-up system never showed the cost; it appeared
+    only once the sweep had work to do.
 
-    Ordered by ``consumed_at``, which jorb_mailbox_consumed_idx provides
+    Ordered by ``consumed_at``, which ``jorb_mailbox_consumed_idx`` provides
     directly: the probe walks the index in order and stops at the batch size,
     with no sort even when a large backlog matches. Ordering by id instead
     would have to sort every matching row first, which is the cost that grows.
 
-    Single atomic statement; safe with concurrent monitor instances."""
+    The two statements share one transaction, so the rows the probe locked
+    with FOR UPDATE SKIP LOCKED are still held when the delete runs and
+    concurrent monitors partition the backlog rather than colliding on it.
+    Returns the number of messages deleted."""
     retention = datetime.timedelta(days=retention_days)
 
-    deleted = await pool.fetch(SWEEP_MAILBOX_SQL, retention, batch_size)
+    async with pool.acquire() as conn, conn.transaction():
+        doomed = await conn.fetch(SWEEP_MAILBOX_SQL, retention, batch_size)
+        if not doomed:
+            return 0
 
-    return len(deleted)
+        await conn.execute(DELETE_MAILBOX_SQL, [row["id"] for row in doomed])
+
+    return len(doomed)
 
 
 async def sweep_orphaned_dags(
@@ -907,11 +952,11 @@ async def monitor(
     checkpoints of terminal jobs much sooner. Either set to ``0`` means keep
     forever: those sweeps do not run at all.
 
-    One window covers the four job-scoped tables rather than four knobs
-    because none of them has its own lifetime to argue for: they all mean "as
-    long as the work they describe". Checkpoints get the second knob because
-    they genuinely do — they are the bulkiest rows in the system and stop
-    being useful the instant their job goes terminal.
+    One window covers all five of those tables rather than five knobs because
+    none of them has its own lifetime to argue for: they all mean "as long as
+    the work they describe". Checkpoints get the second knob because they
+    genuinely do — they are the bulkiest rows in the system and stop being
+    useful the instant their job goes terminal.
 
     Each retention sweep drains its backlog within a ``retention_max_seconds``
     budget per cycle, so it can catch up on a busy install without ever

@@ -5,8 +5,9 @@ that get written into documents and then defended. These tests do not
 measure performance — they prove the harness is HONEST at tiny N:
 
 * every subcommand runs and emits JSON with the keys its consumers read
-* ``plans`` exits non-zero on a sequential scan of jorb and zero otherwise,
-  which is the only reason it is safe to run in CI as a gate
+* ``plans`` exits non-zero on a bad plan and zero otherwise, which is the
+  only reason it is safe to run in CI as a gate — and it gates EVERY sweep
+  ``monitor.py`` defines, checked here rather than trusted
 * the triggers ``enqueue`` disables come back even when the run explodes
   while they are off — the one failure here that would silently break a
   production install rather than just report a wrong number
@@ -89,6 +90,9 @@ async def counts(conn: asyncpg.Connection) -> dict[str, int]:
         "jorb_mailbox",
         "jorb_queue",
         "jorb_worker",
+        "jorb_dag",
+        "jorb_schedule",
+        "jorb_schedule_log",
     )
     return {
         table: int(await conn.fetchval(f"SELECT count(*) FROM {table}"))  # noqa: S608
@@ -332,30 +336,59 @@ class TestSubcommandsEmitDocumentedJson:
             assert latency["p50"] <= latency["p95"] <= latency["p99"] <= latency["max"]
 
     async def test_plans(self, db_params, db_pool):
-        code, payload, _ = await run_bench(
+        code, payload, output = await run_bench(
             dsn_from(db_params), "plans", "--seed", str(PLAN_SEED)
         )
 
-        assert code == 0, payload
+        assert code == 0, output
         assert payload["benchmark"] == "plans"
         assert payload["healthy"] is True
         assert payload["seq_scan_offenders"] == []
+        assert payload["discard_offenders"] == []
         assert set(payload["queries"]) == {
             "claim",
             "concurrency_cap",
-            "retention_probe",
-            "checkpoint_sweep",
-            "mailbox_sweep",
             "metrics_completions",
             "metrics_arrivals",
+            # every sweep, in both the caught-up and the full-backlog state
+            "timed_out",
+            "dead_worker_jobs",
+            "dead_worker_jobs_backlog",
+            "unregistered_claims",
+            "unregistered_claims_backlog",
+            "expired_jobs",
+            "expired_jobs_backlog",
+            "checkpoint_jobs",
+            "checkpoint_jobs_backlog",
+            "mailbox",
+            "mailbox_backlog",
+            "orphaned_dags",
+            "orphaned_dags_backlog",
+            "schedule_log",
+            "schedule_log_backlog",
+            "retired_workers",
+            "retired_workers_backlog",
         }
         for key, data in payload["queries"].items():
             assert data["access_methods"], key
             assert data["buffers"] > 0, key
-            assert data["seq_scan_on_jorb"] == [], key
+            assert data["seq_scans"] == [], key
+            assert data["over_discard_budget"] is False, key
         # the two paths docs/SCALE.md names must reach their own index
         assert "jorb_claim_idx" in payload["queries"]["claim"]["indexes"]
-        assert "jorb_retention_idx" in payload["queries"]["retention_probe"]["indexes"]
+        assert "jorb_retention_idx" in payload["queries"]["expired_jobs"]["indexes"]
+        # Each sweep must reach the index its own table was given for it --
+        # "no seq scan" alone would be satisfied by the wrong index.
+        for key, index in (
+            ("expired_jobs", "jorb_retention_idx"),
+            ("checkpoint_jobs", "jorb_retention_idx"),
+            ("mailbox_backlog", "jorb_mailbox_consumed_idx"),
+            ("orphaned_dags_backlog", "jorb_dag_retention_idx"),
+            ("schedule_log_backlog", "jorb_schedule_log_retention_idx"),
+            ("retired_workers_backlog", "jorb_worker_retention_idx"),
+            ("timed_out", "jorb_timeout_idx"),
+        ):
+            assert index in payload["queries"][key]["indexes"], (key, payload)
         # The concurrency-cap count runs inside the per-queue advisory lock,
         # so it is the one query here whose cost is subtracted from a capped
         # queue's entire throughput rather than from one timer. It must reach
@@ -422,9 +455,157 @@ class TestPlansGate:
 
         assert code == 1
         assert payload["healthy"] is False
-        assert "retention_probe" in payload["seq_scan_offenders"]
-        assert payload["queries"]["retention_probe"]["seq_scan_on_jorb"]
-        assert "sequential scan of jorb" in output
+        assert "expired_jobs" in payload["seq_scan_offenders"]
+        assert payload["queries"]["expired_jobs"]["seq_scans"]
+        assert "sequential scan in" in output
+        # ...and the tables the newer sweeps read are gated too, not just
+        # jorb. This is the check that would have failed before those three
+        # sweeps were added to the gate at all.
+        for key in ("orphaned_dags", "schedule_log", "retired_workers", "mailbox"):
+            assert key in payload["seq_scan_offenders"], (key, payload)
+
+    async def test_every_sweep_monitor_defines_is_gated(self):
+        """The coverage claim, checked instead of trusted.
+
+        Retention grew three sweeps and none of them reached the gate, which
+        went on reporting success — a gap that is worse than no gate, because
+        a green gate is believed. The roster is now DERIVED from monitor.py,
+        and this is the assertion that says so.
+        """
+        gated = {q.sweep for q in bench.hot_queries() if q.sweep}
+
+        assert gated == set(bench.monitor_sweeps())
+        assert gated == set(bench.SWEEP_GATES)
+        # not vacuously true: the sweeps that prompted this must be in there
+        assert {
+            "SWEEP_ORPHANED_DAGS_SQL",
+            "SWEEP_SCHEDULE_LOG_SQL",
+            "SWEEP_RETIRED_WORKERS_SQL",
+            "SWEEP_MAILBOX_SQL",
+        } <= gated
+
+    async def test_a_sweep_with_no_gate_entry_is_an_error_not_a_gap(self, monkeypatch):
+        """Adding a sweep and forgetting the gate must FAIL the run.
+
+        The whole failure this replaced was silent: the list did not mention
+        the new sweeps, so the gate skipped them and said everything was fine.
+        """
+        monkeypatch.setattr(
+            bench.monitor, "SWEEP_INVENTED_FOR_THIS_TEST_SQL", "SELECT 1", raising=False
+        )
+
+        with pytest.raises(RuntimeError, match="SWEEP_INVENTED_FOR_THIS_TEST_SQL"):
+            bench.sweep_queries()
+
+    async def test_a_gate_entry_for_a_deleted_sweep_is_also_an_error(self, monkeypatch):
+        """...and so is coverage of a statement nobody runs, which reads
+        exactly like coverage to whoever sees the output."""
+        monkeypatch.setitem(
+            bench.SWEEP_GATES,
+            "SWEEP_DELETED_SQL",
+            bench.SweepGate("gone", ("jorb",)),
+        )
+
+        with pytest.raises(RuntimeError, match="SWEEP_DELETED_SQL"):
+            bench.sweep_queries()
+
+    async def test_the_gate_uses_the_monitors_own_statements(self):
+        """A copy passes review, drifts on the next edit, and then certifies
+        a statement nobody executes."""
+        from pyjobby import monitor
+
+        by_sweep = {q.sweep: q.sql for q in bench.hot_queries() if q.sweep}
+
+        assert by_sweep["SWEEP_MAILBOX_SQL"] is monitor.SWEEP_MAILBOX_SQL
+        assert by_sweep["SWEEP_ORPHANED_DAGS_SQL"] is monitor.SWEEP_ORPHANED_DAGS_SQL
+
+    def test_an_index_scan_that_discards_everything_still_fails(self):
+        """The failure a seq-scan gate cannot see.
+
+        This plan uses an index, has no Seq Scan node anywhere, and reads a
+        table's worth of rows to return none. It costs the same as the scan
+        and must fail the same way.
+        """
+        query = bench.HotQuery(
+            "probe", "", "SELECT 1", lambda _q: [], max_rows_removed=1000
+        )
+
+        summary = bench.summarize_plan(
+            {
+                "Plan": {
+                    "Node Type": "Index Scan",
+                    "Relation Name": "jorb",
+                    "Index Name": "jorb_pkey",
+                    "Actual Rows": 0,
+                    "Actual Loops": 1,
+                    "Rows Removed by Filter": 20_000,
+                    "Shared Hit Blocks": 465,
+                }
+            },
+            query,
+        )
+
+        assert summary["seq_scans"] == []
+        assert summary["rows_removed_by_filter"] == 20_000
+        assert summary["over_discard_budget"] is True
+
+    def test_rows_discarded_are_counted_per_loop_and_not_per_plan(self):
+        """EXPLAIN reports these PER LOOP.
+
+        The inner side of a nested loop that throws away one row on each of
+        two hundred passes reports "1", and a budget compared against that
+        reads two hundred times cheaper than the work actually done.
+        """
+        query = bench.HotQuery("probe", "", "SELECT 1", lambda _q: [])
+
+        summary = bench.summarize_plan(
+            {
+                "Plan": {
+                    "Node Type": "Nested Loop",
+                    "Shared Hit Blocks": 10,
+                    "Plans": [
+                        {
+                            "Node Type": "Index Scan",
+                            "Relation Name": "jorb",
+                            "Index Name": "jorb_pkey",
+                            "Actual Rows": 1,
+                            "Actual Loops": 200,
+                            "Rows Removed by Filter": 3,
+                        }
+                    ],
+                }
+            },
+            query,
+        )
+
+        assert summary["rows_removed_by_filter"] == 600
+        assert summary["scans"][0]["actual_rows"] == 200
+
+    def test_a_scan_of_a_table_this_query_does_not_gate_is_not_a_failure(self):
+        """The gate is per-query, because the tables are.
+
+        A sweep that reads jorb_dag is not excused by jorb being fine, and a
+        query that legitimately scans something small must not be failed for
+        it either.
+        """
+        document = {
+            "Plan": {
+                "Node Type": "Seq Scan",
+                "Relation Name": "jorb_dag",
+                "Actual Rows": 20_000,
+                "Actual Loops": 1,
+                "Shared Hit Blocks": 331,
+            }
+        }
+        gated = bench.HotQuery(
+            "dags", "", "SELECT 1", lambda _q: [], tables=("jorb_dag",)
+        )
+        ungated = bench.HotQuery("jobs", "", "SELECT 1", lambda _q: [])
+
+        assert bench.summarize_plan(document, gated)["seq_scans"] == [
+            "Seq Scan on jorb_dag"
+        ]
+        assert bench.summarize_plan(document, ungated)["seq_scans"] == []
 
     async def test_rejects_a_malformed_planner_setting(self, db_params):
         code, _, output = await run_bench(

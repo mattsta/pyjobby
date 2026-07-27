@@ -76,6 +76,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import datetime
 import json
 import math
 import os
@@ -94,7 +95,7 @@ from urllib.parse import quote, unquote, urlsplit
 import asyncpg  # type: ignore[import-untyped]
 import click
 
-from . import db
+from . import db, monitor
 from .cli import (
     ConfigProblem,
     DatabaseProblem,
@@ -103,12 +104,7 @@ from .cli import (
     print_warning,
 )
 from .configloader import load_config_from_file
-from .monitor import (
-    SWEEP_CHECKPOINT_JOBS_SQL,
-    SWEEP_EXPIRED_JOBS_SQL,
-    SWEEP_MAILBOX_SQL,
-    TERMINAL_STATES,
-)
+from .monitor import TERMINAL_STATES
 from .pj import STMTS, Job
 
 DEFAULT_CONFIG = "./pyjobby.conf.py"
@@ -120,6 +116,27 @@ SCALE_TARGET_RATE = 278.0
 #: constant and not a fraction of the seed: in-flight work is bounded by the
 #: workers and by ``max_concurrency``, so it does not grow with the table.
 PLAN_IN_FLIGHT = 200
+
+#: One job in this many gets DXE checkpoints, and one DAG in this many keeps a
+#: job. Both sweeps have to walk past the rest to fill a batch, which is the
+#: shape that catches an index scan doing a table's worth of work — seeding
+#: them all-eligible would make every sweep stop at its first row and prove
+#: nothing. 3 rather than 4 because the job seed assigns state by ``i % 4``,
+#: so every 4th job is the same state.
+PLAN_STEP_EVERY = 3
+PLAN_STEPS_PER_JOB = 3
+PLAN_DAG_EVERY = 3
+
+#: Schedules the plan seed creates, sharing the seeded log between them. The
+#: schedule-log sweep refuses to delete each schedule's newest execution, so
+#: this is also the bound on what that sweep may read and discard.
+PLAN_SCHEDULES = 50
+
+#: Worker registry rows the plan seed leaves RETIRED, for the sweep that
+#: reaps them. A fleet accumulates these per deploy, so unlike in-flight work
+#: the count genuinely does grow — seeding it at the table scale is what
+#: gives the planner a real choice.
+PLAN_LIVE_WORKERS = 10
 
 #: docs/SCALE.md's claims, carried here so a run can say "agrees" or
 #: "DISAGREES" instead of leaving the reader to diff two documents.
@@ -154,6 +171,13 @@ SCALE_CLAIM_ROW_WRITES_PER_LIFECYCLE = 4
 
 #: How many jobs may already exist before a run is refused without --force.
 DEFAULT_MAX_EXISTING_JOBS = 1000
+
+#: What a plan may read and discard when the rows it walks past are bounded by
+#: WORK IN FLIGHT rather than by table size — the seeded in-flight set plus
+#: whatever the busy-database guard tolerates already being here, since those
+#: jobs are in the same index. Two orders of magnitude under the seed, so a
+#: regression to table-scale still fails the gate.
+PLAN_IN_FLIGHT_BUDGET = PLAN_IN_FLIGHT + DEFAULT_MAX_EXISTING_JOBS
 
 #: The job class ``pj-bench e2e`` enqueues. It lives here, in the installed
 #: package, so real worker processes can import it by dotted path with no
@@ -378,10 +402,14 @@ async def cleanup_queue(conn: asyncpg.Connection, queue: str) -> dict[str, int]:
     ``jorb_event`` and ``jorb_mailbox`` rows follow via ON DELETE CASCADE,
     so deleting the job rows is the whole cleanup.
 
-    The three global tables this can reach — ``jorb_queue``, and the worker
-    registry rows the real processes ``pj-bench e2e`` starts register — are
-    both keyed by queue name, so they are removed by the same predicate and
-    no row belonging to anything else is ever in range.
+    The global tables this can reach — ``jorb_queue``, the worker registry
+    rows the real processes ``pj-bench e2e`` starts register, and the
+    schedules and DAGs ``pj-bench plans`` seeds so the sweeps that read them
+    have something to plan against — all carry this run's queue name, in
+    ``jorb_dag``'s case as the DAG name because it has no queue column. So
+    they are removed by the same predicate and no row belonging to anything
+    else is ever in range. ``jorb_schedule_log`` follows its schedule by
+    ON DELETE CASCADE.
 
     Cleanup is page-accurate, not just row-accurate: see the VACUUM below.
     """
@@ -392,6 +420,8 @@ async def cleanup_queue(conn: asyncpg.Connection, queue: str) -> dict[str, int]:
     await conn.execute("DELETE FROM jorb WHERE queue = $1", queue)
     await conn.execute("DELETE FROM jorb_queue WHERE name = $1", queue)
     await conn.execute("DELETE FROM jorb_worker WHERE queue = $1", queue)
+    await conn.execute("DELETE FROM jorb_schedule WHERE queue = $1", queue)
+    await conn.execute("DELETE FROM jorb_dag WHERE name = $1", queue)
 
     # Deleting the rows is not the whole cleanup, because a deleted row is not
     # a gone row: it leaves a dead tuple and an unset visibility-map bit. A
@@ -1757,7 +1787,7 @@ def _payload_is_ours(channel: str, payload: str, queue: str, job_ids: set[int]) 
         return False
     try:
         data = json.loads(payload)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return False
     if channel == "jorb_done":
         return int(data.get("id", -1)) in job_ids
@@ -1809,14 +1839,6 @@ async def _drain_notifications(
 # 5. plans — EXPLAIN every hot query; the CI regression gate
 # =========================================================================
 
-# The monitor's own statements, not copies of them. A benchmark that gates
-# CI on a query's plan has to run the query the monitor runs: a copy passes
-# review, drifts on the next edit, and then certifies a statement nobody
-# executes. These are re-exported under the names the plan gate uses.
-RETENTION_PROBE_SQL = SWEEP_EXPIRED_JOBS_SQL
-CHECKPOINT_SWEEP_SQL = SWEEP_CHECKPOINT_JOBS_SQL
-MAILBOX_SWEEP_SQL = SWEEP_MAILBOX_SQL
-
 CLAIM_PROBE_SQL = """
     SELECT j.id FROM jorb j
      WHERE j.queue = $1
@@ -1866,17 +1888,238 @@ class HotQuery:
     what: str
     sql: str
     args: Callable[[str], list[Any]]
-    #: DELETEs are explained inside a transaction that is rolled back, so
-    #: EXPLAIN ANALYZE measures the real plan without removing rows.
+    #: Relations a sequential scan of is a FAILURE. Per-query rather than a
+    #: global "jorb", because the sweeps added since this gate was written
+    #: read jorb_dag, jorb_worker, jorb_mailbox and jorb_schedule_log -- a
+    #: gate hardcoded to one table certifies those as healthy while they scan.
+    tables: tuple[str, ...] = ("jorb",)
+    #: Rows this plan may read and throw away. NOT optional, and rarely large:
+    #: an index scan that discards everything it reads is not a sequential
+    #: scan, costs the same, and passes a seq-scan check. Where a sweep
+    #: legitimately walks past rows it cannot take, the budget says how many
+    #: and the comment says why -- always a multiple of the BATCH, never of
+    #: the table.
+    max_rows_removed: int = 0
+    #: Statements that write are explained inside a transaction that is
+    #: rolled back, so EXPLAIN ANALYZE measures the real plan without
+    #: changing any rows.
+    mutating: bool = False
+    #: The ``monitor.SWEEP_*_SQL`` constant this case covers, if any. What
+    #: makes the gate's coverage checkable rather than a matter of trust.
+    sweep: str | None = None
+
+
+#: The batch every gated sweep is explained with: the monitor's own default,
+#: so a discard budget can be stated as "a batch's worth" and stay true.
+PLAN_BATCH = 1000
+
+#: "Nothing has expired" — the steady state, run every cycle forever, and the
+#: most expensive way for a sweep to say nothing.
+CAUGHT_UP = datetime.timedelta(days=3650)
+
+#: "Everything has expired" — first run against an install that has never
+#: swept, and the state the mailbox sweep's sequential scan hid in: its
+#: caught-up plan was a clean two-buffer probe, and the scan only appeared
+#: once the sweep had rows to delete. Gating one state and not the other is
+#: how that survived review.
+BACKLOG = datetime.timedelta(0)
+
+
+@dataclass(frozen=True)
+class SweepGate:
+    """How the plan gate exercises one of ``monitor.py``'s sweeps.
+
+    Keyed by CONSTANT NAME in `SWEEP_GATES`, and checked against the
+    constants ``monitor.py`` actually defines — see `sweep_queries`.
+    """
+
+    what: str
+    #: Sequentially scanning any of these fails the gate. The sweep's own
+    #: target table, plus whatever it joins or probes.
+    tables: tuple[str, ...]
+    #: Discard budgets for the caught-up and backlog states.
+    caught_up_discards: int = 0
+    backlog_discards: int = 0
+    #: False for the timeout sweep, whose only parameter is the batch size.
+    takes_window: bool = True
+    #: Only the two requeue sweeps write; the rest probe and let the monitor
+    #: delete by key in a second statement.
     mutating: bool = False
 
 
-def hot_queries() -> tuple[HotQuery, ...]:
-    """The queries whose plan is load-bearing, and why each one is here."""
-    import datetime
+#: Every sweep, and how to run it. Hand-written — the parameters and the
+#: discard budgets cannot be derived — but NOT a hand-maintained list of what
+#: to gate: `sweep_queries` compares these keys against the ``SWEEP_*_SQL``
+#: constants ``monitor.py`` defines and refuses to run if either side has an
+#: entry the other lacks. Adding a sweep without gating it is therefore a
+#: hard error at gate time rather than a silent gap, which is the failure
+#: this arrangement exists to prevent: three sweeps were added and none was
+#: gated, and the gate went on reporting success.
+SWEEP_GATES: dict[str, SweepGate] = {
+    "SWEEP_TIMED_OUT_SQL": SweepGate(
+        "monitor timeout sweep (running jobs past their deadline)",
+        ("jorb",),
+        takes_window=False,
+    ),
+    "SWEEP_DEAD_WORKER_JOBS_SQL": SweepGate(
+        "monitor dead-worker requeue (in-flight jobs of stale workers)",
+        ("jorb", "jorb_worker"),
+        mutating=True,
+        # It walks the in-flight set and probes each job's worker, discarding
+        # the ones still beating -- bounded by work in flight, never by the
+        # table. That is true in BOTH states: caught up, every probe is a
+        # discard, which is the honest cost of asking.
+        caught_up_discards=PLAN_IN_FLIGHT_BUDGET,
+        backlog_discards=PLAN_IN_FLIGHT_BUDGET,
+    ),
+    "SWEEP_UNREGISTERED_CLAIMS_SQL": SweepGate(
+        "monitor unregistered-claim requeue (claimed with no registry row)",
+        ("jorb",),
+        mutating=True,
+        # Same index, and here the discards are claimed rows that DO have a
+        # registry reference -- the overwhelmingly normal case.
+        backlog_discards=PLAN_IN_FLIGHT_BUDGET,
+    ),
+    "SWEEP_EXPIRED_JOBS_SQL": SweepGate(
+        "monitor job retention sweep (every cycle, forever)",
+        ("jorb",),
+    ),
+    "SWEEP_CHECKPOINT_JOBS_SQL": SweepGate(
+        "monitor checkpoint retention sweep",
+        ("jorb", "jorb_step"),
+        # Most terminal jobs have no checkpoints, so filling a batch means
+        # walking past the ones that do not: a multiple of the batch, set by
+        # the seeded checkpointed fraction, and independent of table size.
+        # One job in PLAN_STEP_EVERY checkpoints and three in four are
+        # terminal, so a batch costs about 4x itself.
+        backlog_discards=(PLAN_STEP_EVERY + 1) * PLAN_BATCH,
+    ),
+    "SWEEP_MAILBOX_SQL": SweepGate(
+        "monitor consumed-mailbox sweep",
+        ("jorb_mailbox",),
+    ),
+    "SWEEP_ORPHANED_DAGS_SQL": SweepGate(
+        "monitor orphaned-DAG sweep (a wrong answer, not just storage)",
+        ("jorb_dag", "jorb"),
+        # DAGs that still hold a job are refused, and the sweep walks past
+        # them to fill a batch.
+        backlog_discards=PLAN_DAG_EVERY * PLAN_BATCH,
+    ),
+    "SWEEP_SCHEDULE_LOG_SQL": SweepGate(
+        "monitor schedule-log sweep (the one table with no other bound)",
+        ("jorb_schedule_log",),
+        # Each schedule's newest execution is kept at any age, so the
+        # discards are bounded by the number of SCHEDULES, not the log.
+        backlog_discards=PLAN_SCHEDULES,
+    ),
+    "SWEEP_RETIRED_WORKERS_SQL": SweepGate(
+        "monitor retired-worker sweep (grows with deploys, forever)",
+        ("jorb_worker",),
+    ),
+}
 
-    def retention_args(_queue: str) -> list[Any]:
-        return [datetime.timedelta(days=3650), 1000]
+
+def monitor_sweeps() -> dict[str, str]:
+    """Every ``SWEEP_*_SQL`` statement ``monitor.py`` defines, by name.
+
+    DISCOVERED from the module, never listed here. The gate's whole value is
+    that it certifies the statements the monitor actually runs, and a
+    hand-copied roster of them is the one part that can go stale without
+    anybody noticing — which is exactly what happened: retention grew three
+    sweeps, the roster kept four, and the gate reported success.
+    """
+    return {
+        name: sql
+        for name, sql in vars(monitor).items()
+        if name.startswith("SWEEP_") and name.endswith("_SQL") and isinstance(sql, str)
+    }
+
+
+def _batch_only_args(_queue: str) -> list[Any]:
+    """Parameters for the one sweep that takes no time window."""
+    return [PLAN_BATCH]
+
+
+def _window_args(window: datetime.timedelta) -> Callable[[str], list[Any]]:
+    """Bind `window` NOW. A closure over the loop variable would hand every
+    case the last window built, so the whole gate would measure one state."""
+
+    def args(_queue: str) -> list[Any]:
+        return [window, PLAN_BATCH]
+
+    return args
+
+
+def sweep_queries() -> tuple[HotQuery, ...]:
+    """A gate case per sweep per state, derived from the sweeps themselves.
+
+    Raises rather than skipping when `SWEEP_GATES` and ``monitor.py`` disagree
+    in either direction. A sweep with no gate entry is the gap this replaced;
+    a gate entry for a sweep that no longer exists is a case certifying
+    nothing, which reads exactly like coverage.
+    """
+    sweeps = monitor_sweeps()
+    ungated = sorted(set(sweeps) - set(SWEEP_GATES))
+    if ungated:
+        raise RuntimeError(
+            f"monitor.py defines sweeps the plan gate does not run: "
+            f"{', '.join(ungated)}. Add an entry to SWEEP_GATES — a gate that "
+            f"silently covers a subset is worse than no gate, because it is "
+            f"trusted."
+        )
+    stale = sorted(set(SWEEP_GATES) - set(sweeps))
+    if stale:
+        raise RuntimeError(
+            f"SWEEP_GATES names sweeps monitor.py no longer defines: "
+            f"{', '.join(stale)}. Remove them; a case that gates nothing "
+            f"still counts as coverage to whoever reads the output."
+        )
+
+    queries: list[HotQuery] = []
+    for name, sql in sorted(sweeps.items()):
+        gate = SWEEP_GATES[name]
+        key = name.removeprefix("SWEEP_").removesuffix("_SQL").lower()
+        if not gate.takes_window:
+            queries.append(
+                HotQuery(
+                    key,
+                    gate.what,
+                    sql,
+                    _batch_only_args,
+                    tables=gate.tables,
+                    max_rows_removed=gate.caught_up_discards,
+                    mutating=gate.mutating,
+                    sweep=name,
+                )
+            )
+            continue
+        for suffix, window, budget in (
+            ("", CAUGHT_UP, gate.caught_up_discards),
+            ("_backlog", BACKLOG, gate.backlog_discards),
+        ):
+            queries.append(
+                HotQuery(
+                    key + suffix,
+                    gate.what + (" — full backlog" if suffix else " — caught up"),
+                    sql,
+                    _window_args(window),
+                    tables=gate.tables,
+                    max_rows_removed=budget,
+                    mutating=gate.mutating,
+                    sweep=name,
+                )
+            )
+    return tuple(queries)
+
+
+def hot_queries() -> tuple[HotQuery, ...]:
+    """The queries whose plan is load-bearing, and why each one is here.
+
+    The monitor's sweeps come from `sweep_queries`, which reads them off
+    ``monitor.py`` itself: a benchmark that gates CI on a query's plan has to
+    run the query the monitor runs, and a copy passes review, drifts on the
+    next edit, and then certifies a statement nobody executes.
+    """
 
     def claim_args(queue: str) -> list[Any]:
         return [queue, ["bench"], 1000]
@@ -1896,26 +2139,10 @@ def hot_queries() -> tuple[HotQuery, ...]:
             "claim_jorb's max_concurrency count, inside the serialised section",
             CAP_COUNT_SQL,
             lambda queue: [queue],
-        ),
-        HotQuery(
-            "retention_probe",
-            "monitor retention sweep (every cycle, forever)",
-            RETENTION_PROBE_SQL,
-            retention_args,
-        ),
-        HotQuery(
-            "checkpoint_sweep",
-            "monitor checkpoint retention sweep",
-            CHECKPOINT_SWEEP_SQL,
-            retention_args,
-            mutating=True,
-        ),
-        HotQuery(
-            "mailbox_sweep",
-            "monitor consumed-mailbox sweep",
-            MAILBOX_SWEEP_SQL,
-            retention_args,
-            mutating=True,
+            # It reads the in-flight index and discards other queues' rows.
+            # That is the cost of the count being per-queue, and it is bounded
+            # by work in flight everywhere, never by the size of jorb.
+            max_rows_removed=PLAN_IN_FLIGHT_BUDGET,
         ),
         HotQuery(
             "metrics_completions",
@@ -1929,6 +2156,7 @@ def hot_queries() -> tuple[HotQuery, ...]:
             METRICS_ARRIVALS_SQL,
             window_args,
         ),
+        *sweep_queries(),
     )
 
 
@@ -1938,7 +2166,7 @@ def walk_plan(node: dict[str, Any]) -> Iterator[dict[str, Any]]:
         yield from walk_plan(child)
 
 
-def summarize_plan(document: dict[str, Any]) -> dict[str, Any]:
+def summarize_plan(document: dict[str, Any], query: HotQuery) -> dict[str, Any]:
     """Access method, index, and buffers — the three facts that matter.
 
     Buffers rather than milliseconds: a duration says how fast the machine
@@ -1949,6 +2177,12 @@ def summarize_plan(document: dict[str, Any]) -> dict[str, Any]:
     EXPLAIN's per-node buffer counts are cumulative, so a sum counts every
     child once per ancestor and reports a query as several times more
     expensive than it is.
+
+    Sequential scans are looked for on the relations THIS query is gated on,
+    not on a hardcoded ``jorb``. The sweeps read jorb_dag, jorb_worker,
+    jorb_mailbox and jorb_schedule_log, and a scan of any of them grows with
+    DAGs, deploys, mail and cron rate exactly as a scan of jorb grows with
+    jobs.
     """
     plan = document["Plan"]
     nodes = list(walk_plan(plan))
@@ -1962,29 +2196,43 @@ def summarize_plan(document: dict[str, Any]) -> dict[str, Any]:
         relation = node.get("Relation Name")
         if "Scan" not in node_type:
             continue
+        # Multiplied by the loop count, because EXPLAIN reports both of these
+        # PER LOOP. The inner side of a nested loop that discards one row on
+        # each of two hundred passes reports "1", and a budget compared
+        # against that number is comparing against a two-hundredth of the
+        # work actually done.
+        loops = max(int(node.get("Actual Loops", 1)), 1)
         scans.append(
             {
                 "node": node_type,
                 "relation": relation,
                 "index": node.get("Index Name"),
-                "rows_removed_by_filter": int(node.get("Rows Removed by Filter", 0)),
-                "actual_rows": int(node.get("Actual Rows", 0)),
+                "loops": loops,
+                "rows_removed_by_filter": (
+                    int(node.get("Rows Removed by Filter", 0)) * loops
+                ),
+                "actual_rows": int(node.get("Actual Rows", 0)) * loops,
             }
         )
-        if node_type == "Seq Scan" and relation == "jorb":
+        if node_type == "Seq Scan" and relation in query.tables:
             seq_scans.append(f"{node_type} on {relation}")
     indexes = sorted({str(s["index"]) for s in scans if s["index"]})
+    # Per-node and therefore genuinely additive, unlike buffers. This is the
+    # "read the whole table to return nothing" tell: a plan can use an index,
+    # stay off the seq-scan gate, and still discard every row in the table
+    # because the index it chose was the wrong one.
+    discarded = sum(int(s["rows_removed_by_filter"]) for s in scans)
     return {
         "access_methods": sorted({str(s["node"]) for s in scans}),
         "indexes": indexes,
         "buffers": buffers,
         "scans": scans,
-        "seq_scan_on_jorb": seq_scans,
-        # Per-node and therefore genuinely additive, unlike buffers. This is
-        # the "read the whole table to return nothing" tell: a plan can use
-        # an index, stay off the seq-scan gate, and still discard every row
-        # in the table because the index it chose was the wrong one.
-        "rows_removed_by_filter": sum(s["rows_removed_by_filter"] for s in scans),
+        "gated_tables": list(query.tables),
+        "seq_scans": seq_scans,
+        "rows_removed_by_filter": discarded,
+        "max_rows_removed": query.max_rows_removed,
+        "over_discard_budget": discarded > query.max_rows_removed,
+        "sweep": query.sweep,
         "planning_ms": float(document.get("Planning Time", 0.0)),
         "execution_ms": float(document.get("Execution Time", 0.0)),
     }
@@ -2040,6 +2288,12 @@ async def seed_plan_data(
     only its own seeding created. ``claimed_at`` is set with them: a real
     claimed row always has one, and without it the row is missing from an
     index the planner may want.
+
+    Every table a gated sweep reads is seeded at the same scale, not just
+    ``jorb``: the DAG, schedule-log and worker-registry sweeps grow with
+    deploys, cron rate and DAG count rather than with job throughput, and a
+    plan measured against three rows in those tables certifies a sequential
+    scan as healthy — which is what a seq-scan gate is for.
     """
     await conn.execute(
         """
@@ -2056,15 +2310,27 @@ async def seed_plan_data(
         rows,
     )
     in_flight = min(PLAN_IN_FLIGHT, max(rows // 10, 1))
+    # Split claimed/running by ROW NUMBER, never by `id % 2`: the seed above
+    # makes every 4th row queued, so the rows this picks have ids four apart
+    # and all share a parity -- `id % 2` silently puts every one of them in
+    # the same state, and the sweeps that read the other one then plan
+    # against an empty set and certify nothing.
+    #
+    # `timeout_at` goes on the running half, past its deadline, because that
+    # is what the timeout sweep reads: without it that sweep stops at its
+    # first index entry and its plan proves nothing either.
     await conn.execute(
         """
-        UPDATE jorb SET state = CASE WHEN id % 2 = 0 THEN 'claimed'
+        UPDATE jorb SET state = CASE WHEN picked.n % 2 = 0 THEN 'claimed'
                                      ELSE 'running' END::jorbstate,
                         claimed_at = now(),
-                        started = CASE WHEN id % 2 = 1 THEN now() END
-         WHERE id IN (SELECT id FROM jorb
-                       WHERE queue = $1 AND state = 'queued'
-                       ORDER BY id LIMIT $2)
+                        started = CASE WHEN picked.n % 2 = 1 THEN now() END,
+                        timeout_at = CASE WHEN picked.n % 2 = 1
+                                          THEN now() - interval '1 minute' END
+          FROM (SELECT id, row_number() OVER (ORDER BY id) AS n
+                  FROM jorb WHERE queue = $1 AND state = 'queued'
+                 ORDER BY id LIMIT $2) picked
+         WHERE jorb.id = picked.id
         """,
         queue,
         in_flight,
@@ -2073,17 +2339,30 @@ async def seed_plan_data(
         "SELECT id FROM jorb WHERE queue = $1 ORDER BY id LIMIT 200", queue
     )
     anchor = int(job_ids[0]["id"])
-    steps = min(rows, 5000)
-    await conn.execute(
-        """
-        INSERT INTO jorb_step (job_id, step_seq, name, output, run_epoch)
-        SELECT j.id, i, 'bench', '{}'::jsonb, 0
-        FROM jorb j, generate_series(1, 3) i
-        WHERE j.queue = $1
-        LIMIT $2
-        """,
-        queue,
-        steps,
+    # One job in PLAN_STEP_EVERY gets checkpoints, and the checkpointed
+    # FRACTION is what the sweep's cost turns on: it walks past step-less
+    # jobs to fill a batch, so capping the insert at a flat few thousand
+    # rows (as this once did) leaves one job in twelve checkpointed and
+    # reports the sweep discarding ten thousand rows — a number produced
+    # entirely by the seeding, not by the query.
+    steps = int(
+        await conn.fetchval(
+            """
+            WITH inserted AS (
+                INSERT INTO jorb_step (job_id, step_seq, name, output, run_epoch)
+                SELECT j.id, i, 'bench', '{}'::jsonb, 0
+                  FROM (SELECT id, row_number() OVER (ORDER BY id) AS n
+                          FROM jorb WHERE queue = $1) j,
+                       generate_series(1, $2) i
+                 WHERE j.n % $3 = 0
+                RETURNING 1
+            )
+            SELECT count(*) FROM inserted
+            """,
+            queue,
+            PLAN_STEPS_PER_JOB,
+            PLAN_STEP_EVERY,
+        )
     )
     mailbox = min(rows, 20000)
     await conn.execute(
@@ -2097,23 +2376,120 @@ async def seed_plan_data(
         anchor,
         mailbox,
     )
+    # DAGs are named for this run's queue, which is the only handle cleanup
+    # has on them: jorb_dag carries no queue of its own.
+    await conn.execute(
+        """
+        INSERT INTO jorb_dag (name, created)
+        SELECT $1, now() - (i % 60) * interval '1 day'
+        FROM generate_series(1, $2::int) i
+        """,
+        queue,
+        rows,
+    )
+    dags_with_jobs = await conn.fetchval(
+        """
+        WITH paired AS (
+            SELECT j.id AS job_id, d.id AS dag_id
+              FROM (SELECT id, row_number() OVER (ORDER BY id) AS n
+                      FROM jorb WHERE queue = $1) j
+              JOIN (SELECT id, row_number() OVER (ORDER BY id) AS n
+                      FROM jorb_dag WHERE name = $1) d ON d.n = j.n
+             WHERE j.n % $2 <> 0
+        )
+        UPDATE jorb SET dag_id = paired.dag_id
+          FROM paired WHERE jorb.id = paired.job_id
+        RETURNING (SELECT count(*) FROM paired)
+        """,
+        queue,
+        PLAN_DAG_EVERY,
+    )
+    await conn.execute(
+        """
+        INSERT INTO jorb_schedule (name, job_class, queue, cron_expr, next_run)
+        SELECT $1 || '_' || i, $2, $1, '* * * * *', now()
+        FROM generate_series(1, $3::int) i
+        """,
+        queue,
+        BENCH_JOB_CLASS,
+        PLAN_SCHEDULES,
+    )
+    await conn.execute(
+        """
+        INSERT INTO jorb_schedule_log (schedule_id, schedule_name,
+                                       scheduled_time, actual_time, result)
+        SELECT s.id, s.name,
+               now() - (i % 60) * interval '1 day',
+               now() - (i % 60) * interval '1 day',
+               'success'
+          FROM generate_series(1, $2::int) i
+          JOIN (SELECT id, name, row_number() OVER (ORDER BY id) AS n
+                  FROM jorb_schedule WHERE queue = $1) s
+            ON s.n = 1 + (i % $3)
+        """,
+        queue,
+        rows,
+        PLAN_SCHEDULES,
+    )
+    # Retired workers for the registry sweep, plus a handful of live ones so
+    # the dead-worker requeue has rows to JOIN to rather than an empty table.
+    await conn.execute(
+        """
+        INSERT INTO jorb_worker (host, pid, queue, started, last_seen,
+                                 shutdown_at)
+        SELECT 'bench-plans', i, $1,
+               now() - (i % 60) * interval '1 day',
+               now() - (i % 60) * interval '1 day',
+               CASE WHEN i > $3 THEN now() - (i % 60) * interval '1 day' END
+        FROM generate_series(1, $2::int) i
+        """,
+        queue,
+        rows,
+        PLAN_LIVE_WORKERS,
+    )
+    # The in-flight jobs point at the live workers, so the dead-worker sweep
+    # plans a real join instead of one whose inner side is always empty.
+    await conn.execute(
+        """
+        UPDATE jorb SET claimed_by = w.id
+          FROM (SELECT id, row_number() OVER (ORDER BY id) AS n
+                  FROM jorb_worker WHERE queue = $1 AND shutdown_at IS NULL) w
+         WHERE jorb.queue = $1
+           AND jorb.state IN ('claimed', 'running')
+           AND w.n = 1 + (jorb.id % $2)
+        """,
+        queue,
+        PLAN_LIVE_WORKERS,
+    )
     # VACUUM as well as ANALYZE, and not as a nicety: ANALYZE gives the
     # planner its statistics, but only VACUUM sets the VISIBILITY MAP, and
     # an index-only or bitmap plan is costed as though every tuple needed a
     # heap fetch until it is set. On a freshly seeded (or repeatedly
     # re-seeded, and therefore bloated) table that inflates the index plans
-    # until a sequential scan wins -- and this gate then reports "sequential
-    # scan of jorb" for a query whose index is perfectly healthy. Autovacuum
+    # until a sequential scan wins -- and this gate then reports a sequential
+    # scan for a query whose index is perfectly healthy. Autovacuum
     # does both continuously in production; a gate that skips them measures
     # a table no running system ever has.
-    await conn.execute("VACUUM (ANALYZE) jorb")
-    await conn.execute("VACUUM (ANALYZE) jorb_step")
-    await conn.execute("VACUUM (ANALYZE) jorb_mailbox")
+    for table in (
+        "jorb",
+        "jorb_step",
+        "jorb_mailbox",
+        "jorb_dag",
+        "jorb_schedule",
+        "jorb_schedule_log",
+        "jorb_worker",
+    ):
+        await conn.execute(f"VACUUM (ANALYZE) {table}")  # noqa: S608 - literal
     return {
         "jobs": rows,
         "steps": steps,
         "mailbox": mailbox,
         "in_flight": in_flight,
+        "dags": rows,
+        "dags_with_jobs": int(dags_with_jobs or 0),
+        "schedules": PLAN_SCHEDULES,
+        "schedule_log": rows,
+        "workers": rows,
     }
 
 
@@ -2125,12 +2501,17 @@ async def run_plans(
     max_existing_jobs: int,
     force: bool,
 ) -> dict[str, Any]:
-    """EXPLAIN (ANALYZE, BUFFERS) every hot query and gate on seq scans.
+    """EXPLAIN (ANALYZE, BUFFERS) every hot query and gate on its plan.
 
     This is the CI-runnable half of the harness. Timings flake on a loaded
     box and pass on a fast one with the index dropped; a plan is a fact, and
     "did this query stop using its index" is the regression that stays
     correct while getting slower forever.
+
+    TWO verdicts, because one of them is not enough. A sequential scan is the
+    obvious failure; the quiet one is an INDEX scan that reads a table's worth
+    of rows and discards them, which is not a Seq Scan node, costs the same,
+    and passes any seq-scan check. Both fail the run.
     """
     queue = bench_queue("plans")
     conn = await open_connection(target)
@@ -2154,11 +2535,12 @@ async def run_plans(
             else:
                 raw = await conn.fetchval(explain, *args)
             document = json.loads(raw) if isinstance(raw, str) else raw
-            summary = summarize_plan(document[0])
+            summary = summarize_plan(document[0], query)
             summary["what"] = query.what
             queries[query.key] = summary
 
-        offenders = sorted(k for k, v in queries.items() if v["seq_scan_on_jorb"])
+        offenders = sorted(k for k, v in queries.items() if v["seq_scans"])
+        discarders = sorted(k for k, v in queries.items() if v["over_discard_budget"])
         result.update(
             {
                 "benchmark": "plans",
@@ -2169,8 +2551,15 @@ async def run_plans(
                 "guard": guard,
                 "planner_settings": applied,
                 "queries": queries,
+                # Which sweeps this run certified, stated rather than implied:
+                # a reader can check the coverage against monitor.py without
+                # trusting the harness to have kept up.
+                "sweeps_gated": sorted(
+                    {v["sweep"] for v in queries.values() if v["sweep"]}
+                ),
                 "seq_scan_offenders": offenders,
-                "healthy": not offenders,
+                "discard_offenders": discarders,
+                "healthy": not offenders and not discarders,
             }
         )
         return result
@@ -2740,7 +3129,7 @@ def plans_cmd(
     seed: int,
     planner_settings: tuple[str, ...],
 ) -> None:
-    """EXPLAIN (ANALYZE, BUFFERS) every hot query; non-zero on a seq scan."""
+    """EXPLAIN (ANALYZE, BUFFERS) every hot query; non-zero on a bad plan."""
     target = resolve_target(pick(ctx, config, "config"), pick(ctx, dsn, "dsn"))
     result = run_command(
         run_plans(
@@ -2757,19 +3146,36 @@ def plans_cmd(
             f"{'+'.join(data['access_methods']) or 'none'} "
             f"{'via ' + ','.join(data['indexes']) if data['indexes'] else ''} "
             f"— {data['buffers']:,} buffers, "
-            f"{data['rows_removed_by_filter']:,} rows discarded",
+            f"{data['rows_removed_by_filter']:,} rows discarded "
+            f"(budget {data['max_rows_removed']:,})",
         ]
         for key, data in result["queries"].items()
     ]
     emit(result, output_json, table)
     if not result["healthy"]:
-        offenders = ", ".join(result["seq_scan_offenders"])
-        click.echo(
-            f"FAIL: sequential scan of jorb in: {offenders}. These run on a "
-            f"timer forever; a scan here stays correct and gets slower as the "
-            f"table grows.",
-            err=True,
-        )
+        if result["seq_scan_offenders"]:
+            offenders = ", ".join(
+                f"{key} ({'; '.join(result['queries'][key]['seq_scans'])})"
+                for key in result["seq_scan_offenders"]
+            )
+            click.echo(
+                f"FAIL: sequential scan in: {offenders}. These run on a timer "
+                f"forever; a scan here stays correct and gets slower as the "
+                f"table grows.",
+                err=True,
+            )
+        if result["discard_offenders"]:
+            offenders = ", ".join(
+                f"{key} ({result['queries'][key]['rows_removed_by_filter']:,} rows "
+                f"discarded, budget {result['queries'][key]['max_rows_removed']:,})"
+                for key in result["discard_offenders"]
+            )
+            click.echo(
+                f"FAIL: rows read and thrown away over budget in: {offenders}. "
+                f"An index scan that discards everything it reads is not a "
+                f"sequential scan and costs exactly the same.",
+                err=True,
+            )
         raise SystemExit(1)
 
 
@@ -2918,9 +3324,21 @@ def all_cmd(
         ],
         [
             "hot query plans",
-            "healthy"
+            f"healthy ({len(results['plans']['sweeps_gated'])} monitor sweeps gated)"
             if results["healthy"]
-            else "SEQ SCAN: " + ", ".join(results["plans"]["seq_scan_offenders"]),
+            else "; ".join(
+                part
+                for part in (
+                    "SEQ SCAN: " + ", ".join(results["plans"]["seq_scan_offenders"])
+                    if results["plans"]["seq_scan_offenders"]
+                    else "",
+                    "OVER DISCARD BUDGET: "
+                    + ", ".join(results["plans"]["discard_offenders"])
+                    if results["plans"]["discard_offenders"]
+                    else "",
+                )
+                if part
+            ),
         ],
     ]
     emit(results, output_json, summary)
