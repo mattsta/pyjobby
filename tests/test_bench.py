@@ -27,6 +27,7 @@ import os
 import signal
 import sys
 import traceback
+from pathlib import Path
 
 import asyncpg
 import pytest
@@ -969,7 +970,7 @@ class TestCleanup:
         assert cleanup["off_sys_path"] is True
         assert cleanup["out_of_sys_modules"] is True
         # and independently of what the run says about itself
-        assert not os.path.exists(cleanup["job_module_dir"])
+        assert not Path(cleanup["job_module_dir"]).exists()
         assert sys.path == before
         module_name = payload["job_class"].split(".")[0]
         assert module_name not in sys.modules

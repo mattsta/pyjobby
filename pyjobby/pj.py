@@ -45,6 +45,7 @@ from concurrent.futures import Future as ThreadFuture
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from multiprocessing import Process
+from pathlib import Path
 from typing import Any, ClassVar, Final
 
 import asyncpg  # type: ignore[import-untyped]
@@ -85,7 +86,7 @@ def cleanupLogLengths(record: dict[str, Any]) -> None:
 
 
 # ignore type here because the loguru signature is too specific
-logger = logger.patch(cleanupLogLengths)  # type: ignore
+logger = logger.patch(cleanupLogLengths)  # type: ignore[arg-type]
 
 
 STMTS: dict[str, str] = {}
@@ -372,7 +373,7 @@ class JobSystem:
         re-preparing everything) if the connection was lost."""
         while True:
             try:
-                return await self.stmts[op].fetch(*args)  # type: ignore
+                return await self.stmts[op].fetch(*args)  # type: ignore[no-any-return]
             except (asyncpg.InterfaceError, asyncpg.PostgresConnectionError) as e:
                 if self.stop:
                     raise
@@ -720,7 +721,7 @@ class JobSystem:
     async def _start_web_listener(self) -> None:
         if not (self.webPort and "sites" in self.webPort):
             return
-        server = web.Server(self.webHandler)  # type: ignore
+        server = web.Server(self.webHandler)  # type: ignore[arg-type]
         runner = web.ServerRunner(server)
         await runner.setup()
         self._web_runner = runner
@@ -761,8 +762,23 @@ class JobSystem:
         def source_mtime() -> float:
             module = sys.modules.get(module_name)
             source = getattr(module, "__file__", None) if module else None
-            if source and os.path.exists(source):
-                return os.path.getmtime(source)
+            if source:
+                # ONE stat syscall, where exists()+getmtime() was two. That is
+                # NOT a speedup, and the number is here so nobody re-derives it
+                # from first principles: measured by `pj-bench resolve` (the
+                # reload_check arm, 3 interleaved pairs, spread 1-6%), the
+                # os.path pair ran 5.29 us/job and this runs 5.71 us/job. The
+                # Path() allocation costs more than the stat() it saves.
+                #
+                # Kept anyway, deliberately: 0.43 us lands only on the --reload
+                # dev flag (the cached arm production actually runs measured
+                # 0.485 us/job before and after), it is 0.012% of the per-job
+                # budget, and docs/SCALE.md's "the check costs ~5.5 us" holds
+                # for both. Consistency with the rest of the tree beats it.
+                try:
+                    return Path(source).stat().st_mtime
+                except OSError:
+                    return 0.0
             return 0.0
 
         if (
@@ -1993,7 +2009,7 @@ def workit(
 
     configure_worker_logging()
 
-    if not os.path.isfile(config):
+    if not Path(config).is_file():
         logger.error("Config file not found! Requested: {}", config)
         sys.exit(1)
 
@@ -2062,7 +2078,7 @@ def workit(
         """Forward main interrupt to child processes"""
         try:
             for p in launched:
-                os.kill(p.pid, signum)  # type: ignore
+                os.kill(p.pid, signum)  # type: ignore[arg-type]
         except OSError:
             pass
 

@@ -33,9 +33,15 @@ import sys
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+#: The checkout root: ``<root>/pyjobby/procs.py`` -> ``<root>``. This is the
+#: ``cwd`` every spawned daemon inherits, so a relative config path in a test
+#: resolves against the repo. (It carried one ``dirname()`` too many until
+#: 2026-07 and pointed at the checkout's PARENT, which made the ``.venv/bin``
+#: lookup below always miss and always take the fallback branch.)
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def dsn_from(db_params: dict[str, Any]) -> str:
@@ -44,6 +50,24 @@ def dsn_from(db_params: dict[str, Any]) -> str:
         f"postgresql://{db_params['user']}:{db_params['password']}"
         f"@{db_params['host']}:{db_params['port']}/{db_params['database']}"
     )
+
+
+def script_path(name: str) -> Path:
+    """Locate installed console script ``name``.
+
+    Prefers the checkout's ``.venv/bin`` so the entry point an operator gets
+    from ``poetry install`` is the one exercised, and falls back to the
+    running interpreter's own script directory (a venv installed elsewhere,
+    or an editable install into a system Python).
+
+    Single source of truth on purpose: ``spawn()`` and the synchronous
+    ``run_to_completion()`` in the suite both resolve scripts through here,
+    so they cannot drift into disagreeing about which binary is under test.
+    """
+    executable = REPO_ROOT / ".venv" / "bin" / name
+    if not executable.exists():
+        return Path(sys.executable).parent / name
+    return executable
 
 
 def spawn(
@@ -56,16 +80,12 @@ def spawn(
     Runs through ``poetry run`` equivalent (the venv's bin directory) so the
     installed entry point is exercised exactly as an operator would.
     """
-    bin_dir = os.path.join(REPO_ROOT, ".venv", "bin")
-    executable = os.path.join(bin_dir, args[0])
-    if not os.path.exists(executable):
-        # fall back to the interpreter's own script directory
-        executable = os.path.join(os.path.dirname(sys.executable), args[0])
+    executable = script_path(args[0])
 
     full_env = {**os.environ, **(env or {})}
     pipe = subprocess.PIPE if capture else subprocess.DEVNULL
     return subprocess.Popen(
-        [executable, *args[1:]],
+        [str(executable), *args[1:]],
         stdout=pipe,
         stderr=pipe,
         cwd=REPO_ROOT,

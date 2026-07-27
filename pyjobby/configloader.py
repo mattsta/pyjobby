@@ -8,6 +8,7 @@ import importlib.util
 import os
 import sys
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 
@@ -29,10 +30,10 @@ def chdir_addpath(path: str) -> None:
 
 
 def get_config_from_filename(filename: str) -> dict[str, Any]:
-    if not os.path.exists(filename):
+    if not Path(filename).exists():
         raise RuntimeError(f"{filename!r} doesn't exist")
 
-    ext = os.path.splitext(filename)[1]
+    ext = Path(filename).suffix
 
     try:
         module_name = "__config__"
@@ -47,7 +48,7 @@ def get_config_from_filename(filename: str) -> dict[str, Any]:
         assert spec is not None
         mod = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = mod
-        spec.loader.exec_module(mod)  # type: ignore
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
     except Exception as e:
         raise ConfigError(f"Failed to read config file: {filename}: {e}") from e
 

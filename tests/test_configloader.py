@@ -6,6 +6,7 @@ Using LIVE file operations with NO MOCKS for maximum correctness guarantees!
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -23,11 +24,11 @@ class TestChdirAddpath:
 
     def test_chdir_addpath_changes_directory(self):
         """Test that chdir_addpath changes to the specified directory."""
-        original_dir = os.getcwd()
+        original_dir = Path.cwd()
         with tempfile.TemporaryDirectory() as tmpdir:
             chdir_addpath(tmpdir)
             # realpath: macOS tempdirs live behind the /var -> /private/var symlink
-            assert os.path.realpath(os.getcwd()) == os.path.realpath(tmpdir)
+            assert Path.cwd().resolve() == Path(tmpdir).resolve()
             assert tmpdir in sys.path
             # Restore original directory
             os.chdir(original_dir)
@@ -35,7 +36,7 @@ class TestChdirAddpath:
 
     def test_chdir_addpath_adds_to_sys_path(self):
         """Test that path is added to sys.path - covers lines 19-20."""
-        original_dir = os.getcwd()
+        original_dir = Path.cwd()
         with tempfile.TemporaryDirectory() as tmpdir:
             # Ensure it's not already in path
             if tmpdir in sys.path:
@@ -69,7 +70,7 @@ class TestGetConfigFromFilename:
                 assert config["web_listen"] == {"port": 8080}
                 assert config["test_value"] == 42
             finally:
-                os.unlink(f.name)
+                Path(f.name).unlink()
 
     def test_get_config_from_nonexistent_file_raises(self):
         """Test that non-existent file raises RuntimeError - covers line 24-25."""
@@ -87,7 +88,7 @@ class TestGetConfigFromFilename:
                 config = get_config_from_filename(f.name)
                 assert config["custom_setting"] == "test"
             finally:
-                os.unlink(f.name)
+                Path(f.name).unlink()
 
 
 class TestGetConfigFromModuleName:
@@ -127,7 +128,7 @@ class TestLoadConfigFromModuleNameOrFilename:
                 assert config["db_params"] == {"host": "test"}
                 assert config["web_listen"] is None
             finally:
-                os.unlink(f.name)
+                Path(f.name).unlink()
 
     def test_load_from_filename_no_prefix(self):
         """Test loading without prefix - covers lines 69-70."""
@@ -143,7 +144,7 @@ class TestLoadConfigFromModuleNameOrFilename:
                 assert config["setting1"] == "value1"
                 assert config["setting2"] == 123
             finally:
-                os.unlink(f.name)
+                Path(f.name).unlink()
 
 
 class TestLoadConfigFromFile:
@@ -163,4 +164,4 @@ class TestLoadConfigFromFile:
                 assert "web_listen" in config
                 assert "extra" not in config  # Should be filtered out
             finally:
-                os.unlink(f.name)
+                Path(f.name).unlink()

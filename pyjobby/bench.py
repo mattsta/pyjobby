@@ -99,6 +99,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
 
@@ -1323,7 +1324,7 @@ def worker_config(target: Target) -> Iterator[str]:
         yield path
     finally:
         with contextlib.suppress(OSError):
-            os.unlink(path)
+            Path(path).unlink()
 
 
 async def _e2e_round(
@@ -2715,7 +2716,7 @@ class ResolveModule:
             "jobs_deleted": 0,
             "workers_deleted": 0,
             "job_module_dir": self.directory,
-            "job_module_removed": not os.path.exists(self.directory),
+            "job_module_removed": not Path(self.directory).exists(),
             "off_sys_path": self.directory not in sys.path,
             "out_of_sys_modules": self.module_name not in sys.modules,
         }
@@ -2737,7 +2738,7 @@ def resolve_job_module() -> Iterator[ResolveModule]:
         directory=directory,
     )
     try:
-        with open(os.path.join(directory, f"{module_name}.py"), "w") as handle:
+        with (Path(directory) / f"{module_name}.py").open("w") as handle:
             handle.write(RESOLVE_JOB_SOURCE)
         sys.path.insert(0, directory)
         # The import system caches a directory's listing by mtime with

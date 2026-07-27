@@ -122,7 +122,21 @@ strict_equality = true
 
 [tool.ruff]
 target-version = "py314"
-lint.select = ["I", "FURB", "UP", "C4", "SIM", "F401"]
+# A rule that is not in this list is not enforced, and an unenforced rule
+# drifts back in. PTH and PGH were both cleaned up by hand once and both
+# regrew, so they live here now rather than in someone's shell history.
+lint.select = [
+    "I",    # import sorting
+    "F401", # imported and unused
+    "C4",   # comprehensions over list()/dict() calls
+    "SIM",  # simplifiable branches, contextlib.suppress, ternaries
+    "UP",   # syntax that 3.14 made obsolete
+    "FURB", # modern stdlib idioms
+    "PTH",  # pathlib over os.path (see the note at pj.py source_mtime)
+    "PGH",  # no BLANKET `# type: ignore` / `# noqa`; name the code
+]
+# No SIM102/SIM110 exemptions: the tree is clean of both, so a suppression
+# here would only license the next collapsible `if` nobody had to write.
 
 [build-system]
 requires = ["poetry-core>=2.1.0"]

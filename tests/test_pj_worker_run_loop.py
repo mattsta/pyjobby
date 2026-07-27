@@ -736,8 +736,8 @@ class TestWebServerStartup:
 
     async def test_web_server_unix_socket_startup(self, live_worker, unique_queue):
         """Test that worker starts a Unix socket web server when configured."""
-        import os
         import tempfile
+        from pathlib import Path
 
         # Create a temporary file path for the Unix socket
         with tempfile.NamedTemporaryFile(delete=True) as f:
@@ -751,11 +751,11 @@ class TestWebServerStartup:
         )
 
         # Socket file is created with the worker ID appended
-        expected_socket = f"{socket_path}-{system.workerId}"
+        expected_socket = Path(f"{socket_path}-{system.workerId}")
         try:
-            assert os.path.exists(expected_socket), (
+            assert expected_socket.exists(), (
                 f"Unix socket should have been created at {expected_socket}"
             )
         finally:
             with contextlib.suppress(OSError):
-                os.unlink(expected_socket)
+                expected_socket.unlink()

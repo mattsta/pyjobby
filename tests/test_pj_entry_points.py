@@ -11,6 +11,7 @@ import os
 import signal
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
@@ -20,11 +21,14 @@ from pyjobby.pj import STMTS, JobSystem, workit
 
 from .conftest import wait_for_job_state
 
-REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
-CONFIG_PATH = os.path.join(REPO_ROOT, "pyjobby.conf.py")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+# stays a str: it is passed straight into argv lists and into
+# load_config_from_file(), whose "python:"/"file:" prefix handling is string
+# surgery on the value it is given
+CONFIG_PATH = str(REPO_ROOT / "pyjobby.conf.py")
 
 
-def run_workit_briefly(args: list[str], cwd: str, timeout: float = 2) -> None:
+def run_workit_briefly(args: list[str], cwd: Path, timeout: float = 2) -> None:
     """Launch `python -m pyjobby.pj <args>` in its own process group and kill
     the WHOLE group after `timeout`.
 

@@ -8,6 +8,7 @@ Coverage target: 70%+
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -29,7 +30,7 @@ class TestChdirAddpath:
 
     def test_chdir_and_addpath(self, tmp_path):
         """Test that chdir_addpath changes directory and adds to sys.path."""
-        original_cwd = os.getcwd()
+        original_cwd = Path.cwd()
         original_syspath = sys.path.copy()
 
         try:
@@ -42,7 +43,7 @@ class TestChdirAddpath:
 
             # Verify directory changed
             # (realpath: macOS tempdirs live behind the /var symlink)
-            assert os.path.realpath(os.getcwd()) == os.path.realpath(str(test_dir))
+            assert Path.cwd().resolve() == test_dir.resolve()
 
             # Verify path added to sys.path
             assert str(test_dir) in sys.path
@@ -54,7 +55,7 @@ class TestChdirAddpath:
 
     def test_chdir_addpath_already_in_syspath(self, tmp_path):
         """Test that chdir_addpath doesn't add duplicate paths."""
-        original_cwd = os.getcwd()
+        original_cwd = Path.cwd()
         original_syspath = sys.path.copy()
 
         try:

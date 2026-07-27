@@ -734,20 +734,17 @@ def write_config(tmp_path, dsn: str) -> object:
 async def run_to_completion(*args: str, timeout: float = 30):
     """Run a console script to completion and return the finished process."""
     import asyncio
-    import os
     import subprocess
-    import sys
 
-    from pyjobby.procs import REPO_ROOT
+    from pyjobby.procs import REPO_ROOT, script_path
 
-    bin_dir = os.path.join(REPO_ROOT, ".venv", "bin")
-    executable = os.path.join(bin_dir, args[0])
-    if not os.path.exists(executable):
-        executable = os.path.join(os.path.dirname(sys.executable), args[0])
+    # same resolution as procs.spawn(); this is the synchronous twin of it,
+    # so it must not carry its own copy of the .venv/bin lookup
+    executable = script_path(args[0])
 
     def _run():
         return subprocess.run(
-            [executable, *args[1:]],
+            [str(executable), *args[1:]],
             capture_output=True,
             text=True,
             cwd=REPO_ROOT,
