@@ -93,8 +93,14 @@ def calculate_retry_delay(
     jitter = random.uniform(0, min(delay * 0.1, 5))
     delay = delay + jitter
 
-    # Cap at max_delay
-    delay = min(int(delay), max_delay)
+    # Cap at max_delay. Deliberately NOT int(): truncating to whole seconds
+    # quantizes the jitter away, which is the one thing jitter must not do.
+    # A batch failing together at error_count=5 spreads over [16.0, 17.6);
+    # truncated, all of it collapses onto 16 or 17 -- two buckets, i.e. the
+    # thundering herd the jitter was added to prevent. run_after is
+    # TIMESTAMPTZ with microsecond resolution, so there is nothing to round
+    # for.
+    delay = min(delay, float(max_delay))
 
     return datetime.timedelta(seconds=delay)
 

@@ -21,6 +21,21 @@ from pyjobby.retry_strategies import (
 from tests.utils.factories import create_job, get_job
 
 
+def assert_jittered(delay: timedelta, base: float) -> None:
+    """The delay is `base` plus jitter -- which only ever runs UPWARD.
+
+    A symmetric window around `base` is the wrong assertion and passed only
+    while the delay was truncated with `int()`, which floored every sample
+    back onto the base second. The real contract is
+    `base <= delay <= base + min(base * 0.1, 5)`.
+    """
+    ceiling = base + min(base * 0.1, 5)
+    seconds = delay.total_seconds()
+    assert base <= seconds <= ceiling, (
+        f"{seconds}s is outside the jitter window [{base}, {ceiling}]"
+    )
+
+
 class TestRetryDelayCalculation:
     """Test retry delay calculation algorithms."""
 
@@ -110,7 +125,7 @@ class TestRetryDelayCalculation:
         # Start with 10 seconds
         delay = calculate_retry_delay(1, strategy="exponential", initial_delay=10)
 
-        assert 9.5 <= delay.total_seconds() <= 10.5
+        assert_jittered(delay, 10)
 
     def test_jitter_prevents_exact_values(self):
         """Test that jitter makes delays non-deterministic."""
@@ -119,9 +134,16 @@ class TestRetryDelayCalculation:
             for _ in range(10)
         ]
 
-        # All should be around 16s but slightly different
+        # Every sample distinct. This used to assert only `> 1` because
+        # `int()` truncation collapsed ten samples onto two integer seconds,
+        # so the test flaked whenever all ten landed on the same one -- about
+        # 1% of runs, which is exactly how it was found. With sub-second
+        # resolution restored, ten draws from a continuous range collide with
+        # probability zero.
         unique_delays = {d.total_seconds() for d in delays}
-        assert len(unique_delays) > 1  # Not all identical
+        assert len(unique_delays) == len(delays)
+        for delay in delays:
+            assert_jittered(delay, 16)
 
     def test_returns_timedelta(self):
         """Test that function returns timedelta."""
@@ -187,7 +209,7 @@ class TestRetryConfigExtraction:
 
         # Exponential with initial=2: 2, 4, 8...
         # Attempt 3 should be ~8 seconds
-        assert 7.5 <= delay.total_seconds() <= 8.5
+        assert_jittered(delay, 8)
 
 
 class TestAdminDataRetryConfig:
