@@ -107,7 +107,7 @@ import asyncpg  # type: ignore[import-untyped]
 import click
 from loguru import logger
 
-from . import db, monitor
+from . import db, dxe, monitor
 from .cli import (
     ConfigProblem,
     DatabaseProblem,
@@ -116,7 +116,7 @@ from .cli import (
     print_warning,
 )
 from .configloader import load_config_from_file
-from .monitor import TERMINAL_STATES
+from .lifecycle import TERMINAL_STATES
 from .pj import STMTS, Job, JobSystem
 from .scheduler import CONCURRENCY_COUNT_SQL
 
@@ -3014,6 +3014,182 @@ async def run_resolve(
 
 
 # =========================================================================
+# Replay depth: what a long checkpoint log costs to resume
+# =========================================================================
+
+#: Checkpoint counts to sweep. Spans "an ordinary job" (a handful) to "a
+#: state machine that has been idle for a month" (~17k, from one recv() and
+#: one sleep() per five-minute idle turn) to an order beyond it, because the
+#: interesting question is where the curve stops being flat, and you cannot
+#: see that from inside the range you care about.
+REPLAY_DEPTHS = (0, 10, 100, 1_000, 10_000, 100_000)
+
+#: A recorded step's output is JSONB, and deserialising N of them is most of
+#: what a resume pays. A synthetic row whose output is `{}` would measure an
+#: empty table and report it as good news, so the seed writes a payload the
+#: size a real step returns.
+REPLAY_OUTPUT_BYTES = 200
+
+#: Where a resume stops being free. Not a hard limit -- a job woken every five
+#: minutes can afford far more than one woken every second -- but a threshold
+#: the report can flag against instead of leaving the reader to judge.
+REPLAY_BUDGET_SECONDS = 0.100
+
+
+async def _seed_checkpoints(
+    conn: asyncpg.Connection, job_id: int, depth: int, epoch: int
+) -> None:
+    """Give one job `depth` recorded steps, in one statement.
+
+    Names vary per row: replay matches the recorded name against the name the
+    code asks for, so a seed of identical names would exercise a dictionary of
+    one distinct string and let the interpreter intern its way to a faster
+    answer than any real machine gets.
+    """
+    if depth <= 0:
+        return
+    await conn.execute(
+        """
+        INSERT INTO jorb_step
+            (job_id, step_seq, name, output, error, run_epoch, started, finished)
+        SELECT $1, i, 'machine.transition#' || i,
+               jsonb_build_object('n', i, 'pad', repeat('x', $3)),
+               NULL, $4, now(), now()
+        FROM generate_series(1, $2) i
+        """,
+        job_id,
+        depth,
+        REPLAY_OUTPUT_BYTES,
+        epoch,
+    )
+
+
+async def run_replay(
+    target: Target,
+    *,
+    depths: Sequence[int],
+    repeat: int,
+    warmup: bool,
+    max_existing_jobs: int,
+    force: bool,
+) -> dict[str, Any]:
+    """How long it takes to resume a job that already has N checkpoints.
+
+    DXE replays by loading every recorded step for a job and fast-forwarding
+    through the completed prefix. That is one indexed range scan and a dict
+    build, both linear in the number of steps -- so a job whose step count
+    grows without bound gets slower to resume without bound, and nothing in
+    the system reports it. This measures the constant.
+
+    It measures the two halves separately, because they have different fixes.
+    ``load`` is the query: an index range scan over ``jorb_step_pkey``, plus
+    transferring and decoding N JSONB values. ``bind`` is what the worker then
+    does with the rows -- ``{row["step_seq"]: row for row in checkpoints}`` --
+    which is pure CPU in the worker process and invisible to any database
+    metric. A resume pays both before running a single line of job code.
+
+    The queue is torn down per depth rather than at the end: a 100k-step seed
+    left in place would sit in the buffers the next depth is trying to
+    measure.
+    """
+    conn = await open_connection(target)
+    queue = bench_queue("replay")
+    try:
+        guard = await guard_busy_database(conn, limit=max_existing_jobs, force=force)
+
+        by_depth: dict[str, Any] = {}
+        for depth in depths:
+            job_id = await conn.fetchval(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, state, run_epoch)
+                VALUES ('bench.Replay', '{}', $1, 'queued', 1) RETURNING id
+                """,
+                queue,
+            )
+            await _seed_checkpoints(conn, job_id, depth, epoch=1)
+            await conn.execute("ANALYZE jorb_step")
+
+            load_samples: list[float] = []
+            bind_samples: list[float] = []
+            rows: list[Any] = []
+
+            async def one_round(job: int = job_id) -> None:
+                nonlocal rows
+                started = time.perf_counter()
+                rows = await conn.fetch(dxe.LOAD_STEPS_SQL, job)
+                loaded = time.perf_counter()
+                # Exactly what Job._dxe_bind does, and the only work a resume
+                # does with the rows before job code starts.
+                bound = {row["step_seq"]: row for row in rows}
+                done = time.perf_counter()
+                load_samples.append(loaded - started)
+                bind_samples.append(done - loaded)
+                assert len(bound) == depth
+
+            if warmup:
+                await one_round()
+                load_samples.clear()
+                bind_samples.clear()
+            for _ in range(repeat):
+                await one_round()
+
+            load = summarize(load_samples)
+            bind = summarize(bind_samples)
+            resume = load["median"] + bind["median"]
+            # Time is not the only thing a resume spends. Every one of these
+            # rows is live in the worker process for the whole attempt, so a
+            # worker running C such jobs concurrently holds C times this.
+            loaded_bytes = int(
+                await conn.fetchval(
+                    """SELECT coalesce(sum(pg_column_size(name)
+                                          + pg_column_size(output)), 0)
+                       FROM jorb_step WHERE job_id = $1""",
+                    job_id,
+                )
+            )
+            by_depth[str(depth)] = {
+                "checkpoints": depth,
+                "loaded_bytes": loaded_bytes,
+                "load_seconds": load,
+                "bind_seconds": bind,
+                "resume_seconds": resume,
+                "microseconds_per_checkpoint": (resume / depth * 1e6 if depth else 0.0),
+                "within_budget": resume <= REPLAY_BUDGET_SECONDS,
+                "plan": await conn.fetchval(
+                    f"EXPLAIN (FORMAT JSON) {dxe.LOAD_STEPS_SQL}", job_id
+                ),
+            }
+            await conn.execute("DELETE FROM jorb WHERE id = $1", job_id)
+
+        measured = [d for d in by_depth.values() if d["checkpoints"] > 0]
+        marginal = [
+            d["microseconds_per_checkpoint"]
+            for d in measured
+            if d["checkpoints"] >= 1_000
+        ]
+        affordable = [d["checkpoints"] for d in measured if d["within_budget"]]
+        return {
+            "benchmark": "replay",
+            "database": target.label,
+            "guard": guard,
+            "repeat": repeat,
+            "depths": list(depths),
+            "output_bytes_per_step": REPLAY_OUTPUT_BYTES,
+            "budget_seconds": REPLAY_BUDGET_SECONDS,
+            "by_depth": by_depth,
+            # The headline: the per-checkpoint constant, taken from the deep
+            # end where fixed per-query cost has stopped dominating.
+            "microseconds_per_checkpoint": (
+                statistics.median(marginal) if marginal else 0.0
+            ),
+            "max_checkpoints_within_budget": max(affordable) if affordable else 0,
+            "cleanup": await cleanup_queue(conn, queue),
+        }
+    finally:
+        await conn.close()
+
+
+# =========================================================================
 # Output
 # =========================================================================
 
@@ -3730,6 +3906,103 @@ def resolve_table(result: dict[str, Any]) -> list[list[str]]:
             "module's top level, so a bigger jobs file costs more.",
         ],
     ]
+
+
+@cli.command("replay")
+@db_options
+@timing_options
+@click.option(
+    "--depths",
+    default=",".join(str(d) for d in REPLAY_DEPTHS),
+    show_default=True,
+    help="Comma-separated checkpoint counts to sweep",
+)
+@click.pass_context
+def replay_cmd(
+    ctx: click.Context,
+    dsn: str | None,
+    config: str | None,
+    output_json: bool,
+    force: bool,
+    max_existing_jobs: int,
+    repeat: int,
+    warmup: bool,
+    depths: str,
+) -> None:
+    """What a long checkpoint log costs to resume.
+
+    A resume loads every step a job has ever recorded. Ordinary jobs record a
+    handful and never notice; a durable state machine records one per
+    transition AND one per idle wake, so its log grows with elapsed time
+    rather than with work done. This is the number that decides how long such
+    a machine may live.
+    """
+    try:
+        parsed = tuple(int(part) for part in depths.split(",") if part.strip())
+    except ValueError:
+        fail(f"--depths must be comma-separated integers, got {depths!r}")
+    if not parsed:
+        fail("--depths needs at least one value")
+    target = resolve_target(pick(ctx, config, "config"), pick(ctx, dsn, "dsn"))
+    result = run_command(
+        run_replay(
+            target,
+            depths=parsed,
+            repeat=repeat,
+            warmup=warmup,
+            max_existing_jobs=max_existing_jobs,
+            force=force,
+        )
+    )
+    emit(result, output_json, replay_table(result))
+
+
+def replay_table(result: dict[str, Any]) -> list[list[str]]:
+    """One row per depth, then what the curve means."""
+    rows: list[list[str]] = [
+        [
+            "resume cost by checkpoint count",
+            f"{result['repeat']} rounds each; medians; "
+            f"{result['output_bytes_per_step']}-byte JSONB output per step",
+        ]
+    ]
+    for depth in result["depths"]:
+        block = result["by_depth"][str(depth)]
+        marginal = (
+            f", {block['microseconds_per_checkpoint']:.2f} us/step"
+            if depth
+            else " (fixed cost: the query still runs)"
+        )
+        rows.append(
+            [
+                f"  {depth:,} checkpoints",
+                f"{block['resume_seconds'] * 1e3:,.2f} ms "
+                f"(load {block['load_seconds']['median'] * 1e3:,.2f} + "
+                f"bind {block['bind_seconds']['median'] * 1e3:,.2f}){marginal}"
+                f", {block['loaded_bytes'] / 1e6:,.2f} MB resident"
+                + ("" if block["within_budget"] else "  OVER BUDGET"),
+            ]
+        )
+    rows.extend(
+        [
+            [
+                "marginal cost per checkpoint",
+                f"{result['microseconds_per_checkpoint']:.2f} us "
+                "(from the deep end, where fixed query cost no longer dominates)",
+            ],
+            [
+                f"most checkpoints under {result['budget_seconds'] * 1e3:.0f} ms",
+                f"{result['max_checkpoints_within_budget']:,}",
+            ],
+            [
+                "what this bounds",
+                "a machine that wakes, replays, handles one event and sleeps "
+                "pays this on EVERY wake. Divide the wake interval by it to "
+                "see what fraction of the machine's life is spent replaying.",
+            ],
+        ]
+    )
+    return rows
 
 
 @cli.command("all")
