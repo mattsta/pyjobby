@@ -16,16 +16,18 @@ a second, and it exits 1 on any FAIL — so it works as a cron probe, a CI
 gate, and a deploy smoke test. Run it before reading logs.
 
 ```console
-$ pj-admin doctor
+$ pj-admin --dsn "$PYJOBBY_DSN" doctor
 PASS database: connected
-PASS schema: installed, migrations current (baseline)
-PASS triggers: all NOTIFY triggers present (3)
+PASS schema: installed and complete; migrations [1, 2] are not recorded yet, which the next upgrade reads (run: pj-admin db migrate)
+PASS triggers: all schema triggers present (7)
 PASS notify-queue: 0.0% full
-PASS workers: 4 live worker(s) seen in last 60s
-PASS job-threads: 4 live worker(s) claiming
-WARN queue pjbench_e2e_67f5e7c6: depth 10067, oldest queued 0m (thresholds: depth 10000, age 60m)
+WARN workers: no live workers seen in last 60s
+PASS job-threads: 0 live worker(s) claiming
+PASS queue q_reports: depth 1, oldest queued 51m
 PASS dlq: empty
 PASS schedules: no overdue schedules
+$ echo $?
+0
 ```
 
 FAIL means the platform cannot function and is the only thing that changes
@@ -35,8 +37,8 @@ all" is a WARN, so one worker of ten refusing to claim cannot be graver.
 | Check | FAIL / WARN means | Go to |
 |---|---|---|
 | `database` | cannot connect with the DSN or config given | [Config and connection](#the-database-is-unreachable-or-the-config-is-wrong) |
-| `schema` | no schema, or migrations pending | [Schema is missing or stale](#the-schema-is-missing-or-stale) |
-| `triggers` | a NOTIFY trigger is missing — workers will not wake and clients will not be notified | [Schema is missing or stale](#the-schema-is-missing-or-stale) |
+| `schema` | no schema at all, or a schema **missing objects this release needs** (each one named) | [Schema is missing or stale](#the-schema-is-missing-or-stale) |
+| `triggers` | one of the schema's triggers is missing — NOTIFY waiters degrade to polling, or history stops being recorded | [Schema is missing or stale](#the-schema-is-missing-or-stale) |
 | `notify-queue` | WARN at 25% full, FAIL past 50% | [NOTIFY queue saturation](#notify-queue-saturation) |
 | `workers` | no heartbeat in the last 60s | [Nothing is being claimed](#nothing-is-being-claimed) |
 | `job-threads` | live workers that claim nothing | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing) |
@@ -93,6 +95,10 @@ abandons its in-flight jobs to the monitor.
 
 ## The schema is missing or stale
 
+Both cases are a `FAIL schema`, and both are fixed by the same command.
+
+**No schema at all:**
+
 ```console
 $ pj-admin doctor
 PASS database: connected
@@ -101,28 +107,71 @@ $ echo $?
 1
 ```
 
-Fix: `pj-admin db migrate`. See
+**A schema of the wrong shape** — installed from a different revision of
+`schema.sql`, so it has `jorb` and records no pending migration, and used
+to pass. `doctor` now checks the schema's *shape* against the manifest of
+objects this release actually addresses (`pyjobby/migrations.py`), and
+names what is absent:
+
+```console
+$ pj-admin doctor
+PASS database: connected
+FAIL schema: installed, but 3 object(s) this release needs are missing: index jorb_dag_retention_idx, index jorb_schedule_log_retention_idx, index jorb_worker_retention_idx (run: pj-admin db migrate)
+$ echo $?
+1
+```
+
+It names up to five and then counts the rest; `pj-admin db status` lists
+every one:
+
+```console
+$ pj-admin db status
+Base schema installed: yes
+Applied migrations:    none
+Pending migrations:    [1, 2]
+Missing objects:       3
+  index jorb_dag_retention_idx
+  index jorb_schedule_log_retention_idx
+  index jorb_worker_retention_idx
+```
+
+`Missing objects` is the line that matters. `Pending migrations` can only
+say "this database has not *recorded* migration N", and a database
+installed before the migration runner existed records nothing at all while
+still being stale.
+
+Both checks stop the report: every line below `schema` queries something
+the check just reported missing, and a health report that crashes halfway
+through is worse than one that stops.
+
+**Fix: `pj-admin db migrate`**, which now upgrades an existing database
+rather than only installing a new one. It installs `schema.sql` if `jorb`
+is absent, otherwise applies the numbered migration files this database has
+not recorded — one transaction per file, serialised fleet-wide by an
+advisory lock, so running it from every host's deploy step is safe. See
 [deployment-guide.md § The database](deployment-guide.md#the-database).
 
-A **stale** schema looks different and is worse. `doctor` only verifies
-that `jorb` exists and that no numbered migration is pending, so a database
-installed from a different revision of `schema.sql` passes that check and
-then fails at the first statement needing a column it does not have:
+If a stale schema is reached by a command rather than by `doctor`, you get
+a message instead of a traceback — `pj-admin` turns every
+undefined-table/column/function error into the same answer:
 
-```
-asyncpg.exceptions.UndefinedColumnError: column "job_threads" does not exist
+```console
+$ pj-admin workers list
+Error: The database schema is missing or out of date: relation "jorb_worker" does not exist
+Error: Install or upgrade it with `pj-admin db migrate`, then confirm with `pj-admin doctor`.
+$ echo $?
+1
 ```
 
-```
-asyncpg.exceptions.UndefinedTableError: relation "jorb" does not exist
-```
+The same handler covers a missing *column* (`column "job_threads" does not
+exist`), a missing function and a missing schema, and it sits on the root
+command group — so every `pj-admin` subcommand, including ones added later,
+answers a stale database the same way.
 
-Both surface as a traceback rather than a message, from whichever command
-happened to touch that column first. Treat any `UndefinedColumnError` or
-`UndefinedTableError` naming a `jorb*` table as "this database does not
-match this version of pyjobby" and re-create it — the schema is one file
-shipped inside the package, and there is no supported way to patch a
-database into agreement with it.
+A worker or the monitor hitting the same condition still raises
+`asyncpg.exceptions.UndefinedColumnError` / `UndefinedTableError` in its
+log. Any of those naming a `jorb*` table means this database does not match
+this version of pyjobby; run `db migrate` and confirm with `doctor`.
 
 ## Nothing is being claimed
 
@@ -135,19 +184,30 @@ In order:
    the database, so they bind every claimer, and a paused queue stops
    claims within a fraction of a second.
 3. **`pj-admin workers list`.** Are there live workers *on that queue*?
-   Read the Queue column, not the worker count. `--queue` is **per worker
-   process**: `pj --queue reports --workers 4` starts one worker on
-   `reports` and three on `default`, because `pj` pairs process *i* with
-   queue *i* and pads the list to `--workers` with `default`. A queue that
-   looks unserved while four workers are "live" is usually this. Repeat
-   `--queue` once per worker — see
+   Read the Queue column, not the worker count. `--workers` is **per
+   queue**, and no worker is ever started on a queue you did not name:
+   `pj --queue reports --workers 4` is four workers, all on `reports`, and
+   `--queue reports --queue billing --workers 4` is eight processes, four
+   on each. (It used to be a total, with the queue list padded out using
+   the literal `default`, so that first command put one worker on `reports`
+   and three somewhere nobody asked for. A queue that looked unserved while
+   four workers were "live" was usually that.) See
    [deployment-guide.md § Worker settings](deployment-guide.md#worker-settings).
 4. **Capability.** A job with a `capability` no worker advertises is
    invisible to those workers. Workers advertise with `--cap`.
-5. **Priority.** Workers claim `prio <= 1000`, and there is no flag to
-   raise that ceiling. A job enqueued above it is invisible to every
-   worker. Lower numbers are more urgent; `pj-admin jobs inspect ID` shows
-   the job's `Priority`.
+5. **Priority — and remember the direction.** A **lower** `prio` is
+   claimed **sooner**; the big numbers are the ones nothing runs. Each
+   worker has a ceiling (`pj --max-prio`, default 1000) and claims only
+   `prio <= ceiling`, so a job above every live worker's ceiling is
+   invisible to all of them. `pj-admin jobs inspect ID` shows the job's
+   `Priority`; compare it against the `--max-prio` the fleet was started
+   with. Rows enqueued through `JobClient` cannot get into this state (the
+   client refuses them), so when it happens the row arrived another way —
+   raw SQL, a schedule, a tool. An idle worker also logs it once a minute:
+   grep its log for `ABOVE this worker's priority ceiling`. Fix by lowering
+   the job's `prio` or by running a worker with a `--max-prio` that covers
+   it — see
+   [OPERATIONS.md § Priority](OPERATIONS.md#priority-and-the-ceiling-a-worker-claims-under).
 6. **`run_after`.** A job with a future `run_after` is *supposed* to be
    invisible — that is how retry backoff and durable sleep are
    implemented. `pj-admin jobs inspect ID` shows it.
@@ -268,8 +328,11 @@ all four are load-bearing. Full argument:
 [SCALE.md § NOTIFY queue saturation](SCALE.md#3-notify-queue-saturation--the-cliff).
 
 A missing trigger is the opposite failure and `doctor` checks it
-separately — `FAIL triggers` means workers will not be woken and clients
-will not be notified. That is a stale-schema symptom; see above.
+separately, by name, over all seven the schema installs — the five NOTIFY
+triggers plus `jorb_history_record` and `jorb_dag_complete`. Nothing raises
+when one goes missing: waiters silently degrade to their polling fallback,
+or the audit trail silently stops being written. `FAIL triggers` names the
+ones that are gone. That is a stale-schema symptom; see above.
 
 ## A schedule is not firing
 

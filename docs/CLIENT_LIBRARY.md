@@ -103,6 +103,11 @@ import asyncpg
 pool = await asyncpg.create_pool(...)
 client = JobClient(pool)
 
+# All three take prio_ceiling=, the priority ceiling THIS deployment's
+# workers run with (`pj --max-prio`, default 1000). It is a declaration,
+# not something the client can observe; see "Priority, and the ceiling".
+client = JobClient(pool, prio_ceiling=5000)
+
 # Always close when done
 await client.close()
 
@@ -138,9 +143,14 @@ Enqueue a single job.
 
 - `job_class` (str): Full Python class path (e.g., `'myapp.jobs.SendEmail'`)
 - `queue` (str): Queue name (default: `'default'`)
-- `priority` (int): Priority — **LOWER numbers are MORE urgent** (default: 100).
-  Workers claim in ascending `prio` order and only take jobs at or below
-  their ceiling (1000), so a priority above that is never claimed.
+- `priority` (int): Priority as a **finishing position** — a *smaller*
+  number runs *sooner*, the way `priority=1` means "first" in a race
+  (default: 100). Workers claim in ascending `prio` order and only take
+  jobs at or below their ceiling (`pj --max-prio`, default 1000), so a
+  number above the ceiling is not "run last", it is "never run". This
+  client **refuses** such an enqueue with `ValueError` rather than writing
+  a row nothing would claim — see
+  [Priority, and the ceiling](#5-priority-and-the-ceiling).
 - `run_after` (datetime): When to run (default: now)
 - `capability` (str): Required worker capability (default: None)
 - `uid` (int): User/tenant ID for multi-tenancy (default: None)
@@ -514,22 +524,60 @@ except asyncpg.UniqueViolationError:
     print(f"Report for {date} already scheduled")
 ```
 
-### 5. High-Priority Jobs
+### 5. Priority, and the ceiling
 
-Queue urgent jobs ahead of others.
+Priority is a **finishing position**, not a rating: `priority=1` means
+"first" the way it does in a race, and the big numbers are the ones that
+wait. Sorting the calls by the number sorts them by when they run.
 
 ```python
-# Lower numbers are more urgent. Think "priority 1" as in first place,
-# not "priority 500" as in a big important number.
-await client.enqueue("myapp.jobs.ProcessData", priority=100)      # default
-
-await client.enqueue("myapp.jobs.UrgentTask", priority=10)        # goes first
-
-await client.enqueue("myapp.jobs.BackgroundCleanup", priority=900)  # goes last
-
-# Anything above a worker's ceiling (1000) is NEVER claimed — it sits
-# `queued` forever with no error. Keep background work well under it.
+await client.enqueue("myapp.jobs.UrgentTask", priority=10)  # runs first
+await client.enqueue("myapp.jobs.ProcessData", priority=100)  # the default
+await client.enqueue("myapp.jobs.BackgroundCleanup", priority=900)  # runs last
 ```
+
+Each worker also has a **ceiling** — `pj --max-prio`, default 1000 — and
+claims only `prio <= ceiling`. Past it, a bigger number stops meaning
+"later" and starts meaning "never": the job is never claimed, never fails,
+never retries and never reaches the DLQ, and no age check looks at `queued`.
+
+The client closes that at the call site rather than letting you find out
+months later:
+
+```python
+await client.enqueue("myapp.jobs.Whenever", priority=5000)
+# ValueError: priority 5000 is above the worker priority ceiling (1000):
+# workers claim only jobs with prio <= their ceiling, so this job would sit
+# 'queued' forever -- no error, no retry, no DLQ. LOWER numbers are MORE
+# urgent, so least-urgent work wants a priority just UNDER the ceiling
+# (e.g. 900), not a large one. If this deployment really runs its workers
+# with `pj --max-prio 5000` (or higher), declare it once:
+# JobClient(pool, prio_ceiling=5000).
+
+await client.enqueue("myapp.jobs.Whenever", priority=1000)  # fine: the least urgent
+```
+
+A refused enqueue writes nothing.
+
+**Raising the ceiling takes both halves.** The ceiling belongs to the worker
+fleet and nothing about it is visible over a connection, so the client takes
+it as a *declaration* rather than trying to observe it:
+
+```bash
+pj --queue backfill --max-prio 5000            # the workers that will claim it
+```
+```python
+client = JobClient(pool, prio_ceiling=5000)
+# or: await JobClient.create(..., prio_ceiling=5000)
+# or: await JobClient.from_config("./pyjobby.conf.py", prio_ceiling=5000)
+# or, for one call only:
+await client.enqueue("myapp.jobs.Whenever", priority=5000, prio_ceiling=5000)
+```
+
+Declaring it on the client alone writes a job no default-ceiling worker will
+claim; raising it only on the workers leaves the client refusing to feed
+them. `update_job_priority()` is validated against the same ceiling, for the
+same reason.
 
 ### 6. Multi-Tenant Jobs
 

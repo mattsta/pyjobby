@@ -167,7 +167,9 @@ class LoadWarehouse(Job):
     async def task(self, batch: str, upstream_result: dict[str, Any]) -> dict[str, Any]:
         return await self.transaction("load", self.load, batch, upstream_result["rows"])
 
-    async def load(self, conn, batch: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    async def load(
+        self, conn, batch: str, rows: list[dict[str, Any]]
+    ) -> dict[str, Any]:
         for row in rows:
             await conn.execute(
                 "INSERT INTO example_row (batch, sku, units) VALUES ($1, $2, $3)",
@@ -428,8 +430,9 @@ await ImportRow.enqueue(client, queue="imports", sku="x", unts=1)  # TypeError
 
 ## 8. Priority and capability routing
 
-**Lower numbers are more urgent.** This is the one that reads backwards:
-`priority=10` is claimed before `priority=100`, and the default is 100.
+**A smaller number runs sooner.** Priority here is a *finishing position*,
+not a rating: `priority=1` means "first", the way it does in a race, and the
+big numbers are the ones that wait. The default is 100.
 
 ```python
 await client.enqueue("myapp.Job", priority=10, ...)  # ahead of everything normal
@@ -440,13 +443,41 @@ await client.enqueue("myapp.Job", priority=900, ...)  # backfill
 Claiming is `ORDER BY prio, run_after`, and the test starts a worker after
 enqueueing all three and asserts they *started* in exactly that order.
 
-There is a second consequence of the direction, and it is a trap: a worker
-claims only jobs whose priority is **at or below its own ceiling**, which is
-1000 and is not settable from `pj`. A job enqueued at `priority=5000` is not
-"very low priority" — it is **unclaimable**, and it sits `queued` forever
-while every worker ignores it. The test pins that too. Keep priorities inside
-1..1000, and use a separate queue rather than a large number when you want
-work to be genuinely deferrable.
+The direction has a consequence at the far end: a worker claims only jobs
+**at or below its own ceiling** (`pj --max-prio`, default 1000), so a number
+big enough is not "run this last" but "run this never". `priority=5000` past
+a default fleet would sit `queued` forever, never failing and never reaching
+the DLQ. So the client refuses it where the caller can still see it:
+
+```python
+await client.enqueue("myapp.Job", priority=5000, ...)
+# ValueError: priority 5000 is above the worker priority ceiling (1000):
+# workers claim only jobs with prio <= their ceiling, so this job would sit
+# 'queued' forever -- no error, no retry, no DLQ. LOWER numbers are MORE
+# urgent, so least-urgent work wants a priority just UNDER the ceiling
+# (e.g. 900), not a large one. ...
+```
+
+Nothing is written when it refuses — there is no row to find later and
+wonder about. `priority=1000` exactly is fine, and is what "least urgent"
+means on a default fleet.
+
+If you genuinely run workers for less-urgent-than-1000 work, the deployment
+declares that ceiling **twice**, because the client cannot observe a worker
+flag:
+
+```bash
+pj --queue backfill --max-prio 5000        # the workers that will claim it
+```
+```python
+client = JobClient(pool, prio_ceiling=5000)  # the client allowed to enqueue it
+```
+
+The test pins both halves: with only the client raised, the job is written
+and a default-ceiling worker stays blind to it; a worker started at
+`--max-prio 5000` then runs it. Still prefer a separate queue over a large
+number when the point is isolation — priority orders work within a queue, it
+does not separate it.
 
 `capability` routes by hardware rather than by urgency. A job that names one
 is invisible to every worker that does not advertise it:
@@ -553,9 +584,7 @@ class Estimate(Job):
 ```
 
 ```python
-handle = await client.enqueue_handle(
-    "myapp.quotes.Estimate", queue="quotes", cents=250
-)
+handle = await client.enqueue_handle("myapp.quotes.Estimate", queue="quotes", cents=250)
 
 await handle.event("progress", timeout=15)  # {'pct': 50}
 result = await handle.wait(timeout=20)  # {'total': 500}
@@ -587,7 +616,7 @@ polling — example 1 — for anything that is not fast and bounded.
 | many in parallel, then one | `create_fan_out(...)` → `enqueue(..., waitfor_group=g)` |
 | thousands of identical rows | `enqueue_batch([...])` |
 | the job must not outlive its order | `JobClient.enqueue_in_transaction(conn, ...)` |
-| this one first | `priority=` **lower** than 100 |
+| this one first | `priority=` a **smaller** number than 100 (10 goes before 100) |
 | only on that hardware | `capability="gpu"`, and `pj --cap gpu` |
 | every night at 2am | `pj-admin schedule add` + `pj-scheduler` |
 | the caller wants the value | `enqueue_handle(...)` → `await handle.wait()` |

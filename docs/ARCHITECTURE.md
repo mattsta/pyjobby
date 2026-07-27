@@ -74,10 +74,15 @@ leader.
 | **Websocket** | `pj-ws` | The aggregate dashboard feed (one polled query per interval, shared by every client) and per-job watches | Tail individual transitions — see [the notification model](#the-notification-model). Also unauthenticated. |
 | **Benchmarks** | `pj-bench` | Reproducing every number in SCALE.md, and the `pj-bench plans` CI gate that fails when a hot query stops using its index | Anything outside its own uniquely-named queue, which it deletes in a `finally`. |
 
-A `pj` invocation is a launcher: it forks `--workers N` processes, each of
-which is **one queue, one job at a time**. Concurrency is process count, not
-threads. A worker that finds nothing to claim parks on a wakeup and
-re-polls every `--check-interval` (5 s, jittered) regardless.
+A `pj` invocation is a launcher: it forks `--workers N` processes **on each
+`--queue` named** (so two queues at `--workers 4` is eight processes), each
+of which is **one queue, one job at a time**. Repeating a queue name asks for
+nothing extra, and no worker is ever started on a queue that was not named —
+`--workers` used to be a fleet total with the queue list padded out using the
+literal `default`, which put workers on a queue the operator never asked for.
+Concurrency is process count, not threads. A worker that finds nothing to
+claim parks on a wakeup and re-polls every `--check-interval` (5 s, jittered)
+regardless.
 
 ---
 
@@ -185,9 +190,12 @@ starving the rest. `schema.sql` carries the measurements for both.
 
 The row itself is picked with `FOR UPDATE SKIP LOCKED` over
 `jorb_claim_idx (queue, prio, run_after) WHERE state = 'queued'`, ordered
-by priority then run time. Lower `prio` is more urgent; a worker claims
-only `prio <= its ceiling`, and only jobs whose `capability` it advertises
-(or which name none).
+by priority then run time — and because the order is `ASC`, **the smallest
+`prio` is claimed first**: it is a finishing position, not a rating. A
+worker claims only `prio <= its ceiling` (`pj --max-prio`, default 1000),
+so past the ceiling a bigger number stops meaning "later" and starts
+meaning "never"; the client refuses those enqueues for that reason. It also
+claims only jobs whose `capability` it advertises (or which name none).
 
 ---
 

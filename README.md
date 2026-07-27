@@ -88,7 +88,7 @@ statement — no worker restarts, no config deploys. Dead workers are
 detected by registry heartbeat and their jobs requeued globally by
 `pj-monitor` (jobs resume from their last completed step).
 
-### ✅ Client Library (NEW!)
+### ✅ Client Library
 
 Clean, high-performance Python client with:
 
@@ -350,18 +350,24 @@ Start here:
 
 Reference:
 
+- [writing-jobs.md](docs/writing-jobs.md) - What goes inside one job, and which durable primitive to reach for
 - [CLIENT_LIBRARY.md](docs/CLIENT_LIBRARY.md) - Client API reference with examples
-- [EXAMPLES.md](docs/EXAMPLES.md) - Real-world usage patterns
+- [EXAMPLES.md](docs/EXAMPLES.md) - Complete applications, executed by the test suite
 - [ADMIN_TOOLS.md](docs/ADMIN_TOOLS.md) - CLI, Web UI, and Admin API
+- [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) - Symptom index: what `doctor` is telling you and what to do
+- [deployment-guide.md](docs/deployment-guide.md) - Install, configure, systemd, containers, Kubernetes
 - [RECURRING_SCHEDULER.md](docs/RECURRING_SCHEDULER.md) - Cron scheduling guide
 - [WEBSOCKET_DASHBOARD.md](docs/WEBSOCKET_DASHBOARD.md) - Realtime websocket dashboard
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) - What the moving parts are and why
 - [TESTING.md](docs/TESTING.md) - How the suite is structured, and why coverage
   is a diagnostic rather than a target
 
+The full index, with what each document answers, is
+[docs/README.md](docs/README.md).
+
 ### ✅ Testing
 
-- The test suite is roughly 1,650 tests, run against a **real PostgreSQL** instance (not mocks)
+- The test suite runs against a **real PostgreSQL** instance — no mocked database anywhere in the core paths (count and structure: [TESTING.md](docs/TESTING.md))
 - Covers core job lifecycle, result storage, retries, timeouts, DAGs, the scheduler, and the admin tools
 - Includes direct SQL function testing and Hypothesis property-based tests for retry strategies, timeout enforcement, and DAG algorithms
 
@@ -379,7 +385,7 @@ Reference:
 - **queue** - a column index in the jorb table for selecting subsets of **job (storage)** to run on a worker
 - **capability** - a string value set on a **job (storage)** row also needing to match exactly one of the capability strings provided by `pj` on launch. by default, each worker advertises its own hostname as capability `f"hostname:{platform.node()}"`
 - **run_after** - a minimum start time for the job to run
-- **priority** - numeric values allowing **job (storage)** added later in a queue to run before other previously queued jobs. lower numbers are higher selection priority
+- **priority** - a finishing position, so the **smallest** number is selected first and a job added later can run before jobs already queued. each worker also has a **ceiling** (`pj --max-prio`, default 1000) and selects only `prio <=` it, so past the ceiling a bigger number means "never selected", not "selected later" — the client refuses those enqueues
 - **deadline key** - a unique constraint on `(deadline_key, state==queued)` per queue. allows you to request the same job multiple times, but the server will only schedule one instance
 - **run_group** - multiple tasks may be assigned the same `run_group` value if you would like to run other jobs only when _all_ jobs in a group move to a _finished_ state
 - **waitfor_group** - jobs in _waiting_ state with a `waitfor_group` value will run **only** when _all_ job rows with the matching `run_group` have moved to a _finished_ state
@@ -401,13 +407,13 @@ to `finished`, the job returns to `queued` for the requested future run.
 
 ### Job Selection
 
-- Using the `pj` script, on startup `--workers` numbers of completely independent workers are forked using `multiprocessing.Process` (defaults to half the number of CPU cores on the system)
+- Using the `pj` script, on startup `--workers` completely independent workers are forked using `multiprocessing.Process` **for each `--queue` named** (default: half the number of CPU cores, per queue). Two queues at `--workers 4` is eight processes; repeating a queue name asks for nothing extra; and no worker is ever started on a queue you did not name
 - If web endpoints are enabled, each worker also opens a web server for requests
   - Under linux, each web server on each worker process can receive queries due to in-kernel TCP port load balancing
   - On other platforms, only one of the workers will receive all web requests
-- Workers `LISTEN` on postgres `NOTIFY` channels (migration 009), so a newly enqueued job wakes an idle worker **immediately**; the periodic poll (`--check-interval`, default 5 seconds) is only a fallback
+- Workers `LISTEN` on postgres `NOTIFY` channels (the triggers are in `pyjobby/sql/schema.sql`), so a newly enqueued job wakes an idle worker **immediately**; the periodic poll (`--check-interval`, default 5 seconds) is only a fallback
 - If a worker finds a job, it claims it (state `claimed`), marks it `running` while executing, completes it, then immediately checks the job database for more jobs without entering the delay loop again
-  - see query `claim` for logic behind next job selection based on: matching server capability, allowed server priority, most urgent job priority (lower number is more urgent; workers claim jobs with `prio <=` the worker ceiling, default 1000), scheduled run time, and current job state
+  - see query `claim` for logic behind next job selection based on: matching server capability, most urgent job priority first (priority is a finishing position — the **smallest** `prio` is claimed first — and each worker claims only `prio <=` its own ceiling, `pj --max-prio`, default 1000), scheduled run time, and current job state
 - If a worker doesn't find an eligible job, it waits for a `NOTIFY` or the next `--check-interval` poll
 - On startup, workers recover abandoned same-host jobs by checking pid liveness: jobs claimed by a process on this host that is no longer alive get requeued
 
@@ -443,16 +449,27 @@ poetry install
 
 ### Database Setup
 
-One step — `pj-admin db migrate` installs the base schema and applies **all**
-migrations (001-009) idempotently, tracking them in a `schema_migrations`
-table (the SQL ships inside the package under `pyjobby/sql/`):
+One step, and the same step whether the database is new or old. `pj-admin db
+migrate` installs `pyjobby/sql/schema.sql` on a fresh database (recording
+every shipped migration as already contained in it, so none of them runs),
+and on an **existing** database applies the numbered files in
+`pyjobby/sql/migrations/` it has not recorded in `schema_migrations` — one
+transaction per file. All the SQL ships inside the package.
+
+It is idempotent, and safe to run from every host's deploy step at once: it
+takes an advisory lock, so one process does the work and the others wait and
+find nothing left to do.
 
 ```bash
 createdb pyjobby
 pj-admin --config ./pyjobby.conf.py db migrate
 
-# Check what's applied vs pending
+# What is applied, what is pending, and — the line that matters —
+# what objects this release needs that the database does not have
 pj-admin --config ./pyjobby.conf.py db status
+
+# Confirm the platform agrees (exits 1 on any FAIL)
+pj-admin --config ./pyjobby.conf.py doctor
 ```
 
 For local development, `make setup-db` (which runs
@@ -509,7 +526,12 @@ experimental `web_listen` per-worker web endpoints.)
 
 ```bash
 # Start job workers (pj is a flat command: no subcommands, no positional args)
+# --workers is PER --queue: this is 4 processes, all on `default`.
 pj --config ./pyjobby.conf.py --queue default --workers 4
+
+# Two queues, 4 workers on each = 8 processes. No worker ever lands on a
+# queue you did not name.
+pj --config ./pyjobby.conf.py --queue emails --queue billing --workers 4
 ```
 
 ### 4. Enqueue Jobs
@@ -625,14 +647,23 @@ await client.enqueue(
 )
 ```
 
-### High-Priority Jobs
+### Priority
 
 ```python
-# LOWER number = MORE urgent. Workers only claim jobs with
-# prio <= the worker's priority ceiling (default 1000).
-await client.enqueue("UrgentTask", priority=10)  # Most urgent
-await client.enqueue("NormalTask", priority=100)  # Normal (default)
-await client.enqueue("BackgroundTask", priority=500)  # Least urgent
+# Priority is a FINISHING POSITION, not a rating: the smaller number runs
+# sooner, the way `priority=1` means "first" in a race.
+await client.enqueue("UrgentTask", priority=10)  # runs first
+await client.enqueue("NormalTask", priority=100)  # the default
+await client.enqueue("BackgroundTask", priority=500)  # runs last
+
+# Each worker claims only prio <= its ceiling (`pj --max-prio`, default
+# 1000), so past the ceiling a bigger number means "never", not "later".
+# The client refuses those enqueues instead of writing an unclaimable row:
+await client.enqueue("Whenever", priority=5000)  # ValueError, nothing written
+
+# Really running less-urgent workers? Declare the ceiling on both sides:
+#   pj --queue backfill --max-prio 5000
+#   JobClient(pool, prio_ceiling=5000)
 ```
 
 ### Capability-Based Routing
@@ -666,9 +697,8 @@ await client.enqueue("TrainModel", capability="gpu", model="resnet50")
 
 ## 📝 Schema Notes
 
-- The original `jorb` timestamp columns (`created`, `updated`, `run_after`) are **naive timestamps interpreted as UTC**
-- Columns added by migrations (`started`, `finished`, `timeout_at`, and all `jorb_schedule` timestamps) are **`timestamptz`**
-- Keep this in mind when writing raw SQL queries that compare or join across the two kinds of columns
+- **Every** timestamp column in the schema is `TIMESTAMPTZ`, in every table — `created`, `updated`, `run_after`, `claimed_at`, `started`, `finished`, `timeout_at`, and all the schedule, step, history, mailbox, DAG and worker timestamps. There is no longer a naive/aware split to reason about when writing raw SQL.
+- Timestamp comparisons therefore happen in UTC regardless of the connecting session's `TimeZone`; a cron schedule's own timezone lives in `jorb_schedule.timezone` and is applied when computing `next_run`, not by the column type.
 
 ---
 

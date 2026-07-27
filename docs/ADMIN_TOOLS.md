@@ -82,20 +82,53 @@ Commands:
   status   Show applied vs pending schema migrations
 ```
 
-```console
-$ pj-admin db migrate
-Installing base schema (jorb table not found)
-Database schema is up to date
+`db migrate` handles **both** histories, and upgrading an existing database
+is one of them:
 
+* **A fresh database** gets `schema.sql` — the whole current schema, in one
+  file — and every shipped migration is then *recorded* without being run,
+  because `schema.sql` already contains their effects.
+* **An existing database** gets the numbered files in
+  `pyjobby/sql/migrations/` it has not recorded, oldest first, one
+  transaction per file. A database installed before the runner existed has
+  no `schema_migrations` table, which reads as "recorded nothing", so it
+  gets every migration — which is right, because it was installed from an
+  older revision of `schema.sql`.
+
+Same command either way, and it is idempotent. It is **safe to run from
+every host's deploy step simultaneously**: `migrate()` takes a session-level
+advisory lock, so one process installs or upgrades and the others wait and
+then find nothing to do. (A first install is not idempotent statement by
+statement — `CREATE TYPE jorbstate` has no `IF NOT EXISTS` — which is what
+the lock is there for.)
+
+`db status` on a database that is behind:
+
+```console
 $ pj-admin db status
 Base schema installed: yes
 Applied migrations:    none
-Pending migrations:    none
+Pending migrations:    [1, 2]
+Missing objects:       3
+  index jorb_dag_retention_idx
+  index jorb_schedule_log_retention_idx
+  index jorb_worker_retention_idx
 ```
 
-Idempotent, and the only supported way to install or upgrade. Run it from
-one place per deploy — it takes no lock, so two simultaneous fresh installs
-race. See
+`Missing objects` is the load-bearing line. `Pending migrations` can only
+say "this database has not *recorded* migration N", and a database that
+predates the runner records nothing at all while still being stale; the
+missing list is read out of the catalog and compared against the
+required-shape manifest in `pyjobby/migrations.py`. A healthy database
+prints `Missing objects:       none`.
+
+`db migrate` reports "applied" and "recorded" distinctly, because they are
+different events: a fresh install prints `Installed base schema` followed by
+`Recorded migrations [...] (already contained in the base schema)`, an
+upgrade prints `Applied migrations: [...]`, and a database already current
+prints `Database schema is up to date`.
+
+See
 [deployment-guide.md § The database](deployment-guide.md#the-database) for
 what it does and does not bring forward.
 
@@ -118,25 +151,75 @@ Options:
                              than this
 ```
 
-A healthy platform under load:
+A live platform, idle:
+
+```console
+$ pj-admin --dsn "$PYJOBBY_DSN" doctor
+PASS database: connected
+PASS schema: installed and complete; migrations [1, 2] are not recorded yet, which the next upgrade reads (run: pj-admin db migrate)
+PASS triggers: all schema triggers present (7)
+PASS notify-queue: 0.0% full
+WARN workers: no live workers seen in last 60s
+PASS job-threads: 0 live worker(s) claiming
+PASS queues: no queued jobs
+PASS dlq: empty
+PASS schedules: no overdue schedules
+$ echo $?
+0
+```
+
+### What the `schema` check actually checks
+
+It used to ask two questions — is `jorb` there, and does `schema_migrations`
+record something pending — and a database installed from an *older*
+`schema.sql` answers both the way a healthy one does: `jorb` exists, and it
+records nothing, so nothing is pending. `doctor` printed PASS and the next
+check died on `column "job_threads" does not exist`.
+
+So it now checks the **shape**: every table, column, view, function, index
+and enum label this release addresses, by name, read out of the catalog and
+compared against the manifest in `pyjobby/migrations.py` (which the test
+suite asserts equals a fresh install's catalog in both directions, so it
+cannot rot). Three verdicts:
+
+| Verdict | Line |
+|---|---|
+| FAIL | `base schema not installed (run: pj-admin db migrate)` |
+| FAIL | `installed, but N object(s) this release needs are missing: …` — up to five named, then a count |
+| PASS | `installed, migrations current (…)`, or `installed and complete; migrations […] are not recorded yet, which the next upgrade reads` |
+
+A stale schema, named:
 
 ```console
 $ pj-admin doctor
 PASS database: connected
-PASS schema: installed, migrations current (baseline)
-PASS triggers: all NOTIFY triggers present (3)
-PASS notify-queue: 0.0% full
-PASS workers: 4 live worker(s) seen in last 60s
-PASS job-threads: 4 live worker(s) claiming
-WARN queue pjbench_e2e_67f5e7c6: depth 10067, oldest queued 0m (thresholds: depth 10000, age 60m)
-PASS dlq: empty
-PASS schedules: no overdue schedules
+FAIL schema: installed, but 3 object(s) this release needs are missing: index jorb_dag_retention_idx, index jorb_schedule_log_retention_idx, index jorb_worker_retention_idx (run: pj-admin db migrate)
+$ echo $?
+1
 ```
 
-FAIL is reserved for "the platform cannot function" — no schema, pending
-migrations, missing NOTIFY triggers, a NOTIFY queue past half full — and is
-the only thing that changes the exit code. Lost capacity is a WARN. Which
-check means what, and what to do about each, is in
+Either FAIL ends the report there — every check below `schema` queries
+something it just reported missing, and a health report that crashes halfway
+through is worse than one that stops. `pj-admin db status` prints the full
+missing list.
+
+A schema that is complete but has *unrecorded* migrations — the third line
+in that table — is a **PASS**, not a FAIL: the shape check just proved every
+object those files install is already present, so the running code can
+address this database and only the bookkeeping is behind. Waking someone at
+3am over a missing row in `schema_migrations` is how a health probe teaches
+people to ignore it. It is still said out loud, because that record is what
+the *next* upgrade reads: until `db migrate` runs, a later release cannot
+tell this database from one that never applied the migration at all.
+
+Triggers get their own check for the same reason the shape does: nothing
+raises when one is missing, the platform just quietly stops waking waiters
+or recording history. All seven the schema installs are checked by name.
+
+FAIL is otherwise reserved for "the platform cannot function" — a missing
+trigger, a NOTIFY queue past half full — and is the only thing that changes
+the exit code. Lost capacity is a WARN. Which check means what, and what to
+do about each, is in
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md#start-with-doctor).
 
 Defaults are `--max-depth 10000` and `--max-age-minutes 60`. Age is the
@@ -625,7 +708,7 @@ api = AdminAPI(conn)
 
 crashed = await api.list_jobs(state="crashed", limit=10)
 for job in crashed:
-    await api.retry_job(job["id"])      # {"job_id": ..., "status": "requeued"}
+    await api.retry_job(job["id"])  # {"job_id": ..., "status": "requeued"}
 ```
 
 Method groups, all `async`:

@@ -47,12 +47,36 @@ authenticating proxy.
 pj-admin --dsn "$PYJOBBY_DSN" doctor [--max-depth 10000] [--max-age-minutes 60]
 ```
 
-Checks (FAIL exits nonzero; WARN does not): database reachable, schema
-installed and migrations current, NOTIFY triggers present, NOTIFY queue
-saturation, live workers seen in the last 60s, workers that are alive but
-claiming nothing, per-queue depth and oldest-job age, DLQ size, overdue
-schedules. Run it from cron/CI as a platform health probe; scrape
-`GET /metrics` on the web admin for Prometheus.
+Checks (FAIL exits nonzero; WARN does not): database reachable, the schema's
+**shape** against the manifest of objects this release addresses, all seven
+schema triggers present by name, NOTIFY queue saturation, live workers seen
+in the last 60s, workers that are alive but claiming nothing, per-queue
+depth and oldest-job age, DLQ size, overdue schedules. Run it from cron/CI
+as a platform health probe; scrape `GET /metrics` on the web admin for
+Prometheus.
+
+```console
+$ pj-admin --dsn "$PYJOBBY_DSN" doctor
+PASS database: connected
+PASS schema: installed and complete; migrations [1, 2] are not recorded yet, which the next upgrade reads (run: pj-admin db migrate)
+PASS triggers: all schema triggers present (7)
+PASS notify-queue: 0.0% full
+WARN workers: no live workers seen in last 60s
+PASS job-threads: 0 live worker(s) claiming
+PASS queues: no queued jobs
+PASS dlq: empty
+PASS schedules: no overdue schedules
+```
+
+A schema check that FAILs names what is absent and ends the report:
+
+```console
+FAIL schema: installed, but 3 object(s) this release needs are missing: index jorb_dag_retention_idx, index jorb_schedule_log_retention_idx, index jorb_worker_retention_idx (run: pj-admin db migrate)
+```
+
+`pj-admin db migrate` fixes both that and a database with no schema at all;
+`pj-admin db status` lists every missing object. Full reference:
+[ADMIN_TOOLS.md § doctor](ADMIN_TOOLS.md#doctor--the-health-entry-point).
 
 ## How execution works (what the states mean)
 
@@ -234,7 +258,9 @@ that happening quietly:
   pj --config ./pyjobby.conf.py --queue backfill --max-prio 5000
   ```
   ```python
-  client = JobClient(pool, prio_ceiling=5000)   # or JobClient.create(..., prio_ceiling=5000)
+  client = JobClient(
+      pool, prio_ceiling=5000
+  )  # or JobClient.create(..., prio_ceiling=5000)
   ```
 
   Both halves are required. Declaring it on the client alone gets the job

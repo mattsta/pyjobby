@@ -1,143 +1,112 @@
 # Pyjobby Documentation
 
-Comprehensive documentation for the pyjobby PostgreSQL-backed job queue system.
+Every document in `docs/`, what it answers, and when to reach for it.
+Nothing here is a summary of a document that does not exist: each entry
+below is a file you can open.
 
-## What's New
+## Where to start
 
-🎉 **Phase 1 Improvements** - Self-Healing and Fault Tolerance
+| If you want to… | Read |
+|---|---|
+| understand how the platform is shaped | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| get it running in production | [deployment-guide.md](deployment-guide.md) |
+| write your first job | [writing-jobs.md](writing-jobs.md) |
+| submit jobs from your application | [CLIENT_LIBRARY.md](CLIENT_LIBRARY.md) |
+| see whole applications, not snippets | [EXAMPLES.md](EXAMPLES.md) |
+| run and watch the fleet | [OPERATIONS.md](OPERATIONS.md) |
+| find out why something is broken | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
 
-Pyjobby now includes critical production-ready improvements:
+## The documents
 
-- ✅ **Fixed Retry Mechanism** - Jobs now retry correctly (critical bug fix)
-- ✅ **Worker Crash Recovery** - Automatic recovery of abandoned jobs on startup
-- ✅ **Job Timeout Protection** - Configurable per-job and system-wide timeouts
-- ✅ **Max Retry Limits** - Prevent infinite retry loops with permanent failure detection
-- ✅ **Enhanced Error Handling** - Detailed logging and monitoring support
-- ✅ **Recurring Scheduler** - Cron-based schedules executed by `pj-scheduler` (see [RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md))
-- ✅ **Realtime Websocket Dashboard** - Live event stream via `pj-ws` (see [WEBSOCKET_DASHBOARD.md](WEBSOCKET_DASHBOARD.md))
-- ✅ **One-Step Schema Install** - `pj-admin db migrate` installs the base schema and all migrations idempotently
+### Understanding it
 
-## Table of Contents
+1. **[ARCHITECTURE.md](ARCHITECTURE.md)** — the components, the life of a
+   job, why claiming lives in the database, the notification model, and
+   liveness/fencing/recovery.
+2. **[DXE.md](DXE.md)** — the Durable Execution Engine: checkpointed
+   `step()`, `transaction()`, durable `sleep()`, events and mailboxes, and
+   the invariant that a completed step never runs twice.
+3. **[SCALE.md](SCALE.md)** — every measured number, what breaks first at
+   1M jobs/hour, and the design decisions on the write path that were
+   rejected and why. All of it reproducible with `pj-bench`.
 
-### Getting Started
+### Building on it
 
-1. **[Architecture](ARCHITECTURE.md)** - Components, the life of a job, and why the system is shaped this way
-   - System architecture and design philosophy
-   - Component breakdown and relationships
-   - Data flow examples
-   - Scaling and distribution strategies
-   - Advanced features overview
+4. **[writing-jobs.md](writing-jobs.md)** — what goes *inside* one job:
+   `task()`, sync vs async vs generator, which durable primitive to reach
+   for, the determinism obligation, timeouts, retries, tags, and a
+   checklist for a new job class.
+5. **[CLIENT_LIBRARY.md](CLIENT_LIBRARY.md)** — the enqueue API in full:
+   `JobClient`, every `enqueue()` option, batches, pipelines,
+   fan-out/fan-in, deadline keys, priority and the worker ceiling.
+6. **[EXAMPLES.md](EXAMPLES.md)** — complete applications: accept-now/
+   work-later, an ETL pipeline, the transactional outbox, a rate-limited
+   third-party API, human-in-the-loop, batch import. Every complete example
+   is executed against a real worker by `tests/test_examples_doc.py`.
+7. **[RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md)** — cron schedules:
+   `pj-scheduler`, timezones and DST, and the five safety features
+   (circuit breaker, max concurrent, backpressure, jitter, deadline keys).
 
-2. **[Operations Runbook](OPERATIONS.md)** - What runs, how to check it, what to do when it breaks
-   - Process inventory and start commands
-   - Health checking (`pj-admin doctor`, `/metrics`)
-   - The job state machine (one row for life, epoch fencing, crashed = DLQ)
-   - Live queue controls
-   - Failure playbooks (dead host, hung job, flooding queue, DLQ triage)
+### Running it
 
-3. **[Testing Guide](TESTING.md)** - Running the suite, shared fixtures, and why coverage is a diagnostic
-   - How to run tests and point them at any database
-   - Reusable fixtures (`live_worker`, `wait_for_job_state`, shared job classes)
-   - Coverage baseline and the anti-goal (evidence from this repo's own history)
+8. **[deployment-guide.md](deployment-guide.md)** — install, the database,
+   configuration, the processes to run, systemd, containers, Kubernetes,
+   exposure, backup/restore and how to verify a deployment.
+9. **[OPERATIONS.md](OPERATIONS.md)** — the runbook: the process
+   inventory, `pj-admin doctor`, the state machine, timeouts, abandoned job
+   threads, live queue controls, priority and the worker ceiling,
+   retention, and the failure playbooks.
+10. **[ADMIN_TOOLS.md](ADMIN_TOOLS.md)** — the reference for *what exists*:
+    every `pj-admin` command with real output, `pj-web`, and the
+    `AdminAPI` Python interface.
+11. **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — the symptom index. Start
+    at `pj-admin doctor`, then jump to the entry for what you are seeing.
+12. **[WEBSOCKET_DASHBOARD.md](WEBSOCKET_DASHBOARD.md)** — `pj-ws` and
+    `frontend/live-dashboard.html`: live aggregates, per-job watches, and
+    the demand-gated channels behind them.
 
-4. **[Deployment Guide](deployment-guide.md)** - Production deployment and operations
-   - Quick start for development
-   - Production deployment checklist
-   - Docker and Kubernetes configurations
-   - Systemd service setup
-   - Monitoring and logging
-   - Security best practices
-   - Disaster recovery
+### Changing it
 
-### Core Components
+13. **[TESTING.md](TESTING.md)** — running the suite against any database,
+    the shared fixtures (`live_worker`, `wait_for_job_state`), and why
+    coverage is a diagnostic rather than a target.
+14. **[The schema itself](../pyjobby/sql/schema.sql)** — the canonical
+    source, commented end to end, including the measurements behind the
+    indexes and autovacuum settings.
 
-5. **[Operations](OPERATIONS.md)** - Running the fleet: queue controls, retention, timeouts, playbooks
-   - Class definition and initialization
-   - Key methods and their usage
-   - Database operations and prepared statements
-   - Worker-local caching
-   - Web server integration
-   - Real-world usage examples
-   - Performance tuning
-
-6. **[Writing Jobs](writing-jobs.md)** - Which durable primitive to reach for, and what each one guarantees
-   - Class interface and attributes
-   - Core methods (task, run, reschedule)
-   - Job lifecycle and state transitions
-   - Execution modes (sync, async, generator)
-   - Real-world job examples
-   - Advanced patterns
-   - Best practices
-
-7. **[The schema itself](../pyjobby/sql/schema.sql)** - The canonical source, commented end to end; see also [DXE.md](DXE.md) and [SCALE.md](SCALE.md)
-   - Complete column reference
-   - State machine and transitions
-   - Indexes and their purposes
-   - Job submission patterns
-   - Monitoring and maintenance queries
-   - Schema migration examples
-
-### Features
-
-8. **Configuration System** _(See sample.conf.py)_ - How to configure pyjobby
-   - Database connection parameters
-   - Web server configuration
-   - Custom application settings
-   - Environment-specific configs
-
-9. **Job Dependencies** _(Covered in [ARCHITECTURE.md](ARCHITECTURE.md))_ - waitfor_job and waitfor_group
-   - Single job dependencies
-   - Group dependencies (fan-out/fan-in)
-   - Complex workflow examples
-   - Best practices
-
-10. **Web Server Integration** _(`web_listen` in the worker config)_ - Direct HTTP job invocation
-   - Configuration and setup
-   - Job web() method
-   - Load balancing strategies
-   - Security considerations
-
-11. **Retry and Backoff** _(Covered in [writing-jobs.md](writing-jobs.md))_ - Automatic error handling
-   - Exponential backoff algorithm
-   - Custom retry logic
-   - Manual rescheduling
-
-### Operations
-
-12. **Best Practices** - Production-ready patterns
-    - Idempotent jobs
-    - Resource caching
-    - Error handling
-    - Security
-    - Performance optimization
-
-13. **Troubleshooting** - Common issues and solutions
-    - Worker not claiming jobs
-    - Jobs stuck in claimed/running state
-    - High error rates
-    - Database performance issues
-    - Memory leaks
+Configuration is not a separate document: `sample.conf.py` in the
+repository root is the annotated example, and
+[deployment-guide.md § Configuration](deployment-guide.md#configuration)
+covers which process reads what.
 
 ## Quick Reference
 
 ### Essential Files
 
-- `pyjobby/pj.py` - Core job system
-- `pyjobby/sql/schema.sql` - the canonical schema v1 (shipped in the wheel)
-- `pyjobby/sql/migrations/` - future incremental migrations (v1 is the baseline; `pj-admin db migrate` installs and tracks both)
+- `pyjobby/pj.py` - the worker: claiming, execution, state transitions
+- `pyjobby/client.py` - `JobClient`, the enqueue side
+- `pyjobby/sql/schema.sql` - the canonical schema, shipped in the wheel
+- `pyjobby/sql/migrations/` - the numbered migration files. `pj-admin db migrate` installs `schema.sql` on a fresh database (recording every migration as already contained in it) and applies unrecorded migrations to an existing one
+- `pyjobby/migrations.py` - the runner, plus the required-shape manifest `pj-admin doctor` checks a database against
 - `pyjobby/dxe.py` - Durable Execution Engine semantics and SQL
-- `pyjobby/monitor.py` - the reaper (timeouts, dead-worker reclaim)
+- `pyjobby/monitor.py` - the reaper (timeouts, dead-worker reclaim, retention)
 - `sample.conf.py` - Example configuration
 
 ### Common Commands
 
 ```bash
-# Install/upgrade the database schema (base schema + all migrations)
+# Install or upgrade the database schema (fresh install, or pending migrations)
 pj-admin db migrate --config ./pyjobby.conf.py
 pj-admin db status --config ./pyjobby.conf.py
 
-# Start workers
+# Is the platform healthy? (exits 1 on any FAIL, so it works as a CI gate)
+pj-admin --dsn "$PYJOBBY_DSN" doctor
+
+# Start workers: --workers is PER --queue, so this is 4 processes on `default`
 pj --queue default --workers 4 --config ./pyjobby.conf.py
+
+# Start the reaper: timeouts, dead-worker reclaim, retention. NOT optional.
+pj-monitor --config ./pyjobby.conf.py
 
 # Start the recurring (cron) schedule executor
 pj-scheduler --config ./pyjobby.conf.py
@@ -158,24 +127,20 @@ pj -v
 ### Job Submission Template
 
 ```python
-import asyncpg
-import orjson
+from pyjobby import JobClient
 
 
-async def submit_job(job_class: str, kwargs: dict):
-    conn = await asyncpg.connect(**db_params)
-    job_id = await conn.fetchval(
-        """
-        INSERT INTO jorb (job_class, kwargs, queue)
-        VALUES ($1, $2, $3)
-        RETURNING id
-    """,
-        job_class,
-        orjson.dumps(kwargs),
-        "default",
-    )
-    return job_id
+async def submit_job(job_class: str, **kwargs):
+    async with await JobClient.from_config("./pyjobby.conf.py") as client:
+        return await client.enqueue(job_class, queue="default", **kwargs)
 ```
+
+Enqueue through the client rather than with a hand-written `INSERT`: the
+client validates what the database cannot reject on its own — a `priority`
+above the worker fleet's ceiling, an unusable `on_timeout`, tag values that
+are not filterable — and a raw insert is the usual way an unclaimable row
+gets into the table. Full API:
+[CLIENT_LIBRARY.md](CLIENT_LIBRARY.md).
 
 ### Job Class Template
 
@@ -193,7 +158,8 @@ class MyJob(Job):
 ## Architecture at a Glance
 
 ```
-CLI (pj) → spawns workers (multiprocessing), each registers in jorb_worker
+CLI (pj) → spawns --workers processes on EACH --queue named
+           (multiprocessing), each registers in jorb_worker
     ↓
 Worker sleeps on LISTEN jorb_enqueued (poll is the fallback)
     ↓
@@ -234,7 +200,7 @@ jorb_history; pj-monitor reaps timeouts and jobs of dead workers
 | `id`              | Primary key                                                    |
 | `queue`           | Route jobs to specific workers                                 |
 | `state`           | Current status (queued → claimed → running → finished/crashed) |
-| `prio`            | Priority (lower = higher priority)                             |
+| `prio`            | Priority as a finishing position: the **smallest** number is claimed first, and each worker claims only `prio <=` its own ceiling (`pj --max-prio`, default 1000) |
 | `run_after`       | Minimum start time                                             |
 | `job_class`       | Python class path                                              |
 | `kwargs`          | Arguments (JSONB)                                              |
@@ -257,61 +223,46 @@ class SendEmail(Job):
         return {"sent": True}
 
 
-# 2. Start workers
+# 2. Start workers (2 processes, both on `email`)
 # $ pj --queue email --workers 2
 
 # 3. Submit job
-await db.execute("""
-    INSERT INTO jorb (job_class, kwargs, queue)
-    VALUES ('job.email.SendEmail',
-            '{"to": "user@example.com", "subject": "Hello"}',
-            'email')
-""")
+await client.enqueue(
+    "job.email.SendEmail",
+    queue="email",
+    to="user@example.com",
+    subject="Hello",
+)
 ```
 
 ### Job Pipeline with Dependencies
 
 ```python
-# 1. Parallel jobs with group dependency
-group_id = secrets.randbits(63)
+# Many units in parallel, then one job that runs when ALL of them finish.
+items = [{"file": f} for f in ("a.jpg", "b.jpg", "c.jpg")]
+job_ids, group_id = await client.create_fan_out("job.Thumbnail", items)
 
-# Create 3 parallel jobs (all in same group)
-for job in ["Hash", "Thumbnail", "EXIF"]:
-    await db.execute(
-        """
-        INSERT INTO jorb (job_class, kwargs, run_group)
-        VALUES ($1, $2, $3)
-    """,
-        f"job.{job}",
-        '{"file": "/tmp/upload.jpg"}',
-        group_id,
-    )
+await client.enqueue("job.Aggregate", waitfor_group=group_id, expected=len(items))
 
-# Create aggregator (waits for all 3 to finish)
-await db.execute(
-    """
-    INSERT INTO jorb (job_class, kwargs, state, waitfor_group)
-    VALUES ($1, $2, $3, $4)
-""",
-    "job.Aggregate",
-    "{}",
-    "waiting",
-    group_id,
-)
-
-# Execution: Hash, Thumbnail, EXIF run in parallel
-#            → When ALL finish, Aggregate runs
+# Execution: every Thumbnail runs in parallel
+#            → when ALL of them finish, Aggregate runs
 ```
+
+More of these, executed against a real worker on every test run:
+[EXAMPLES.md](EXAMPLES.md).
 
 ## Performance Characteristics
 
-| Metric                  | Typical Value               |
-| ----------------------- | --------------------------- |
-| Job claiming latency    | <1ms                        |
-| Polling interval        | 5-6 seconds                 |
-| Throughput (small jobs) | 100-500 jobs/sec per worker |
-| Throughput (large jobs) | Limited by job duration     |
-| Database bottleneck     | ~1000 jobs/sec aggregate    |
+Measured, not estimated, and all of it in one place:
+**[SCALE.md](SCALE.md)** — what one job costs, what breaks first, sizing
+per million jobs, and the reproduction commands (`pj-bench`) for every
+figure. It is the only set of numbers in this documentation, deliberately:
+a second copy here would drift away from the benchmarks that produce them.
+
+The two facts worth carrying out of it: enqueue is **not** the bottleneck
+(measured throughput has roughly two orders of magnitude of headroom over
+1M jobs/hour), and what breaks first is anything that has to read or retain
+the *accumulated* table — which is what retention exists for.
 
 ## Design Trade-offs
 
@@ -319,15 +270,17 @@ await db.execute(
 
 **What we sacrificed**:
 
-- 5-6 second polling (not instant job start)
 - Every state change writes to WAL
 - FOR UPDATE SKIP LOCKED (not advisory locks)
 
+Note that polling is *not* on that list: enqueue fires a `NOTIFY` and an
+idle worker wakes immediately. `--check-interval` (5 s, jittered) is the
+fallback for a missed wakeup, not the normal path.
+
 **What we gained**:
 
-- <1000 lines of code
-- No complex pub/sub coordination
-- Easy to understand and debug
+- No pub/sub coordination outside the database
+- One place to look when something is wrong: the tables
 - Predictable behavior
 
 ### Chosen: PostgreSQL over Message Broker
@@ -335,38 +288,39 @@ await db.execute(
 **What we sacrificed**:
 
 - Peak throughput vs Redis/RabbitMQ
-- Real-time job execution
 
 **What we gained**:
 
 - One dependency instead of two
 - Durable by default
 - Observable with SQL
-- ACID guarantees
+- ACID guarantees, including enqueue-inside-your-own-transaction
 
 ## When to Use Pyjobby
 
 **Good fit**:
 
 - Applications already using PostgreSQL
-- Job volumes <1000/second
-- Need for durable job state
-- Teams valuing simplicity
+- Need for durable job state, resumable work, or an audit trail
+- Work that must not be lost, and must not run twice
 - Mixed sync/async workloads
 
 **Not ideal for**:
 
-- Ultra-high throughput (millions of tiny jobs/second)
-- Real-time requirements (<1 second latency)
+- Ultra-high throughput (millions of tiny jobs/second) — see
+  [SCALE.md](SCALE.md) for where the real ceilings are
+- Sub-millisecond dispatch latency
 - Complex workflow orchestration (use Airflow/Prefect)
 
 ## Contributing
 
-Pyjobby aims to stay under 1,000 lines in `pyjobby/pj.py`. When adding features, consider:
+When adding features, consider:
 
 1. **Is this feature essential?** (Avoid feature creep)
 2. **Can it be implemented in user code?** (Prefer extensibility)
 3. **Does it maintain simplicity?** (Code golf is not the goal, clarity is)
+4. **Is it proved by a test against a real database?** See
+   [TESTING.md](TESTING.md).
 
 ## Support
 
@@ -389,34 +343,28 @@ Inspired by:
 - Celery (Python) - Distributed task queue
 - Good Queue (Go) - PostgreSQL queue implementation
 
-## Version History
+## Version
 
-- **v1.1.0** (2025-01-XX): Phase 1 - Self-Healing and Fault Tolerance
-  - **CRITICAL FIX**: Retry mechanism now works correctly (jobs were stuck in 'crashed')
-  - Worker crash recovery - automatic requeue of abandoned jobs on startup
-  - Job timeout protection with configurable per-job and system-wide timeouts
-  - Max retry limits to prevent infinite retry loops
-  - Enhanced error handling with detailed logging
-  - Complete audit trail via separate retry jobs
-  - New configuration options: `max_retries`, `default_timeout`, `enable_recovery`
-  - 100% backward compatible - existing jobs work without modification
+The version is declared once, in `pyproject.toml`, and the installed one is
+what `pj -v` prints:
 
-- **v1.0.0** (2025-01-XX): Initial release
-  - Core job system (<1000 lines)
-  - PostgreSQL-backed persistence
-  - Multiprocessing workers
-  - Dependencies (waitfor_job, waitfor_group)
-  - Priority queues
-  - Automatic retry with backoff
-  - Web server integration
-  - Type-safe (mypy strict)
+```bash
+pj -v
+```
+
+There is no hand-maintained changelog here — `git log` is the record, and a
+second copy of it in this file would only tell you what was true when
+someone last remembered to update it.
 
 ## Next Steps
 
-1. Read [Architecture](ARCHITECTURE.md) for system design
-2. Follow [Deployment Guide](deployment-guide.md) to get started
-3. Study [Writing Jobs](writing-jobs.md) to write your first job
-4. Review [Client Library](CLIENT_LIBRARY.md) for job submission
-5. Check [DXE.md](DXE.md) for durable execution: checkpoints, fencing, exactly-once
+1. Read [ARCHITECTURE.md](ARCHITECTURE.md) for system design
+2. Follow [deployment-guide.md](deployment-guide.md) to get it running
+3. Study [writing-jobs.md](writing-jobs.md) to write your first job
+4. Review [CLIENT_LIBRARY.md](CLIENT_LIBRARY.md) for job submission
+5. Work through [EXAMPLES.md](EXAMPLES.md) for whole applications
+6. Check [DXE.md](DXE.md) for durable execution: checkpoints, fencing, exactly-once
+7. Keep [ADMIN_TOOLS.md](ADMIN_TOOLS.md) and
+   [TROUBLESHOOTING.md](TROUBLESHOOTING.md) open once it is running
 
 Happy job processing! 🚀

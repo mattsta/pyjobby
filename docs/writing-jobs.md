@@ -66,6 +66,7 @@ class StreamBatches(Job):
         for i in range(count):
             yield {"batch": i}
 
+
 # result == [{"batch": 0}, {"batch": 1}, {"batch": 2}]
 ```
 
@@ -121,7 +122,7 @@ class ResizeImage(Job):
 
 
 job_id = await ResizeImage.enqueue(client, queue=..., url="s3://bucket/a.png", width=64)
-await ResizeImage.enqueue(client, widht=64)      # TypeError, before any INSERT
+await ResizeImage.enqueue(client, widht=64)  # TypeError, before any INSERT
 ```
 
 `enqueue_handle(...)` returns a `JobHandle` you can wait on, cancel, or read
@@ -131,7 +132,7 @@ enqueue is refused rather than silently enqueueing the parent's class.
 A plain function can be decorated too, and becomes a Job subclass:
 
 ```python
-@job                                  # fragment: registration shape only
+@job  # fragment: registration shape only
 async def resize_image(url: str, width: int = 128) -> dict: ...
 ```
 
@@ -221,9 +222,9 @@ and a crash in between re-runs `fn`. That window is inherent for work outside
 this database, so **make the effect idempotent yourself**:
 
 ```python
-async def charge(self, order_id: int, cents: int) -> dict:   # fragment
+async def charge(self, order_id: int, cents: int) -> dict:  # fragment
     return await payments.charge(
-        idempotency_key=f"order-{order_id}",   # the provider dedupes the retry
+        idempotency_key=f"order-{order_id}",  # the provider dedupes the retry
         cents=cents,
     )
 ```
