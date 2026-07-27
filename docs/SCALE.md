@@ -455,6 +455,43 @@ do not use it, while the rollup charged every transition in a queue whether
 anyone read the counter or not. **That is the test to apply to the next
 proposal: not "is it cheap", but "who pays when it is unused".**
 
+### A column and a doubly-partial index for the scheduler: accepted
+
+The scheduler's `max_concurrent_jobs` check filtered `admin_data->>'schedule_id'`
+with no index serving it — a sequential scan of `jorb` on every firing, growing
+with the table rather than with the schedule's own load.
+
+It became a real `jorb.schedule_id` column rather than an expression index,
+measured the same way tags was — nine interleaved A/B pairs on two identically
+installed databases:
+
+| enqueue | jobs/s (median of 9) |
+|---|---|
+| without the column and index | 27,941 |
+| with them | 28,010 |
+
+1.002×, against a within-run spread of 10–33%. No difference, which is the
+argument.
+
+**The predicate is doubly partial, and the second clause is the load-bearing
+one:**
+
+```sql
+WHERE schedule_id IS NOT NULL
+  AND state IN ('queued', 'claimed', 'running', 'waiting')
+```
+
+`IS NOT NULL` alone would have been used, would have reported no sequential
+scan, and would have handed the check **every job the schedule had ever
+created** — about 525,000 a year for a minutely schedule — to count and
+discard. An index scan that discards every row costs what a scan costs. The
+live-state clause bounds the index by in-flight work, which
+`max_concurrent_jobs` itself bounds.
+
+Gated as `schedule_concurrency` in `pj-bench plans` with a discard budget of
+**zero**, because that is the property worth defending rather than the access
+method.
+
 ### Recounting for counters: rejected, and it is a correctness bug
 
 A counter derived by recounting rows (`COUNT(*) FROM jorb_history WHERE

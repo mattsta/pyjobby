@@ -349,6 +349,7 @@ class TestSubcommandsEmitDocumentedJson:
         assert set(payload["queries"]) == {
             "claim",
             "concurrency_cap",
+            "schedule_concurrency",
             "metrics_completions",
             "metrics_arrivals",
             # every sweep, in both the caught-up and the full-backlog state

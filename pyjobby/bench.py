@@ -117,6 +117,7 @@ from .cli import (
 from .configloader import load_config_from_file
 from .monitor import TERMINAL_STATES
 from .pj import STMTS, Job, JobSystem
+from .scheduler import CONCURRENCY_COUNT_SQL
 
 DEFAULT_CONFIG = "./pyjobby.conf.py"
 
@@ -2174,6 +2175,17 @@ def hot_queries() -> tuple[HotQuery, ...]:
             # That is the cost of the count being per-queue, and it is bounded
             # by work in flight everywhere, never by the size of jorb.
             max_rows_removed=PLAN_IN_FLIGHT_BUDGET,
+        ),
+        HotQuery(
+            "schedule_concurrency",
+            "the scheduler's max_concurrent_jobs count, once per firing",
+            CONCURRENCY_COUNT_SQL,
+            # Zero discards is the whole point of this one. Its index is
+            # partial on the LIVE states as well as on schedule_id -- without
+            # that second clause it still reports no seq scan while counting
+            # and discarding every job the schedule has ever created.
+            lambda queue: [1],
+            max_rows_removed=0,
         ),
         HotQuery(
             "metrics_completions",
