@@ -35,7 +35,11 @@ PYTEST_ARGS=()
 for arg in "$@"; do
     case $arg in
         --fast)
-            PYTEST_ARGS+=(-m "not slow and not concurrency")
+            # pytest's -m is single-valued, so this REPLACES the "not performance"
+            # filter in pyproject's addopts rather than narrowing it. Repeat it
+            # here or --fast silently re-enables throughput assertions, which
+            # measure the machine rather than the code.
+            PYTEST_ARGS+=(-m "not slow and not concurrency and not performance")
             ;;
         --parallel)
             PYTEST_ARGS+=(-n auto)

@@ -33,13 +33,13 @@ import pytest_asyncio
 from aiohttp import web
 from aiohttp.test_utils import TestClient
 
+from pyjobby.procs import wait_until
 from pyjobby.websocket_server import (
     MAX_CHANNEL_NAME_LENGTH,
     MAX_ERROR_MESSAGE_LENGTH,
     MAX_MESSAGE_LENGTH,
     WebSocketServer,
 )
-from tests.utils.processes import wait_until
 
 # =============================================================================
 # Harness

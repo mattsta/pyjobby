@@ -34,6 +34,7 @@ import pytest
 from pyjobby import db
 from pyjobby.monitor import sweep_dead_workers, sweep_timed_out_jobs
 from pyjobby.pj import STMTS, Job
+from pyjobby.procs import wait_until
 
 from .conftest import wait_for_job_state
 from .utils.faults import (
@@ -43,7 +44,6 @@ from .utils.faults import (
     ensure_effects_table,
     record_effect,
 )
-from .utils.processes import wait_until
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.concurrency]
 

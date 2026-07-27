@@ -45,8 +45,8 @@ from pyjobby.monitor import (
     sweep_unregistered_claims,
 )
 from pyjobby.pj import STMTS
+from pyjobby.procs import dsn_from
 from tests.conftest import wait_for_job_state
-from tests.utils.processes import dsn_from
 
 pytestmark = pytest.mark.asyncio
 

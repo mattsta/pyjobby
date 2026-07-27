@@ -1295,11 +1295,11 @@ async def _e2e_round(
     """Enqueue, run real ``pj`` workers, and measure what came out.
 
     Deliberately uses the console script and a process group kill (the
-    helpers in tests/utils/processes.py), not an in-process JobSystem: a
+    helpers in pyjobby/procs.py), not an in-process JobSystem: a
     worker that only ever runs inside the benchmark's own event loop is not
     the thing an operator deploys.
     """
-    from tests.utils.processes import spawn, terminate, wait_until
+    from pyjobby.procs import spawn, terminate, wait_until
 
     await conn.execute("DELETE FROM jorb WHERE queue = $1", queue)
     await conn.execute(ENQUEUE_SQL, BENCH_JOB_CLASS, queue, jobs)

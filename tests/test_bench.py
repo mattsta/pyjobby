@@ -31,7 +31,7 @@ import pytest
 from click.testing import CliRunner
 
 from pyjobby import bench
-from tests.utils.processes import dsn_from, spawn, terminate, wait_until
+from pyjobby.procs import dsn_from, spawn, terminate, wait_until
 
 #: Enough rows that the planner has a real choice. Below this a sequential
 #: scan is the genuinely correct plan and the gate would pass for the wrong

@@ -31,6 +31,7 @@ import pytest
 from pyjobby import db
 from pyjobby.monitor import sweep_dead_workers, sweep_unregistered_claims
 from pyjobby.pj import STMTS, Job
+from pyjobby.procs import spawn, terminate, wait_until
 
 from .conftest import wait_for_job_state
 from .utils.faults import (
@@ -46,7 +47,6 @@ from .utils.faults import (
     sigkill_group,
     write_worker_config,
 )
-from .utils.processes import spawn, terminate, wait_until
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 

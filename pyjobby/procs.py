@@ -1,4 +1,10 @@
-"""Launch real pyjobby daemons in tests and reap them completely.
+"""Launch real pyjobby daemons and reap them completely.
+
+Part of the package rather than the test tree because `pj-bench e2e` needs
+it too: a benchmark that measures end-to-end latency has to drive real
+worker processes, and importing test helpers from shipped code meant
+`pj-bench e2e` raised ModuleNotFoundError for anyone who installed pyjobby
+instead of cloning it -- the wheel does not package tests/.
 
 A console script that parses ``--help`` proves nothing: this platform has
 shipped a 97%-covered scheduler with no entry point and a 99%-covered

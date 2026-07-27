@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 import aiohttp
 import pytest
 
-from .utils.processes import daemon, dsn_from, free_port, port_is_open, wait_until
+from pyjobby.procs import daemon, dsn_from, free_port, port_is_open, wait_until
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -494,7 +494,7 @@ async def run_to_completion(*args: str, timeout: float = 30):
     import subprocess
     import sys
 
-    from .utils.processes import REPO_ROOT
+    from pyjobby.procs import REPO_ROOT
 
     bin_dir = os.path.join(REPO_ROOT, ".venv", "bin")
     executable = os.path.join(bin_dir, args[0])
