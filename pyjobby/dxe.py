@@ -131,15 +131,28 @@ RECORD_STEP_SQL = """INSERT INTO jorb_step
                 finished = EXCLUDED.finished
         RETURNING step_seq"""
 
+# Fenced like every other state-changing write. Without this a superseded
+# execution could overwrite the events a live attempt has published -- and an
+# event is read by other jobs and by clients, so the stale value does not stay
+# inside the zombie.
 SET_EVENT_SQL = """INSERT INTO jorb_event (job_id, key, value)
-        VALUES ($1, $2, $3)
+        SELECT $1, $2, $3
+        WHERE EXISTS (SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $4)
         ON CONFLICT (job_id, key) DO UPDATE
-            SET value = EXCLUDED.value, updated = now()"""
+            SET value = EXCLUDED.value, updated = now()
+        RETURNING key"""
 
 GET_EVENT_SQL = """SELECT value FROM jorb_event WHERE job_id = $1 AND key = $2"""
 
+# Fenced on the SENDER, not the destination: the question is whether this
+# execution is still entitled to act. Unfenced, a zombie delivered the message
+# and only then raised on its own checkpoint -- the effect escaping while the
+# record of it was refused, which is the one ordering a durable mailbox must
+# not have.
 SEND_SQL = """INSERT INTO jorb_mailbox (dest_job_id, topic, message)
-        VALUES ($1, $2, $3) RETURNING id"""
+        SELECT $1, $2, $3
+        WHERE EXISTS (SELECT 1 FROM jorb WHERE id = $4 AND run_epoch = $5)
+        RETURNING id"""
 
 # Consume exactly one pending message (oldest first) for this job/topic.
 RECV_SQL = """UPDATE jorb_mailbox

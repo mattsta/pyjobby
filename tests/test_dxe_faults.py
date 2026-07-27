@@ -525,7 +525,7 @@ async def test_unregistered_claim_is_reclaimed_only_after_the_grace_period(
 #: testable rather than aspirational.
 EPOCH_FENCED = ("run", "set-timeout", "finished", "retry", "crashed", "cancelled")
 
-STALE_WRITE_CASES = (*EPOCH_FENCED, "record-step")
+STALE_WRITE_CASES = (*EPOCH_FENCED, "record-step", "set-event", "send")
 
 
 async def apply_fenced_statement(pool, name: str, job_id: int, epoch: int) -> int:
@@ -564,6 +564,17 @@ async def apply_fenced_statement(pool, name: str, job_id: int, epoch: int) -> in
             STMTS[name], job_id, 1, "stale-step", {"v": 1}, None, epoch, db.utcnow()
         )
         return len(rows)
+    if name == "set-event":
+        rows = await pool.fetch(STMTS[name], job_id, "stale-key", {"v": 1}, epoch)
+        return len(rows)
+    if name == "send":
+        # fenced on the SENDER, so the job sends to itself: one row is enough
+        # to prove the write happened, and self-delivery keeps the case from
+        # needing a second job whose own epoch would confuse the assertion.
+        rows = await pool.fetch(
+            STMTS[name], job_id, "stale-topic", {"v": 1}, job_id, epoch
+        )
+        return len(rows)
     raise AssertionError(f"unhandled statement {name}")
 
 
@@ -588,6 +599,12 @@ async def test_every_state_changing_statement_carries_the_fence():
         EPOCH_FENCED
     )
     assert "AND run_epoch = $6" in STMTS["record-step"]
+    # set-event and send were the last two DXE writes with no fence at all: a
+    # superseded worker could overwrite a live attempt's published events, and
+    # could deliver a mailbox message and only THEN raise on its own
+    # checkpoint -- the effect escaping while the record of it was refused.
+    assert "run_epoch = $4" in STMTS["set-event"]
+    assert "run_epoch = $5" in STMTS["send"]
 
 
 @pytest.mark.parametrize("statement", STALE_WRITE_CASES)

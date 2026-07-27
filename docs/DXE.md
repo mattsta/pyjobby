@@ -103,6 +103,16 @@ A retry therefore fast-forwards through the completed prefix at the cost of one
 query and a dict lookup per step, then does real work only from the point of
 failure onward.
 
+**A recorded `NULL` output is a real answer, not a missing one.** The second row
+of that table means what it says: `error IS NULL` returns the recorded `output`
+even when that output is `NULL`. This matters most for a `recv()` that timed
+out — it checkpoints its empty-handed result unconditionally, so on every later
+replay that call site returns `None` forever, even if the message arrived a
+millisecond after the timeout expired. That is required for determinism, not an
+oversight, and the message is not lost: a *later* `recv()`, at a new sequence
+number, still picks it up. Write the retry loop as a new call, never as a
+re-entry into the same one.
+
 **A failed step is deliberately not a cached result.** Recording the failure
 buys observability (`pj-admin jobs steps <id>` shows exactly which step failed
 and why) without making a transient error permanent.
@@ -404,8 +414,12 @@ step the old attempts completed.
 2. **A job keeps one row for its entire life.** Retries requeue it;
    `jorb_history` is the per-attempt audit trail.
 3. **`run_epoch` only increases**, and a write at a stale epoch is a no-op.
-4. **A superseded execution cannot write** a result, a checkpoint, a timeout,
-   or a reschedule.
+4. **A superseded execution cannot write** — a result, a checkpoint, a timeout,
+   a reschedule, a published event, or a mailbox message. The list is every
+   durable write there is; a new one that skips the fence is caught by
+   `test_every_state_changing_statement_carries_the_fence`. `send` is fenced on
+   the **sender's** epoch, not the destination's: the question is whether this
+   execution is still entitled to act.
 5. **The step sequence is deterministic**, or `NondeterminismError` is raised
    before anything runs.
 6. **A step's result is JSON-serializable**, or it cannot be checkpointed.

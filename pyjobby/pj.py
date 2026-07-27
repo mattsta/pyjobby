@@ -1733,7 +1733,13 @@ class Job:
         """Publish a key/value event on this job (idempotent upsert).
         Clients and other jobs read it with get_event; waiters are woken
         via NOTIFY."""
-        await self.s.ex("set-event", self.job["id"], key, value)
+        applied = await self.s.ex(
+            "set-event", self.job["id"], key, value, self._dxe_epoch
+        )
+        if not applied:
+            raise dxe.StaleExecutionError(
+                f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
+            )
 
     async def send(
         self, dest_job_id: int, message: Any, topic: str | None = None
@@ -1742,8 +1748,19 @@ class Job:
         across retries (the send is a checkpointed step)."""
 
         async def _do_send() -> int | None:
-            rows = await self.s.ex("send", dest_job_id, topic, message)
-            return rows[0]["id"] if rows else None
+            rows = await self.s.ex(
+                "send",
+                dest_job_id,
+                topic,
+                message,
+                self.job["id"],
+                self._dxe_epoch,
+            )
+            if not rows:
+                raise dxe.StaleExecutionError(
+                    f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
+                )
+            return int(rows[0]["id"])
 
         await self.step(f"dxe.send:{dest_job_id}:{topic or ''}", _do_send)
 
