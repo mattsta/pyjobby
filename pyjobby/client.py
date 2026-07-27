@@ -1467,12 +1467,22 @@ class JobClient:
             value = row["value"] if row is not None else None
             if value is not None and (accept is None or accept(value)):
                 return value
+            job_state = row["job_state"] if row is not None else None
             # Terminal without a match: nothing will publish this key again.
-            if row is not None and row["job_state"] in _TERMINAL_JOB_STATES:
+            if job_state in _TERMINAL_JOB_STATES:
                 raise JobError(
-                    f"job {job_id} ended in {row['job_state']!r} without "
+                    f"job {job_id} ended in {job_state!r} without "
                     f"event {key!r} reaching an accepted value "
                     f"(last: {value!r})"
+                )
+            # No row at all — a bad id, or retention removed the job. Nothing
+            # will ever publish, so waiting the full timeout only delays the
+            # same answer. The event value comes from the same snapshot, so a
+            # job cannot look absent while its event is still readable.
+            if job_state is None:
+                raise JobError(
+                    f"job {job_id} does not exist, so event {key!r} will "
+                    f"never be published"
                 )
             return _PENDING
 

@@ -22,6 +22,7 @@ import re
 
 import pytest
 
+from pyjobby import dxe
 from pyjobby.lifecycle import TERMINAL_STATES
 from pyjobby.monitor import (
     DELETE_MAILBOX_SQL,
@@ -895,3 +896,94 @@ class TestCascadeIndexes:
             f"cascade delete would sequentially scan: {unindexed} "
             "— add an index on the referencing column"
         )
+
+
+class TestCompactionPlan:
+    """`compact()` is issued by every long-lived job, on every turn.
+
+    It deletes one job's checkpoints out of a `jorb_step` that holds every
+    other job's too. The whole point of the primitive is to keep a job that
+    lives indefinitely from getting slower, so a compaction that scans
+    `jorb_step` would defeat itself: the table it scans is the one that grows
+    with the fleet, and the cost would return by a different route than the
+    one that was closed.
+
+    Runs `dxe.COMPACT_STEPS_SQL` itself, rolled back, rather than a copy —
+    a gate reading a duplicate certifies a statement nobody executes as soon
+    as the two drift.
+    """
+
+    STEP_EVERY = 3
+    STEPS_PER_JOB = 3
+
+    async def seed(self, pool, queue: str) -> tuple[int, int]:
+        """Fill jorb_step for many jobs; return (job to compact, its epoch)."""
+        await seed_terminal_jobs(pool, queue)
+        await pool.execute(
+            """
+            INSERT INTO jorb_step (job_id, step_seq, name, output, run_epoch)
+            SELECT j.id, s, 'machine.transition', '{}', j.run_epoch
+              FROM jorb j, generate_series(1, $3) s
+             WHERE j.queue = $1 AND j.id % $2 = 0
+            """,
+            queue,
+            self.STEP_EVERY,
+            self.STEPS_PER_JOB,
+        )
+        await settle(pool)
+        await pool.execute("ANALYZE jorb_step")
+        row = await pool.fetchrow(
+            """SELECT j.id, j.run_epoch FROM jorb j
+                WHERE EXISTS (SELECT 1 FROM jorb_step s WHERE s.job_id = j.id)
+                ORDER BY j.id LIMIT 1"""
+        )
+        return int(row["id"]), int(row["run_epoch"])
+
+    async def test_compaction_finds_one_jobs_checkpoints_by_index(
+        self, db_pool, unique_queue
+    ):
+        """It must reach this job's rows through `jorb_step_pkey`.
+
+        The epoch passed is the job's real one, or the fence matches nothing,
+        the DELETE is never executed, and the plan being asserted on is one
+        that did no work — which would pass every check while proving nothing.
+        """
+        job_id, epoch = await self.seed(db_pool, unique_queue)
+        total = await db_pool.fetchval("SELECT count(*) FROM jorb_step")
+        assert total > 1000, f"only {total} steps seeded; a scan would be cheap"
+
+        plan = await explain_rolled_back(db_pool, dxe.COMPACT_STEPS_SQL, job_id, epoch)
+
+        assert "Seq Scan on jorb_step" not in plan, plan
+        assert "jorb_step_pkey" in plan, plan
+        # It really ran: the statement reports the rows it removed, so a
+        # fenced-out no-op cannot masquerade as a well-planned delete.
+        assert f"actual rows={self.STEPS_PER_JOB}" in plan, plan
+
+    async def test_compaction_of_a_job_with_no_checkpoints_is_just_as_cheap(
+        self, db_pool, unique_queue
+    ):
+        """The common case for a long-lived job: an already-empty log.
+
+        The loop calls `compact()` every turn, so most calls have nothing to
+        remove. That call must not be the expensive one — and "nothing to
+        remove" is exactly the shape that tempts a planner into a scan,
+        because there is no row for a LIMIT to stop early on.
+        """
+        await self.seed(db_pool, unique_queue)
+        row = await db_pool.fetchrow(
+            """SELECT j.id, j.run_epoch FROM jorb j
+                WHERE j.queue = $1
+                  AND NOT EXISTS (SELECT 1 FROM jorb_step s WHERE s.job_id = j.id)
+                LIMIT 1""",
+            unique_queue,
+        )
+        assert row is not None
+
+        plan = await explain_rolled_back(
+            db_pool, dxe.COMPACT_STEPS_SQL, row["id"], row["run_epoch"]
+        )
+
+        assert "Seq Scan on jorb_step" not in plan, plan
+        assert "jorb_step_pkey" in plan, plan
+        await assert_reads_far_less_than_a_scan(db_pool, plan, "jorb_step")

@@ -18,7 +18,13 @@ from __future__ import annotations
 
 import pytest
 
-from pyjobby.client import JobClient, MachineHandle, UnhandledEventError
+from pyjobby.client import (
+    JobClient,
+    JobError,
+    MachineHandle,
+    SyncMachine,
+    UnhandledEventError,
+)
 from pyjobby.fsm import EVENT_FIELD, EVENT_TOPIC, STATE_KEY
 
 from .machine_jobs import OrderMachine, QuietMachine
@@ -228,3 +234,80 @@ async def test_the_handle_uses_the_declarations_topic_and_keys(
         STATE_KEY,
     )
     assert published == STATE_KEY
+
+
+# =========================================================================
+# The blocking facade
+# =========================================================================
+
+
+def test_sync_machine_drives_a_machine_from_plain_code(db_params, unique_queue):
+    """`SyncMachine` is the whole async surface, blocking, for scripts.
+
+    Runs on `SyncJobClient`'s own event loop with no worker: the assertions
+    are that every method is really wired to its async twin and returns the
+    right type. Whether a machine *runs* is settled by the async tests; what
+    is settled here is that a script author gets the same API, since the
+    methods are written out by hand and a missed one would only ever fail at
+    the call site.
+    """
+    from pyjobby.client import SyncJobClient
+
+    with SyncJobClient(**db_params) as client:
+        order = client.start_machine(OrderMachine, queue=unique_queue)
+
+        assert isinstance(order.id, int)
+        # Local, from the declaration — no worker needed for these.
+        assert "awaiting_payment --> packing: paid / charge" in order.diagram()
+
+        # The machine has not been claimed, so nothing has published a state
+        # yet; asking with a short timeout must time out rather than hang.
+        with pytest.raises(TimeoutError):
+            order.state(timeout=1)
+
+        # An event still goes into the mailbox (no state to check against).
+        assert isinstance(order.send("paid", check=False, amount=5), int)
+        assert order.history() == []
+
+        assert client.machine(order.id, OrderMachine).id == order.id
+        assert order.cancel() == "cancelled"
+
+
+def test_the_sync_facade_mirrors_every_async_method():
+    """`SyncMachine` is written out by hand, so it can fall behind.
+
+    A method added to `MachineHandle` and not mirrored is invisible until a
+    script author calls it, and scripts are exactly the callers least likely
+    to be covered by tests. This compares the two surfaces directly, which is
+    deliberate metaprogramming over the class dictionaries rather than a list
+    someone has to remember to update.
+    """
+    public = {
+        name
+        for name, value in vars(MachineHandle).items()
+        if not name.startswith("_") and callable(value)
+    }
+    mirrored = {
+        name
+        for name, value in vars(SyncMachine).items()
+        if not name.startswith("_") and callable(value)
+    }
+    assert public, "expected MachineHandle to expose methods"
+    missing = sorted(public - mirrored)
+    assert not missing, (
+        f"SyncMachine does not mirror {missing}; a script author calling one "
+        f"of those gets an AttributeError at the call site"
+    )
+
+
+async def test_waiting_on_a_job_that_does_not_exist_fails_fast(client):
+    """A bad id, or one retention has already removed, must not hang.
+
+    Nothing will ever publish, so waiting the full timeout only delays the
+    same answer — and a caller that passed no timeout would wait forever. The
+    event and the job's state come from one snapshot, so the job cannot look
+    absent while its event is still readable.
+    """
+    ghost = client.machine(2_000_000_000, OrderMachine)
+    with pytest.raises(JobError, match="does not exist"):
+        await ghost.wait_for_state("shipped", timeout=30)

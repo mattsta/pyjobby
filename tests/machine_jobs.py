@@ -104,3 +104,48 @@ class IdleMachine(StateMachineJob):
     transitions = {"waiting": {"impossible": "never"}}
     wait_seconds = 0.25
     idle_seconds = 0.25
+
+
+class ObservedMachine(StateMachineJob):
+    """Overrides both hooks, recording each call as a durable event.
+
+    The hooks are the machine's only extension points that are NOT steps, and
+    the difference matters: `on_transition` re-runs on replay by design, so a
+    subclass that puts an effect in one gets that effect more than once. These
+    record through `set_event`, which is an idempotent upsert, so the test can
+    observe that they ran without the recording itself being a lie about how
+    many times.
+    """
+
+    initial = "start"
+    final = frozenset({"done"})
+    transitions = {"start": {"go": "done"}}
+    wait_seconds = 2.0
+    idle_seconds = 1.0
+
+    async def on_unhandled(self, state: str, event: str, payload: Any) -> None:
+        await self.set_event("saw.unhandled", {"state": state, "event": event})
+
+    async def on_transition(self, source: str, event: str, target: str) -> None:
+        await self.set_event(
+            "saw.transition", {"source": source, "event": event, "target": target}
+        )
+
+
+class PeerReaderMachine(StateMachineJob):
+    """Reads another job's published event, by id, and republishes what it saw.
+
+    `get_event(key, job_id=...)` is the cross-job form, which is how one
+    machine observes another's state without a mailbox round trip.
+    """
+
+    initial = "reading"
+    final = frozenset({"read"})
+    transitions = {"reading": {"look": ("read", "peek")}}
+    wait_seconds = 2.0
+    idle_seconds = 1.0
+
+    async def peek(self, event: str, payload: Any) -> dict[str, Any]:
+        seen = await self.get_event("machine.state", job_id=int(payload["peer"]))
+        await self.set_event("peer.state", seen)
+        return {"peer_state": seen}

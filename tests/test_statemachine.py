@@ -318,3 +318,63 @@ async def test_an_idle_machine_does_not_accumulate_checkpoints(
         f"an idle machine's checkpoint log grew to {max(samples)} rows across "
         f"{runs} wakes (samples: {samples}); compaction is not bounding it"
     )
+
+
+async def test_both_hooks_are_called(live_worker, unique_queue, db_pool):
+    """`on_unhandled` and `on_transition` are the two extension points.
+
+    Neither is a checkpointed step, which is deliberate and documented:
+    `on_transition` re-runs on replay, so effects belong in actions. This
+    asserts only that a subclass's overrides are reached at all — the
+    behaviour a subclass depends on.
+    """
+    await live_worker()
+    job_id = await enqueue_machine(
+        db_pool, "tests.machine_jobs.ObservedMachine", unique_queue
+    )
+    await wait_for_machine_state(db_pool, job_id, "start")
+
+    await post(db_pool, job_id, "nonsense")  # no edge for this in 'start'
+    await post(db_pool, job_id, "go")
+
+    row = await wait_for_job_state(db_pool, job_id, ("finished",))
+    assert row["result"]["final_state"] == "done"
+
+    unhandled = await db_pool.fetchval(
+        "SELECT value FROM jorb_event WHERE job_id=$1 AND key='saw.unhandled'", job_id
+    )
+    assert unhandled == {"state": "start", "event": "nonsense"}
+
+    transition = await db_pool.fetchval(
+        "SELECT value FROM jorb_event WHERE job_id=$1 AND key='saw.transition'", job_id
+    )
+    assert transition == {"source": "start", "event": "go", "target": "done"}
+
+
+async def test_a_machine_can_read_another_jobs_event_by_id(
+    live_worker, unique_queue, db_pool
+):
+    """`get_event(key, job_id=...)`: observing a peer without a mailbox.
+
+    The cross-job form is the reason `get_event` takes a job id at all, and
+    it is what lets one machine watch another's published state directly.
+    """
+    await live_worker()
+    peer = await enqueue_machine(
+        db_pool, "tests.machine_jobs.OrderMachine", unique_queue
+    )
+    await wait_for_machine_state(db_pool, peer, "awaiting_payment")
+
+    reader = await enqueue_machine(
+        db_pool, "tests.machine_jobs.PeerReaderMachine", unique_queue
+    )
+    await wait_for_machine_state(db_pool, reader, "reading")
+    await post(db_pool, reader, "look", peer=peer)
+
+    row = await wait_for_job_state(db_pool, reader, ("finished",))
+    assert row["result"]["final_state"] == "read"
+
+    seen = await db_pool.fetchval(
+        "SELECT value FROM jorb_event WHERE job_id=$1 AND key='peer.state'", reader
+    )
+    assert seen == {"state": "awaiting_payment"}
