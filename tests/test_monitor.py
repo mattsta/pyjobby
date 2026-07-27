@@ -41,6 +41,9 @@ from pyjobby.monitor import (
     sweep_consumed_mailbox,
     sweep_dead_workers,
     sweep_expired_jobs,
+    sweep_orphaned_dags,
+    sweep_retired_workers,
+    sweep_schedule_log,
     sweep_timed_out_jobs,
     sweep_unregistered_claims,
 )
@@ -105,6 +108,85 @@ async def insert_worker(pool, queue: str, *, last_seen_age_seconds: float = 0) -
         queue,
         last_seen_age_seconds,
     )
+
+
+async def insert_dag(pool, name: str, *, days_ago: float = 0) -> int:
+    """A jorb_dag row created ``days_ago`` days ago."""
+    return await pool.fetchval(
+        """
+        INSERT INTO jorb_dag (name, created)
+        VALUES ($1, now() - make_interval(secs => $2))
+        RETURNING id
+        """,
+        name,
+        days_ago * 86400,
+    )
+
+
+async def dag_ids(pool) -> list[int]:
+    return [r["id"] for r in await pool.fetch("SELECT id FROM jorb_dag ORDER BY id")]
+
+
+async def dag_status(pool, dag_id: int):
+    """What ``pj-admin dag list`` shows for one DAG."""
+    return await pool.fetchrow(
+        "SELECT * FROM jorb_dag_status WHERE dag_id = $1", dag_id
+    )
+
+
+async def insert_schedule(pool, name: str) -> int:
+    return await pool.fetchval(
+        """
+        INSERT INTO jorb_schedule (name, job_class, cron_expr, next_run)
+        VALUES ($1, 'tests.dxe_jobs.OkJob', '* * * * *', now())
+        RETURNING id
+        """,
+        name,
+    )
+
+
+async def log_execution(
+    pool, schedule_id: int, name: str, *, days_ago: float, result: str = "success"
+) -> int:
+    """One jorb_schedule_log row, as the scheduler writes it."""
+    return await pool.fetchval(
+        """
+        INSERT INTO jorb_schedule_log (schedule_id, schedule_name, scheduled_time,
+                                       actual_time, result)
+        VALUES ($1, $2, now() - make_interval(secs => $3),
+                now() - make_interval(secs => $3), $4)
+        RETURNING id
+        """,
+        schedule_id,
+        name,
+        days_ago * 86400,
+        result,
+    )
+
+
+async def schedule_log_ids(pool) -> list[int]:
+    return [
+        r["id"]
+        for r in await pool.fetch("SELECT id FROM jorb_schedule_log ORDER BY id")
+    ]
+
+
+async def retire_worker(pool, worker_id: int, *, days_ago: float) -> None:
+    """Stamp shutdown_at (and last_seen) that long ago: a worker gone since."""
+    await pool.execute(
+        """
+        UPDATE jorb_worker
+        SET shutdown_at = now() - make_interval(secs => $2),
+            last_seen   = now() - make_interval(secs => $2)
+        WHERE id = $1
+        """,
+        worker_id,
+        days_ago * 86400,
+    )
+
+
+async def worker_ids(pool) -> list[int]:
+    return [r["id"] for r in await pool.fetch("SELECT id FROM jorb_worker ORDER BY id")]
 
 
 async def get_job(pool, job_id: int):
@@ -1177,6 +1259,299 @@ class TestSweepConsumedMailbox:
 
 
 # ============================================================================
+# the three tables the job cascade cannot reach
+# ============================================================================
+
+
+class TestSweepOrphanedDags:
+    """jorb_dag is the PARENT of the relationship, so nothing cascades to it.
+
+    That makes it the only retention target where the row's size is beside
+    the point: an emptied DAG does not merely linger, it goes on ANSWERING —
+    jorb_dag_status LEFT JOINs jorb, so the moment job retention removes its
+    last job the view reports total_jobs = 0 for it, forever.
+    """
+
+    async def add_dag_job(
+        self, pool, queue: str, dag_id: int, *, state: str = "finished", days_ago: float
+    ) -> int:
+        job_id = await insert_terminal_job(pool, queue, state=state, days_ago=days_ago)
+        await pool.execute("UPDATE jorb SET dag_id = $2 WHERE id = $1", job_id, dag_id)
+        return job_id
+
+    async def test_an_emptied_dag_reports_a_lie_until_the_sweep_removes_it(
+        self, db_pool, unique_queue
+    ):
+        """The wrong answer, produced end to end and then fixed.
+
+        This is the whole case for the sweep: it is not "a few small rows
+        leak", it is "`pj-admin dag list` tells an operator that a DAG which
+        ran two jobs to completion ran nothing at all, and keeps saying so".
+        """
+        dag = await insert_dag(db_pool, "nightly", days_ago=40)
+        first = await self.add_dag_job(db_pool, unique_queue, dag, days_ago=40)
+        second = await self.add_dag_job(db_pool, unique_queue, dag, days_ago=40)
+
+        before = await dag_status(db_pool, dag)
+        assert (before["total_jobs"], before["finished_jobs"]) == (2, 2)
+
+        # ...retention comes past and takes the jobs, exactly as designed
+        assert await sweep_expired_jobs(db_pool, retention_days=30) == 2
+        assert await job_ids(db_pool) == []
+
+        # THE WRONG ANSWER: a DAG that ran two jobs now reads as one that
+        # ran none, and no later event ever corrects it.
+        ghost = await dag_status(db_pool, dag)
+        assert (
+            ghost["total_jobs"],
+            ghost["finished_jobs"],
+            ghost["crashed_jobs"],
+            ghost["pending_jobs"],
+        ) == (0, 0, 0, 0)
+        assert ghost["name"] == "nightly"
+
+        assert await sweep_orphaned_dags(db_pool, retention_days=30) == 1
+
+        assert await dag_ids(db_pool) == []
+        assert await dag_status(db_pool, dag) is None
+        # and the jobs it once had are still gone, not resurrected by a
+        # foreign key doing something clever
+        assert await job_ids(db_pool) == []
+        assert first != second
+
+    async def test_a_dag_with_one_surviving_job_is_kept_however_old(
+        self, db_pool, unique_queue
+    ):
+        """The refusal. The DAG row is what gives a surviving job its group,
+        and the foreign key would silently NULL it on the way out."""
+        emptied = await insert_dag(db_pool, "emptied", days_ago=400)
+        populated = await insert_dag(db_pool, "populated", days_ago=400)
+        survivor = await self.add_dag_job(db_pool, unique_queue, populated, days_ago=1)
+
+        assert await sweep_orphaned_dags(db_pool, retention_days=30) == 1
+
+        assert await dag_ids(db_pool) == [populated]
+        assert emptied not in await dag_ids(db_pool)
+        # the surviving job kept its group
+        assert (
+            await db_pool.fetchval("SELECT dag_id FROM jorb WHERE id = $1", survivor)
+            == populated
+        )
+
+    async def test_a_live_job_keeps_its_dag_at_any_age(self, db_pool, unique_queue):
+        """A 'waiting' job is exactly the shape retention already protects on
+        the job side: it is live work, however old the row looks."""
+        dag = await insert_dag(db_pool, "long-runner", days_ago=400)
+        job_id = await insert_job(db_pool, unique_queue, state="waiting")
+        await db_pool.execute("UPDATE jorb SET dag_id = $2 WHERE id = $1", job_id, dag)
+        await age_job(db_pool, job_id, days=400)
+
+        assert await sweep_orphaned_dags(db_pool, retention_days=30) == 0
+        assert await dag_ids(db_pool) == [dag]
+
+    async def test_a_dag_inside_the_window_is_kept_even_with_no_jobs(self, db_pool):
+        """A DAG with no jobs YET is a real state — DAGBuilder writes this row
+        before the jobs it will own. Age is what tells that apart from a DAG
+        whose jobs are gone, and it is the only thing that can."""
+        fresh = await insert_dag(db_pool, "being-built", days_ago=0)
+
+        assert await sweep_orphaned_dags(db_pool, retention_days=30) == 0
+        assert await dag_ids(db_pool) == [fresh]
+
+    async def test_batch_size_bounds_one_sweep_oldest_first(self, db_pool):
+        dags = [
+            await insert_dag(db_pool, f"dag-{n}", days_ago=100 - n) for n in range(5)
+        ]
+
+        for expected, remaining in ((2, dags[2:]), (2, dags[4:]), (1, []), (0, [])):
+            deleted = await sweep_orphaned_dags(
+                db_pool, retention_days=30, batch_size=2
+            )
+            assert (deleted, await dag_ids(db_pool)) == (expected, remaining)
+
+
+class TestSweepScheduleLog:
+    """One row per schedule execution, cascading only from a table operators
+    disable rather than delete. Before this sweep it had no bound at all."""
+
+    async def test_old_executions_go_and_the_newest_survives(self, db_pool, test_id):
+        """The refusal: `pj-admin schedule history` must never come back
+        empty for a schedule that has in fact run."""
+        schedule = await insert_schedule(db_pool, f"nightly_{test_id}")
+        ancient = await log_execution(db_pool, schedule, "nightly", days_ago=400)
+        old = await log_execution(db_pool, schedule, "nightly", days_ago=90)
+        newest = await log_execution(db_pool, schedule, "nightly", days_ago=45)
+
+        assert await sweep_schedule_log(db_pool, retention_days=30) == 2
+
+        assert await schedule_log_ids(db_pool) == [newest]
+        assert ancient not in await schedule_log_ids(db_pool)
+        assert old not in await schedule_log_ids(db_pool)
+        # the schedule itself is untouched
+        assert (
+            await db_pool.fetchval(
+                "SELECT count(*) FROM jorb_schedule WHERE id = $1", schedule
+            )
+            == 1
+        )
+
+    async def test_a_rarely_firing_schedules_only_execution_is_never_deleted(
+        self, db_pool, test_id
+    ):
+        """A yearly schedule's single execution is older than any sane window,
+        and deleting it would make the schedule read as "never ran" while
+        jorb_schedule.last_run says otherwise."""
+        schedule = await insert_schedule(db_pool, f"yearly_{test_id}")
+        only = await log_execution(db_pool, schedule, "yearly", days_ago=400)
+
+        assert await sweep_schedule_log(db_pool, retention_days=30) == 0
+        assert await schedule_log_ids(db_pool) == [only]
+
+    async def test_executions_inside_the_window_are_kept(self, db_pool, test_id):
+        schedule = await insert_schedule(db_pool, f"hourly_{test_id}")
+        recent = [
+            await log_execution(db_pool, schedule, "hourly", days_ago=days)
+            for days in (5, 3, 1)
+        ]
+
+        assert await sweep_schedule_log(db_pool, retention_days=30) == 0
+        assert await schedule_log_ids(db_pool) == recent
+
+    async def test_each_schedule_keeps_its_own_newest(self, db_pool, test_id):
+        """The rule is per schedule, not per table: reaping everything but
+        one global row would erase whole schedules' histories."""
+        first = await insert_schedule(db_pool, f"a_{test_id}")
+        second = await insert_schedule(db_pool, f"b_{test_id}")
+        await log_execution(db_pool, first, "a", days_ago=400)
+        first_newest = await log_execution(db_pool, first, "a", days_ago=200)
+        await log_execution(db_pool, second, "b", days_ago=300)
+        second_newest = await log_execution(db_pool, second, "b", days_ago=100)
+
+        assert await sweep_schedule_log(db_pool, retention_days=30) == 2
+        assert await schedule_log_ids(db_pool) == sorted([first_newest, second_newest])
+
+    async def test_batch_size_bounds_one_sweep_oldest_first(self, db_pool, test_id):
+        schedule = await insert_schedule(db_pool, f"minutely_{test_id}")
+        rows = [
+            await log_execution(db_pool, schedule, "minutely", days_ago=100 - n)
+            for n in range(5)
+        ]
+
+        # rows[4] is the newest and is never eligible, so the backlog is four
+        # rows and the third batch comes back empty — which is what tells the
+        # drain loop it is caught up rather than out of work to look at
+        for expected, remaining in ((2, rows[2:]), (2, rows[4:]), (0, rows[4:])):
+            deleted = await sweep_schedule_log(db_pool, retention_days=30, batch_size=2)
+            assert (deleted, await schedule_log_ids(db_pool)) == (expected, remaining)
+
+
+class TestSweepRetiredWorkers:
+    """One row per worker PROCESS START, and until now nothing ever deleted
+    one — shutdown only stamps the row."""
+
+    async def test_a_long_retired_worker_is_deleted(self, db_pool, unique_queue):
+        gone = await insert_worker(db_pool, unique_queue)
+        await retire_worker(db_pool, gone, days_ago=90)
+
+        assert await sweep_retired_workers(db_pool, retention_days=30) == 1
+        assert await worker_ids(db_pool) == []
+
+    async def test_a_live_worker_is_never_deleted(self, db_pool, unique_queue):
+        """Deleting a live worker's row would be silent and total: its
+        heartbeat UPDATE would match nothing and every liveness surface would
+        say the process is gone while it kept claiming."""
+        live = await insert_worker(db_pool, unique_queue)
+        await db_pool.execute(
+            "UPDATE jorb_worker SET started = now() - interval '400 days' WHERE id = $1",
+            live,
+        )
+
+        assert await sweep_retired_workers(db_pool, retention_days=30) == 0
+        assert await worker_ids(db_pool) == [live]
+
+    async def test_a_worker_retired_during_a_blip_that_came_back_is_kept(
+        self, db_pool, unique_queue
+    ):
+        """shutdown_at is set (the monitor retired it) but it is beating
+        again, so it is alive: both clocks have to be stale, not one."""
+        resurrected = await insert_worker(db_pool, unique_queue)
+        await retire_worker(db_pool, resurrected, days_ago=90)
+        await db_pool.execute(
+            "UPDATE jorb_worker SET last_seen = now() WHERE id = $1", resurrected
+        )
+
+        assert await sweep_retired_workers(db_pool, retention_days=30) == 0
+        assert await worker_ids(db_pool) == [resurrected]
+
+    async def test_a_worker_still_owning_in_flight_work_is_refused(
+        self, db_pool, unique_queue
+    ):
+        """The dangerous one. jorb.claimed_by carries no foreign key, so
+        deleting this row would strand the job permanently: the dead-worker
+        sweep finds orphans by JOINing to jorb_worker, and the
+        unregistered-claim sweep only looks at claimed_by IS NULL."""
+        holder = await insert_worker(db_pool, unique_queue)
+        stranded = await insert_job(
+            db_pool, unique_queue, state="running", claimed_by=holder
+        )
+        await retire_worker(db_pool, holder, days_ago=90)
+
+        assert await sweep_retired_workers(db_pool, retention_days=30) == 0
+        assert await worker_ids(db_pool) == [holder]
+
+        # ...and because the row survived, recovery still works
+        assert await sweep_dead_workers(db_pool, liveness_grace_seconds=60) == 1
+        assert (await get_job(db_pool, stranded))["state"] == "queued"
+
+        # now the job is no longer in flight, so the next cycle takes the row
+        assert await sweep_retired_workers(db_pool, retention_days=30) == 1
+        assert await worker_ids(db_pool) == []
+
+    async def test_a_worker_whose_jobs_all_finished_is_deleted(
+        self, db_pool, unique_queue
+    ):
+        """The common case: the jobs are terminal, and worker_host/worker_pid
+        on the job row carry everything the registry row was telling anyone."""
+        gone = await insert_worker(db_pool, unique_queue)
+        job_id = await insert_job(db_pool, unique_queue, claimed_by=gone)
+        await db_pool.execute(
+            "UPDATE jorb SET state = 'finished', finished = now() WHERE id = $1", job_id
+        )
+        await retire_worker(db_pool, gone, days_ago=90)
+
+        assert await sweep_retired_workers(db_pool, retention_days=30) == 1
+        assert await worker_ids(db_pool) == []
+        assert await job_ids(db_pool) == [job_id]
+
+    async def test_a_recently_retired_worker_is_kept(self, db_pool, unique_queue):
+        recent = await insert_worker(db_pool, unique_queue)
+        await retire_worker(db_pool, recent, days_ago=1)
+
+        assert await sweep_retired_workers(db_pool, retention_days=30) == 0
+        assert await worker_ids(db_pool) == [recent]
+
+    async def test_batch_size_bounds_one_sweep_oldest_first(
+        self, db_pool, unique_queue
+    ):
+        workers = []
+        for n in range(5):
+            worker_id = await insert_worker(db_pool, unique_queue)
+            await retire_worker(db_pool, worker_id, days_ago=100 - n)
+            workers.append(worker_id)
+
+        for expected, remaining in (
+            (2, workers[2:]),
+            (2, workers[4:]),
+            (1, []),
+            (0, []),
+        ):
+            deleted = await sweep_retired_workers(
+                db_pool, retention_days=30, batch_size=2
+            )
+            assert (deleted, await worker_ids(db_pool)) == (expected, remaining)
+
+
+# ============================================================================
 # run_epoch fencing
 # ============================================================================
 
@@ -1381,6 +1756,14 @@ class TestMonitorLoop:
         orphaned = await insert_job(
             db_pool, unique_queue, state="running", claimed_by=dead_worker
         )
+        # the three tables no cascade reaches share the one window, so `0`
+        # has to be the escape hatch for all of them too
+        empty_dag = await insert_dag(db_pool, "ancient", days_ago=3650)
+        schedule = await insert_schedule(db_pool, f"ancient_{unique_queue}")
+        old_run = await log_execution(db_pool, schedule, "ancient", days_ago=3650)
+        newer_run = await log_execution(db_pool, schedule, "ancient", days_ago=3600)
+        retired = await insert_worker(db_pool, unique_queue)
+        await retire_worker(db_pool, retired, days_ago=3650)
 
         task = asyncio.create_task(
             monitor(
@@ -1405,6 +1788,11 @@ class TestMonitorLoop:
             "jorb_mailbox": 1,
             "jorb_history": 2,
         }
+        assert await dag_ids(db_pool) == [empty_dag]
+        assert await schedule_log_ids(db_pool) == [old_run, newer_run]
+        # the dead worker was RETIRED by its sweep (that is recovery, not
+        # retention) but no registry row was deleted
+        assert await worker_ids(db_pool) == sorted([dead_worker, retired])
 
     async def test_loop_reaps_checkpoints_of_a_job_it_still_keeps(
         self, db_pool, unique_queue, db_params
@@ -1478,6 +1866,68 @@ class TestMonitorLoop:
             "jorb_history": 0,
         }
 
+    async def test_loop_reaps_the_tables_no_cascade_reaches(
+        self, db_pool, unique_queue, db_params
+    ):
+        """The DAG, the schedule log and the worker registry are cleaned by
+        the same cycle and the same window as the jobs.
+
+        The DAG is the one that has to happen in ORDER: its jobs are deleted
+        by the sweep ahead of it in the same cycle, and only then is it
+        empty. If the sweeps were reordered it would take an extra interval —
+        an extra interval of `dag list` reporting a DAG that ran nothing.
+        """
+        dag = await insert_dag(db_pool, "nightly", days_ago=40)
+        dag_job = await insert_terminal_job(db_pool, unique_queue, days_ago=40)
+        await db_pool.execute("UPDATE jorb SET dag_id = $2 WHERE id = $1", dag_job, dag)
+
+        schedule = await insert_schedule(db_pool, f"nightly_{unique_queue}")
+        stale_run = await log_execution(db_pool, schedule, "nightly", days_ago=40)
+        last_run = await log_execution(db_pool, schedule, "nightly", days_ago=35)
+
+        gone = await insert_worker(db_pool, unique_queue)
+        await retire_worker(db_pool, gone, days_ago=40)
+        live = await insert_worker(db_pool, unique_queue)
+
+        task = asyncio.create_task(
+            monitor(
+                dsn_from(db_params),
+                check_interval=0.1,
+                liveness_grace_seconds=60,
+                retention_days=7,
+            )
+        )
+        try:
+            await wait_until(
+                lambda: db_pool.fetchval(
+                    "SELECT NOT EXISTS (SELECT 1 FROM jorb_dag WHERE id = $1)", dag
+                ),
+                timeout=10,
+            )
+            await wait_until(
+                lambda: db_pool.fetchval(
+                    "SELECT NOT EXISTS (SELECT 1 FROM jorb_worker WHERE id = $1)", gone
+                ),
+                timeout=10,
+            )
+            await wait_until(
+                lambda: db_pool.fetchval(
+                    "SELECT NOT EXISTS (SELECT 1 FROM jorb_schedule_log WHERE id = $1)",
+                    stale_run,
+                ),
+                timeout=10,
+            )
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert await dag_ids(db_pool) == []
+        assert await job_ids(db_pool) == []
+        # the schedule keeps its newest execution, and the live worker stays
+        assert await schedule_log_ids(db_pool) == [last_run]
+        assert await worker_ids(db_pool) == [live]
+
     async def test_failing_retention_sweep_does_not_starve_the_others(
         self, db_pool, unique_queue, db_params, monkeypatch
     ):
@@ -1512,6 +1962,48 @@ class TestMonitorLoop:
         try:
             await wait_until(lambda: len(attempts) >= 2, timeout=10)
             await wait_for_job_state(db_pool, orphaned, ("queued",), timeout=10)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    async def test_a_failing_dag_sweep_does_not_starve_the_sweeps_behind_it(
+        self, db_pool, unique_queue, db_params, monkeypatch
+    ):
+        """The DAG sweep sits in the middle of the retention block, so its
+        failure is the one that could swallow the three behind it — and it is
+        the sweep most likely to meet a lock, since it deletes the parent of
+        a foreign key."""
+        attempts = []
+
+        async def exploding_sweep(*args, **kwargs):
+            attempts.append(1)
+            raise RuntimeError("dag sweep is broken")
+
+        monkeypatch.setattr(monitor_module, "sweep_orphaned_dags", exploding_sweep)
+
+        expired = await insert_terminal_job(db_pool, unique_queue, days_ago=3650)
+        gone = await insert_worker(db_pool, unique_queue)
+        await retire_worker(db_pool, gone, days_ago=3650)
+
+        task = asyncio.create_task(
+            monitor(
+                dsn_from(db_params),
+                check_interval=0.1,
+                liveness_grace_seconds=60,
+                retention_days=7,
+            )
+        )
+        try:
+            await wait_until(lambda: len(attempts) >= 2, timeout=10)
+            # the sweep before it and the sweeps after it both still ran
+            await wait_for_job_gone(db_pool, expired, timeout=10)
+            await wait_until(
+                lambda: db_pool.fetchval(
+                    "SELECT NOT EXISTS (SELECT 1 FROM jorb_worker WHERE id = $1)", gone
+                ),
+                timeout=10,
+            )
         finally:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):

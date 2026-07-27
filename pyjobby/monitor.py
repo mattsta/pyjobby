@@ -28,12 +28,32 @@ recovery:
    thing on the row with the shortest useful life. They outlive the job's
    terminal transition only far enough to debug it. ``0`` keeps them for as
    long as the job.
+6. **The three tables the job cascade cannot reach**, all on the same
+   ``--retention-days`` window, because none of them has a lifetime argument
+   of its own — they are all "as long as the jobs they describe":
 
-Both retention sweeps DRAIN: a cycle keeps taking batches until it is caught
+   * ``jorb_dag`` — jobs point AT a DAG (``ON DELETE SET NULL``), so
+     deleting jobs never touches it. Left alone it is not just leaked
+     storage: ``jorb_dag_status`` LEFT JOINs jorb, so a DAG whose jobs aged
+     out reports ``total_jobs = 0`` forever, and ``pj-admin dag list``
+     fills up with DAGs that appear to have run nothing.
+   * ``jorb_schedule_log`` — cascades only from ``jorb_schedule``, which
+     operators disable rather than delete, so it had no bound at all: one
+     row per execution at cron rate, forever.
+   * ``jorb_worker`` — one row per worker PROCESS START, never deleted, only
+     stamped ``shutdown_at``. A fleet that redeploys daily accumulates rows
+     indefinitely.
+
+Every retention sweep DRAINS: a cycle keeps taking batches until it is caught
 up or spends ``--retention-max-seconds``, then yields. One batch per cycle
 would be a fixed deletion rate that a busy install simply outruns, leaving
 retention switched on and the table still growing; the budget keeps a backlog
 from delaying the latency-critical sweeps above.
+
+Every retention sweep also REFUSES to delete a row something live still
+needs, and the refusal is the interesting half of each one: a terminal job a
+'waiting' job depends on, a DAG that still has jobs, a schedule's most recent
+execution, a worker row whose jobs are still in flight.
 
 Requeues bump nothing themselves: the next claim increments ``run_epoch``,
 which fences any still-running stale execution out of the row.
@@ -225,6 +245,153 @@ DELETE_CHECKPOINTS_SQL = """
     DELETE FROM jorb_step
     WHERE job_id = ANY($1::bigint[])
     RETURNING job_id, step_seq
+"""
+
+#: DAGs whose jobs are all gone and which outlived the window. ($1, $2)
+#:
+#: This one is not primarily about storage — a jorb_dag row is a name, two
+#: timestamps and a small JSONB — it is about a WRONG ANSWER. jorb.dag_id is
+#: the CHILD side of the foreign key (ON DELETE SET NULL), so deleting jobs
+#: never touches this table; and jorb_dag_status is a LEFT JOIN, so the
+#: instant retention removes a DAG's last job the view starts reporting that
+#: DAG as ``total_jobs = 0, pending_jobs = 0`` — a DAG that ran nothing —
+#: and goes on reporting it forever. An operator running `pj-admin dag list`
+#: on a year-old install would see a fleet of empty ghosts, each one a lie
+#: about work that in fact completed.
+#:
+#: The DAG is therefore reaped, not hidden. A view cannot distinguish "never
+#: had jobs" from "had jobs, they aged out", so making jorb_dag_status an
+#: inner join would trade this wrong answer for a different one: it would
+#: hide a DAG during construction, which is a legitimate empty state.
+#:
+#: Two conditions, and the second is the one that keeps it safe:
+#:
+#: * ``created < now() - retention`` — the DAG itself outlived the window.
+#:   It is ordered by ``created`` too, which ``jorb_dag_retention_idx``
+#:   serves directly, so a caught-up sweep is a two-buffer range probe
+#:   rather than a scan of every DAG ever run.
+#: * no job points at it — ANY job, at any age, in any state. The DAG row is
+#:   the only thing that gives its surviving jobs a group, and dropping it
+#:   would silently NULL their dag_id via the foreign key; a DAG with even
+#:   one job left is a DAG somebody can still ask about.
+#:
+#: The "no jobs" test is a scalar subquery and not the EXISTS it reads like,
+#: for the same measured reason as SWEEP_CHECKPOINT_JOBS_SQL: PostgreSQL
+#: flattens an EXISTS sublink into a semi-join and can then cost a hash
+#: against the whole of jorb, which makes scanning jorb_dag look free. A
+#: scalar subquery stays a per-row index probe through jorb_dag_idx.
+#:
+#: Probe then delete by key, the shape sweep_expired_jobs and
+#: sweep_completed_checkpoints use, and for the third measured time it is not
+#: cosmetic: the one-statement ``DELETE ... USING (CTE)`` form plans its
+#: second stage against jorb_dag's whole-table statistics and hash-joins a
+#: SEQUENTIAL SCAN of jorb_dag against the batch (measured at 20,000 DAGs:
+#: 3,300 buffers on top of the probe, to delete 1,000 rows by primary key).
+#: A batch is bounded; a scan per batch grows with every DAG the install has
+#: ever run.
+SWEEP_ORPHANED_DAGS_SQL = """
+    SELECT d.id
+    FROM jorb_dag d
+    WHERE d.created < now() - $1::interval
+      AND (SELECT j.id FROM jorb j
+            WHERE j.dag_id = d.id LIMIT 1) IS NULL
+    ORDER BY d.created
+    FOR UPDATE SKIP LOCKED
+    LIMIT $2
+"""
+
+DELETE_ORPHANED_DAGS_SQL = "DELETE FROM jorb_dag WHERE id = ANY($1::bigint[])"
+
+#: Schedule executions past the window, except each schedule's newest. ($1, $2)
+#:
+#: jorb_schedule_log cascades from jorb_schedule and from nothing else, and
+#: operators do not delete schedules — they disable them. So one row per
+#: execution accumulated with no upper bound whatsoever: a minutely schedule
+#: writes ~43,000 rows a month and keeps every one of them for the life of
+#: the install. It is also the only unbounded table sitting on a notification
+#: path (``schedule_executed_notify`` is deliberately ungated), which makes
+#: its size everybody's problem and not just the DBA's.
+#:
+#: THE REFUSAL: a schedule's most recent execution is never deleted, however
+#: old it is. `pj-admin schedule history NAME` and the dashboard read this
+#: table to answer "when did this last run, and did it work?", and a schedule
+#: that fires quarterly or yearly would otherwise have its entire history
+#: erased and read as "never ran" — while jorb_schedule.last_run says
+#: otherwise. That is the same class of wrong answer as the empty DAG above,
+#: so it gets the same treatment: keep the row the live object still needs.
+#: ``id < (SELECT max(id) ...)`` is served by jorb_schedule_log_idx
+#: (schedule_id, id) as a backwards index-only probe, one per candidate row.
+SWEEP_SCHEDULE_LOG_SQL = """
+    SELECT l.id
+    FROM jorb_schedule_log l
+    WHERE l.actual_time < now() - $1::interval
+      AND l.id < (SELECT max(l2.id) FROM jorb_schedule_log l2
+                   WHERE l2.schedule_id = l.schedule_id)
+    ORDER BY l.actual_time
+    FOR UPDATE SKIP LOCKED
+    LIMIT $2
+"""
+
+#: ...and the delete by primary key, for the same reason as the DAG sweep
+#: above: the CTE form's second stage sequentially scans the log to join a
+#: batch it was handed.
+DELETE_SCHEDULE_LOG_SQL = "DELETE FROM jorb_schedule_log WHERE id = ANY($1::bigint[])"
+
+#: Retired workers whose registry row aged out. ($1 retention, $2 batch)
+#:
+#: jorb_worker holds one row per worker PROCESS START, and nothing has ever
+#: deleted one: graceful exit and the monitor's own dead-worker retirement
+#: both only stamp ``shutdown_at``. A fleet of 100 workers redeployed daily
+#: leaves 36,500 rows a year behind, all of them invisible to every operator
+#: surface (``pj-admin workers list`` shows dead workers for an hour) and all
+#: of them read by nothing.
+#:
+#: ``shutdown_at IS NOT NULL`` is the safety gate and ``last_seen`` is the
+#: second one. A live worker never has shutdown_at set, so it can never be a
+#: candidate — and a worker the monitor retired during a network blip that
+#: then came BACK keeps beating last_seen, so requiring both to be stale
+#: means resurrection cannot be mistaken for death. Deleting a live worker's
+#: row would be silent and total: its heartbeat UPDATE would match no row,
+#: and every liveness surface in the platform would say the process is gone
+#: while it goes on claiming jobs.
+SWEEP_RETIRED_WORKERS_SQL = """
+    SELECT w.id
+    FROM jorb_worker w
+    WHERE w.shutdown_at IS NOT NULL
+      AND w.shutdown_at < now() - $1::interval
+      AND w.last_seen   < now() - $1::interval
+    ORDER BY w.shutdown_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT $2
+"""
+
+#: ...and the delete, which is where the refusal lives. ($1 ids)
+#:
+#: A worker row whose jobs are still 'claimed' or 'running' is NOT deletable
+#: at any age, because ``claimed_by`` carries no foreign key: deleting the
+#: registry row of a worker that still owns in-flight work would strand those
+#: jobs permanently. SWEEP_DEAD_WORKER_JOBS_SQL finds them by JOINing jorb to
+#: jorb_worker, so with the worker row gone there is nothing left to join to,
+#: and SWEEP_UNREGISTERED_CLAIMS_SQL cannot pick them up either — it looks
+#: for ``claimed_by IS NULL``, and these rows point at an id that no longer
+#: exists. The job would sit in 'running' until somebody noticed by hand.
+#:
+#: The check runs on the DELETE rather than in the probe on purpose: it is
+#: driven by ``jorb_inflight_idx``, whose partial predicate is exactly these
+#: two states written as literals, so it costs the in-flight set (bounded by
+#: work in flight, never by table size) and not a scan of jorb. Putting it in
+#: the probe would make the planner cost that join against jorb_worker's
+#: whole-table statistics on every cycle, including the overwhelmingly common
+#: one where the probe returns nothing at all.
+DELETE_RETIRED_WORKERS_SQL = """
+    DELETE FROM jorb_worker w
+    WHERE w.id = ANY($1::bigint[])
+      AND NOT EXISTS (
+          SELECT 1 FROM jorb j
+          WHERE j.claimed_by = w.id
+            AND j.state IN ('claimed', 'running')
+      )
+    RETURNING w.id
 """
 
 #: Consumed mailbox messages past the window. ($1 retention, $2 batch)
@@ -539,6 +706,118 @@ async def sweep_consumed_mailbox(
     return len(deleted)
 
 
+async def sweep_orphaned_dags(
+    pool: asyncpg.Pool,
+    retention_days: float,
+    batch_size: int = 1000,
+) -> int:
+    """Delete DAG rows that outlived the window and have no jobs left.
+
+    This is a CORRECTNESS sweep wearing retention's clothes. ``jorb.dag_id``
+    is the child side of the foreign key, so job retention never touches
+    ``jorb_dag``; and ``jorb_dag_status`` LEFT JOINs jorb, so a DAG whose
+    jobs have aged out reports ``total_jobs = 0`` — permanently, and to
+    anyone who runs ``pj-admin dag list``. The row is tiny. The answer it
+    produces is wrong, and wrong answers do not get cheaper at scale.
+
+    A DAG with even ONE job left is kept regardless of age: the row is what
+    gives those jobs a group, and the foreign key would silently NULL their
+    ``dag_id`` on the way out. Age is only the tiebreaker among DAGs that
+    already have nothing.
+
+    Because a DAG is created before its own jobs (inside the same
+    transaction), ``created`` is always earlier than any of their terminal
+    timestamps — so a DAG becomes eligible on the very cycle that removes
+    its last job, and the empty-DAG window is one monitor cycle wide rather
+    than forever. Ordered by ``created``, which ``jorb_dag_retention_idx``
+    serves directly. Returns the number of DAGs deleted."""
+    retention = datetime.timedelta(days=retention_days)
+
+    async with pool.acquire() as conn, conn.transaction():
+        doomed = await conn.fetch(SWEEP_ORPHANED_DAGS_SQL, retention, batch_size)
+        if not doomed:
+            return 0
+
+        await conn.execute(DELETE_ORPHANED_DAGS_SQL, [row["id"] for row in doomed])
+
+    return len(doomed)
+
+
+async def sweep_schedule_log(
+    pool: asyncpg.Pool,
+    retention_days: float,
+    batch_size: int = 1000,
+) -> int:
+    """Delete schedule executions older than the window, keeping the newest.
+
+    ``jorb_schedule_log`` cascades only from ``jorb_schedule``, and nobody
+    deletes a schedule — they disable it. So this table had no upper bound of
+    any kind: one row per execution, at cron rate, kept for the life of the
+    install.
+
+    Each schedule's most recent execution survives at any age. It is what
+    ``pj-admin schedule history`` and the dashboard read to answer "when did
+    this last run", so reaping it would make a quarterly schedule read as
+    "never ran" while ``jorb_schedule.last_run`` says otherwise — a wrong
+    answer, not merely a shorter history.
+
+    Ordered by ``actual_time``, which ``jorb_schedule_log_retention_idx``
+    provides directly: no sort however large the backlog, and a two-buffer
+    answer once caught up. Returns the number of rows deleted."""
+    retention = datetime.timedelta(days=retention_days)
+
+    async with pool.acquire() as conn, conn.transaction():
+        doomed = await conn.fetch(SWEEP_SCHEDULE_LOG_SQL, retention, batch_size)
+        if not doomed:
+            return 0
+
+        await conn.execute(DELETE_SCHEDULE_LOG_SQL, [row["id"] for row in doomed])
+
+    return len(doomed)
+
+
+async def sweep_retired_workers(
+    pool: asyncpg.Pool,
+    retention_days: float,
+    batch_size: int = 1000,
+) -> int:
+    """Delete registry rows of workers that shut down long enough ago.
+
+    One row per worker PROCESS START and nothing ever deleted one, so a fleet
+    that redeploys accumulates registry rows forever. Only rows that are both
+    retired (``shutdown_at`` set) and silent (``last_seen`` stale) for the
+    whole window are candidates, which is what makes a live worker — or one
+    that was retired during a blip and came back — structurally ineligible.
+
+    A worker that still owns 'claimed' or 'running' jobs is refused whatever
+    its age. ``jorb.claimed_by`` has no foreign key, so deleting the row
+    would strand that work: the dead-worker sweep finds orphaned jobs by
+    joining to this table, and the unregistered-claim sweep only looks at
+    ``claimed_by IS NULL``. Neither can see a job pointing at an id that no
+    longer exists.
+
+    Probe then delete, the same two-statement shape as the other sweeps: the
+    probe rides ``jorb_worker_retention_idx`` oldest-shutdown-first, and the
+    in-flight refusal rides ``jorb_inflight_idx`` on the delete, where it is
+    only paid when there were candidates at all. A refused worker makes the
+    batch come back short, which ``_drain`` reads as "caught up" — correct
+    here, because the refusal is transient: the dead-worker sweep requeues
+    those jobs within the liveness grace and the next cycle takes the row.
+    Returns the number of registry rows deleted."""
+    retention = datetime.timedelta(days=retention_days)
+
+    async with pool.acquire() as conn, conn.transaction():
+        doomed = await conn.fetch(SWEEP_RETIRED_WORKERS_SQL, retention, batch_size)
+        if not doomed:
+            return 0
+
+        deleted = await conn.fetch(
+            DELETE_RETIRED_WORKERS_SQL, [row["id"] for row in doomed]
+        )
+
+    return len(deleted)
+
+
 async def _run_sweep(name: str, sweep: Callable[[], Awaitable[int]]) -> int:
     """Run one sweep, containing its failure to itself.
 
@@ -622,9 +901,17 @@ async def monitor(
     """Run all sweeps every ``check_interval`` seconds, forever.
 
     Retention is on by default and the two windows are independent:
-    ``retention_days`` deletes whole terminal jobs, ``checkpoint_retention_days``
-    deletes just the checkpoints of terminal jobs much sooner. Either set to
-    ``0`` means keep forever — that sweep does not run at all.
+    ``retention_days`` deletes whole terminal jobs — and the emptied DAGs,
+    aged schedule executions, consumed mail and retired worker rows that no
+    cascade can reach — while ``checkpoint_retention_days`` deletes just the
+    checkpoints of terminal jobs much sooner. Either set to ``0`` means keep
+    forever: those sweeps do not run at all.
+
+    One window covers the four job-scoped tables rather than four knobs
+    because none of them has its own lifetime to argue for: they all mean "as
+    long as the work they describe". Checkpoints get the second knob because
+    they genuinely do — they are the bulkiest rows in the system and stop
+    being useful the instant their job goes terminal.
 
     Each retention sweep drains its backlog within a ``retention_max_seconds``
     budget per cycle, so it can catch up on a busy install without ever
@@ -672,6 +959,33 @@ async def monitor(
                 await _run_retention(
                     "expired jobs",
                     lambda: sweep_expired_jobs(
+                        pool, retention_days, retention_batch_size
+                    ),
+                    retention_batch_size,
+                    retention_max_seconds,
+                )
+                # immediately after the jobs, so a DAG emptied by the sweep
+                # above is reaped on the same cycle rather than spending one
+                # interval reporting itself as a DAG that ran no jobs
+                await _run_retention(
+                    "orphaned dags",
+                    lambda: sweep_orphaned_dags(
+                        pool, retention_days, retention_batch_size
+                    ),
+                    retention_batch_size,
+                    retention_max_seconds,
+                )
+                await _run_retention(
+                    "schedule log",
+                    lambda: sweep_schedule_log(
+                        pool, retention_days, retention_batch_size
+                    ),
+                    retention_batch_size,
+                    retention_max_seconds,
+                )
+                await _run_retention(
+                    "retired workers",
+                    lambda: sweep_retired_workers(
                         pool, retention_days, retention_batch_size
                     ),
                     retention_batch_size,
@@ -730,7 +1044,9 @@ def cli() -> None:
         default=30.0,
         show_default=True,
         help="Delete terminal jobs (with their history, events, mailbox and "
-        "checkpoints) older than this. 0 keeps every job forever.",
+        "checkpoints) older than this, plus the tables the job cascade cannot "
+        "reach: emptied DAGs, schedule executions (each schedule keeps its "
+        "latest) and retired worker registry rows. 0 keeps everything forever.",
     )
     @click.option(
         "--checkpoint-retention-days",

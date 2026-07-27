@@ -18,11 +18,20 @@ dropped. A plan is a fact.
 from __future__ import annotations
 
 import datetime
+import re
 
 import pytest
 
-from pyjobby.monitor import SWEEP_CHECKPOINT_JOBS_SQL, TERMINAL_STATES
+from pyjobby.monitor import (
+    DELETE_RETIRED_WORKERS_SQL,
+    SWEEP_CHECKPOINT_JOBS_SQL,
+    SWEEP_ORPHANED_DAGS_SQL,
+    SWEEP_RETIRED_WORKERS_SQL,
+    SWEEP_SCHEDULE_LOG_SQL,
+    TERMINAL_STATES,
+)
 from tests.utils.plans import (
+    assert_no_seq_scan,
     assert_reads_far_less_than_a_scan,
     plan_for,
     reset_job_tables,
@@ -39,6 +48,42 @@ ROWS = 20_000
 #: The sweeps' default batch, so a plan assertion can say "a batch's worth"
 #: rather than a bare number.
 BATCH = 1000
+
+
+def rows_scanned_by(plan: str, index: str) -> int:
+    """Rows the node using `index` actually returned.
+
+    "Which index did it use" is only half the question -- an index scan that
+    reads a table's worth of rows costs a table's worth. This reads the
+    `actual rows=` of the node itself, so a test can say what the scan is
+    bounded BY rather than merely which access method it chose.
+    """
+    name = re.escape(index)
+    match = re.search(
+        rf"(?:Index (?:Only )?Scan using {name} on \S+"
+        rf"|Bitmap Index Scan on {name})[^\n]*actual rows=([\d.]+)",
+        plan,
+    )
+    assert match, f"no node using {index} in\n{plan}"
+    return int(float(match.group(1)))
+
+
+async def explain_rolled_back(pool, sql: str, *args) -> str:
+    """EXPLAIN (ANALYZE) a statement that WRITES, then undo it.
+
+    The sweeps under test are DELETEs, and a plan is only a fact if the
+    statement really ran — so it runs, and the transaction is rolled back.
+    """
+    async with pool.acquire() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            rows = await conn.fetch(
+                "EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) " + sql, *args
+            )
+            return "\n".join(r["QUERY PLAN"] for r in rows)
+        finally:
+            await tx.rollback()
 
 
 async def seed_terminal_jobs(pool, queue: str, rows: int = ROWS) -> None:
@@ -168,19 +213,12 @@ class TestCheckpointSweepPlan:
 
     async def explain_sweep(self, pool, retention_days: float) -> str:
         """EXPLAIN the real sweep statement, rolled back so it deletes nothing."""
-        async with pool.acquire() as conn:
-            tx = conn.transaction()
-            await tx.start()
-            try:
-                rows = await conn.fetch(
-                    "EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) "
-                    + SWEEP_CHECKPOINT_JOBS_SQL,
-                    datetime.timedelta(days=retention_days),
-                    BATCH,
-                )
-                return "\n".join(r["QUERY PLAN"] for r in rows)
-            finally:
-                await tx.rollback()
+        return await explain_rolled_back(
+            pool,
+            SWEEP_CHECKPOINT_JOBS_SQL,
+            datetime.timedelta(days=retention_days),
+            BATCH,
+        )
 
     async def test_nothing_expired_reads_almost_nothing(self, db_pool, unique_queue):
         """The steady state: caught up, asked every cycle, answer empty.
@@ -330,6 +368,247 @@ class TestMailboxSweepPlan:
         assert "jorb_mailbox_consumed_idx" in plan, plan
         # index order means the batch needs no sort, however big the backlog
         assert "Sort" not in plan, plan
+
+
+class TestOrphanedDagSweepPlan:
+    """The DAG sweep runs every cycle forever like the rest of retention.
+
+    It has the same trap as the checkpoint sweep and one extra: as well as
+    walking jorb_dag by an index, it asks "has this DAG any jobs left?" per
+    candidate, and that question is a second chance to accidentally read the
+    whole job table.
+    """
+
+    #: 2 in 3 DAGs still hold a job, so the sweep genuinely has to walk past
+    #: them to fill a batch -- the shape that catches an index scan doing a
+    #: table's worth of work.
+    JOB_EVERY = 3
+
+    async def seed(self, pool, queue: str) -> None:
+        # jorb_dag is the PARENT, so truncating it needs CASCADE (which
+        # empties jorb too) and therefore has to happen before the job seed.
+        await pool.execute("TRUNCATE jorb_dag RESTART IDENTITY CASCADE")
+        await pool.execute(
+            """
+            INSERT INTO jorb_dag (name, created)
+            SELECT 'plan-dag', now() - (i % 60) * interval '1 day'
+              FROM generate_series(1, $1) i
+            """,
+            ROWS,
+        )
+        await seed_terminal_jobs(pool, queue)
+        # ids restart at 1 in both tables, so job i belongs to dag i
+        await pool.execute(
+            "UPDATE jorb SET dag_id = id WHERE id % $1 <> 0", self.JOB_EVERY
+        )
+        await settle(pool)
+        await pool.execute("VACUUM (ANALYZE) jorb_dag")
+
+    async def explain_sweep(self, pool, retention_days: float) -> str:
+        return await explain_rolled_back(
+            pool,
+            SWEEP_ORPHANED_DAGS_SQL,
+            datetime.timedelta(days=retention_days),
+            BATCH,
+        )
+
+    async def test_nothing_expired_reads_almost_nothing(self, db_pool, unique_queue):
+        """The steady state, and the one that runs every cycle forever."""
+        await self.seed(db_pool, unique_queue)
+
+        plan = await self.explain_sweep(db_pool, retention_days=3650)
+
+        assert "jorb_dag_retention_idx" in plan, plan
+        assert_no_seq_scan(plan, "jorb_dag")
+        assert_no_seq_scan(plan, "jorb")
+        assert rows_removed_by_filter(plan) == 0, plan
+        await assert_reads_far_less_than_a_scan(db_pool, plan, "jorb_dag")
+
+    async def test_a_backlog_is_still_index_driven(self, db_pool, unique_queue):
+        """...and with work to do it must not degrade into a scan of either
+        table: jorb_dag by the retention index, jorb by jorb_dag_idx.
+
+        The rows it discards are DAGs that still have jobs, so the count
+        scales with the batch and the populated fraction -- never with how
+        many DAGs the install has ever run.
+        """
+        await self.seed(db_pool, unique_queue)
+
+        plan = await self.explain_sweep(db_pool, retention_days=0)
+
+        assert "jorb_dag_retention_idx" in plan, plan
+        assert "jorb_dag_idx" in plan, plan
+        assert_no_seq_scan(plan, "jorb_dag")
+        assert_no_seq_scan(plan, "jorb")
+        assert rows_removed_by_filter(plan) < self.JOB_EVERY * BATCH, plan
+
+
+class TestScheduleLogSweepPlan:
+    """The schedule log was the one table with no bound at all, so its sweep
+    is the one most likely to meet a very large backlog on first run."""
+
+    SCHEDULES = 50
+
+    async def seed(self, pool) -> None:
+        await pool.execute("TRUNCATE jorb_schedule RESTART IDENTITY CASCADE")
+        await pool.execute(
+            """
+            INSERT INTO jorb_schedule (name, job_class, cron_expr, next_run)
+            SELECT 'plan-schedule-' || i, 'plan.Job', '* * * * *', now()
+              FROM generate_series(1, $1) i
+            """,
+            self.SCHEDULES,
+        )
+        await pool.execute(
+            """
+            INSERT INTO jorb_schedule_log (schedule_id, schedule_name,
+                                           scheduled_time, actual_time, result)
+            SELECT 1 + (i % $2), 'plan-schedule',
+                   now() - (i % 60) * interval '1 day',
+                   now() - (i % 60) * interval '1 day',
+                   'success'
+              FROM generate_series(1, $1) i
+            """,
+            ROWS,
+            self.SCHEDULES,
+        )
+        await pool.execute("VACUUM (ANALYZE) jorb_schedule_log")
+
+    async def explain_sweep(self, pool, retention_days: float) -> str:
+        return await explain_rolled_back(
+            pool,
+            SWEEP_SCHEDULE_LOG_SQL,
+            datetime.timedelta(days=retention_days),
+            BATCH,
+        )
+
+    async def test_nothing_expired_reads_almost_nothing(self, db_pool):
+        """Ordering by actual_time is what makes this a range probe. Ordering
+        by id would look equivalent -- id ascends with actual_time -- and
+        would make the planner walk the primary key and filter every row in
+        the table to discover that nothing has expired."""
+        await self.seed(db_pool)
+
+        plan = await self.explain_sweep(db_pool, retention_days=3650)
+
+        assert "jorb_schedule_log_retention_idx" in plan, plan
+        assert_no_seq_scan(plan, "jorb_schedule_log")
+        assert rows_removed_by_filter(plan) == 0, plan
+        await assert_reads_far_less_than_a_scan(db_pool, plan, "jorb_schedule_log")
+
+    async def test_a_backlog_is_still_index_driven(self, db_pool):
+        """The whole table expired at once -- the first-run shape.
+
+        The only rows discarded are each schedule's newest, which the sweep
+        refuses to delete, so the discard count is bounded by the number of
+        SCHEDULES and not by the size of the log.
+        """
+        await self.seed(db_pool)
+
+        plan = await self.explain_sweep(db_pool, retention_days=0)
+
+        assert "jorb_schedule_log_retention_idx" in plan, plan
+        # the "keep the newest" refusal is a per-row backwards index-only
+        # probe of (schedule_id, id) -- max(id) for one schedule read off the
+        # end of its own index range -- and not a scan or a hash of the log
+        assert "Index Only Scan Backward using jorb_schedule_log_idx" in plan, plan
+        assert_no_seq_scan(plan, "jorb_schedule_log")
+        assert "Sort" not in plan, plan
+        assert rows_removed_by_filter(plan) <= self.SCHEDULES, plan
+
+
+class TestRetiredWorkerSweepPlan:
+    """One row per worker process start, so this table grows with DEPLOYS --
+    slowly, forever, and entirely unrelated to job throughput."""
+
+    async def seed(self, pool, queue: str) -> None:
+        await seed_terminal_jobs(pool, queue)
+        await pool.execute("TRUNCATE jorb_worker RESTART IDENTITY")
+        await pool.execute(
+            """
+            INSERT INTO jorb_worker (host, pid, queue, started, last_seen,
+                                     shutdown_at)
+            SELECT 'plan-host', i, $2,
+                   now() - (i % 60) * interval '1 day',
+                   now() - (i % 60) * interval '1 day',
+                   now() - (i % 60) * interval '1 day'
+              FROM generate_series(1, $1) i
+            """,
+            ROWS,
+            queue,
+        )
+        await pool.execute("VACUUM (ANALYZE) jorb_worker")
+
+    async def explain_probe(self, pool, retention_days: float) -> str:
+        return await explain_rolled_back(
+            pool,
+            SWEEP_RETIRED_WORKERS_SQL,
+            datetime.timedelta(days=retention_days),
+            BATCH,
+        )
+
+    async def test_nothing_expired_reads_almost_nothing(self, db_pool, unique_queue):
+        await self.seed(db_pool, unique_queue)
+
+        plan = await self.explain_probe(db_pool, retention_days=3650)
+
+        assert "jorb_worker_retention_idx" in plan, plan
+        assert_no_seq_scan(plan, "jorb_worker")
+        assert rows_removed_by_filter(plan) == 0, plan
+        await assert_reads_far_less_than_a_scan(db_pool, plan, "jorb_worker")
+
+    async def test_a_backlog_is_still_index_driven(self, db_pool, unique_queue):
+        await self.seed(db_pool, unique_queue)
+
+        plan = await self.explain_probe(db_pool, retention_days=0)
+
+        assert "jorb_worker_retention_idx" in plan, plan
+        assert_no_seq_scan(plan, "jorb_worker")
+        assert rows_removed_by_filter(plan) == 0, plan
+
+    async def test_the_in_flight_refusal_costs_the_in_flight_set(
+        self, db_pool, unique_queue
+    ):
+        """The refusal is on the DELETE, and it must be paid in IN-FLIGHT
+        jobs rather than in table size.
+
+        jorb.claimed_by has no index and must not get one -- it is written on
+        the claim path, on the hottest table in the system, to answer a
+        question only retention asks. jorb_inflight_idx already covers exactly
+        the two states this refusal cares about, and in-flight work is bounded
+        by the fleet however big the job table grows: the assertion is that
+        the join's inner side reads the in-flight rows and NOT the table.
+
+        Buffers are deliberately not asserted here. This statement is a bulk
+        DELETE, so most of what it touches is the heap and index writes for
+        the rows it is removing -- that cost scales with the batch, which is
+        the point of having a batch.
+        """
+        await self.seed(db_pool, unique_queue)
+        in_flight = await db_pool.fetchval(
+            """
+            WITH picked AS (
+                SELECT id FROM jorb WHERE queue = $1 ORDER BY id LIMIT 25
+            )
+            UPDATE jorb j SET state = 'running', claimed_by = j.id
+              FROM picked p WHERE j.id = p.id
+            RETURNING (SELECT count(*) FROM picked)
+            """,
+            unique_queue,
+        )
+        await settle(db_pool)
+        doomed = [
+            r["id"]
+            for r in await db_pool.fetch(
+                "SELECT id FROM jorb_worker ORDER BY shutdown_at LIMIT $1", BATCH
+            )
+        ]
+
+        plan = await explain_rolled_back(db_pool, DELETE_RETIRED_WORKERS_SQL, doomed)
+
+        assert "jorb_inflight_idx" in plan, plan
+        assert_no_seq_scan(plan, "jorb")
+        assert rows_scanned_by(plan, "jorb_inflight_idx") == in_flight, plan
 
 
 class TestCascadeIndexes:

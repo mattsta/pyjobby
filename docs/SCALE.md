@@ -318,6 +318,28 @@ state, resume is impossible and every checkpoint it holds is dead weight kept
 only for audit — which is why checkpoints get their own, much shorter retention
 window than the job row. See [DXE.md](DXE.md#retention).
 
+### The tables that do not scale with jobs
+
+These grow on their own clocks, which is exactly why they were missed: none of
+them is reachable from a job's `ON DELETE CASCADE`, so job retention could run
+perfectly and leave all three growing forever.
+
+| Table | Grows with | Bounded by |
+|---|---|---|
+| `jorb_dag` | DAG executions | the DAG sweep, once its jobs are gone |
+| `jorb_schedule_log` | schedule *fires* (cron rate, not job rate) | the schedule-log sweep, minus one row per schedule |
+| `jorb_worker` | worker process **starts** — i.e. deploys | the retired-worker sweep |
+
+`jorb_worker` is the one that surprises people: it is a *deployment* clock,
+completely unrelated to throughput. A 100-worker fleet redeployed daily writes
+36,500 rows a year at zero jobs/second.
+
+`jorb_dag` is the one where size was never the point. Its rows are tiny; the
+cost of keeping them was that `jorb_dag_status` LEFT JOINs `jorb`, so a DAG
+whose jobs had aged out reported `total_jobs = 0` **permanently**. That is a
+wrong answer served to an operator, and unlike a slow query it does not
+announce itself.
+
 ---
 
 ## Checklist before running at this rate
@@ -375,10 +397,11 @@ answers here before the harness existed:
 
 ---
 
-## Design decisions on the write path
+## Design decisions on the write path — and on retention
 
 These are recorded because each one is a place where the obvious improvement
-makes the platform slower, and someone will propose it again.
+makes the platform slower (or, for the retention entries, quieter about being
+wrong), and someone will propose it again.
 
 ### Cumulative per-queue counters: rejected
 
@@ -437,6 +460,75 @@ Counters were therefore **renamed** rather than re-typed in place, so a
 dashboard using `rate(pyjobby_jobs_crashed_total[5m])` breaks loudly with a
 missing series instead of quietly reporting garbage. A metric that lies is
 worse than one that is absent.
+
+### An index on `jorb.claimed_by`: rejected, on who pays
+
+Retention cannot delete a worker registry row whose jobs are still `claimed`
+or `running` — `claimed_by` has no foreign key, so removing the row would
+strand that work where neither recovery sweep can find it (the dead-worker
+sweep JOINs `jorb_worker`; the unregistered-claim sweep only looks for
+`claimed_by IS NULL`). The obvious way to ask "does this worker still hold
+anything?" is an index on `jorb.claimed_by`.
+
+Same test as the rollup and the GIN index: **who pays when it is unused.**
+`claimed_by` is written on the claim path, on the hottest table in the
+system, for every job — and the only question anyone asks of it is one
+retention asks a few times a day. A plain index also stores an entry for
+every `queued` job's NULL, and a partial one moves the row in and out of the
+index as its state changes, defeating HOT on exactly the update it is added
+to.
+
+The refusal instead rides `jorb_inflight_idx`, which already exists for the
+reaper and whose partial predicate is exactly `state IN ('claimed',
+'running')`. In-flight work is bounded by the fleet, never by the table:
+measured at 20,000 jobs with 25 in flight, the anti-join's inner side reads
+**25 rows and 3 buffers** — and `tests/test_scale_plans.py` asserts that it
+reads the in-flight set rather than merely "used an index".
+
+### Fixing the empty-DAG report in the view: rejected, in favour of deleting the row
+
+`jorb_dag_status` LEFT JOINs `jorb`, so a DAG whose jobs retention removed
+reports `total_jobs = 0` forever. The cheap fix is an inner join — hide DAGs
+with no jobs — and it is wrong, because **a view cannot tell "never had jobs"
+from "had jobs, they aged out"**. A DAG with no jobs *yet* is a real state:
+`DAGBuilder` writes that row before the jobs it will own, so an inner join
+would hide a DAG from `dag list` exactly while it is being built.
+
+Recording a job count on `jorb_dag` was rejected on the rollup argument
+above: it is a counter maintained by the write path so a read can be cheap.
+
+So the row is **deleted** rather than reinterpreted, and the sweep runs
+immediately after job retention in the same cycle. Because a DAG row is
+created before its own jobs, `created` is always earlier than any of their
+terminal timestamps — so a DAG becomes eligible on the very cycle that
+removes its last job, and the empty-DAG window is one `--check-interval`
+wide instead of unbounded.
+
+### A retention knob per table: rejected
+
+Four job-scoped tables outlive the job cascade (`jorb_mailbox` for live jobs,
+`jorb_dag`, `jorb_schedule_log`, `jorb_worker`) and they all share
+`--retention-days`. Per-table windows were considered and rejected: none of
+them has a lifetime of its own to argue for — they all mean "as long as the
+work they describe" — and four more knobs is four more ways for an install to
+be quietly wrong in a direction nobody checks. `--checkpoint-retention-days`
+stays separate because checkpoints genuinely do have their own lifetime:
+bulkiest rows in the system, useless the instant their job goes terminal.
+
+### `DELETE ... USING (a CTE of victims)`: rejected, measured, three times
+
+Every sweep here **probes for victims by index, then deletes them by primary
+key**, in two statements. The one-statement form reads better and plans
+worse: its second stage is costed against the target table's whole-table
+statistics and hash-joins a **sequential scan** of it against the batch it
+was just handed. Measured at a 20,000-row seed: 1,006 buffers on the
+checkpoint sweep to delete nothing, and 3,300 buffers on the DAG sweep on top
+of the probe to delete 1,000 rows it already had the keys for. A batch is
+bounded; a scan per batch grows with the table forever.
+
+Two statements also mean the delete is **not executed at all** when the probe
+comes back empty — which is the steady state of every retention sweep in the
+system.
 
 ### Claiming a batch per lock acquisition: rejected, on the measurement
 

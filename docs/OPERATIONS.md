@@ -196,6 +196,58 @@ pj-admin queues show NAME
 Controls live in `jorb_queue` and are enforced inside the worker's claim
 statement — changes take effect on the next claim attempt (sub-second).
 
+## Retention: what it deletes, and what it refuses to
+
+Retention is **on by default** (`--retention-days 30`) and runs in the
+monitor. Two windows, and the second one exists because checkpoints are the
+bulkiest rows in the system with the shortest useful life:
+
+| Window | Deletes |
+|---|---|
+| `--retention-days` (30) | terminal jobs — and with them, by cascade, their history, events, mail and checkpoints — plus **the four tables no cascade reaches**: consumed mailbox rows of *live* jobs, emptied DAGs, schedule executions, retired worker registry rows |
+| `--checkpoint-retention-days` (1) | the `jorb_step` checkpoints of terminal jobs, keeping the job row itself |
+
+`0` on either means keep forever; that sweep does not run at all.
+
+**One window covers all four job-scoped tables** rather than a knob per
+table, because none of them has a lifetime of its own to argue for — they all
+mean "as long as the work they describe". Checkpoints get the second knob
+because they genuinely do.
+
+The three tables added last are the ones a cascade can never reach, and two
+of them were leaking an *answer*, not just rows:
+
+* **`jorb_dag`** — jobs point **at** a DAG (`ON DELETE SET NULL`), so
+  deleting jobs never touches it. Left alone, `pj-admin dag list` fills up
+  with DAGs reporting `total_jobs = 0` — DAGs that appear to have run
+  nothing, forever, when in fact they completed and their jobs aged out. A
+  DAG is reaped once it is past the window **and has no jobs left**; one with
+  even a single job, in any state, is kept at any age.
+* **`jorb_schedule_log`** — cascades only from `jorb_schedule`, which you
+  disable rather than delete, so it had no upper bound at all. Each
+  schedule's **most recent execution is never deleted**, however old: a
+  quarterly schedule must not read as "never ran" in
+  `pj-admin schedule history` while `last_run` says otherwise.
+* **`jorb_worker`** — one row per worker *process start*, previously only
+  stamped `shutdown_at`, never removed; a fleet that redeploys daily
+  accumulates rows indefinitely. Only rows that are both retired **and**
+  silent for the whole window are candidates, so a live worker — or one the
+  monitor retired during a blip that then came back — is never touched. A
+  worker that still owns `claimed`/`running` jobs is refused whatever its
+  age, because `claimed_by` carries no foreign key and deleting the row
+  would strand that work where no sweep can find it.
+
+That last point is the general rule: **every retention sweep refuses to
+delete a row something live still needs**, and the refusal is the half worth
+knowing. Job retention already keeps a terminal job that a `waiting` job
+depends on; these keep a populated DAG, a schedule's last execution, and a
+worker with jobs in flight.
+
+Nothing here is an operator action. Watch that the monitor logs
+`caught up` rather than `stopped on its ... budget`
+([TROUBLESHOOTING](TROUBLESHOOTING.md#retention-is-falling-behind)), and set
+`--retention-days` to match your storage budget.
+
 ## Failure playbooks
 
 **A worker host died.** Nothing to do. Its registry heartbeat

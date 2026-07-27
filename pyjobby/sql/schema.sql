@@ -367,6 +367,17 @@ CREATE TABLE jorb_worker (
 
 CREATE INDEX jorb_worker_live_idx ON jorb_worker (last_seen) WHERE shutdown_at IS NULL;
 
+-- Retention. This table holds one row per worker PROCESS START, so a fleet
+-- that restarts on every deploy accumulates rows forever -- nothing here is
+-- ever updated in place across restarts, and shutdown_at only marks a row
+-- dead, it does not remove it. The monitor's sweep asks "which retired
+-- workers aged out?" every cycle and, once caught up, the honest answer is
+-- "none"; without this index it reads the whole registry to say so.
+-- Partial over retired rows only: a live worker is never a candidate, and
+-- the live set is what every other query here cares about.
+CREATE INDEX jorb_worker_retention_idx ON jorb_worker (shutdown_at)
+    WHERE shutdown_at IS NOT NULL;
+
 -- The enqueue trigger's gate: "is anybody on this queue parked, waiting to
 -- be woken?" Partial so the index holds ONLY parked workers -- which is
 -- near-empty exactly when the system is busy and the lookup is hottest.
@@ -438,7 +449,11 @@ CREATE TABLE jorb_history (
     -- leave the largest one growing forever
     job_id  BIGINT      NOT NULL REFERENCES jorb (id) ON DELETE CASCADE,
     at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    event   TEXT        NOT NULL,  -- enqueued|claimed|started|finished|retrying|crashed|cancelled|timeout|requeued|recovered
+    -- enqueued|queued|claimed|running|waiting|finished|crashed|cancelled --
+    -- 'enqueued' on INSERT, otherwise NEW.state::text, so the domain is
+    -- 'enqueued' plus the jorbstate labels and nothing else. See the COMMENT
+    -- below, which is checked against jorbstate by a test.
+    event   TEXT        NOT NULL,
     detail  JSONB       NOT NULL DEFAULT '{}'
 );
 
@@ -454,6 +469,7 @@ ALTER TABLE jorb_history SET (
 
 
 COMMENT ON TABLE jorb_history IS 'Every state transition with worker/epoch/error detail; the per-attempt audit trail (jobs keep one row in jorb for life).';
+COMMENT ON COLUMN jorb_history.event IS 'Domain: enqueued, queued, claimed, running, waiting, finished, crashed, cancelled. That list is exhaustive and machine-checked (tests/test_history_event_domain.py) because record_jorb_history() writes ''enqueued'' on INSERT and NEW.state::text on every other row -- so the domain is ''enqueued'' plus the jorbstate labels, and it changes only when jorbstate does. There is no verb vocabulary here and never was: a retry is a queued row whose detail.from is running, a timeout is a queued or crashed row with detail.error set, and dead-worker recovery is a queued row written by the monitor. Counting ATTEMPTS therefore means counting running rows, which is what pj-admin stats does. The column is TEXT rather than jorbstate purely so enqueued can coexist with the states.';
 
 -- ============================================================================
 -- Recurring schedules (cron) + execution log
@@ -506,7 +522,21 @@ CREATE TABLE jorb_schedule_log (
     jitter_applied_seconds INTEGER
 );
 
+-- One row per schedule EXECUTION, per schedule, forever: this index serves
+-- `pj-admin schedule history NAME` and the "keep the newest execution"
+-- refusal in the retention sweep, both of which are "the last N rows of one
+-- schedule" -- id ascends with actual_time, so a backward scan answers both.
 CREATE INDEX jorb_schedule_log_idx ON jorb_schedule_log (schedule_id, id);
+
+-- Retention. jorb_schedule_log cascades from jorb_schedule, which operators
+-- essentially never delete, so before the sweep this was the one table in the
+-- system with no upper bound at all: a minutely schedule writes ~43k rows a
+-- month and keeps them until the schedule itself is dropped. The sweep filters
+-- on actual_time, so it is indexed on actual_time -- ordering by id instead
+-- would make the planner walk the primary key and filter every row to
+-- discover that nothing has expired, which is the exact pathology
+-- jorb_retention_idx exists to prevent on jorb.
+CREATE INDEX jorb_schedule_log_retention_idx ON jorb_schedule_log (actual_time);
 
 -- ============================================================================
 -- DAG orchestration
@@ -518,6 +548,25 @@ CREATE TABLE jorb_dag (
     completed   TIMESTAMPTZ,
     metadata    JSONB NOT NULL DEFAULT '{}'
 );
+
+-- Retention, and it is a CORRECTNESS index, not just a storage one. A DAG is
+-- the PARENT here (jorb.dag_id is the child side, ON DELETE SET NULL), so
+-- deleting jobs never touches this table: without a sweep a DAG row outlives
+-- every job it describes, and jorb_dag_status -- a LEFT JOIN -- then reports
+-- it as total_jobs = 0 forever. That is a wrong answer, not a stale one, and
+-- it is what `pj-admin dag list` shows an operator. The sweep reaps DAGs that
+-- have outlived the retention window AND have no jobs left; it filters and
+-- orders on created, so that is what is indexed.
+--
+-- created, not completed: a DAG whose jobs all crashed never completes at
+-- all, and created is the only clock every DAG has. It is also always
+-- EARLIER than any of its jobs' terminal times (the jobs are created inside
+-- the same transaction, after this row), so a DAG becomes eligible in the
+-- same cycle that retention removes its last job -- the empty-DAG window is
+-- one monitor cycle wide instead of unbounded.
+CREATE INDEX jorb_dag_retention_idx ON jorb_dag (created);
+
+COMMENT ON TABLE jorb_dag IS 'One row per DAG execution, holding only what is not on the jobs themselves (name, metadata, completion). Its jobs point AT it (jorb.dag_id, ON DELETE SET NULL), so its lifetime is bounded by the monitor''s DAG sweep and not by any cascade: see jorb_dag_retention_idx.';
 
 CREATE TABLE jorb_dependencies (
     job_id     BIGINT NOT NULL REFERENCES jorb (id) ON DELETE CASCADE,
@@ -532,9 +581,20 @@ CREATE TABLE jorb_dependencies (
 -- exactly what retention does in bulk.
 CREATE INDEX jorb_dependencies_depends_on_idx ON jorb_dependencies (depends_on);
 
+-- SET NULL and not CASCADE, deliberately: dropping a DAG row must never
+-- delete jobs. The direction that matters for retention is the other one --
+-- deleting a job leaves this parent behind, which is why jorb_dag needs a
+-- sweep of its own (see jorb_dag_retention_idx).
 ALTER TABLE jorb ADD CONSTRAINT jorb_dag_fk
     FOREIGN KEY (dag_id) REFERENCES jorb_dag (id) ON DELETE SET NULL;
 
+-- LEFT JOIN, and it stays a LEFT JOIN: a DAG with no jobs is a real state
+-- during construction, and an inner join would hide a DAG from `dag list`
+-- exactly while its jobs are being created. The failure mode this shape has
+-- -- a DAG whose jobs retention removed reporting total_jobs = 0 forever --
+-- is fixed by REMOVING the row (sweep_orphaned_dags), not by hiding it: a
+-- view cannot tell "never had jobs" from "had jobs, they aged out", so any
+-- answer it invents for one is wrong for the other.
 CREATE VIEW jorb_dag_status AS
     SELECT d.id AS dag_id,
            d.name,
