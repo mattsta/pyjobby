@@ -260,6 +260,9 @@ keeping up" is a survival question at this rate and nothing else answers it.
 * **Enqueue.** 67k rows/s measured against a 278/s requirement.
 * **Fencing.** `run_epoch` comparisons are per-row and add nothing measurable.
 * **Cascade deletes** — now that every foreign key has a leading index.
+* **Resolving the job class.** 0.49 µs/job from the class cache, and the
+  `--reload` dev flag adds 5 µs — measured, not assumed; see
+  [Caching the resolved job class](#caching-the-resolved-job-class-and-what-the-reload-flag-costs).
 
 ### The one caveat on capped queues
 
@@ -316,7 +319,7 @@ Per million jobs, with an average of 3 steps each:
 `jorb_step` exists to make a job **resumable**. Once the job reaches a terminal
 state, resume is impossible and every checkpoint it holds is dead weight kept
 only for audit — which is why checkpoints get their own, much shorter retention
-window than the job row. See [DXE.md](DXE.md#retention).
+window than the job row. See [DXE.md](DXE.md#retention-checkpoints-outlive-the-run-but-not-the-job).
 
 ### The tables that do not scale with jobs
 
@@ -377,6 +380,9 @@ pj-bench claim      # claim throughput, advisory-lock contention, and what a
 pj-bench e2e        # completed jobs/sec and enqueue->finished p50/p95/p99
 pj-bench notify     # notifications per lifecycle, per channel, + queue usage
 pj-bench plans      # EXPLAINs every hot query; exits non-zero on a seq scan
+pj-bench resolve    # per-job class resolution, four interleaved arms: cached,
+                    # the --reload mtime check, no cache at all, and a real
+                    # re-import (--resolutions / --reloads)
 pj-bench all --json # everything, machine-readable, for diffing runs
 ```
 
@@ -606,3 +612,83 @@ rollup above: not "is it cheap", but *who pays when it is unused*.
 
 Until one of those is a measurement rather than a worry, the ceiling is not
 where this platform runs out.
+
+### Caching the resolved job class, and what the reload flag costs
+
+A worker turns `jorb.job_class` — a dotted path carried on every job row — into
+a class object once per job, in `JobSystem.resolve_job_class`. That result is
+cached. With the `--reload` dev flag the resolver first stats the module's
+source file and re-imports only when the mtime has moved.
+
+The cache was added for **correctness**: an unconditional `importlib.reload` was
+re-executing job modules between jobs, re-evaluating decorators and breaking
+Hypothesis tests. Its effect on throughput was never measured, and "turn
+`--reload` off in production" has been folklore ever since. Measured with
+`pj-bench resolve --repeat 7 --resolutions 50000 --reloads 2000`, four arms
+**interleaved** (median of 7, Python 3.14, PostgreSQL 18.3, 10-core box under
+load ~3):
+
+| arm | µs/job | vs cached | ceiling, if resolution were the only work |
+|---|---|---|---|
+| cached — `--reload` off | **0.49** | — | 2,020,000 jobs/s |
+| `--reload` on, module unchanged: the mtime **check** | **5.5** | 11× | 182,000 jobs/s |
+| no class cache: `pydoc.locate` per job | **7.0** | 14× | 144,000 jobs/s |
+| `--reload` on, module edited: the **reload** | **104** | 211× | 9,600 jobs/s |
+
+Rows two and four are different questions and the gap between them is the flag's
+whole design. **The check is what a production worker with `--reload` left on
+pays on every job. The reload is what a developer pays on the first job after
+each edit** — and, before the cache existed, what every job paid.
+
+**`--reload` is safe to leave on, on throughput grounds.** Five microseconds
+against a measured `claim->finished` p50 of ~1 ms is 0.5% of a job, under a
+benchmark whose own round-to-round spread is 4–15%. As a ceiling it permits
+182,000 jobs/s in one worker process — about 10× the platform's entire uncapped
+claim ceiling of 19,037 claims/s, so the flag cannot become the binding
+constraint before claiming does.
+
+It stays off by default anyway, and the reason is not throughput: a flag that
+re-executes module-level code whenever a file's mtime moves will do that under
+running jobs, on a deploy that rsyncs into a live tree. That argument stands on
+its own. The throughput argument never existed.
+
+**What the cache is worth is mostly correctness too — but not entirely.**
+Dropping it costs 6.5 µs/job (14×), which is still a 144,000 jobs/s ceiling and
+would not be visible end to end. Making resolution *unconditional* in the old
+sense — `importlib.reload` on every job — costs 104 µs and implies **9,600
+jobs/s, below the 19,037 claims/s the claim path sustains**. That is the shape
+that turns a per-job overhead into the system's bottleneck, and it is the number
+the correctness fix also bought.
+
+**Why this is not measured through `pj-bench e2e`,** which is the window the
+cost actually lands in: e2e is the honest window and a dishonest instrument. Its
+spread is percent-scale on a p50 of milliseconds and the effect is microseconds,
+three orders of magnitude under its own noise floor. An e2e comparison could
+only ever return "no difference" — and there, "no difference" is
+indistinguishable from "the flag never reached the workers" and from "the
+harness is broken". A measurement with no failure mode is not a measurement.
+Two runs at 200 jobs on 4 workers landed at 1,454 jobs/s with the flag off and
+1,497 with it on; the flag-on run was *faster*, which is the noise floor
+demonstrating itself. `pj-bench e2e --reload` exists for exactly that smell test
+and is documented as not being an arm.
+
+**What would change these answers**, in the order it is likely to arrive:
+
+1. **A different operating system.** The check is two `stat()` calls, so its
+   cost belongs to the kernel and the filesystem rather than to this platform —
+   5 µs is APFS on macOS. A Linux box with a warm dentry cache stats faster, and
+   unusually for this document the *ratio* will not travel either, because its
+   numerator is a syscall and its denominator is a dict lookup. Re-take it with
+   `pj-bench resolve`; do not quote this row.
+2. **A jobs module that does real work at import time.** `importlib.reload`
+   re-executes only the target module — everything it imports is already in
+   `sys.modules` and costs a dict lookup — so 104 µs is a **floor**, measured on
+   a four-class file. A module that builds a client or reads config at import
+   time pays that on every edit, and would have paid it on every job.
+   `pj-bench resolve`'s own reload is warm, too: page cache hot, bytecode
+   already compiled. A developer's first edit after a cold boot costs more, and
+   that number belongs to their filesystem.
+3. **Jobs short enough for 5 µs to matter.** At the 278 jobs/s reference
+   workload the per-job budget is 3.6 ms and the flag is 0.14% of it. A claim
+   round trip alone is longer than 5 µs, so a job this cheap does not exist
+   here.

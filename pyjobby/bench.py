@@ -14,6 +14,8 @@ from zero.
     pj-bench e2e     --jobs 200       real worker processes, real latency
     pj-bench notify                   notifications per job lifecycle
     pj-bench plans   --seed 20000     EXPLAIN every hot query (CI gate)
+    pj-bench resolve                  what resolving a job class costs per
+                                      job: the cache, and what --reload adds
     pj-bench all                      everything, with a summary table
 
 ``--json`` on every subcommand emits stable key names for CI and for
@@ -30,6 +32,12 @@ CASCADE. Nothing here ever runs TRUNCATE, ever issues an unqualified
 DELETE, and never touches a row outside its own queue. The only global
 state it writes is a ``jorb_queue`` control row for its own queue name,
 deleted in the same ``finally``.
+
+Two subcommands also write outside the database, both into a temporary
+directory removed in a ``finally``: ``pj-bench e2e`` writes the config file
+its real worker processes read, and ``pj-bench resolve`` writes the
+throwaway jobs module it re-imports (and takes it back off ``sys.path`` and
+out of ``sys.modules``, which its ``cleanup`` block reports).
 
 Two things are deliberately global while a run is in flight, both restored:
 
@@ -77,10 +85,12 @@ import asyncio
 import atexit
 import contextlib
 import datetime
+import importlib
 import json
 import math
 import os
 import re
+import shutil
 import signal
 import statistics
 import sys
@@ -94,6 +104,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 import asyncpg  # type: ignore[import-untyped]
 import click
+from loguru import logger
 
 from . import db, monitor
 from .cli import (
@@ -105,7 +116,7 @@ from .cli import (
 )
 from .configloader import load_config_from_file
 from .monitor import TERMINAL_STATES
-from .pj import STMTS, Job
+from .pj import STMTS, Job, JobSystem
 
 DEFAULT_CONFIG = "./pyjobby.conf.py"
 
@@ -1321,6 +1332,7 @@ async def _e2e_round(
     jobs: int,
     workers: int,
     timeout: float,
+    reload_jobs: bool = False,
 ) -> dict[str, Any]:
     """Enqueue, run real ``pj`` workers, and measure what came out.
 
@@ -1335,6 +1347,8 @@ async def _e2e_round(
     await conn.execute(ENQUEUE_SQL, BENCH_JOB_CLASS, queue, jobs)
 
     args = ["pj", "--config", config_path, "--workers", str(workers)]
+    if reload_jobs:
+        args.append("--reload")
     for _ in range(workers):
         args.extend(["--queue", queue])
 
@@ -1440,6 +1454,7 @@ async def run_e2e(
     timeout: float,
     max_existing_jobs: int,
     force: bool,
+    reload_jobs: bool = False,
 ) -> dict[str, Any]:
     """The headline number: completed jobs/sec through real processes.
 
@@ -1448,6 +1463,13 @@ async def run_e2e(
     benchmark deliberately creates; ``claim_to_finished`` is what the worker
     itself costs. Reporting only the first makes a fast platform look slow
     at any queue depth; reporting only the second hides the queue.
+
+    ``reload_jobs`` starts the fleet with ``pj --reload``. It is a smell
+    test, not the measurement: what that flag costs is measured per call by
+    ``pj-bench resolve``, and comparing two separate ``e2e`` invocations is
+    precisely the un-interleaved before/after shape docs/TESTING.md rule 3
+    exists to forbid. The flag is recorded in the JSON so a run cannot be
+    mistaken for the other one.
     """
     queue = bench_queue("e2e")
     conn = await open_connection(target)
@@ -1459,11 +1481,19 @@ async def run_e2e(
         with worker_config(target) as config_path:
             if warmup:
                 warmup_round = await _e2e_round(
-                    conn, config_path, queue, min(jobs, 20), workers, timeout
+                    conn,
+                    config_path,
+                    queue,
+                    min(jobs, 20),
+                    workers,
+                    timeout,
+                    reload_jobs,
                 )
             for _ in range(repeat):
                 rounds.append(
-                    await _e2e_round(conn, config_path, queue, jobs, workers, timeout)
+                    await _e2e_round(
+                        conn, config_path, queue, jobs, workers, timeout, reload_jobs
+                    )
                 )
 
         rates = [r["jobs_per_second"] for r in rounds]
@@ -1477,6 +1507,7 @@ async def run_e2e(
                 "jobs": jobs,
                 "workers": workers,
                 "repeat": repeat,
+                "reload_jobs": reload_jobs,
                 "guard": guard,
                 "warmup": warmup_round,
                 "rounds": rounds,
@@ -2569,6 +2600,407 @@ async def run_plans(
 
 
 # =========================================================================
+# 6. resolve — what turning a dotted path into a class costs, per job
+# =========================================================================
+
+#: A worker resolves ``jorb.job_class`` — a dotted path on every job row — to
+#: a class object once per job, in ``JobSystem.resolve_job_class``. That
+#: result is cached, and with the ``--reload`` dev flag the resolver also
+#: stats the module's source file so an edit takes effect on the next job.
+#:
+#: Neither number had ever been measured. The cache was added for
+#: CORRECTNESS — an unconditional ``importlib.reload`` was re-executing
+#: decorators between jobs and breaking Hypothesis tests — and "so turn
+#: --reload off in production" has been advice rather than a finding ever
+#: since. These arms make both of them numbers.
+#:
+#: WHY NOT A ``--reload`` VARIANT OF ``pj-bench e2e``, which is where this
+#: cost actually lands: resolution happens once per job inside
+#: claim→finished, so e2e is the honest WINDOW and a dishonest INSTRUMENT.
+#: e2e's own round-to-round spread is percent-scale on a p50 of
+#: milliseconds; the effect here is microseconds, three to four orders of
+#: magnitude under that noise floor. An e2e comparison could only ever
+#: return "no difference", and "no difference" there is indistinguishable
+#: from "the flag was never passed to the workers" and from "the harness is
+#: broken" — a measurement with no failure mode is not a measurement.
+#: Timing the call directly returns a number with a spread, and the e2e p50
+#: is then what turns it into a share of a job. ``pj-bench e2e --reload``
+#: exists as a smell test (a real fleet, flag on), explicitly not as an arm.
+
+
+#: The throwaway jobs module ``pj-bench resolve`` re-imports. It is written
+#: to a temporary directory, put on ``sys.path``, and both are removed in a
+#: ``finally`` — the same shape as ``worker_config()`` above, and for the
+#: same reason: the subject is a DEVELOPER'S jobs file and the installed
+#: package does not contain one to borrow. Reloading ``pyjobby.bench``
+#: instead would re-execute the module this benchmark is running inside,
+#: rebinding its own globals mid-run.
+#:
+#: ``importlib.reload`` re-executes ONLY this module — everything it imports
+#: is already in ``sys.modules`` and costs a dict lookup — so the reload arm
+#: is set by the top-level statements here and by nothing else. Four small
+#: classes is a modest jobs file. A module that defines forty job classes,
+#: or builds a client at import time, pays more. **Read the reload arm as a
+#: floor, not as a typical cost.**
+RESOLVE_JOB_SOURCE = '''\
+"""Generated by `pj-bench resolve`; safe to delete."""
+
+from pyjobby.pj import Job
+
+DEFAULT_N = 0
+
+
+class ResolveBenchJob(Job):
+    """The class `pj-bench resolve` resolves over and over."""
+
+    async def task(self, n: int = DEFAULT_N) -> dict[str, int]:
+        return {"n": n}
+
+
+class ResolveBenchJobTwo(Job):
+    async def task(self, n: int = DEFAULT_N) -> dict[str, int]:
+        return {"n": n}
+
+
+class ResolveBenchJobThree(Job):
+    async def task(self, n: int = DEFAULT_N) -> dict[str, int]:
+        return {"n": n}
+
+
+class ResolveBenchJobFour(Job):
+    async def task(self, n: int = DEFAULT_N) -> dict[str, int]:
+        return {"n": n}
+'''
+
+#: A reload costs orders of magnitude more than a cached lookup, so running
+#: it as many times as the cheap arms would spend the whole run inside one
+#: arm and force everyone's ``--repeat`` down to fit. Per-arm iteration
+#: counts are safe here because every arm is reduced to a PER-RESOLUTION
+#: cost before anything is compared.
+DEFAULT_RESOLVE_RELOADS = 500
+
+
+@dataclass(frozen=True)
+class ResolveModule:
+    """The generated jobs module, and proof it was cleaned up afterwards."""
+
+    module_name: str
+    klass: str
+    directory: str
+
+    def cleanup_report(self) -> dict[str, Any]:
+        """What ``resolve`` removed — asserted by tests, not just claimed.
+
+        Three separate places have to be put back, and leaving any one of
+        them behind leaks into the calling process rather than into the
+        database: the directory, the ``sys.path`` entry, and the imported
+        module object. ``jobs_deleted``/``workers_deleted`` are here and
+        always zero because this subcommand writes no rows at all, and a
+        consumer reading every benchmark's ``cleanup`` block should get the
+        same keys back rather than a KeyError.
+        """
+        return {
+            "jobs_deleted": 0,
+            "workers_deleted": 0,
+            "job_module_dir": self.directory,
+            "job_module_removed": not os.path.exists(self.directory),
+            "off_sys_path": self.directory not in sys.path,
+            "out_of_sys_modules": self.module_name not in sys.modules,
+        }
+
+
+@contextlib.contextmanager
+def resolve_job_module() -> Iterator[ResolveModule]:
+    """Write, import-enable, and afterwards fully remove a jobs module.
+
+    The module name carries a random suffix so a second run in the same
+    interpreter (the test suite does exactly this) cannot resolve the first
+    run's cached module object and measure nothing.
+    """
+    directory = tempfile.mkdtemp(prefix="pjbench_jobs_")
+    module_name = f"pjbench_jobs_{uuid.uuid4().hex[:8]}"
+    module = ResolveModule(
+        module_name=module_name,
+        klass=f"{module_name}.ResolveBenchJob",
+        directory=directory,
+    )
+    try:
+        with open(os.path.join(directory, f"{module_name}.py"), "w") as handle:
+            handle.write(RESOLVE_JOB_SOURCE)
+        sys.path.insert(0, directory)
+        # The import system caches a directory's listing by mtime with
+        # one-second granularity, so a file written into a directory it has
+        # already scanned this second is invisible without this.
+        importlib.invalidate_caches()
+        try:
+            yield module
+        finally:
+            with contextlib.suppress(ValueError):
+                sys.path.remove(directory)
+            sys.modules.pop(module_name, None)
+            importlib.invalidate_caches()
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+@dataclass(frozen=True)
+class ResolveArm:
+    """One branch of ``resolve_job_class``, and what it means in production.
+
+    ``drop_cache`` and ``stale_mtime`` are how an arm forces the resolver
+    down its branch on every call: dropping the cache entry is a worker with
+    no class cache at all, and zeroing the recorded mtime is exactly what
+    the resolver reads as "the source file moved" — without a ``utime()``
+    syscall inside the timed loop, which would be measured as though it were
+    part of the reload.
+    """
+
+    key: str
+    what: str
+    means: str
+    reload_jobs: bool
+    drop_cache: bool
+    stale_mtime: bool
+    reloads: bool
+
+
+RESOLVE_ARMS = (
+    ResolveArm(
+        key="cached",
+        what="--reload off, class already resolved: a dict hit",
+        means="what a production worker pays per job today",
+        reload_jobs=False,
+        drop_cache=False,
+        stale_mtime=False,
+        reloads=False,
+    ),
+    ResolveArm(
+        key="reload_check",
+        what="--reload on, module untouched: the mtime CHECK and no import",
+        means="what a production worker with --reload left on pays per job",
+        reload_jobs=True,
+        drop_cache=False,
+        stale_mtime=False,
+        reloads=False,
+    ),
+    ResolveArm(
+        key="uncached",
+        what="no class cache: pydoc.locate() per job, module already imported",
+        means="what a refactor that dropped _class_cache would cost per job",
+        reload_jobs=False,
+        drop_cache=True,
+        stale_mtime=False,
+        reloads=False,
+    ),
+    ResolveArm(
+        key="reload_fire",
+        what="--reload on and the source looks edited: importlib.reload plus "
+        "pydoc.locate, every call",
+        means="what a developer pays on the first job after each edit — and "
+        "what the pre-cache resolver paid on EVERY job",
+        reload_jobs=True,
+        drop_cache=False,
+        stale_mtime=True,
+        reloads=True,
+    ),
+)
+
+
+def _resolve_round(arm: ResolveArm, klass: str, resolutions: int) -> dict[str, Any]:
+    """One arm, one round: ``resolutions`` calls of the real resolver.
+
+    The first resolution happens OUTSIDE the timer, deliberately. It is the
+    cold one — source read off disk, compiled, executed — and no arm here is
+    measuring that: ``cached`` and ``reload_check`` are steady-state
+    questions, and ``uncached`` and ``reload_fire`` re-pay their own cost
+    inside every iteration by construction.
+
+    The two ``if``s in the loop are constant per arm and present in all four
+    arms, so the loop's own overhead is identical everywhere and cancels out
+    of every difference this subcommand reports. They are inside the timer
+    because the alternative is timing each call individually, and a
+    ``perf_counter`` pair costs more than the entire cached call.
+
+    ``re_imported`` is how an arm PROVES it drove the branch it is named
+    after: ``importlib.reload`` rebuilds the class object, so a round that
+    really re-imported ends holding a different class than it started with,
+    while re-locating a module that is already in ``sys.modules`` hands back
+    the same object. An arm that quietly stopped reloading would otherwise
+    measure the mtime check and publish it as the cost of an import — wrong
+    by two orders of magnitude, with nothing failing.
+    """
+    system = JobSystem(
+        dsn={},
+        qname="pjbench_resolve",
+        capabilities=("pjbench",),
+        workerId=0,
+        reload_jobs=arm.reload_jobs,
+    )
+    primed = system.resolve_job_class(klass)
+
+    # Private on purpose: these two dicts ARE the mechanism under test, and
+    # the arms exist to drive the resolver down each of its branches.
+    cache = system._class_cache
+    mtimes = system._class_mtimes
+    drop = arm.drop_cache
+    stale = arm.stale_mtime
+
+    started = time.perf_counter()
+    for _ in range(resolutions):
+        if drop:
+            cache.pop(klass, None)
+        if stale:
+            mtimes[klass] = 0.0
+        system.resolve_job_class(klass)
+    elapsed = time.perf_counter() - started
+    return {
+        "seconds": elapsed,
+        "resolutions": resolutions,
+        # Outside the timer, and a plain identity check: see the docstring.
+        "re_imported": system.resolve_job_class(klass) is not primed,
+    }
+
+
+def _resolve_arm_report(
+    arm: ResolveArm, rounds: Sequence[dict[str, Any]], resolutions: int
+) -> dict[str, Any]:
+    summary = summarize([r["seconds"] for r in rounds])
+    per_resolution = summary["median"] / resolutions if resolutions else 0.0
+    return {
+        "what": arm.what,
+        "means": arm.means,
+        "resolutions": resolutions,
+        # Measured, not declared: whether the class object actually changed
+        # under this arm. It must equal ``arm.reloads``, and tests assert
+        # that it does -- an arm whose name and behaviour drifted apart is
+        # how a benchmark starts publishing the wrong number silently.
+        "re_imported": bool(rounds) and all(r["re_imported"] for r in rounds),
+        "declares_reimport": arm.reloads,
+        "seconds": summary,
+        "per_resolution_us": per_resolution * 1e6,
+        # The spread belongs to the per-resolution figure too: it is the same
+        # sample divided by a constant, and a median quoted without it is
+        # the failure mode docs/TESTING.md rule 3 is about.
+        "spread_pct": summary["spread_pct"],
+        # If resolution were the only thing a worker did. Not a throughput
+        # claim — a ceiling, and the only form in which a per-call cost can
+        # be compared against a jobs/second requirement at all.
+        "implied_ceiling_jobs_per_second": (
+            1.0 / per_resolution if per_resolution else 0.0
+        ),
+        "pct_of_reference_job_budget": per_resolution * SCALE_TARGET_RATE * 100.0,
+    }
+
+
+async def run_resolve(
+    target: Target,
+    *,
+    resolutions: int,
+    reloads: int,
+    repeat: int,
+    warmup: bool,
+    max_existing_jobs: int,
+    force: bool,
+) -> dict[str, Any]:
+    """Per-job class resolution: cached, reload-checking, and reloading.
+
+    This is the one subcommand that writes nothing to the database, and it
+    still opens a connection and runs the busy-database guard. That is not
+    ceremony: it is a CPU measurement, and a database busy running real work
+    is a box whose CPU it would be competing for — which lands on the ratio
+    just as row contention would. ``--force`` still overrides, loudly.
+
+    WHAT THE WARM-UP ROUND DOES AND DOES NOT ABSORB, because here that
+    matters more than usual: import cost is the subject, not the noise.
+
+    * It absorbs the interpreter's warm-up — the generated module's first
+      compile to bytecode, its first read off a cold page cache, and CPython
+      specialising the code paths involved.
+    * It does NOT absorb the import cost being measured. ``uncached`` and
+      ``reload_fire`` re-pay theirs on every iteration by construction, so
+      there is nothing for a warm-up to amortise away.
+    * Neither does it stand between any arm and a cold first touch: each
+      round primes the cache outside its own timer, so no measured window
+      ever contains the very first import — including in the first measured
+      round, and including with ``--no-warmup``.
+
+    So what the reload arm reports is a WARM reload: the source is in the
+    page cache and its bytecode is already compiled. A developer's first
+    edit after a cold boot costs more, and that number belongs to their
+    filesystem rather than to this platform.
+    """
+    conn = await open_connection(target)
+    try:
+        guard = await guard_busy_database(conn, limit=max_existing_jobs, force=force)
+    finally:
+        await conn.close()
+
+    by_arm: dict[str, list[dict[str, Any]]] = {arm.key: [] for arm in RESOLVE_ARMS}
+    warmup_rounds: dict[str, Any] = {}
+    counts = {arm.key: reloads if arm.reloads else resolutions for arm in RESOLVE_ARMS}
+
+    with resolve_job_module() as module:
+        # A real reload writes one log line, and this loop drives hundreds of
+        # them. Its cost is the SINK's — a terminal is milliseconds, a log
+        # file is microseconds — and a real worker pays it once per edit
+        # rather than once per job, so leaving it in would report the
+        # operator's terminal as the cost of importlib.
+        logger.disable("pyjobby")
+        try:
+            # INTERLEAVED. Running every cached round before every reload
+            # round would land whatever else the box picked up in between on
+            # the ratio, which is the whole reported result here.
+            if warmup:
+                for arm in RESOLVE_ARMS:
+                    warmup_rounds[arm.key] = _resolve_round(
+                        arm, module.klass, max(1, counts[arm.key] // 10)
+                    )
+            for _ in range(repeat):
+                for arm in RESOLVE_ARMS:
+                    by_arm[arm.key].append(
+                        _resolve_round(arm, module.klass, counts[arm.key])
+                    )
+        finally:
+            logger.enable("pyjobby")
+
+    arms = {
+        arm.key: _resolve_arm_report(arm, by_arm[arm.key], counts[arm.key])
+        for arm in RESOLVE_ARMS
+    }
+    cached = arms["cached"]["per_resolution_us"]
+
+    def against_cached(key: str) -> dict[str, Any]:
+        """One arm read against the cached path, which is the baseline every
+        question here is really asking about."""
+        value = arms[key]["per_resolution_us"]
+        return {
+            "extra_us_per_job": value - cached,
+            "ratio": (value / cached) if cached else 0.0,
+            "pct_of_reference_job_budget": (
+                (value - cached) / 1e6 * SCALE_TARGET_RATE * 100.0
+            ),
+        }
+
+    return {
+        "benchmark": "resolve",
+        "database": target.label,
+        "resolutions": resolutions,
+        "reloads": reloads,
+        "repeat": repeat,
+        "guard": guard,
+        "job_class": module.klass,
+        "warmup": warmup_rounds or None,
+        "arms": arms,
+        # The three questions, in the order they get asked.
+        "reload_flag_cost": against_cached("reload_check"),
+        "cache_saving": against_cached("uncached"),
+        "reload_cost": against_cached("reload_fire"),
+        "target_rate": SCALE_TARGET_RATE,
+        "cleanup": module.cleanup_report(),
+    }
+
+
+# =========================================================================
 # Output
 # =========================================================================
 
@@ -2959,6 +3391,17 @@ def claim_cmd(
     show_default=True,
     help="Seconds to wait for the queue to drain before giving up",
 )
+@click.option(
+    "--reload",
+    "reload_jobs",
+    is_flag=True,
+    help="Start the fleet with `pj --reload`, so every job re-checks its "
+    "module's mtime. A SMELL TEST, not a measurement: the effect is "
+    "microseconds against a claim->finished p50 in milliseconds, so it is "
+    "far under this benchmark's own spread, and comparing two separate runs "
+    "is the un-interleaved shape docs/TESTING.md rule 3 forbids. What the "
+    "flag costs is measured per call by `pj-bench resolve`.",
+)
 @click.pass_context
 def e2e_cmd(
     ctx: click.Context,
@@ -2972,6 +3415,7 @@ def e2e_cmd(
     jobs: int,
     workers: int,
     timeout: float,
+    reload_jobs: bool,
 ) -> None:
     """End-to-end throughput and latency with REAL worker processes."""
     target = resolve_target(pick(ctx, config, "config"), pick(ctx, dsn, "dsn"))
@@ -2985,6 +3429,7 @@ def e2e_cmd(
             timeout=timeout,
             max_existing_jobs=max_existing_jobs,
             force=force,
+            reload_jobs=reload_jobs,
         )
     )
     latency = result["enqueue_to_finished"]
@@ -2995,6 +3440,12 @@ def e2e_cmd(
         [
             ["worker processes", fmt(result["workers"])],
             ["jobs per run", fmt(result["jobs"])],
+            [
+                "pj --reload",
+                "ON (smell test; see `pj-bench resolve` for the cost)"
+                if result["reload_jobs"]
+                else "off",
+            ],
             ["completed jobs/s", fmt(result["jobs_per_second"]["median"], 2)],
             ["spread", f"{result['jobs_per_second']['spread_pct']:.0f}%"],
             ["headroom vs 278/s", f"{result['headroom_vs_target_rate']:.2f}x"],
@@ -3179,6 +3630,95 @@ def plans_cmd(
         raise SystemExit(1)
 
 
+@cli.command("resolve")
+@db_options
+@timing_options
+@click.option(
+    "--resolutions",
+    default=20000,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Calls per round for the arms that do not re-import",
+)
+@click.option(
+    "--reloads",
+    default=DEFAULT_RESOLVE_RELOADS,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Calls per round for the arm that DOES re-import. Lower on purpose: "
+    "a reload costs orders of magnitude more than a cached lookup, and every "
+    "arm is reduced to a per-resolution cost before anything is compared.",
+)
+@click.pass_context
+def resolve_cmd(
+    ctx: click.Context,
+    dsn: str | None,
+    config: str | None,
+    output_json: bool,
+    force: bool,
+    max_existing_jobs: int,
+    repeat: int,
+    warmup: bool,
+    resolutions: int,
+    reloads: int,
+) -> None:
+    """What resolving a job class costs per job, and what --reload adds."""
+    target = resolve_target(pick(ctx, config, "config"), pick(ctx, dsn, "dsn"))
+    result = run_command(
+        run_resolve(
+            target,
+            resolutions=resolutions,
+            reloads=reloads,
+            repeat=repeat,
+            warmup=warmup,
+            max_existing_jobs=max_existing_jobs,
+            force=force,
+        )
+    )
+    emit(result, output_json, resolve_table(result))
+
+
+def resolve_table(result: dict[str, Any]) -> list[list[str]]:
+    """Four arms, then the three questions they were run to answer."""
+    arms = result["arms"]
+
+    def arm_row(key: str) -> list[str]:
+        arm = arms[key]
+        return [
+            f"  {key}",
+            f"{arm['per_resolution_us']:.3f} us/job "
+            f"(spread {arm['spread_pct']:.0f}%, "
+            f"ceiling {arm['implied_ceiling_jobs_per_second']:,.0f} jobs/s) "
+            f"— {arm['means']}",
+        ]
+
+    def question(label: str, key: str) -> list[str]:
+        block = result[key]
+        return [
+            label,
+            f"{block['extra_us_per_job']:+.3f} us/job ({block['ratio']:.2f}x, "
+            f"{block['pct_of_reference_job_budget']:.4f}% of the per-job "
+            f"budget at {result['target_rate']:.0f} jobs/s)",
+        ]
+
+    return [
+        [
+            "per-job class resolution",
+            f"{result['repeat']} interleaved rounds; medians",
+        ],
+        *(arm_row(arm.key) for arm in RESOLVE_ARMS),
+        question("--reload costs a production worker", "reload_flag_cost"),
+        question("the class cache saves", "cache_saving"),
+        question("one reload, after an edit", "reload_cost"),
+        [
+            "what the reload number is NOT",
+            "a cold import: the module is in the page cache and its bytecode "
+            "is compiled. It is also a FLOOR — reload re-executes the job "
+            "module's top level, so a bigger jobs file costs more.",
+        ],
+    ]
+
+
 @cli.command("all")
 @db_options
 @timing_options
@@ -3196,6 +3736,8 @@ def plans_cmd(
 @click.option("--lifecycles", default=200, show_default=True)
 @click.option("--target-rate", default=SCALE_TARGET_RATE, show_default=True)
 @click.option("--seed", default=20000, show_default=True, help="plans: rows to seed")
+@click.option("--resolutions", default=20000, show_default=True)
+@click.option("--reloads", default=DEFAULT_RESOLVE_RELOADS, show_default=True)
 @click.option("--allow-trigger-toggle", is_flag=True, help="See `pj-bench enqueue`.")
 @click.pass_context
 def all_cmd(
@@ -3217,6 +3759,8 @@ def all_cmd(
     lifecycles: int,
     target_rate: float,
     seed: int,
+    resolutions: int,
+    reloads: int,
     allow_trigger_toggle: bool,
 ) -> None:
     """Run every benchmark and print one summary table."""
@@ -3265,6 +3809,15 @@ def all_cmd(
                 target,
                 seed=seed,
                 planner_settings=(),
+                max_existing_jobs=max_existing_jobs,
+                force=force,
+            ),
+            "resolve": await run_resolve(
+                target,
+                resolutions=resolutions,
+                reloads=reloads,
+                repeat=repeat,
+                warmup=warmup,
                 max_existing_jobs=max_existing_jobs,
                 force=force,
             ),
@@ -3321,6 +3874,20 @@ def all_cmd(
             f" unobserved / "
             f"{results['notify']['phases']['observed']['projected_notifications_per_second']:,.0f}"
             f" observed",
+        ],
+        [
+            "class resolution/job (cached)",
+            f"{results['resolve']['arms']['cached']['per_resolution_us']:.3f} us",
+        ],
+        [
+            "  --reload adds",
+            f"{results['resolve']['reload_flag_cost']['extra_us_per_job']:+.3f} us "
+            f"({results['resolve']['reload_flag_cost']['ratio']:.2f}x)",
+        ],
+        [
+            "  the cache saves",
+            f"{results['resolve']['cache_saving']['extra_us_per_job']:+.3f} us "
+            f"({results['resolve']['cache_saving']['ratio']:.2f}x)",
         ],
         [
             "hot query plans",

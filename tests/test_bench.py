@@ -25,6 +25,7 @@ import asyncio
 import json
 import os
 import signal
+import sys
 import traceback
 
 import asyncpg
@@ -402,6 +403,77 @@ class TestSubcommandsEmitDocumentedJson:
         assert payload["cleanup"]["jobs_deleted"] == PLAN_SEED
         assert await db_pool.fetchval("SELECT count(*) FROM jorb") == 0
 
+    async def test_resolve(self, db_params):
+        code, payload, output = await run_bench(
+            dsn_from(db_params),
+            "resolve",
+            "--resolutions",
+            "200",
+            "--reloads",
+            "20",
+            "--repeat",
+            "2",
+            "--no-warmup",
+        )
+
+        assert code == 0, output
+        assert payload["benchmark"] == "resolve"
+        # The JSON arms are tied to the arm definitions, so an arm added to
+        # one and not the other is a failure rather than a silent gap.
+        assert set(payload["arms"]) == {arm.key for arm in bench.RESOLVE_ARMS}
+        for key, arm in payload["arms"].items():
+            assert arm["per_resolution_us"] > 0, key
+            assert arm["implied_ceiling_jobs_per_second"] > 0, key
+            assert arm["seconds"]["runs"] == 2, key
+            assert arm["what"] and arm["means"], key
+        assert payload["arms"]["reload_fire"]["resolutions"] == 20
+        assert payload["arms"]["cached"]["resolutions"] == 200
+        # NOTHING here asserts that one arm is slower than another: a
+        # throughput assertion cannot share a machine (docs/TESTING.md rule
+        # 7), and a benchmark's own test suite is the worst possible place
+        # to learn that lesson again.
+        for key in ("reload_flag_cost", "cache_saving", "reload_cost"):
+            assert set(payload[key]) == {
+                "extra_us_per_job",
+                "ratio",
+                "pct_of_reference_job_budget",
+            }, key
+
+    async def test_resolve_arms_really_drive_the_branch_they_name(self, db_params):
+        """The arms must be doing what the published number says they do.
+
+        This is the assertion that keeps the reload figure honest without
+        timing anything. `importlib.reload` rebuilds the class object, so a
+        round that really re-imported ends holding a different class than it
+        started with; re-locating a module already in `sys.modules` hands
+        back the same object. A `reload_fire` arm that quietly stopped
+        reloading would measure the mtime check instead and report it as the
+        cost of an import — two orders of magnitude wrong, with every other
+        assertion here still passing.
+        """
+        code, payload, output = await run_bench(
+            dsn_from(db_params),
+            "resolve",
+            "--resolutions",
+            "50",
+            "--reloads",
+            "5",
+            "--repeat",
+            "1",
+            "--no-warmup",
+        )
+
+        assert code == 0, output
+        measured = {k: v["re_imported"] for k, v in payload["arms"].items()}
+        assert measured == {
+            "cached": False,
+            "reload_check": False,
+            "uncached": False,
+            "reload_fire": True,
+        }
+        for key, arm in payload["arms"].items():
+            assert arm["re_imported"] == arm["declares_reimport"], key
+
     async def test_all(self, db_params):
         code, payload, _ = await run_bench(
             dsn_from(db_params),
@@ -424,13 +496,25 @@ class TestSubcommandsEmitDocumentedJson:
             "5",
             "--seed",
             str(PLAN_SEED),
+            "--resolutions",
+            "200",
+            "--reloads",
+            "20",
             "--repeat",
             "1",
             "--no-warmup",
         )
 
         assert code == 0, payload
-        assert set(payload) >= {"enqueue", "claim", "e2e", "notify", "plans", "healthy"}
+        assert set(payload) >= {
+            "enqueue",
+            "claim",
+            "e2e",
+            "notify",
+            "plans",
+            "resolve",
+            "healthy",
+        }
         assert payload["healthy"] is True
         assert payload["notify"]["per_lifecycle_observed"] > 0
         assert payload["notify"]["per_lifecycle_unobserved"] == 0
@@ -808,6 +892,19 @@ class TestCleanup:
             ),
             pytest.param(["notify", "--lifecycles", "5"], id="notify"),
             pytest.param(["plans", "--seed", "500"], id="plans"),
+            pytest.param(
+                [
+                    "resolve",
+                    "--resolutions",
+                    "50",
+                    "--reloads",
+                    "5",
+                    "--repeat",
+                    "1",
+                    "--no-warmup",
+                ],
+                id="resolve",
+            ),
         ],
     )
     async def test_leaves_no_rows_behind(self, db_params, db_pool, args):
@@ -842,6 +939,42 @@ class TestCleanup:
         assert code == 0
         assert payload["cleanup"]["workers_deleted"] >= 1
         assert await counts(db_pool) == before
+
+    async def test_resolve_removes_the_jobs_module_it_generated(self, db_params):
+        """`resolve` is the one subcommand whose leak would be in the
+        PROCESS, not the database: a temp directory, a `sys.path` entry and
+        an imported module. All three are checked here in the interpreter
+        that ran it — `run_bench` drives the real click entry point in a
+        worker thread of this process, so the leak would be visible right
+        here rather than only in a claim in the JSON.
+        """
+        before = list(sys.path)
+
+        code, payload, output = await run_bench(
+            dsn_from(db_params),
+            "resolve",
+            "--resolutions",
+            "50",
+            "--reloads",
+            "5",
+            "--repeat",
+            "1",
+            "--no-warmup",
+        )
+
+        assert code == 0, output
+        cleanup = payload["cleanup"]
+        assert cleanup["job_module_removed"] is True
+        assert cleanup["off_sys_path"] is True
+        assert cleanup["out_of_sys_modules"] is True
+        # and independently of what the run says about itself
+        assert not os.path.exists(cleanup["job_module_dir"])
+        assert sys.path == before
+        module_name = payload["job_class"].split(".")[0]
+        assert module_name not in sys.modules
+        # it writes no rows at all, so it claims none
+        assert cleanup["jobs_deleted"] == 0
+        assert cleanup["workers_deleted"] == 0
 
     async def test_a_run_never_touches_rows_it_did_not_create(self, db_params, db_pool):
         """Someone else's jobs survive a benchmark untouched."""
@@ -921,6 +1054,42 @@ class TestBusyDatabaseGuard:
         # unobserved lifecycle legitimately emits nothing, so asserting on it
         # would only prove the run happened, not that it measured anything.
         assert payload["per_lifecycle_observed"] > 0
+        assert await db_pool.fetchval("SELECT count(*) FROM jorb") == 5
+
+    async def test_resolve_is_guarded_too_even_though_it_writes_nothing(
+        self, db_params, db_pool
+    ):
+        """It is a CPU measurement, and a database doing real work is a box
+        whose CPU it competes for — which lands on the ratio exactly as row
+        contention would. So the guard applies, and `--force` still
+        overrides it."""
+        await db_pool.execute(
+            "INSERT INTO jorb (job_class, kwargs, queue) "
+            "SELECT 'other.Job', '{}'::jsonb, 'busy' FROM generate_series(1, 5)"
+        )
+        args = (
+            "resolve",
+            "--resolutions",
+            "50",
+            "--reloads",
+            "5",
+            "--repeat",
+            "1",
+            "--no-warmup",
+            "--max-existing-jobs",
+            "2",
+        )
+
+        code, _, output = await run_bench(dsn_from(db_params), *args)
+
+        assert code == 1
+        assert "already holds 5 jobs" in output
+
+        code, payload, output = await run_bench(dsn_from(db_params), *args, "--force")
+
+        assert code == 0, output
+        assert payload["guard"]["existing_jobs"] == 5
+        assert payload["arms"]["cached"]["per_resolution_us"] > 0
         assert await db_pool.fetchval("SELECT count(*) FROM jorb") == 5
 
 
