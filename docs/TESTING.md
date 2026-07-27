@@ -80,7 +80,7 @@ newest change in the diff rather than on the fixture. Once the tests were
 passing *only* because the two databases happened to agree.
 
 The rule: anything that needs a DSN string builds it from `db_params`. Use
-`tests/utils/processes.dsn_from(db_params)` — never `conftest.TEST_DSN`, never
+`pyjobby.procs.dsn_from(db_params)` — never `conftest.TEST_DSN`, never
 the environment variable. `tests/test_dxe_admin.py`'s `dsn` fixture is the
 worked example.
 
@@ -103,11 +103,11 @@ one-off scaffolding.
 | `unique_queue` / `test_id` fixtures | per-test namespacing so tests never collide on shared tables |
 | `tests/dxe_jobs.py` | shared job classes (`OkJob`, `FailJob`, `SlowJob`, `StepPipelineJob`, `SleeperJob`, `PingJob`, `PongJob`) resolved by dotted path like production jobs |
 | `tests/utils/factories.py` | v1-safe row builders (aware UTC, non-NULL jsonb) |
-| `tests/utils/processes.py` | launch real console scripts and reap their process groups |
+| `pyjobby/procs.py` | launch real console scripts and reap their process groups |
 | `tests/utils/faults.py` | fault injection and the side-effect ledger |
 | `tests/utils/plans.py` | seeding and assertions for query-plan tests |
 
-### `tests/utils/processes.py` — real processes
+### `pyjobby/procs.py` — real processes
 
 A console script that parses `--help` proves nothing. These helpers start the
 actual entry point from `.venv/bin`, wait for an observable effect, and reap
