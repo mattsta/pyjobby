@@ -45,6 +45,7 @@ import pytest_asyncio
 from aiohttp import web
 from aiohttp.test_utils import TestClient
 
+from pyjobby import websocket_server
 from pyjobby.websocket_server import (
     JOB_CHANNEL_PREFIX,
     QUEUE_CHANNEL_PREFIX,
@@ -554,6 +555,107 @@ class TestTheChannelIsGone:
         )
         assert found.stdout == "", (
             f"something still LISTENs on the deleted channel:\n{found.stdout}"
+        )
+
+
+async def emitted_notify_channels(pool: asyncpg.Pool) -> set[str]:
+    """Every channel the schema can actually NOTIFY on, from the catalog.
+
+    Read out of ``pg_trigger`` rather than the schema text so a channel that
+    is declared but never wired to a trigger does not count, and so a trigger
+    added by a migration does. Same query ``tests/test_bench.py`` uses to keep
+    ``pj-bench notify`` honest.
+    """
+    return {
+        r["channel"]
+        for r in await pool.fetch(
+            r"""
+            SELECT DISTINCT
+                   (regexp_match(pg_get_triggerdef(t.oid),
+                                 $re$jorb_notify\('([a-z_]+)'$re$))[1]
+                       AS channel
+              FROM pg_trigger t
+              JOIN pg_proc p ON p.oid = t.tgfoid
+             WHERE p.proname = 'jorb_notify' AND NOT t.tgisinternal
+            """
+        )
+    }
+
+
+class TestNoListenerOnAChannelNothingEmits:
+    """The general form of the defect above, not one dead channel.
+
+    PostgreSQL accepts ``LISTEN`` on any identifier, so a listener for a
+    channel no trigger emits does not raise, does not warn, and does not
+    fire. It reads like a working feed to the next person, and worse, the
+    protocol documentation grows an event that clients can subscribe to and
+    then wait for forever -- which is precisely what ``queue_alert`` was:
+    registered here, routed to ``alerts:queues:{queue}``, documented in
+    docs/WEBSOCKET_DASHBOARD.md, and emitted by nothing in the platform.
+
+    So: every channel anything in this repo LISTENs on must be one the
+    schema NOTIFYs on. Adding a listener is now a claim the catalog checks.
+    """
+
+    async def test_the_dashboard_server_listens_only_on_live_channels(
+        self, db_params, db_pool, monkeypatch
+    ):
+        """Behavioral: what ``init_notify_connection`` really registers.
+
+        Recorded off the connection, not read off ``LISTEN_CHANNELS``, so a
+        stray ``add_listener`` next to the loop is caught too.
+        """
+        registered: list[str] = []
+
+        class RecordingConnection:
+            def is_closed(self) -> bool:
+                return False
+
+            async def add_listener(self, channel: str, callback: Any) -> None:
+                registered.append(channel)
+
+        async def fake_connect(**_kwargs: Any) -> RecordingConnection:
+            return RecordingConnection()
+
+        monkeypatch.setattr(websocket_server.db, "connect", fake_connect)
+
+        server = WebSocketServer(db_params)
+        await server.init_notify_connection()
+
+        assert registered, "the server registered no listeners at all"
+        assert set(registered) == set(websocket_server.LISTEN_CHANNELS)
+
+        dead = set(registered) - await emitted_notify_channels(db_pool)
+        assert not dead, (
+            f"pj-ws LISTENs on {sorted(dead)}, which no trigger emits: "
+            f"a client subscribed to those events waits forever"
+        )
+
+    async def test_nothing_in_the_repo_listens_on_a_dead_channel(self, db_pool):
+        """The same rule for the worker, the client library, anything else.
+
+        Literal channel names only -- a name computed at runtime (pj-bench
+        iterates its own list) is covered by
+        tests/test_bench.py::test_notify_counts_only_channels_the_schema_emits_on.
+        """
+        found = subprocess.run(
+            ["git", "grep", "-nE", r"""add_listener\(\s*["'][a-z_]+["']"""],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        listened = set(
+            re.findall(r"""add_listener\(\s*["']([a-z_]+)["']""", found.stdout)
+        )
+        assert listened, (
+            "no literal add_listener() call found anywhere; the pattern has "
+            f"stopped matching:\n{found.stdout}"
+        )
+
+        dead = listened - await emitted_notify_channels(db_pool)
+        assert not dead, (
+            f"these channels are LISTENed on but emitted by nothing: "
+            f"{sorted(dead)}\n{found.stdout}"
         )
 
 

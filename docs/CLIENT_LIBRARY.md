@@ -149,6 +149,23 @@ Enqueue a single job.
 - `admin_data` (dict): Metadata for tracking (default: None)
 - `tags` (dict): Your own labels — customer, region, batch — that you can
   filter jobs by later (default: None). See [Job Tags](#8-job-tags).
+- `save_result` (bool): Store the job's return value (default: True)
+- `use_result_from` (int): Inject that job's result as `upstream_result`
+  (default: None). Pair with `waitfor_job` so it has finished first.
+- `retry_strategy` (str): `'exponential'`, `'linear'`, `'fibonacci'` or
+  `'fixed'` (default: `'exponential'`)
+- `max_retries` (int): Attempts before the dead-letter state (default: 10)
+- `initial_retry_delay` / `max_retry_delay` (int): Backoff floor and ceiling
+  in seconds (defaults: 1 and 3600)
+- `timeout_seconds` (int): This job's deadline, overriding the job class's
+  `timeout` attribute and the worker's `--default-timeout`. `0` means no
+  deadline at all; `None` (the default) defers to the class, then the worker.
+- `on_timeout` (str): What a blown deadline means — `'retry'` (default) or
+  `'fail'`, terminal on the first overrun. It governs **whichever** of those
+  three deadlines binds, so passing it without `timeout_seconds` is
+  meaningful: the class attribute and the worker default are deadlines too,
+  and neither is visible from the enqueue site. Any other value raises
+  `ValueError`.
 - `**kwargs`: Job arguments passed to job class
 
 **Returns:** Job ID (int)

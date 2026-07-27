@@ -59,7 +59,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Final
 
 import aiohttp
 import asyncpg  # type: ignore[import-untyped]
@@ -109,6 +109,14 @@ SNAPSHOT_CHANNEL = "jobs"
 QUEUE_CHANNEL_PREFIX = "queues:"
 #: Prefix of the per-job channels created by ``watch_job``.
 JOB_CHANNEL_PREFIX = "job:"
+
+#: The PostgreSQL NOTIFY channels this server LISTENs on. Every name here
+#: must be one the schema actually emits (``jorb_notify('<channel>', ...)``
+#: in sql/schema.sql): PostgreSQL accepts LISTEN on any string, so a name
+#: nothing NOTIFYs does not fail, it just never fires -- and a client that
+#: subscribed to the events it was supposed to carry waits forever.
+#: ``queue_alert`` was exactly that, and is gone.
+LISTEN_CHANNELS: Final = ("jorb_done", "schedule_executed")
 
 #: Seconds between snapshots. A dashboard does not need faster, and this is
 #: the whole database cost of the feed: one query per interval however many
@@ -305,16 +313,18 @@ class WebSocketServer:
         if not self.notify_conn or self.notify_conn.is_closed():
             self.notify_conn = await db.connect(**self.db_params)
 
-            # Every channel this server LISTENs on. There is deliberately no
-            # per-transition channel here: the whole-system view is polled
-            # (see SNAPSHOT_SQL), and the only per-job push is jorb_done,
-            # which the schema gates on jorb.awaited -- so it fires only for
-            # jobs a watch_job actually asked about.
-            await self.notify_conn.add_listener("jorb_done", self.handle_notification)
-            await self.notify_conn.add_listener(
-                "schedule_executed", self.handle_notification
-            )
-            await self.notify_conn.add_listener("queue_alert", self.handle_notification)
+            # Every channel this server LISTENs on, and every one of them is
+            # emitted by a trigger in sql/schema.sql -- LISTENing on a name
+            # nothing NOTIFYs is accepted by PostgreSQL and then waits
+            # forever, which is a promise to subscribers that cannot be kept
+            # (tests/test_ws_snapshot.py checks this set against the catalog).
+            # There is deliberately no per-transition channel here: the
+            # whole-system view is polled (see SNAPSHOT_SQL), and the only
+            # per-job push is jorb_done, which the schema gates on
+            # jorb.awaited -- so it fires only for jobs a watch_job actually
+            # asked about.
+            for channel in LISTEN_CHANNELS:
+                await self.notify_conn.add_listener(channel, self.handle_notification)
 
             logger.info("PostgreSQL LISTEN connections established")
 
@@ -380,10 +390,6 @@ class WebSocketServer:
 
         elif event_type == "schedule_executed":
             return "schedules"
-
-        elif event_type == "queue_alert":
-            queue = data.get("queue", "default")
-            return f"alerts:queues:{queue}"
 
         return "jobs"
 

@@ -440,9 +440,12 @@ class Impatient(Job):
 `timeout = 0` disables the ceiling; `None` (the default) defers to the
 worker. Blowing it records `Job timed out after 1s` and takes the retry path,
 so a job that always overruns eventually dead-letters. Enqueue with
-`timeout_seconds=1, on_timeout="fail"` to make the first overrun terminal
-instead — `on_timeout` is only recorded when `timeout_seconds` is passed with
-it, so it has no effect on a deadline that came from the class attribute.
+`on_timeout="fail"` to make the first overrun terminal instead. That policy
+is about the job's deadline whichever of the three sources supplied it — pass
+it alone and it still applies to the class attribute and to the worker
+default, neither of which the caller can see from the enqueue site.
+`on_timeout` is `"retry"` or `"fail"`; anything else raises at enqueue,
+because the worker reads any non-`"retry"` value as terminal.
 
 **A per-step budget** bounds one step, so one slow call cannot spend the
 job's whole budget anonymously:

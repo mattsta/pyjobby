@@ -474,8 +474,35 @@ async def test_the_job_timeout_is_the_ceiling(client, live_worker, unique_queue)
     assert row["error_message"] == "Job timed out after 1s"
 
 
+class Unbounded(Job):
+    """No deadline of its own: whatever bounds it comes from outside.
+
+    Not one of the guide's snippets — it is what proves the guide's claim
+    that the worker's --default-timeout is a deadline like the other two,
+    which needs a job class that declines to name one.
+    """
+
+    async def task(self) -> str:
+        await asyncio.sleep(30)
+        return "never"
+
+
+# ---------------------------------------------------------------------------
+# `on_timeout` is a policy about the job's deadline, wherever that deadline
+# came from. There are exactly three sources -- `timeout_seconds=` at
+# enqueue, the class's `timeout` attribute, the worker's --default-timeout --
+# and the policy has to mean the same thing for all three, because the caller
+# writing `on_timeout='fail'` cannot see which one will bind.
+#
+# `fail` is terminal on the first overrun (error_count == 1 with retries left
+# on the table); `retry` spends the budget and dead-letters at the end of it
+# (error_count == max_retries). Driven by a real worker, since the whole
+# question is what the worker does with the value the client stored.
+# ---------------------------------------------------------------------------
+
+
 async def test_on_timeout_fail_skips_the_retries(client, live_worker, unique_queue):
-    """`on_timeout='fail'` is recorded only alongside `timeout_seconds=`."""
+    """Deadline from `timeout_seconds=` at enqueue."""
     await live_worker()
 
     job_id = await client.enqueue(
@@ -489,6 +516,91 @@ async def test_on_timeout_fail_skips_the_retries(client, live_worker, unique_que
     row = await wait_for_job_state(client.pool, job_id, ("crashed",), timeout=20)
     assert row["error_message"] == "Job timed out after 1s"
     assert row["error_count"] == 1  # terminal on the first overrun
+
+
+async def test_on_timeout_fail_applies_to_the_class_deadline(
+    client, live_worker, unique_queue
+):
+    """Deadline from the class's `timeout` attribute.
+
+    Nothing about this enqueue mentions a number, and that is the point: the
+    caller asked for "a timeout must not be retried" and the job class is
+    what says when a timeout is. Recording the policy only alongside
+    `timeout_seconds=` dropped it here, and the job retried -- the opposite
+    of what was asked for, silently.
+    """
+    await live_worker()
+
+    job_id = await client.enqueue(
+        "tests.test_writing_jobs.Impatient",  # timeout = 1
+        queue=unique_queue,
+        on_timeout="fail",
+        max_retries=10,
+    )
+
+    row = await wait_for_job_state(client.pool, job_id, ("crashed",), timeout=20)
+    assert row["error_message"] == "Job timed out after 1s"
+    assert row["error_count"] == 1
+
+
+async def test_on_timeout_fail_applies_to_the_worker_default_deadline(
+    client, live_worker, unique_queue
+):
+    """Deadline from the worker's --default-timeout: neither the enqueue nor
+    the class named one, and the operator's fleet-wide ceiling bound it."""
+    await live_worker(default_timeout=1)
+
+    job_id = await client.enqueue(
+        "tests.test_writing_jobs.Unbounded",  # timeout is None
+        queue=unique_queue,
+        on_timeout="fail",
+        max_retries=10,
+    )
+
+    row = await wait_for_job_state(client.pool, job_id, ("crashed",), timeout=20)
+    assert row["error_message"] == "Job timed out after 1s"
+    assert row["error_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "job_class,options,worker_options",
+    [
+        ("Impatient", {"timeout_seconds": 1}, {}),
+        ("Impatient", {}, {}),
+        ("Unbounded", {}, {"default_timeout": 1}),
+    ],
+    ids=["enqueue_argument", "class_attribute", "worker_default"],
+)
+async def test_on_timeout_retry_spends_the_budget_from_every_source(
+    client, live_worker, unique_queue, job_class, options, worker_options
+):
+    """The mirror: 'retry' (the default) still retries, from all three."""
+    await live_worker(**worker_options)
+
+    job_id = await client.enqueue(
+        f"tests.test_writing_jobs.{job_class}",
+        queue=unique_queue,
+        on_timeout="retry",
+        max_retries=2,  # one retry, then the dead-letter state
+        initial_retry_delay=0,
+        **options,
+    )
+
+    row = await wait_for_job_state(client.pool, job_id, ("crashed",), timeout=30)
+    assert row["error_message"] == "Job timed out after 1s"
+    assert row["error_count"] == 2  # the budget was spent, not skipped
+
+
+async def test_an_unknown_on_timeout_is_refused_at_enqueue(client, unique_queue):
+    """The worker asks `== 'retry'` and treats everything else as terminal,
+    so a typo would dead-letter jobs on their first overrun. The client can
+    see that much without knowing where the deadline comes from."""
+    with pytest.raises(ValueError, match="on_timeout must be one of"):
+        await client.enqueue(
+            "tests.test_writing_jobs.Impatient",
+            queue=unique_queue,
+            on_timeout="ignore",
+        )
 
 
 # ===========================================================================

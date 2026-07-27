@@ -318,21 +318,13 @@ queued with a `run_after` in the future.
 }
 ```
 
-#### queue_alert
-
-```json
-{
-  "event": "queue_alert",
-  "timestamp": "2025-11-18T10:30:15.000Z",
-  "data": {
-    "queue": "default",
-    "depth": 1523,
-    "threshold": 1000,
-    "severity": "warning",
-    "message": "Queue 'default' has 1523 jobs (threshold: 1000)"
-  }
-}
-```
+There is no alert event. Nothing in the platform decides that a queue is too
+deep — thresholds belong to the operator, not to the feed — and the
+`queue_stats` payload above already carries what an alert would have said
+(`backlog`, `oldest_backlog_age_seconds`, `paused`, `workers_live`), once per
+interval, for every queue. A client that wants an alert compares those to its
+own threshold. An `alerts:queues:{queue}` channel used to be documented here
+and listened for; nothing ever emitted it, so subscribers waited forever.
 
 ### Actions Sent
 
@@ -428,7 +420,6 @@ Clients subscribe to specific channels to filter events:
   (`queue_stats` events) — fed from the same single query, so a per-queue
   dashboard costs no extra database work
 - **schedules**: schedule execution events
-- **alerts:queues:{queue_name}**: queue alert events
 - **job:{job_id}**: created by `watch_job`; carries that job's completion.
   Subscribing to it by name does nothing useful — the notification only exists
   because `watch_job` registered demand for it.
@@ -444,7 +435,6 @@ ws.send(
       "queues:default", // Default queue only
       "queues:processing", // Processing queue only
       "schedules", // Schedule events
-      "alerts:queues:default", // Alerts for default queue
     ],
   }),
 );

@@ -191,6 +191,46 @@ class TestJobClientEnqueue:
             assert admin["timeout_seconds"] == 30
             assert admin["on_timeout"] == "fail"
 
+    @staticmethod
+    def admin_data_for(**options):
+        """The admin_data the enqueue INSERT would be given, without a
+        database: _build_enqueue_row returns _ENQUEUE_SQL's parameter row and
+        admin_data is $12."""
+        return JobClient._build_enqueue_row("J", **options)[11]
+
+    def test_on_timeout_is_recorded_without_a_deadline_argument(self):
+        """The row shape, without a database: the policy is stored whether or
+        not THIS call supplied the deadline it governs. The job class's
+        `timeout` and the worker's --default-timeout are deadlines too, and
+        neither is visible from here — storing the policy only alongside
+        `timeout_seconds=` silently turned `fail` back into `retry`."""
+        admin = self.admin_data_for(on_timeout="fail")
+
+        assert admin["on_timeout"] == "fail"
+        assert "timeout_seconds" not in admin  # no deadline invented either
+
+    def test_a_zero_timeout_is_a_value_not_an_omission(self):
+        """`timeout_seconds=0` means "no deadline at all", the same thing it
+        means on the class attribute. Testing truthiness dropped it and let
+        the class or the worker impose one anyway."""
+        admin = self.admin_data_for(timeout_seconds=0)
+
+        assert admin["timeout_seconds"] == 0
+
+    def test_an_explicit_admin_data_policy_still_wins(self):
+        """Same precedence as every other retry knob: what the caller wrote
+        into admin_data by hand is not overwritten by a default."""
+        admin = self.admin_data_for(admin_data={"on_timeout": "fail"})
+
+        assert admin["on_timeout"] == "fail"
+
+    @pytest.mark.parametrize("policy", ["ignore", "Fail", "", "crash"])
+    def test_an_unknown_on_timeout_policy_is_refused(self, policy):
+        """The worker reads anything that is not 'retry' as terminal, so an
+        unrecognized value does not degrade — it dead-letters."""
+        with pytest.raises(ValueError, match="on_timeout must be one of"):
+            self.admin_data_for(on_timeout=policy)
+
 
 class TestJobClientEnqueueBatch:
     """Test JobClient.enqueue_batch method - covers lines 390-477."""

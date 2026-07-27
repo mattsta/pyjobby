@@ -347,26 +347,8 @@ class TestProcessNotificationErrors:
         assert server.stats["events_received"] == 0
 
 
-class TestDetermineChannelQueueAlert:
-    """Test determine_broadcast_channel for queue_alert - covers lines 170-174."""
-
-    def test_queue_alert_with_queue(self, db_params):
-        """Test queue_alert broadcast channel determination."""
-        server = WebSocketServer(db_params)
-
-        data = {"queue": "high-priority", "alert": "queue_depth_high"}
-        channel = server.determine_broadcast_channel("queue_alert", data)
-
-        assert channel == "alerts:queues:high-priority"
-
-    def test_queue_alert_default_queue(self, db_params):
-        """Test queue_alert with default queue."""
-        server = WebSocketServer(db_params)
-
-        data = {"alert": "some_alert"}  # No queue specified
-        channel = server.determine_broadcast_channel("queue_alert", data)
-
-        assert channel == "alerts:queues:default"
+class TestDetermineChannelFallback:
+    """Every routed event type, and what an unrouted one falls back to."""
 
     def test_unknown_event_type(self, db_params):
         """Test unknown event type defaults to 'jobs' channel."""

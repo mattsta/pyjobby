@@ -101,6 +101,12 @@ _ENQUEUE_SQL = """
 # then silently unfilterable.
 _TAG_VALUE_TYPES = (str, int, float, bool, type(None))
 
+# What `on_timeout` may say. The worker asks `on_timeout == 'retry'` and
+# treats everything else as terminal (pj.py `_handle_failure`), so an
+# unrecognized value is not ignored -- it dead-letters the job on its first
+# overrun. Checked at enqueue, where the caller is still there to be told.
+_ON_TIMEOUT_POLICIES = frozenset({"retry", "fail"})
+
 
 def validate_tags(tags: dict[str, Any] | None) -> dict[str, Any]:
     """Check caller-supplied tags and return a copy safe to store.
@@ -414,8 +420,15 @@ class JobClient:
             max_retries: Maximum retry attempts (Phase 2, default: 10)
             initial_retry_delay: Starting retry delay in seconds (Phase 2, default: 1)
             max_retry_delay: Maximum retry delay cap (Phase 2, default: 3600)
-            timeout_seconds: Job execution timeout in seconds (Phase 2, default: None)
-            on_timeout: 'retry' or 'fail' (Phase 2, default: 'retry')
+            timeout_seconds: This job's deadline in seconds, overriding the
+                job class's `timeout` attribute and the worker's
+                --default-timeout. 0 means "no deadline at all"; None (the
+                default) defers to the class, then the worker.
+            on_timeout: What a blown deadline means — 'retry' (default: spend
+                the retry budget) or 'fail' (terminal on the first overrun).
+                Applies to WHICHEVER deadline binds: timeout_seconds above,
+                the job class's `timeout`, or the worker default. Any other
+                value raises ValueError.
             **kwargs: Job arguments (passed to job class)
 
         Returns:
@@ -423,8 +436,9 @@ class JobClient:
 
         Raises:
             asyncpg.UniqueViolationError: If deadline_key already exists
-            ValueError: If both waitfor_job and waitfor_group specified, or
-                if tags are not a flat dict of string keys to scalar values
+            ValueError: If both waitfor_job and waitfor_group specified, if
+                on_timeout is neither 'retry' nor 'fail', or if tags are not
+                a flat dict of string keys to scalar values
 
         Examples:
             # Simple job
@@ -564,6 +578,13 @@ class JobClient:
         if waitfor_job and waitfor_group:
             raise ValueError("Cannot specify both waitfor_job and waitfor_group")
 
+        if on_timeout not in _ON_TIMEOUT_POLICIES:
+            raise ValueError(
+                f"on_timeout must be one of {sorted(_ON_TIMEOUT_POLICIES)}, "
+                f"got {on_timeout!r} — the worker treats anything that is not "
+                f"'retry' as 'fail', so a typo dead-letters silently"
+            )
+
         # Default run_after to now if not specified
         if run_after is None:
             run_after = datetime.now(UTC)
@@ -596,10 +617,19 @@ class JobClient:
         admin_data.setdefault("initial_retry_delay", initial_retry_delay)
         admin_data.setdefault("max_retry_delay", max_retry_delay)
 
-        # Add timeout configuration if specified
-        if timeout_seconds:
+        # A deadline supplied HERE, overriding the job class and the worker
+        # default. `0` is a real value ("no deadline, whatever the class or
+        # the worker says"), so the test is against None, not truthiness.
+        if timeout_seconds is not None:
             admin_data["timeout_seconds"] = timeout_seconds
-            admin_data.setdefault("on_timeout", on_timeout)
+
+        # The policy is about ANY deadline, not just one passed above: the
+        # job class's `timeout` attribute and the worker's --default-timeout
+        # are equally deadlines, and neither is visible from here. Recording
+        # it only alongside timeout_seconds silently turned `on_timeout=
+        # 'fail'` into a retry for the other two. setdefault so an explicit
+        # admin_data entry still wins, as with every retry knob above.
+        admin_data.setdefault("on_timeout", on_timeout)
 
         return [
             job_class,
