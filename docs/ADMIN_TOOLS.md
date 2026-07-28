@@ -641,7 +641,7 @@ measured over the window and comparable across window sizes; **levels**
 ## `pj-web` — the HTML admin
 
 ```bash
-pj-web /etc/pyjobby/pyjobby.conf.py --host 127.0.0.1 --port 8081
+pj-web --config /etc/pyjobby/pyjobby.conf.py --host 127.0.0.1 --port 8081
 ```
 
 It takes a config file positionally; it does not read `PYJOBBY_DSN`.

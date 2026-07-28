@@ -118,10 +118,10 @@ pj-monitor --config ./pyjobby.conf.py
 pj-scheduler --config ./pyjobby.conf.py
 
 # Start the web admin UI (localhost:8081, no auth)
-pj-web ./pyjobby.conf.py
+pj-web --config ./pyjobby.conf.py
 
 # Start the realtime websocket dashboard server (localhost:8082)
-pj-ws ./pyjobby.conf.py
+pj-ws --config ./pyjobby.conf.py
 
 # View help
 pj --help

@@ -449,7 +449,7 @@ class TestDaemonsShutDownCleanly:
         params = dsn_from_parts(dsn)
         config.write_text(f"db_params = {params!r}\n")
         port = await free_port()
-        proc = spawn("pj-ws", str(config), "--port", str(port))
+        proc = spawn("pj-ws", "--config", str(config), "--port", str(port))
         try:
             await wait_until(
                 lambda: port_is_open("127.0.0.1", port),
@@ -560,6 +560,7 @@ class TestWebEntryPoint:
 
         async with daemon(
             "pj-web",
+            "--config",
             str(write_config(tmp_path, dsn)),
             "--host",
             "127.0.0.1",
@@ -595,6 +596,7 @@ class TestWebEntryPoint:
 
         async with daemon(
             "pj-web",
+            "--config",
             str(write_config(tmp_path, dsn)),
             "--host",
             "127.0.0.1",
@@ -633,6 +635,7 @@ class TestWebsocketEntryPoint:
 
         async with daemon(
             "pj-ws",
+            "--config",
             str(write_config(tmp_path, dsn)),
             "--host",
             "127.0.0.1",
@@ -680,6 +683,7 @@ class TestWebsocketEntryPoint:
         port = await free_port()
         async with daemon(
             "pj-ws",
+            "--config",
             str(write_config(tmp_path, dsn)),
             "--host",
             "127.0.0.1",

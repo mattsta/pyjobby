@@ -145,6 +145,15 @@ db_params = {
 It is executed as Python, so secrets can be read from the environment, a
 mounted file, or a secrets manager at load time.
 
+The file may also define `prio_ceiling` (an int): the worker fleet's
+priority ceiling, read by `pj`, `pj-scheduler`, `pj-web` and `pj-ws` when
+their `--max-prio` flag is not given — one declaration instead of the same
+number repeated on four command lines. An explicit flag always wins.
+
+```python
+prio_ceiling = 1000  # must match what your `pj` workers claim under
+```
+
 `db_params` is **`asyncpg.connect()` keyword arguments**, and only those.
 Do not put `min_size` or `max_size` in it: workers, the scheduler,
 `pj-admin` and `pj-bench` open a plain connection and will reject the

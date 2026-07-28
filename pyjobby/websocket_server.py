@@ -1287,7 +1287,15 @@ def main() -> None:
     import click
 
     @click.command()
-    @click.argument("config", default="./pyjobby.conf.py")
+    @click.option(
+        "--config",
+        "-c",
+        default="./pyjobby.conf.py",
+        show_default=True,
+        help="Config file path (must define db_params; may define "
+        "prio_ceiling) — the same -c/--config every other pyjobby daemon "
+        "takes; this one used to be the odd positional argument out",
+    )
     @click.option(
         "--host",
         default="127.0.0.1",
@@ -1307,23 +1315,29 @@ def main() -> None:
     )
     @click.option(
         "--max-prio",
-        default=DEFAULT_PRIO_CEILING,
-        show_default=True,
+        default=None,
         type=int,
         help="The priority ceiling this fleet's workers run with (`pj "
         "--max-prio`). adjust_priority refuses anything above it: LOWER is "
-        "MORE urgent, and a job above the ceiling is never claimed at all",
+        "MORE urgent, and a job above the ceiling is never claimed at all. "
+        "Defaults to the config file's prio_ceiling, else 1000",
     )
     def cli(
-        config: str, host: str, port: int, snapshot_interval: float, max_prio: int
+        config: str,
+        host: str,
+        port: int,
+        snapshot_interval: float,
+        max_prio: int | None,
     ) -> None:
         """Run the realtime websocket dashboard server."""
         from .configloader import load_config_from_file
 
-        cfg = load_config_from_file(config, keys=["db_params"])
+        cfg = load_config_from_file(config, keys=["db_params", "prio_ceiling"])
         db_params = cfg.get("db_params")
         if not db_params:
             raise click.ClickException(f"No db_params found in config: {config}")
+        if max_prio is None:
+            max_prio = cfg.get("prio_ceiling") or DEFAULT_PRIO_CEILING
 
         if snapshot_interval <= 0:
             raise click.ClickException("--snapshot-interval must be positive")

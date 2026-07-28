@@ -139,7 +139,7 @@ The notification triggers this server relies on ship in
 ### Step 2: Start WebSocket Server
 
 ```bash
-pj-ws ./pyjobby.conf.py --snapshot-interval 1.0
+pj-ws --config ./pyjobby.conf.py --snapshot-interval 1.0
 ```
 
 You should see:

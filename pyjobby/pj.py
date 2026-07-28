@@ -2188,12 +2188,13 @@ def runAndDone(
 )
 @click.option(
     "--max-prio",
-    default=DEFAULT_PRIO_CEILING,
+    default=None,
+    type=int,
     help="Priority CEILING for these workers: they claim jobs whose prio is "
     "<= this and are blind to everything above it. LOWER prio is MORE "
     "urgent, so raising this makes a worker take LESS urgent work as well; "
-    "a job above every worker's ceiling is never claimed at all",
-    show_default=True,
+    "a job above every worker's ceiling is never claimed at all. Defaults "
+    "to the config file's prio_ceiling, else 1000",
 )
 @click.option(
     "--path",
@@ -2252,7 +2253,7 @@ def workit(
     queue: tuple[str],
     cap: tuple[str],
     workers: int,
-    max_prio: int,
+    max_prio: int | None,
     path: str,
     max_retries: int,
     default_timeout: int,
@@ -2284,10 +2285,18 @@ def workit(
         sys.exit(1)
 
     try:
-        loadedConfig = load_config_from_file(config, {"db_params", "web_listen"})
+        loadedConfig = load_config_from_file(
+            config, {"db_params", "web_listen", "prio_ceiling"}
+        )
     except RuntimeError as e:
         logger.error("Failed to load config {}: {}", config, e)
         sys.exit(1)
+
+    # ceiling precedence: explicit flag > config file's prio_ceiling >
+    # platform default — ONE config key, so a fleet does not repeat the same
+    # number on four command lines (and forget one)
+    if max_prio is None:
+        max_prio = loadedConfig.get("prio_ceiling") or DEFAULT_PRIO_CEILING
 
     # One full set of workers per DISTINCT named queue. Duplicates collapse
     # (asking for the same queue twice asks for the same set twice), which
