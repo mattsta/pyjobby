@@ -162,22 +162,28 @@ async def test_waiting_for_a_state_does_not_poll(
     notification inflates the count either.
     """
     await live_worker()
+    # Closed at the end: this client opens a LISTEN connection (that is the
+    # point of passing db_params), and an unclosed listener is a leaked
+    # asyncpg Connection whose finalizer fires during some later test's GC.
     client = JobClient(pool=db_pool, db_params=db_params)
-    machine = await client.start_machine(QuietMachine, queue=unique_queue)
-    await machine.wait_for_state("parked", timeout=20)
+    try:
+        machine = await client.start_machine(QuietMachine, queue=unique_queue)
+        await machine.wait_for_state("parked", timeout=20)
 
-    # Wait on a state it will not reach, and time out on purpose.
-    with counted_client(client) as counter, pytest.raises(TimeoutError):
-        await machine.wait_for_state("released", timeout=6)
+        # Wait on a state it will not reach, and time out on purpose.
+        with counted_client(client) as counter, pytest.raises(TimeoutError):
+            await machine.wait_for_state("released", timeout=6)
 
-    # With a listener the fallback is 2s: ~3 checks in 6 seconds, plus one
-    # demand registration. The polling version made three round trips every
-    # 250ms — about 72. The bound is loose enough to be about the shape
-    # rather than an exact count.
-    assert counter.calls <= 6, (
-        f"{counter.calls} round trips in a 6s wait: that is polling, not "
-        f"waiting on the notification"
-    )
+        # With a listener the fallback is 2s: ~3 checks in 6 seconds, plus one
+        # demand registration. The polling version made three round trips every
+        # 250ms — about 72. The bound is loose enough to be about the shape
+        # rather than an exact count.
+        assert counter.calls <= 6, (
+            f"{counter.calls} round trips in a 6s wait: that is polling, not "
+            f"waiting on the notification"
+        )
+    finally:
+        await client.close()
 
 
 async def test_a_handle_can_be_rebuilt_from_an_id(live_worker, unique_queue, client):

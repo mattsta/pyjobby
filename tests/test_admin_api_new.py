@@ -486,7 +486,7 @@ class TestAdminAPIJobManagement:
 
             assert len(results) == 3
             for result in results:
-                assert result["status"] == "cancelled"
+                assert result["status"] == "cancelled", result
 
     @pytest.mark.asyncio
     async def test_delete_job(self, db_pool):

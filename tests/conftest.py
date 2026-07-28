@@ -269,6 +269,24 @@ async def ensure_clean_database(db_params: dict[str, str]):
     # connection churn.
 
 
+@pytest.fixture(autouse=True)
+def gc_after_each_test():
+    """Leak-attribution mode, off by default: PYJOBBY_GC_EACH_TEST=1.
+
+    A leaked connection's ResourceWarning fires whenever GC happens to run,
+    which is usually many tests later -- the unraisable-exception plugin then
+    fails an innocent test, and the report moves between runs. Collecting at
+    every teardown makes the warning fire in the leaking test's own teardown,
+    turning a floating canary into a name. Gated because a full collection
+    per test costs real wall-clock across the suite.
+    """
+    yield
+    if os.environ.get("PYJOBBY_GC_EACH_TEST"):
+        import gc
+
+        gc.collect()
+
+
 # ============================================================================
 # JSON Codec Configuration
 # ============================================================================
