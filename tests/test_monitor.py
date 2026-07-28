@@ -28,11 +28,14 @@ import asyncio
 import contextlib
 import datetime
 import inspect
+import subprocess
 import uuid
 
+import click
 import pytest
 from loguru import logger
 
+from pyjobby import migrations
 from pyjobby import monitor as monitor_module
 from pyjobby.monitor import (
     CANCEL_UNSATISFIABLE_WAITERS_SQL,
@@ -53,8 +56,9 @@ from pyjobby.monitor import (
     sweep_timed_out_jobs,
 )
 from pyjobby.pj import STMTS
-from pyjobby.procs import dsn_from
+from pyjobby.procs import dsn_from, script_path
 from tests.conftest import wait_for_job_state
+from tests.schema_fixtures import ScratchDatabases
 
 pytestmark = pytest.mark.asyncio
 
@@ -2396,3 +2400,95 @@ class TestMonitorLoop:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
+
+
+# ============================================================================
+# startup preflight and pool sizing
+# ============================================================================
+
+
+class TestMonitorPreflight:
+    """The monitor asks "can I use this database?" ONCE, before the loop.
+
+    Against a database with no schema every sweep fails, once per cycle,
+    forever — while the process stays up and every liveness check reports a
+    healthy daemon. Nothing in that picture says "migrate". The in-loop
+    resilience is for TRANSIENT failures and is deliberately untouched; this
+    is the startup precondition, and it is an exit code.
+    """
+
+    async def test_a_usable_database_has_no_problem(self, db_params):
+        assert await monitor_module._preflight_problem(db_params) is None
+        assert await monitor_module._preflight_problem(dsn_from(db_params)) is None
+
+    async def test_pj_monitor_exits_2_on_a_database_without_the_schema(self, db_params):
+        """The wiring, end to end: the daemon must EXIT, not settle into a
+        sweep loop that fails forever behind a healthy-looking process."""
+        factory = ScratchDatabases(db_params)
+        try:
+            params = await factory.create(install=None)
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                [str(script_path("pj-monitor")), "--dsn", dsn_from(params)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        finally:
+            await factory.close()
+
+        assert proc.returncode == 2, proc.stdout + proc.stderr
+        assert migrations.MIGRATE_REMEDY in proc.stderr
+
+    async def test_a_database_without_the_schema_names_the_remedy(self, db_params):
+        factory = ScratchDatabases(db_params)
+        try:
+            params = await factory.create(install=None)
+            problem = await monitor_module._preflight_problem(params)
+        finally:
+            await factory.close()
+
+        assert problem is not None
+        assert params["database"] in problem
+        assert migrations.MIGRATE_REMEDY in problem
+
+    async def test_an_unreachable_database_names_the_target_not_the_password(self):
+        problem = await monitor_module._preflight_problem(
+            {
+                "host": "127.0.0.1",
+                # privileged and unbound: connection refused, now
+                "port": 1,
+                "database": "pyjobby",
+                "user": "nobody",
+                "password": "hunter2-must-not-be-logged",
+            }
+        )
+
+        assert problem is not None
+        assert "127.0.0.1:1/pyjobby" in problem
+        assert "hunter2" not in problem
+
+
+class TestMonitorPoolSizing:
+    """db_params is handed to asyncpg WHOLE, so it can carry a key the monitor
+    already owns. That used to be a bare TypeError traceback out of
+    create_pool before a single sweep ran."""
+
+    async def test_ordinary_db_params_pass_through_with_the_monitors_sizes(self):
+        assert monitor_module._pool_kwargs({"host": "db", "port": 5433}) == {
+            "host": "db",
+            "port": 5433,
+            **monitor_module.MONITOR_POOL_SIZES,
+        }
+
+    @pytest.mark.parametrize(
+        "extra", [{"min_size": 10}, {"max_size": 10}, {"min_size": 4, "max_size": 9}]
+    )
+    async def test_pool_size_keys_are_refused_by_name(self, extra):
+        with pytest.raises(click.ClickException) as caught:
+            monitor_module._pool_kwargs({"host": "db", **extra})
+
+        message = caught.value.message
+        for key in extra:
+            assert key in message
+        assert "sizes its own pool" in message

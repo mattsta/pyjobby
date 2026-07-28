@@ -923,6 +923,107 @@ class TestMissingIdBehavior:
             )
 
 
+class TestRefusedMutations:
+    """The OTHER half of TestMissingIdBehavior: the job exists, and the verb
+    refuses it anyway.
+
+    Every mutation route answers with a ``{job_id, status}`` dict in which the
+    status is the whole refusal — 'not_retriable'/'not_cancellable' — and the
+    handler must turn that into a 400. Without these, dropping the status
+    guard would return 2xx with a refusal body for a mutation that changed
+    nothing, and every caller that checks the HTTP code (curl, htmx, a deploy
+    script) would read "done".
+
+    The refusal message is also asserted NOT to quote a pre-read state: the
+    row is read before the verb runs, so a concurrent operator made the
+    message contradict itself. The returned status is the authority.
+    """
+
+    @staticmethod
+    async def _job(pool: asyncpg.Pool, queue: str, state: str) -> int:
+        job_id: int = await pool.fetchval(
+            """INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+               VALUES ('tests.dxe_jobs.OkJob', '{}', $1, 100, $2)
+               RETURNING id""",
+            queue,
+            state,
+        )
+        return job_id
+
+    @pytest.mark.asyncio
+    async def test_retry_of_a_running_job_is_400(
+        self, web: Harness, db_pool: asyncpg.Pool, unique_queue: str
+    ):
+        """Retry takes crashed/cancelled only. A running job is refused —
+        200 with a 'not_retriable' body would tell the operator their retry
+        landed while the original attempt is still executing."""
+        job_id = await self._job(db_pool, unique_queue, "running")
+
+        resp = await web.client.post(f"/api/jobs/{job_id}/retry")
+
+        assert resp.status == 400
+        body = await resp.json()
+        assert str(job_id) in body["error"]
+        assert "not_retriable" in body["error"]
+        assert "running" not in body["error"], "quotes a state it read before the verb"
+        # and the refusal changed nothing
+        assert (
+            await db_pool.fetchval("SELECT state FROM jorb WHERE id = $1", job_id)
+            == "running"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancel_of_a_finished_job_is_400(
+        self, web: Harness, db_pool: asyncpg.Pool, unique_queue: str
+    ):
+        """Terminal is terminal: there is nothing left to cancel."""
+        job_id = await self._job(db_pool, unique_queue, "finished")
+
+        resp = await web.client.post(f"/api/jobs/{job_id}/cancel")
+
+        assert resp.status == 400
+        body = await resp.json()
+        assert str(job_id) in body["error"]
+        assert "not_cancellable" in body["error"]
+        assert "finished" not in body["error"], "quotes a state it read before the verb"
+        assert (
+            await db_pool.fetchval("SELECT state FROM jorb WHERE id = $1", job_id)
+            == "finished"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dlq_retry_of_a_non_crashed_job_is_400(
+        self, web: Harness, db_pool: asyncpg.Pool, unique_queue: str
+    ):
+        """The DLQ is the crashed jobs by definition, so the DLQ retry has a
+        narrower guard than the ordinary one: a queued job is not in it."""
+        job_id = await self._job(db_pool, unique_queue, "queued")
+
+        resp = await web.client.post(f"/api/dlq/{job_id}/retry")
+
+        assert resp.status == 400
+        body = await resp.json()
+        assert str(job_id) in body["error"]
+        assert "not_retriable" in body["error"]
+        assert (
+            await db_pool.fetchval("SELECT state FROM jorb WHERE id = $1", job_id)
+            == "queued"
+        )
+
+    @pytest.mark.asyncio
+    async def test_html_dlq_retry_of_a_non_crashed_job_is_400(
+        self, web: Harness, db_pool: asyncpg.Pool, unique_queue: str
+    ):
+        """The htmx button takes the same refusal: ?format=html must not swap
+        a refreshed table in as though the retry had happened."""
+        job_id = await self._job(db_pool, unique_queue, "cancelled")
+
+        resp = await web.client.post(f"/api/dlq/{job_id}/retry?format=html")
+
+        assert resp.status == 400
+        assert resp.content_type == "application/json"
+
+
 class TestMalformedInput:
     """Path ids and query parameters go through two shared parsers
     (``_path_id``/``_query_int``), so malformed input never reaches ``int()``

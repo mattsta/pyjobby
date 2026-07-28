@@ -143,9 +143,9 @@ command lines. An explicit flag always wins.
 `db_params` is **`asyncpg.connect()` keyword arguments**, and only those.
 Do not put `min_size` or `max_size` in it: workers, the scheduler,
 `pj-admin` and `pj-bench` open a plain connection and will reject the
-unknown argument, and `pj-web` and `pj-ws` supply their own pool sizes
-alongside your dict and will reject the duplicate. Pool sizing is not
-configurable from here.
+unknown argument, and `pj-monitor`, `pj-web` and `pj-ws` supply their own
+pool sizes alongside your dict and refuse the duplicate by name. Pool
+sizing is not configurable from here.
 
 **A DSN** — `--dsn`, or the `PYJOBBY_DSN` environment variable:
 

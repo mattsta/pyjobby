@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -173,6 +174,118 @@ class TestWorkitPreflight:
         assert result.returncode == 1, result.stdout
         assert "crashed during startup/run" in result.stdout
         assert "exited non-zero" in result.stdout
+
+
+class TestWorkitShutdown:
+    """`pj` is a supervisor, so `systemctl stop pj` has to mean two things:
+    every worker stops, and the unit is not marked failed for doing it.
+
+    Both used to be false. The SIGTERM handler was installed AFTER the fork
+    loop, so a stop that arrived while the fleet was still coming up killed
+    the launcher at its default disposition and left the workers it had
+    already started running, reparented to init. And a worker killed before
+    it installed its OWN handler exits with a NEGATIVE code (-SIGTERM), which
+    the launcher counted as a failure — so the graceful stop exited 1.
+    """
+
+    @staticmethod
+    def _fleet_harness(monkeypatch, *, signal_at: int, exitcode: int):
+        """Replace multiprocessing.Process with a fake fleet.
+
+        The fake delivers the stop by CALLING the handler the launcher has
+        installed, rather than raising a real signal: a regression (no handler
+        yet) is then an assertion, not a SIGTERM to the test session.
+        """
+        started: list[Any] = []
+        killed: list[tuple[int, int]] = []
+
+        class FakeProcess:
+            def __init__(self, **_: Any) -> None:
+                self.pid: int | None = None
+                self.exitcode: int | None = None
+
+            def start(self) -> None:
+                self.pid = 500000 + len(started)
+                started.append(self)
+                if len(started) == signal_at:
+                    handler = signal.getsignal(signal.SIGTERM)
+                    assert callable(handler), (
+                        "the SIGTERM handler must be installed BEFORE the "
+                        "first worker is forked"
+                    )
+                    handler(signal.SIGTERM, None)
+
+            def join(self) -> None:
+                self.exitcode = exitcode
+
+        monkeypatch.setattr("pyjobby.pj.Process", FakeProcess)
+        monkeypatch.setattr(
+            "pyjobby.pj.os.kill",
+            lambda pid, sig: killed.append((pid, sig)),
+        )
+        return started, killed
+
+    def test_a_stop_mid_launch_reaches_every_worker_already_started(
+        self, live_config, monkeypatch
+    ):
+        """The launcher stops spawning and forwards the signal to the workers
+        it has: the fleet it created is never left behind."""
+        started, killed = self._fleet_harness(
+            monkeypatch, signal_at=2, exitcode=-signal.SIGTERM
+        )
+        original = signal.getsignal(signal.SIGTERM)
+        try:
+            result = CliRunner().invoke(
+                workit, ["--config", live_config, "--workers", "6"]
+            )
+        finally:
+            signal.signal(signal.SIGTERM, original)
+
+        assert len(started) == 2, "kept spawning after a stop was requested"
+        assert {pid for pid, _ in killed} == {p.pid for p in started}
+        assert all(sig == signal.SIGTERM for _, sig in killed)
+        # a fleet that stopped because it was told to is not a failure
+        assert result.exit_code == 0, result.stderr
+
+    def test_workers_killed_before_they_handle_sigterm_are_not_a_failure(
+        self, live_config, monkeypatch
+    ):
+        """-SIGTERM is what a worker still in its bootstrap exits with. The
+        launcher used to call that non-zero and exit 1, so `systemctl stop`
+        marked the unit failed."""
+        started, _ = self._fleet_harness(
+            monkeypatch, signal_at=1, exitcode=-signal.SIGTERM
+        )
+        original = signal.getsignal(signal.SIGTERM)
+        try:
+            result = CliRunner().invoke(
+                workit, ["--config", live_config, "--workers", "2"]
+            )
+        finally:
+            signal.signal(signal.SIGTERM, original)
+
+        assert len(started) == 1
+        assert result.exit_code == 0, result.stderr
+
+    def test_a_worker_killed_by_another_signal_is_still_a_failure(
+        self, live_config, monkeypatch
+    ):
+        """Only SIGTERM/SIGINT mean "we asked for this". A SIGSEGV death is a
+        crash, and the exit code has to keep saying so."""
+        started, _ = self._fleet_harness(
+            monkeypatch, signal_at=1, exitcode=-signal.SIGSEGV
+        )
+        original = signal.getsignal(signal.SIGTERM)
+        try:
+            result = CliRunner().invoke(
+                workit, ["--config", live_config, "--workers", "2"]
+            )
+        finally:
+            signal.signal(signal.SIGTERM, original)
+
+        assert len(started) == 1
+        assert result.exit_code == 1, result.stderr
+        assert "exited non-zero" in result.stderr
 
 
 # ============================================================================

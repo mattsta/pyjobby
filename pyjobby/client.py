@@ -154,6 +154,14 @@ DEFAULT_PRIO_CEILING: Final = 1000
 #: anything; `queue=` overrides it.
 DEFAULT_MACHINE_QUEUE: Final = "machines"
 
+#: How long `run()` waits for its best-effort cancellation after the caller
+#: has already stopped waiting. Bounded because that cleanup runs inside an
+#: exception handler on the way OUT: an exhausted pool or a database that
+#: went away made it wait forever, so the TimeoutError the caller was told to
+#: catch never arrived and the call hung on the tidying instead of the work.
+#: Short on purpose — the cancel is best effort, the exception is not.
+_RUN_CANCEL_TIMEOUT: Final = 5.0
+
 
 def validate_priority(priority: int, ceiling: int = DEFAULT_PRIO_CEILING) -> int:
     """Refuse a priority no worker at `ceiling` could ever claim.
@@ -950,10 +958,24 @@ class JobClient:
             # async abandonments -- asyncio.timeout()/wait_for around this
             # call, or the whole task cancelled on client disconnect -- which
             # arrive as CancelledError. The cancel RPC is shielded so the
-            # in-flight cancellation cannot kill the cleanup it triggered;
-            # best effort either way, and the exception propagates unchanged.
-            with contextlib.suppress(Exception):
-                await asyncio.shield(self.cancel_job(job_id))
+            # in-flight cancellation cannot kill the cleanup it triggered,
+            # and BOUNDED by _RUN_CANCEL_TIMEOUT so the cleanup cannot
+            # outlive the failure it is tidying up after.
+            #
+            # BaseException, not Exception: a second cancellation arriving
+            # while this handler runs raises CancelledError, which
+            # suppress(Exception) let through -- replacing the caller's
+            # TimeoutError with a CancelledError they were never told to
+            # expect, and losing the cleanup as well. Everything the cleanup
+            # can raise (including its own timeout, which cancels the shield's
+            # waiter and leaves the shielded cancel running) is swallowed
+            # here, and the bare `raise` re-raises the ORIGINAL exception:
+            # the caller always sees the one this method documents.
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(
+                    asyncio.shield(self.cancel_job(job_id)),
+                    timeout=_RUN_CANCEL_TIMEOUT,
+                )
             raise
 
     async def start_machine(

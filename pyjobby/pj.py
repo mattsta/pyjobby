@@ -346,6 +346,14 @@ WORKER_SHUTDOWN_SQL = (
     "UPDATE jorb_worker SET shutdown_at = now(), idle = FALSE WHERE id = $1"
 )
 
+# Signals that mean "stop", so a worker killed by one is a GRACEFUL stop
+# rather than a failure the launcher reports (see workit's exit-code
+# collection). A child that has not yet installed its own SIGTERM handler
+# dies at the default disposition and multiprocessing reports that as a
+# negative exit code -- which is the ordinary shape of `systemctl stop`
+# reaching a fleet still starting up, not a fault.
+GRACEFUL_STOP_SIGNALS: Final = frozenset({signal.SIGTERM, signal.SIGINT})
+
 
 @dataclass
 class JobSystem:
@@ -2459,11 +2467,54 @@ def workit(
         max_prio,
         workers * len(queues),
     )
-    launched = set()
+    launched: set[Process] = set()
+    stopping = False
+
+    def signalBroadcast(signum: int, frame: Any) -> None:
+        """Forward the launcher's signal to every child STARTED SO FAR.
+
+        Installed BEFORE the first fork, not after the last one. A SIGTERM
+        that landed mid-launch used to kill the launcher at its default
+        disposition and leave every worker already started running —
+        reparented to init, claiming jobs for a fleet nobody is supervising.
+        That is exactly what `systemctl stop` produces against a fleet still
+        coming up (the launch loop sleeps between starts, so the window is
+        real). So the handler exists from before there is anything to forward
+        to, and it iterates whatever ``launched`` holds at the instant it
+        fires — a partially filled set is the normal case, not an edge one.
+
+        It also sets the flag the launch loop checks between starts: once a
+        stop has been asked for, no further worker is started.
+
+        The suppression is PER CHILD, not around the loop. A worker that has
+        already exited raises ProcessLookupError from os.kill, and catching
+        that outside the loop abandoned the broadcast there -- so one dead
+        child silenced the signal for every worker after it, and the survivors
+        only noticed at their next orphan check, up to a poll interval later.
+        """
+        nonlocal stopping
+        stopping = True
+        for p in list(launched):
+            if p.pid is None:  # never started, or already reaped
+                continue
+            with contextlib.suppress(OSError):
+                os.kill(p.pid, signum)
+
+    signal.signal(signal.SIGTERM, signalBroadcast)
+
     # worker ids are unique across the whole fleet, not per queue: they name
     # this process's per-worker web listen socket (see _start_web_listener)
     fleet = [q for q in queues for _ in range(workers)]
     for idx, q in enumerate(fleet):
+        if stopping:
+            logger.warning(
+                "Stop requested during launch; {} of {} worker(s) started, "
+                "starting no more",
+                len(launched),
+                len(fleet),
+            )
+            break
+
         p = Process(
             target=runAndDone,
             args=(
@@ -2492,33 +2543,43 @@ def workit(
         # staggered instead of bunching at the same start microsecond.
         time.sleep(random.uniform(0.001, 0.010))
 
-    def signalBroadcast(signum: int, frame: Any) -> None:
-        """Forward main interrupt to every child, including after one is gone.
+    if stopping:
+        # A signal delivered INSIDE Process.start() -- after the fork, before
+        # the Process object carries a pid -- reached no child. Every worker
+        # this launcher started is in `launched` now, so re-broadcast once;
+        # a second SIGTERM to a worker is a no-op (its handler only sets stop)
+        # and to a dead one is a suppressed ProcessLookupError.
+        signalBroadcast(signal.SIGTERM, None)
 
-        The suppression is PER CHILD, not around the loop. A worker that has
-        already exited raises ProcessLookupError from os.kill, and catching
-        that outside the loop abandoned the broadcast there -- so one dead
-        child silenced the signal for every worker after it, and the survivors
-        only noticed at their next orphan check, up to a poll interval later.
-        """
-        for p in launched:
-            if p.pid is None:  # never started, or already reaped
-                continue
-            with contextlib.suppress(OSError):
-                os.kill(p.pid, signum)
-
-    signal.signal(signal.SIGTERM, signalBroadcast)
-    failed: list[tuple[int | None, int]] = []
+    failed: list[tuple[int | None, int | str]] = []
     for l in launched:
         with contextlib.suppress(KeyboardInterrupt):
             l.join()
-        # None = the join was interrupted (Ctrl-C, suppressed above) and this
-        # child's fate is unknown; 0 = a clean stop, which is what SIGTERM and
-        # Ctrl-C produce, so a graceful shutdown still exits 0. Everything
-        # else — a crash (1) or a signal death (negative) — is a failure the
-        # launcher must not report as success.
-        if l.exitcode:
-            failed.append((l.pid, l.exitcode))
+        code = l.exitcode
+        if code is None:
+            # The join never completed (Ctrl-C, suppressed above): this child
+            # may still be running, may have died, and the launcher cannot
+            # tell. Counting "unknown" as success is how a half-dead fleet
+            # exits 0, so it is named here and counted as a failure.
+            logger.error(
+                "Worker pid {} could not be joined; its fate is unknown", l.pid
+            )
+            failed.append((l.pid, "unknown (join interrupted)"))
+        elif code < 0 and -code in GRACEFUL_STOP_SIGNALS:
+            # A child killed by SIGTERM/SIGINT before it installed its own
+            # handler exits with the NEGATED signal number, not 0 -- and the
+            # window for that is every stop that catches a worker still
+            # starting up. Reporting it as a failure made `systemctl stop`
+            # mark the unit failed for doing exactly what it was told.
+            logger.info(
+                "Worker pid {} stopped on signal {} before it could handle it",
+                l.pid,
+                -code,
+            )
+        elif code:
+            # A crash (positive exit code) is a real failure the launcher must
+            # not report as success, and so is a death by any other signal.
+            failed.append((l.pid, code))
 
     if failed:
         logger.error(

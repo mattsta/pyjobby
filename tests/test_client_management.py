@@ -618,6 +618,32 @@ class TestRunTimeout:
         jobs = await job_client.get_jobs(queue=queue)
         assert [j["state"] for j in jobs] == ["cancelled"]
 
+    @pytest.mark.parametrize(
+        "boom",
+        [RuntimeError("the pool is gone"), asyncio.CancelledError()],
+        ids=["ordinary-error", "cancellation"],
+    )
+    async def test_a_failing_cleanup_never_replaces_the_caller_s_error(
+        self, db_pool, job_client, boom
+    ):
+        """The cleanup is best effort; the exception is not.
+
+        run()'s cancel runs inside the handler on the way OUT, so whatever it
+        raises lands on the path of the TimeoutError the caller was told to
+        catch. An ordinary error there was already swallowed; a CancelledError
+        was not — suppress(Exception) let it through and the caller got a
+        cancellation instead of the timeout, with the cleanup lost as well.
+        Both must leave the TimeoutError intact."""
+        queue = f"run_cleanup_{uuid.uuid4().hex}"
+
+        async def exploding_cancel(job_id: int) -> dict[str, str]:
+            raise boom
+
+        job_client.cancel_job = exploding_cancel
+
+        with pytest.raises(TimeoutError):
+            await job_client.run("test.Job", timeout=0.5, queue=queue, data="x")
+
 
 @pytest.mark.asyncio
 class TestBulkOperations:

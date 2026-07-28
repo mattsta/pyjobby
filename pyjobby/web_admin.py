@@ -1087,15 +1087,21 @@ class WebAdminServer:
         """Retry a job (404 if it does not exist, 400 if its state forbids it)"""
         job_id = _path_id(request, "job_id")
         async with self.api() as api:
-            job = await self._job_or_404(api, job_id)
+            await self._job_or_404(api, job_id)
             result = await api.retry_job(job_id)
             if result["status"] == "not_retriable":
-                # the job exists (404 already ruled absence out), so the only
-                # thing left is a state the retry verb refuses
+                # The job exists (404 already ruled absence out), so the only
+                # thing left is a state the retry verb refuses. The message is
+                # built from the RETURNED status, never from the row read
+                # above: that read is a snapshot from before the verb ran, so
+                # a concurrent operator made the refusal quote a state the job
+                # was no longer in ("is in state 'crashed', can only retry
+                # crashed"). The status is what the statement itself decided.
                 return web.json_response(
                     {
-                        "error": f"Job {job_id} is in state '{job['state']}', "
-                        f"can only retry crashed or cancelled jobs"
+                        "error": f"Job {job_id} was not retried "
+                        f"({result['status']}): only crashed or cancelled "
+                        f"jobs can be retried"
                     },
                     status=400,
                 )
@@ -1105,15 +1111,18 @@ class WebAdminServer:
         """Cancel a job (404 if it does not exist, 400 if it is terminal)"""
         job_id = _path_id(request, "job_id")
         async with self.api() as api:
-            job = await self._job_or_404(api, job_id)
+            await self._job_or_404(api, job_id)
             result = await api.cancel_job(job_id)
             if result["status"] == "not_cancellable":
-                # the job exists (404 already ruled absence out), so it is
-                # terminal
+                # The job exists (404 already ruled absence out), so it is
+                # terminal. Message from the RETURNED status, not the row read
+                # above: see api_job_retry for why quoting that snapshot made
+                # the refusal contradict itself under a concurrent operator.
                 return web.json_response(
                     {
-                        "error": f"Job {job_id} is in state '{job['state']}' "
-                        f"and cannot be cancelled"
+                        "error": f"Job {job_id} was not cancelled "
+                        f"({result['status']}): it has already reached a "
+                        f"terminal state"
                     },
                     status=400,
                 )
@@ -1386,13 +1395,19 @@ class WebAdminServer:
         """
         job_id = _path_id(request, "job_id")
         async with self.api() as api:
-            job = await self._job_or_404(api, job_id)
+            await self._job_or_404(api, job_id)
             result = await api.retry_from_dlq(job_id)
             if result["status"] == "not_retriable":
-                # the job exists (404 already ruled absence out), so it is
-                # simply not a DLQ job
+                # The job exists (404 already ruled absence out), so it is
+                # simply not a DLQ job. Message from the RETURNED status, not
+                # the row read above: see api_job_retry for why that snapshot
+                # is not allowed to speak for the verb's decision.
                 return web.json_response(
-                    {"error": f"Job {job_id} is not in DLQ (state: {job['state']})"},
+                    {
+                        "error": f"Job {job_id} was not retried "
+                        f"({result['status']}): the DLQ is the crashed jobs, "
+                        f"and this one is not crashed"
+                    },
                     status=400,
                 )
             if request.query.get("format") == "html":

@@ -96,13 +96,19 @@ import contextlib
 import datetime
 import signal
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Final
 
 import asyncpg  # type: ignore[import-untyped]
 from loguru import logger
 
-from . import db
+from . import db, migrations
+from .configloader import describe_db_target
 from .lifecycle import TERMINAL_STATES_SQL
+
+# The monitor sizes its own pool: its sweeps run one at a time, so two
+# connections is the whole daemon's concurrency. These are NOT the operator's
+# to set -- see _pool_kwargs for what happens when db_params tries.
+MONITOR_POOL_SIZES: Final[dict[str, int]] = {"min_size": 1, "max_size": 2}
 
 # =========================================================================
 # The sweep statements
@@ -1218,6 +1224,73 @@ async def _run_retention(
     )
 
 
+def _pool_kwargs(target: dict[str, Any]) -> dict[str, Any]:
+    """asyncpg.create_pool keyword arguments for a ``db_params`` table.
+
+    db_params is passed to asyncpg WHOLE (that is the point of it), so a
+    table carrying ``min_size``/``max_size`` used to reach create_pool as a
+    duplicate keyword and take the daemon down on a bare TypeError traceback
+    before it swept anything. Refused by name instead: the monitor sizes its
+    own pool, and an operator who wrote those keys deserves to be told which
+    one is the problem rather than shown an interpreter error.
+    """
+    import click
+
+    clashes = sorted(MONITOR_POOL_SIZES.keys() & target.keys())
+    if clashes:
+        raise click.ClickException(
+            f"db_params sets {', '.join(clashes)}, which pj-monitor does not "
+            f"accept: it sizes its own pool "
+            f"(min_size={MONITOR_POOL_SIZES['min_size']}, "
+            f"max_size={MONITOR_POOL_SIZES['max_size']}) because its sweeps "
+            f"run one at a time. Remove "
+            f"{'those keys' if len(clashes) > 1 else 'that key'} from the "
+            f"db_params table; every other key is passed to asyncpg unchanged."
+        )
+    return {**MONITOR_POOL_SIZES, **target}
+
+
+async def _preflight_problem(target: str | dict[str, Any]) -> str | None:
+    """Connect once and check the schema is there. Returns the operator-facing
+    problem, or None when the database is usable.
+
+    Run BEFORE the sweep loop, for the same reason pj.py's namesake runs
+    before the fork: against a database with no schema the monitor loops
+    forever logging a failed sweep per cycle while every health check sees a
+    live process, and nothing in that picture says "migrate". The loop's own
+    resilience is deliberately unchanged — a database that goes away
+    mid-run is transient and must be retried, not exited on. This asks the
+    question once, at startup, where the answer can be an exit code.
+    """
+    described = describe_db_target(target)
+    try:
+        conn = (
+            await db.connect(target)
+            if isinstance(target, str)
+            else await db.connect(**target)
+        )
+    except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as e:
+        hint = migrations.schema_error_hint(e)
+        return f"Cannot connect to the database at {described}: {e}" + (
+            f" {hint}" if hint else ""
+        )
+    try:
+        if not await conn.fetchval("SELECT to_regclass('public.jorb')"):
+            return (
+                f"No pyjobby schema in the database at {described}: "
+                f"{migrations.SCHEMA_REMEDY}"
+            )
+    except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as e:
+        hint = migrations.schema_error_hint(e)
+        return f"Cannot query the database at {described}: {e}" + (
+            f" {hint}" if hint else ""
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await conn.close()
+    return None
+
+
 async def monitor(
     target: str | dict[str, Any],
     check_interval: float = 10,
@@ -1256,9 +1329,9 @@ async def monitor(
     budget per cycle, so it can catch up on a busy install without ever
     delaying the latency-critical sweeps above it."""
     if isinstance(target, str):
-        pool = await db.create_pool(target, min_size=1, max_size=2)
+        pool = await db.create_pool(target, **MONITOR_POOL_SIZES)
     else:
-        pool = await db.create_pool(min_size=1, max_size=2, **target)
+        pool = await db.create_pool(**_pool_kwargs(target))
 
     # SIGTERM/SIGINT set the stop event so shutdown is a clean end-of-cycle
     # rather than a kill mid-sweep: the default SIGTERM disposition never
@@ -1458,7 +1531,7 @@ def cli() -> None:
         retention (on by default; --retention-days 0 keeps everything)."""
         import asyncio
 
-        from .configloader import describe_db_target, load_config_from_file
+        from .configloader import load_config_from_file
 
         target: str | dict[str, Any]
         if dsn:
@@ -1475,6 +1548,21 @@ def cli() -> None:
         else:
             click.echo("Error: Must provide --dsn or --config", err=True)
             sys.exit(1)
+
+        # Refuse the db_params keys the monitor owns BEFORE anything tries to
+        # connect with them: min_size/max_size are not asyncpg.connect
+        # arguments either, so the preflight below would die on the same raw
+        # TypeError the pool used to.
+        if isinstance(target, dict):
+            _pool_kwargs(target)
+
+        # Ask the question every sweep is about to ask, once, before the loop:
+        # exit code 2 (a startup precondition) rather than a daemon that runs
+        # forever failing every sweep while looking perfectly alive.
+        problem = asyncio.run(_preflight_problem(target))
+        if problem is not None:
+            click.echo(problem, err=True)
+            sys.exit(2)
 
         click.echo(f"Starting monitor (check every {check_interval}s)...")
         click.echo(f"Database: {describe_db_target(target)}")
