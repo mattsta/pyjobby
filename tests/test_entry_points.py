@@ -698,6 +698,8 @@ class TestMigrateEntryPoint:
         """Install into a brand-new database and enqueue against it."""
         import asyncpg
 
+        from tests.schema_fixtures import drop_database
+
         admin_dsn = (
             f"postgresql://{db_params['user']}:{db_params['password']}"
             f"@{db_params['host']}:{db_params['port']}/{db_params['database']}"
@@ -742,9 +744,7 @@ class TestMigrateEntryPoint:
         finally:
             admin = await asyncpg.connect(admin_dsn)
             try:
-                await admin.execute(
-                    f'DROP DATABASE IF EXISTS "{fresh_db}" WITH (FORCE)'
-                )
+                await drop_database(admin, fresh_db)
             finally:
                 await admin.close()
 

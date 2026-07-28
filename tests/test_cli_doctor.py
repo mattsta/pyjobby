@@ -32,6 +32,7 @@ from click.testing import CliRunner
 
 from pyjobby import migrations
 from pyjobby.cli import DOCTOR_REQUIRED_TRIGGERS, cli
+from tests.schema_fixtures import drop_database
 
 pytestmark = pytest.mark.asyncio
 
@@ -108,7 +109,7 @@ async def scratch_db(db_params: dict):
         for name in created:
             # best effort: a leaked scratch database must not fail the test
             with contextlib.suppress(asyncpg.PostgresError):
-                await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+                await drop_database(admin, name)
         await admin.close()
 
 

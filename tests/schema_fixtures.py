@@ -18,6 +18,7 @@ Two things are shared, by the files that need them
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import uuid
 from pathlib import Path
@@ -32,6 +33,27 @@ CATALOG_SQL = (_SQL / "catalog_snapshot.sql").read_text()
 async def catalog(conn: asyncpg.Connection) -> list[str]:
     """Every catalog object in `public`, as sorted comparable text."""
     return [r["line"] for r in await conn.fetch(CATALOG_SQL)]
+
+
+async def drop_database(admin: asyncpg.Connection, name: str) -> None:
+    """DROP a scratch database, waiting out whatever is still attached.
+
+    Plain DROP with retries, not ``WITH (FORCE)``: FORCE terminates every
+    backend on the target, and when one of them is an autovacuum worker that
+    takes superuser -- an intermittent InsufficientPrivilegeError that
+    either failed the test (where the drop was unguarded) or silently LEAKED
+    the database (where it was wrapped in suppress; dozens accumulated). A
+    just-disconnected client's backend or an autovacuum pass clears in
+    milliseconds, so a short retry outlasts both. FORCE remains only as the
+    last resort, for a backend that genuinely will not go away on its own.
+    """
+    for _ in range(40):
+        try:
+            await admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
+            return
+        except asyncpg.ObjectInUseError:
+            await asyncio.sleep(0.05)
+    await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
 
 
 class ScratchDatabases:
@@ -82,9 +104,7 @@ class ScratchDatabases:
             # Best effort: a leaked scratch database must not fail a test that
             # otherwise passed.
             with contextlib.suppress(asyncpg.PostgresError):
-                await self._admin.execute(
-                    f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'
-                )
+                await drop_database(self._admin, name)
         await self._admin.close()
         self._admin = None
 
