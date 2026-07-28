@@ -938,6 +938,31 @@ class TestScheduleCommands:
 
             assert result.exit_code == 0
 
+    def test_schedule_enable_exits_nonzero_on_error(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        """A deploy script doing `pj-admin schedule enable X && next` must
+        NOT proceed when the enable failed. These verbs used to print the
+        error and exit 0."""
+        mock_admin_api.enable_schedule.side_effect = RuntimeError("db exploded")
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "schedule", "enable", "test-schedule"]
+            )
+        assert result.exit_code != 0
+        assert "Failed to enable schedule" in result.output
+
+    def test_schedule_disable_exits_nonzero_on_error(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        mock_admin_api.disable_schedule.side_effect = RuntimeError("db exploded")
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "schedule", "disable", "test-schedule"]
+            )
+        assert result.exit_code != 0
+        assert "Failed to disable schedule" in result.output
+
     def test_schedule_disable(self, cli_runner, mock_admin_api, mock_db_params):
         """Test schedule disable command."""
         with mock_cli_context(mock_admin_api, mock_db_params):

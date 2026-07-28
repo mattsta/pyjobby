@@ -55,7 +55,14 @@ class ConfigError(RuntimeError):
 #: A value that is EXACTLY an environment reference. Deliberately the whole
 #: string rather than embedded interpolation: "${A}:${B}" templating invites
 #: quoting bugs, while a value that IS a secret reference is unambiguous.
-_ENV_REF = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+#: \Z, not $ -- $ also matches BEFORE a trailing newline, so "${VAR}\n"
+#: would substitute and silently drop the newline.
+_ENV_REF = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}\Z")
+
+#: A config file larger than this is refused unread. A settings file is
+#: kilobytes; a megabytes-large one is a mistake or a resource-exhaustion
+#: attempt, and reading it into memory to then reject it is the exhaustion.
+_MAX_CONFIG_BYTES = 1024 * 1024
 
 
 def _substitute_env(value: Any, *, source: str) -> Any:
@@ -99,18 +106,37 @@ def load_config_from_file(filename: str, keys: Iterable[str]) -> dict[str, Any]:
         )
     if not path.exists():
         raise ConfigError(f"{filename!r} doesn't exist")
+    try:
+        size = path.stat().st_size
+    except OSError as e:
+        raise ConfigError(f"Failed to read config file: {filename}: {e}") from e
+    if size > _MAX_CONFIG_BYTES:
+        raise ConfigError(
+            f"{filename!r} is {size} bytes; a pyjobby config is refused above "
+            f"{_MAX_CONFIG_BYTES} bytes (it is a settings file, not a dataset)"
+        )
 
     try:
         with path.open("rb") as fh:
             raw = tomllib.load(fh)
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"Failed to parse config file {filename}: {e}") from e
-    except OSError as e:
+    except (OSError, UnicodeDecodeError, RecursionError) as e:
+        # UnicodeDecodeError: a non-UTF-8 file; RecursionError: pathologically
+        # nested TOML. Both must arrive as ConfigError (RuntimeError) so the
+        # `except RuntimeError` guard in every CLI entry point catches them
+        # instead of a raw traceback escaping.
         raise ConfigError(f"Failed to read config file: {filename}: {e}") from e
 
     wanted = {k.lower() for k in keys}
-    return {
-        k.lower(): _substitute_env(v, source=filename)
-        for k, v in raw.items()
-        if k.lower() in wanted
-    }
+    try:
+        return {
+            k.lower(): _substitute_env(v, source=filename)
+            for k, v in raw.items()
+            if k.lower() in wanted
+        }
+    except RecursionError as e:
+        raise ConfigError(
+            f"Failed to read config file: {filename}: structure too deeply "
+            f"nested ({e})"
+        ) from e

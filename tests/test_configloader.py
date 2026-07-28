@@ -113,6 +113,19 @@ class TestEnvSubstitution:
 
         assert cfg["db_params"]["host"] == "prefix-${NOT_A_REF}"
 
+    def test_a_trailing_newline_defeats_the_reference(self, tmp_path, monkeypatch):
+        """The anchor is \\Z, not $ -- $ also matches before a trailing
+        newline, which would substitute "${VAR}\\n" and drop the newline."""
+        monkeypatch.setenv("PYJOBBY_TEST_NL", "secret")
+        path = write(
+            tmp_path, '[db_params]\nhost = """${PYJOBBY_TEST_NL}\n"""\n'
+        )
+
+        cfg = load_config_from_file(path, ["db_params"])
+
+        # a value with a trailing newline is NOT a bare reference; left literal
+        assert cfg["db_params"]["host"] == "${PYJOBBY_TEST_NL}\n"
+
 
 class TestFailureModes:
     def test_missing_file(self, tmp_path):
@@ -143,3 +156,21 @@ class TestFailureModes:
         working."""
         with pytest.raises(RuntimeError):
             load_config_from_file(str(tmp_path / "absent.toml"), ["db_params"])
+
+    def test_a_non_utf8_file_is_a_config_error_not_a_raw_traceback(
+        self, tmp_path
+    ):
+        """UnicodeDecodeError must arrive as ConfigError (RuntimeError) so the
+        `except RuntimeError` guard in every CLI entry point catches it."""
+        path = tmp_path / "bad.toml"
+        path.write_bytes(b'host = "\xff\xfe not utf-8"\n')
+
+        with pytest.raises(ConfigError):
+            load_config_from_file(str(path), ["db_params"])
+
+    def test_an_oversized_file_is_refused_unread(self, tmp_path):
+        path = tmp_path / "huge.toml"
+        path.write_text("x = 1\n" + "# padding\n" * 200_000)
+
+        with pytest.raises(ConfigError, match="refused above"):
+            load_config_from_file(str(path), ["db_params"])

@@ -1765,8 +1765,10 @@ def schedule_enable(ctx: click.Context, name_or_id: str) -> None:
             await api.enable_schedule(schedule_id)
             print_success(f"✓ Schedule enabled: {sched['name']}")
 
+        except SystemExit:
+            raise  # a fail() above (e.g. "not found") already set the code
         except Exception as e:
-            print_error(f"Failed to enable schedule: {e}")
+            fail(f"Failed to enable schedule: {e}")
         finally:
             await conn.close()
 
@@ -1801,8 +1803,10 @@ def schedule_disable(ctx: click.Context, name_or_id: str) -> None:
             await api.disable_schedule(schedule_id)
             print_success(f"✓ Schedule disabled: {sched['name']}")
 
+        except SystemExit:
+            raise
         except Exception as e:
-            print_error(f"Failed to disable schedule: {e}")
+            fail(f"Failed to disable schedule: {e}")
         finally:
             await conn.close()
 
@@ -1838,8 +1842,10 @@ def schedule_delete(ctx: click.Context, name_or_id: str) -> None:
             await api.delete_schedule(schedule_id)
             print_success(f"✓ Schedule deleted: {sched['name']}")
 
+        except SystemExit:
+            raise
         except Exception as e:
-            print_error(f"Failed to delete schedule: {e}")
+            fail(f"Failed to delete schedule: {e}")
         finally:
             await conn.close()
 

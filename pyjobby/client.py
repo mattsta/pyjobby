@@ -1059,6 +1059,19 @@ class JobClient:
         # admin_data entry still wins, as with every retry knob above.
         admin_data.setdefault("on_timeout", on_timeout)
 
+        # Validate the MERGED value, not just the on_timeout parameter: a
+        # caller who passed admin_data={"on_timeout": "typo"} bypassed the
+        # parameter check above, and the worker treats anything but 'retry'
+        # as terminal -- so the very "typo dead-letters silently" the
+        # parameter check exists to prevent still got through.
+        if admin_data["on_timeout"] not in _ON_TIMEOUT_POLICIES:
+            raise ValueError(
+                f"admin_data['on_timeout'] must be one of "
+                f"{sorted(_ON_TIMEOUT_POLICIES)}, got "
+                f"{admin_data['on_timeout']!r} — the worker treats anything "
+                f"that is not 'retry' as 'fail', so a typo dead-letters silently"
+            )
+
         return [
             job_class,
             kwargs if job_kwargs is None else job_kwargs,  # codec converts

@@ -2312,7 +2312,10 @@ def workit(
     # platform default — ONE config key, so a fleet does not repeat the same
     # number on four command lines (and forget one)
     if max_prio is None:
-        max_prio = loadedConfig.get("prio_ceiling") or DEFAULT_PRIO_CEILING
+        # `is not None`, not `or`: a configured prio_ceiling = 0 (a ceiling
+        # that admits only prio-0 work) is a real value, not "unset".
+        configured = loadedConfig.get("prio_ceiling")
+        max_prio = DEFAULT_PRIO_CEILING if configured is None else configured
 
     if not loadedConfig.get("db_params"):
         logger.error("No db_params found in config: {}", config)

@@ -226,6 +226,15 @@ class TestJobClientEnqueue:
         with pytest.raises(ValueError, match="on_timeout must be one of"):
             self.admin_data_for(on_timeout=policy)
 
+    @pytest.mark.parametrize("policy", ["typo", "Fail", ""])
+    def test_an_unknown_on_timeout_INSIDE_admin_data_is_refused(self, policy):
+        """The parameter check is not enough: a caller who buries a bad
+        on_timeout in admin_data bypassed it, and the merged value is what
+        the worker reads. The 'typo dead-letters silently' hole must close
+        for the admin_data path too."""
+        with pytest.raises(ValueError, match="admin_data\\['on_timeout'\\]"):
+            self.admin_data_for(admin_data={"on_timeout": policy})
+
 
 class TestJobClientEnqueueBatch:
     """Test JobClient.enqueue_batch method - covers lines 390-477."""

@@ -1406,7 +1406,10 @@ def main() -> None:
         if not db_params:
             raise click.ClickException(f"No db_params found in config: {config}")
         if max_prio is None:
-            max_prio = cfg.get("prio_ceiling") or DEFAULT_PRIO_CEILING
+            # `is not None`, not `or`: a configured prio_ceiling = 0 is a
+            # real value, not "unset".
+            configured = cfg.get("prio_ceiling")
+            max_prio = DEFAULT_PRIO_CEILING if configured is None else configured
 
         if snapshot_interval <= 0:
             raise click.ClickException("--snapshot-interval must be positive")
