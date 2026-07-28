@@ -15,6 +15,8 @@ import asyncio
 import contextlib
 import hashlib
 import os
+import socket
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
@@ -66,6 +68,32 @@ def unique_name(base: str) -> str:
         Unique name with UUID suffix
     """
     return f"{base}_{uuid.uuid4().hex[:8]}"
+
+
+@contextlib.contextmanager
+def reserved_unused_port() -> Iterator[int]:
+    """A localhost TCP port that REFUSES connections for as long as the
+    context is open.
+
+    Binding, reading the port and closing again -- the obvious version --
+    hands out a port nothing owns: under `-n auto` a sibling worker (or any
+    process on the box) can take it between the close and the assertion, and
+    then the "unreachable database" test connects to something real. So the
+    socket stays bound for the whole test.
+
+    Bound but never listen()ed, and deliberately WITHOUT SO_REUSEADDR:
+      * no listener means the kernel answers a connect with RST, which is
+        the ECONNREFUSED these tests are about;
+      * no SO_REUSEADDR means any other bind of this port fails with
+        EADDRINUSE instead of quietly sharing it, which is what makes the
+        reservation a reservation.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        yield int(sock.getsockname()[1])
+    finally:
+        sock.close()
 
 
 @pytest.fixture
@@ -591,6 +619,40 @@ async def live_worker(db_params: dict[str, str], unique_queue: str):
 
     started: list[tuple[JobSystem, asyncio.Task]] = []
 
+    async def _await_registration(system: JobSystem, timeout: float = 10.0) -> None:
+        """Block until this worker's jorb_worker row is VISIBLE to another
+        session.
+
+        The worker registers last (`run()` connects, prepares statements,
+        LISTENs, and only then registers), so that row is proof that every
+        part of the startup a test depends on has happened. A fixed sleep was
+        proof of nothing: on a loaded box -- four xdist workers, a cold
+        connection -- the test began before the worker existed, and the
+        failure landed on whatever the test was actually asserting.
+
+        The confirming connection is opened and closed inside the poll rather
+        than kept for the fixture's lifetime: tests that identify a worker's
+        backends by diffing pg_stat_activity around its startup (see
+        tests/utils/faults.py::new_backends) would otherwise attribute this
+        fixture's connection to the worker.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if system.worker_id is not None:
+                probe = await asyncpg.connect(**db_params)
+                try:
+                    if await probe.fetchval(
+                        "SELECT 1 FROM jorb_worker WHERE id = $1", system.worker_id
+                    ):
+                        return
+                finally:
+                    await probe.close()
+            await asyncio.sleep(0.02)
+        raise AssertionError(
+            f"worker on queue {system.qname!r} did not register within "
+            f"{timeout}s (worker_id={system.worker_id})"
+        )
+
     async def _start(**overrides) -> JobSystem:
         params: dict = {
             "qname": unique_queue,
@@ -602,8 +664,7 @@ async def live_worker(db_params: dict[str, str], unique_queue: str):
         system = JobSystem(dsn=db_params, **params)
         task = asyncio.create_task(system.run())
         started.append((system, task))
-        # give the worker a beat to connect, register, and LISTEN
-        await asyncio.sleep(0.4)
+        await _await_registration(system)
         return system
 
     yield _start

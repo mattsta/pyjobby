@@ -538,9 +538,20 @@ alert on its exit code.
 Neither web surface authenticates anything. `pj-web` binds `127.0.0.1:8081`
 and `pj-ws` binds `127.0.0.1:8082` by default, and both say so in
 `--help`. `pj-web` can cancel, retry and delete jobs; `pj-ws` can cancel,
-retry and re-prioritise them. Keep them on localhost, behind an
-authenticating reverse proxy, or on a private network. Do not pass
-`--host 0.0.0.0` without one of those.
+retry and re-prioritise them, and a `pj-web` schedule names a class every
+worker imports — write access there is as privileged as the workers. Keep
+them on localhost, behind an authenticating reverse proxy, or on a private
+network. Do not pass `--host 0.0.0.0` without one of those.
+
+Localhost is not by itself a boundary against a browser: a form-encoded
+`POST` needs no CORS permission, so a page the operator is reading can
+submit one to `127.0.0.1:8081`. `pj-web` refuses mutations a browser marks
+as cross-site (`Sec-Fetch-Site`, `Origin`) with a `403`, while leaving
+header-less clients such as curl and deploy scripts alone. That closes the
+drive-by; it is not authentication, and does not replace the proxy.
+
+`pj-web`'s pool sets a 30-second `command_timeout`: an admin query that
+cannot answer in that time must not hold one of the ten connections.
 
 For the database, give the platform a role that can write every `jorb*`
 table. It needs `DELETE` — retention is a delete — and it needs to create

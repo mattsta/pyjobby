@@ -288,6 +288,84 @@ class TestWorkitShutdown:
         assert "exited non-zero" in result.stderr
 
 
+class TestWorkitPriorityCeiling:
+    """The ceiling the fleet claims at is declared once, in the config file,
+    and every forked worker has to be started with THAT number."""
+
+    @staticmethod
+    def _capture_fleet(monkeypatch) -> list[dict]:
+        """Replace multiprocessing.Process with a fake that records the
+        keyword arguments each worker would have been started with."""
+        launched: list[dict] = []
+
+        class FakeProcess:
+            def __init__(self, **kwargs: Any) -> None:
+                launched.append(kwargs)
+                self.pid: int | None = None
+                self.exitcode: int | None = None
+
+            def start(self) -> None:
+                self.pid = 600000 + len(launched)
+
+            def join(self) -> None:
+                self.exitcode = 0
+
+        monkeypatch.setattr("pyjobby.pj.Process", FakeProcess)
+        return launched
+
+    def _run(self, config: str, monkeypatch, *args: str) -> list[dict]:
+        launched = self._capture_fleet(monkeypatch)
+        original = signal.getsignal(signal.SIGTERM)
+        try:
+            result = CliRunner().invoke(
+                workit, ["--config", config, "--workers", "2", *args]
+            )
+        finally:
+            signal.signal(signal.SIGTERM, original)
+        assert result.exit_code == 0, result.stderr
+        return launched
+
+    def test_a_configured_ceiling_of_zero_reaches_every_worker(
+        self, db_params, tmp_path, monkeypatch
+    ):
+        """`prio_ceiling = 0` is a fleet that claims ONLY prio-0 work — and
+        it is the one value that reads as "unset" to `or`. Resolved that
+        way, every worker would come up at the 1000 default and claim work
+        the operator declared unclaimable."""
+        config = str(
+            write_config_toml(tmp_path / "pyjobby.toml", db_params, prio_ceiling=0)
+        )
+
+        launched = self._run(config, monkeypatch)
+
+        assert len(launched) == 2
+        assert [p["kwargs"]["max_prio"] for p in launched] == [0, 0]
+
+    def test_a_file_without_a_ceiling_starts_workers_at_the_default(
+        self, live_config, monkeypatch
+    ):
+        """...and the zero above is a real declaration rather than the
+        default arriving by another route."""
+        from pyjobby.client import DEFAULT_PRIO_CEILING
+
+        launched = self._run(live_config, monkeypatch)
+
+        assert [p["kwargs"]["max_prio"] for p in launched] == [
+            DEFAULT_PRIO_CEILING
+        ] * len(launched)
+
+    def test_the_flag_still_overrides_the_file(self, db_params, tmp_path, monkeypatch):
+        """--max-prio is the operator saying they know better about THIS
+        launch; the file is the default, not an override."""
+        config = str(
+            write_config_toml(tmp_path / "pyjobby.toml", db_params, prio_ceiling=0)
+        )
+
+        launched = self._run(config, monkeypatch, "--max-prio", "250")
+
+        assert [p["kwargs"]["max_prio"] for p in launched] == [250, 250]
+
+
 # ============================================================================
 # Test runAndDone Parameterization
 # ============================================================================

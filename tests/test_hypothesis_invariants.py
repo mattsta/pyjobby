@@ -1,17 +1,21 @@
 """
-Hypothesis property tests for retry delays, DAGs, timeouts, and result storage.
+Hypothesis property tests for retry delays, DAG construction, and results.
 
-Property-based fuzz testing of mathematical invariants and edge cases that
-would be hard to discover manually.
+Property-based fuzz testing of invariants that would be hard to discover
+manually, every one of them asserted against pyjobby code:
+``retry_strategies`` (delay math and config defaults), ``dag`` (levels,
+options, node identity, visualisation), and the jsonb codec a job result is
+stored with.
 """
 
-import json
 from datetime import timedelta
 
+import orjson
 from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
 
 from pyjobby.dag import DAGBuilder, DAGNode
+from pyjobby.db import _orjson_encode
 from pyjobby.retry_strategies import calculate_retry_delay, get_retry_config
 
 # Strategy definitions
@@ -340,39 +344,14 @@ class TestDAGProperties:
         assert len(viz) > 0
 
 
-class TestTimeoutProperties:
-    """Property-based tests for timeout handling."""
-
-    @given(timeout_seconds=st.integers(min_value=1, max_value=86400))
-    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-    def test_timeout_config_is_always_positive(self, timeout_seconds):
-        """Property: Timeout configuration must be positive."""
-        admin_data = {"timeout_seconds": timeout_seconds}
-
-        # Timeout should be preserved
-        assert admin_data["timeout_seconds"] > 0
-
-    @given(
-        timeout=st.integers(min_value=1, max_value=3600),
-        on_timeout=st.sampled_from(["retry", "fail"]),
-    )
-    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-    def test_timeout_config_is_json_serializable(self, timeout, on_timeout):
-        """Property: Timeout config must be JSON serializable for admin_data."""
-        admin_data = {"timeout_seconds": timeout, "on_timeout": on_timeout}
-
-        # Should serialize without error
-        json_str = json.dumps(admin_data)
-        assert isinstance(json_str, str)
-
-        # Should deserialize back to same values
-        decoded = json.loads(json_str)
-        assert decoded["timeout_seconds"] == timeout
-        assert decoded["on_timeout"] == on_timeout
-
-
 class TestResultStorageProperties:
-    """Property-based tests for result storage."""
+    """Property-based tests for result storage.
+
+    A job result is stored in a jsonb column through the codec
+    ``pyjobby.db`` registers on every connection -- orjson, not the standard
+    library's json. So the round trip asserted here is the platform's own,
+    which is the only one that can fail in production.
+    """
 
     @given(
         result_data=st.recursive(
@@ -408,40 +387,19 @@ class TestResultStorageProperties:
     @settings(
         suppress_health_check=[HealthCheck.function_scoped_fixture], max_examples=50
     )
-    def test_result_is_json_serializable(self, result_data):
-        """Property: Any result must be JSON serializable."""
-        # Should serialize without error
-        json_str = json.dumps(result_data)
-        assert isinstance(json_str, str)
+    def test_a_result_round_trips_through_the_platforms_json_codec(self, result_data):
+        """Property: what a job returned is what a caller reads back.
 
-        # Should deserialize back
-        decoded = json.loads(json_str)
-        # Note: exact equality may not hold due to JSON limitations
-        # but it should be structurally similar
-        assert type(decoded) in (
-            type(result_data),
-            dict,
-            list,
-            str,
-            int,
-            float,
-            bool,
-            type(None),
-        )
+        Encoded with the exact function registered as the jsonb encoder
+        (``pyjobby.db._orjson_encode``) and decoded with the exact decoder
+        (``orjson.loads``), so a value orjson handles differently from the
+        standard library -- and there are several -- fails here rather than
+        in a worker.
+        """
+        encoded = _orjson_encode(result_data)
+        assert isinstance(encoded, str), "asyncpg needs str for a text-format type"
 
-    @given(result_size=st.integers(min_value=0, max_value=5000))
-    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
-    def test_result_size_can_be_calculated(self, result_size):
-        """Property: Result size can be calculated from JSON serialization."""
-        # Create result with approximately target size
-        result = {"data": "x" * result_size}
-
-        json_str = json.dumps(result)
-        size = len(json_str.encode("utf-8"))
-
-        # Size should be calculable and reasonable
-        assert size > 0
-        assert size < 10 * 1024 * 1024  # Under 10MB limit
+        assert orjson.loads(encoded) == result_data
 
 
 class TestEdgeCases:

@@ -7,8 +7,9 @@ schedule, and metrics management.
 Coverage Target: 80%+
 """
 
+import json
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -494,17 +495,19 @@ class TestJobsCommands:
             mock_admin_api.list_jobs.assert_called_once()
 
     def test_jobs_list_json_output(self, cli_runner, mock_admin_api, mock_db_params):
-        """Test jobs list with JSON output."""
+        """--json is the machine-readable form of the SAME rows: a scraper
+        parses it, so it has to BE the AdminAPI's answer, not a string that
+        merely opens with a bracket."""
         with mock_cli_context(mock_admin_api, mock_db_params):
             result = cli_runner.invoke(
                 cli, ["--config", "test.py", "jobs", "list", "--json"]
             )
 
             assert result.exit_code == 0
-            # JSON output should start with [ or {
-            assert result.output.strip().startswith(
-                "["
-            ) or result.output.strip().startswith("{")
+            payload = json.loads(result.output)
+            assert payload == mock_admin_api.list_jobs.return_value
+            assert [job["id"] for job in payload] == [1, 2]
+            assert [job["job_class"] for job in payload] == ["test.Job", "test.Job2"]
 
     def test_jobs_inspect(self, cli_runner, mock_admin_api, mock_db_params):
         """Test jobs inspect command."""
@@ -518,7 +521,7 @@ class TestJobsCommands:
             mock_admin_api.get_job.assert_called_once_with(1)
 
     def test_jobs_inspect_json(self, cli_runner, mock_admin_api, mock_db_params):
-        """Test jobs inspect with JSON output."""
+        """--json emits the whole JobInfo record, not a rendering of it."""
         with mock_cli_context(mock_admin_api, mock_db_params):
             result = cli_runner.invoke(
                 cli,
@@ -526,7 +529,13 @@ class TestJobsCommands:
             )
 
             assert result.exit_code == 0
-            assert result.output.strip().startswith("{")
+            mock_admin_api.get_job.assert_called_once_with(1)
+            payload = json.loads(result.output)
+            assert payload == mock_admin_api.get_job.return_value
+            # the fields a caller actually reaches for survive the trip
+            assert payload["job_class"] == "test.Job"
+            assert payload["kwargs"] == {"key": "value"}
+            assert payload["admin_data"] == {"timeout_seconds": 60}
 
     def test_jobs_retry(self, cli_runner, mock_admin_api, mock_db_params):
         """Test jobs retry command."""
@@ -729,13 +738,20 @@ class TestQueuesCommands:
             mock_admin_api.queue_stats.assert_called()
 
     def test_queues_stats_json(self, cli_runner, mock_admin_api, mock_db_params):
-        """Test queues stats with JSON output."""
+        """--json is the per-queue stat records, verbatim: a dashboard reads
+        the counts out of it."""
         with mock_cli_context(mock_admin_api, mock_db_params):
             result = cli_runner.invoke(
                 cli, ["--config", "test.py", "queues", "stats", "--json"]
             )
 
             assert result.exit_code == 0
+            mock_admin_api.queue_stats.assert_called_once_with()
+            payload = json.loads(result.output)
+            assert payload == mock_admin_api.queue_stats.return_value
+            assert payload[0]["queue"] == "default"
+            assert payload[0]["queued"] == 10
+            assert payload[0]["total"] == 118
 
     def test_queues_clear_with_force(self, cli_runner, mock_admin_api, mock_db_params):
         """Test queues clear with --force flag."""
@@ -964,13 +980,28 @@ class TestMetricsCommands:
             mock_admin_api.get_metrics.assert_called_once()
 
     def test_metrics_json(self, cli_runner, mock_admin_api, mock_db_params):
-        """Test metrics with JSON output."""
+        """--json is the metrics document itself: alerting rules read the
+        nested backlog/inflight/storage sections straight out of it."""
         with mock_cli_context(mock_admin_api, mock_db_params):
             result = cli_runner.invoke(
                 cli, ["--config", "test.py", "metrics", "--json"]
             )
 
             assert result.exit_code == 0
+
+            mock_admin_api.get_metrics.assert_called_once()
+            kwargs = mock_admin_api.get_metrics.call_args.kwargs
+            assert kwargs["queue"] is None
+            # the default window is the last 24h, ending now
+            window = datetime.now(UTC) - kwargs["since"]
+            assert timedelta(hours=24) <= window <= timedelta(hours=24, minutes=1)
+
+            payload = json.loads(result.output)
+            assert payload == mock_admin_api.get_metrics.return_value
+            assert payload["finished_count"] == 950
+            assert payload["backlog"]["depth"] == 200
+            assert payload["inflight"]["stuck"] == 2
+            assert payload["top_errors"][0]["job_class"] == "test.FailedJob"
 
 
 # ============================================================================
@@ -990,7 +1021,9 @@ class TestScheduleCommands:
             mock_admin_api.list_schedules.assert_called_once()
 
     def test_schedule_show(self, cli_runner, mock_admin_api, mock_db_params):
-        """Test schedule show command."""
+        """A non-numeric argument is looked up BY NAME, and the row that
+        comes back is what gets printed -- cron expression, safety limits
+        and counters included."""
         with mock_cli_context(mock_admin_api, mock_db_params):
             result = cli_runner.invoke(
                 cli,
@@ -998,6 +1031,14 @@ class TestScheduleCommands:
             )
 
             assert result.exit_code == 0
+            mock_admin_api.get_schedule.assert_called_once_with(name="test-schedule")
+
+            sched = mock_admin_api.get_schedule.return_value
+            assert f"Schedule: {sched['name']}" in result.output
+            assert sched["cron_expr"] in result.output
+            assert sched["job_class"] in result.output
+            assert f"Total Runs:            {sched['run_count']}" in result.output
+            assert f"Successes:             {sched['success_count']}" in result.output
 
     def test_schedule_add(self, cli_runner, mock_admin_api, mock_db_params):
         """Test schedule add command."""
@@ -1020,7 +1061,7 @@ class TestScheduleCommands:
             mock_admin_api.create_schedule.assert_called_once()
 
     def test_schedule_enable(self, cli_runner, mock_admin_api, mock_db_params):
-        """Test schedule enable command."""
+        """The name is resolved to an id and THAT id is what gets enabled."""
         with mock_cli_context(mock_admin_api, mock_db_params):
             result = cli_runner.invoke(
                 cli,
@@ -1034,6 +1075,11 @@ class TestScheduleCommands:
             )
 
             assert result.exit_code == 0
+            mock_admin_api.get_schedule.assert_called_once_with(name="test-schedule")
+            mock_admin_api.enable_schedule.assert_called_once_with(
+                mock_admin_api.get_schedule.return_value["id"]
+            )
+            assert "Schedule enabled: test-schedule" in result.output
 
     def test_schedule_enable_exits_nonzero_on_error(
         self, cli_runner, mock_admin_api, mock_db_params
@@ -1061,7 +1107,7 @@ class TestScheduleCommands:
         assert "Failed to disable schedule" in result.output
 
     def test_schedule_disable(self, cli_runner, mock_admin_api, mock_db_params):
-        """Test schedule disable command."""
+        """The name is resolved to an id and THAT id is what gets disabled."""
         with mock_cli_context(mock_admin_api, mock_db_params):
             result = cli_runner.invoke(
                 cli,
@@ -1075,6 +1121,11 @@ class TestScheduleCommands:
             )
 
             assert result.exit_code == 0
+            mock_admin_api.get_schedule.assert_called_once_with(name="test-schedule")
+            mock_admin_api.disable_schedule.assert_called_once_with(
+                mock_admin_api.get_schedule.return_value["id"]
+            )
+            assert "Schedule disabled: test-schedule" in result.output
 
     def test_schedule_delete_with_force(
         self, cli_runner, mock_admin_api, mock_db_params
@@ -1100,7 +1151,8 @@ class TestScheduleCommands:
             mock_admin_api.delete_schedule.assert_called_once()
 
     def test_schedule_history(self, cli_runner, mock_admin_api, mock_db_params):
-        """Test schedule history command."""
+        """History is fetched for the RESOLVED id, with the command's own
+        defaults (no result filter, 50 rows), and every row is rendered."""
         with mock_cli_context(mock_admin_api, mock_db_params):
             result = cli_runner.invoke(
                 cli,
@@ -1114,6 +1166,20 @@ class TestScheduleCommands:
             )
 
             assert result.exit_code == 0
+            mock_admin_api.get_schedule.assert_called_once_with(name="test-schedule")
+            mock_admin_api.get_schedule_history.assert_called_once_with(
+                schedule_id=mock_admin_api.get_schedule.return_value["id"],
+                result_filter=None,
+                limit=50,
+            )
+
+            entry = mock_admin_api.get_schedule_history.return_value[0]
+            assert "Execution History: test-schedule" in result.output
+            # the table truncates the column, so match the part it keeps
+            assert entry["actual_time"].strftime("%Y-%m-%d %H:%M") in result.output
+            assert str(entry["job_id"]) in result.output
+            assert f"{entry['duration_ms']}ms" in result.output
+            assert "Total: 1 execution(s)" in result.output
 
     def test_schedule_stats(self, cli_runner, mock_admin_api, mock_db_params):
         """Test schedule stats command."""
@@ -1174,20 +1240,16 @@ class TestHelperFunctions:
 
 
 class TestCLIErrorHandling:
-    """Test CLI error handling."""
+    """Test CLI error handling.
 
-    def test_config_file_not_found(self, cli_runner):
-        """Test handling of missing config file."""
-        # When config file doesn't exist, CLI should handle it gracefully
-        # This might load default config or use DB_PARAMS from environment
-        result = cli_runner.invoke(cli, ["--help"])
-
-        # Should show help successfully
-        assert result.exit_code == 0
-        assert "Usage:" in result.output
+    (A missing --config file is covered end-to-end, message by message, in
+    tests/test_cli_errors.py::test_missing_config_file_exits_one — there is
+    no second, weaker copy of it here.)
+    """
 
     def test_invalid_job_id(self, cli_runner, mock_admin_api, mock_db_params):
-        """Test handling of invalid job ID."""
+        """A job id nobody has is a FAILURE: `pj-admin jobs inspect X` in a
+        script must not report success for a job that does not exist."""
         # jobs inspect uses AdminAPI.get_job; None means "not found"
         mock_admin_api.get_job.return_value = None
 
@@ -1196,6 +1258,6 @@ class TestCLIErrorHandling:
                 cli, ["--config", "test.py", "jobs", "inspect", "99999"]
             )
 
-            # Should handle gracefully (may succeed with "not found" message or fail)
-            # Either exit code is acceptable
-            assert result.exit_code in (0, 1)
+            assert result.exit_code == 1
+            mock_admin_api.get_job.assert_called_once_with(99999)
+            assert "Job 99999 not found" in result.output + result.stderr

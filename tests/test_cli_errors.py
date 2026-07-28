@@ -27,6 +27,7 @@ from click.testing import CliRunner
 from pyjobby import migrations
 from pyjobby.cli import cli
 from pyjobby.client import DEFAULT_PRIO_CEILING
+from tests.conftest import reserved_unused_port
 from tests.schema_fixtures import drop_database
 
 pytestmark = pytest.mark.asyncio
@@ -69,14 +70,6 @@ async def make_job(pool, queue: str, state: str, **cols) -> int:
         cols.get("error_message"),
         cols.get("error_count", 0),
     )
-
-
-async def unused_port() -> int:
-    server = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
-    port = int(server.sockets[0].getsockname()[1])
-    server.close()
-    await server.wait_closed()
-    return port
 
 
 @pytest_asyncio.fixture
@@ -252,13 +245,15 @@ class TestBadDsn:
         )
 
     async def test_unreachable_port_exits_one(self, db_params):
-        port = await unused_port()
-        bad = (
-            f"postgresql://{db_params['user']}:{db_params['password']}"
-            f"@127.0.0.1:{port}/{db_params['database']}"
-        )
+        # the port stays reserved until the assertion: sampling one and
+        # letting it go hands the next xdist worker a real listener to hit
+        with reserved_unused_port() as port:
+            bad = (
+                f"postgresql://{db_params['user']}:{db_params['password']}"
+                f"@127.0.0.1:{port}/{db_params['database']}"
+            )
 
-        result = await run_cli("--dsn", bad, "queues", "list")
+            result = await run_cli("--dsn", bad, "queues", "list")
 
         assert result.exit_code == 1
         assert "Error: Failed to connect to database:" in result.stderr

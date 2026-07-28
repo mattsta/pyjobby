@@ -34,6 +34,7 @@ from click.testing import CliRunner
 
 from pyjobby import migrations
 from pyjobby.cli import DOCTOR_REQUIRED_TRIGGERS, cli
+from tests.conftest import reserved_unused_port
 from tests.schema_fixtures import drop_database
 
 pytestmark = pytest.mark.asyncio
@@ -118,15 +119,6 @@ async def scratch_db(db_params: dict):
 ScratchFactory = Callable[..., Awaitable[str]]
 
 
-async def unused_port() -> int:
-    """A localhost port with nothing listening on it."""
-    server = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
-    port = int(server.sockets[0].getsockname()[1])
-    server.close()
-    await server.wait_closed()
-    return port
-
-
 # ============================================================================
 # Database reachability
 # ============================================================================
@@ -134,13 +126,15 @@ async def unused_port() -> int:
 
 class TestDoctorDatabaseReachability:
     async def test_closed_port_fails_and_stops_after_first_check(self, db_params):
-        port = await unused_port()
-        bad = (
-            f"postgresql://{db_params['user']}:{db_params['password']}"
-            f"@127.0.0.1:{port}/{db_params['database']}"
-        )
+        # held for the whole check: a port merely sampled and released can be
+        # taken by another xdist worker before doctor dials it
+        with reserved_unused_port() as port:
+            bad = (
+                f"postgresql://{db_params['user']}:{db_params['password']}"
+                f"@127.0.0.1:{port}/{db_params['database']}"
+            )
 
-        result = await run_doctor(bad)
+            result = await run_doctor(bad)
 
         assert result.exit_code == 1, result.output
         checks = parse_checks(result.output)
@@ -979,8 +973,8 @@ class TestDoctorJson:
         assert "jorb_done_notify" in triggers["message"]
 
     async def test_an_unreachable_database_still_reports_json(self, db_params):
-        port = await unused_port()
-        result = await run_doctor(dsn_for({**db_params, "port": port}), "--json")
+        with reserved_unused_port() as port:
+            result = await run_doctor(dsn_for({**db_params, "port": port}), "--json")
 
         assert result.exit_code == 1
         assert json.loads(result.stdout) == [

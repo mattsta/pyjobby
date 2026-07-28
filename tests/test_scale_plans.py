@@ -172,6 +172,10 @@ class TestRetentionScanPlan:
             datetime.timedelta(days=30),
         )
 
+        # the index BY NAME, like the sibling above: "not a seq scan" also
+        # passes for an index scan over the wrong index, which is how a lost
+        # jorb_retention_idx would look
+        assert "jorb_retention_idx" in plan, plan
         assert "Seq Scan on jorb" not in plan, plan
 
 

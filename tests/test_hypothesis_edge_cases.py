@@ -1,31 +1,38 @@
 """
-Extended Hypothesis property-based tests.
+Property-based edge-case tests for the retry math and the DAG builder.
 
-Comprehensive edge case testing using property-based testing with Hypothesis.
-Tests invariants, boundary conditions, and edge cases across retry, result,
-timeout, and DAG features.
+Every property here is asserted against pyjobby code -- either
+``pyjobby.retry_strategies`` (delay math, config resolution) or
+``pyjobby.dag`` (topological sort, cycle refusal). Properties that only
+restated Python's own semantics (a sorted list is sorted, ``json.dumps``
+round-trips, ``now + timedelta > now``) used to live here; they asserted
+nothing about the platform and are gone.
 
 Test categories:
-1. Retry strategy edge cases (large error counts, boundary values)
-2. Result storage limits (size, structure, serialization)
-3. Timeout boundary conditions (very short, very long, edge cases)
-4. DAG topology properties (cycles, depth, breadth)
-5. Concurrent operations (race conditions, ordering)
-6. Admin data validation (schema, constraints)
+1. Retry strategy edge cases (large error counts, boundary values, the
+   jitter band every strategy's growth has to stay inside)
+2. DAG topology (parallel branches, self-dependency refusal, and the
+   ordering guarantee topological_sort() exists to provide)
+3. admin_data retry settings reaching the calculation that uses them
 """
-
-import json
-from datetime import UTC
-from typing import Any
 
 import pytest
 from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
 
+from pyjobby.dag import DAGBuilder
 from pyjobby.retry_strategies import (
     calculate_retry_delay,
+    calculate_retry_from_job,
     get_retry_config,
 )
+
+#: calculate_retry_delay() adds jitter of uniform(0, min(delay * 0.1, 5)),
+#: so every returned delay sits in [base, base * 1.1]. Two delays computed
+#: from the SAME base are therefore within a factor of 1.1 of each other,
+#: which is what lets these properties compare the platform's outputs
+#: without re-deriving the platform's arithmetic.
+JITTER_FACTOR = 1.1
 
 
 @pytest.mark.hypothesis
@@ -81,23 +88,42 @@ class TestRetryStrategyEdgeCases:
             f"Exponential backoff not increasing: {delay1} -> {delay2}"
         )
 
-    @given(error_count=st.integers(min_value=1, max_value=50))
-    def test_fibonacci_sequence_property(self, error_count):
-        """Property: Fibonacci sequence follows F(n) = F(n-1) + F(n-2)."""
+    @given(
+        error_count=st.integers(min_value=3, max_value=25),
+        initial_delay=st.integers(min_value=1, max_value=10),
+    )
+    def test_fibonacci_delays_obey_the_fibonacci_recurrence(
+        self, error_count, initial_delay
+    ):
+        """Property: the fibonacci strategy's own delays satisfy
+        F(n) = F(n-1) + F(n-2).
 
-        def fib(n: int) -> int:
-            if n <= 0:
-                return 0
-            if n == 1 or n == 2:
-                return 1
-            a, b = 1, 1
-            for _ in range(n - 2):
-                a, b = b, a + b
-            return b
+        Asserted on what calculate_retry_delay() RETURNS rather than on a
+        copy of the sequence: a private fib() in the test agreeing with
+        itself said nothing about the delay a failed job actually waits.
+        The comparison is a band because each delay carries jitter (see
+        JITTER_FACTOR); max_delay is far above the largest base here, so
+        the cap never truncates the recurrence.
+        """
+        max_delay = 10**9
 
-        # Test the underlying fibonacci function
-        if error_count > 2:
-            assert fib(error_count) == fib(error_count - 1) + fib(error_count - 2)
+        def delay_for(n: int) -> float:
+            return calculate_retry_delay(
+                n,
+                strategy="fibonacci",
+                initial_delay=initial_delay,
+                max_delay=max_delay,
+            ).total_seconds()
+
+        previous_two = delay_for(error_count - 1) + delay_for(error_count - 2)
+        this_one = delay_for(error_count)
+
+        assert previous_two / JITTER_FACTOR - 1e-9 <= this_one, (
+            f"fibonacci delay {this_one} is below F(n-1)+F(n-2)={previous_two}"
+        )
+        assert this_one <= previous_two * JITTER_FACTOR + 1e-9, (
+            f"fibonacci delay {this_one} is above F(n-1)+F(n-2)={previous_two}"
+        )
 
     @given(
         error_count=st.integers(min_value=1, max_value=100),
@@ -155,388 +181,147 @@ class TestRetryStrategyEdgeCases:
 
 
 @pytest.mark.hypothesis
-class TestResultStorageEdgeCases:
-    """Property-based tests for result storage edge cases."""
+class TestAdminDataReachesTheRetryMath:
+    """A job's admin_data is where an operator writes retry policy. These
+    pin that the written values are the ones a retry actually waits for --
+    the failure mode being a silent fall back to the platform defaults."""
 
     @given(
-        result_data=st.dictionaries(
-            keys=st.text(
-                alphabet=st.characters(
-                    exclude_characters="\x00", exclude_categories=["Cs"]
-                ),
-                min_size=1,
-                max_size=100,
-            ),
-            values=st.one_of(
-                st.integers(),
-                st.floats(allow_nan=False, allow_infinity=False),
-                st.text(
-                    alphabet=st.characters(
-                        exclude_characters="\x00", exclude_categories=["Cs"]
-                    ),
-                    max_size=1000,
-                ),
-                st.booleans(),
-                st.none(),
-            ),
-            max_size=100,
-        )
+        retry_strategy=st.sampled_from(
+            ["exponential", "linear", "fibonacci", "fixed", "quadratic"]
+        ),
+        initial_retry_delay=st.integers(min_value=2, max_value=60),
+        max_retry_delay=st.integers(min_value=600, max_value=7200),
+        max_retries=st.integers(min_value=1, max_value=50),
+        error_count=st.integers(min_value=1, max_value=8),
     )
-    def test_result_data_json_serializable(self, result_data):
-        """Property: All result data must be JSON serializable."""
-        try:
-            serialized = json.dumps(result_data)
-            deserialized = json.loads(serialized)
+    def test_a_jobs_retry_settings_are_the_ones_used(
+        self,
+        retry_strategy,
+        initial_retry_delay,
+        max_retry_delay,
+        max_retries,
+        error_count,
+    ):
+        admin_data = {
+            "retry_strategy": retry_strategy,
+            "max_retries": max_retries,
+            "initial_retry_delay": initial_retry_delay,
+            "max_retry_delay": max_retry_delay,
+        }
 
-            # Should round-trip successfully
-            assert isinstance(deserialized, dict)
-        except (TypeError, ValueError) as e:
-            pytest.fail(f"Result data not JSON serializable: {e}")
+        # 1. the config resolver hands back what the job declared, verbatim
+        assert get_retry_config(admin_data) == admin_data
 
-    @given(list_size=st.integers(min_value=0, max_value=10000))
-    def test_large_result_arrays(self, list_size):
-        """Property: Large arrays should be handled (up to reasonable size)."""
-        result = {"data": list(range(list_size))}
+        # 2. ...and the job-level entry point computes the delay those
+        #    settings describe, not the delay the defaults would give
+        from_job = calculate_retry_from_job(
+            {"id": 1, "admin_data": admin_data}, error_count
+        ).total_seconds()
+        direct = calculate_retry_delay(
+            error_count,
+            strategy=retry_strategy,
+            initial_delay=initial_retry_delay,
+            max_delay=max_retry_delay,
+        ).total_seconds()
 
-        # Should serialize without error
-        serialized = json.dumps(result)
-
-        # Size should be reasonable (rough check: < 1MB for 10k integers)
-        if list_size <= 10000:
-            assert len(serialized) < 1024 * 1024  # 1MB
-
-    @given(nesting_depth=st.integers(min_value=1, max_value=20))
-    def test_nested_result_structures(self, nesting_depth):
-        """Property: Nested dictionaries should be handled up to reasonable depth."""
-        # Create nested structure
-        result: dict[str, Any] = {"level": 0}
-        current = result
-
-        for i in range(1, nesting_depth):
-            current["nested"] = {"level": i}
-            current = current["nested"]
-
-        # Should serialize successfully
-        serialized = json.dumps(result)
-        deserialized = json.loads(serialized)
-
-        # Verify structure preserved
-        current = deserialized
-        for i in range(nesting_depth):
-            assert current["level"] == i
-            if i < nesting_depth - 1:
-                current = current["nested"]
-
-    @given(
-        data=st.lists(
-            st.integers(min_value=-1000000, max_value=1000000),
-            min_size=1,
-            max_size=1000,
-        )
-    )
-    def test_numeric_result_precision(self, data):
-        """Property: Numeric results maintain precision after serialization."""
-        result = {"numbers": data}
-
-        serialized = json.dumps(result)
-        deserialized = json.loads(serialized)
-
-        assert deserialized["numbers"] == data
-
-
-@pytest.mark.hypothesis
-class TestTimeoutBoundaryConditions:
-    """Property-based tests for timeout edge cases."""
-
-    @given(timeout_seconds=st.integers(min_value=1, max_value=86400))
-    def test_timeout_at_calculation(self, timeout_seconds):
-        """Property: timeout_at should be current time + timeout_seconds."""
-        from datetime import datetime, timedelta
-
-        now = datetime.now(UTC)
-        timeout_at = now + timedelta(seconds=timeout_seconds)
-
-        # Timeout should be in the future
-        assert timeout_at > now
-
-        # Difference should match timeout_seconds (within 1 second tolerance)
-        diff = (timeout_at - now).total_seconds()
-        assert abs(diff - timeout_seconds) < 1
-
-    @given(
-        timeout_seconds=st.integers(min_value=1, max_value=3600),
-        elapsed_seconds=st.integers(min_value=0, max_value=7200),
-    )
-    def test_timeout_detection(self, timeout_seconds, elapsed_seconds):
-        """Property: Job is timed out iff elapsed > timeout."""
-        from datetime import datetime, timedelta
-
-        # Use fixed timestamps to avoid timing precision issues
-        started = datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC)
-        timeout_at = started + timedelta(seconds=timeout_seconds)
-        now = started + timedelta(seconds=elapsed_seconds)
-
-        is_timed_out = timeout_at < now
-
-        # Should match logical condition (elapsed > timeout, not >=)
-        # At exactly timeout_seconds, not yet timed out
-        assert is_timed_out == (elapsed_seconds > timeout_seconds)
-
-    @given(
-        admin_data=st.dictionaries(
-            keys=st.sampled_from(["timeout_seconds", "on_timeout"]),
-            values=st.one_of(
-                st.integers(min_value=1, max_value=86400),
-                st.sampled_from(["retry", "fail", "ignore"]),
-            ),
-        )
-    )
-    def test_timeout_config_validation(self, admin_data):
-        """Property: Timeout config should handle various valid admin_data."""
-        # Extract timeout configuration
-        timeout_seconds = admin_data.get("timeout_seconds")
-        on_timeout = admin_data.get("on_timeout", "retry")
-
-        if timeout_seconds is not None and isinstance(timeout_seconds, int):
-            assert timeout_seconds > 0
-
-        if on_timeout is not None and isinstance(on_timeout, str):
-            assert on_timeout in ["retry", "fail", "ignore"]
+        # both carry independent jitter over the same base, so they agree
+        # within the jitter band and no further
+        assert from_job <= direct * JITTER_FACTOR + 1e-9
+        assert direct <= from_job * JITTER_FACTOR + 1e-9
 
 
 @pytest.mark.hypothesis
 class TestDAGTopologyProperties:
     """Property-based tests for DAG structure invariants."""
 
-    @given(num_jobs=st.integers(min_value=1, max_value=100))
-    def test_linear_dag_depth(self, num_jobs):
-        """Property: Linear DAG depth equals number of jobs."""
-        # Linear DAG: Job1 → Job2 → ... → JobN
-        # Depth should equal num_jobs
-
-        # This is a structural property test
-        assert num_jobs >= 1
-
     @given(
-        num_branches=st.integers(min_value=2, max_value=20),
+        num_branches=st.integers(min_value=2, max_value=10),
         jobs_per_branch=st.integers(min_value=1, max_value=10),
     )
-    def test_parallel_dag_structure(self, num_branches, jobs_per_branch):
-        """Property: Parallel DAG should have num_branches independent paths."""
-        total_jobs = num_branches * jobs_per_branch
+    def test_parallel_branches_advance_one_level_at_a_time(
+        self, num_branches, jobs_per_branch
+    ):
+        """Property: N independent chains of M jobs sort into M levels of N.
 
-        # Each branch should be independent
-        assert total_jobs == num_branches * jobs_per_branch
+        Branches never join, so nothing in one branch may be pushed to a
+        later level by the length of another -- the whole point of running
+        them in parallel.
+        """
+        dag = DAGBuilder(name="Parallel")
+        for branch in range(num_branches):
+            previous = None
+            for step in range(jobs_per_branch):
+                previous = dag.add(
+                    f"B{branch}S{step}",
+                    {},
+                    depends_on=[previous] if previous is not None else None,
+                )
+
+        levels = dag.topological_sort()
+
+        assert len(levels) == jobs_per_branch
+        assert all(len(level) == num_branches for level in levels)
+        assert sum(len(level) for level in levels) == num_branches * jobs_per_branch
 
     @given(
+        node_count=st.integers(min_value=1, max_value=10),
+        loop_at=st.integers(min_value=0, max_value=9),
+    )
+    def test_a_node_depending_on_itself_is_refused(self, node_count, loop_at):
+        """Property: a self-edge is a cycle, and both DAG entry points say so.
+
+        DAGBuilder.add() cannot express a self-edge (the node does not exist
+        until add() returns), so the loop is attached the way a caller
+        assembling DAGNodes by hand would produce it. Neither validate() nor
+        topological_sort() may accept it: a self-dependent job waits for
+        itself forever.
+        """
+        assume(loop_at < node_count)
+
+        dag = DAGBuilder(name="SelfLoop")
+        nodes = [dag.add(f"Job{i}", {}) for i in range(node_count)]
+        nodes[loop_at].depends_on.append(nodes[loop_at])
+
+        with pytest.raises(ValueError, match="cycle"):
+            dag.validate()
+        with pytest.raises(ValueError, match="cycle"):
+            dag.topological_sort()
+
+    @given(
+        node_count=st.integers(min_value=2, max_value=10),
         edges=st.lists(
             st.tuples(
-                st.integers(min_value=1, max_value=10),
-                st.integers(min_value=1, max_value=10),
+                st.integers(min_value=0, max_value=9),
+                st.integers(min_value=0, max_value=9),
             ),
-            min_size=0,
-            max_size=20,
-        )
-    )
-    def test_dag_no_self_loops(self, edges):
-        """Property: DAG should not have self-loops (node pointing to itself)."""
-        # Filter out self-loops
-        valid_edges = [
-            (from_node, to_node) for from_node, to_node in edges if from_node != to_node
-        ]
-
-        # Valid DAG should have no self-loops
-        for from_node, to_node in valid_edges:
-            assert from_node != to_node
-
-    @given(
-        dependencies=st.lists(
-            st.integers(min_value=1, max_value=50), min_size=0, max_size=10
-        )
-    )
-    def test_dag_dependency_ordering(self, dependencies):
-        """Property: Dependencies should form partial order."""
-        # Remove duplicates
-        unique_deps = list(set(dependencies))
-
-        # Dependencies should be unique
-        assert len(unique_deps) == len(set(dependencies))
-
-
-@pytest.mark.hypothesis
-class TestConcurrentOperationsInvariants:
-    """Property-based tests for concurrent operation invariants."""
-
-    @given(
-        job_priorities=st.lists(
-            st.integers(min_value=1, max_value=1000), min_size=1, max_size=100
-        )
-    )
-    def test_priority_queue_ordering(self, job_priorities):
-        """Property: Lower priority numbers should be processed first."""
-        # Sort by priority (ascending = higher priority)
-        sorted_priorities = sorted(job_priorities)
-
-        # First job should have lowest priority number
-        if sorted_priorities:
-            assert sorted_priorities[0] == min(job_priorities)
-
-    @given(
-        initial_count=st.integers(min_value=0, max_value=100),
-        increments=st.lists(
-            st.integers(min_value=0, max_value=5), min_size=0, max_size=20
+            max_size=25,
         ),
     )
-    def test_run_count_monotonic_increase(self, initial_count, increments):
-        """Property: run_count should only increase or stay the same."""
-        # Simulate run_count updates (only increases)
-        counts = [initial_count]
-        for increment in increments:
-            counts.append(counts[-1] + increment)
+    def test_every_dependency_lands_in_an_earlier_level(self, node_count, edges):
+        """Property: topological_sort() places each dependency strictly
+        before every node that depends on it, and loses no node.
 
-        # Verify monotonic increase
-        for i in range(1, len(counts)):
-            assert counts[i] >= counts[i - 1], (
-                f"run_count should only increase: {counts[i - 1]} -> {counts[i]}"
-            )
+        This is the guarantee execution rests on -- a level is only started
+        once the previous one finished -- asserted over arbitrary graphs
+        rather than the three hand-built shapes the fixed tests cover. Edges
+        are kept only when they point from a lower index to a higher one,
+        which is what makes the generated graph acyclic by construction.
+        """
+        dag = DAGBuilder(name="Random")
+        nodes = [dag.add(f"Job{i}", {}) for i in range(node_count)]
 
-    @given(
-        worker_ids=st.lists(
-            st.integers(min_value=1, max_value=10), min_size=1, max_size=20
-        )
-    )
-    def test_job_claimed_by_single_worker(self, worker_ids):
-        """Property: Job can only be claimed by one worker at a time."""
-        # Simulate job claiming
-        claimed_worker = worker_ids[0] if worker_ids else None
+        kept = {(a, b) for a, b in edges if a < b < node_count}
+        for upstream, downstream in kept:
+            nodes[downstream].depends_on.append(nodes[upstream])
 
-        # Only one worker should claim the job
-        if claimed_worker is not None:
-            assert claimed_worker in worker_ids
+        levels = dag.topological_sort()
 
-
-@pytest.mark.hypothesis
-class TestAdminDataValidation:
-    """Property-based tests for admin_data validation."""
-
-    @given(
-        admin_data=st.dictionaries(
-            keys=st.text(
-                alphabet=st.characters(
-                    exclude_characters="\x00", exclude_categories=["Cs"]
-                ),
-                min_size=1,
-                max_size=50,
-            ),
-            values=st.one_of(
-                st.integers(),
-                st.text(
-                    alphabet=st.characters(
-                        exclude_characters="\x00", exclude_categories=["Cs"]
-                    ),
-                    max_size=100,
-                ),
-                st.booleans(),
-                st.floats(allow_nan=False, allow_infinity=False),
-            ),
-            max_size=20,
-        )
-    )
-    def test_admin_data_json_serializable(self, admin_data):
-        """Property: admin_data must be JSON serializable."""
-        try:
-            serialized = json.dumps(admin_data)
-            deserialized = json.loads(serialized)
-
-            assert isinstance(deserialized, dict)
-        except (TypeError, ValueError) as e:
-            pytest.fail(f"admin_data not JSON serializable: {e}")
-
-    @given(
-        max_retries=st.integers(min_value=0, max_value=100),
-        timeout_seconds=st.integers(min_value=1, max_value=86400),
-    )
-    def test_admin_data_constraints(self, max_retries, timeout_seconds):
-        """Property: admin_data constraints should be valid."""
-        admin_data = {"max_retries": max_retries, "timeout_seconds": timeout_seconds}
-
-        # max_retries should be non-negative
-        assert admin_data["max_retries"] >= 0
-
-        # timeout_seconds should be positive
-        assert admin_data["timeout_seconds"] > 0
-
-    @given(
-        on_timeout=st.sampled_from(["retry", "fail", "ignore"]),
-        retry_strategy=st.sampled_from(
-            ["exponential", "linear", "fibonacci", "fixed", "quadratic"]
-        ),
-    )
-    def test_admin_data_enum_values(self, on_timeout, retry_strategy):
-        """Property: Enum-like admin_data fields should have valid values."""
-        admin_data = {"on_timeout": on_timeout, "retry_strategy": retry_strategy}
-
-        # Validate enum values
-        assert admin_data["on_timeout"] in ["retry", "fail", "ignore"]
-        assert admin_data["retry_strategy"] in [
-            "exponential",
-            "linear",
-            "fibonacci",
-            "fixed",
-            "quadratic",
-        ]
-
-
-@pytest.mark.hypothesis
-class TestQueueOperationsProperties:
-    """Property-based tests for queue operation invariants."""
-
-    @given(
-        queue_names=st.lists(
-            st.text(
-                min_size=1,
-                max_size=50,
-                alphabet=st.characters(min_codepoint=97, max_codepoint=122),
-            ),
-            min_size=1,
-            max_size=10,
-            unique=True,
-        )
-    )
-    def test_queue_name_uniqueness(self, queue_names):
-        """Property: Queue names should be unique."""
-        assert len(queue_names) == len(set(queue_names))
-
-    @given(
-        job_counts=st.dictionaries(
-            keys=st.text(
-                alphabet=st.characters(
-                    exclude_characters="\x00", exclude_categories=["Cs"]
-                ),
-                min_size=1,
-                max_size=20,
-            ),
-            values=st.integers(min_value=0, max_value=1000),
-            min_size=1,
-            max_size=10,
-        )
-    )
-    def test_total_job_count(self, job_counts):
-        """Property: Total jobs = sum of jobs per queue."""
-        total = sum(job_counts.values())
-
-        # Verify sum
-        assert total == sum(count for count in job_counts.values())
-
-    @given(
-        enqueue_count=st.integers(min_value=0, max_value=100),
-        dequeue_count=st.integers(min_value=0, max_value=100),
-    )
-    def test_queue_size_invariant(self, enqueue_count, dequeue_count):
-        """Property: Queue size = enqueued - dequeued (if dequeued <= enqueued)."""
-        if dequeue_count <= enqueue_count:
-            expected_size = enqueue_count - dequeue_count
-            assert expected_size >= 0
-        else:
-            # Can't dequeue more than enqueued
-            assert True  # This would be an error in real system
+        assert sum(len(level) for level in levels) == node_count
+        level_of = {
+            node.node_id: index for index, level in enumerate(levels) for node in level
+        }
+        for upstream, downstream in kept:
+            assert (
+                level_of[nodes[upstream].node_id] < level_of[nodes[downstream].node_id]
+            ), f"Job{upstream} must run before Job{downstream}"
