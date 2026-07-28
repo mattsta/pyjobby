@@ -10,9 +10,10 @@ All methods are async and return structured data (dicts/lists).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Final
 
 import asyncpg  # type: ignore[import-untyped]
 
@@ -24,6 +25,7 @@ from .client import (
     validate_tags,
 )
 from .cron import next_cron_run
+from .lifecycle import TERMINAL_STATES_SQL
 from .monitor import DEFAULT_LIVENESS_GRACE_SECONDS
 
 
@@ -32,6 +34,14 @@ class Unset:
 
 
 UNSET = Unset()
+
+#: What `clear_queue` deletes when the caller does not say: work that has not
+#: started. The same default `JobClient.purge_queue` has, and for the same
+#: reason -- a CLAIMED or RUNNING row belongs to a worker that is executing
+#: it right now, and deleting the row does not stop the worker, it strands
+#: the run (the completion write then matches zero rows). Reaching those
+#: states has to be a decision somebody typed.
+CLEAR_QUEUE_STATES: Final[tuple[str, ...]] = ("queued", "waiting")
 
 # Jobs in flight this long without a state change are reported separately from
 # "busy": at 278 jobs/sec a worker that has held one job for five minutes is
@@ -440,8 +450,8 @@ class AdminAPI:
     async def delete_jobs(
         self,
         queue: str | None = None,
-        state: str | None = None,
-        older_than_days: int | None = None,
+        state: str | Sequence[str] | None = None,
+        not_updated_for_days: int | None = None,
     ) -> int:
         """
         Bulk delete jobs matching criteria.
@@ -450,8 +460,10 @@ class AdminAPI:
 
         Args:
             queue: Only delete jobs in this queue
-            state: Only delete jobs in this state
-            older_than_days: Only delete jobs older than N days
+            state: Only delete jobs in this state, or in any of these states
+            not_updated_for_days: Only delete jobs whose last state change was
+                more than N days ago (quiesced work -- the filter is on
+                `updated`, not on when the job was created)
 
         Returns:
             Number of jobs deleted
@@ -465,19 +477,28 @@ class AdminAPI:
             params.append(queue)
             param_idx += 1
 
-        if state:
-            where_clauses.append(f"state = ${param_idx}")
-            params.append(state)
+        if state is not None:
+            # One state or several, in one parameter shape each: `= ANY(...)`
+            # for a list keeps the caller from having to build a predicate,
+            # and the enum cast is what makes an unknown label an error here
+            # instead of a silent no-match.
+            if isinstance(state, str):
+                where_clauses.append(f"state = ${param_idx}")
+                params.append(state)
+            else:
+                where_clauses.append(f"state = ANY(${param_idx}::jorbstate[])")
+                params.append(list(state))
             param_idx += 1
 
-        if older_than_days:
+        if not_updated_for_days:
             where_clauses.append(f"updated < (now() - ${param_idx}::interval)")
-            params.append(timedelta(days=older_than_days))
+            params.append(timedelta(days=not_updated_for_days))
             param_idx += 1
 
         if not where_clauses:
             raise ValueError(
-                "Must specify at least one filter (queue, state, or older_than_days)"
+                "Must specify at least one filter (queue, state, or "
+                "not_updated_for_days)"
             )
 
         where_sql = "WHERE " + " AND ".join(where_clauses)
@@ -590,22 +611,25 @@ class AdminAPI:
     async def clear_queue(
         self,
         queue: str,
-        state: str | None = None,
-        older_than_days: int | None = None,
+        states: Sequence[str] = CLEAR_QUEUE_STATES,
+        not_updated_for_days: int | None = None,
     ) -> int:
         """
         Clear (delete) jobs from a queue.
 
         Args:
             queue: Queue name to clear
-            state: Only clear jobs in this state (optional)
-            older_than_days: Only clear jobs older than N days (optional)
+            states: Which states to clear (default: queued and waiting -- see
+                CLEAR_QUEUE_STATES; deleting live claimed/running work is an
+                explicit choice, never the default)
+            not_updated_for_days: Only clear jobs quiesced this long (no state
+                change for N days)
 
         Returns:
             Number of jobs deleted
         """
         return await self.delete_jobs(
-            queue=queue, state=state, older_than_days=older_than_days
+            queue=queue, state=states, not_updated_for_days=not_updated_for_days
         )
 
     # =========================================================================
@@ -1203,7 +1227,7 @@ class AdminAPI:
                 MAX(EXTRACT(EPOCH FROM (claimed_at - run_after)))
                     FILTER (WHERE claimed_at IS NOT NULL) as max_wait_seconds
             FROM jorb
-            WHERE state IN ('finished', 'crashed', 'cancelled')
+            WHERE state IN ({TERMINAL_STATES_SQL})
               AND COALESCE(finished, updated) >= $1 {queue_sql}
         """,
             *params,

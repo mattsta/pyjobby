@@ -249,3 +249,32 @@ class TestDagVisualize:
         # and it names the jobs still stuck in the cycle, which is what an
         # operator needs in order to break it
         assert str(a) in combined and str(b) in combined
+
+    async def test_json_emits_the_same_levels_as_data(self, dsn, db_pool, unique_queue):
+        """The rendering is a topological sort, not a diagram language, so
+        the JSON form is the levels themselves."""
+        dag_id = await make_dag(db_pool, "chain-json")
+        a = await make_dag_job(db_pool, dag_id, unique_queue, "finished")
+        b = await make_dag_job(db_pool, dag_id, unique_queue, "queued")
+        await add_edge(db_pool, b, a)
+
+        result = await run_cli("--dsn", dsn, "dag", "visualize", str(dag_id), "--json")
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["dag_id"] == dag_id
+        assert payload["name"] == "chain-json"
+        assert [[j["job_id"] for j in level] for level in payload["levels"]] == [
+            [a],
+            [b],
+        ]
+        assert payload["levels"][1][0]["depends_on"] == [a]
+        assert payload["levels"][0][0]["depends_on"] == []
+
+    async def test_json_on_an_unknown_dag_still_fails(self, dsn):
+        result = await run_cli(
+            "--dsn", dsn, "dag", "visualize", str(MISSING_ID), "--json"
+        )
+
+        assert result.exit_code == 1
+        assert result.stdout.strip() == ""

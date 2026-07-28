@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 from datetime import timedelta
 
@@ -421,6 +422,71 @@ class TestJobsUnknownId:
         assert await db_pool.fetchval("SELECT COUNT(*) FROM jorb WHERE id = $1", job_id)
 
 
+class TestJobsDeleteMany:
+    """`jobs delete` takes as many ids as `jobs retry` and `jobs cancel`."""
+
+    async def test_several_ids_are_deleted_with_a_per_id_line(
+        self, dsn, db_pool, unique_queue
+    ):
+        ids = [await make_job(db_pool, unique_queue, "finished") for _ in range(3)]
+
+        result = await run_cli(
+            "--dsn", dsn, "jobs", "delete", *[str(i) for i in ids], "--force"
+        )
+
+        assert result.exit_code == 0, result.output
+        for job_id in ids:
+            assert f"Job {job_id} deleted" in result.output
+        assert "Deleted: 3" in result.output
+        assert (
+            await db_pool.fetchval(
+                "SELECT COUNT(*) FROM jorb WHERE id = ANY($1::bigint[])", ids
+            )
+            == 0
+        )
+
+    async def test_a_missing_id_is_reported_and_exits_one(
+        self, dsn, db_pool, unique_queue
+    ):
+        """The rest still go: a bulk verb reports per id and then fails."""
+        job_id = await make_job(db_pool, unique_queue, "finished")
+
+        result = await run_cli(
+            "--dsn", dsn, "jobs", "delete", str(job_id), str(MISSING_ID), "--force"
+        )
+
+        assert result.exit_code == 1
+        assert f"Job {job_id} deleted" in result.output
+        assert f"Error: Job {MISSING_ID} not found" in result.stderr
+        assert "Deleted: 1" in result.output
+        assert not await db_pool.fetchval(
+            "SELECT COUNT(*) FROM jorb WHERE id = $1", job_id
+        )
+
+    async def test_one_prompt_covers_the_whole_list(self, dsn, db_pool, unique_queue):
+        """Declining once leaves every one of them alone."""
+        ids = [await make_job(db_pool, unique_queue, "finished") for _ in range(2)]
+
+        result = await run_cli(
+            "--dsn", dsn, "jobs", "delete", *[str(i) for i in ids], input="n\n"
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Delete 2 job(s)?" in result.output
+        assert "Cancelled" in result.output
+        assert (
+            await db_pool.fetchval(
+                "SELECT COUNT(*) FROM jorb WHERE id = ANY($1::bigint[])", ids
+            )
+            == 2
+        )
+
+    async def test_no_ids_at_all_is_a_usage_error(self, dsn):
+        result = await run_cli("--dsn", dsn, "jobs", "delete", "--force")
+
+        assert result.exit_code == 2
+
+
 # ============================================================================
 # jobs: wrong state
 # ============================================================================
@@ -549,7 +615,9 @@ class TestJobsInvalidFilters:
         the name they typed back plus the list of states that do exist."""
         result = await run_cli("--dsn", dsn, "jobs", "list", "--state", "bogus")
 
-        assert result.exit_code == 1
+        # 2, not 1: the arguments were wrong, which is what click itself
+        # exits 2 for -- nothing was attempted against the database
+        assert result.exit_code == 2
         assert "Error: Unknown job state: 'bogus'" in result.stderr
         assert f"Error: Valid states: {self.VALID_STATES}" in result.stderr
         assert not isinstance(result.exception, asyncpg.InvalidTextRepresentationError)
@@ -565,7 +633,7 @@ class TestJobsInvalidFilters:
             "--dsn", dsn, "queues", "clear", unique_queue, "--state", "bogus", "--force"
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == 2
         assert "Error: Unknown job state: 'bogus'" in result.stderr
         assert f"Error: Valid states: {self.VALID_STATES}" in result.stderr
         assert not isinstance(result.exception, asyncpg.InvalidTextRepresentationError)
@@ -648,21 +716,24 @@ class TestDlq:
 
 
 class TestQueues:
-    async def test_stats_for_unknown_queue_reports_nothing(self, dsn, unique_queue):
+    async def test_stats_is_fleet_wide_only(self, dsn, unique_queue):
+        """`queues stats` has no per-queue option: `queues show NAME` is the
+        single-queue view, with the pause/limit controls alongside. Two
+        spellings of one question is how they drift."""
         result = await run_cli("--dsn", dsn, "queues", "stats", "-q", unique_queue)
 
-        assert result.exit_code == 0, result.output
-        assert "No stats available" in result.output
+        assert result.exit_code == 2
+        assert "no such option" in result.output.lower() + result.stderr.lower()
 
-    async def test_stats_json_for_unknown_queue_is_an_empty_array(
-        self, dsn, unique_queue
-    ):
-        result = await run_cli(
-            "--dsn", dsn, "queues", "stats", "-q", unique_queue, "--json"
-        )
+    async def test_stats_json_is_an_array_of_queues(self, dsn, unique_queue, db_pool):
+        await make_job(db_pool, unique_queue, "queued")
+
+        result = await run_cli("--dsn", dsn, "queues", "stats", "--json")
 
         assert result.exit_code == 0, result.output
-        assert result.stdout.strip() == "[]"
+        stats = json.loads(result.stdout)
+        assert isinstance(stats, list)
+        assert unique_queue in {row["queue"] for row in stats}
 
     async def test_show_for_unknown_queue_says_so(self, dsn, unique_queue):
         result = await run_cli("--dsn", dsn, "queues", "show", unique_queue)
@@ -805,6 +876,90 @@ class TestQueues:
             "SELECT COUNT(*) FROM jorb WHERE queue = $1", unique_queue
         )
 
+    async def test_clear_leaves_running_work_alone_by_default(
+        self, dsn, db_pool, unique_queue
+    ):
+        """The default is unstarted work: deleting a claimed or running row
+        does not stop its worker, it strands the run."""
+        queued = await make_job(db_pool, unique_queue, "queued")
+        running = await make_job(db_pool, unique_queue, "running")
+        finished = await make_job(db_pool, unique_queue, "finished")
+
+        result = await run_cli("--dsn", dsn, "queues", "clear", unique_queue, "--force")
+
+        assert result.exit_code == 0, result.output
+        assert "Deleted 1 job(s)" in result.output
+        survivors = await db_pool.fetchval(
+            "SELECT COUNT(*) FROM jorb WHERE id = ANY($1::bigint[])",
+            [running, finished],
+        )
+        assert survivors == 2
+        assert not await db_pool.fetchval(
+            "SELECT COUNT(*) FROM jorb WHERE id = $1", queued
+        )
+
+    async def test_the_prompt_names_the_states_it_will_delete(
+        self, dsn, db_pool, unique_queue
+    ):
+        await make_job(db_pool, unique_queue, "queued")
+
+        result = await run_cli(
+            "--dsn", dsn, "queues", "clear", unique_queue, input="n\n"
+        )
+
+        assert "in state queued/waiting" in result.output
+
+    async def test_an_explicit_state_reaches_running_work(
+        self, dsn, db_pool, unique_queue
+    ):
+        running = await make_job(db_pool, unique_queue, "running")
+
+        result = await run_cli(
+            "--dsn",
+            dsn,
+            "queues",
+            "clear",
+            unique_queue,
+            "--state",
+            "running",
+            "--force",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Deleted 1 job(s)" in result.output
+        assert "in state running" in result.output
+        assert not await db_pool.fetchval(
+            "SELECT COUNT(*) FROM jorb WHERE id = $1", running
+        )
+
+    async def test_not_updated_for_days_spares_fresh_rows(
+        self, dsn, db_pool, unique_queue
+    ):
+        fresh = await make_job(db_pool, unique_queue, "queued")
+        stale = await make_job(db_pool, unique_queue, "queued")
+        await db_pool.execute(
+            "UPDATE jorb SET updated = now() - interval '30 days' WHERE id = $1",
+            stale,
+        )
+
+        result = await run_cli(
+            "--dsn",
+            dsn,
+            "queues",
+            "clear",
+            unique_queue,
+            "--not-updated-for-days",
+            "7",
+            "--force",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Deleted 1 job(s)" in result.output
+        assert await db_pool.fetchval("SELECT COUNT(*) FROM jorb WHERE id = $1", fresh)
+        assert not await db_pool.fetchval(
+            "SELECT COUNT(*) FROM jorb WHERE id = $1", stale
+        )
+
 
 # ============================================================================
 # schedule
@@ -851,19 +1006,21 @@ class TestScheduleUnknownName:
 
     async def test_delete_confirmed(self, dsn):
         result = await run_cli(
-            "--dsn", dsn, "schedule", "delete", "no_such_sched", "--yes"
+            "--dsn", dsn, "schedule", "delete", "no_such_sched", "--force"
         )
 
         assert result.exit_code == 1
         assert "Error: Schedule not found: no_such_sched" in result.stderr
 
-    async def test_delete_without_confirmation_aborts(self, dsn, db_pool):
+    async def test_delete_declined_at_the_prompt_does_nothing(self, dsn, db_pool):
+        """Declining is not a failure -- the same -f/prompt shape (and the
+        same 'Cancelled' + exit 0) as `jobs delete` and `queues clear`."""
         result = await run_cli(
             "--dsn", dsn, "schedule", "delete", "no_such_sched", input="n\n"
         )
 
-        assert result.exit_code == 1
-        assert "Aborted!" in result.output
+        assert result.exit_code == 0, result.output
+        assert "Cancelled" in result.output
 
 
 class TestScheduleAddValidation:
@@ -1004,7 +1161,8 @@ class TestScheduleAddValidation:
             str(DEFAULT_PRIO_CEILING + 1),
         )
 
-        assert result.exit_code == 1, result.output
+        # 2: a refused ARGUMENT, reported before the database is touched
+        assert result.exit_code == 2, result.output
         assert (
             f"Error: priority {DEFAULT_PRIO_CEILING + 1} is above the worker "
             f"priority ceiling ({DEFAULT_PRIO_CEILING})" in result.stderr
@@ -1086,12 +1244,144 @@ class TestScheduleAddValidation:
             "5000",
         )
 
-        assert result.exit_code == 1, result.output
+        assert result.exit_code == 2, result.output
         assert (
             "Error: priority 5001 is above the worker priority ceiling (5000)"
             in result.stderr
         )
         assert await self._count(db_pool, test_id) == 0
+
+
+class TestPriorityCeilingFromConfig:
+    """The fleet's ceiling is a deployment fact, declared once.
+
+    `pj-admin` reads `prio_ceiling` from the config file, exactly as the
+    four daemons and JobClient.from_config do -- before this, a fleet
+    running `pj --max-prio 5000` could not set a priority its own workers
+    claim happily from any CLI verb but `schedule add`.
+    """
+
+    @staticmethod
+    def _config(tmp_path, db_params: dict, ceiling: int | None) -> str:
+        lines = [
+            "[db_params]",
+            f'host = "{db_params["host"]}"',
+            f"port = {db_params['port']}",
+            f'database = "{db_params["database"]}"',
+            f'user = "{db_params["user"]}"',
+            f'password = "{db_params["password"]}"',
+        ]
+        if ceiling is not None:
+            lines.insert(0, f"prio_ceiling = {ceiling}\n")
+        conf = tmp_path / "pyjobby.toml"
+        conf.write_text("\n".join(lines) + "\n")
+        return str(conf)
+
+    async def test_set_priority_above_the_default_is_refused(
+        self, dsn, db_pool, unique_queue
+    ):
+        job_id = await make_job(db_pool, unique_queue, "queued")
+
+        result = await run_cli(
+            "--dsn", dsn, "jobs", "set-priority", str(job_id), "5000"
+        )
+
+        assert result.exit_code == 2
+        assert "above the worker priority ceiling" in result.stderr
+        assert (
+            await db_pool.fetchval("SELECT prio FROM jorb WHERE id = $1", job_id)
+            != 5000
+        )
+
+    async def test_set_priority_accepts_it_with_max_prio(
+        self, dsn, db_pool, unique_queue
+    ):
+        job_id = await make_job(db_pool, unique_queue, "queued")
+
+        result = await run_cli(
+            "--dsn",
+            dsn,
+            "jobs",
+            "set-priority",
+            str(job_id),
+            "5000",
+            "--max-prio",
+            "5000",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert (
+            await db_pool.fetchval("SELECT prio FROM jorb WHERE id = $1", job_id)
+            == 5000
+        )
+
+    async def test_set_priority_accepts_it_from_the_config_ceiling(
+        self, tmp_path, db_params, db_pool, unique_queue
+    ):
+        """No flag at all: the config file said what the fleet runs."""
+        job_id = await make_job(db_pool, unique_queue, "queued")
+        config = self._config(tmp_path, db_params, 5000)
+
+        result = await run_cli(
+            "--config", config, "jobs", "set-priority", str(job_id), "5000"
+        )
+
+        assert result.exit_code == 0, result.output
+        assert (
+            await db_pool.fetchval("SELECT prio FROM jorb WHERE id = $1", job_id)
+            == 5000
+        )
+
+    async def test_schedule_add_reads_the_config_ceiling_too(
+        self, tmp_path, db_params, db_pool
+    ):
+        config = self._config(tmp_path, db_params, 5000)
+        name = "config_ceiling_schedule"
+        await db_pool.execute("DELETE FROM jorb_schedule WHERE name = $1", name)
+
+        result = await run_cli(
+            "--config",
+            config,
+            "schedule",
+            "add",
+            name,
+            "tests.dxe_jobs.OkJob",
+            "0 2 * * *",
+            "--priority",
+            "5000",
+        )
+
+        try:
+            assert result.exit_code == 0, result.output
+            assert (
+                await db_pool.fetchval(
+                    "SELECT prio FROM jorb_schedule WHERE name = $1", name
+                )
+                == 5000
+            )
+        finally:
+            await db_pool.execute("DELETE FROM jorb_schedule WHERE name = $1", name)
+
+    async def test_a_config_without_a_ceiling_keeps_the_platform_default(
+        self, tmp_path, db_params, db_pool, unique_queue
+    ):
+        job_id = await make_job(db_pool, unique_queue, "queued")
+        config = self._config(tmp_path, db_params, None)
+
+        result = await run_cli(
+            "--config",
+            config,
+            "jobs",
+            "set-priority",
+            str(job_id),
+            str(DEFAULT_PRIO_CEILING + 1),
+        )
+
+        assert result.exit_code == 2
+        assert (
+            f"above the worker priority ceiling ({DEFAULT_PRIO_CEILING})"
+            in result.stderr
+        )
 
     async def test_list_enabled_requires_a_boolean(self, dsn):
         result = await run_cli("--dsn", dsn, "schedule", "list", "--enabled", "maybe")
@@ -1187,6 +1477,34 @@ class TestDbCommands:
         assert "Pending migrations:    none" in result.output
         assert "column jorb_worker.job_threads" in result.output
         assert "function claim_jorb" in result.output
+
+    async def test_status_json_is_the_status_dict(self, dsn):
+        """A deploy gate reads this: the same four facts, as data."""
+        result = await run_cli("--dsn", dsn, "db", "status", "--json")
+
+        assert result.exit_code == 0, result.output
+        info = json.loads(result.stdout)
+        assert info["base_schema_installed"] is True
+        assert info["missing"] == []
+        assert set(info) >= {
+            "base_schema_installed",
+            "applied",
+            "pending",
+            "missing",
+        }
+
+    async def test_status_json_names_missing_objects_on_a_drifted_database(
+        self, db_params, scratch_db
+    ):
+        name = await scratch_db(stale=True)
+
+        result = await run_cli(
+            "--dsn", dsn_for(db_params, name), "db", "status", "--json"
+        )
+
+        assert result.exit_code == 0, result.output
+        info = json.loads(result.stdout)
+        assert "column jorb_worker.job_threads" in info["missing"]
 
     async def test_migrate_without_create_privilege_fails(
         self, db_params, scratch_db, db_pool

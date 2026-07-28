@@ -102,8 +102,12 @@ _PENDING: Any = object()
 _TERMINAL_JOB_STATES = frozenset(lifecycle.TERMINAL_STATES)
 
 # The single enqueue INSERT shared by every enqueue path (pool-based
-# enqueue(), caller-transaction enqueue_in_transaction(), handles).
-_ENQUEUE_SQL = """
+# enqueue(), caller-transaction enqueue_in_transaction(), handles) — and by
+# the scheduler, which enqueues a job on every firing. Public, because a
+# second component using it is not a private reach-in: it is the platform's
+# one enqueue statement, and the alternative (a hand-rolled INSERT next
+# door) is what it exists to prevent.
+ENQUEUE_SQL = """
     INSERT INTO jorb (
         job_class, kwargs, queue, prio, run_after,
         capability, uid, run_group,
@@ -255,10 +259,6 @@ class JobHandle:
     id: int
     client: JobClient
 
-    async def wait(self, timeout: float | None = None) -> Any:
-        """Wait for the terminal state; see JobClient.wait_for_result()."""
-        return await self.client.wait_for_result(self.id, timeout=timeout)
-
     async def status(self) -> str | None:
         """Current state, or None if the row no longer exists."""
         info = await self.client.get_job(self.id)
@@ -270,6 +270,11 @@ class JobHandle:
         For a non-blocking peek that returns None until the job finishes, use
         get_job_result()."""
         return await self.client.wait_for_result(self.id, timeout=timeout)
+
+    #: The two spellings are ONE method: `wait()` reads better at a call site
+    #: that ignores the value, `result()` at one that uses it, and a second
+    #: body would be a second thing to keep in step.
+    wait = result
 
     async def cancel(self) -> dict[str, Any]:
         """Cancel the job; see JobClient.cancel_job()."""
@@ -1016,12 +1021,12 @@ class JobClient:
                     conn, 'myapp.jobs.FulfillOrder', order_id=42
                 )
         """
-        args = JobClient._build_enqueue_row(job_class, **options)
-        job_id: int = await conn.fetchval(_ENQUEUE_SQL, *args)
+        args = JobClient.build_enqueue_row(job_class, **options)
+        job_id: int = await conn.fetchval(ENQUEUE_SQL, *args)
         return job_id
 
     @staticmethod
-    def _build_enqueue_row(
+    def build_enqueue_row(
         job_class: str,
         *,
         queue: str = "default",
@@ -1049,8 +1054,8 @@ class JobClient:
         **kwargs: Any,
     ) -> list[Any]:
         """Validate enqueue options and build the parameter row for
-        _ENQUEUE_SQL — the single construction path shared by enqueue(),
-        enqueue_batch() and enqueue_in_transaction().
+        ENQUEUE_SQL — the single construction path shared by enqueue(),
+        enqueue_batch(), enqueue_in_transaction() and the scheduler.
 
         The job's payload arrives one of two ways: as the leftover **kwargs
         (enqueue()'s historical shared namespace), or explicitly as
@@ -1222,7 +1227,7 @@ class JobClient:
         # These three are supplied by enqueue_batch itself — job_class and
         # kwargs from each tuple, prio_ceiling from the call. Naming any of
         # them again in the shared options or a per-job dict would reach
-        # _build_enqueue_row as a duplicate argument and raise a bare
+        # build_enqueue_row as a duplicate argument and raise a bare
         # "multiple values for keyword argument" TypeError from deep in the
         # call; caught here it becomes a message that says which key and where.
         reserved = {"job_class", "job_kwargs", "prio_ceiling"}
@@ -1248,7 +1253,7 @@ class JobClient:
                     f"batch-level argument"
                 )
             rows.append(
-                self._build_enqueue_row(
+                self.build_enqueue_row(
                     job_class,
                     prio_ceiling=ceiling,
                     job_kwargs=kwargs,
@@ -1529,8 +1534,8 @@ class JobClient:
                 else:
                     conn = await db.connect(**self._db_params)
                 try:
-                    await conn.add_listener("jorb_done", self._on_jorb_done)
-                    await conn.add_listener("jorb_event", self._on_jorb_event)
+                    await conn.add_listener(db.CHANNEL_DONE, self._on_jorb_done)
+                    await conn.add_listener(db.CHANNEL_EVENT, self._on_jorb_event)
                 except BaseException:
                     # never leak the half-registered connection
                     with contextlib.suppress(Exception):
@@ -2384,7 +2389,7 @@ class JobClient:
         Example:
             failed = await client.get_failed_jobs(queue='processing', limit=50)
             for job in failed:
-                print(f"Job {job['id']} failed: {job['error']}")
+                print(f"Job {job['id']} failed: {job['error_message']}")
         """
         where = "state = 'crashed'"
         params: list[Any] = []

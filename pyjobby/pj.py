@@ -497,8 +497,8 @@ class JobSystem:
 
         assert self.cxn is not None, "_listen requires an established connection"
         try:
-            await self.cxn.add_listener("jorb_enqueued", _on_enqueue)
-            await self.cxn.add_listener("jorb_cancel", _on_cancel)
+            await self.cxn.add_listener(db.CHANNEL_ENQUEUED, _on_enqueue)
+            await self.cxn.add_listener(db.CHANNEL_CANCEL, _on_cancel)
         except asyncpg.PostgresError as e:
             logger.warning(f"Could not LISTEN for wakeups ({e}); polling only")
 

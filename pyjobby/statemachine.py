@@ -42,7 +42,14 @@ from typing import Any, ClassVar
 from loguru import logger
 
 from . import fsm
-from .fsm import EVENT_TOPIC, STATE_KEY, EdgeTable, Transition, TransitionSpec
+from .fsm import (
+    EVENT_TOPIC,
+    STATE_KEY,
+    EdgeTable,
+    MachineDefinitionError,
+    Transition,
+    TransitionSpec,
+)
 from .pj import Job
 
 # The declaration format itself lives in `pyjobby.fsm`, which imports nothing,
@@ -52,6 +59,7 @@ from .pj import Job
 __all__ = [
     "EVENT_TOPIC",
     "STATE_KEY",
+    "MachineDefinitionError",
     "StateMachineJob",
     "Transition",
     "TransitionSpec",

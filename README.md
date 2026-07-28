@@ -165,7 +165,8 @@ pj-admin jobs retry 12345
 
 # Queue monitoring
 pj-admin queues list
-pj-admin queues stats -q default
+pj-admin queues stats          # every queue
+pj-admin queues show default   # one queue, with its pause/limit controls
 
 # Worker monitoring
 pj-admin workers list
@@ -183,7 +184,7 @@ pj-admin metrics -q default --since-hours 48 --json
 pj-admin schedule add daily-cleanup myapp.jobs.CleanupJob "0 2 * * *"
 pj-admin schedule list
 pj-admin schedule history daily-cleanup
-pj-admin schedule delete daily-cleanup --yes
+pj-admin schedule delete daily-cleanup --force
 
 # Database schema management
 pj-admin db migrate   # install base schema + apply all pending migrations

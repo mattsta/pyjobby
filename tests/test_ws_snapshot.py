@@ -45,7 +45,7 @@ import pytest_asyncio
 from aiohttp import web
 from aiohttp.test_utils import TestClient
 
-from pyjobby import websocket_server
+from pyjobby import db, websocket_server
 from pyjobby.websocket_server import (
     JOB_CHANNEL_PREFIX,
     QUEUE_CHANNEL_PREFIX,
@@ -631,31 +631,42 @@ class TestNoListenerOnAChannelNothingEmits:
             f"a client subscribed to those events waits forever"
         )
 
-    async def test_nothing_in_the_repo_listens_on_a_dead_channel(self, db_pool):
+    async def test_every_declared_channel_is_one_the_schema_emits(self, db_pool):
         """The same rule for the worker, the client library, anything else.
 
-        Literal channel names only -- a name computed at runtime (pj-bench
-        iterates its own list) is covered by
-        tests/test_bench.py::test_notify_counts_only_channels_the_schema_emits_on.
+        Every LISTENer in the platform names its channel through a
+        ``db.CHANNEL_*`` constant, so checking the constants covers all of
+        them at once -- including the channels whose only call site builds
+        its list at runtime (pj-bench, pj-ws), which a grep for literals
+        never reached.
         """
+        declared = {
+            name: value
+            for name, value in vars(db).items()
+            if name.startswith("CHANNEL_")
+        }
+        assert declared, "pyjobby.db declares no NOTIFY channel constants"
+
+        dead = set(declared.values()) - await emitted_notify_channels(db_pool)
+        assert not dead, (
+            f"these channels are declared and LISTENed on but emitted by "
+            f"nothing: {sorted(dead)}"
+        )
+
+    async def test_no_listener_spells_its_channel_as_a_bare_string(self):
+        """A literal is how a channel name drifts from the schema silently:
+        PostgreSQL accepts LISTEN on any identifier, so a typo is a feed that
+        never fires. The constants are the only spelling."""
         found = subprocess.run(
             ["git", "grep", "-nE", r"""add_listener\(\s*["'][a-z_]+["']"""],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
         )
-        listened = set(
-            re.findall(r"""add_listener\(\s*["']([a-z_]+)["']""", found.stdout)
-        )
-        assert listened, (
-            "no literal add_listener() call found anywhere; the pattern has "
-            f"stopped matching:\n{found.stdout}"
-        )
-
-        dead = listened - await emitted_notify_channels(db_pool)
-        assert not dead, (
-            f"these channels are LISTENed on but emitted by nothing: "
-            f"{sorted(dead)}\n{found.stdout}"
+        literals = re.findall(r"""add_listener\(\s*["']([a-z_]+)["']""", found.stdout)
+        assert not literals, (
+            f"add_listener() called with a literal channel name; use the "
+            f"pyjobby.db.CHANNEL_* constant instead:\n{found.stdout}"
         )
 
 
@@ -665,9 +676,7 @@ class TestNoListenerOnAChannelNothingEmits:
 
 
 class TestListenWatchdog:
-    async def test_a_dead_listen_connection_is_reestablished(
-        self, snapshot_server
-    ):
+    async def test_a_dead_listen_connection_is_reestablished(self, snapshot_server):
         """The LISTEN connection was opened once at startup and never again:
         after any drop, every watch_job subscription waited forever for a
         jorb_done that could not arrive, while /health reported a live port.
@@ -767,9 +776,7 @@ class TestWatchJob:
 
         # the machine's compact() clears the latch, THEN the job finishes —
         # so the terminal UPDATE reads awaited=FALSE and emits no NOTIFY
-        await db_pool.execute(
-            "UPDATE jorb SET awaited = FALSE WHERE id = $1", job_id
-        )
+        await db_pool.execute("UPDATE jorb SET awaited = FALSE WHERE id = $1", job_id)
         await db_pool.execute(
             "UPDATE jorb SET state = 'finished' WHERE id = $1", job_id
         )

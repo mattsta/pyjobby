@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import datetime
 import enum
-from typing import Any
+from typing import Any, Final
 
 import asyncpg  # type: ignore[import-untyped]
 import orjson
@@ -31,6 +31,41 @@ class JobState(enum.StrEnum):
     FINISHED = "finished"
     CRASHED = "crashed"  # terminal: the dead letter queue
     CANCELLED = "cancelled"
+
+
+# =========================================================================
+# NOTIFY channels
+# =========================================================================
+# Every channel the schema can emit on, spelled once. The names are declared
+# by ``pyjobby/sql/schema/90_notify.sql`` -- as the trigger's TG_ARGV[0] and
+# as the branch of ``jorb_notify()`` that builds that channel's payload --
+# and a LISTENer that types one of them slightly differently gets no error
+# from PostgreSQL at all: LISTEN accepts any identifier, so a typo is a
+# subscription to a channel nothing will ever send on, reporting a confident
+# zero forever. Named constants make that a NameError at import instead.
+#
+# ``pj-bench notify`` asserts these against the running database's triggers.
+
+#: A claimable job appeared on a queue some worker has published demand for
+#: (payload: the queue name). The wakeup an idle worker sleeps on.
+CHANNEL_ENQUEUED: Final[str] = "jorb_enqueued"
+
+#: A job somebody is waiting on reached a terminal state (payload:
+#: {"id", "state"}). Gated on ``jorb.awaited``, which is what makes
+#: wait_for_result() cost nothing when nobody is waiting.
+CHANNEL_DONE: Final[str] = "jorb_done"
+
+#: A job published an event key (payload: {"job_id", "key"}), gated on the
+#: job being awaited.
+CHANNEL_EVENT: Final[str] = "jorb_event"
+
+#: A RUNNING job was asked to stop (payload: the job id). The executing
+#: worker cancels the task at its next await point.
+CHANNEL_CANCEL: Final[str] = "jorb_cancel"
+
+#: A recurring schedule fired (payload: {"schedule_id", "schedule_name",
+#: "result", "job_id"}). Ungated: its consumer has no polling fallback.
+CHANNEL_SCHEDULE_EXECUTED: Final[str] = "schedule_executed"
 
 
 def _orjson_encode(obj: Any) -> str:

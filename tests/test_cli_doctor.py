@@ -13,14 +13,16 @@ against the session's test database, which the autouse
 ``ensure_clean_database`` fixture empties before every test so doctor's
 global (un-filtered) queries are deterministic.
 
-There is no --json mode on doctor, so assertions are made on the parsed
-"STATUS name: message" check lines.
+Assertions are made on the parsed "STATUS name: message" check lines; the
+--json mode emits the SAME records (see TestDoctorJson), so there is one
+enumeration of the checks, not two.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
@@ -919,3 +921,74 @@ class TestDoctorExitCode:
         )
         assert checks["dlq"][0] == "WARN"
         assert result.exit_code == 1, result.output
+
+
+# ============================================================================
+# --json
+# ============================================================================
+
+
+class TestDoctorJson:
+    """--json is the SAME checks, serialised.
+
+    A CI job scrapes this, so the records must carry every check the text
+    mode prints, in the same order, with the same message -- and the exit
+    code must not change with the output format.
+    """
+
+    async def test_json_matches_the_text_report_check_for_check(self, dsn, db_pool):
+        await db_pool.execute(
+            """INSERT INTO jorb (job_class, queue, state, error_message)
+               VALUES ('tests.dxe_jobs.FailJob', 'default', 'crashed', 'boom')"""
+        )
+
+        text = await run_doctor(dsn)
+        payload = await run_doctor(dsn, "--json")
+
+        assert payload.exit_code == text.exit_code
+        records = json.loads(payload.stdout)
+        assert {r["check"] for r in records} == set(parse_checks(text.output))
+        assert [(r["check"], r["status"]) for r in records] == [
+            (name, status) for name, (status, _) in parse_checks(text.output).items()
+        ]
+        dlq = next(r for r in records if r["check"] == "dlq")
+        assert dlq["status"] == "WARN"
+        assert "dead-lettered job(s)" in dlq["message"]
+
+    async def test_json_prints_no_check_lines(self, dsn):
+        result = await run_doctor(dsn, "--json")
+
+        assert result.exit_code == 0, result.output
+        assert parse_checks(result.stdout) == {}
+        assert isinstance(json.loads(result.stdout), list)
+
+    async def test_a_failing_report_is_still_json_and_still_exits_one(
+        self, scratch_db: ScratchFactory
+    ):
+        """The early returns emit too: a FAIL that stops the report must not
+        leave a scraper with empty stdout and a bare exit code."""
+        damaged = await scratch_db()
+        conn = await asyncpg.connect(damaged)
+        try:
+            await conn.execute("DROP TRIGGER jorb_done_notify ON jorb")
+        finally:
+            await conn.close()
+
+        result = await run_doctor(damaged, "--json")
+
+        assert result.exit_code == 1
+        records = json.loads(result.stdout)
+        triggers = next(r for r in records if r["check"] == "triggers")
+        assert triggers["status"] == "FAIL"
+        assert "jorb_done_notify" in triggers["message"]
+
+    async def test_an_unreachable_database_still_reports_json(self, db_params):
+        port = await unused_port()
+        result = await run_doctor(
+            dsn_for({**db_params, "port": port}), "--json"
+        )
+
+        assert result.exit_code == 1
+        assert json.loads(result.stdout) == [
+            {"check": "database", "status": "FAIL", "message": "unreachable"}
+        ]

@@ -756,7 +756,7 @@ class TestAdminAPIQueueManagement:
                     queue,
                 )
 
-            deleted = await api.clear_queue(queue=queue, state="finished")
+            deleted = await api.clear_queue(queue=queue, states=["finished"])
             assert deleted == 5
 
 

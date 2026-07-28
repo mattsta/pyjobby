@@ -197,9 +197,9 @@ class TestJobClientEnqueue:
     @staticmethod
     def admin_data_for(**options):
         """The admin_data the enqueue INSERT would be given, without a
-        database: _build_enqueue_row returns _ENQUEUE_SQL's parameter row and
+        database: build_enqueue_row returns ENQUEUE_SQL's parameter row and
         admin_data is $12."""
-        return JobClient._build_enqueue_row("J", **options)[11]
+        return JobClient.build_enqueue_row("J", **options)[11]
 
     def test_on_timeout_is_recorded_without_a_deadline_argument(self):
         """The row shape, without a database: the policy is stored whether or

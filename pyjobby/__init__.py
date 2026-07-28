@@ -43,7 +43,12 @@ from .client import (
 )
 from .dag import DAGBuilder
 from .db import JobState
-from .dxe import DXEError, NondeterminismError, StaleExecutionError
+from .dxe import DXEError, NondeterminismError, StaleExecutionError, StepTimeoutError
+
+# MachineDefinitionError comes from .fsm, not .statemachine: the declaration
+# format has no imports of its own, so exporting the error a bad machine
+# declaration raises does not drag in the worker runtime.
+from .fsm import MachineDefinitionError
 from .registry import JobRegistry, job, registry
 from .retry_strategies import RetryStrategy
 
@@ -84,11 +89,13 @@ __all__ = [
     "JobRegistry",
     "JobState",
     "JobSystem",
+    "MachineDefinitionError",
     "MachineHandle",
     "NondeterminismError",
     "RetryStrategy",
     "StaleExecutionError",
     "StateMachineJob",
+    "StepTimeoutError",
     "SyncJobClient",
     "SyncMachine",
     "UnhandledEventError",

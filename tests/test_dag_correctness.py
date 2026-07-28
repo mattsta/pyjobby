@@ -121,7 +121,7 @@ class TestDAGCreationIsAtomic:
         second = dag.add("Second", depends_on=[first])
         dag.add("Third", depends_on=[second])
 
-        real_build = JobClient._build_enqueue_row
+        real_build = JobClient.build_enqueue_row
         calls = {"n": 0}
 
         def explode(job_class, **options):
@@ -130,7 +130,7 @@ class TestDAGCreationIsAtomic:
                 raise RuntimeError("enqueue exploded")
             return real_build(job_class, **options)
 
-        monkeypatch.setattr(JobClient, "_build_enqueue_row", staticmethod(explode))
+        monkeypatch.setattr(JobClient, "build_enqueue_row", staticmethod(explode))
 
         with pytest.raises(RuntimeError, match="exploded"):
             await dag.execute(client)

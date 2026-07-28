@@ -23,6 +23,7 @@ from typing import Any
 import asyncpg  # type: ignore[import-untyped]
 from loguru import logger
 
+from .client import ENQUEUE_SQL, JobClient
 from .cron import next_cron_run
 from .db import utcnow
 
@@ -578,9 +579,7 @@ class SchedulerWorker:
             # hand-roll its own INSERT, which silently skipped priority
             # validation and every option the row builder handles; a second
             # enqueue path is a second place for the two to disagree.
-            from .client import _ENQUEUE_SQL, JobClient
-
-            args = JobClient._build_enqueue_row(
+            args = JobClient.build_enqueue_row(
                 schedule["job_class"],
                 queue=schedule["queue"],
                 priority=schedule["prio"],
@@ -593,7 +592,7 @@ class SchedulerWorker:
                 prio_ceiling=self.prio_ceiling,
             )
             async with self.conn.transaction():
-                job_id: int = await self.conn.fetchval(_ENQUEUE_SQL, *args)
+                job_id: int = await self.conn.fetchval(ENQUEUE_SQL, *args)
 
             logger.info(
                 f"Created job {job_id} for schedule '{schedule['name']}'",
@@ -924,7 +923,11 @@ class SchedulerWorker:
                 # Sleep until next poll
                 await self._sleep(self.poll_interval)
 
-            except (asyncpg.PostgresConnectionError, asyncpg.InterfaceError, OSError) as e:
+            except (
+                asyncpg.PostgresConnectionError,
+                asyncpg.InterfaceError,
+                OSError,
+            ) as e:
                 # A lost connection is permanent unless somebody rebuilds it,
                 # and a scheduler that stops firing after a database restart
                 # has failed at its one job — reconnect with backoff until
@@ -1053,9 +1056,7 @@ def main() -> None:
         ceiling = max_prio if max_prio is not None else cfg.get("prio_ceiling")
 
         asyncio.run(
-            run_scheduler(
-                db_params, poll_interval=poll_interval, prio_ceiling=ceiling
-            )
+            run_scheduler(db_params, poll_interval=poll_interval, prio_ceiling=ceiling)
         )
 
     cli()

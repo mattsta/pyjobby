@@ -407,7 +407,7 @@ class TestEnqueueBatchFidelity:
     The batch used to write six columns and silently drop everything else —
     retry policy, deadline_key, tags — so converting a loop of enqueue()
     calls into a batch (the documented performance advice) changed what the
-    jobs meant. Every row now goes through _build_enqueue_row.
+    jobs meant. Every row now goes through build_enqueue_row.
     """
 
     async def test_batch_rows_carry_the_full_option_set(

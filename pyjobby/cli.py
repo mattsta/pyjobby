@@ -11,105 +11,33 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from collections.abc import Callable
 from datetime import timedelta
-from typing import Any, NoReturn
+from typing import Any
 
 import asyncpg  # type: ignore[import-untyped]
 import click
 
 from . import db, migrations
-from .admin_api import UNSET, AdminAPI, Unset
+from .admin_api import CLEAR_QUEUE_STATES, UNSET, AdminAPI, Unset
 from .client import DEFAULT_PRIO_CEILING, validate_priority
 from .configloader import load_config_from_file
 from .db import JobState
 from .monitor import DEFAULT_LIVENESS_GRACE_SECONDS
 
-
-# ANSI color codes for terminal output
-class Colors:
-    HEADER = "\033[95m"
-    OKBLUE = "\033[94m"
-    OKCYAN = "\033[96m"
-    OKGREEN = "\033[92m"
-    WARNING = "\033[93m"
-    FAIL = "\033[91m"
-    ENDC = "\033[0m"
-    BOLD = "\033[1m"
-    UNDERLINE = "\033[4m"
-
-
-def print_success(msg: str) -> None:
-    """Print success message in green"""
-    click.echo(f"{Colors.OKGREEN}{msg}{Colors.ENDC}")
-
-
-def print_error(msg: str) -> None:
-    """Print error message in red"""
-    click.echo(f"{Colors.FAIL}Error: {msg}{Colors.ENDC}", err=True)
-
-
-def print_warning(msg: str) -> None:
-    """Print warning message in yellow"""
-    click.echo(f"{Colors.WARNING}{msg}{Colors.ENDC}")
-
-
-def print_table(headers: list[str], rows: list[list[str]], max_width: int = 80) -> None:
-    """Print data as formatted table"""
-    if not rows:
-        print_warning("No data to display")
-        return
-
-    # Calculate column widths
-    col_widths = [len(h) for h in headers]
-    for row in rows:
-        for i, cell in enumerate(row):
-            col_widths[i] = max(col_widths[i], len(str(cell)))
-
-    # Limit column widths to fit terminal
-    for i in range(len(col_widths)):
-        col_widths[i] = min(col_widths[i], max_width // len(headers))
-
-    # Print header
-    header_row = "  ".join(
-        h[: col_widths[i]].ljust(col_widths[i]) for i, h in enumerate(headers)
-    )
-    click.echo(f"{Colors.BOLD}{header_row}{Colors.ENDC}")
-    click.echo("-" * len(header_row))
-
-    # Print rows
-    for row in rows:
-        row_str = "  ".join(
-            str(cell)[: col_widths[i]].ljust(col_widths[i])
-            for i, cell in enumerate(row)
-        )
-        click.echo(row_str)
-
-
-class ConfigProblem(SystemExit):
-    """The operator's configuration is wrong -- not the database.
-
-    A SystemExit subclass, so every caller that simply lets it propagate
-    exits exactly as before; callers that need to tell the two apart (the
-    doctor's per-subsystem report) can catch this specifically.
-    """
-
-
-class DatabaseProblem(SystemExit):
-    """The database could not be reached, or refused the operation."""
-
-
-def fail(
-    *messages: str, code: int = 1, problem: type[SystemExit] = SystemExit
-) -> NoReturn:
-    """Report an operator-facing failure and exit non-zero.
-
-    Every failure path goes through here so a command can never report a
-    problem while exiting 0 — scripts chaining `pj-admin ... && next-step`
-    depend on that.
-    """
-    for message in messages:
-        print_error(message)
-    raise problem(code)
+# Terminal output lives in termout.py, which pj-bench shares; imported by
+# name here so every call site in this file (and everything importing them
+# from pyjobby.cli) reads exactly as it did when they were defined here.
+from .termout import (
+    Colors,
+    ConfigProblem,
+    DatabaseProblem,
+    fail,
+    print_error,
+    print_success,
+    print_table,
+    print_warning,
+)
 
 
 class PyjobbyCLI(click.Group):
@@ -201,6 +129,7 @@ def parse_tags(pairs: tuple[str, ...]) -> dict[str, Any] | None:
             fail(
                 f"Malformed --tag {pair!r}: expected key=value",
                 "Examples: --tag customer=acme --tag region=us-east-1 --tag batch=7",
+                code=2,
             )
         try:
             value: Any = json.loads(raw)
@@ -210,6 +139,7 @@ def parse_tags(pairs: tuple[str, ...]) -> dict[str, Any] | None:
             fail(
                 f"Malformed --tag {pair!r}: tag values must be a string, "
                 "number, boolean or null, not an object or an array",
+                code=2,
             )
         tags[key] = value
     return tags
@@ -221,7 +151,11 @@ def validate_state(state: str | None) -> str | None:
         return None
     valid = [s.value for s in JobState]
     if state not in valid:
-        fail(f"Unknown job state: {state!r}", f"Valid states: {', '.join(valid)}")
+        fail(
+            f"Unknown job state: {state!r}",
+            f"Valid states: {', '.join(valid)}",
+            code=2,
+        )
     return state
 
 
@@ -262,6 +196,69 @@ async def get_connection(
         return await db.connect(**db_params)
     except Exception as e:
         fail(f"Failed to connect to database: {e}", problem=DatabaseProblem)
+
+
+def load_prio_ceiling(config_path: str) -> int:
+    """This fleet's worker priority ceiling, from the config file.
+
+    The ceiling belongs to the worker fleet (`pj --max-prio`) and nothing
+    about it is visible from a connection, so a deployment that raised it
+    declares it once in its config -- and every pj-admin verb that writes a
+    priority has to read the same declaration, or the CLI refuses priorities
+    the fleet's own workers claim happily.
+
+    A config that cannot be loaded is NOT reported here: this is a lookup
+    every command does, including the ones running on --dsn with no config
+    file at all, and get_connection reports config problems properly the
+    moment it needs db_params from the same file.
+    """
+    try:
+        config = load_config_from_file(config_path, keys=["prio_ceiling"])
+    except RuntimeError:  # ConfigError: missing, unreadable, or bad
+        return DEFAULT_PRIO_CEILING
+    ceiling = config.get("prio_ceiling")
+    return int(ceiling) if ceiling is not None else DEFAULT_PRIO_CEILING
+
+
+def max_prio_option(command: Callable[..., Any]) -> Callable[..., Any]:
+    """The `--max-prio` flag, declared once for every verb that writes a
+    priority (`schedule add`, `jobs set-priority`).
+
+    Its default is None rather than the platform ceiling so that "not given"
+    stays distinguishable from "given as 1000": without the flag the config
+    file's `prio_ceiling` decides, and a fleet that declared its real
+    ceiling there does not have to repeat it on every command line.
+    """
+    return click.option(
+        "--max-prio",
+        type=int,
+        default=None,
+        help=(
+            f"The priority ceiling this fleet's workers run with (`pj "
+            f"--max-prio`, default {DEFAULT_PRIO_CEILING}); overrides the "
+            f"config file's prio_ceiling. A priority above it is refused: "
+            f"no worker would ever claim the job."
+        ),
+    )(command)
+
+
+async def get_api(
+    ctx: click.Context, prio_ceiling: int | None = None
+) -> tuple[asyncpg.Connection, AdminAPI]:
+    """The connection and the AdminAPI on it, built the one way.
+
+    Every verb that reaches the admin API opens its connection through here
+    so the API is never constructed without this deployment's priority
+    ceiling -- which is what `pj-admin` used to do, leaving `--max-prio` on
+    `schedule add` as the only surface that knew the fleet's real number.
+
+    ``prio_ceiling`` is an explicit override (a `--max-prio` flag); without
+    one the config file's declaration applies.
+    """
+    conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+    if prio_ceiling is None:
+        prio_ceiling = load_prio_ceiling(ctx.obj["config"])
+    return conn, AdminAPI(conn, prio_ceiling=prio_ceiling)
 
 
 # =========================================================================
@@ -334,9 +331,8 @@ def jobs_list(
         # problem, and reporting it should not depend on the database being
         # reachable.
         tags = parse_tags(tag_pairs)
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
             jobs = await api.list_jobs(
                 queue=queue,
                 state=state,
@@ -387,14 +383,12 @@ def jobs_inspect(ctx: click.Context, job_id: int, output_json: bool) -> None:
     """Show detailed information about a job"""
 
     async def _inspect() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
             job = await api.get_job(job_id)
 
             if not job:
-                print_error(f"Job {job_id} not found")
-                sys.exit(1)
+                fail(f"Job {job_id} not found")
 
             if output_json:
                 click.echo(json.dumps(job, indent=2))
@@ -450,10 +444,8 @@ def jobs_retry(ctx: click.Context, job_ids: tuple[int, ...]) -> None:
     """Retry one or more crashed jobs"""
 
     async def _retry() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
-
             if len(job_ids) == 1:
                 # Single job
                 result = await api.retry_job(job_ids[0])
@@ -500,10 +492,8 @@ def jobs_cancel(ctx: click.Context, job_ids: tuple[int, ...]) -> None:
     """
 
     async def _cancel() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
-
             if len(job_ids) == 1:
                 # Single job
                 result = await api.cancel_job(job_ids[0])
@@ -535,24 +525,28 @@ def jobs_cancel(ctx: click.Context, job_ids: tuple[int, ...]) -> None:
 @jobs.command("set-priority")
 @click.argument("job_id", type=int)
 @click.argument("priority", type=int)
+@max_prio_option
 @click.pass_context
-def jobs_set_priority(ctx: click.Context, job_id: int, priority: int) -> None:
+def jobs_set_priority(
+    ctx: click.Context, job_id: int, priority: int, max_prio: int | None
+) -> None:
     """Change a queued or waiting job's priority.
 
     Lower numbers are claimed first. Only jobs still in the queue can be
     re-prioritised: once claimed, priority no longer decides anything. A
     priority above the deployment's worker ceiling is refused, because no
-    worker would ever claim the job.
+    worker would ever claim the job -- so a fleet running a raised ceiling
+    declares it (config `prio_ceiling`, or `--max-prio` here) rather than
+    being locked out of the priorities its own workers accept.
     """
 
     async def _set_priority() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx, prio_ceiling=max_prio)
         try:
-            api = AdminAPI(conn)
             try:
                 updated = await api.update_job_priority(job_id, priority)
             except ValueError as e:
-                fail(str(e))
+                fail(str(e), code=2)
             if updated:
                 print_success(f"Job {job_id} priority set to {priority}")
             else:
@@ -567,27 +561,47 @@ def jobs_set_priority(ctx: click.Context, job_id: int, priority: int) -> None:
 
 
 @jobs.command("delete")
-@click.argument("job_id", type=int)
+@click.argument("job_ids", nargs=-1, type=int, required=True)
 @click.option("--force", "-f", is_flag=True, help="Skip confirmation")
 @click.pass_context
-def jobs_delete(ctx: click.Context, job_id: int, force: bool) -> None:
-    """Delete a job (permanent!)"""
+def jobs_delete(ctx: click.Context, job_ids: tuple[int, ...], force: bool) -> None:
+    """Delete one or more jobs (permanent!)
+
+    Takes as many ids as `jobs retry` and `jobs cancel` do, and reports the
+    same way: a line per id, then a summary. ONE confirmation covers the
+    whole list, naming how many rows are about to go.
+    """
 
     async def _delete() -> None:
-        if not force and not click.confirm(f"Delete job {job_id}? This is permanent"):
+        target = f"job {job_ids[0]}" if len(job_ids) == 1 else f"{len(job_ids)} job(s)"
+        if not force and not click.confirm(f"Delete {target}? This is permanent"):
             click.echo("Cancelled")
             return
 
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
-            deleted = await api.delete_job(job_id)
+            if len(job_ids) == 1:
+                # Single job
+                if not await api.delete_job(job_ids[0]):
+                    fail(f"Job {job_ids[0]} not found")
+                print_success(f"Job {job_ids[0]} deleted")
+                return
 
-            if deleted:
-                print_success(f"Job {job_id} deleted")
-            else:
-                print_error(f"Job {job_id} not found")
-                sys.exit(1)
+            # Multiple jobs
+            missing = []
+            for job_id in job_ids:
+                if await api.delete_job(job_id):
+                    print_success(f"Job {job_id} deleted")
+                else:
+                    print_error(f"Job {job_id} not found")
+                    missing.append(job_id)
+
+            click.echo(f"\n{Colors.BOLD}Summary:{Colors.ENDC}")
+            print_success(f"  Deleted: {len(job_ids) - len(missing)}")
+            if missing:
+                # a bulk operation that could not do what was asked must
+                # exit non-zero, exactly like the single-job form
+                fail(f"  Failed: {len(missing)}")
 
         finally:
             await conn.close()
@@ -603,9 +617,8 @@ def jobs_history(ctx: click.Context, job_id: int, output_json: bool) -> None:
     """Show a job's full transition trail (including per-attempt errors)"""
 
     async def _history() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
             history = await api.get_job_history(job_id)
 
             if output_json:
@@ -658,9 +671,8 @@ def jobs_steps(ctx: click.Context, job_id: int, output_json: bool) -> None:
     """Show a job's DXE step checkpoints"""
 
     async def _steps() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
             steps = await api.get_job_steps(job_id)
 
             if output_json:
@@ -733,9 +745,8 @@ def jobs_rerun(ctx: click.Context, job_id: int, resume: bool) -> None:
     """
 
     async def _rerun() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
             result = await api.rerun_job(job_id, fresh=not resume)
             if result["status"] == "not_rerunnable":
                 fail(f"Job {result['job_id']} {NOT_RERUNNABLE}")
@@ -770,9 +781,8 @@ def queues_list(ctx: click.Context, output_json: bool) -> None:
     """List all queues with their pause/limit controls"""
 
     async def _list() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
             queues = await api.list_queues()
 
             if output_json:
@@ -804,17 +814,19 @@ def queues_list(ctx: click.Context, output_json: bool) -> None:
 
 
 @queues.command("stats")
-@click.option("--queue", "-q", help="Specific queue (default: all)")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def queues_stats(ctx: click.Context, queue: str | None, output_json: bool) -> None:
-    """Show queue statistics"""
+def queues_stats(ctx: click.Context, output_json: bool) -> None:
+    """Show statistics for every queue
+
+    Fleet-wide by design: `queues show NAME` is the single-queue view, with
+    the pause and limit controls alongside the counts.
+    """
 
     async def _stats() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
-            stats = await api.queue_stats(queue=queue)
+            stats = await api.queue_stats()
 
             if output_json:
                 click.echo(json.dumps(stats, indent=2))
@@ -876,18 +888,37 @@ def queues_stats(ctx: click.Context, queue: str | None, output_json: bool) -> No
 
 @queues.command("clear")
 @click.argument("queue")
-@click.option("--state", "-s", help="Only clear jobs in this state")
-@click.option("--older-than-days", type=int, help="Only clear jobs older than N days")
+@click.option(
+    "--state",
+    "-s",
+    help=(
+        "Clear jobs in THIS state instead of the default "
+        f"({'/'.join(CLEAR_QUEUE_STATES)}) -- the only way to delete live "
+        "claimed or running work"
+    ),
+)
+@click.option(
+    "--not-updated-for-days",
+    type=int,
+    help="Only clear jobs that have been quiesced this long (no state "
+    "change for N days)",
+)
 @click.option("--force", "-f", is_flag=True, help="Skip confirmation")
 @click.pass_context
 def queues_clear(
     ctx: click.Context,
     queue: str,
     state: str | None,
-    older_than_days: int | None,
+    not_updated_for_days: int | None,
     force: bool,
 ) -> None:
-    """Clear (delete) jobs from a queue"""
+    """Clear (delete) jobs from a queue
+
+    Only queued and waiting jobs by default -- work that has not started.
+    A CLAIMED or RUNNING job is being executed by a worker right now, and
+    deleting its row does not stop the worker: it strands the run, so it
+    takes an explicit `--state claimed` / `--state running`.
+    """
 
     async def _clear() -> None:
         validate_state(state)
@@ -898,12 +929,13 @@ def queues_clear(
                 "target every job.",
             )
 
-        # Build description
-        desc = f"queue '{queue}'"
-        if state:
-            desc += f" with state '{state}'"
-        if older_than_days:
-            desc += f" older than {older_than_days} days"
+        states = (state,) if state else CLEAR_QUEUE_STATES
+
+        # Build description -- it names the STATES, because that is the part
+        # of "delete all jobs" an operator can be wrong about
+        desc = f"queue '{queue}' in state {'/'.join(states)}"
+        if not_updated_for_days:
+            desc += f", not updated for {not_updated_for_days} days"
 
         if not force and not click.confirm(
             f"Delete all jobs in {desc}? This is permanent"
@@ -911,11 +943,12 @@ def queues_clear(
             click.echo("Cancelled")
             return
 
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
             count = await api.clear_queue(
-                queue=queue, state=state, older_than_days=older_than_days
+                queue=queue,
+                states=states,
+                not_updated_for_days=not_updated_for_days,
             )
 
             print_success(f"Deleted {count} job(s) from {desc}")
@@ -933,9 +966,8 @@ def queues_pause(ctx: click.Context, queue: str) -> None:
     """Pause a queue (workers stop claiming from it immediately)"""
 
     async def _pause() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
             await api.pause_queue(queue)
             print_success(f"Queue '{queue}' paused")
         finally:
@@ -951,9 +983,8 @@ def queues_resume(ctx: click.Context, queue: str) -> None:
     """Resume a paused queue"""
 
     async def _resume() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
             await api.resume_queue(queue)
             print_success(f"Queue '{queue}' resumed")
         finally:
@@ -971,8 +1002,7 @@ def _parse_optional_limit(value: str | None, option: str) -> int | None | Unset:
     try:
         return int(value)
     except ValueError:
-        print_error(f"{option} must be an integer or 'none' (got '{value}')")
-        sys.exit(2)
+        fail(f"{option} must be an integer or 'none' (got '{value}')", code=2)
 
 
 def _echo_queue_control(control: dict) -> None:
@@ -1026,10 +1056,8 @@ def queues_limits(
     rl = _parse_optional_limit(rate_limit, "--rate-limit")
 
     async def _limits() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
-
             if isinstance(mc, Unset) and isinstance(rl, Unset) and rate_period is None:
                 # No changes requested: show the current control row.
                 control = await api.get_queue_control(queue)
@@ -1066,9 +1094,8 @@ def queues_show(ctx: click.Context, queue: str, output_json: bool) -> None:
     """Show one queue's controls and statistics"""
 
     async def _show() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
             control = await api.get_queue_control(queue)
             stats = await api.queue_stats(queue=queue)
 
@@ -1167,9 +1194,8 @@ def workers_list(ctx: click.Context, output_json: bool) -> None:
     """List registered workers (live and recently dead)"""
 
     async def _list() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
             workers = await api.list_workers()
 
             if output_json:
@@ -1224,9 +1250,8 @@ def workers_stats(ctx: click.Context, output_json: bool) -> None:
     """Show worker registry statistics"""
 
     async def _stats() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
             stats = await api.worker_stats()
 
             if output_json:
@@ -1273,9 +1298,8 @@ def dlq_list(ctx: click.Context, limit: int, output_json: bool) -> None:
     """List jobs in Dead Letter Queue"""
 
     async def _list() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
             jobs = await api.list_dlq(limit=limit)
 
             if output_json:
@@ -1318,9 +1342,8 @@ def dlq_retry(ctx: click.Context, job_id: int) -> None:
     """Retry a job from Dead Letter Queue"""
 
     async def _retry() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
             result = await api.retry_from_dlq(job_id)
             if result["status"] == "not_retriable":
                 fail(f"Job {result['job_id']} {NOT_IN_DLQ}")
@@ -1374,9 +1397,8 @@ def metrics(
     """Show system metrics"""
 
     async def _metrics() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
             since = db.utcnow() - timedelta(hours=since_hours)
             metrics_data = await api.get_metrics(since=since, queue=queue)
 
@@ -1513,9 +1535,8 @@ def schedule_list(
     """List recurring schedules"""
 
     async def _list() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
             schedules = await api.list_schedules(
                 enabled=enabled, queue=queue, limit=limit
             )
@@ -1571,10 +1592,8 @@ def schedule_show(ctx: click.Context, name_or_id: str, output_json: bool) -> Non
     """Show schedule details"""
 
     async def _show() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
-
             # Try as ID first, then as name
             try:
                 schedule_id = int(name_or_id)
@@ -1650,16 +1669,7 @@ def schedule_show(ctx: click.Context, name_or_id: str, output_json: bool) -> Non
         "worker priority ceiling -- see --max-prio"
     ),
 )
-@click.option(
-    "--max-prio",
-    type=int,
-    default=DEFAULT_PRIO_CEILING,
-    help=(
-        f"The priority ceiling this fleet's workers run with (`pj "
-        f"--max-prio`, default {DEFAULT_PRIO_CEILING}). --priority above it is "
-        "refused: every firing would mint a job no worker can claim"
-    ),
-)
+@max_prio_option
 @click.option("--capability", help="Required worker capability")
 @click.option("--timezone", default="UTC", help="Timezone (default: UTC)")
 @click.option(
@@ -1691,7 +1701,7 @@ def schedule_add(
     queue: str,
     kwargs: str | None,
     priority: int,
-    max_prio: int,
+    max_prio: int | None,
     capability: str | None,
     timezone: str,
     max_concurrent: int,
@@ -1708,27 +1718,29 @@ def schedule_add(
         pj-admin schedule add hourly-report ReportJob "0 * * * *" --queue reports
         pj-admin schedule add sync SyncJob "*/5 * * * *" --jitter 60 --max-concurrent 3
     """
+    ceiling = max_prio if max_prio is not None else load_prio_ceiling(ctx.obj["config"])
+
     # Checked before a connection is opened, because this failure is about
     # the operator's arguments and not the database. The predicate and the
     # message are the client's, so the schedule door and the enqueue door
     # cannot drift; only the hint is CLI-shaped, since `JobClient(...)` is
     # not the thing an operator typing this command would change.
     try:
-        validate_priority(priority, max_prio)
+        validate_priority(priority, ceiling)
     except ValueError as e:
         fail(
             str(e),
             f"If this fleet really runs `pj --max-prio {priority}` (or "
             f"higher), say so here too: `pj-admin schedule add ... "
-            f"--priority {priority} --max-prio {priority}`.",
+            f"--priority {priority} --max-prio {priority}` (or declare "
+            f"prio_ceiling in the config file, once, for every command).",
+            code=2,
         )
 
     async def _add() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx, prio_ceiling=ceiling)
         problem: str | None = None
         try:
-            api = AdminAPI(conn, prio_ceiling=max_prio)
-
             # Parse kwargs if provided
             job_kwargs = {}
             if kwargs:
@@ -1784,10 +1796,8 @@ def schedule_enable(ctx: click.Context, name_or_id: str) -> None:
     """Enable a disabled schedule"""
 
     async def _enable() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
-
             # Try as ID first, then as name
             schedule_id: int | None
             try:
@@ -1822,10 +1832,8 @@ def schedule_disable(ctx: click.Context, name_or_id: str) -> None:
     """Disable an enabled schedule"""
 
     async def _disable() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
-
             # Try as ID first, then as name
             schedule_id: int | None
             try:
@@ -1855,16 +1863,24 @@ def schedule_disable(ctx: click.Context, name_or_id: str) -> None:
 
 @schedule.command("delete")
 @click.argument("name_or_id")
-@click.confirmation_option(prompt="Are you sure you want to delete this schedule?")
+@click.option("--force", "-f", is_flag=True, help="Skip confirmation")
 @click.pass_context
-def schedule_delete(ctx: click.Context, name_or_id: str) -> None:
-    """Delete a recurring schedule"""
+def schedule_delete(ctx: click.Context, name_or_id: str, force: bool) -> None:
+    """Delete a recurring schedule
+
+    Prompts unless `-f/--force`, the same flag every other destructive verb
+    here takes (`jobs delete`, `queues clear`).
+    """
 
     async def _delete() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
-        try:
-            api = AdminAPI(conn)
+        if not force and not click.confirm(
+            f"Delete schedule {name_or_id}? This is permanent"
+        ):
+            click.echo("Cancelled")
+            return
 
+        conn, api = await get_api(ctx)
+        try:
             # Try as ID first, then as name
             schedule_id: int | None
             try:
@@ -1908,10 +1924,8 @@ def schedule_history(
     """Show schedule execution history"""
 
     async def _history() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
-
             # Try as ID first, then as name
             schedule_id: int | None
             try:
@@ -1983,9 +1997,8 @@ def schedule_stats(ctx: click.Context, output_json: bool) -> None:
     """Show execution statistics for all schedules"""
 
     async def _stats() -> None:
-        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        conn, api = await get_api(ctx)
         try:
-            api = AdminAPI(conn)
             stats = await api.get_schedule_stats()
 
             if output_json:
@@ -2183,8 +2196,7 @@ def dag_show(ctx: click.Context, dag_id: int, output_json: bool) -> None:
             )
 
             if not dag:
-                print_error(f"DAG {dag_id} not found")
-                sys.exit(1)
+                fail(f"DAG {dag_id} not found")
 
             # Get jobs in DAG
             jobs = await conn.fetch(
@@ -2274,9 +2286,15 @@ def dag_show(ctx: click.Context, dag_id: int, output_json: bool) -> None:
 
 @dag.command("visualize")
 @click.argument("dag_id", type=int)
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def dag_visualize(ctx: click.Context, dag_id: int) -> None:
-    """Visualize DAG structure (ASCII art)"""
+def dag_visualize(ctx: click.Context, dag_id: int, output_json: bool) -> None:
+    """Visualize DAG structure (ASCII art)
+
+    The rendering is levels of a topological sort, not a diagram language,
+    so --json emits the same levels as data: {dag_id, name, levels: [[{job_id,
+    job_class, depends_on}]]}.
+    """
 
     async def _visualize() -> None:
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
@@ -2302,8 +2320,7 @@ def dag_visualize(ctx: click.Context, dag_id: int) -> None:
             )
 
             if not deps:
-                print_error(f"DAG {dag_id} not found or has no jobs")
-                sys.exit(1)
+                fail(f"DAG {dag_id} not found or has no jobs")
 
             # Get DAG name
             dag_name = await conn.fetchval(
@@ -2312,12 +2329,6 @@ def dag_visualize(ctx: click.Context, dag_id: int) -> None:
             """,
                 dag_id,
             )
-
-            click.echo(
-                f"\n{Colors.BOLD}DAG: {dag_name or f'DAG-{dag_id}'}{Colors.ENDC}"
-            )
-            click.echo("=" * 60)
-            click.echo()
 
             # Build dependency map
             dep_map = {}
@@ -2360,6 +2371,38 @@ def dag_visualize(ctx: click.Context, dag_id: int) -> None:
                     for other_id in remaining:
                         if job_id in dep_map[other_id]["depends_on"]:
                             in_degree[other_id] -= 1
+
+            if output_json:
+                click.echo(
+                    json.dumps(
+                        {
+                            "dag_id": dag_id,
+                            "name": dag_name,
+                            "levels": [
+                                [
+                                    {
+                                        "job_id": job_id,
+                                        "job_class": dep_map[job_id]["job_class"],
+                                        "depends_on": list(
+                                            dep_map[job_id]["depends_on"]
+                                        ),
+                                    }
+                                    for job_id in level
+                                ]
+                                for level in levels
+                            ],
+                        },
+                        indent=2,
+                        default=str,
+                    )
+                )
+                return
+
+            click.echo(
+                f"\n{Colors.BOLD}DAG: {dag_name or f'DAG-{dag_id}'}{Colors.ENDC}"
+            )
+            click.echo("=" * 60)
+            click.echo()
 
             # Display levels
             for level_num, level in enumerate(levels):
@@ -2797,10 +2840,18 @@ def notify_queue_verdict(usage: float) -> tuple[str, str]:
 
 
 class _Doctor:
-    """Accumulates PASS/WARN/FAIL check lines for `pj-admin doctor`."""
+    """Accumulates PASS/WARN/FAIL check lines for `pj-admin doctor`.
 
-    def __init__(self) -> None:
+    Every check goes through report(), so the records it keeps ARE the
+    report: --json serialises them instead of the coloured lines, and a CI
+    scrape and a human read the same checks in the same order with the same
+    messages -- there is no second enumeration to fall behind.
+    """
+
+    def __init__(self, as_json: bool = False) -> None:
         self.failed = False
+        self.as_json = as_json
+        self.records: list[dict[str, str]] = []
 
     def report(self, status: str, name: str, message: str) -> None:
         color = {
@@ -2810,7 +2861,14 @@ class _Doctor:
         }[status]
         if status == "FAIL":
             self.failed = True
-        click.echo(f"{color}{status}{Colors.ENDC} {name}: {message}")
+        self.records.append({"check": name, "status": status, "message": message})
+        if not self.as_json:
+            click.echo(f"{color}{status}{Colors.ENDC} {name}: {message}")
+
+    def emit_json(self) -> None:
+        """Print the accumulated records as one JSON array (--json only)."""
+        if self.as_json:
+            click.echo(json.dumps(self.records, indent=2))
 
     def check(self, ok: bool, name: str, ok_msg: str, fail_msg: str) -> None:
         if ok:
@@ -2838,18 +2896,24 @@ class _Doctor:
     default=60,
     help="WARN when a queue's oldest queued job is older than this",
 )
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def doctor(ctx: click.Context, max_depth: int, max_age_minutes: int) -> None:
+def doctor(
+    ctx: click.Context, max_depth: int, max_age_minutes: int, output_json: bool
+) -> None:
     """Run health checks against the job platform (exit 1 on any FAIL)
 
     Checks: database reachability, schema/migrations, NOTIFY triggers,
     NOTIFY queue saturation, live workers, workers that are alive but
-    claiming nothing, queue backlogs, the DLQ, and overdue schedules.
+    claiming nothing, queue backlogs, blocked waiters, unread mail, the DLQ,
+    and overdue schedules.
+
+    With --json the same checks come out as [{check, status, message}] and
+    the exit code is unchanged, so a CI job can scrape them.
     """
+    doc = _Doctor(as_json=output_json)
 
     async def _doctor() -> int:
-        doc = _Doctor()
-
         try:
             conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         except ConfigProblem:
@@ -3106,7 +3170,9 @@ def doctor(ctx: click.Context, max_depth: int, max_age_minutes: int) -> None:
 
         return 1 if doc.failed else 0
 
-    sys.exit(asyncio.run(_doctor()))
+    exit_code = asyncio.run(_doctor())
+    doc.emit_json()  # no-op without --json; every early return lands here too
+    sys.exit(exit_code)
 
 
 # =========================================================================
@@ -3180,14 +3246,22 @@ def db_migrate(ctx: click.Context) -> None:
 
 
 @db_group.command("status")
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
-def db_status(ctx: click.Context) -> None:
-    """Show applied vs pending schema migrations"""
+def db_status(ctx: click.Context, output_json: bool) -> None:
+    """Show applied vs pending schema migrations
+
+    With --json, migrations.status() itself: base_schema_installed, applied,
+    pending and the missing objects, for a deploy gate to read.
+    """
 
     async def _status() -> None:
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             info = await migrations.status(conn)
+            if output_json:
+                click.echo(json.dumps(info, indent=2, default=str))
+                return
             click.echo(
                 f"Base schema installed: {'yes' if info['base_schema_installed'] else 'no'}"
             )

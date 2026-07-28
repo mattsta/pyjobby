@@ -1083,8 +1083,7 @@ class TestScheduleCommands:
     ):
         """Test schedule delete skipping confirmation.
 
-        The real CLI uses click.confirmation_option, whose skip flag is
-        --yes (there is no --force option on schedule delete).
+        -f/--force, the same flag every other destructive verb takes.
         """
         with mock_cli_context(mock_admin_api, mock_db_params):
             result = cli_runner.invoke(
@@ -1095,7 +1094,7 @@ class TestScheduleCommands:
                     "schedule",
                     "delete",
                     "test-schedule",
-                    "--yes",
+                    "--force",
                 ],
             )
 

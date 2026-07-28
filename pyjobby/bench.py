@@ -107,18 +107,18 @@ import asyncpg  # type: ignore[import-untyped]
 import click
 from loguru import logger
 
-from . import db, dxe, monitor
-from .cli import (
+from . import db, dxe, migrations, monitor
+from .configloader import load_config_from_file
+from .lifecycle import TERMINAL_STATES_SQL
+from .pj import STMTS, Job, JobSystem
+from .scheduler import CONCURRENCY_COUNT_SQL
+from .termout import (
     ConfigProblem,
     DatabaseProblem,
     fail,
     print_table,
     print_warning,
 )
-from .configloader import load_config_from_file
-from .lifecycle import TERMINAL_STATES
-from .pj import STMTS, Job, JobSystem
-from .scheduler import CONCURRENCY_COUNT_SQL
 
 DEFAULT_CONFIG = "./pyjobby.toml"
 
@@ -213,10 +213,19 @@ BENCH_JOB_CLASS = "pyjobby.bench.BenchJob"
 #: ``job_state_change_notify`` used to be here. It is not "disabled" or
 #: "deprecated": the trigger and its channel were DELETED from the schema,
 #: so naming it would make every variant below fail on a missing trigger.
+#:
+#: Each name is checked against ``migrations.REQUIRED_TRIGGERS`` -- the
+#: manifest the doctor and the schema-shape check read -- at import, so a
+#: trigger renamed in the schema breaks `pj-bench` on the spot instead of
+#: producing a variant that silently disables nothing.
 TRIGGER_HISTORY = "jorb_history_record"
 TRIGGER_ENQUEUED = "jorb_enqueued_notify"
 TRIGGER_DONE = "jorb_done_notify"
 TRIGGER_CANCEL = "jorb_cancel_notify"
+
+assert {TRIGGER_HISTORY, TRIGGER_ENQUEUED, TRIGGER_DONE, TRIGGER_CANCEL} <= set(
+    migrations.REQUIRED_TRIGGERS
+), "bench trigger names have drifted from migrations.REQUIRED_TRIGGERS"
 
 #: Every trigger on ``jorb`` that issues a NOTIFY. Disabling all of them is
 #: the upper bound for enqueue: the cost of the commit lock is paid once per
@@ -225,28 +234,24 @@ TRIGGER_CANCEL = "jorb_cancel_notify"
 NOTIFY_TRIGGERS = (TRIGGER_ENQUEUED, TRIGGER_DONE, TRIGGER_CANCEL)
 
 #: Every channel the schema can emit on, so ``pj-bench notify`` counts what
-#: is actually sent rather than what it expected to be sent. Two names that
-#: used to be here are gone from the schema entirely, and LISTENing on a
-#: dead channel is not harmless — PostgreSQL accepts any name, so the tool
-#: would sit there reporting a confident 0 for a channel that cannot exist:
+#: is actually sent rather than what it expected to be sent. The names come
+#: from :mod:`pyjobby.db`, because LISTENing on a channel that does not
+#: exist is not harmless — PostgreSQL accepts any name, so the tool would
+#: sit there reporting a confident 0. Two names that used to be here are gone
+#: from the schema entirely:
 #:
 #:   job_state_change  deleted; the dashboard polls aggregates instead.
 #:   jorb_mailbox      deleted; Job.recv() polls jorb_mailbox directly.
 NOTIFY_CHANNELS = (
-    "jorb_enqueued",
-    "jorb_done",
-    "jorb_cancel",
-    "jorb_event",
-    "schedule_executed",
+    db.CHANNEL_ENQUEUED,
+    db.CHANNEL_DONE,
+    db.CHANNEL_CANCEL,
+    db.CHANNEL_EVENT,
+    db.CHANNEL_SCHEDULE_EXECUTED,
 )
 
 #: Channels a worker or client depends on; the rest are observability.
-LOAD_BEARING_CHANNELS = ("jorb_enqueued", "jorb_done", "jorb_cancel")
-
-#: Terminal states inlined as SQL literals, exactly as monitor.py does it:
-#: jorb_retention_idx is PARTIAL on this predicate, and a bound parameter
-#: falls off the index once PostgreSQL switches to a generic plan.
-TERMINAL_STATES_SQL = ", ".join(f"'{state}'" for state in TERMINAL_STATES)
+LOAD_BEARING_CHANNELS = (db.CHANNEL_ENQUEUED, db.CHANNEL_DONE, db.CHANNEL_CANCEL)
 
 
 class BenchJob(Job):

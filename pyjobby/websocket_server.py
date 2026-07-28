@@ -69,7 +69,7 @@ from aiohttp import web
 
 from . import db
 from .client import DEFAULT_PRIO_CEILING, validate_priority
-from .lifecycle import TERMINAL_STATES
+from .lifecycle import TERMINAL_STATES, TERMINAL_STATES_SQL
 from .monitor import DEFAULT_LIVENESS_GRACE_SECONDS
 
 # Configure logging
@@ -115,13 +115,13 @@ QUEUE_CHANNEL_PREFIX = "queues:"
 #: Prefix of the per-job channels created by ``watch_job``.
 JOB_CHANNEL_PREFIX = "job:"
 
-#: The PostgreSQL NOTIFY channels this server LISTENs on. Every name here
-#: must be one the schema actually emits (``jorb_notify('<channel>', ...)``
-#: in sql/schema/90_notify.sql): PostgreSQL accepts LISTEN on any string, so a name
-#: nothing NOTIFYs does not fail, it just never fires -- and a client that
-#: subscribed to the events it was supposed to carry waits forever.
-#: ``queue_alert`` was exactly that, and is gone.
-LISTEN_CHANNELS: Final = ("jorb_done", "schedule_executed")
+#: The PostgreSQL NOTIFY channels this server LISTENs on. The names come from
+#: :mod:`pyjobby.db`, which declares the channels sql/schema/90_notify.sql
+#: emits, because PostgreSQL accepts LISTEN on any string: a name nothing
+#: NOTIFYs does not fail, it just never fires -- and a client that subscribed
+#: to the events it was supposed to carry waits forever. ``queue_alert`` was
+#: exactly that, and is gone.
+LISTEN_CHANNELS: Final = (db.CHANNEL_DONE, db.CHANNEL_SCHEDULE_EXECUTED)
 
 #: Seconds between snapshots. A dashboard does not need faster, and this is
 #: the whole database cost of the feed: one query per interval however many
@@ -177,9 +177,11 @@ DEFAULT_SNAPSHOT_WINDOW_SECONDS = 60.0
 #: answer to (queued = claimable now, scheduled = deferred and NOT backlog,
 #: terminal states windowed); this string stays separate only because its
 #: plan is pinned and it carries the kind/age columns the snapshot needs.
-# f-string ONLY for the liveness constant (a float from monitor.py, not user
-# input): the dashboard's live-worker count must use the same grace as the
-# monitor and pj-web, or the surfaces disagree the day the default changes.
+# f-string ONLY for module constants (the liveness grace from monitor.py and
+# the terminal states from lifecycle.py, never user input): the dashboard's
+# live-worker count must use the same grace as the monitor and pj-web, and
+# the same three terminal states as everything else, or the surfaces
+# disagree the day either declaration changes.
 SNAPSHOT_SQL = f"""
     SELECT 'backlog'::text AS kind, queue, 'queued'::text AS state,
            COUNT(*)::bigint AS n,
@@ -202,7 +204,7 @@ SNAPSHOT_SQL = f"""
     UNION ALL
     SELECT 'recent', queue, state::text, COUNT(*)::bigint, NULL::float8
       FROM jorb
-     WHERE state IN ('finished', 'crashed', 'cancelled')
+     WHERE state IN ({TERMINAL_STATES_SQL})
        AND COALESCE(finished, updated) >= now() - $1::interval
      GROUP BY queue, state
     UNION ALL
@@ -404,13 +406,13 @@ class WebSocketServer:
 
     def determine_broadcast_channel(self, event_type: str, data: dict[str, Any]) -> str:
         """Determine which WebSocket channel to broadcast on"""
-        if event_type == "jorb_done":
+        if event_type == db.CHANNEL_DONE:
             # Delivered only to the clients that asked for THIS job. The
             # notification exists at all only because one of them registered
             # demand on the row (see WATCH_JOB_SQL).
             return f"{JOB_CHANNEL_PREFIX}{data.get('id')}"
 
-        elif event_type == "schedule_executed":
+        elif event_type == db.CHANNEL_SCHEDULE_EXECUTED:
             return "schedules"
 
         return "jobs"

@@ -306,9 +306,12 @@ class DAGBuilder:
         visible to a worker until every job and every dependency link exists.
         That is what makes the graph safe to submit against live workers — a
         level-0 job that finished while later levels were still being written
-        would leave its dependents blocked forever, because the wake-up is
-        performed by the worker that finishes the upstream job, not by a
-        trigger. It also means a mid-way failure leaves no partial DAG.
+        would leave its dependents blocked, because the wake-up is performed
+        by the worker that finishes the upstream job, not by a trigger. Not
+        forever: `monitor.sweep_stranded_waiters` releases exactly this case
+        on its next pass, so the transaction buys correctness that does not
+        depend on the monitor running, at monitor-interval latency otherwise.
+        It also means a mid-way failure leaves no partial DAG.
 
         Args:
             client: JobClient instance
@@ -496,9 +499,7 @@ async def wait_for_dag(
         status = await get_dag_status(pool, dag_id)
 
         if "error" in status:
-            raise LookupError(
-                f"DAG {dag_id} does not exist, so it can never complete"
-            )
+            raise LookupError(f"DAG {dag_id} does not exist, so it can never complete")
 
         # Derive terminal state from the jorb_dag_status counts. A crashed or
         # cancelled job means the DAG did not run to completion: everything

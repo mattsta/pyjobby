@@ -522,7 +522,9 @@ class TestTagCliFiltering:
         """
         result = await run_cli("--dsn", dsn, "jobs", "list", "--tag", bad)
 
-        assert result.exit_code == 1
+        # 2, the status click itself uses for bad arguments: this filter was
+        # refused before anything was attempted
+        assert result.exit_code == 2
         assert f"Error: Malformed --tag {bad!r}" in result.stderr
 
     async def test_a_malformed_tag_never_reaches_the_database(self):
@@ -536,7 +538,7 @@ class TestTagCliFiltering:
             "customer",
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == 2
         assert "Error: Malformed --tag 'customer': expected key=value" in result.stderr
         assert "Failed to connect to database" not in result.stderr
 

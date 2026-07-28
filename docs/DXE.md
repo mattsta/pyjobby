@@ -576,7 +576,7 @@ The child rows go with the job through `ON DELETE CASCADE`.
 Operators can also delete explicitly:
 
 ```
-pj-admin queues clear <queue> --state finished --older-than-days 30
+pj-admin queues clear <queue> --state finished --not-updated-for-days 30
 pj-admin jobs delete <id>
 ```
 

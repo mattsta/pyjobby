@@ -176,7 +176,16 @@ class TestRegistry:
         """
         worker = await live_worker(job_threads=3, heartbeat_interval=3600.0)
 
+        # Poll for the row's EXISTENCE only: the fixture returns concurrently
+        # with the registration INSERT's commit, and a single read raced it.
+        # The hour-long heartbeat still guarantees the VALUES cannot have
+        # come from a heartbeat -- which is what this test is about.
+        deadline = time.monotonic() + 10
         row = await registry_row(db_pool, worker)
+        while row is None and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+            row = await registry_row(db_pool, worker)
+        assert row is not None, "worker never registered"
 
         assert row["job_threads"] == 3
         assert row["job_threads_abandoned"] == 0

@@ -46,6 +46,14 @@ JOB_STATES: tuple[str, ...] = (
 #: is no separate DLQ table to move a exhausted job into.
 TERMINAL_STATES: tuple[str, ...] = ("finished", "crashed", "cancelled")
 
+#: :data:`TERMINAL_STATES` as the inside of a SQL ``IN (...)`` list.
+#:
+#: Interpolated rather than bound, deliberately and everywhere it is used:
+#: ``jorb_retention_idx`` is PARTIAL on this predicate, and a bound parameter
+#: falls off the index the moment PostgreSQL switches to a generic plan. The
+#: values are these three literals, so there is nothing to inject.
+TERMINAL_STATES_SQL: str = ", ".join(f"'{state}'" for state in TERMINAL_STATES)
+
 #: The states that represent work still in the system.
 LIVE_STATES: tuple[str, ...] = tuple(
     state for state in JOB_STATES if state not in TERMINAL_STATES

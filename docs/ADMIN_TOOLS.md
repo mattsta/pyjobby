@@ -60,14 +60,29 @@ $ echo $?
 1
 ```
 
-An empty *answer* is not a failure — `dlq list` on an empty DLQ, or
-`queues show` for a queue with no jobs and no control row, exit 0.
+Arguments that were wrong before anything was attempted exit **2**, the
+status click itself uses for a usage error — an unknown `--state`, a
+malformed `--tag`, a limit that is not a number, a priority above the
+worker ceiling:
+
+```console
+$ pj-admin jobs list --state bogus
+Error: Unknown job state: 'bogus'
+Error: Valid states: queued, claimed, running, waiting, finished, crashed, cancelled
+$ echo $?
+2
+```
+
+So `1` means "I tried and could not", `2` means "I did not try". An empty
+*answer* is not a failure either — `dlq list` on an empty DLQ, or `queues
+show` for a queue with no jobs and no control row, exit 0.
 
 Machine-readable output is `--json`, available on `jobs list`, `jobs
 inspect`, `jobs history`, `jobs steps`, `jobs retry-stats`, `jobs
 timeout-stats`, `queues list`, `queues show`, `queues stats`, `workers
 list`, `dlq list`, `metrics`, `schedule list`, `schedule show`, `schedule
-history`, `dag list` and `dag show`.
+history`, `dag list`, `dag show`, `dag visualize`, `doctor` and `db
+status`.
 
 ```bash
 pj-admin jobs retry $(pj-admin jobs list --state crashed --json | jq -r '.[].id')
@@ -141,13 +156,19 @@ Usage: pj-admin doctor [OPTIONS]
 
   Checks: database reachability, schema/migrations, NOTIFY triggers, NOTIFY
   queue saturation, live workers, workers that are alive but claiming nothing,
-  queue backlogs, the DLQ, and overdue schedules.
+  queue backlogs, blocked waiters, unread mail, the DLQ, and overdue
+  schedules.
+
+  With --json the same checks come out as [{check, status, message}] and the
+  exit code is unchanged, so a CI job can scrape them.
 
 Options:
   --max-depth INTEGER        WARN when a queue's backlog exceeds this many
                              queued jobs
   --max-age-minutes INTEGER  WARN when a queue's oldest queued job is older
                              than this
+  --json                     Output as JSON
+  --help                     Show this message and exit.
 ```
 
 A live platform, idle:
@@ -230,7 +251,7 @@ not.
 $ pj-admin jobs --help
 Commands:
   cancel         Cancel one or more jobs.
-  delete         Delete a job (permanent!)
+  delete         Delete one or more jobs (permanent!)
   history        Show a job's full transition trail (including per-attempt errors)
   inspect        Show detailed information about a job
   list           List jobs with optional filtering
@@ -354,8 +375,11 @@ Options:
 * `jobs set-priority ID PRIORITY` — re-prioritise a **queued or waiting**
   job (lower numbers are claimed first). Once a job is claimed its priority
   no longer decides anything, so those are refused; a priority above the
-  deployment's worker ceiling is refused too, since no worker would claim it.
-* `jobs delete ID` — permanent, prompts unless `-f/--force`.
+  deployment's worker ceiling is refused too, since no worker would claim
+  it. The ceiling comes from the config file's `prio_ceiling`, and
+  `--max-prio N` overrides it for one command.
+* `jobs delete ID...` — permanent, one line per id, prompts once for the
+  whole list unless `-f/--force`.
 
 The retry-versus-rerun distinction is expanded in
 [OPERATIONS.md § Retry vs. re-run](OPERATIONS.md#retry-vs-re-run).
@@ -439,9 +463,13 @@ Queue        Paused  Queued  Running  Waiting  Finished  Crashed  Total  Limits
 maintenance  no      0       0        0        0         0        0      conc=8, rate=
 ```
 
-`queues clear QUEUE` deletes jobs, optionally narrowed by `-s/--state` and
-`--older-than-days`, and prompts unless `-f/--force`. It is a blunt
-instrument for a test queue — routine cleanup is retention's job
+`queues clear QUEUE` deletes **queued and waiting** jobs — work that has not
+started — and prompts unless `-f/--force`, naming the states it is about to
+hit. `-s/--state` narrows it to one state instead, and is the only way to
+reach a claimed or running job: deleting one of those does not stop its
+worker, it strands the run. `--not-updated-for-days N` restricts the sweep
+to rows quiesced that long. It is a blunt instrument for a test queue —
+routine cleanup is retention's job
 (see [deployment-guide.md § Retention](deployment-guide.md#retention--on-by-default)).
 
 ## `workers`

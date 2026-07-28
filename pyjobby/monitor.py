@@ -102,7 +102,7 @@ import asyncpg  # type: ignore[import-untyped]
 from loguru import logger
 
 from . import db
-from .lifecycle import TERMINAL_STATES
+from .lifecycle import TERMINAL_STATES_SQL
 
 # =========================================================================
 # The sweep statements
@@ -116,19 +116,15 @@ from .lifecycle import TERMINAL_STATES
 # gate exists to prevent, so the monitor and the benchmark now read the same
 # string.
 #
-# The `_TERMINAL_STATES_SQL` interpolation below is a module constant, never
-# user input; see its own comment for why the states are inlined rather than
-# bound.
-
-#: The same list inlined into SQL, because ``jorb_retention_idx`` is PARTIAL
-#: on exactly this predicate. A bound ``state = ANY($1)`` reads fine under the
-#: custom plan of the first few executions and then silently falls off the
-#: index: asyncpg prepares its statements, and once PostgreSQL switches to a
-#: GENERIC plan it can no longer prove an unknown parameter implies the index
-#: predicate. Measured on 20k terminal rows with nothing expired -- generic
-#: plan, bound states: Seq Scan + Sort, 617 buffers; literal states: Index
-#: Scan, 2 buffers. Interpolating a module constant is not user input.
-_TERMINAL_STATES_SQL = ", ".join(f"'{state}'" for state in TERMINAL_STATES)
+# The `TERMINAL_STATES_SQL` interpolation below is a module constant from
+# lifecycle.py, never user input; the states are inlined rather than bound
+# because ``jorb_retention_idx`` is PARTIAL on exactly this predicate. A
+# bound ``state = ANY($1)`` reads fine under the custom plan of the first few
+# executions and then silently falls off the index: asyncpg prepares its
+# statements, and once PostgreSQL switches to a GENERIC plan it can no longer
+# prove an unknown parameter implies the index predicate. Measured on 20k
+# terminal rows with nothing expired -- generic plan, bound states: Seq Scan
+# + Sort, 617 buffers; literal states: Index Scan, 2 buffers.
 
 #: Running jobs past their deadline. ($1 batch size)
 SWEEP_TIMED_OUT_SQL = """
@@ -215,7 +211,7 @@ SWEEP_STUCK_CLAIMS_SQL = """
 SWEEP_EXPIRED_JOBS_SQL = f"""
     SELECT j.id
     FROM jorb j
-    WHERE j.state IN ({_TERMINAL_STATES_SQL})
+    WHERE j.state IN ({TERMINAL_STATES_SQL})
       AND COALESCE(j.finished, j.updated) < now() - $1::interval
       AND NOT EXISTS (
           SELECT 1 FROM jorb w

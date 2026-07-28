@@ -2281,7 +2281,7 @@ class TestAdminAPIErrorPaths:
 
     @pytest.mark.asyncio
     async def test_delete_jobs_by_age(self, db_pool):
-        """Test delete_jobs with older_than_days filter - covers lines 411-415."""
+        """Test delete_jobs with the not_updated_for_days filter."""
         from datetime import timedelta
 
         api = AdminAPI(db_pool)
@@ -2316,8 +2316,8 @@ class TestAdminAPIErrorPaths:
                 timedelta(days=1),
             )
 
-        # Delete jobs older than 7 days
-        deleted = await api.delete_jobs(state="finished", older_than_days=7)
+        # Delete jobs not updated for 7 days
+        deleted = await api.delete_jobs(state="finished", not_updated_for_days=7)
 
         assert deleted == 1
 
@@ -2385,9 +2385,9 @@ class TestAdminAPIErrorPaths:
                 timedelta(days=1),
             )
 
-        # Delete only: queue_a AND crashed AND older than 7 days
+        # Delete only: queue_a AND crashed AND not updated for 7 days
         deleted = await api.delete_jobs(
-            queue="queue_a", state="crashed", older_than_days=7
+            queue="queue_a", state="crashed", not_updated_for_days=7
         )
 
         assert deleted == 1
@@ -2405,7 +2405,11 @@ class TestAdminAPIErrorPaths:
 
     @pytest.mark.asyncio
     async def test_clear_queue(self, db_pool):
-        """Test clear_queue calls delete_jobs correctly - covers line 532."""
+        """clear_queue defaults to queued/waiting and takes states explicitly.
+
+        Terminal rows are NOT swept by a bare clear_queue(): reaching them
+        (like reaching claimed/running) has to be asked for.
+        """
         api = AdminAPI(db_pool)
 
         # Create jobs in test_queue
@@ -2434,8 +2438,11 @@ class TestAdminAPIErrorPaths:
                 100,
             )
 
-        # Clear queue
-        deleted = await api.clear_queue("test_queue")
+        # The default states leave both terminal rows alone
+        assert await api.clear_queue("test_queue") == 0
+
+        # Named explicitly, they go
+        deleted = await api.clear_queue("test_queue", states=("finished", "crashed"))
 
         assert deleted == 2
 

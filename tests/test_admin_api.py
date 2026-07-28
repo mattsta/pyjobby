@@ -337,7 +337,7 @@ class TestJobManagement:
         )
 
         # Delete jobs older than 30 days
-        count = await admin_api.delete_jobs(state="finished", older_than_days=30)
+        count = await admin_api.delete_jobs(state="finished", not_updated_for_days=30)
 
         assert count >= 1
 
@@ -413,10 +413,10 @@ class TestQueueManagement:
         assert stats[0]["oldest_queued_age_seconds"] >= 0
 
     async def test_clear_queue(self, admin_api, db_connection):
-        """Test clearing queue"""
+        """Test clearing queue: unstarted work by default"""
         # Create jobs in queue
         for i in range(5):
-            await create_test_job(db_connection, queue="clear-test", state="finished")
+            await create_test_job(db_connection, queue="clear-test", state="queued")
 
         # Clear queue
         count = await admin_api.clear_queue(queue="clear-test")
@@ -427,6 +427,18 @@ class TestQueueManagement:
         jobs = await admin_api.list_jobs(queue="clear-test")
         assert len(jobs) == 0
 
+    async def test_clear_queue_leaves_live_and_terminal_work_alone(
+        self, admin_api, db_connection
+    ):
+        """The default is queued/waiting: a claimed or running job belongs to
+        a worker that is executing it, and deleting the row strands the run
+        rather than stopping it."""
+        for state in ("claimed", "running", "finished"):
+            await create_test_job(db_connection, queue="clear-live", state=state)
+
+        assert await admin_api.clear_queue(queue="clear-live") == 0
+        assert len(await admin_api.list_jobs(queue="clear-live")) == 3
+
     async def test_clear_queue_by_state(self, admin_api, db_connection):
         """Test clearing queue filtered by state"""
         # Create jobs in different states
@@ -434,7 +446,7 @@ class TestQueueManagement:
         await create_test_job(db_connection, queue="test", state="crashed")
 
         # Clear only finished jobs
-        count = await admin_api.clear_queue(queue="test", state="finished")
+        count = await admin_api.clear_queue(queue="test", states=["finished"])
 
         assert count == 1
 
