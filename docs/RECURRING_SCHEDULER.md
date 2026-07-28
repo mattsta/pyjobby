@@ -70,7 +70,7 @@ pj-admin schedule stats
 pj-admin schedule delete daily-revenue
 ```
 
-Every command that names a schedule takes a name **or** an id. `--prio`,
+Every command that names a schedule takes a name **or** an id. `--priority`,
 `--capability`, `--jitter`, `--backpressure` and `--disabled` (create it
 switched off) are the remaining `add` options, and `list`, `show`, `history`
 and `stats` all take `--json`; `pj-admin schedule --help` is authoritative.

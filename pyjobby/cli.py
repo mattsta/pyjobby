@@ -1638,7 +1638,7 @@ def schedule_show(ctx: click.Context, name_or_id: str, output_json: bool) -> Non
 @click.option("--queue", "-q", default="default", help="Target queue")
 @click.option("--kwargs", help="Job kwargs as JSON")
 @click.option(
-    "--prio",
+    "--priority",
     "-p",
     type=int,
     default=100,
@@ -1653,7 +1653,7 @@ def schedule_show(ctx: click.Context, name_or_id: str, output_json: bool) -> Non
     default=DEFAULT_PRIO_CEILING,
     help=(
         f"The priority ceiling this fleet's workers run with (`pj "
-        f"--max-prio`, default {DEFAULT_PRIO_CEILING}). --prio above it is "
+        f"--max-prio`, default {DEFAULT_PRIO_CEILING}). --priority above it is "
         "refused: every firing would mint a job no worker can claim"
     ),
 )
@@ -1687,7 +1687,7 @@ def schedule_add(
     cron_expr: str,
     queue: str,
     kwargs: str | None,
-    prio: int,
+    priority: int,
     max_prio: int,
     capability: str | None,
     timezone: str,
@@ -1711,13 +1711,13 @@ def schedule_add(
     # cannot drift; only the hint is CLI-shaped, since `JobClient(...)` is
     # not the thing an operator typing this command would change.
     try:
-        validate_priority(prio, max_prio)
+        validate_priority(priority, max_prio)
     except ValueError as e:
         fail(
             str(e),
-            f"If this fleet really runs `pj --max-prio {prio}` (or higher), "
-            f"say so here too: `pj-admin schedule add ... --prio {prio} "
-            f"--max-prio {prio}`.",
+            f"If this fleet really runs `pj --max-prio {priority}` (or "
+            f"higher), say so here too: `pj-admin schedule add ... "
+            f"--priority {priority} --max-prio {priority}`.",
         )
 
     async def _add() -> None:
@@ -1740,7 +1740,7 @@ def schedule_add(
                 cron_expr=cron_expr,
                 queue=queue,
                 kwargs=job_kwargs,
-                prio=prio,
+                priority=priority,
                 capability=capability,
                 timezone=timezone,
                 enabled=not disabled,

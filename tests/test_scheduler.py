@@ -249,7 +249,7 @@ class TestScheduleManagerIntegration:
                     job_class="tests.test_scheduler.DummyJob",
                     cron_expr="0 * * * *",
                     queue="test_queue",
-                    prio=50,
+                    priority=50,
                 )
                 assert schedule_id is not None
             except ImportError:

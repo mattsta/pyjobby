@@ -953,13 +953,13 @@ class TestScheduleAddValidation:
             test_id,
             "tests.dxe_jobs.OkJob",
             "0 2 * * *",
-            "--prio",
+            "--priority",
             "high",
         )
 
         assert result.exit_code == 2
         assert (
-            "Error: Invalid value for '--prio' / '-p': 'high' is not a valid integer."
+            "Error: Invalid value for '--priority' / '-p': 'high' is not a valid integer."
             in result.stderr
         )
 
@@ -977,7 +977,7 @@ class TestScheduleAddValidation:
             test_id,
             "tests.dxe_jobs.OkJob",
             "0 2 * * *",
-            "--prio",
+            "--priority",
             str(DEFAULT_PRIO_CEILING + 1),
         )
 
@@ -990,7 +990,7 @@ class TestScheduleAddValidation:
         assert "LOWER numbers are MORE urgent" in result.stderr
         # and the escape hatch is the one an operator can actually type here
         assert (
-            f"--prio {DEFAULT_PRIO_CEILING + 1} --max-prio "
+            f"--priority {DEFAULT_PRIO_CEILING + 1} --max-prio "
             f"{DEFAULT_PRIO_CEILING + 1}" in result.stderr
         )
         assert await self._count(db_pool, test_id) == 0
@@ -1005,7 +1005,7 @@ class TestScheduleAddValidation:
             test_id,
             "tests.dxe_jobs.OkJob",
             "0 2 * * *",
-            "--prio",
+            "--priority",
             str(DEFAULT_PRIO_CEILING),
         )
 
@@ -1032,7 +1032,7 @@ class TestScheduleAddValidation:
             test_id,
             "tests.dxe_jobs.OkJob",
             "0 2 * * *",
-            "--prio",
+            "--priority",
             "5000",
             "--max-prio",
             "5000",
@@ -1057,7 +1057,7 @@ class TestScheduleAddValidation:
             test_id,
             "tests.dxe_jobs.OkJob",
             "0 2 * * *",
-            "--prio",
+            "--priority",
             "5001",
             "--max-prio",
             "5000",

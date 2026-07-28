@@ -1104,7 +1104,7 @@ class TestMalformedInput:
                 "name": f"badprio_{uuid.uuid4().hex[:8]}",
                 "job_class": "BadPrio",
                 "cron_expr": "0 * * * *",
-                "prio": "high",
+                "priority":"high",
             },
         )
         assert resp.status == 400
@@ -1124,7 +1124,7 @@ class TestMalformedInput:
                 "name": name,
                 "job_class": "OverPrio",
                 "cron_expr": "0 * * * *",
-                "prio": str(DEFAULT_PRIO_CEILING + 1),
+                "priority":str(DEFAULT_PRIO_CEILING + 1),
             },
         )
         assert resp.status == 400
@@ -1155,7 +1155,7 @@ class TestMalformedInput:
                 "name": name,
                 "job_class": "AtPrio",
                 "cron_expr": "0 * * * *",
-                "prio": str(DEFAULT_PRIO_CEILING),
+                "priority":str(DEFAULT_PRIO_CEILING),
             },
         )
         assert resp.status == 200
@@ -1185,7 +1185,7 @@ class TestMalformedInput:
                 "name": name,
                 "job_class": "Declared",
                 "cron_expr": "0 * * * *",
-                "prio": "5000",
+                "priority":"5000",
             },
         )
         assert ok.status == 200
@@ -1197,7 +1197,7 @@ class TestMalformedInput:
                 "name": refused_name,
                 "job_class": "Declared",
                 "cron_expr": "0 * * * *",
-                "prio": "5001",
+                "priority":"5001",
             },
         )
         assert refused.status == 400
@@ -1230,7 +1230,7 @@ class TestMalformedInput:
         assert resp.status == 200
         body = await resp.text()
 
-        assert f'name="prio" value="100" max="{DEFAULT_PRIO_CEILING}"' in body
+        assert f'name="priority" value="100" max="{DEFAULT_PRIO_CEILING}"' in body
         assert (
             f"LOWER is MORE urgent. Above the worker priority ceiling "
             f"({DEFAULT_PRIO_CEILING}) no worker ever claims the job." in body

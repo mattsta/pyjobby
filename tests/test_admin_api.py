@@ -634,7 +634,7 @@ class TestSchedulePriorityCeiling:
                 name=test_id,
                 job_class="tests.dxe_jobs.OkJob",
                 cron_expr="0 2 * * *",
-                prio=DEFAULT_PRIO_CEILING + 1,
+                priority=DEFAULT_PRIO_CEILING + 1,
             )
 
         message = str(exc.value)
@@ -652,7 +652,7 @@ class TestSchedulePriorityCeiling:
             name=test_id,
             job_class="tests.dxe_jobs.OkJob",
             cron_expr="0 2 * * *",
-            prio=DEFAULT_PRIO_CEILING,
+            priority=DEFAULT_PRIO_CEILING,
         )
 
         assert sched["prio"] == DEFAULT_PRIO_CEILING
@@ -666,7 +666,7 @@ class TestSchedulePriorityCeiling:
             name=test_id,
             job_class="tests.dxe_jobs.OkJob",
             cron_expr="0 2 * * *",
-            prio=5000,
+            priority=5000,
         )
         assert sched["prio"] == 5000
 
@@ -675,7 +675,7 @@ class TestSchedulePriorityCeiling:
                 name=f"{test_id}_2",
                 job_class="tests.dxe_jobs.OkJob",
                 cron_expr="0 2 * * *",
-                prio=5001,
+                priority=5001,
             )
         assert await self._count(db_connection, f"{test_id}_2") == 0
 
@@ -688,11 +688,11 @@ class TestSchedulePriorityCeiling:
             name=test_id,
             job_class="tests.dxe_jobs.OkJob",
             cron_expr="0 2 * * *",
-            prio=100,
+            priority=100,
         )
 
         with pytest.raises(ValueError) as exc:
-            await admin_api.update_schedule(sched["id"], prio=DEFAULT_PRIO_CEILING + 1)
+            await admin_api.update_schedule(sched["id"], priority=DEFAULT_PRIO_CEILING + 1)
         assert (
             f"priority {DEFAULT_PRIO_CEILING + 1} is above the worker "
             f"priority ceiling ({DEFAULT_PRIO_CEILING})" in str(exc.value)
@@ -706,7 +706,7 @@ class TestSchedulePriorityCeiling:
 
         # The mirror: at the ceiling the update goes through.
         updated = await admin_api.update_schedule(
-            sched["id"], prio=DEFAULT_PRIO_CEILING
+            sched["id"], priority=DEFAULT_PRIO_CEILING
         )
         assert updated["prio"] == DEFAULT_PRIO_CEILING
 

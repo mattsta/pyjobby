@@ -1091,7 +1091,7 @@ class TestAdminAPIScheduleManagement:
                 cron_expr="0 2 * * *",
                 queue="test",
                 kwargs={"key": "value"},
-                prio=50,
+                priority=50,
                 timezone="UTC",
                 description="Test schedule",
             )
@@ -1131,7 +1131,7 @@ class TestAdminAPIScheduleManagement:
             )
 
             updated = await api.update_schedule(
-                schedule_id, description="Updated description", prio=200
+                schedule_id, description="Updated description", priority=200
             )
 
             assert updated["description"] == "Updated description"

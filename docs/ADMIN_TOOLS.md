@@ -532,7 +532,7 @@ $ pj-admin schedule add nightly-cleanup examples.jobs.example_jobs.BasicJob "0 2
   Queue:    maintenance
 ```
 
-`add` also takes `-p/--prio`, `--capability`, `--timezone`, `--jitter`,
+`add` also takes `-p/--priority`, `--capability`, `--timezone`, `--jitter`,
 `--max-concurrent`, `--backpressure`, `--circuit-breaker`, `--description`
 and `--disabled`. The cron expression and timezone are validated at this
 point, not at fire time.

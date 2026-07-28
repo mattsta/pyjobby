@@ -1605,7 +1605,7 @@ class AdminAPI:
         cron_expr: str,
         queue: str = "default",
         kwargs: dict | None = None,
-        prio: int = 100,
+        priority: int = 100,
         capability: str | None = None,
         timezone: str = "UTC",
         enabled: bool = True,
@@ -1645,7 +1645,7 @@ class AdminAPI:
         # already refuses this at enqueue, and this is the same check against
         # the same imported ceiling -- a schedule writes `jorb.prio` on every
         # firing without ever passing through the client.
-        validate_priority(prio, self.prio_ceiling)
+        validate_priority(priority, self.prio_ceiling)
 
         # Reject the expression here rather than at fire time: a schedule
         # that cannot be evaluated is a schedule that silently never runs.
@@ -1673,7 +1673,7 @@ class AdminAPI:
             job_class,
             kwargs or {},
             queue,
-            prio,
+            priority,
             capability,
             cron_expr,
             timezone,
@@ -1699,6 +1699,13 @@ class AdminAPI:
         Returns:
             Updated schedule dictionary
         """
+        # The API vocabulary is `priority` (like enqueue); the COLUMN is
+        # `prio`, an SQL-side name that stays on the SQL side of the
+        # boundary. Translate before the allow-list so callers never need to
+        # know the column.
+        if "priority" in updates:
+            updates["prio"] = updates.pop("priority")
+
         # Allowed fields for update
         allowed_fields = {
             "name",
@@ -1724,7 +1731,7 @@ class AdminAPI:
         if not updates:
             raise ValueError("No valid fields to update")
 
-        # `prio` is an updatable field, so this is the second door onto
+        # Priority is an updatable field, so this is the second door onto
         # jorb_schedule.prio and it gets the same lock as create_schedule:
         # raising an existing schedule out of every worker's reach mints the
         # same unbounded stream of unclaimable jobs.

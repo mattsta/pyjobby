@@ -965,7 +965,7 @@ class TestSchedulesAPI:
                 "job_class": "CreateJob",
                 "cron_expr": "0 2 * * *",
                 "queue": "test",
-                "prio": "100",
+                "priority": "100",
             },
         )
 

@@ -1753,7 +1753,7 @@ class WebAdminServer:
         # intuition, and that inversion is what mints the unclaimable job.
         html = html.replace(
             "<!--PRIO_FIELD-->",
-            '<input type="number" name="prio" value="100" '
+            '<input type="number" name="priority" value="100" '
             f'max="{self.prio_ceiling}">\n'
             "                        <small>LOWER is MORE urgent. Above the "
             f"worker priority ceiling ({self.prio_ceiling}) no worker ever "
@@ -1863,7 +1863,7 @@ class WebAdminServer:
                     job_class=cast(str, data["job_class"]),
                     cron_expr=cast(str, data["cron_expr"]),
                     queue=cast(str, data.get("queue", "default")),
-                    prio=int(cast(str | int, data.get("prio", 100))),
+                    priority=int(cast(str | int, data.get("priority", 100))),
                     description=cast(str | None, data.get("description")),
                     max_concurrent_jobs=int(
                         cast(str | int, data.get("max_concurrent_jobs", 1))
