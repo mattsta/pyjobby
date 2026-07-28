@@ -1362,8 +1362,7 @@ def main() -> None:
         default="./pyjobby.toml",
         show_default=True,
         help="Config file path (must define db_params; may define "
-        "prio_ceiling) — the same -c/--config every other pyjobby daemon "
-        "takes; this one used to be the odd positional argument out",
+        "prio_ceiling) — the same -c/--config every other pyjobby daemon takes",
     )
     @click.option(
         "--host",

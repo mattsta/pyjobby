@@ -67,7 +67,7 @@ leader.
 | Process | Script | What it owns | What it does **not** do |
 |---|---|---|---|
 | **Worker** | `pj` | Claiming, executing job code, this attempt's state transitions, its own registry row and heartbeat, its own job-thread pool | Decide whether a queue may run at all — `claim_jorb()` does. Recover its own crash — the monitor does. Enforce any other worker's deadline. |
-| **Monitor** | `pj-monitor` | Every safety-net sweep in the platform: timeouts, dead-worker reclaim, unregistered-claim reclaim, and six retention sweeps | Execute jobs, enqueue anything, elect a leader. Several instances are safe; every sweep is one atomic statement or a transaction holding its own row locks. |
+| **Monitor** | `pj-monitor` | Every safety-net sweep in the platform: timeouts, dead-worker reclaim, unregistered-claim reclaim, and seven retention sweeps | Execute jobs, enqueue anything, elect a leader. Several instances are safe; every sweep is one atomic statement or a transaction holding its own row locks. |
 | **Scheduler** | `pj-scheduler` | Firing due `jorb_schedule` rows into `jorb`, the safety checks around that (concurrency, backpressure, jitter, circuit breaker), and `jorb_schedule_log` | Run the jobs it creates — it only inserts them. Several instances are safe: each schedule is row-locked `FOR UPDATE SKIP LOCKED` while it fires, and `deadline_key` makes a duplicate insert fail. |
 | **Admin CLI** | `pj-admin` | Nothing at runtime. It is a client: schema install/migrate, queue controls, DLQ, requeue, `doctor` | Participate in execution. |
 | **Web admin** | `pj-web` | HTML operator UI, a JSON API, and `GET /metrics` for Prometheus | Authenticate anybody. Keep it on localhost or behind a proxy. |
@@ -409,8 +409,8 @@ ran. Retention is therefore **on by default** — a policy nobody remembers
 to switch on is not a policy — and `0` on either window means "keep
 forever".
 
-Six sweeps on two windows. `--checkpoint-retention-days` governs the first;
-`--retention-days` governs the other five, because none of those tables has
+Seven sweeps on two windows. `--checkpoint-retention-days` governs the first;
+`--retention-days` governs the other six, because none of those tables has
 a lifetime of its own to argue for — they all mean "as long as the work they
 describe".
 
@@ -419,6 +419,7 @@ describe".
 | Checkpoints | 1 day | `jorb_step` rows of terminal jobs; the job row stays | Checkpoints exist to make a job *resumable*. The instant it terminates, resume is impossible — so they are the bulkiest thing hanging off a job with the shortest useful life. They outlive the terminal transition only far enough to debug it. |
 | Jobs | 30 days | The whole `jorb` row, and its history, events, mailbox, checkpoints and DAG edges by `ON DELETE CASCADE` | The job's own audit lifetime. |
 | Consumed mail | 30 days | `jorb_mailbox` rows with `consumed_at` set | The job-scoped cascade cannot reach these: a long-lived workflow reads mail for months and never terminates, so nothing else would ever free them. |
+| History | 30 days | `jorb_history` rows past the window | The audit trail lives as long as the work it describes. A durable machine that never terminates is never reached by the job cascade, so nothing else bounds its wake/sleep history. |
 | Orphaned DAGs | 30 days | `jorb_dag` rows past the window with no jobs left | Jobs point **at** a DAG (`ON DELETE SET NULL`), so job retention never touches it. Left alone it does not merely linger, it keeps *answering*: `jorb_dag_status` LEFT JOINs `jorb`, so an emptied DAG reports `total_jobs = 0` forever. |
 | Schedule log | 30 days | `jorb_schedule_log` rows, except each schedule's newest | It cascades only from `jorb_schedule`, which operators disable rather than delete — so it had no upper bound of any kind, at cron rate, for the life of the install. |
 | Retired workers | 30 days | `jorb_worker` rows both retired and silent for the window | One row per worker *process start*, and nothing ever deleted one: a fleet that redeploys accumulates registry rows for as long as it exists. |

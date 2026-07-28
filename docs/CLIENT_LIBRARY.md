@@ -143,13 +143,15 @@ report = await client.run("myapp.jobs.Report", day="mon", timeout=60)
 
 # Cancel and wait for the cancellation to LAND. 'cancel_requested' is a
 # promise, not an outcome: this returns the terminal state — 'cancelled',
-# or 'finished'/'crashed' when the job outran the cancel.
+# or 'finished'/'crashed' when the job outran the cancel — or None when
+# there was nothing to cancel. It never raises TimeoutError: if the wait
+# elapses (the default is finite), it returns the still-live state instead.
 final = await client.cancel_and_wait(job_id, timeout=30)
 
 # Await a whole fan-out. Returns the member count when every job in the
 # group finished; raises if a member crashed/was cancelled (the group can
 # then never finish) or the group has no members.
-group_id, job_ids = await client.create_fan_out("myapp.jobs.Resize", items)
+job_ids, group_id = await client.create_fan_out("myapp.jobs.Resize", items)
 await client.wait_for_group(group_id, timeout=600)
 ```
 
@@ -355,12 +357,15 @@ else:
 
 #### `retry_job(job_id)`
 
-Retry a failed or crashed job (creates new job).
+Retry a crashed or cancelled job. The job keeps its id — the same row is
+requeued and the per-attempt history lives in `jorb_history`. Returns the
+job id if it was requeued, or `None` if it was not in a retriable state (a
+job that already finished is not retriable; see `rerun_job`).
 
 ```python
-new_job_id = await client.retry_job(12345)
-if new_job_id:
-    print(f"Retry job created: {new_job_id}")
+requeued = await client.retry_job(12345)
+if requeued:
+    print(f"Job {requeued} requeued")
 ```
 
 ### Queue Operations
@@ -374,16 +379,21 @@ depth = await client.queue_depth("emails")
 print(f"Queue has {depth} jobs waiting")
 ```
 
-#### `queue_stats(queue='default')`
+#### `queue_stats(queue='default', window=timedelta(hours=1))`
 
-Get statistics for a queue.
+Per-state counts for a queue. Live states (`queued`, `claimed`, `running`,
+`waiting`) are counted exactly; terminal states (`finished`, `crashed`,
+`cancelled`) are counted only within `window` (default: the last hour), a
+recent-activity number rather than an all-time total.
 
 ```python
-stats = await client.queue_stats("emails")
+from datetime import timedelta
+
+stats = await client.queue_stats("emails", window=timedelta(hours=24))
 print(f"Queued: {stats['queued']}")
 print(f"Running: {stats['running']}")
-print(f"Finished: {stats['finished']}")
-print(f"Crashed: {stats['crashed']}")
+print(f"Finished (last 24h): {stats['finished']}")
+print(f"Crashed (last 24h): {stats['crashed']}")
 ```
 
 ### Health Check
@@ -749,7 +759,7 @@ choose another.
 ```python
 await order.send("paid", amount=100)  # payload is yours
 state = await order.wait_for_state("shipped", "refunded", timeout=600)
-result = await order.result()  # {"final_state": "shipped"}
+result = await order.result()  # whatever the machine's job returned
 ```
 
 `wait_for_state()` waits for a **state**, not a transition, so it returns
@@ -892,8 +902,12 @@ async def monitor_queues(client, queues=["default", "emails", "processing"]):
         if depth > 1000:
             print(f"ALERT: Queue '{queue}' has {depth} jobs waiting!")
 
-        # Alert if many crashes
-        crash_rate = stats["crashed"] / max(stats["finished"], 1)
+        # Alert if many crashes. crashed/finished are counted within
+        # queue_stats' window (default: the last hour), so this is a RECENT
+        # crash rate, not an all-time one. Divide by all terminal jobs in the
+        # window (crashed + finished), not by finished alone.
+        terminal = stats["crashed"] + stats["finished"]
+        crash_rate = stats["crashed"] / max(terminal, 1)
         if crash_rate > 0.1:  # > 10% crash rate
             print(f"ALERT: Queue '{queue}' has {crash_rate:.1%} crash rate!")
 

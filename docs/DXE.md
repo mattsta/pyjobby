@@ -541,13 +541,13 @@ keeps its step checkpoints for a day — long enough to answer "which step
 failed, and why" after an incident — and the job row, its result and its
 history for thirty.
 
-`--retention-days` drives five separate sweeps, not one. Four of the tables
+`--retention-days` drives six separate sweeps, not one. Five of the tables
 it covers are not reachable from a job at all — `jorb_dag` is the *parent* of
 its jobs, `jorb_schedule_log` cascades only from `jorb_schedule`,
-`jorb_worker` is referenced by nothing, and a live job's consumed mail
-outlives no job — so deleting jobs would never free them. They share the one
-window because none of them has a lifetime of its own to argue for. What each
-sweep refuses to delete, and why, is in
+`jorb_worker` is referenced by nothing, and a live job's consumed mail and
+its history outlive any job deletion — so deleting jobs would never free them.
+They share the one window because none of them has a lifetime of its own to
+argue for. What each sweep refuses to delete, and why, is in
 [OPERATIONS.md § Retention](OPERATIONS.md#retention-what-it-deletes-and-what-it-refuses-to);
 the DXE-relevant half is below.
 
@@ -567,6 +567,9 @@ The job sweep is deliberately conservative:
   and the job-scoped cascade would never reach them. Only messages `recv` has
   already consumed are candidates — unread mail is kept at any age, because it
   is still deliverable.
+* `jorb_history` is pruned by a sweep of its own for the same reason: a
+  durable machine that never terminates is never reached by the job cascade,
+  so nothing else would ever bound its wake/sleep audit trail.
 
 The child rows go with the job through `ON DELETE CASCADE`.
 

@@ -96,8 +96,7 @@ PROM_RATE_WINDOW_SECONDS = 300
 #
 #   state="queued"     claimable RIGHT NOW. The number an operator pages on.
 #   state="scheduled"  deliberately parked in the future (retry backoff,
-#                      enqueue-at). Not a backlog, and it used to be counted
-#                      as one.
+#                      enqueue-at). Not a backlog, and not counted as one.
 PROM_SQL_LIVE_STATES = """
     SELECT queue, 'queued' AS state, COUNT(*) AS n
       FROM jorb WHERE state = 'queued' AND run_after <= now() GROUP BY queue
@@ -1993,8 +1992,7 @@ def main() -> None:
         default="./pyjobby.toml",
         show_default=True,
         help="Config file path (must define db_params; may define "
-        "prio_ceiling) — the same -c/--config every other pyjobby daemon "
-        "takes; this one used to be the odd positional argument out",
+        "prio_ceiling) — the same -c/--config every other pyjobby daemon takes",
     )
     @click.option(
         "--host",

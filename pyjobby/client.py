@@ -256,9 +256,8 @@ class JobHandle:
     async def result(self, timeout: float | None = None) -> Any:
         """WAIT for the result — the same contract as MachineHandle.result(),
         so `await handle.result()` means one thing across both handle kinds.
-        (It used to be a non-blocking peek that returned None for a job that
-        simply hadn't run yet — a silent "no result" branch in every caller
-        that copied the machine idiom. The peek is get_job_result().)"""
+        For a non-blocking peek that returns None until the job finishes, use
+        get_job_result()."""
         return await self.client.wait_for_result(self.id, timeout=timeout)
 
     async def cancel(self) -> str | None:
@@ -1119,11 +1118,9 @@ class JobClient:
 
         Every row is built by the same construction path as a single
         enqueue, so a batch job loses nothing by being batched: retry
-        strategy, timeout policy, tags, deadline_key, capability — all of
-        it applies. (An earlier version wrote only six columns, so batched
-        jobs silently ran with worker-default retry/timeout policy and no
-        deadline_key; converting a loop of enqueue() calls into a batch for
-        speed must not change what the jobs mean.)
+        strategy, timeout policy, tags, deadline_key, capability — all of it
+        applies, so converting a loop of enqueue() calls into a batch does
+        not change what the jobs mean.
 
         Args:
             jobs: a list of ``(job_class, kwargs)`` tuples, or

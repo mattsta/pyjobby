@@ -108,7 +108,7 @@ the lock is there for.)
 $ pj-admin db status
 Base schema installed: yes
 Applied migrations:    none
-Pending migrations:    [1, 2]
+Pending migrations:    [1, 2, 3, 4]
 Missing objects:       3
   index jorb_dag_retention_idx
   index jorb_schedule_log_retention_idx
@@ -156,7 +156,7 @@ A live platform, idle:
 ```console
 $ pj-admin --dsn "$PYJOBBY_DSN" doctor
 PASS database: connected
-PASS schema: installed and complete; migrations [1, 2] are not recorded yet, which the next upgrade reads (run: pj-admin db migrate)
+PASS schema: installed and complete; migrations [1, 2, 3, 4] are not recorded yet, which the next upgrade reads (run: pj-admin db migrate)
 PASS triggers: all schema triggers present (7)
 PASS notify-queue: 0.0% full
 WARN workers: no live workers seen in last 60s
@@ -643,7 +643,8 @@ measured over the window and comparable across window sizes; **levels**
 pj-web --config /etc/pyjobby/pyjobby.toml --host 127.0.0.1 --port 8081
 ```
 
-It takes a config file positionally; it does not read `PYJOBBY_DSN`.
+It takes a config file with `-c`/`--config` (the same flag every pyjobby
+daemon takes); it does not read `PYJOBBY_DSN`.
 Defaults are `127.0.0.1:8081`. **There is no authentication**, and the API
 can cancel, retry and delete jobs — bind it to localhost, or put an
 authenticating proxy in front. `--host 0.0.0.0` exposes an unauthenticated

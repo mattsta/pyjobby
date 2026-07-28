@@ -18,7 +18,7 @@ gate, and a deploy smoke test. Run it before reading logs.
 ```console
 $ pj-admin --dsn "$PYJOBBY_DSN" doctor
 PASS database: connected
-PASS schema: installed and complete; migrations [1, 2] are not recorded yet, which the next upgrade reads (run: pj-admin db migrate)
+PASS schema: installed and complete; migrations [1, 2, 3, 4] are not recorded yet, which the next upgrade reads (run: pj-admin db migrate)
 PASS triggers: all schema triggers present (7)
 PASS notify-queue: 0.0% full
 WARN workers: no live workers seen in last 60s
@@ -128,7 +128,7 @@ every one:
 $ pj-admin db status
 Base schema installed: yes
 Applied migrations:    none
-Pending migrations:    [1, 2]
+Pending migrations:    [1, 2, 3, 4]
 Missing objects:       3
   index jorb_dag_retention_idx
   index jorb_schedule_log_retention_idx

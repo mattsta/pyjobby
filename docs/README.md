@@ -102,8 +102,8 @@ covers which process reads what.
 
 ```bash
 # Install or upgrade the database schema (fresh install, or pending migrations)
-pj-admin db migrate --config ./pyjobby.toml
-pj-admin db status --config ./pyjobby.toml
+pj-admin --config ./pyjobby.toml db migrate
+pj-admin --config ./pyjobby.toml db status
 
 # Is the platform healthy? (exits 1 on any FAIL, so it works as a CI gate)
 pj-admin --dsn "$PYJOBBY_DSN" doctor
