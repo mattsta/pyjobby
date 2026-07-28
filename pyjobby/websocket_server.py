@@ -606,7 +606,7 @@ class WebSocketServer:
             data["channels"] = self.validate_channels(data.get("channels", []))
         if action in (
             "cancel_job",
-            "retry_job",
+            "rerun_job",
             "adjust_priority",
             "watch_job",
             "unwatch_job",
@@ -651,8 +651,8 @@ class WebSocketServer:
         elif action == "cancel_job":
             await self.handle_cancel_job(ws, client, data)
 
-        elif action == "retry_job":
-            await self.handle_retry_job(ws, client, data)
+        elif action == "rerun_job":
+            await self.handle_rerun_job(ws, client, data)
 
         elif action == "adjust_priority":
             await self.handle_adjust_priority(ws, client, data)
@@ -842,24 +842,30 @@ class WebSocketServer:
             await self.send_error(ws, f"Failed to cancel job: {str(e)}")
             self.stats["errors"] += 1
 
-    async def handle_retry_job(
+    async def handle_rerun_job(
         self, ws: web.WebSocketResponse, client: ClientConnection, data: dict[str, Any]
     ) -> None:
-        """Handle job retry request (job_id validated by validate_message)"""
+        """Handle a job RE-RUN request (job_id validated by validate_message).
+
+        Named for what it does: this surface deliberately allows re-running
+        FINISHED jobs (db.rerun_job), which repeats their side effects. The
+        admin API and CLI `retry` verbs refuse finished jobs, so the two
+        words must stay distinct — a surface labeled "retry" that silently
+        repeats completed work is the drift this name exists to prevent.
+        """
         job_id = data["job_id"]
 
         assert self.db_pool is not None
         try:
             async with self.db_pool.acquire() as conn:
-                # shared re-run verb — jobs keep their ids across retries, and
-                # this surface deliberately allows re-running finished jobs
+                # shared re-run verb — jobs keep their ids across reruns
                 requeued = await db.rerun_job(conn, job_id)
 
                 if requeued:
                     await self.send_to_client(
                         ws,
                         {
-                            "event": "job_retried",
+                            "event": "job_rerun",
                             "timestamp": datetime.now(UTC).isoformat(),
                             "data": {
                                 "job_id": job_id,
@@ -870,12 +876,12 @@ class WebSocketServer:
                     logger.info(f"Job {job_id} requeued via WebSocket")
                 else:
                     await self.send_error(
-                        ws, f"Job {job_id} not found or cannot be retried"
+                        ws, f"Job {job_id} not found or cannot be rerun"
                     )
 
         except Exception as e:
-            logger.error(f"Error retrying job: {e}")
-            await self.send_error(ws, f"Failed to retry job: {str(e)}")
+            logger.error(f"Error rerunning job: {e}")
+            await self.send_error(ws, f"Failed to rerun job: {str(e)}")
             self.stats["errors"] += 1
 
     async def handle_adjust_priority(

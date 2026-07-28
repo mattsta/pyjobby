@@ -360,10 +360,10 @@ EXACT_FRAME_CASES: tuple[tuple[Any, str], ...] = (
     ({"action": "cancel_job", "job_id": {"a": 1}}, "job_id must be an integer"),
     ({"action": "cancel_job", "job_id": -1}, JOB_ID_RANGE_ERROR),
     ({"action": "cancel_job", "job_id": 2**63}, JOB_ID_RANGE_ERROR),
-    ({"action": "retry_job"}, "Missing job_id"),
-    ({"action": "retry_job", "job_id": 0}, "Job 0 not found or cannot be retried"),
-    ({"action": "retry_job", "job_id": "abc"}, "job_id must be an integer"),
-    ({"action": "retry_job", "job_id": 2**63}, JOB_ID_RANGE_ERROR),
+    ({"action": "rerun_job"}, "Missing job_id"),
+    ({"action": "rerun_job", "job_id": 0}, "Job 0 not found or cannot be rerun"),
+    ({"action": "rerun_job", "job_id": "abc"}, "job_id must be an integer"),
+    ({"action": "rerun_job", "job_id": 2**63}, JOB_ID_RANGE_ERROR),
     ({"action": "adjust_priority"}, "Missing job_id"),
     ({"action": "adjust_priority", "job_id": 1}, "Missing new_priority"),
     ({"action": "adjust_priority", "new_priority": 1}, "Missing job_id"),
@@ -742,7 +742,7 @@ class TestUnauthenticatedMutationBoundary:
     * ``cancel_job`` — cancel any queued/waiting job outright, and set
       ``cancel_requested`` on any claimed/running job, for any queue and any
       ``uid``. Denial of service against every tenant's work.
-    * ``retry_job`` — requeue any job in state crashed, cancelled **or
+    * ``rerun_job`` — requeue any job in state crashed, cancelled **or
       finished**. Re-running a *successfully finished* job is a duplicate side
       effect (re-charge, re-send, re-deliver); note the HTTP admin API refuses
       this (crashed/cancelled only), so the websocket surface is strictly more
@@ -828,7 +828,7 @@ class TestUnauthenticatedMutationBoundary:
             assert (await job_row(db_pool, job_id))["state"] == state
 
     @pytest.mark.asyncio
-    async def test_retry_job_reruns_a_successfully_finished_job(
+    async def test_rerun_job_reruns_a_successfully_finished_job(
         self, ws_factory, db_pool, unique_queue
     ):
         """The widest mutation on this surface: an anonymous client can make a
@@ -837,22 +837,22 @@ class TestUnauthenticatedMutationBoundary:
         ws = await h.connect()
         job_id = await make_job(db_pool, unique_queue, "finished", uid=7)
 
-        reply = await ask(ws, {"action": "retry_job", "job_id": job_id})
-        assert reply["event"] == "job_retried"
+        reply = await ask(ws, {"action": "rerun_job", "job_id": job_id})
+        assert reply["event"] == "job_rerun"
         assert reply["data"] == {"job_id": job_id, "status": "requeued"}
 
         row = await job_row(db_pool, job_id)
         assert row["state"] == "queued"
 
     @pytest.mark.asyncio
-    async def test_retry_job_requeues_crashed_and_resets_the_error_budget(
+    async def test_rerun_job_requeues_crashed_and_resets_the_error_budget(
         self, ws_factory, db_pool, unique_queue
     ):
         h = await ws_factory()
         ws = await h.connect()
         job_id = await make_job(db_pool, unique_queue, "crashed", error_count=9)
 
-        reply = await ask(ws, {"action": "retry_job", "job_id": job_id})
+        reply = await ask(ws, {"action": "rerun_job", "job_id": job_id})
         assert reply["data"] == {"job_id": job_id, "status": "requeued"}
 
         row = await job_row(db_pool, job_id)
@@ -860,17 +860,17 @@ class TestUnauthenticatedMutationBoundary:
         assert row["error_count"] == 0
 
     @pytest.mark.asyncio
-    async def test_retry_job_refuses_in_flight_states(
+    async def test_rerun_job_refuses_in_flight_states(
         self, ws_factory, db_pool, unique_queue
     ):
         h = await ws_factory()
         ws = await h.connect()
         for state in ("queued", "claimed", "running"):
             job_id = await make_job(db_pool, unique_queue, state)
-            reply = await ask(ws, {"action": "retry_job", "job_id": job_id})
+            reply = await ask(ws, {"action": "rerun_job", "job_id": job_id})
             assert reply["event"] == "error"
             assert reply["data"]["message"] == (
-                f"Job {job_id} not found or cannot be retried"
+                f"Job {job_id} not found or cannot be rerun"
             )
             assert (await job_row(db_pool, job_id))["state"] == state
 
@@ -1143,7 +1143,7 @@ class TestUnauthenticatedMutationBoundary:
             "watch_job",
             "unwatch_job",
             "cancel_job",
-            "retry_job",
+            "rerun_job",
             "adjust_priority",
             "get_stats",
         }

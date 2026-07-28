@@ -382,11 +382,16 @@ immediately instead of hanging.
 }
 ```
 
-#### retry_job
+#### rerun_job
+
+Named for what it does: re-runs a terminal job, **including one that
+finished successfully** — which repeats its side effects. (The admin API
+and CLI `retry` verbs refuse finished jobs; this dashboard action is the
+explicit "do it again anyway".)
 
 ```json
 {
-  "action": "retry_job",
+  "action": "rerun_job",
   "job_id": 12345
 }
 ```

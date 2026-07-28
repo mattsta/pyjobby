@@ -42,7 +42,7 @@ import contextlib
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Final
 
@@ -1756,70 +1756,82 @@ class JobClient:
             )
             return depth
 
-    async def queue_stats(self, queue: str = "default") -> dict[str, int]:
+    # Queue statistics without reading each queue's whole history. A single
+    # GROUP BY over jorb read every row the install ever ran — multi-second
+    # within a day at documented rates, as the FIRST thing an operator calls.
+    # One arm per partial index instead (the same construction the websocket
+    # snapshot uses): live states are counted exactly, terminal states within
+    # a recency window — "how many jobs finished, EVER" is an audit question
+    # for SQL, not a dashboard number. ($1 = the window, as an interval.)
+    _QUEUE_STATS_SQL = """
+        SELECT queue, 'queued' AS state, COUNT(*)::bigint AS n
+          FROM jorb WHERE state = 'queued' GROUP BY queue
+        UNION ALL
+        SELECT queue, state::text, COUNT(*)::bigint
+          FROM jorb WHERE state IN ('claimed', 'running') GROUP BY queue, state
+        UNION ALL
+        SELECT queue, 'waiting', COUNT(*)::bigint
+          FROM jorb WHERE state = 'waiting' GROUP BY queue
+        UNION ALL
+        SELECT queue, state::text, COUNT(*)::bigint
+          FROM jorb
+         WHERE state IN ('finished', 'crashed', 'cancelled')
+           AND COALESCE(finished, updated) >= now() - $1::interval
+         GROUP BY queue, state
+    """
+
+    async def queue_stats(
+        self, queue: str = "default", window: timedelta = timedelta(hours=1)
+    ) -> dict[str, int]:
         """
-        Get statistics for a queue.
+        Per-state counts for a queue: LIVE states exactly, terminal states
+        within `window` (default: the last hour).
+
+        Live work (queued/claimed/running/waiting) is bounded and counted
+        in full. Terminal counts are a recent-activity dashboard number,
+        not an all-time audit — the all-time count grows with the install's
+        whole history and belongs to SQL, not to a call every dashboard
+        makes on a timer.
 
         Args:
             queue: Queue name (default: 'default')
-
-        Returns:
-            Dict with counts by state
+            window: how far back to count finished/crashed/cancelled
 
         Example:
             stats = await client.queue_stats('emails')
             print(f"Queued: {stats['queued']}, Running: {stats['running']}")
         """
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT state, COUNT(*) as count
-                FROM jorb
-                WHERE queue = $1
-                GROUP BY state
-            """,
-                queue,
-            )
-
-        stats = {row["state"]: row["count"] for row in rows}
-
-        # Zero-fill from the platform's own declaration, so a state added to
-        # the enum cannot quietly vanish from every dashboard reading this
-        for state in lifecycle.JOB_STATES:
-            stats.setdefault(state, 0)
-
+        rows = await self.pool.fetch(self._QUEUE_STATS_SQL, window)
+        stats = dict.fromkeys(lifecycle.JOB_STATES, 0)
+        for row in rows:
+            if row["queue"] == queue:
+                stats[row["state"]] = row["n"]
         return stats
 
-    async def list_queues(self) -> list[dict[str, Any]]:
+    async def list_queues(
+        self, window: timedelta = timedelta(hours=1)
+    ) -> list[dict[str, Any]]:
         """
-        List all queues with statistics.
-
-        Returns:
-            List of dicts with queue name and stats
+        Every queue with per-state counts — the same contract as
+        queue_stats(): live states exact, terminal states within `window`,
+        `total` the sum of what is reported.
 
         Example:
             queues = await client.list_queues()
             for q in queues:
                 print(f"{q['queue']}: {q['queued']} queued, {q['running']} running")
         """
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT
-                    queue,
-                    COUNT(*) FILTER (WHERE state = 'queued') as queued,
-                    COUNT(*) FILTER (WHERE state = 'claimed') as claimed,
-                    COUNT(*) FILTER (WHERE state = 'running') as running,
-                    COUNT(*) FILTER (WHERE state = 'waiting') as waiting,
-                    COUNT(*) FILTER (WHERE state = 'finished') as finished,
-                    COUNT(*) FILTER (WHERE state = 'crashed') as crashed,
-                    COUNT(*) FILTER (WHERE state = 'cancelled') as cancelled,
-                    COUNT(*) as total
-                FROM jorb
-                GROUP BY queue
-                ORDER BY queue
-            """)
-
-        return [dict(row) for row in rows]
+        rows = await self.pool.fetch(self._QUEUE_STATS_SQL, window)
+        queues: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            entry = queues.setdefault(
+                row["queue"],
+                {"queue": row["queue"], **dict.fromkeys(lifecycle.JOB_STATES, 0)},
+            )
+            entry[row["state"]] = row["n"]
+        for entry in queues.values():
+            entry["total"] = sum(entry[state] for state in lifecycle.JOB_STATES)
+        return [queues[name] for name in sorted(queues)]
 
     async def purge_queue(self, queue: str, states: list[str] | None = None) -> int:
         """

@@ -618,9 +618,9 @@ class TestJobActionHandlers:
 
             ws = FakeWS()
             client = ClientConnection(ws=ws, channels=set(), connected_at=time.time())
-            await server.handle_retry_job(ws, client, {"job_id": job_id})
+            await server.handle_rerun_job(ws, client, {"job_id": job_id})
 
-            assert ws.sent[-1]["event"] == "job_retried"
+            assert ws.sent[-1]["event"] == "job_rerun"
             assert ws.sent[-1]["data"] == {"job_id": job_id, "status": "requeued"}
 
             async with db_pool.acquire() as conn:
@@ -634,7 +634,7 @@ class TestJobActionHandlers:
 
     @pytest.mark.asyncio
     async def test_retry_running_job_rejected(self, db_params, db_pool):
-        """A running job cannot be retried."""
+        """A running job cannot be rerun."""
         server = WebSocketServer(db_params)
         await server.init_db_pool()
         try:
@@ -649,7 +649,7 @@ class TestJobActionHandlers:
 
             ws = FakeWS()
             client = ClientConnection(ws=ws, channels=set(), connected_at=time.time())
-            await server.handle_retry_job(ws, client, {"job_id": job_id})
+            await server.handle_rerun_job(ws, client, {"job_id": job_id})
 
             assert ws.sent[-1]["event"] == "error"
         finally:

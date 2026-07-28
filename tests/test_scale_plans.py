@@ -23,6 +23,7 @@ import re
 import pytest
 
 from pyjobby import dxe
+from pyjobby.client import JobClient
 from pyjobby.lifecycle import TERMINAL_STATES
 from pyjobby.monitor import (
     DELETE_MAILBOX_SQL,
@@ -701,6 +702,42 @@ class TestRetiredWorkerSweepPlan:
         assert "jorb_inflight_idx" in plan, plan
         assert_no_seq_scan(plan, "jorb")
         assert rows_scanned_by(plan, "jorb_inflight_idx") == in_flight, plan
+
+
+class TestClientQueueStatsPlan:
+    """queue_stats()/list_queues() are the first thing an operator calls,
+    usually on a dashboard timer. Their old single GROUP BY read every row
+    the install ever ran; the arm-per-partial-index form (the snapshot's
+    construction) must read live work plus one recency window, never the
+    history."""
+
+    async def test_the_stats_read_no_history(self, db_pool, unique_queue):
+        await seed_terminal_jobs(db_pool, unique_queue)
+
+        plan = await plan_for(
+            db_pool, JobClient._QUEUE_STATS_SQL, datetime.timedelta(hours=1)
+        )
+
+        assert_no_seq_scan(plan)
+        # The honest bound is the WINDOW's own population, not a fraction of
+        # the table: the seed compresses 60 days into a few hundred pages,
+        # so its one-hour slice is a large share of a small table — while on
+        # a real install the same window is a vanishing one. What the plan
+        # must prove is that cost scales with live work + the window, so:
+        # nothing read-and-discarded, and buffers bounded by a small
+        # multiple of the rows the window actually holds (plus the live
+        # arms' index pages).
+        assert rows_removed_by_filter(plan) <= 5, plan
+        recent = await db_pool.fetchval(
+            """SELECT count(*) FROM jorb
+               WHERE state IN ('finished', 'crashed', 'cancelled')
+                 AND COALESCE(finished, updated) >= now() - interval '1 hour'"""
+        )
+        from tests.utils.plans import buffers_in
+
+        assert buffers_in(plan) <= recent * 2 + 100, (
+            f"{buffers_in(plan)} buffers for {recent} in-window rows\n{plan}"
+        )
 
 
 class TestBackpressureCountPlan:
