@@ -499,6 +499,11 @@ CREATE TABLE jorb_history (
 );
 
 CREATE INDEX jorb_history_job_idx ON jorb_history (job_id, id);
+-- retention: live-job history is reachable ONLY by age — the cascade fires
+-- at job deletion, which a job that never terminates (a parked durable
+-- machine, ~3 rows per wake, forever) never reaches. The sweep walks this
+-- in age order and stops at its batch.
+CREATE INDEX jorb_history_at_idx ON jorb_history (at);
 
 -- Append-only until retention deletes in bulk, so it needs a low scale factor
 -- to clean up promptly after a sweep, but no fillfactor headroom.

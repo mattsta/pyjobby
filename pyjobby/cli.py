@@ -2945,11 +2945,19 @@ def doctor(ctx: click.Context, max_depth: int, max_age_minutes: int) -> None:
                 f"{DOCTOR_THREADS_REMEDY}",
             )
 
-            # Queue backlogs
+            # Queue backlogs. RUNNABLE work only: a row whose run_after is in
+            # the future is deliberately deferred (retry backoff, a batch
+            # scheduled for next week), and counting it as backlog is the
+            # exact mistake three other surfaces carry long comments warning
+            # against — a retry storm or a scheduled campaign would trip the
+            # WARN operators alert on while nothing is wrong. Deferred work
+            # is reported separately, as information rather than alarm.
             backlogs = await conn.fetch("""
                 SELECT queue,
-                       COUNT(*) AS depth,
-                       EXTRACT(EPOCH FROM (now() - MIN(run_after))) / 60.0
+                       COUNT(*) FILTER (WHERE run_after <= now()) AS depth,
+                       COUNT(*) FILTER (WHERE run_after > now()) AS deferred,
+                       EXTRACT(EPOCH FROM (now() - MIN(run_after)
+                           FILTER (WHERE run_after <= now()))) / 60.0
                            AS oldest_minutes
                 FROM jorb
                 WHERE state = 'queued'
@@ -2960,7 +2968,9 @@ def doctor(ctx: click.Context, max_depth: int, max_age_minutes: int) -> None:
                 doc.report("PASS", "queues", "no queued jobs")
             for b in backlogs:
                 oldest = max(b["oldest_minutes"] or 0.0, 0.0)
-                summary = f"depth {b['depth']}, oldest queued {oldest:.0f}m"
+                summary = f"depth {b['depth']}, oldest runnable {oldest:.0f}m"
+                if b["deferred"]:
+                    summary += f", {b['deferred']} deferred to the future"
                 doc.warn_if(
                     b["depth"] > max_depth or oldest > max_age_minutes,
                     f"queue {b['queue']}",
@@ -2994,6 +3004,28 @@ def doctor(ctx: click.Context, max_depth: int, max_age_minutes: int) -> None:
                 f"{blocked} waiting job(s) blocked on a crashed/cancelled "
                 f"upstream; retry the upstream (pj-admin dlq retry) or "
                 f"cancel the waiter (pj-admin jobs cancel)",
+            )
+
+            # Unread durable mail older than a day. The mailbox is durable
+            # delivery, so the platform must NEVER delete an unconsumed
+            # message of a live job — a parked machine may legitimately read
+            # it months later — which makes this check the only bound there
+            # is: mail piling up unread usually means a sender is using a
+            # topic no receiver ever recv()s. Reads the pending partial
+            # index; bounded by unread mail, never by the table.
+            stale_mail = await conn.fetchval("""
+                SELECT COUNT(*) FROM jorb_mailbox
+                WHERE consumed_at IS NULL
+                  AND created < now() - interval '1 day'
+            """)
+            doc.warn_if(
+                bool(stale_mail),
+                "mailbox",
+                "no unread mail older than a day",
+                f"{stale_mail} unread mailbox message(s) older than a day; "
+                f"a sender is likely using a topic its destination never "
+                f"recv()s (the platform will not delete unconsumed mail of "
+                f"live jobs — durable delivery is the contract)",
             )
 
             # DLQ ('crashed' is the terminal dead-letter state)

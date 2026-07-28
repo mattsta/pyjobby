@@ -682,6 +682,38 @@ class TestJobSystemErrorHandling:
         finally:
             await system.cxn.close()
 
+    async def test_heartbeat_loop_registers_an_unregistered_worker(
+        self, db_params, worker_params
+    ):
+        """Registration failure at startup is a DEGRADED mode (claims carry
+        no owner, enqueue wakeups are off) — it must be retried from the
+        heartbeat loop, not accepted forever."""
+        async with prepared_system(db_params, worker_params) as system:
+            system.worker_id = None
+            system._hb_cxn = None  # as after a failed startup registration
+            system.heartbeat_interval = 0.05
+
+            task = asyncio.create_task(system._heartbeat_loop())
+            try:
+                deadline = asyncio.get_running_loop().time() + 5.0
+                while system.worker_id is None:
+                    assert asyncio.get_running_loop().time() < deadline, (
+                        "heartbeat loop never registered the worker"
+                    )
+                    await asyncio.sleep(0.05)
+            finally:
+                system.stop = True
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                if system._hb_cxn is not None:
+                    await system._hb_cxn.close()
+
+            registered = await system.cxn.fetchrow(
+                "SELECT queue FROM jorb_worker WHERE id = $1", system.worker_id
+            )
+            assert registered["queue"] == system.qname
+
     async def test_ex_raises_on_client_side_misuse_instead_of_spinning(
         self, db_params, worker_params
     ):

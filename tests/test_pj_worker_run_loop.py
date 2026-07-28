@@ -546,6 +546,32 @@ class TestAsyncGeneratorWithTimeout:
         assert job["result"] == ["direct_0", "direct_1"]
 
 
+class TestUnhonoredCancel:
+    """A cancel the task never yields for is outrun, not honored — and that
+    outcome must be visible, not recorded as plain success."""
+
+    async def test_completion_with_a_pending_cancel_keeps_the_flag(
+        self, live_worker, unique_queue, db_pool
+    ):
+        """cancel_requested set before the run (no NOTIFY fires for a
+        non-running job, so nothing can deliver the cancellation): the job
+        completes, and the row records BOTH facts — finished, and that a
+        cancel was asked for and never took effect. The worker logs the
+        contradiction; this asserts the durable trace of it."""
+        job_id = await enqueue(
+            db_pool, unique_queue, f"{THIS}.SyncQuickJob", {"value": "outran"}
+        )
+        await db_pool.execute(
+            "UPDATE jorb SET cancel_requested = TRUE WHERE id = $1", job_id
+        )
+
+        await live_worker()
+        job = await wait_for_job_state(db_pool, job_id, ("finished",))
+
+        assert job["result"] == "quick: outran"
+        assert job["cancel_requested"] is True  # the unhonored ask, on record
+
+
 # ============================================================================
 # Test Job Rescheduling
 # ============================================================================

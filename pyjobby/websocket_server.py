@@ -53,8 +53,10 @@ Features:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import signal
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -1160,6 +1162,25 @@ class WebSocketServer:
             try:
                 await asyncio.sleep(self.snapshot_interval)
 
+                # LISTEN watchdog, on the same beat: the notify connection is
+                # opened once at startup, and a connection nothing re-opens
+                # is a server that reports healthy on the port while every
+                # watch_job subscription waits forever for a jorb_done that
+                # cannot arrive. init_notify_connection() is a no-op while
+                # the connection is alive.
+                if self.notify_conn is None or self.notify_conn.is_closed():
+                    try:
+                        await self.init_notify_connection()
+                        logger.warning(
+                            "PostgreSQL LISTEN connection re-established"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"PostgreSQL LISTEN connection is down and could "
+                            f"not be re-established ({e}); job watches are "
+                            f"stalled until it returns"
+                        )
+
                 if not self.db_pool or not self.snapshot_demand():
                     continue
 
@@ -1209,16 +1230,37 @@ class WebSocketServer:
         logger.info(f"Health check available at http://{host}:{port}/health")
         logger.info("Using PostgreSQL LISTEN/NOTIFY (no Redis needed!)")
 
+        # SIGTERM/SIGINT set the stop event so the finally below actually
+        # runs under systemd/Docker stop — the default SIGTERM disposition
+        # kills the process with the pool still holding connections and
+        # every client socket dropped mid-frame.
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        with contextlib.suppress(NotImplementedError):
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, stop.set)
+
         try:
-            # Keep running
-            await asyncio.Event().wait()
+            await stop.wait()
+            logger.info("Shutdown signal received")
         finally:
-            # Cleanup
+            # snapshot feed first (cancelled AND awaited, so its loop's
+            # cleanup runs before the pool it reads from goes away)...
             stats_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stats_task
+            # ...then in-flight notification fan-outs, for the same reason
+            if self._notification_tasks:
+                for task in self._notification_tasks:
+                    task.cancel()
+                await asyncio.gather(
+                    *self._notification_tasks, return_exceptions=True
+                )
             if self.notify_conn and not self.notify_conn.is_closed():
                 await self.notify_conn.close()
             if self.db_pool:
                 await self.db_pool.close()
+            await runner.cleanup()
 
 
 async def serve(

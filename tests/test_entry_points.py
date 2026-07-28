@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 import uuid
 from collections import Counter
 from datetime import UTC, datetime, timedelta
@@ -24,6 +26,7 @@ from pyjobby.procs import (
     dsn_from,
     free_port,
     port_is_open,
+    spawn,
     terminate,
     wait_until,
 )
@@ -422,6 +425,55 @@ class TestSchedulerEntryPoint:
 # ============================================================================
 # pj-monitor — the reaper (this is the subsystem that was a no-op)
 # ============================================================================
+
+
+class TestDaemonsShutDownCleanly:
+    """SIGTERM is how systemd and Docker stop a service; a daemon whose
+    default disposition just dies never runs its cleanup — the monitor was
+    killed mid-sweep and the two servers dropped pools without closing.
+    Exit code 0 under SIGTERM is the observable for 'the finally ran'."""
+
+    async def test_pj_monitor_exits_zero_on_sigterm(self, dsn):
+        proc = spawn("pj-monitor", "--dsn", dsn, "--check-interval", "1")
+        try:
+            await asyncio.sleep(1.5)  # into the loop, past startup
+            assert proc.poll() is None
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            await asyncio.to_thread(proc.wait, 10)
+        finally:
+            terminate(proc)
+        assert proc.returncode == 0
+
+    async def test_pj_ws_exits_zero_on_sigterm(self, dsn, tmp_path):
+        config = tmp_path / "conf.py"
+        params = dsn_from_parts(dsn)
+        config.write_text(f"db_params = {params!r}\n")
+        port = await free_port()
+        proc = spawn("pj-ws", str(config), "--port", str(port))
+        try:
+            await wait_until(
+                lambda: port_is_open("127.0.0.1", port),
+                what="websocket server listening",
+            )
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            await asyncio.to_thread(proc.wait, 10)
+        finally:
+            terminate(proc)
+        assert proc.returncode == 0
+
+
+def dsn_from_parts(dsn: str) -> dict[str, object]:
+    """asyncpg-style params from a DSN, for writing a config file."""
+    from urllib.parse import urlparse
+
+    parts = urlparse(dsn)
+    return {
+        "host": parts.hostname,
+        "port": parts.port or 5432,
+        "user": parts.username,
+        "password": parts.password,
+        "database": parts.path.lstrip("/"),
+    }
 
 
 class TestMonitorEntryPoint:

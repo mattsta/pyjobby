@@ -860,6 +860,40 @@ async def test_live_attempt_can_still_reschedule_itself(db_pool, unique_queue):
     assert row["run_after"] > row["started"]
 
 
+async def test_compaction_drops_the_notification_latch(db_pool, unique_queue):
+    """compact() clears jorb.awaited alongside the checkpoint log.
+
+    The latch's design ("set once, dies with the row") assumes rows die; a
+    compacting job is exactly the one that never does, so one wait ever
+    would make every future publish a NOTIFY-bearing commit forever. An
+    ACTIVE waiter re-arms from its fallback poll (client._poll_until), so
+    clearing costs at most one fallback interval of latency, once per turn.
+    """
+    job_id = await enqueue(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {"x": 1})
+    claimed = await claim_once(db_pool, unique_queue)
+    await db_pool.execute(
+        "UPDATE jorb SET awaited = TRUE WHERE id = $1", job_id
+    )
+
+    job = await bound_job(db_pool, claimed)
+    assert await job.compact() is True
+
+    assert (
+        await db_pool.fetchval("SELECT awaited FROM jorb WHERE id = $1", job_id)
+        is False
+    )
+
+    # a zombie's compact must not drop a live attempt's latch
+    await db_pool.execute("UPDATE jorb SET awaited = TRUE WHERE id = $1", job_id)
+    zombie = await bound_job(db_pool, claimed, epoch=claimed["run_epoch"] - 1)
+    with pytest.raises(dxe.StaleExecutionError):
+        await zombie.compact()
+    assert (
+        await db_pool.fetchval("SELECT awaited FROM jorb WHERE id = $1", job_id)
+        is True
+    )
+
+
 # ============================================================================
 # 13. the mailbox has no crash window and no zombie window
 # ============================================================================

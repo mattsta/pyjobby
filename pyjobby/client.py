@@ -1280,9 +1280,17 @@ class JobClient:
     # jorb_event are only emitted for a job somebody is waiting on, so
     # waiting means SAYING SO FIRST — this is the client half of the
     # ordering argument written out in sql/schema.sql. `AND NOT awaited`
-    # makes every registration after the first a no-op at the server, and
-    # the flag is deliberately never withdrawn: it is a per-job latch that
-    # dies with the row, not a refcount to leak.
+    # makes every registration after the first a no-op at the server. The
+    # latch is not a refcount: for a job that terminates it simply dies
+    # with the row, and for a job that never terminates (a durable state
+    # machine) compact() clears it at each turn boundary — otherwise ONE
+    # wait_for_state ever would make every future publish a NOTIFY-bearing
+    # commit forever. A wait that is IN FLIGHT across a compact is not
+    # broken by the clearing, only degraded: its 2s fallback poll still
+    # answers, and every NEW wait re-registers here first. Deliberately no
+    # per-beat re-arm — a waiter that wrote to the hottest row in the
+    # system every fallback interval would be the polling this design
+    # exists to avoid (test_waiting_for_a_state_does_not_poll counts it).
     _REGISTER_DEMAND_SQL = (
         "UPDATE jorb SET awaited = TRUE WHERE id = $1 AND NOT awaited"
     )

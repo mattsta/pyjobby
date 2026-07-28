@@ -473,6 +473,10 @@ class SchedulerWorker:
         self.poll_interval = poll_interval
         self.safety = ScheduleSafetyManager(conn)
         self.manager = ScheduleManager(conn)
+        #: Connection parameters for reconnecting after a lost connection.
+        #: None means the caller manages the connection's lifetime and the
+        #: scheduler cannot rebuild it (tests driving a single conn).
+        self.db_params: dict[str, Any] | None = None
         self.stop_requested = False
         # Set by stop(); cuts the poll sleep short so SIGTERM does not have
         # to wait out a whole poll interval before the loop exits.
@@ -885,11 +889,46 @@ class SchedulerWorker:
                 # Sleep until next poll
                 await self._sleep(self.poll_interval)
 
+            except (asyncpg.PostgresConnectionError, asyncpg.InterfaceError, OSError) as e:
+                # A lost connection is permanent unless somebody rebuilds it,
+                # and a scheduler that stops firing after a database restart
+                # has failed at its one job — reconnect with backoff until
+                # the database is back or we are told to stop.
+                logger.error(f"Scheduler lost its database connection: {e}")
+                await self._reconnect()
             except Exception as e:
                 logger.error(f"Scheduler main loop error: {e}", exc_info=True)
                 await self._sleep(10)  # Shorter sleep on error
 
         logger.info("Scheduler worker stopped")
+
+    async def _reconnect(self) -> None:
+        """Rebuild the connection (and every component holding it), retrying
+        with backoff until it works or stop() is called. With no db_params
+        (a caller-managed connection) there is nothing to rebuild: log that
+        loudly and back off so the loop does not spin."""
+        from . import db
+
+        if self.db_params is None:
+            logger.error(
+                "Scheduler has no db_params to reconnect with; schedules "
+                "will not fire until the caller-provided connection returns"
+            )
+            await self._sleep(10)
+            return
+
+        while not self.stop_requested:
+            try:
+                with contextlib.suppress(Exception):
+                    await self.conn.close()
+                self.conn = await db.connect(**self.db_params)
+                self.safety.conn = self.conn
+                self.manager.conn = self.conn
+                logger.info("Scheduler database connection re-established")
+                return
+            except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as e:
+                logger.warning(f"Scheduler reconnect failed ({e}); retrying in 5s")
+                await self._sleep(5)
 
     async def _sleep(self, seconds: float) -> None:
         """Wait ``seconds``, or until stop() is called — whichever is first."""
@@ -911,6 +950,7 @@ async def run_scheduler(db_params: dict[str, Any], poll_interval: int = 60) -> N
 
     conn = await db.connect(**db_params)
     worker = SchedulerWorker(conn, poll_interval=poll_interval)
+    worker.db_params = db_params  # enables reconnect after a lost connection
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):

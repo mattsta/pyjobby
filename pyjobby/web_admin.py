@@ -9,9 +9,11 @@ Built on top of the admin API for clean separation.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html as html_mod
 import json
 import re
+import signal
 import urllib.parse
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -1948,10 +1950,17 @@ class WebAdminServer:
         await site.start()
         print(f"🌐 Web admin running at http://{self.host}:{self.port}/")
 
-        # Keep running
+        # SIGTERM/SIGINT set the stop event so the finally below actually
+        # runs under systemd/Docker stop — the default SIGTERM disposition
+        # kills the process with the pool still open.
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        with contextlib.suppress(NotImplementedError):
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, stop.set)
+
         try:
-            await asyncio.Event().wait()
-        except KeyboardInterrupt:
+            await stop.wait()
             print("\n👋 Shutting down...")
         finally:
             # Cleans up the app, which also closes the connection pool

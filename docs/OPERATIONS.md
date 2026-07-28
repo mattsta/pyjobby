@@ -289,7 +289,7 @@ bulkiest rows in the system with the shortest useful life:
 
 | Window | Deletes |
 |---|---|
-| `--retention-days` (30) | terminal jobs — and with them, by cascade, their history, events, mail and checkpoints — plus **the four tables no cascade reaches**: consumed mailbox rows of *live* jobs, emptied DAGs, schedule executions, retired worker registry rows |
+| `--retention-days` (30) | terminal jobs — and with them, by cascade, their history, events, mail and checkpoints — plus **the five tables no cascade reaches**: consumed mailbox rows of *live* jobs, history rows of *live* jobs (a durable machine that never terminates writes ~3 per wake, forever), emptied DAGs, schedule executions, retired worker registry rows |
 | `--checkpoint-retention-days` (1) | the `jorb_step` checkpoints of terminal jobs, keeping the job row itself |
 
 `0` on either means keep forever; that sweep does not run at all.

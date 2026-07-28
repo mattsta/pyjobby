@@ -188,7 +188,7 @@ REQUIRED_INDEXES: frozenset[str] = _names("""
     jorb_step_pkey
     jorb_event_pkey
     jorb_mailbox_pkey jorb_mailbox_pending_idx jorb_mailbox_consumed_idx
-    jorb_history_pkey jorb_history_job_idx
+    jorb_history_pkey jorb_history_job_idx jorb_history_at_idx
     jorb_schedule_pkey jorb_schedule_name_key jorb_schedule_due_idx
     jorb_schedule_log_pkey jorb_schedule_log_idx
     jorb_schedule_log_retention_idx

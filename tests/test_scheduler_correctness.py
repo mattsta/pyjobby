@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from pyjobby import db
 from pyjobby.scheduler import (
     ScheduleExecutionResult,
     ScheduleManager,
@@ -189,6 +190,49 @@ class TestGracefulShutdown:
                 pytest.fail("run() did not return after stop()")
 
             assert time.monotonic() - started < 5.0
+
+
+class TestConnectionRecovery:
+    """A scheduler that stops firing after a database restart has failed at
+    its one job. The loop reconnects with backoff instead."""
+
+    async def test_reconnect_rebuilds_the_connection_and_every_holder(
+        self, db_params, db_pool
+    ):
+        conn = await db.connect(**db_params)
+        worker = SchedulerWorker(conn, poll_interval=0.05)
+        worker.db_params = dict(db_params)
+
+        await conn.close()
+        assert conn.is_closed()
+
+        await worker._reconnect()
+
+        # a fresh connection, shared by every component that queries
+        assert not worker.conn.is_closed()
+        assert worker.manager.conn is worker.conn
+        assert worker.safety.conn is worker.conn
+        assert await worker.conn.fetchval("SELECT 1") == 1
+        await worker.conn.close()
+
+    async def test_the_loop_survives_a_killed_connection(
+        self, db_params, db_pool
+    ):
+        """End to end: the run loop hits a dead connection, reconnects, and
+        keeps polling instead of dying or spinning."""
+        conn = await db.connect(**db_params)
+        worker = SchedulerWorker(conn, poll_interval=0.05)
+        worker.db_params = dict(db_params)
+
+        task = asyncio.create_task(worker.run())
+        await asyncio.sleep(0.2)  # let it poll at least once
+        await conn.close()  # the "database restart"
+        await asyncio.sleep(1.0)  # a few cycles to notice and recover
+
+        assert not worker.conn.is_closed(), "scheduler did not reconnect"
+        worker.stop()
+        await asyncio.wait_for(task, timeout=5.0)
+        await worker.conn.close()
 
 
 class TestConcurrencyLimitStillEnforces:

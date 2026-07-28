@@ -2059,6 +2059,11 @@ SWEEP_GATES: dict[str, SweepGate] = {
         "monitor consumed-mailbox sweep",
         ("jorb_mailbox",),
     ),
+    "SWEEP_HISTORY_SQL": SweepGate(
+        "monitor history retention sweep (live jobs' audit trail — the "
+        "cascade never fires for a job that never ends)",
+        ("jorb_history",),
+    ),
     "SWEEP_ORPHANED_DAGS_SQL": SweepGate(
         "monitor orphaned-DAG sweep (a wrong answer, not just storage)",
         ("jorb_dag", "jorb"),

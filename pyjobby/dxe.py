@@ -157,11 +157,25 @@ GET_EVENT_SQL = """SELECT value FROM jorb_event WHERE job_id = $1 AND key = $2""
 # cannot distinguish "nothing to remove" from "superseded", and those need
 # opposite responses. `fenced` answers the second question; `removed` the
 # first.
+# Also drops the `awaited` notification latch. The latch's design ("set
+# once, dies with the row") assumes rows die; a compacting job is exactly
+# the one that never does, so one wait_for_state ever would make every
+# future publish a NOTIFY-bearing commit forever. Clearing it at the turn
+# boundary bounds that the same way compaction bounds replay. A wait that
+# is IN FLIGHT across the clearing is degraded, not broken: its 2-second
+# fallback poll still answers, and every NEW wait registers demand afresh
+# before its first check. (Deliberately no waiter-side re-arm: that would
+# be a write to the hottest row per fallback beat — the polling the
+# demand-gated design exists to avoid.)
 COMPACT_STEPS_SQL = """WITH fence AS (
             SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $2
         ), gone AS (
             DELETE FROM jorb_step
             WHERE job_id = $1 AND EXISTS (SELECT 1 FROM fence)
+            RETURNING 1
+        ), unlatched AS (
+            UPDATE jorb SET awaited = FALSE
+            WHERE id = $1 AND run_epoch = $2 AND awaited
             RETURNING 1
         )
         SELECT (SELECT count(*) FROM fence) AS fenced,

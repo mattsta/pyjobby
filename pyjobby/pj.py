@@ -119,6 +119,14 @@ STMTS["above-ceiling"] = """SELECT count(*) AS above, min(prio) AS lowest
 # (admin_data.use_result_from).
 STMTS["get-result"] = """SELECT state, result FROM jorb WHERE id = $1"""
 
+# The DATABASE's clock. Durable sleep computes its wake time against this
+# rather than the worker's wall clock, because the reschedule that enforces
+# the wake compares run_after to the database's now(): a worker clock ahead
+# of the server would otherwise wake "early" by the skew, compute a positive
+# remainder, and re-sleep an extra round — forever, for a skewed-enough
+# worker. One clock domain per decision.
+STMTS["now"] = """SELECT now() AS now"""
+
 # claimed -> running (records `started`; timeout enforcement, duration
 # metrics, and rate limiting all key off this transition). The deadline is
 # stamped HERE rather than by a separate statement: the two writes were
@@ -151,6 +159,10 @@ STMTS["run"] = """UPDATE jorb
 # the attempt, and a state guard alone does not stop them. The concrete
 # leak this closes: a synchronous job thread the worker had to abandon is
 # unstoppable and still holds a then-valid epoch.
+# RETURNING cancel_requested as well as id: a completion that lands with a
+# cancel still pending means the task never yielded at an await point for
+# the cancellation to be delivered — the operator's cancel silently did
+# nothing, and the caller logs that instead of recording plain success.
 STMTS["finished"] = """UPDATE jorb
               SET state = 'finished',
                   result = $2,
@@ -161,7 +173,7 @@ STMTS["finished"] = """UPDATE jorb
               WHERE id = $1
                 AND state IN ('claimed', 'running')
                 AND run_epoch = $3
-          RETURNING id"""
+          RETURNING id, cancel_requested"""
 
 # Same-row retry: back into the queue with backoff; jorb_history holds the
 # per-attempt audit trail (recorded by trigger on the state change).
@@ -487,41 +499,79 @@ class JobSystem:
     # ------------------------------------------------------------------
 
     async def _register_worker(self) -> None:
-        from pyjobby import __version__
-
         try:
             self._hb_cxn = await db.connect(**self.dsn)
-            self.worker_id = await self._hb_cxn.fetchval(
-                WORKER_REGISTER_SQL,
-                self.node,
-                self.pid,
-                self.qname,
-                list(self.capabilities),
-                __version__,
-                self.job_threads,
+            await self._try_register()
+        except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as e:
+            # Unregistered is a DEGRADED mode, not a cosmetic one: claims
+            # carry no claimed_by (dead-worker recovery cannot see this
+            # worker's jobs), and _set_idle never arms the enqueue wakeup,
+            # so claim latency is the full poll interval. Say all of that,
+            # and keep retrying from the heartbeat loop instead of giving
+            # up at startup forever.
+            logger.warning(
+                f"Worker registry unavailable ({e}); running UNREGISTERED — "
+                f"claims carry no owner (dead-worker recovery cannot requeue "
+                f"this worker's jobs) and enqueue wakeups are off (claim "
+                f"latency is the poll interval). Registration will be "
+                f"retried every {self.heartbeat_interval:g}s."
             )
-            self._hb_task = asyncio.create_task(self._heartbeat_loop())
-        except (OSError, asyncpg.PostgresError) as e:
-            logger.warning(f"Worker registry unavailable ({e}); running unregistered")
             self.worker_id = None
-            self._hb_task = None
+        self._hb_task = asyncio.create_task(self._heartbeat_loop())
+
+    async def _try_register(self) -> None:
+        from pyjobby import __version__
+
+        self.worker_id = await self._hb_cxn.fetchval(  # type: ignore[union-attr]
+            WORKER_REGISTER_SQL,
+            self.node,
+            self.pid,
+            self.qname,
+            list(self.capabilities),
+            __version__,
+            self.job_threads,
+        )
 
     async def _heartbeat_loop(self) -> None:
-        assert self._hb_cxn is not None
+        failures = 0
         while not self.stop:
             try:
-                # One statement, three columns: liveness and the reason this
-                # worker might be alive without working. See
-                # WORKER_HEARTBEAT_SQL for why the second belongs here.
-                await self._hb_cxn.execute(
-                    WORKER_HEARTBEAT_SQL,
-                    self.worker_id,
-                    self.job_threads,
-                    self._abandoned_job_threads(),
-                )
-            except asyncpg.PostgresError, asyncpg.InterfaceError, OSError:
-                with contextlib.suppress(Exception):
+                if self._hb_cxn is None or self._hb_cxn.is_closed():
                     self._hb_cxn = await db.connect(**self.dsn)
+                if self.worker_id is None:
+                    # registration failed earlier; this is the retry
+                    await self._try_register()
+                    logger.info(
+                        f"Worker registered (id {self.worker_id}); leaving "
+                        f"unregistered mode"
+                    )
+                else:
+                    # One statement, three columns: liveness and the reason
+                    # this worker might be alive without working. See
+                    # WORKER_HEARTBEAT_SQL for why the second belongs here.
+                    await self._hb_cxn.execute(
+                        WORKER_HEARTBEAT_SQL,
+                        self.worker_id,
+                        self.job_threads,
+                        self._abandoned_job_threads(),
+                    )
+                if failures:
+                    logger.info(
+                        f"Worker heartbeat restored after {failures} failure(s)"
+                    )
+                failures = 0
+            except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError) as e:
+                # NEVER silent: a worker whose heartbeat flatlines looks dead
+                # to the monitor, which requeues its in-flight jobs while it
+                # is still running them. Rate-limited so an outage does not
+                # write a line per interval forever.
+                failures += 1
+                if failures == 1 or failures % 6 == 0:
+                    logger.warning(
+                        f"Worker heartbeat failing ({failures} consecutive: "
+                        f"{e}); the monitor will treat this worker as dead "
+                        f"after --liveness-grace"
+                    )
             await asyncio.sleep(self.heartbeat_interval)
 
     async def _set_idle(self, idle: bool) -> None:
@@ -1084,6 +1134,17 @@ class JobSystem:
                 result = None
             completed = await self.ex("finished", jid, result, epoch)
             if completed:
+                if completed[0]["cancel_requested"]:
+                    # the operator asked for a cancel and the task finished
+                    # anyway: a synchronous task() has no await points for
+                    # the cancellation to be delivered at. The job succeeded
+                    # — but saying nothing is how "I cancelled that" and
+                    # "it ran to completion" coexist as a mystery.
+                    logger.warning(
+                        f"[job {jid}] Completed DESPITE a pending cancel "
+                        f"request (the task never yielded, so cancellation "
+                        f"could not be delivered)"
+                    )
                 await self._wake_dependents(job)
             elif klass._dxe_rescheduled:
                 # the task called reschedule(): the requeue won over normal
@@ -1782,14 +1843,19 @@ class Job:
                     f"but is a sleep now"
                 )
             wake_at = datetime.datetime.fromisoformat(prior["output"]["wake_at"])
-            remaining = (wake_at - db.utcnow()).total_seconds()
+            # measured against the DATABASE clock — the same clock the
+            # reschedule's run_after gate uses, so a skewed worker cannot
+            # wake "early" and re-sleep an extra round forever
+            db_now = (await self.s.ex("now"))[0]["now"]
+            remaining = (wake_at - db_now).total_seconds()
             if remaining <= 0:
                 return  # slept enough on a previous attempt; continue
             # woken early (operator requeue): go back to sleep for the rest
             await self._reschedule(datetime.timedelta(seconds=remaining))
             raise dxe.DurableSleep(wake_at)
 
-        wake_at = db.utcnow() + datetime.timedelta(seconds=seconds)
+        db_now = (await self.s.ex("now"))[0]["now"]
+        wake_at = db_now + datetime.timedelta(seconds=seconds)
         recorded = await self.s.ex(
             "record-step",
             self.job["id"],
@@ -1951,7 +2017,9 @@ class Job:
                 return prior["output"]
 
         started = db.utcnow()
-        deadline = started + datetime.timedelta(seconds=timeout)
+        # the wait budget is a local duration, so it runs on the monotonic
+        # clock like every other budget in the engine — wall time can jump
+        deadline = time.monotonic() + timeout
         while True:
             row = (
                 await self.s.ex(
@@ -1975,7 +2043,7 @@ class Job:
                 return row["prior_output"]
             if row["consumed"]:
                 return row["message"]
-            if db.utcnow() >= deadline:
+            if time.monotonic() >= deadline:
                 break
             await asyncio.sleep(poll_interval)
 

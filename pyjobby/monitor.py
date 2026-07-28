@@ -85,7 +85,9 @@ transaction holding its row locks).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
+import signal
 from collections.abc import Awaitable, Callable
 
 import asyncpg  # type: ignore[import-untyped]
@@ -443,6 +445,27 @@ SWEEP_MAILBOX_SQL = """
 #: ...and the delete, by the primary key's leading column.
 DELETE_MAILBOX_SQL = "DELETE FROM jorb_mailbox WHERE id = ANY($1::bigint[])"
 
+#: History rows past the retention window, oldest first. ($1 window, $2 batch)
+#:
+#: History of a TERMINAL job dies with the job's cascade at this same
+#: window, so this sweep exists for the jobs that never terminate: a parked
+#: durable machine transitions queued -> claimed -> running -> queued on
+#: every wake — roughly three rows per turn, forever — and the cascade that
+#: bounds every other child table never fires for it. jorb_history_at_idx
+#: serves the range in order, so the probe stops at its batch instead of
+#: scanning the largest table in the system.
+SWEEP_HISTORY_SQL = """
+    SELECT h.id
+    FROM jorb_history h
+    WHERE h.at < now() - $1::interval
+    ORDER BY h.at
+    FOR UPDATE SKIP LOCKED
+    LIMIT $2
+"""
+
+#: ...and the delete, by primary key.
+DELETE_HISTORY_SQL = "DELETE FROM jorb_history WHERE id = ANY($1::bigint[])"
+
 #: Waiting jobs whose single-job dependency is already satisfied. ($1 batch)
 #:
 #: The wake is normally edge-triggered: the upstream's terminal transition
@@ -657,6 +680,32 @@ async def sweep_timed_out_jobs(pool: asyncpg.Pool, batch_size: int = 100) -> int
             )
 
     return len(timed_out)
+
+
+async def sweep_job_history(
+    pool: asyncpg.Pool,
+    retention_days: float,
+    batch_size: int = 1000,
+) -> int:
+    """Delete history rows past the retention window, whatever their job is
+    doing.
+
+    Same window as job retention: an audit trail means "as long as the work
+    it describes", and for the one class of job whose history nothing else
+    bounds — a durable machine that never terminates — thirty days of its
+    wake/sleep loop describes it as well as a year would. Probe-then-delete
+    like every sweep here; FOR UPDATE SKIP LOCKED partitions concurrent
+    monitors."""
+    retention = datetime.timedelta(days=retention_days)
+
+    async with pool.acquire() as conn, conn.transaction():
+        expired = await conn.fetch(SWEEP_HISTORY_SQL, retention, batch_size)
+        if not expired:
+            return 0
+        ids = [r["id"] for r in expired]
+        await conn.execute(DELETE_HISTORY_SQL, ids)
+
+    return len(ids)
 
 
 async def sweep_stranded_waiters(pool: asyncpg.Pool, batch_size: int = 500) -> int:
@@ -1130,6 +1179,16 @@ async def monitor(
     delaying the latency-critical sweeps above it."""
     pool = await db.create_pool(dsn, min_size=1, max_size=2)
 
+    # SIGTERM/SIGINT set the stop event so shutdown is a clean end-of-cycle
+    # rather than a kill mid-sweep: the default SIGTERM disposition never
+    # reaches the finally below, dropping the pool with a sweep's
+    # transaction possibly open.
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    with contextlib.suppress(NotImplementedError):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop.set)
+
     def window(days: float) -> str:
         return f"{days}d" if days else "forever"
 
@@ -1141,7 +1200,7 @@ async def monitor(
     )
 
     try:
-        while True:
+        while not stop.is_set():
             timed_out = await _run_sweep(
                 "timed-out jobs", lambda: sweep_timed_out_jobs(pool, batch_size)
             )
@@ -1215,8 +1274,18 @@ async def monitor(
                     retention_batch_size,
                     retention_max_seconds,
                 )
+                await _run_retention(
+                    "job history",
+                    lambda: sweep_job_history(
+                        pool, retention_days, retention_batch_size
+                    ),
+                    retention_batch_size,
+                    retention_max_seconds,
+                )
 
-            await asyncio.sleep(check_interval)
+            # wait out the interval, or leave immediately on SIGTERM/SIGINT
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=check_interval)
 
     finally:
         await pool.close()

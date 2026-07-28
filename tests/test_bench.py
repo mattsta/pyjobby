@@ -377,6 +377,8 @@ class TestSubcommandsEmitDocumentedJson:
             "checkpoint_jobs_backlog",
             "mailbox",
             "mailbox_backlog",
+            "history",
+            "history_backlog",
             "orphaned_dags",
             "orphaned_dags_backlog",
             "schedule_log",

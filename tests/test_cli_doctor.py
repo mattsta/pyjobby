@@ -550,14 +550,14 @@ class TestDoctorQueueBacklog:
         assert at_threshold.exit_code == 0, at_threshold.output
         assert parse_checks(at_threshold.output)[key] == (
             "PASS",
-            "depth 3, oldest queued 0m",
+            "depth 3, oldest runnable 0m",
         )
 
         over_threshold = await run_doctor(dsn, "--max-depth", "2")
         assert over_threshold.exit_code == 0, over_threshold.output
         assert parse_checks(over_threshold.output)[key] == (
             "WARN",
-            "depth 3, oldest queued 0m (thresholds: depth 2, age 60m)",
+            "depth 3, oldest runnable 0m (thresholds: depth 2, age 60m)",
         )
         # a backlog is a warning, never a failure
         assert "FAIL" not in over_threshold.output
@@ -572,29 +572,49 @@ class TestDoctorQueueBacklog:
         assert under.exit_code == 0, under.output
         assert parse_checks(under.output)[key] == (
             "PASS",
-            "depth 1, oldest queued 90m",
+            "depth 1, oldest runnable 90m",
         )
 
         over = await run_doctor(dsn, "--max-age-minutes", "89")
         assert over.exit_code == 0, over.output
         assert parse_checks(over.output)[key] == (
             "WARN",
-            "depth 1, oldest queued 90m (thresholds: depth 10000, age 89m)",
+            "depth 1, oldest runnable 90m (thresholds: depth 10000, age 89m)",
         )
 
-    async def test_future_run_after_is_clamped_to_zero_minutes(
+    async def test_deferred_work_is_information_not_backlog(
         self, dsn, db_pool, unique_queue
     ):
-        """A delayed/retry-waiting job must not report a negative age."""
+        """A job whose run_after is in the future is deliberately deferred
+        (retry backoff, a scheduled batch) — counting it as backlog tripped
+        the WARN operators alert on while nothing was wrong, and its future
+        run_after dragged the age negative. It is reported, separately, and
+        alarms nothing."""
         await insert_queued(db_pool, unique_queue, run_after_age=timedelta(minutes=-10))
 
-        result = await run_doctor(dsn, "--max-age-minutes", "1")
+        result = await run_doctor(dsn, "--max-depth", "0", "--max-age-minutes", "1")
 
         assert result.exit_code == 0, result.output
         assert parse_checks(result.output)[f"queue {unique_queue}"] == (
             "PASS",
-            "depth 1, oldest queued 0m",
+            "depth 0, oldest runnable 0m, 1 deferred to the future",
         )
+
+    async def test_a_retry_backoff_storm_does_not_trip_the_backlog_warn(
+        self, dsn, db_pool, unique_queue
+    ):
+        """Many jobs parked on retry backoff must read as deferred, not as a
+        depth alarm."""
+        await insert_queued(
+            db_pool, unique_queue, count=50, run_after_age=timedelta(minutes=-5)
+        )
+
+        result = await run_doctor(dsn, "--max-depth", "10")
+
+        assert result.exit_code == 0, result.output
+        status, summary = parse_checks(result.output)[f"queue {unique_queue}"]
+        assert status == "PASS"
+        assert "50 deferred to the future" in summary
 
     async def test_each_backlogged_queue_reports_separately(
         self, dsn, db_pool, unique_queue
@@ -607,8 +627,91 @@ class TestDoctorQueueBacklog:
 
         checks = parse_checks(result.output)
         assert checks[f"queue {unique_queue}"][0] == "WARN"
-        assert checks[f"queue {other}"] == ("PASS", "depth 1, oldest queued 0m")
+        assert checks[f"queue {other}"] == ("PASS", "depth 1, oldest runnable 0m")
         assert "queues" not in checks  # the "no queued jobs" line is suppressed
+
+
+class TestDoctorBlockedWaiters:
+    async def test_a_waiter_on_a_crashed_upstream_warns(
+        self, dsn, db_pool, unique_queue
+    ):
+        """The monitor deliberately leaves these parked (the upstream is
+        retryable); doctor is the ONLY place the condition is visible."""
+        upstream = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, queue, state)
+               VALUES ('tests.dxe_jobs.OkJob', $1, 'crashed') RETURNING id""",
+            unique_queue,
+        )
+        await db_pool.execute(
+            """INSERT INTO jorb (job_class, queue, state, waitfor_job)
+               VALUES ('tests.dxe_jobs.OkJob', $1, 'waiting', $2)""",
+            unique_queue,
+            upstream,
+        )
+
+        result = await run_doctor(dsn)
+
+        assert result.exit_code == 0, result.output
+        status, summary = parse_checks(result.output)["blocked-waiters"]
+        assert status == "WARN"
+        assert "blocked on a crashed/cancelled upstream" in summary
+
+    async def test_ordinary_waiters_do_not_warn(self, dsn, db_pool, unique_queue):
+        upstream = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, queue, state)
+               VALUES ('tests.dxe_jobs.OkJob', $1, 'running') RETURNING id""",
+            unique_queue,
+        )
+        await db_pool.execute(
+            """INSERT INTO jorb (job_class, queue, state, waitfor_job)
+               VALUES ('tests.dxe_jobs.OkJob', $1, 'waiting', $2)""",
+            unique_queue,
+            upstream,
+        )
+
+        result = await run_doctor(dsn)
+
+        assert parse_checks(result.output)["blocked-waiters"][0] == "PASS"
+
+
+class TestDoctorMailbox:
+    async def test_stale_unread_mail_warns(self, dsn, db_pool, unique_queue):
+        """The platform never deletes unconsumed mail of a live job (durable
+        delivery is the contract), so aging unread mail is the one signal
+        that a sender is using a topic nothing recv()s."""
+        dest = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, queue, state)
+               VALUES ('tests.dxe_jobs.OkJob', $1, 'running') RETURNING id""",
+            unique_queue,
+        )
+        await db_pool.execute(
+            """INSERT INTO jorb_mailbox (dest_job_id, topic, message, created)
+               VALUES ($1, 'nobody-reads-this', '{}', now() - interval '2 days')""",
+            dest,
+        )
+
+        result = await run_doctor(dsn)
+
+        assert result.exit_code == 0, result.output
+        status, summary = parse_checks(result.output)["mailbox"]
+        assert status == "WARN"
+        assert "unread mailbox message" in summary
+
+    async def test_fresh_unread_mail_passes(self, dsn, db_pool, unique_queue):
+        dest = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, queue, state)
+               VALUES ('tests.dxe_jobs.OkJob', $1, 'running') RETURNING id""",
+            unique_queue,
+        )
+        await db_pool.execute(
+            """INSERT INTO jorb_mailbox (dest_job_id, topic, message)
+               VALUES ($1, 'about-to-be-read', '{}')""",
+            dest,
+        )
+
+        result = await run_doctor(dsn)
+
+        assert parse_checks(result.output)["mailbox"][0] == "PASS"
 
 
 # ============================================================================

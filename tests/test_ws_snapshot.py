@@ -664,6 +664,33 @@ class TestNoListenerOnAChannelNothingEmits:
 # =============================================================================
 
 
+class TestListenWatchdog:
+    async def test_a_dead_listen_connection_is_reestablished(
+        self, snapshot_server
+    ):
+        """The LISTEN connection was opened once at startup and never again:
+        after any drop, every watch_job subscription waited forever for a
+        jorb_done that could not arrive, while /health reported a live port.
+        The snapshot loop now re-opens it on its own beat."""
+        harness = await snapshot_server(notify=True)
+        server = harness.server
+        assert server.notify_conn is not None
+        assert not server.notify_conn.is_closed()
+
+        await server.notify_conn.close()
+        assert server.notify_conn.is_closed()
+
+        harness.start_feed()
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while server.notify_conn is None or server.notify_conn.is_closed():
+            assert asyncio.get_running_loop().time() < deadline, (
+                "snapshot loop never re-established the LISTEN connection"
+            )
+            await asyncio.sleep(TICK)
+
+        assert not server.notify_conn.is_closed()
+
+
 class TestWatchJob:
     """What a client uses when it genuinely needs per-job updates.
 

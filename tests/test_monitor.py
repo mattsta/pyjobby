@@ -41,6 +41,7 @@ from pyjobby.monitor import (
     sweep_consumed_mailbox,
     sweep_dead_workers,
     sweep_expired_jobs,
+    sweep_job_history,
     sweep_orphaned_dags,
     sweep_retired_workers,
     sweep_schedule_log,
@@ -538,6 +539,59 @@ class TestSweepTimedOutJobs:
 # ============================================================================
 # dead-worker reclaim
 # ============================================================================
+
+
+class TestSweepJobHistory:
+    """History retention by AGE, for the jobs whose cascade never fires.
+
+    A terminal job's history dies with the job's own retention; a durable
+    machine that never terminates writes ~3 history rows per wake forever,
+    and this sweep is the only thing that bounds them.
+    """
+
+    async def _age_history(self, pool, job_id: int, days: float) -> None:
+        await pool.execute(
+            "UPDATE jorb_history SET at = now() - make_interval(days => $2)"
+            " WHERE job_id = $1",
+            job_id,
+            days,
+        )
+
+    async def test_old_rows_of_a_live_job_are_deleted(self, db_pool, unique_queue):
+        job_id = await insert_job(db_pool, unique_queue, state="running")
+        await self._age_history(db_pool, job_id, days=60)
+
+        deleted = await sweep_job_history(db_pool, retention_days=30)
+
+        assert deleted >= 1
+        remaining = await db_pool.fetchval(
+            "SELECT count(*) FROM jorb_history WHERE job_id = $1", job_id
+        )
+        assert remaining == 0
+        # the job row itself is untouched — this sweep is about the trail
+        assert (await get_job(db_pool, job_id))["state"] == "running"
+
+    async def test_recent_rows_are_kept(self, db_pool, unique_queue):
+        job_id = await insert_job(db_pool, unique_queue, state="running")
+
+        await sweep_job_history(db_pool, retention_days=30)
+
+        remaining = await db_pool.fetchval(
+            "SELECT count(*) FROM jorb_history WHERE job_id = $1", job_id
+        )
+        assert remaining >= 1  # the trigger-recorded 'enqueued' row survives
+
+    async def test_batch_size_bounds_one_bite(self, db_pool, unique_queue):
+        job_id = await insert_job(db_pool, unique_queue, state="running")
+        await db_pool.execute(
+            """INSERT INTO jorb_history (job_id, at, event)
+               SELECT $1, now() - interval '60 days', 'queued'
+               FROM generate_series(1, 5)""",
+            job_id,
+        )
+        await self._age_history(db_pool, job_id, days=60)
+
+        assert await sweep_job_history(db_pool, retention_days=30, batch_size=2) == 2
 
 
 class TestSweepStrandedWaiters:
