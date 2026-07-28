@@ -13,8 +13,10 @@ This architecture supports concurrent test execution.
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import os
+import re
 import socket
 import time
 import uuid
@@ -256,6 +258,55 @@ def db_params(worker_id: str) -> dict[str, str | int]:
 # ============================================================================
 
 
+@functools.cache
+def _canonical_claim_lock() -> tuple[str, str, list[str]]:
+    """The shipped ``claim_queue_lock``: (replace statement, body, settings).
+
+    Read out of the base schema rather than snapshotted from the database at
+    session start: a session that inherited a leaked definition would
+    otherwise adopt the leak as canonical, which is exactly the failure this
+    exists to end.
+    """
+    text = (SCHEMA_DIR / "30_claim.sql").read_text()
+    start = text.index("CREATE FUNCTION claim_queue_lock(")
+    end = text.index("\n$$;", start) + len("\n$$;")
+    statement = text[start:end]
+    header, body = statement.split("\nAS $$\n", 1)
+    settings = re.findall(r"^SET (\w+) = '([^']*)'$", header, re.MULTILINE)
+    return (
+        statement.replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION", 1),
+        body.removesuffix("\n$$;"),
+        [f"{name}={value}" for name, value in settings],
+    )
+
+
+async def _reset_claim_lock(conn: asyncpg.Connection) -> None:
+    """Undo any in-place edit of claim_queue_lock an earlier test left behind.
+
+    tests/test_claim_contention.py measures the claim lock against itself: it
+    reinstates the old `pg_try_advisory_xact_lock` body as a comparison arm,
+    and sweeps `lock_timeout` to justify the shipped 50 ms. Both are CATALOG
+    changes -- permanent, visible to every backend, invisible to the schema
+    fingerprint because schema.sql has not changed -- so both are restored in
+    a `finally` there.
+
+    A `finally` does not run after a SIGKILL, an OOM kill or an xdist worker
+    dying, and the residue of one that did not run is a database where every
+    later claim stampedes (the try-lock body) or gives up in a millisecond
+    (a swept timeout), for that database's whole remaining life, while the
+    suite goes on passing. One catalog lookup per test buys that back.
+    """
+    statement, body, settings = _canonical_claim_lock()
+    installed = await conn.fetchrow(
+        "SELECT prosrc, proconfig FROM pg_proc WHERE proname = 'claim_queue_lock'"
+    )
+    if installed is not None and (
+        installed["prosrc"].strip() != body.strip()
+        or list(installed["proconfig"] or []) != settings
+    ):
+        await conn.execute(statement)
+
+
 async def _cleanup_database(db_params: dict[str, str]) -> None:
     """
     Clean all test data from database.
@@ -285,6 +336,10 @@ async def _cleanup_database(db_params: dict[str, str]) -> None:
             "DROP TABLE IF EXISTS "
             "jorb_test_effect, example_order, example_row, guide_payment"
         )
+        # Schema objects a test may have edited in place (see _reset_claim_lock:
+        # the data cleanup above cannot see a wrong function body or a wrong
+        # lock_timeout, and neither can the schema fingerprint).
+        await _reset_claim_lock(conn)
     finally:
         await conn.close()
 

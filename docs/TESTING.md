@@ -44,6 +44,40 @@ They are permanent, not disposable: `TestNotifyGateThroughput` rebuilds the
 deleted `job_state_change` firehose to measure against, so the reason it was
 deleted stays a measurement instead of decaying into a claim in a comment.
 
+**What the marker holds is comparisons between configurations, and nothing
+else.** A `performance` test never runs in CI, so an invariant asserted only
+inside one is an invariant no commit is ever checked against. Claim
+exclusivity — *every job claimed exactly once under concurrent claimers, none
+lost, none claimed twice, none left behind* — used to be reachable only that
+way, as a line inside the timeout sweep and the throughput comparison. It is
+now `TestClaimExclusivityUnderContention` in `tests/test_claim_contention.py`,
+which runs in the default suite and in CI: twelve concurrent claimers draining
+600 jobs, once against a capped queue (every claim takes the per-queue
+advisory lock) and once against an uncapped one (no lock at all, exclusivity
+resting on `FOR UPDATE … SKIP LOCKED`), in **0.4 s** together. Exactly-once is
+an invariant, not a number — it does not become true at 2,000 jobs and false
+at 600 — so scale here buys only the *chance to break it*, and both tests were
+confirmed to fail against a `claim_jorb` with its row locking removed (2,487
+and 2,888 claims for 600 jobs).
+
+What is left behind the marker in that file is the tuning evidence and nothing
+that has to hold: `TestClaimLockTimeout` sweeps five `lock_timeout` settings to
+justify the shipped 50 ms, and `TestCappedClaimThroughput` prices the bounded
+wait against the try-lock it replaced. Their remaining full-drain assertions
+are measurement preconditions — *this timed interval covers the same work as
+the other conditions* — not the invariant, which is why they now say so.
+
+Both benchmarks edit the installed `claim_queue_lock` **in the catalog**
+(`ALTER FUNCTION … SET lock_timeout`, `CREATE OR REPLACE` of the old try-lock
+body). That is permanent, database-wide, and invisible to the schema
+fingerprint. The sweep scopes each change to a `claim_lock_timeout()` context
+manager so the restore also runs on `KeyboardInterrupt` and on cancellation —
+and because no `finally` survives a SIGKILL, an OOM kill or an xdist worker
+dying, `conftest._reset_claim_lock` reasserts the shipped definition (body
+*and* settings, read from `pyjobby/sql/schema/30_claim.sql`) before every test
+in the suite. Without that, one killed benchmark leaves a database where every
+later claim stampedes or gives up in a millisecond, silently, forever.
+
 ## The database each test gets
 
 Under `pytest-xdist` each worker automatically gets its own database
@@ -426,7 +460,10 @@ PostgreSQL 18 service container:
 2. `pj-admin db migrate` followed by `pj-admin doctor` — proving a fresh
    install is actually usable, not just that migration returned zero.
 3. The suite with `-n auto` and the coverage floor (`performance` tests are
-   excluded by `addopts`; see rule 7).
+   excluded by `addopts`; see rule 7). Every invariant is therefore in *this*
+   step — see [the `performance` marker](#the-performance-marker) for the rule
+   that keeps it that way, and for the claim-exclusivity tests that moved here
+   because of it.
 4. `pj-bench plans --force` — the gate that catches a lost index. It is the
    only performance-adjacent thing CI runs, because it asserts plans rather
    than durations (rule 4).

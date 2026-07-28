@@ -39,6 +39,11 @@ The tests here pin what has to be true:
 * the lock is really held afterwards, despite being acquired inside the
   ``EXCEPTION`` block's implicit subtransaction, and despite the claiming
   ``UPDATE ... FOR UPDATE SKIP LOCKED`` running outside it;
+* every job is claimed EXACTLY ONCE under concurrent claimers, capped and
+  uncapped -- the invariant the lock exists to keep. It is an invariant, so
+  it holds at any scale and is asserted at a scale the default suite can
+  afford: a correctness proof that only runs behind ``-m performance`` is a
+  correctness proof that never runs;
 * lock contention and a full cap are DIFFERENT empty returns, counted
   separately -- a cap that is doing its job also returns nothing, and
   conflating the two would credit this change for work the cap was correctly
@@ -51,8 +56,10 @@ The tests here pin what has to be true:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import statistics
 import time
+from collections.abc import AsyncIterator
 
 import asyncpg
 import pytest
@@ -115,6 +122,43 @@ BEGIN
 END;
 $$;
 """
+
+
+@contextlib.asynccontextmanager
+async def claim_lock_timeout(
+    conn: asyncpg.Connection, timeout: str
+) -> AsyncIterator[None]:
+    """Run the body with ``claim_queue_lock`` waiting `timeout` for the lock.
+
+    ``ALTER FUNCTION ... SET lock_timeout`` is a CATALOG change, not a session
+    one: it is permanent, it applies to every backend on this database, and no
+    later connection can tell it was made by a test. Left behind, it silently
+    retunes the claim path for the rest of the suite and for every suite after
+    it -- and the schema fingerprint cannot see it, because schema.sql has not
+    changed.
+
+    So the restore is a context manager rather than a step at the end of a
+    loop: it is entered and left once per swept value, and its ``finally``
+    runs for ``BaseException`` too -- ``KeyboardInterrupt`` at any await inside
+    the body, and the ``CancelledError`` pytest-timeout and xdist teardown
+    deliver. What no ``finally`` can survive is a SIGKILL or an OOM kill, and
+    that residue is caught on the other side, by ``_reset_claim_lock`` in
+    tests/conftest.py, which reasserts the shipped definition before every
+    test in the suite.
+
+    The value to restore is read from the catalog on entry rather than passed
+    in, so the sweep cannot restore a timeout the schema does not ship.
+    """
+    restore = f"{await lock_timeout_seconds(conn) * 1000:.0f}ms"
+    await conn.execute(
+        f"ALTER FUNCTION claim_queue_lock(TEXT) SET lock_timeout = '{timeout}'"
+    )
+    try:
+        yield
+    finally:
+        await conn.execute(
+            f"ALTER FUNCTION claim_queue_lock(TEXT) SET lock_timeout = '{restore}'"
+        )
 
 
 async def reseed(conn: asyncpg.Connection, queue: str, count: int) -> None:
@@ -267,8 +311,10 @@ async def test_waiting_claimers_are_served_in_order_not_at_random(
 
 
 # ============================================================================
-# 2. the subtransaction does not break the lock or SKIP LOCKED
+# 2. the subtransaction does not break the lock
 # ============================================================================
+# (that it does not break the claiming ``SKIP LOCKED`` either is section 3,
+# where the exactly-once invariant lives.)
 
 
 async def test_the_lock_survives_the_exception_block_subtransaction(
@@ -339,57 +385,167 @@ async def test_the_lock_is_released_when_the_claiming_transaction_ends(
         await prober.close()
 
 
-async def test_a_capped_queue_drains_completely_under_concurrent_claimers(
-    db_pool, db_params, unique_queue
-):
-    """No job lost, no job claimed twice, nothing left behind.
+# ============================================================================
+# 3. every job is claimed exactly once under contention -- IN THE DEFAULT SUITE
+# ============================================================================
 
-    The claiming UPDATE's ``FOR UPDATE SKIP LOCKED`` probe now runs after a
-    lock taken in a subtransaction; if that combination misbehaved it would
-    show up here as a short drain or a duplicate.
+#: Contention, not volume, is what exposes a broken claim. These run in the
+#: default suite (and therefore in CI), so the scale is the smallest one that
+#: still makes a lost or duplicated claim REACHABLE: more claimers than the
+#: box has spare cores, all on one queue, each looping with no think time, so
+#: every claim overlaps several others' snapshots and the serialised critical
+#: section is contended continuously for the whole drain. Exactly-once is an
+#: invariant -- it does not become true at 2,000 jobs and false at 600 -- so
+#: the only thing scale buys here is the chance to break it, and 600 jobs
+#: across 12 claimers is tens of thousands of overlapping claim attempts in
+#: well under a second.
+EXCLUSIVITY_CLAIMERS = 12
+EXCLUSIVITY_JOBS = 600
+
+
+async def _drain_collecting_ids(
+    pool: asyncpg.Pool, queue: str, claimers: int, hang_guard: float = 60.0
+) -> list[int]:
+    """Drain `queue` with `claimers` racing claimers; return the ids claimed.
+
+    Ids, not a count: a lost claim and a doubly-claimed job are different
+    defects with the same total, and only the ids separate them.
+
+    `hang_guard` bounds a wedged run so the failure is a test failure rather
+    than a session that never ends. Nothing here asserts on elapsed time.
     """
-    claimers, jobs = 8, 240
-    await cap_queue(db_pool, unique_queue, jobs + 100)
-    await enqueue_many(db_pool, unique_queue, jobs)
-
-    pool = await asyncpg.create_pool(**db_params, min_size=claimers, max_size=claimers)
     claimed: list[int] = []
-    try:
 
-        async def drain(worker_id: int) -> None:
-            async with pool.acquire() as conn:
-                while True:
-                    row = await claim_once(conn, unique_queue, worker_id=worker_id)
-                    if row is None:
-                        left = await conn.fetchval(
-                            "SELECT count(*) FROM jorb "
-                            "WHERE queue = $1 AND state = 'queued'",
-                            unique_queue,
-                        )
-                        if not left:
-                            return
-                        continue
-                    claimed.append(row["id"])
+    async def one(worker_id: int) -> None:
+        async with pool.acquire() as conn:
+            while True:
+                row = await claim_once(conn, queue, worker_id=worker_id)
+                if row is None:
+                    # An empty return means "nothing claimable right now",
+                    # which under contention is not the same as "empty": only
+                    # an empty queue ends this claimer.
+                    left = await conn.fetchval(
+                        "SELECT count(*) FROM jorb WHERE queue = $1 AND state = 'queued'",
+                        queue,
+                    )
+                    if not left:
+                        return
+                    continue
+                claimed.append(row["id"])
 
-        await asyncio.wait_for(
-            asyncio.gather(*(drain(i) for i in range(claimers))), timeout=60
-        )
-    finally:
-        await pool.close()
-
-    assert len(claimed) == jobs, f"drained {len(claimed)} of {jobs}"
-    assert len(set(claimed)) == jobs, "a job was claimed by two claimers"
-    assert (
-        await db_pool.fetchval(
-            "SELECT count(*) FROM jorb WHERE queue = $1 AND state <> 'claimed'",
-            unique_queue,
-        )
-        == 0
+    await asyncio.wait_for(
+        asyncio.gather(*(one(i) for i in range(claimers))), timeout=hang_guard
     )
+    return claimed
+
+
+class TestClaimExclusivityUnderContention:
+    """Exactly once, under contention, at a scale the default suite can afford.
+
+    This is the invariant the whole claim path exists to keep, and it is
+    asserted HERE rather than only inside the benchmarks in section 5 because
+    the benchmarks are excluded by ``addopts`` and never run in CI: the same
+    assertion behind ``-m performance`` proves nothing about any commit.
+
+    Both tests run against the schema exactly as shipped -- no sweep, no
+    reinstated try-lock, nothing altered in the catalog. The timeout sweep
+    lives in ``TestClaimLockTimeout``, which is a comparison between
+    configurations and not a statement about correctness.
+    """
+
+    async def test_a_capped_queue_drains_completely_under_concurrent_claimers(
+        self, db_pool, db_params, unique_queue
+    ):
+        """No job lost, no job claimed twice, nothing left behind -- WITH the lock.
+
+        The cap is set far above the job count so it can never bind: every
+        claim therefore takes the queue's advisory lock and none is ever
+        refused by the cap, which makes a short drain unambiguous evidence
+        about the lock rather than about the cap.
+
+        Three ways to fail, and the assertions separate them: fewer ids than
+        jobs is a lost claim, a repeated id is two claimers admitted to the
+        same job (what serialising exists to prevent), and a row left in any
+        state but ``claimed`` is work stranded in the queue. It is also where
+        the claiming ``UPDATE ... FOR UPDATE SKIP LOCKED`` meets a lock taken
+        inside ``claim_queue_lock``'s ``EXCEPTION`` subtransaction: if that
+        combination misbehaved, it would surface here.
+        """
+        await cap_queue(db_pool, unique_queue, EXCLUSIVITY_JOBS + 1000)
+        await enqueue_many(db_pool, unique_queue, EXCLUSIVITY_JOBS)
+
+        pool = await asyncpg.create_pool(
+            **db_params, min_size=EXCLUSIVITY_CLAIMERS, max_size=EXCLUSIVITY_CLAIMERS
+        )
+        try:
+            claimed = await _drain_collecting_ids(
+                pool, unique_queue, EXCLUSIVITY_CLAIMERS
+            )
+        finally:
+            await pool.close()
+
+        assert len(claimed) == EXCLUSIVITY_JOBS, (
+            f"{EXCLUSIVITY_CLAIMERS} claimers drained {len(claimed)} of "
+            f"{EXCLUSIVITY_JOBS}: a claim was lost"
+        )
+        assert len(set(claimed)) == EXCLUSIVITY_JOBS, (
+            f"{len(claimed) - len(set(claimed))} job(s) were claimed by two "
+            f"claimers at once: the queue's claim lock did not serialise"
+        )
+        assert (
+            await db_pool.fetchval(
+                "SELECT count(*) FROM jorb WHERE queue = $1 AND state <> 'claimed'",
+                unique_queue,
+            )
+            == 0
+        ), "the drain returned with claimable work still in the queue"
+
+    async def test_an_uncapped_queue_drains_completely_under_concurrent_claimers(
+        self, db_pool, db_params, unique_queue
+    ):
+        """The same invariant on the path that takes NO lock at all.
+
+        An uncontrolled queue -- no ``jorb_queue`` row, which is the common
+        case -- never calls ``claim_queue_lock``, so exclusivity rests
+        entirely on the claiming UPDATE's ``FOR UPDATE SKIP LOCKED``. That
+        path carries almost all of the traffic and is the one a change to the
+        locked path can quietly break (the lock would then be covering for it
+        everywhere the previous test looks).
+        """
+        assert not await db_pool.fetchval(
+            "SELECT count(*) FROM jorb_queue WHERE name = $1", unique_queue
+        ), "the queue is controlled, so this is not the lock-free path"
+        await enqueue_many(db_pool, unique_queue, EXCLUSIVITY_JOBS)
+
+        pool = await asyncpg.create_pool(
+            **db_params, min_size=EXCLUSIVITY_CLAIMERS, max_size=EXCLUSIVITY_CLAIMERS
+        )
+        try:
+            claimed = await _drain_collecting_ids(
+                pool, unique_queue, EXCLUSIVITY_CLAIMERS
+            )
+        finally:
+            await pool.close()
+
+        assert len(claimed) == EXCLUSIVITY_JOBS, (
+            f"{EXCLUSIVITY_CLAIMERS} claimers drained {len(claimed)} of "
+            f"{EXCLUSIVITY_JOBS} from an uncapped queue: a claim was lost"
+        )
+        assert len(set(claimed)) == EXCLUSIVITY_JOBS, (
+            "the same job was claimed twice with no lock held: SKIP LOCKED is "
+            "no longer keeping claimers off each other's rows"
+        )
+        assert (
+            await db_pool.fetchval(
+                "SELECT count(*) FROM jorb WHERE queue = $1 AND state <> 'claimed'",
+                unique_queue,
+            )
+            == 0
+        ), "the drain returned with claimable work still in the queue"
 
 
 # ============================================================================
-# 3. lock contention is not the same thing as a full cap
+# 4. lock contention is not the same thing as a full cap
 # ============================================================================
 
 
@@ -506,7 +662,7 @@ async def test_cap_refusals_and_lock_contention_are_different_empty_returns(
 
 
 # ============================================================================
-# 4. what a lost lock costs a REAL worker (which is not a round trip)
+# 5. what a lost lock costs a REAL worker (which is not a round trip)
 # ============================================================================
 
 
@@ -592,8 +748,12 @@ async def test_every_worker_on_a_capped_queue_gets_to_work(
 
 
 # ============================================================================
-# 5. what the bounded wait is worth (-m performance -s)
+# 6. what the bounded wait is worth (-m performance -s)
 # ============================================================================
+# CONFIGURATION COMPARISONS, not correctness. Everything below is excluded
+# from the default suite by `addopts` and therefore never runs in CI, so no
+# invariant may live here: exactly-once is pinned in section 3, at CI scale,
+# where a regression can actually fail a build.
 
 #: Conditions are measured round-robin and reduced by median: a single ordered
 #: pass would report accumulating dead tuples, an autovacuum waking up or a
@@ -619,6 +779,12 @@ class TestClaimLockTimeout:
     stampede comes back; too large and a stuck transaction stalls claimers
     for longer than it has to. The knee is an empirical question about how
     long the serialised critical section actually takes on this hardware.
+
+    A COMPARISON BETWEEN CONFIGURATIONS, and nothing more. That claims stay
+    exactly-once under contention is not asserted here -- it is
+    ``TestClaimExclusivityUnderContention`` in section 3, which runs in the
+    default suite. This class only runs when someone asks for it, so an
+    invariant asserted here would be an invariant nobody checks.
     """
 
     async def test_sweep_the_claim_lock_timeout(self, db_pool, db_params, unique_queue):
@@ -632,25 +798,31 @@ class TestClaimLockTimeout:
             await cap_queue(db_pool, unique_queue, PERF_JOBS + 1000)
             for round_no in range(PERF_ROUNDS + 1):
                 for timeout in TIMEOUT_SWEEP:
-                    await db_pool.execute(
-                        f"ALTER FUNCTION claim_queue_lock(TEXT) "
-                        f"SET lock_timeout = '{timeout}'"
+                    # Persistent catalog state, scoped to one measured drain
+                    # and restored on the way out of every exit -- see
+                    # claim_lock_timeout().
+                    async with claim_lock_timeout(db_pool, timeout):
+                        await reseed(db_pool, unique_queue, PERF_JOBS)
+                        started = time.perf_counter()
+                        counts = await _drain_counting_empties(
+                            pool, unique_queue, PERF_CLAIMERS, PERF_JOBS
+                        )
+                        elapsed = time.perf_counter() - started
+                    # A measurement precondition, not the exclusivity
+                    # invariant: it says the interval just timed covers a
+                    # WHOLE drain, so claims/s below is a rate for the same
+                    # work under every swept timeout. (It would be satisfied
+                    # by a drain that claimed a job twice; what may not be
+                    # satisfied is comparing 2,000 claims against 400.)
+                    assert counts["claims"] == PERF_JOBS, (
+                        f"the drain at {timeout} ended after "
+                        f"{counts['claims']} of {PERF_JOBS} claims, so this "
+                        f"round measured less work than the others"
                     )
-                    await reseed(db_pool, unique_queue, PERF_JOBS)
-                    started = time.perf_counter()
-                    counts = await _drain_counting_empties(
-                        pool, unique_queue, PERF_CLAIMERS, PERF_JOBS
-                    )
-                    elapsed = time.perf_counter() - started
-                    assert counts["claims"] == PERF_JOBS
                     if round_no:  # round 0 is warmup
-                        rates[timeout].append(PERF_JOBS / elapsed)
+                        rates[timeout].append(counts["claims"] / elapsed)
                         empties[timeout].append(counts["empty_with_work"])
         finally:
-            await db_pool.execute(
-                f"ALTER FUNCTION claim_queue_lock(TEXT) "
-                f"SET lock_timeout = '{installed * 1000:.0f}ms'"
-            )
             await pool.close()
 
         lines = "\n".join(
@@ -720,6 +892,12 @@ class TestCappedClaimThroughput:
     The win that made the change worth shipping is not here: it is
     ``test_every_worker_on_a_capped_queue_gets_to_work``, which is the same
     contention priced the way a real worker pays for it.
+
+    Nor is the correctness of any of these three conditions here. That every
+    job is claimed exactly once -- capped (lock held) and uncapped (no lock at
+    all), the two conditions this benchmark contrasts -- is asserted by
+    ``TestClaimExclusivityUnderContention`` in section 3, which runs in the
+    default suite and in CI.
     """
 
     async def test_the_bounded_wait_stops_the_stampede_without_costing_rate(
@@ -754,9 +932,17 @@ class TestCappedClaimThroughput:
                         pool, unique_queue, PERF_CLAIMERS, PERF_JOBS
                     )
                     elapsed = time.perf_counter() - started
-                    assert counts["claims"] == PERF_JOBS
+                    # As in the sweep: a measurement precondition (the timed
+                    # interval covers a whole drain, so the three conditions
+                    # are rates for the same work), not the exactly-once
+                    # invariant, which is section 3's and runs in CI.
+                    assert counts["claims"] == PERF_JOBS, (
+                        f"the {condition} drain ended after {counts['claims']} "
+                        f"of {PERF_JOBS} claims, so this condition measured "
+                        f"less work than the others"
+                    )
                     if round_no:  # round 0 is warmup: connections, plans, cache
-                        rates[condition].append(PERF_JOBS / elapsed)
+                        rates[condition].append(counts["claims"] / elapsed)
                         misses[condition].append(counts["empty_with_work"])
         finally:
             await pool.close()

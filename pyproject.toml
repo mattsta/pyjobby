@@ -83,6 +83,9 @@ markers = [
     "concurrency: marks tests as concurrency tests",
     "stress: marks tests as stress tests (high load scenarios)",
     "hypothesis: marks tests as property-based tests using Hypothesis",
+    # Comparisons between configurations only. A test marked here never runs
+    # in CI, so an invariant asserted only inside one is never checked against
+    # any commit -- see docs/TESTING.md, "The performance marker".
     "performance: throughput measurements; excluded by default, see addopts",
 ]
 timeout = 300
