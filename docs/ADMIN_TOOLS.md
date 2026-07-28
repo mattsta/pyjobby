@@ -80,9 +80,9 @@ show` for a queue with no jobs and no control row, exit 0.
 Machine-readable output is `--json`, available on `jobs list`, `jobs
 inspect`, `jobs history`, `jobs steps`, `jobs retry-stats`, `jobs
 timeout-stats`, `queues list`, `queues show`, `queues stats`, `workers
-list`, `dlq list`, `metrics`, `schedule list`, `schedule show`, `schedule
-history`, `dag list`, `dag show`, `dag visualize`, `doctor` and `db
-status`.
+list`, `workers stats`, `dlq list`, `metrics`, `schedule list`, `schedule
+show`, `schedule history`, `schedule stats`, `dag list`, `dag show`, `dag
+visualize`, `doctor` and `db status`.
 
 ```bash
 pj-admin jobs retry $(pj-admin jobs list --state crashed --json | jq -r '.[].id')
@@ -182,6 +182,8 @@ PASS notify-queue: 0.0% full
 WARN workers: no live workers seen in last 60s
 PASS job-threads: 0 live worker(s) claiming
 PASS queues: no queued jobs
+PASS blocked-waiters: no waiting jobs blocked on failed upstreams
+PASS mailbox: no unread mail older than a day
 PASS dlq: empty
 PASS schedules: no overdue schedules
 $ echo $?
@@ -702,7 +704,9 @@ JSON API:
 | GET | `/api/dlq` |
 | POST | `/api/dlq/{id}/retry` |
 | GET | `/api/metrics` |
-| GET/POST | `/api/schedules`, `/api/schedules/{id}` |
+| GET | `/api/schedules`, `/api/schedules/{id}`, `/api/schedules/{id}/history` |
+| POST | `/api/schedules`, `/api/schedules/{id}/enable`, `/api/schedules/{id}/disable` |
+| DELETE | `/api/schedules/{id}` |
 
 `GET /metrics` (not `/api/metrics`) is the Prometheus scrape endpoint. The
 gauges and counters it exposes:

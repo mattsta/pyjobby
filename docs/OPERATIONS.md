@@ -68,7 +68,9 @@ Checks (FAIL exits nonzero; WARN does not): database reachable, the schema's
 **shape** against the manifest of objects this release addresses, all seven
 schema triggers present by name, NOTIFY queue saturation, live workers seen
 in the last 60s, workers that are alive but claiming nothing, per-queue
-depth and oldest-job age, DLQ size, overdue schedules. Run it from cron/CI
+depth and oldest-runnable age, waiters blocked on a crashed or cancelled
+upstream, unread durable mail older than a day, DLQ size, overdue
+schedules. Run it from cron/CI
 as a platform health probe; scrape `GET /metrics` on the web admin for
 Prometheus.
 
@@ -81,6 +83,8 @@ PASS notify-queue: 0.0% full
 WARN workers: no live workers seen in last 60s
 PASS job-threads: 0 live worker(s) claiming
 PASS queues: no queued jobs
+PASS blocked-waiters: no waiting jobs blocked on failed upstreams
+PASS mailbox: no unread mail older than a day
 PASS dlq: empty
 PASS schedules: no overdue schedules
 ```
@@ -311,7 +315,7 @@ bulkiest rows in the system with the shortest useful life:
 
 `0` on either means keep forever; that sweep does not run at all.
 
-**One window covers all four job-scoped tables** rather than a knob per
+**One window covers all five job-scoped tables** rather than a knob per
 table, because none of them has a lifetime of its own to argue for — they all
 mean "as long as the work they describe". Checkpoints get the second knob
 because they genuinely do.

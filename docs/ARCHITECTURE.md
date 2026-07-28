@@ -195,7 +195,7 @@ as "nothing claimable", identical to an empty queue. The bound is what
 stops one claim held open by a stuck transaction from freezing the queue;
 the *wait* rather than an immediate try-lock is what puts claimers in the
 lock manager's FIFO queue, so they take turns instead of one winner
-starving the rest. `sql/schema/90_notify.sql` carries the measurements for both.
+starving the rest. `sql/schema/30_claim.sql` carries the measurements for both.
 
 The row itself is picked with `FOR UPDATE SKIP LOCKED` over
 `jorb_claim_idx (queue, prio, run_after) WHERE state = 'queued'`, ordered
@@ -240,7 +240,7 @@ somebody is.
 One function, `jorb_notify()`, implements every channel. Its trigger
 arguments are `(channel, demand kind)`, and the topic, the gate and the
 payload for all five channels are declared in that one body — so changing
-the convention is one edit, not seven.
+the convention is one edit, not five.
 
 | Channel | Fires on | Demand | "Somebody is waiting" means |
 |---|---|---|---|
@@ -335,7 +335,7 @@ rate.
 The five channels above are all of them. Nothing notifies on
 `queued → claimed → running → finished`, and adding such a trigger would
 undo the whole model in one edit — the lock is per commit, so a single
-ungated channel firing four times per job costs exactly what all seven
+ungated channel firing four times per job costs exactly what all five
 would. Reinstating it measures 2.6–2.9× *slower* on the completion path
 (`tests/test_notify_gating.py` builds that trigger on purpose so the number
 stays measurable).

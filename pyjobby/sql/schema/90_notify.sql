@@ -31,7 +31,7 @@
 -- THE MECHANISM (uniform): every channel goes through jorb_notify() below.
 -- The channel's topic, its demand kind and its payload are declared once, in
 -- that one function, so a change to the gate or the payload convention is
--- made once instead of seven times.
+-- made once instead of five times.
 --
 -- THE DEMAND STORAGE (deliberately NOT uniform): each channel uses the
 -- cheapest correct signal for its own shape. Uniform policy, not uniform
@@ -58,7 +58,7 @@
 -- EVERY state transition (queued->claimed->running->finished, four per job),
 -- ungated, and pushed each one to the websocket dashboard. Once every other
 -- channel was gated it was the entire remaining bill: the commit lock is
--- taken per COMMIT, so one ungated channel costs exactly what seven cost,
+-- taken per COMMIT, so one ungated channel costs exactly what five cost,
 -- and deleting it is worth 2.6-2.9x on the completion path (measured across
 -- runs in tests/test_notify_gating.py, which rebuilds the deleted trigger so
 -- the "before" number stays measurable).

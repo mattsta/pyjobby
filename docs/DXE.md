@@ -529,9 +529,10 @@ Both windows apply in `pj-monitor` and both are **on by default**:
 ```
 --retention-days 30              delete terminal jobs, with their history,
                                  events, mailbox and checkpoints — and the
-                                 four things no cascade reaches: consumed
-                                 mail of LIVE jobs, emptied DAGs, aged
-                                 schedule executions, retired worker rows
+                                 five things no cascade reaches: consumed
+                                 mail of LIVE jobs, history of LIVE jobs,
+                                 emptied DAGs, aged schedule executions,
+                                 retired worker rows
 --checkpoint-retention-days 1    delete the CHECKPOINTS of terminal jobs,
                                  keeping the job row itself
 ```

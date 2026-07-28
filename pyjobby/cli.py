@@ -2724,7 +2724,7 @@ def jobs_timeout_stats(
 # =========================================================================
 
 
-#: Every trigger schema.sql installs, checked by name. Not a second list: it
+#: Every trigger sql/schema/ installs, checked by name. Not a second list: it
 #: IS the migration runner's manifest, so a trigger added to the schema is
 #: checked here the moment it is declared there.
 DOCTOR_REQUIRED_TRIGGERS = migrations.REQUIRED_TRIGGERS
@@ -2930,10 +2930,11 @@ def doctor(
             # THE SCHEMA CHECK, and the one that used to be a lie. It asked
             # two questions -- is `jorb` there, and does schema_migrations
             # record a version this release does not ship -- and a database
-            # installed from an OLDER schema.sql answers both the way a
-            # healthy one does: jorb exists, and it records nothing at all, so
-            # nothing is "pending". Doctor printed PASS schema and the very
-            # next check died on `column "job_threads" does not exist`.
+            # installed from an OLDER revision of sql/schema/ answers both
+            # the way a healthy one does: jorb exists, and it records
+            # nothing at all, so nothing is "pending". Doctor printed PASS
+            # schema and the very next check died on
+            # `column "job_threads" does not exist`.
             #
             # So it now asks what the operator was actually asking: can the
             # code that is running address this database? That is the SHAPE --
@@ -2964,7 +2965,7 @@ def doctor(
                 # proved that every object the pending files install is
                 # already here -- so the answer is yes, and only the
                 # BOOKKEEPING is behind. That is what a database installed
-                # from the current schema.sql by a release that did not record
+                # from the current sql/schema/ by a release that did not record
                 # migrations looks like, and waking someone at 3am over a
                 # missing row in schema_migrations is how a health probe
                 # teaches people to ignore it.

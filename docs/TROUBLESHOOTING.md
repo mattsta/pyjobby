@@ -23,7 +23,9 @@ PASS triggers: all schema triggers present (7)
 PASS notify-queue: 0.0% full
 WARN workers: no live workers seen in last 60s
 PASS job-threads: 0 live worker(s) claiming
-PASS queue q_reports: depth 1, oldest queued 51m
+PASS queue q_reports: depth 1, oldest runnable 51m
+PASS blocked-waiters: no waiting jobs blocked on failed upstreams
+PASS mailbox: no unread mail older than a day
 PASS dlq: empty
 PASS schedules: no overdue schedules
 $ echo $?
@@ -43,6 +45,8 @@ all" is a WARN, so one worker of ten refusing to claim cannot be graver.
 | `workers` | no heartbeat in the last 60s | [Nothing is being claimed](#nothing-is-being-claimed) |
 | `job-threads` | live workers that claim nothing | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing) |
 | `queue <name>` | backlog past `--max-depth` (10000) or `--max-age-minutes` (60) | [The backlog is growing](#the-backlog-is-growing) |
+| `blocked-waiters` | jobs in `waiting` whose upstream crashed or was cancelled — the monitor leaves them alone, so this is the only place they show up | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq) |
+| `mailbox` | unread durable mail older than a day — usually a sender using a topic nothing `recv()`s | [STATECHARTS.md § Waiting](STATECHARTS.md#waiting) |
 | `dlq` | jobs have exhausted their retries | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq) |
 | `schedules` | an enabled schedule is overdue by >5m | [A schedule is not firing](#a-schedule-is-not-firing) |
 
@@ -321,8 +325,13 @@ The queue drains only as fast as the **slowest connected listener**, so the
 cause is almost always a consumer that stopped reading — a wedged
 dashboard, a stuck `pj-ws`, an abandoned `LISTEN` session. Find it in
 `pg_stat_activity` and end it. There is no channel to turn off for relief:
-every remaining channel is demand-gated (an unobserved job emits none) and
-all four are load-bearing. Full argument:
+all five remaining channels are load-bearing, and four of them are already
+demand-gated (an unobserved job emits none). The fifth,
+`schedule_executed`, is **ungated on purpose** — its consumer, the
+websocket dashboard, has no polling fallback, so a gate would drop events
+rather than delay them — and it costs nothing here, because it fires once
+per schedule *execution* on `jorb_schedule_log`, at cron rate, never on a
+job hot path. Full argument:
 [SCALE.md § NOTIFY queue saturation](SCALE.md#3-notify-queue-saturation--the-cliff).
 
 A missing trigger is the opposite failure and `doctor` checks it

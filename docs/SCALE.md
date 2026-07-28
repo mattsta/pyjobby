@@ -69,10 +69,12 @@ Measured here, 16 concurrent connections, one transaction per job:
 | all `NOTIFY` triggers disabled | **28,790** |
 
 **The cost is per-COMMIT, not per-notification.** Disabling the transition
-firehose alone — 3 of the 5 notifications per job — recovered only **3%**,
-because one `NOTIFY` in a transaction takes the same global lock as three.
-Reducing notification *volume* does not raise the ceiling; only removing
-`NOTIFY` from the commit path does.
+firehose alone — four of the five notifications a job emitted, one per
+transition through `queued -> claimed -> running -> finished` — recovered only
+**3%**: the lock is per COMMIT, so a transaction that still issues one
+`NOTIFY` pays exactly what a transaction that issued several paid, and every
+commit on every path still issued one. Reducing notification *volume* does not
+raise the ceiling; only removing `NOTIFY` from the commit path does.
 
 **What was done about it.** Every channel is now emitted only when a consumer
 has registered demand for it, so a job nobody is watching notifies nobody — and
@@ -256,7 +258,10 @@ keeping up" is a survival question at this rate and nothing else answers it.
 * **Claiming.** `claim_jorb()` uses `FOR UPDATE SKIP LOCKED` against a partial
   index over claimable rows only, so claim cost is independent of how many
   finished jobs are in the table. Workers never block each other.
-* **Enqueue.** 67k rows/s measured against a 278/s requirement.
+* **Enqueue.** 34,671 jobs/s in the production shape — 16 concurrent
+  connections, one transaction per job — against a 278/s requirement. (The
+  68k figure is the single-bulk-transaction number, which
+  [measures the wrong thing](#measuring-enqueue-honestly).)
 * **Fencing.** `run_epoch` comparisons are per-row and add nothing measurable.
 * **Cascade deletes** — now that every foreign key has a leading index.
 * **Resolving the job class.** 0.49 µs/job from the class cache, and the
@@ -348,12 +353,22 @@ A state machine (`start_machine`) is a job that parks on `recv()` waiting for
 the next event, so its cost scales with **how many machines are alive at
 once**, not with job throughput:
 
-* **A parked machine holds a worker.** A worker running a machine that is
-  waiting for an event is not claiming other jobs. N machines that must be
-  able to make progress concurrently need N worker slots — which is why
-  machines default to their own `machines` queue, so they cannot starve the
-  workers serving latency-sensitive job queues. Size that queue's `--workers`
-  to the concurrent-machine count, not to the job rate.
+* **A machine holds a worker only while it is awaiting.** `recv()` parks a
+  worker for at most `wait_seconds`; when that times out with no event the
+  machine checkpoints a wake time, requeues itself and **unwinds** — the
+  worker is released and the machine waits `idle_seconds` in the database
+  holding no worker, no connection and no thread (`StateMachineJob.task()` in
+  `pyjobby/statemachine.py`). So the sizing input is not the number of live
+  machines but the number **concurrently in a `recv()` window**: a machine
+  occupies a worker about `wait / (wait + idle)` of the time, which at the
+  class defaults (30s / 300s, see
+  [STATECHARTS.md § Running machines](STATECHARTS.md#running-machines)) is
+  ~9% — roughly one worker per eleven idle machines. Machines still default
+  to their own `machines` queue so a burst of simultaneous wakes cannot
+  starve the workers serving latency-sensitive job queues. Size that queue's
+  `--workers` to concurrent *awaiting* machines; raising `idle_seconds`
+  lowers occupancy and adds up to that much delay to an event arriving just
+  after a park ends.
 * **A long-lived machine accumulates `jorb_history` and consumed mail.** The
   job-scoped `ON DELETE CASCADE` never fires for a machine that never
   terminates, so its wake/sleep history and read messages are bounded only by
@@ -571,14 +586,15 @@ wide instead of unbounded.
 
 ### A retention knob per table: rejected
 
-Four job-scoped tables outlive the job cascade (`jorb_mailbox` for live jobs,
-`jorb_dag`, `jorb_schedule_log`, `jorb_worker`) and they all share
-`--retention-days`. Per-table windows were considered and rejected: none of
-them has a lifetime of its own to argue for — they all mean "as long as the
-work they describe" — and four more knobs is four more ways for an install to
-be quietly wrong in a direction nobody checks. `--checkpoint-retention-days`
-stays separate because checkpoints genuinely do have their own lifetime:
-bulkiest rows in the system, useless the instant their job goes terminal.
+Five job-scoped tables outlive the job cascade (`jorb_mailbox` and
+`jorb_history` for live jobs, `jorb_dag`, `jorb_schedule_log`,
+`jorb_worker`) and they all share `--retention-days`. Per-table windows were
+considered and rejected: none of them has a lifetime of its own to argue for
+— they all mean "as long as the work they describe" — and five more knobs is
+five more ways for an install to be quietly wrong in a direction nobody
+checks. `--checkpoint-retention-days` stays separate because checkpoints
+genuinely do have their own lifetime: bulkiest rows in the system, useless
+the instant their job goes terminal.
 
 ### `DELETE ... USING (a CTE of victims)`: rejected, measured, three times
 

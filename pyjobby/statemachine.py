@@ -15,8 +15,12 @@ What you get that an in-process FSM library cannot give you:
   after another worker takes over — ``run_epoch`` fences every write it makes;
 * an action that writes to this database is exactly-once, via
   ``transaction()``;
-* the transition log is written by a database trigger, so no code path can
-  forget to append to it;
+* the transition log is a by-product of running at all -- each transition's
+  action is a DXE ``step()``, checkpointed durably before the machine moves
+  on, so the log is written by the same mechanism that makes the action
+  exactly-once and no code path can forget to append to it (read it back with
+  ``MachineHandle.history()`` / ``JobClient.get_steps``, bounded to the
+  current turn by ``compact()``);
 * a machine can wait six months for an event without holding a process, a
   connection, or a thread.
 

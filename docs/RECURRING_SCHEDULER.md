@@ -292,8 +292,10 @@ It is a column because it is the one thing about a scheduled job that anything
 *queries by*, and while it lived in the `admin_data` blob no index could serve
 that query — see [Performance](#performance). The `admin_data` copy is **gone**
 rather than kept alongside: two copies of one fact disagree eventually.
-`pj-admin db migrate` moves it on existing databases, including jobs that are
-still in flight.
+There is nothing to backfill: `jorb.schedule_id` is a column of the **base
+schema** (`sql/schema/10_jobs.sql`), so `pj-admin db migrate` installs it
+with the rest of the schema on any database this release creates, and no
+release that wrote the `admin_data` key has ever shipped.
 
 ## When a schedule cannot be evaluated
 

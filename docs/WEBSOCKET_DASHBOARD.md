@@ -92,17 +92,21 @@ Python WebSocket server using aiohttp and asyncpg:
 - Handles client actions (cancel, retry, etc.)
 - Provides health check endpoint
 
-**Start**:
+**Start** (`pj-ws` is the installed entry point; the config is a `-c/--config`
+option, never a positional argument):
 
 ```bash
-python -m pyjobby.websocket_server ./pyjobby.toml --port 8082
+pj-ws --config ./pyjobby.toml --port 8082
 ```
 
-Or with custom host:
+It binds `127.0.0.1` by default. To expose it beyond localhost:
 
 ```bash
-python -m pyjobby.websocket_server ./pyjobby.toml --host 0.0.0.0 --port 8082
+pj-ws --config ./pyjobby.toml --host 0.0.0.0 --port 8082
 ```
+
+The websocket API is unauthenticated, so put a proxy in front of it before
+binding `0.0.0.0`.
 
 ### 3. Live Dashboard (`frontend/live-dashboard.html`)
 
@@ -147,11 +151,15 @@ pj-ws --config ./pyjobby.toml --snapshot-interval 1.0
 You should see:
 
 ```
-WebSocket server running on ws://0.0.0.0:8082/ws
-Health check available at http://0.0.0.0:8082/health
-Using PostgreSQL LISTEN/NOTIFY (no Redis needed!)
-PostgreSQL LISTEN connections established
+... - pyjobby.websocket_server - INFO - Database connection pool initialized
+... - pyjobby.websocket_server - INFO - PostgreSQL LISTEN connections established
+... - pyjobby.websocket_server - INFO - WebSocket server running on ws://127.0.0.1:8082/ws
+... - pyjobby.websocket_server - INFO - Health check available at http://127.0.0.1:8082/health
+... - pyjobby.websocket_server - INFO - Using PostgreSQL LISTEN/NOTIFY (no Redis needed!)
 ```
+
+`127.0.0.1` is the default bind address — pass `--host 0.0.0.0` (behind a
+proxy) if the dashboard runs on another machine.
 
 ### Step 3: Open Dashboard
 
@@ -305,6 +313,11 @@ queued with a `run_after` in the future.
 
 #### schedule_executed
 
+On the `schedules` channel. `data` is the NOTIFY payload verbatim, and the
+trigger in `sql/schema/90_notify.sql` builds exactly four keys — there is no
+`next_run` and no duration: ask `pj-admin schedule show NAME` for the next
+firing time.
+
 ```json
 {
   "event": "schedule_executed",
@@ -312,11 +325,117 @@ queued with a `run_after` in the future.
   "data": {
     "schedule_id": 10,
     "schedule_name": "daily-cleanup",
-    "job_id": 12346,
     "result": "success",
-    "next_run": "2025-11-19T02:00:00.000Z",
-    "duration_ms": 1234
+    "job_id": 12346
   }
+}
+```
+
+This is the one **ungated** channel: it fires at cron rate on
+`jorb_schedule_log`, never on a job hot path, and its consumer (this
+dashboard) has no polling fallback, so a gate would drop events rather than
+delay them.
+
+#### subscribed / unsubscribed
+
+The replies to `subscribe` / `unsubscribe`. `subscribed` echoes the client's
+**full** channel set after the change; `unsubscribed` echoes just the
+channels named in the request.
+
+```json
+{
+  "event": "subscribed",
+  "timestamp": "2025-11-18T10:30:00.100Z",
+  "data": { "channels": ["jobs", "queues:default", "schedules"] }
+}
+```
+
+#### job_cancelled
+
+The reply to a `cancel_job` that took effect. Same `{job_id, status}` shape
+the admin API and client return, so all three surfaces say the same thing;
+`status` is the state the cancellation landed in (`cancelled`, or
+`cancel_requested` for a job already executing). A job that could not be
+cancelled gets an `error` event instead, not a `job_cancelled` with a
+negative status.
+
+```json
+{
+  "event": "job_cancelled",
+  "timestamp": "2025-11-18T10:30:11.000Z",
+  "data": { "job_id": 12345, "status": "cancelled" }
+}
+```
+
+#### job_rerun
+
+The reply to a `rerun_job` that took effect. `fresh` is always `true` from
+this surface and is stated in the payload rather than assumed — "restart
+from step 1" and "resume from checkpoints" are opposite answers to the same
+button. A job that cannot be re-run gets an `error` event instead.
+
+```json
+{
+  "event": "job_rerun",
+  "timestamp": "2025-11-18T10:30:12.000Z",
+  "data": { "job_id": 12345, "status": "requeued", "fresh": true }
+}
+```
+
+#### priority_adjusted
+
+The reply to an `adjust_priority` that matched a `queued` or `waiting` job.
+Anything else — job gone, already running, or a priority above the fleet's
+ceiling — is an `error` event.
+
+```json
+{
+  "event": "priority_adjusted",
+  "timestamp": "2025-11-18T10:30:13.000Z",
+  "data": { "job_id": 12345, "new_priority": 500, "success": true }
+}
+```
+
+#### stats
+
+The reply to `get_stats`. Server counters, the `jorb_queue` control rows,
+the live worker count, and this connection's own view — it is a connection
+diagnostic, not the dashboard feed (that is `dashboard`, above).
+
+```json
+{
+  "event": "stats",
+  "timestamp": "2025-11-18T10:30:14.000Z",
+  "data": {
+    "server": {
+      "total_connections": 42, "current_connections": 7,
+      "messages_sent": 9130, "messages_received": 88,
+      "events_received": 311, "snapshot_queries": 1304, "errors": 0
+    },
+    "queues": {
+      "default": { "paused": false, "max_concurrency": null, "rate_limit": null }
+    },
+    "workers_live": 12,
+    "client": {
+      "connected_at": 1763462400.0,
+      "channels": ["jobs", "queues:default"],
+      "action_count": 3
+    }
+  }
+}
+```
+
+#### error
+
+Every rejected frame and every failed action, with one field. The text is
+truncated to `MAX_ERROR_MESSAGE_LENGTH` because it quotes client-supplied
+values — a large frame must never buy a larger reply.
+
+```json
+{
+  "event": "error",
+  "timestamp": "2025-11-18T10:30:15.000Z",
+  "data": { "message": "Job 12345 not found or cannot be cancelled" }
 }
 ```
 
@@ -549,7 +668,10 @@ After=network.target postgresql.service
 Type=simple
 User=pyjobby
 WorkingDirectory=/opt/pyjobby
-ExecStart=/usr/bin/python3 -m pyjobby.websocket_server /opt/pyjobby/pyjobby.toml --host 0.0.0.0 --port 8082
+ExecStart=/opt/pyjobby/.venv/bin/pj-ws \
+    --config /opt/pyjobby/pyjobby.toml \
+    --host 0.0.0.0 \
+    --port 8082
 Restart=always
 RestartSec=5
 

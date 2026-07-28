@@ -195,6 +195,7 @@ of those measurements.
 | `pj-bench notify` | notifications per job lifecycle, **unobserved and observed**, because on a demand-gated schema that question has two correct answers |
 | `pj-bench plans` | `EXPLAIN (ANALYZE, BUFFERS)` every hot query in **two states** (caught up and backlogged); **exits non-zero on a sequential scan of any gated table, or on a discard budget overrun**. Its sweep cases are derived from monitor.py's `SWEEP_*_SQL` constants, so a new sweep with no gate entry is an error rather than a gap |
 | `pj-bench resolve` | per-job class resolution in four interleaved arms — cached, the `--reload` mtime check, no cache at all, and a real re-import. Each arm reports whether the class object was actually rebuilt, so an arm that stops doing what it is named cannot publish the wrong number |
+| `pj-bench replay` | what a long checkpoint log costs to resume — a resume loads every step a job ever recorded, and a durable machine records one per transition *and* one per idle wake, so this is the number that decides how long such a machine may live |
 | `pj-bench all` | everything, with one summary table |
 
 `pj-bench plans --force` **is the CI gate** (`.github/workflows/ci.yml`), and
