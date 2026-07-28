@@ -58,9 +58,13 @@ clean:  ## Clean up generated files
 	@find . -type f -name '*.pyc' -delete 2>/dev/null || true
 	@echo "Done!"
 
-ci:  ## Run all CI checks (format, lint, type-check, test)
+format-check:  ## Verify formatting WITHOUT writing (what CI runs)
+	@echo "Checking formatting..."
+	poetry run ruff format --check pyjobby/ tests/
+
+ci:  ## Run all CI checks exactly as CI does (verifies; never writes)
 	@echo "Running CI checks..."
-	@make format
+	@make format-check
 	@make lint
 	@make type-check
 	@make test

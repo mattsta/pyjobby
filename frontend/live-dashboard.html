@@ -545,20 +545,21 @@
             log(`Cancelling job ${jobId}...`);
         }
 
-        // Retry job
-        function retryJob(jobId) {
+        // Re-run job. The server verb is `rerun_job`: it accepts a FINISHED
+        // job and repeats its side effects, restarting from step 1.
+        function rerunJob(jobId) {
             if (!ws || ws.readyState !== WebSocket.OPEN) {
                 log('Not connected', 'error');
                 return;
             }
 
             const message = {
-                action: 'retry_job',
+                action: 'rerun_job',
                 job_id: jobId
             };
 
             ws.send(JSON.stringify(message));
-            log(`Retrying job ${jobId}...`);
+            log(`Re-running job ${jobId}...`);
         }
 
         // Render one row per queue from the latest snapshot.

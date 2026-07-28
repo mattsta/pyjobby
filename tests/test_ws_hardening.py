@@ -623,6 +623,31 @@ class TestSubscriptionLimits:
         assert len(h.server.subscriptions["jobs"]) == 1
 
     @pytest.mark.asyncio
+    async def test_a_malformed_job_channel_cannot_stop_the_broadcast_loop(
+        self, ws_factory, db_pool
+    ):
+        """`watch_job` mints `job:<int>`, but `subscribe` takes any string.
+
+        The re-arm pass used to parse those ids OUTSIDE its per-channel try,
+        so one anonymous client subscribing to `job:x` raised through the
+        broadcast loop's catch-all: no snapshots and no watch re-arming for
+        ANY connected client, for as long as that client stayed. Anyone who
+        can open a websocket could silence the whole feed with one frame.
+        """
+        h = await ws_factory(max_subscriptions=100)
+        ws = await h.connect()
+
+        reply = await ask(
+            ws, {"action": "subscribe", "channels": ["job:x", "job:", "jobs"]}
+        )
+        assert reply["event"] == "subscribed"
+
+        # The pass must complete and simply skip the unparseable names.
+        await h.server._rearm_job_watches()
+
+        assert "job:x" in h.server.subscriptions
+
+    @pytest.mark.asyncio
     async def test_unsubscribe_is_idempotent_and_tolerates_unknown_channels(
         self, ws_factory
     ):

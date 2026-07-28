@@ -296,14 +296,10 @@ class TestJobClientEnqueueBatch:
         client = JobClient(db_pool)
 
         with pytest.raises(ValueError, match="shared options may not set"):
-            await client.enqueue_batch(
-                [("BatchJob", {"i": 0})], job_kwargs={"x": 1}
-            )
+            await client.enqueue_batch([("BatchJob", {"i": 0})], job_kwargs={"x": 1})
 
         with pytest.raises(ValueError, match="job 0's per-job options"):
-            await client.enqueue_batch(
-                [("BatchJob", {"i": 0}, {"prio_ceiling": 5})]
-            )
+            await client.enqueue_batch([("BatchJob", {"i": 0}, {"prio_ceiling": 5})])
 
 
 class TestJobClientJobManagement:
@@ -630,6 +626,61 @@ class TestJobClientAdvancedFeatures:
                 "SELECT waitfor_job FROM jorb WHERE id = $1", job_ids[2]
             )
             assert row3["waitfor_job"] == job_ids[1]
+
+    @pytest.mark.asyncio
+    async def test_create_pipeline_passes_enqueue_options_through(self, db_pool):
+        """A stage's kwargs are enqueue options, including the result ones.
+
+        create_pipeline does not name save_result/use_result_from -- threading
+        results is create_pipeline_with_results' job -- so a stage may pass
+        them itself. Naming them unconditionally in the shared chain builder
+        turned that into "multiple values for keyword argument"."""
+        client = JobClient(db_pool)
+
+        job_ids = await client.create_pipeline(
+            [
+                ("PipeA", {"save_result": False, "data": "a"}),
+                ("PipeB", {"data": "b"}),
+            ]
+        )
+
+        assert len(job_ids) == 2
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT admin_data, kwargs FROM jorb WHERE id = $1", job_ids[0]
+            )
+        # the opt-out reached admin_data, and did not leak into job kwargs
+        assert row["admin_data"]["save_result"] is False
+        assert row["kwargs"] == {"data": "a"}
+
+    @pytest.mark.asyncio
+    async def test_create_pipeline_with_results_threads_the_upstream(self, db_pool):
+        """The other verb DOES own those options: each stage after a saving
+        one is wired to receive its result."""
+        client = JobClient(db_pool)
+
+        job_ids = await client.create_pipeline_with_results(
+            [
+                ("FetchIt", {"url": "x"}, True),
+                ("UseIt", {}, False),
+                ("AfterUnsaved", {}, True),
+            ]
+        )
+
+        async with db_pool.acquire() as conn:
+            rows = {
+                r["id"]: r
+                for r in await conn.fetch(
+                    "SELECT id, admin_data FROM jorb WHERE id = ANY($1::bigint[])",
+                    job_ids,
+                )
+            }
+
+        # stage 2 follows a SAVING stage: it receives that result
+        assert rows[job_ids[1]]["admin_data"]["use_result_from"] == job_ids[0]
+        assert rows[job_ids[1]]["admin_data"]["save_result"] is False
+        # stage 3 follows a NON-saving stage: there is nothing to receive
+        assert "use_result_from" not in rows[job_ids[2]]["admin_data"]
 
     @pytest.mark.asyncio
     async def test_create_pipeline_empty(self, db_pool):

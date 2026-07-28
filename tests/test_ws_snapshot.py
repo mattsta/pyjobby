@@ -193,7 +193,11 @@ async def seed_known_queue(pool: asyncpg.Pool, queue: str) -> None:
 #: What ``seed_known_queue`` must produce, exactly. Volatile fields (the two
 #: ages, and the fleet-wide worker count) are asserted separately.
 EXPECTED_SEEDED_QUEUE = {
-    "queued": 4,
+    # `queued` is CLAIMABLE NOW on every surface (db.QUEUE_STATS_SQL), so it
+    # equals `backlog` here and excludes the one `scheduled` job. Summing the
+    # two into `queued` made this feed disagree with pj-admin queues stats
+    # under the same word.
+    "queued": 3,
     "claimed": 1,
     "running": 2,
     "waiting": 1,

@@ -1124,15 +1124,20 @@ class WebSocketServer:
             if kind == "queue":
                 stats["paused"] = bool(count)
             elif kind == "backlog":
+                # `queued` means CLAIMABLE NOW on every surface -- see
+                # db.QUEUE_STATS_SQL, which this snapshot answers to. It is
+                # the same number `backlog` carries; both names are emitted
+                # because the dashboard renders backlog-with-age while the
+                # rest of the platform speaks in states.
                 stats["backlog"] = count
-                stats["queued"] += count
+                stats["queued"] = count
                 stats["oldest_backlog_age_seconds"] = max(float(age or 0.0), 0.0)
             elif kind == "scheduled":
-                # queued, but deliberately not due yet: counted as queued,
-                # excluded from backlog, because a job scheduled for next week
-                # is not the fleet falling behind.
+                # Queued in the database, but deliberately not due yet. NOT
+                # added to `queued`: a job scheduled for next week is not the
+                # fleet falling behind, and summing it here made the dashboard
+                # report a different `queued` than pj-admin queues stats.
                 stats["scheduled"] = count
-                stats["queued"] += count
             elif kind == "inflight":
                 stats[state] = count
                 stats["oldest_inflight_age_seconds"] = max(
@@ -1193,11 +1198,21 @@ class WebSocketServer:
         """
         if self.db_pool is None:
             return
-        watched = [
-            (channel, int(channel[len(JOB_CHANNEL_PREFIX) :]))
-            for channel in list(self.subscriptions)
-            if channel.startswith(JOB_CHANNEL_PREFIX)
-        ]
+        # Parse defensively: `watch_job` only ever mints `job:<int>`, but a
+        # client can `subscribe` to any string, and this loop runs for EVERY
+        # connected client. An unparseable name used to raise out of the
+        # comprehension, past the per-channel try below, into the broadcast
+        # loop's catch-all -- so one client subscribing to "job:x" silently
+        # stopped snapshots AND watch re-arming for everybody, for as long
+        # as it stayed connected.
+        watched: list[tuple[str, int]] = []
+        for channel in list(self.subscriptions):
+            if not channel.startswith(JOB_CHANNEL_PREFIX):
+                continue
+            suffix = channel[len(JOB_CHANNEL_PREFIX) :]
+            if not suffix.isdigit():
+                continue
+            watched.append((channel, int(suffix)))
         for channel, job_id in watched:
             try:
                 state = await self.db_pool.fetchval(WATCH_JOB_SQL, job_id)
@@ -1244,9 +1259,7 @@ class WebSocketServer:
                 if self.notify_conn is None or self.notify_conn.is_closed():
                     try:
                         await self.init_notify_connection()
-                        logger.warning(
-                            "PostgreSQL LISTEN connection re-established"
-                        )
+                        logger.warning("PostgreSQL LISTEN connection re-established")
                     except Exception as e:
                         logger.error(
                             f"PostgreSQL LISTEN connection is down and could "
@@ -1346,9 +1359,7 @@ class WebSocketServer:
             if self._notification_tasks:
                 for task in self._notification_tasks:
                     task.cancel()
-                await asyncio.gather(
-                    *self._notification_tasks, return_exceptions=True
-                )
+                await asyncio.gather(*self._notification_tasks, return_exceptions=True)
             if self.notify_conn and not self.notify_conn.is_closed():
                 await self.notify_conn.close()
             if self.db_pool:

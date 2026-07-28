@@ -944,7 +944,7 @@ class JobClient:
         job_id = await self.enqueue(job_class, **options)
         try:
             return await self.wait_for_result(job_id, timeout=timeout)
-        except (TimeoutError, asyncio.CancelledError):
+        except TimeoutError, asyncio.CancelledError:
             # The caller has stopped waiting; do not orphan the job. This
             # catches BOTH give-up paths: our own timeout, and the ordinary
             # async abandonments -- asyncio.timeout()/wait_for around this
@@ -1463,9 +1463,7 @@ class JobClient:
         to get push latency."""
         return self._db_params is not None and not self._closed
 
-    async def wait_for_group(
-        self, run_group: int, timeout: float | None = None
-    ) -> int:
+    async def wait_for_group(self, run_group: int, timeout: float | None = None) -> int:
         """Wait until EVERY job in `run_group` has finished; returns the
         member count. Raises JobError naming the failed members if any
         member crashed or was cancelled (the group can then never finish),
@@ -2626,16 +2624,25 @@ class JobClient:
         previous_saved = False
 
         for job_class, kwargs, save_result in stages:
+            # The result options are supplied ONLY by the verb that owns them.
+            # create_pipeline never named them, so a stage whose kwargs carry
+            # `save_result` passes it through to enqueue as it always did;
+            # naming them unconditionally here turned that into a "multiple
+            # values for keyword argument" TypeError.
+            result_options: dict[str, Any] = {}
+            if pass_results:
+                result_options["save_result"] = save_result
+                result_options["use_result_from"] = (
+                    previous_job if previous_saved else None
+                )
+
             job_id = await self.enqueue(
                 job_class,
                 **kwargs,
                 queue=queue,
                 priority=priority,
-                save_result=save_result,
-                use_result_from=(
-                    previous_job if pass_results and previous_saved else None
-                ),
                 waitfor_job=previous_job,
+                **result_options,
                 **common_options,
             )
             job_ids.append(job_id)
@@ -3037,9 +3044,7 @@ class SyncJobClient:
     # client — run()/wait_for_result() are the sync shapes of that workflow).
     # ---------------------------------------------------------------------
 
-    def run(
-        self, job_class: str, timeout: float | None = None, **options: Any
-    ) -> Any:
+    def run(self, job_class: str, timeout: float | None = None, **options: Any) -> Any:
         """Synchronous JobClient.run()."""
         return self._run(self._client.run(job_class, timeout=timeout, **options))
 
@@ -3074,9 +3079,7 @@ class SyncJobClient:
         )
         return members
 
-    def cancel_and_wait(
-        self, job_id: int, timeout: float | None = None
-    ) -> str | None:
+    def cancel_and_wait(self, job_id: int, timeout: float | None = None) -> str | None:
         """Synchronous JobClient.cancel_and_wait()."""
         state: str | None = self._run(
             self._client.cancel_and_wait(job_id, timeout=timeout)
@@ -3149,16 +3152,12 @@ class SyncJobClient:
 
     def get_failed_jobs(self, **filters: Any) -> list[dict[str, Any]]:
         """Synchronous JobClient.get_failed_jobs()."""
-        rows: list[dict[str, Any]] = self._run(
-            self._client.get_failed_jobs(**filters)
-        )
+        rows: list[dict[str, Any]] = self._run(self._client.get_failed_jobs(**filters))
         return rows
 
     def get_waiting_jobs(self, **filters: Any) -> list[dict[str, Any]]:
         """Synchronous JobClient.get_waiting_jobs()."""
-        rows: list[dict[str, Any]] = self._run(
-            self._client.get_waiting_jobs(**filters)
-        )
+        rows: list[dict[str, Any]] = self._run(self._client.get_waiting_jobs(**filters))
         return rows
 
     def bulk_cancel(self, job_ids: list[int]) -> int:
@@ -3196,9 +3195,7 @@ class SyncJobClient:
 
     def create_pipeline_with_results(self, *args: Any, **options: Any) -> Any:
         """Synchronous JobClient.create_pipeline_with_results()."""
-        return self._run(
-            self._client.create_pipeline_with_results(*args, **options)
-        )
+        return self._run(self._client.create_pipeline_with_results(*args, **options))
 
     def health_check(self) -> bool:
         """Synchronous JobClient.health_check()."""

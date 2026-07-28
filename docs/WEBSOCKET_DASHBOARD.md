@@ -308,8 +308,13 @@ not fetched separately.
 }
 ```
 
-`queued` = `backlog` + `scheduled`: backlog is claimable *now*, scheduled is
-queued with a `run_after` in the future.
+`queued` and `backlog` are the same number — jobs claimable *now* — under the
+two names this feed serves: `backlog` pairs with `oldest_backlog_age_seconds`
+for the dashboard, `queued` is the state name the rest of the platform uses.
+`scheduled` (queued with a `run_after` in the future) is reported separately
+and is deliberately NOT part of either: deferred work is not the fleet falling
+behind. This is the same split `pj-admin queues stats` and `/metrics` report,
+so all three agree on what "queued" means.
 
 #### schedule_executed
 

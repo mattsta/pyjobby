@@ -88,15 +88,28 @@ jobs:
       - name: Build wheel and sdist
         run: uv build
 
-      - name: Verify the wheel ships its SQL
+      - name: Verify the wheel ships the whole base schema
         run: |
           python - <<'PY'
-          import glob, zipfile, sys
+          import glob, zipfile
+          from pathlib import Path
+
+          # Compare against the source tree rather than a hardcoded name: the
+          # schema is a DIRECTORY of ordered files, and an assertion naming
+          # one file silently stopped protecting anything when it was split.
+          want = {p.name for p in Path("pyjobby/sql/schema").glob("*.sql")}
+          assert want, "no base-schema files in the source tree"
+
           wheel = glob.glob("dist/*.whl")[0]
           names = zipfile.ZipFile(wheel).namelist()
-          sql = [n for n in names if n.startswith("pyjobby/sql/")]
-          assert any(n.endswith("schema.sql") for n in sql), sql
-          print(f"{wheel}: {len(sql)} SQL file(s) packaged")
+          got = {
+              n.split("/")[-1]
+              for n in names
+              if n.startswith("pyjobby/sql/schema/") and n.endswith(".sql")
+          }
+          missing = sorted(want - got)
+          assert not missing, f"{wheel} is missing base-schema files: {missing}"
+          print(f"{wheel}: all {len(got)} base-schema file(s) packaged")
           PY
 
       - uses: actions/upload-artifact@v4
