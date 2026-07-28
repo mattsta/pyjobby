@@ -2594,22 +2594,53 @@ class JobClient:
             # job_ids[1] waits for job_ids[0]
             # job_ids[2] waits for job_ids[1]
         """
-        if not steps:
-            return []
+        return await self._create_chain(
+            [(job_class, kwargs, True) for job_class, kwargs in steps],
+            queue=queue,
+            priority=priority,
+            pass_results=False,
+            common_options={},
+        )
 
-        job_ids = []
-        previous_job = None
+    async def _create_chain(
+        self,
+        stages: list[tuple[str, dict[str, Any], bool]],
+        *,
+        queue: str,
+        priority: int,
+        pass_results: bool,
+        common_options: dict[str, Any],
+    ) -> list[int]:
+        """The one home for the linear-chain builders.
 
-        for job_class, kwargs in steps:
+        Each stage waits on the previous (waitfor_job); when ``pass_results``
+        is set, a stage whose predecessor SAVED its result also receives it
+        (use_result_from -> kwargs['upstream_result'] at execution time).
+        create_pipeline chains without passing -- injecting upstream_result
+        into jobs that never asked for it would be a TypeError in their
+        task() -- while create_pipeline_with_results threads results through.
+        Different verbs, one chain construction.
+        """
+        job_ids: list[int] = []
+        previous_job: int | None = None
+        previous_saved = False
+
+        for job_class, kwargs, save_result in stages:
             job_id = await self.enqueue(
                 job_class,
+                **kwargs,
                 queue=queue,
                 priority=priority,
+                save_result=save_result,
+                use_result_from=(
+                    previous_job if pass_results and previous_saved else None
+                ),
                 waitfor_job=previous_job,
-                **kwargs,
+                **common_options,
             )
             job_ids.append(job_id)
             previous_job = job_id
+            previous_saved = save_result
 
         return job_ids
 
@@ -2825,26 +2856,13 @@ class JobClient:
 
             # Each job receives previous job's result in kwargs['upstream_result']
         """
-        job_ids = []
-        previous_job = None
-        previous_saved_result = False
-
-        for job_class, kwargs, save_result in stages:
-            job_id = await self.enqueue(
-                job_class,
-                **kwargs,
-                queue=queue,
-                priority=priority,
-                save_result=save_result,
-                use_result_from=previous_job if previous_saved_result else None,
-                waitfor_job=previous_job,
-                **common_options,
-            )
-            job_ids.append(job_id)
-            previous_job = job_id
-            previous_saved_result = save_result
-
-        return job_ids
+        return await self._create_chain(
+            list(stages),
+            queue=queue,
+            priority=priority,
+            pass_results=True,
+            common_options=common_options,
+        )
 
 
 class SyncJobClient:
