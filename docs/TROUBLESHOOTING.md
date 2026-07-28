@@ -18,7 +18,7 @@ gate, and a deploy smoke test. Run it before reading logs.
 ```console
 $ pj-admin --dsn "$PYJOBBY_DSN" doctor
 PASS database: connected
-PASS schema: installed and complete; migrations [1, 2, 3, 4] are not recorded yet, which the next upgrade reads (run: pj-admin db migrate)
+PASS schema: installed, migrations current (baseline)
 PASS triggers: all schema triggers present (7)
 PASS notify-queue: 0.0% full
 WARN workers: no live workers seen in last 60s
@@ -108,10 +108,10 @@ $ echo $?
 ```
 
 **A schema of the wrong shape** — installed from a different revision of
-`schema.sql`, so it has `jorb` and records no pending migration, and used
-to pass. `doctor` now checks the schema's *shape* against the manifest of
-objects this release actually addresses (`pyjobby/migrations.py`), and
-names what is absent:
+the base schema, so it has `jorb` and records nothing pending, and a
+presence-only check would pass it. `doctor` checks the schema's *shape*
+against the manifest of objects this release actually addresses
+(`pyjobby/migrations.py`), and names what is absent:
 
 ```console
 $ pj-admin doctor
@@ -128,27 +128,28 @@ every one:
 $ pj-admin db status
 Base schema installed: yes
 Applied migrations:    none
-Pending migrations:    [1, 2, 3, 4]
+Pending migrations:    none
 Missing objects:       3
   index jorb_dag_retention_idx
   index jorb_schedule_log_retention_idx
   index jorb_worker_retention_idx
 ```
 
-`Missing objects` is the line that matters. `Pending migrations` can only
-say "this database has not *recorded* migration N", and a database
-installed before the migration runner existed records nothing at all while
-still being stale.
+`Missing objects` is the line that matters. The version lines can only say
+what this database *recorded*, and a drifted database records exactly what
+a current one does — only the object list tells them apart.
 
 Both checks stop the report: every line below `schema` queries something
 the check just reported missing, and a health report that crashes halfway
 through is worse than one that stops.
 
-**Fix: `pj-admin db migrate`**, which now upgrades an existing database
-rather than only installing a new one. It installs `schema.sql` if `jorb`
-is absent, otherwise applies the numbered migration files this database has
-not recorded — one transaction per file, serialised fleet-wide by an
-advisory lock, so running it from every host's deploy step is safe. See
+**Fix: `pj-admin db migrate`.** On an empty database it installs the whole
+base schema; on a database with pending migration files (a live-deployment
+concern — none ship today) it applies them, one transaction per file,
+serialised fleet-wide by an advisory lock, so running it from every host's
+deploy step is safe. A database that is missing objects with nothing
+pending was installed from a different schema revision: recreate it (or
+reconcile by hand from the object list). See
 [deployment-guide.md § The database](deployment-guide.md#the-database).
 
 If a stale schema is reached by a command rather than by `doctor`, you get

@@ -130,10 +130,10 @@ class JobInfo:
     claimed_by: int | None = None
     claimed_at: datetime | None = None
     # someone has waited on this job; the demand signal that switches its
-    # jorb_done/jorb_event notifications on (see sql/schema.sql)
+    # jorb_done/jorb_event notifications on (see sql/schema/90_notify.sql)
     awaited: bool = False
     # the recurring schedule that fired this job, NULL for a job anyone
-    # enqueued directly (see sql/schema.sql)
+    # enqueued directly (see sql/schema/10_jobs.sql)
     schedule_id: int | None = None
 
     @classmethod

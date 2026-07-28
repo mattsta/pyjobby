@@ -440,7 +440,7 @@ to `finished`, the job returns to `queued` for the requested future run.
 - If web endpoints are enabled, each worker also opens a web server for requests
   - Under linux, each web server on each worker process can receive queries due to in-kernel TCP port load balancing
   - On other platforms, only one of the workers will receive all web requests
-- Workers `LISTEN` on postgres `NOTIFY` channels (the triggers are in `pyjobby/sql/schema.sql`), so a newly enqueued job wakes an idle worker **immediately**; the periodic poll (`--check-interval`, default 5 seconds) is only a fallback
+- Workers `LISTEN` on postgres `NOTIFY` channels (the triggers are in `pyjobby/sql/schema/90_notify.sql`), so a newly enqueued job wakes an idle worker **immediately**; the periodic poll (`--check-interval`, default 5 seconds) is only a fallback
 - If a worker finds a job, it claims it (state `claimed`), marks it `running` while executing, completes it, then immediately checks the job database for more jobs without entering the delay loop again
   - see query `claim` for logic behind next job selection based on: matching server capability, most urgent job priority first (priority is a finishing position — the **smallest** `prio` is claimed first — and each worker claims only `prio <=` its own ceiling, `pj --max-prio`, default 1000), scheduled run time, and current job state
 - If a worker doesn't find an eligible job, it waits for a `NOTIFY` or the next `--check-interval` poll
@@ -479,11 +479,13 @@ poetry install
 ### Database Setup
 
 One step, and the same step whether the database is new or old. `pj-admin db
-migrate` installs `pyjobby/sql/schema.sql` on a fresh database (recording
-every shipped migration as already contained in it, so none of them runs),
-and on an **existing** database applies the numbered files in
-`pyjobby/sql/migrations/` it has not recorded in `schema_migrations` — one
-transaction per file. All the SQL ships inside the package.
+migrate` installs the base schema — the ordered files in
+`pyjobby/sql/schema/`, executed as one transaction — on a fresh database,
+and on an **existing** database applies any numbered files in
+`pyjobby/sql/migrations/` it has not recorded in `schema_migrations`, one
+transaction per file. (No migration files ship today: the base schema is the
+whole current schema, and the first migration is minted when there is a live
+deployment to upgrade.) All the SQL ships inside the package.
 
 It is idempotent, and safe to run from every host's deploy step at once: it
 takes an advisory lock, so one process does the work and the others wait and

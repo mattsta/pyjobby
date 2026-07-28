@@ -117,7 +117,7 @@ JOB_CHANNEL_PREFIX = "job:"
 
 #: The PostgreSQL NOTIFY channels this server LISTENs on. Every name here
 #: must be one the schema actually emits (``jorb_notify('<channel>', ...)``
-#: in sql/schema.sql): PostgreSQL accepts LISTEN on any string, so a name
+#: in sql/schema/90_notify.sql): PostgreSQL accepts LISTEN on any string, so a name
 #: nothing NOTIFYs does not fail, it just never fires -- and a client that
 #: subscribed to the events it was supposed to carry waits forever.
 #: ``queue_alert`` was exactly that, and is gone.
@@ -327,7 +327,7 @@ class WebSocketServer:
             self.notify_conn = await db.connect(**self.db_params)
 
             # Every channel this server LISTENs on, and every one of them is
-            # emitted by a trigger in sql/schema.sql -- LISTENing on a name
+            # emitted by a trigger in sql/schema/90_notify.sql -- LISTENing on a name
             # nothing NOTIFYs is accepted by PostgreSQL and then waits
             # forever, which is a promise to subscribers that cannot be kept
             # (tests/test_ws_snapshot.py checks this set against the catalog).

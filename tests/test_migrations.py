@@ -1,27 +1,21 @@
-"""The upgrade path: a database installed by an older release must be able to
-become a current one.
+"""The migration RUNNER, proven ready before it is needed.
 
-WHY THIS FILE EXISTS. `pj-admin db migrate` used to install schema.sql when
-the `jorb` table was absent and do nothing at all when it was present, and
-`pyjobby/sql/migrations/` did not exist -- so there was no way to bring an
-existing database up to a newer schema, and no test could notice, because the
-test harness reinstalls the schema by dropping the whole `public` namespace
-whenever schema.sql changes. Every test in the suite therefore ran against a
-FRESH install, which is the one shape no long-lived deployment ever has.
+PRE-LIVE, no migration files ship: the base schema (pyjobby/sql/schema/) is
+always the whole current schema, a fresh install is the only supported
+history, and ``available_migrations()`` is empty -- a state this file pins so
+a stray NNN_*.sql cannot sneak into the package while the pre-live policy is
+in force.
 
-So nothing here uses the session database. Every test creates its own, either
-empty, or installed from the frozen pre-migration schema
-(tests/sql/schema_before_001.sql), and the assertion is always about the
-CATALOG -- columns, indexes with their predicates, function bodies, trigger
-definitions, constraints, views, enum labels, storage parameters -- and never
-about a recorded version number. A version number is exactly what a stale
-database lies about.
+The runner itself must stay exercised anyway, because the day the platform
+goes live the FIRST schema change mints migrations/001_*.sql and everything
+here -- ordering, per-file transactions, recorded-vs-applied, the advisory
+lock -- has to already work. So the apply-path tests run against SYNTHETIC
+migrations injected by monkeypatching ``available_migrations()``: the runner
+executes real DDL on a real scratch database, and no file ships.
 
-THE INVARIANT UNDER TEST, stated once: a database upgraded with the shipped
-migrations is indistinguishable from one installed fresh from schema.sql.
-That is what makes it safe for schema.sql to be the whole current schema (so
-a fresh install is one file and one statement) while migrations carry only
-deltas (so an existing database is not asked to re-run history).
+Nothing here uses the session database. Every test creates its own, and the
+assertions are about the CATALOG -- never about a recorded version number,
+which is exactly what a stale database lies about.
 """
 
 from __future__ import annotations
@@ -34,14 +28,15 @@ import pytest_asyncio
 
 from pyjobby import db as pjdb
 from pyjobby import migrations
+from pyjobby.migrations import Migration
 from tests.schema_fixtures import ScratchDatabases, catalog
 
 pytestmark = pytest.mark.asyncio
 
 #: The migration runner's own bookkeeping table. It is created by
-#: migrations.py, not by schema.sql, so it is deliberately absent from the
-#: required-shape manifest -- `doctor` must not demand it of a database that
-#: has never been migrated, it must demand `db migrate`.
+#: migrations.py, not by the base schema, so it is deliberately absent from
+#: the required-shape manifest -- `doctor` must not demand it of a database
+#: that has never been migrated, it must demand `db migrate`.
 RUNNER_OWN_OBJECTS = {"schema_migrations", "schema_migrations_pkey"}
 
 
@@ -59,36 +54,47 @@ async def connect(params: dict) -> asyncpg.Connection:
     return await pjdb.connect(**params)
 
 
+def synthetic_migrations(monkeypatch, *files: tuple[int, str, str]) -> None:
+    """Make the runner see `files` as the shipped migrations.
+
+    Each entry is (version, name, sql). Patching ``available_migrations`` is
+    the whole intervention: everything downstream -- ordering, transactions,
+    recording, locking -- is the real runner against a real database.
+    """
+    fixed = [Migration(version=v, name=n, sql=s) for v, n, s in files]
+    monkeypatch.setattr(
+        migrations, "available_migrations", lambda: sorted(fixed, key=lambda m: m.version)
+    )
+
+
 # ============================================================================
-# What the package ships
+# The pre-live policy, pinned
 # ============================================================================
 
 
-class TestPackagedMigrations:
-    async def test_migration_files_are_shipped_and_ordered(self):
-        """The failure that started this: available_migrations() returned []
-        because pyjobby/sql/migrations/ did not exist, so every database in
-        the world was permanently at whatever schema.sql it was born with."""
-        available = migrations.available_migrations()
+class TestPreLivePolicy:
+    async def test_no_migration_files_ship_before_the_platform_is_live(self):
+        """Pre-live, every schema change goes into the base schema files and
+        a fresh install is the whole story. A migration file appearing in the
+        package would mean an upgrade path is being built for deployments
+        that do not exist -- this fails the moment one ships, so minting 001
+        is an explicit decision (going live), not an accident."""
+        assert migrations.available_migrations() == []
 
-        assert available, "no migration files ship with the package"
-        versions = [m.version for m in available]
-        assert versions == sorted(versions)
-        assert len(set(versions)) == len(versions), f"duplicate versions: {versions}"
-        assert versions[0] == 1, "numbering starts at 001"
-        assert all(m.sql.strip() for m in available), "a migration file is empty"
-
-    async def test_migration_files_are_readable_through_the_installed_package(self):
-        """They are loaded with importlib.resources, so a file that is on
-        disk but not packaged reads as "no migrations" at runtime -- the exact
-        silent failure this file exists to prevent."""
-        names = {m.name for m in migrations.available_migrations()}
-
-        assert names == {
+    async def test_the_base_schema_is_the_ordered_purpose_files(self):
+        """base_schema_sql() concatenates pyjobby/sql/schema/*.sql in lexical
+        order; the numeric prefixes ARE the dependency order. Pinning the
+        first and last keeps a stray file from silently changing what a fresh
+        install runs first or last."""
+        names = sorted(
             entry.name
-            for entry in (migrations._SQL_ROOT / "migrations").iterdir()
+            for entry in (migrations._SQL_ROOT / "schema").iterdir()
             if entry.name.endswith(".sql")
-        }
+        )
+        assert names[0] == "00_core.sql", names
+        assert names[-1] == "92_history_trigger.sql", names
+        sql = migrations.base_schema_sql()
+        assert sql.index("CREATE TYPE jorbstate") < sql.index("CREATE TABLE jorb ")
 
 
 # ============================================================================
@@ -97,27 +103,6 @@ class TestPackagedMigrations:
 
 
 class TestFreshInstall:
-    async def test_fresh_install_records_migrations_without_running_them(
-        self, scratch: ScratchDatabases
-    ):
-        """schema.sql IS the current schema, so a fresh database already has
-        everything the migrations produce. Running them anyway would at best
-        be wasted DDL and at worst real damage -- 001 rebuilds two indexes and
-        deletes rows -- so they are stamped, not applied."""
-        params = await scratch.create(install=None)
-        conn = await connect(params)
-        try:
-            result = await migrations.migrate(conn)
-
-            assert result.installed_base is True
-            assert result.applied == [], "a fresh install must run no migration"
-            assert result.recorded == [
-                m.version for m in migrations.available_migrations()
-            ]
-            assert await migrations.applied_versions(conn) == set(result.recorded)
-        finally:
-            await conn.close()
-
     async def test_fresh_install_has_nothing_pending_and_nothing_missing(
         self, scratch: ScratchDatabases
     ):
@@ -149,231 +134,121 @@ class TestFreshInstall:
         finally:
             await conn.close()
 
-    async def test_every_migration_file_is_a_no_op_on_a_fresh_install(
-        self, scratch: ScratchDatabases
-    ):
-        """The safety net under the "stamp, don't run" decision.
-
-        Stamping means a fresh database never executes these files -- but a
-        database at an INTERMEDIATE shape executes them while already holding
-        some of what they install, and there is no fixture for every
-        intermediate shape that ever shipped. A fresh install is the extreme
-        case of "already has all of it", so running the files against one and
-        requiring the catalog not to move proves every statement in them is
-        conditional.
-        """
-        params = await scratch.create()
-        conn = await connect(params)
-        try:
-            before = await catalog(conn)
-
-            for migration in migrations.available_migrations():
-                await conn.execute(migration.sql)
-
-            assert await catalog(conn) == before
-        finally:
-            await conn.close()
-
 
 # ============================================================================
-# Upgrade
+# The apply path, against synthetic migrations
 # ============================================================================
 
 
-class TestUpgradeFromLegacySchema:
-    async def test_the_legacy_fixture_really_is_stale(self, scratch: ScratchDatabases):
-        """Guards every assertion below it.
+class TestRunnerAppliesMigrations:
+    """The post-live half of the runner, kept working while unused.
 
-        If the frozen schema were quietly refreshed to the current one, the
-        upgrade tests would all pass while testing nothing, so this pins the
-        specific drift: the columns whose absence made `pj-admin doctor` die
-        on a database it had just certified.
-        """
-        params = await scratch.create(install="legacy")
+    These are the semantics the first real migration will land on: files are
+    applied in version order, each in its own transaction, recorded only when
+    they commit -- and a fresh install stamps them all without running one.
+    """
+
+    async def test_fresh_install_records_synthetic_migrations_without_running_them(
+        self, monkeypatch, scratch: ScratchDatabases
+    ):
+        """The base schema is by definition the sum of every migration, so a
+        fresh database already has everything they produce. They are stamped,
+        not applied -- proven by the side effect NOT existing."""
+        synthetic_migrations(
+            monkeypatch,
+            (1, "001_a.sql", "CREATE TABLE pjtest_mig_a (id int)"),
+            (2, "002_b.sql", "CREATE TABLE pjtest_mig_b (id int)"),
+        )
+        params = await scratch.create(install=None)
         conn = await connect(params)
         try:
-            missing = await migrations.missing_objects(conn)
-
-            assert "column jorb_worker.job_threads" in missing
-            assert "column jorb.tags" in missing
-            assert "column jorb.claimed_at" in missing
-            assert "column jorb.awaited" in missing
-            assert "function claim_jorb" in missing
-            assert "function jorb_notify" in missing
-            assert "index jorb_tags_idx" in missing
-            assert "column jorb.schedule_id" in missing
-            assert "index jorb_schedule_id_idx" in missing
-            # ... and it is a database no version number can tell apart from a
-            # current one: it records nothing, so nothing is "pending".
-            assert await migrations.applied_versions(conn) == set()
-        finally:
-            await conn.close()
-
-    async def test_upgraded_database_is_identical_to_a_fresh_install(
-        self, scratch: ScratchDatabases
-    ):
-        """The whole point. Not "the version matches" -- the CATALOG matches."""
-        old = await connect(await scratch.create(install="legacy"))
-        new = await connect(await scratch.create())
-        try:
-            result = await migrations.migrate(old)
-            assert result.applied == [
-                m.version for m in migrations.available_migrations()
-            ]
-
-            upgraded, fresh = await catalog(old), await catalog(new)
-            assert upgraded == fresh, "\n".join(
-                ["upgraded database differs from a fresh install:"]
-                + [f"  only upgraded: {o}" for o in sorted(set(upgraded) - set(fresh))]
-                + [f"  only fresh:    {f}" for f in sorted(set(fresh) - set(upgraded))]
-            )
-        finally:
-            await old.close()
-            await new.close()
-
-    async def test_upgrading_twice_changes_nothing(self, scratch: ScratchDatabases):
-        conn = await connect(await scratch.create(install="legacy"))
-        try:
-            await migrations.migrate(conn)
-            after_first = await catalog(conn)
-
             result = await migrations.migrate(conn)
 
-            assert result.changed is False
-            assert await catalog(conn) == after_first
+            assert result.installed_base is True
+            assert result.applied == []
+            assert result.recorded == [1, 2]
+            assert await migrations.applied_versions(conn) == {1, 2}
+            # stamped means the DDL never ran
+            assert not await conn.fetchval("SELECT to_regclass('pjtest_mig_a')")
         finally:
             await conn.close()
 
-    async def test_upgrade_keeps_the_jobs_that_were_already_there(
-        self, scratch: ScratchDatabases
+    async def test_pending_migrations_apply_in_order_and_are_recorded(
+        self, monkeypatch, scratch: ScratchDatabases
     ):
-        """An upgrade is not a re-create: the rows are the reason the database
-        could not simply be dropped and reinstalled in the first place."""
-        conn = await connect(await scratch.create(install="legacy"))
+        """An existing database (installed before the files existed) runs
+        them, oldest first -- 002 depends on 001 having run."""
+        params = await scratch.create()  # installed, records nothing yet
+        synthetic_migrations(
+            monkeypatch,
+            (2, "002_b.sql", "ALTER TABLE pjtest_mig_a ADD COLUMN b int"),
+            (1, "001_a.sql", "CREATE TABLE pjtest_mig_a (id int)"),
+        )
+        conn = await connect(params)
         try:
-            job_id = await conn.fetchval(
-                "INSERT INTO jorb (queue, job_class, kwargs) "
-                "VALUES ('legacy', 'tests.dxe_jobs.OkJob', $1) RETURNING id",
-                {"n": 1},
-            )
+            result = await migrations.migrate(conn)
 
-            await migrations.migrate(conn)
+            assert result.installed_base is False
+            assert result.applied == [1, 2]
+            assert await migrations.applied_versions(conn) == {1, 2}
+            assert await conn.fetchval("SELECT to_regclass('pjtest_mig_a')")
 
-            row = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-            assert row["queue"] == "legacy"
-            assert row["kwargs"] == {"n": 1}
-            # The new columns arrive with exactly the values a fresh row gets.
-            assert row["tags"] == {}
-            assert row["awaited"] is False
-            assert row["claimed_at"] is None
+            again = await migrations.migrate(conn)
+            assert again.applied == [], "recorded migrations were re-run"
         finally:
             await conn.close()
 
-    async def test_upgrade_moves_schedule_provenance_out_of_admin_data(
-        self, scratch: ScratchDatabases
+    async def test_a_failing_migration_is_rolled_back_and_not_recorded(
+        self, monkeypatch, scratch: ScratchDatabases
     ):
-        """002 relocates `admin_data->>'schedule_id'` to `jorb.schedule_id`.
-
-        The backfill is a CORRECTNESS step, not tidiness. The concurrency
-        check reads the column the instant the new code is deployed, so a
-        schedule whose jobs are still in flight -- old jsonb key, NULL column
-        -- would count ZERO of them and fire again while already at its
-        limit, which is the runaway max_concurrent_jobs exists to prevent.
-
-        And the key is removed rather than left beside the column, because
-        two copies of one fact are two things that can disagree.
-        """
-        conn = await connect(await scratch.create(install="legacy"))
+        """One transaction per file: a failure leaves the database exactly as
+        it was before that file, records nothing for it, and does not stop
+        earlier files from having landed -- so the operator fixes the file
+        and re-runs, rather than untangling half-applied DDL."""
+        params = await scratch.create()
+        synthetic_migrations(
+            monkeypatch,
+            (1, "001_ok.sql", "CREATE TABLE pjtest_mig_a (id int)"),
+            (
+                2,
+                "002_boom.sql",
+                "CREATE TABLE pjtest_mig_b (id int); SELECT no_such_function()",
+            ),
+        )
+        conn = await connect(params)
         try:
-            live = await conn.fetchval(
-                "INSERT INTO jorb (queue, job_class, state, admin_data) "
-                "VALUES ('sched', 'J', 'running', $1) RETURNING id",
-                {"schedule_id": "7", "schedule_name": "nightly"},
-            )
-            plain = await conn.fetchval(
-                "INSERT INTO jorb (queue, job_class, admin_data) "
-                "VALUES ('sched', 'J', $1) RETURNING id",
-                {"max_retries": 3},
-            )
+            with pytest.raises(asyncpg.PostgresError):
+                await migrations.migrate(conn)
 
-            await migrations.migrate(conn)
-
-            moved = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", live)
-            assert moved["schedule_id"] == 7
-            assert moved["admin_data"] == {"schedule_name": "nightly"}
-            # a job no schedule created is untouched and stays out of the index
-            untouched = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", plain)
-            assert untouched["schedule_id"] is None
-            assert untouched["admin_data"] == {"max_retries": 3}
+            # 001 landed and is recorded; 002 left nothing behind
+            assert await migrations.applied_versions(conn) == {1}
+            assert await conn.fetchval("SELECT to_regclass('pjtest_mig_a')")
+            assert not await conn.fetchval("SELECT to_regclass('pjtest_mig_b')")
         finally:
             await conn.close()
 
-    async def test_upgrade_leaves_an_unreadable_schedule_id_alone(
-        self, scratch: ScratchDatabases
+    async def test_two_upgrades_at_once_apply_each_migration_once(
+        self, monkeypatch, scratch: ScratchDatabases
     ):
-        """admin_data is free-form jsonb, so the key may hold anything.
-
-        Casting it blindly aborts the whole upgrade on one hand-edited row.
-        Deleting it blindly is worse -- the migration would destroy the only
-        copy of something it could not understand -- so such a row keeps both
-        its key and its NULL column, where a human can still see it.
-        """
-        conn = await connect(await scratch.create(install="legacy"))
+        """Two hosts deploying at the same instant: the advisory lock makes
+        one apply and the other find nothing left to do -- CREATE TABLE has
+        no IF NOT EXISTS here precisely so a double-run would fail loudly."""
+        params = await scratch.create()
+        synthetic_migrations(
+            monkeypatch,
+            (1, "001_a.sql", "CREATE TABLE pjtest_mig_a (id int)"),
+        )
+        a, b = await connect(params), await connect(params)
         try:
-            odd = await conn.fetchval(
-                "INSERT INTO jorb (queue, job_class, admin_data) "
-                "VALUES ('sched', 'J', $1) RETURNING id",
-                {"schedule_id": "not-a-number"},
+            first, second = await asyncio.gather(
+                migrations.migrate(a), migrations.migrate(b)
             )
 
-            await migrations.migrate(conn)
-
-            row = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", odd)
-            assert row["schedule_id"] is None
-            assert row["admin_data"] == {"schedule_id": "not-a-number"}
+            assert sorted(first.applied + second.applied) == [1]
+            assert await migrations.applied_versions(a) == {1}
         finally:
-            await conn.close()
-
-    async def test_upgrade_installs_the_history_cascade_over_orphaned_rows(
-        self, scratch: ScratchDatabases
-    ):
-        """jorb_history.job_id gained a foreign key, and an old database can
-        hold rows that violate it -- history whose job was deleted before the
-        cascade existed. Under the current schema those rows CANNOT exist, so
-        the migration removes them; leaving them would make ADD CONSTRAINT
-        fail and strand the operator mid-upgrade.
-        """
-        conn = await connect(await scratch.create(install="legacy"))
-        try:
-            job_id = await conn.fetchval(
-                "INSERT INTO jorb (queue, job_class) VALUES ('legacy', 'J') "
-                "RETURNING id"
-            )
-            await conn.execute(
-                "INSERT INTO jorb_history (job_id, event) VALUES ($1, 'orphan')",
-                job_id + 10_000,
-            )
-            assert await conn.fetchval("SELECT count(*) FROM jorb_history") == 2
-
-            await migrations.migrate(conn)
-
-            assert (
-                await conn.fetchval(
-                    "SELECT count(*) FROM jorb_history WHERE event = 'orphan'"
-                )
-                == 0
-            )
-            assert (
-                await conn.fetchval(
-                    "SELECT count(*) FROM jorb_history WHERE job_id = $1", job_id
-                )
-                == 1
-            )
-            # And the key is real: deleting the job now takes its history.
-            await conn.execute("DELETE FROM jorb WHERE id = $1", job_id)
-            assert await conn.fetchval("SELECT count(*) FROM jorb_history") == 0
-        finally:
-            await conn.close()
+            await a.close()
+            await b.close()
 
 
 # ============================================================================
@@ -534,23 +409,6 @@ class TestConcurrentMigrate:
             await a.close()
             await b.close()
 
-    async def test_two_upgrades_at_once_apply_each_migration_once(
-        self, scratch: ScratchDatabases
-    ):
-        params = await scratch.create(install="legacy")
-        a, b = await connect(params), await connect(params)
-        try:
-            first, second = await asyncio.gather(
-                migrations.migrate(a), migrations.migrate(b)
-            )
-
-            versions = [m.version for m in migrations.available_migrations()]
-            assert sorted(first.applied + second.applied) == versions
-            assert await migrations.missing_objects(a) == []
-        finally:
-            await a.close()
-            await b.close()
-
     async def test_migrate_waits_for_a_lock_another_session_holds(
         self, scratch: ScratchDatabases
     ):
@@ -614,17 +472,19 @@ class TestConcurrentMigrate:
 
 
 class TestStatus:
-    async def test_status_on_a_stale_database_names_what_is_missing(
+    async def test_status_on_a_drifted_database_names_what_is_missing(
         self, scratch: ScratchDatabases
     ):
-        conn = await connect(await scratch.create(install="legacy"))
+        """A database whose shape diverges from the base schema is reported
+        by OBJECT, not by version -- a version number is exactly what a
+        drifted database lies about."""
+        conn = await connect(await scratch.create())
         try:
+            await conn.execute("ALTER TABLE jorb DROP COLUMN tags")
+
             info = await migrations.status(conn)
 
             assert info["base_schema_installed"] is True
-            assert info["pending"] == [
-                m.version for m in migrations.available_migrations()
-            ]
             assert "column jorb.tags" in info["missing"]
         finally:
             await conn.close()

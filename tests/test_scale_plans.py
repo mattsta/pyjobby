@@ -1091,6 +1091,60 @@ class TestGroupWakePlan:
         )
         await assert_reads_far_less_than_a_scan(db_pool, plan)
 
+    async def test_a_mostly_finished_group_still_probes_in_o1(
+        self, db_pool, unique_queue
+    ):
+        """The witness-LAST case, which the all-running seed above cannot see.
+
+        Near completion, almost every member is finished — and over the plain
+        run_group index the probe walks past all of them to find the one
+        unfinished witness, an O(members) tail paid by each of the last
+        completions. jorb_group_unfinished_idx holds only unfinished members,
+        so the probe must ride it and touch a handful of entries however many
+        members have already finished."""
+        await seed_terminal_jobs(db_pool, unique_queue)
+        leader = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, kwargs, queue, state, finished)
+               VALUES ('scale.Job', '{}', $1, 'finished', now()) RETURNING id""",
+            unique_queue,
+        )
+        await db_pool.execute("UPDATE jorb SET run_group = $1 WHERE id = $1", leader)
+        # N-2 more finished members, and ONE still running: the witness is the
+        # needle, the finished members are the haystack.
+        await db_pool.execute(
+            """
+            INSERT INTO jorb (job_class, kwargs, queue, state, run_group, finished)
+            SELECT 'scale.Job', '{}', $1, 'finished', $2, now()
+            FROM generate_series(1, $3)
+            """,
+            unique_queue,
+            leader,
+            self.GROUP_SIZE - 2,
+        )
+        await db_pool.execute(
+            """INSERT INTO jorb (job_class, kwargs, queue, state, run_group,
+                                 claimed_at, started)
+               VALUES ('scale.Job', '{}', $1, 'running', $2, now(), now())""",
+            unique_queue,
+            leader,
+        )
+        await settle(db_pool)
+
+        plan = await explain_rolled_back(
+            db_pool, STMTS["enqueue-next-if-peer-group-is-finished"], leader
+        )
+
+        assert_no_seq_scan(plan)
+        assert "jorb_group_unfinished_idx" in plan, plan
+        removed = rows_removed_by_filter(plan)
+        assert removed * 100 < self.GROUP_SIZE, (
+            f"the wake gate read and discarded {removed} rows against a "
+            f"{self.GROUP_SIZE}-member mostly-finished group: the probe is "
+            f"walking finished members instead of riding "
+            f"jorb_group_unfinished_idx\n{plan}"
+        )
+        await assert_reads_far_less_than_a_scan(db_pool, plan)
+
 
 class TestCompactionPlan:
     """`compact()` is issued by every long-lived job, on every turn.

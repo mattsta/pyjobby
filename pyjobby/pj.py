@@ -19,7 +19,7 @@ Design notes:
   that queue has published jorb_worker.idle, so a busy fleet -- which is
   never asleep -- costs the enqueue path nothing. A worker publishes idle
   BEFORE its last claim attempt, which is what makes it impossible for a
-  job to be both unseen and unannounced (see _set_idle and sql/schema.sql).
+  job to be both unseen and unannounced (see _set_idle and sql/schema/90_notify.sql).
 * Cancellation of running jobs: operators set cancel_requested, the
   jorb_cancel NOTIFY reaches the executing worker, and the job's task is
   cancelled at the next await point.
@@ -92,7 +92,7 @@ logger = logger.patch(cleanupLogLengths)  # type: ignore[arg-type]
 STMTS: dict[str, str] = {}
 
 # Claim the single most-urgent runnable job in our queue, honoring the
-# Claiming lives in claim_jorb() (see sql/schema.sql), so the queue control
+# Claiming lives in claim_jorb() (see sql/schema/30_claim.sql), so the queue control
 # plane -- paused / max_concurrency / rate_limit -- is enforced for every
 # claimer rather than re-implemented by each one. Enforcing it there is also
 # the only way it can be CORRECT: the caps need claims for a controlled queue
@@ -611,7 +611,7 @@ class JobSystem:
         """Publish (or withdraw) this worker's demand for enqueue wakeups.
 
         ``jorb_enqueued`` is only notified when some worker on the queue has
-        this flag set (see sql/schema.sql), so this IS the subscription. The
+        this flag set (see sql/schema/90_notify.sql), so this IS the subscription. The
         ordering around it is the correctness argument, and it is the reason
         run() publishes idle BEFORE its last claim rather than after:
 

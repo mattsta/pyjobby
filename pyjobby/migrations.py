@@ -1,17 +1,12 @@
 """Schema installation and migration runner.
 
-The database has exactly two supported histories, and this module is what
-keeps them from diverging:
-
-* a FRESH install runs ``pyjobby/sql/schema.sql`` -- the whole current schema,
-  in one file -- and is then *recorded* as already carrying every migration
-  shipped with the package, because schema.sql already contains their effects.
-  Nothing in ``pyjobby/sql/migrations/`` is executed on a fresh database.
-* an EXISTING database runs the numbered migration files it has not recorded
-  in ``schema_migrations`` yet. A database installed before this runner existed
-  has no ``schema_migrations`` table at all, which reads as "recorded nothing",
-  so it gets every migration from 001 -- which is exactly right: it was
-  installed from an older revision of schema.sql.
+The base schema lives in ``pyjobby/sql/schema/`` as ordered, purpose-named
+files (``00_core.sql``, ``10_jobs.sql``, ... ``92_history_trigger.sql``); a
+FRESH install executes their concatenation, in lexical order, in one
+transaction. An EXISTING database runs any numbered files from
+``pyjobby/sql/migrations/`` it has not recorded in ``schema_migrations`` yet
+-- and a fresh install records every shipped migration WITHOUT running it,
+because the base schema already contains their effects by definition.
 
 Both paths are the same command::
 
@@ -23,20 +18,21 @@ or programmatically::
     conn = await db.connect(**db_params)
     await migrations.migrate(conn)
 
-THE INVARIANT THE TWO PATHS DEPEND ON is that for every N,
-``schema.sql`` is equivalent to ``schema.sql`` as it stood before migration N
-plus migration N. Nothing in this file can enforce that -- it is enforced by
-``tests/test_migrations.py``, which installs a frozen copy of an older
-schema.sql, migrates it, and requires the resulting catalog (columns, indexes,
-functions, triggers, constraints, views, storage parameters) to be identical to
-a fresh install's. A schema change that edits only schema.sql fails that test,
-and so does one that ships only a migration.
+PRE-LIVE POLICY (in force until the platform has live deployments): every
+schema change edits the base schema files and the required-shape manifest
+below, and NO migration files ship -- ``pyjobby/sql/migrations/`` does not
+exist, ``available_migrations()`` is empty, and a fresh install is always the
+complete current schema. The runner itself is kept exercised against
+synthetic migrations by ``tests/test_migrations.py``, so the day the platform
+goes live, the FIRST real schema change mints ``migrations/001_*.sql``
+against the then-frozen baseline and everything below already works.
 
-WHAT A SCHEMA CHANGE THEREFORE COSTS: edit ``schema.sql`` *and* add
+WHAT A SCHEMA CHANGE COSTS, POST-LIVE: edit the base schema files *and* add
 ``pyjobby/sql/migrations/NNN_*.sql`` carrying the same change in idempotent,
 already-applied-tolerant form, then add the objects it introduces to the
-required-shape manifest below. The tests fail loudly if any of the three is
-missed.
+required-shape manifest below. The invariant the two paths depend on -- base
+schema == previous base schema + migration N -- is enforced by the test
+suite, not by this file.
 """
 
 from __future__ import annotations
@@ -83,7 +79,7 @@ MIGRATE_LOCK_KEY = 0x706A62_6D6967  # "pjb" "mig"
 # What `pj-admin doctor` means by "the schema is installed". Before this
 # existed, doctor checked that the `jorb` table was present and that no
 # numbered migration was pending -- and a database installed from an older
-# schema.sql satisfies BOTH: it has jorb, and it has no schema_migrations row
+# base schema satisfies BOTH: it has jorb, and it has no schema_migrations row
 # saying otherwise. Doctor reported PASS schema and the very next check died
 # on `column "job_threads" does not exist`. The health probe certified a
 # database it could not use.
@@ -92,14 +88,14 @@ MIGRATE_LOCK_KEY = 0x706A62_6D6967  # "pjb" "mig"
 # It is written out rather than derived, so an operator reading a FAIL sees
 # what is missing -- and it cannot rot, because tests/test_migrations.py
 # asserts this manifest equals the catalog of a fresh install in BOTH
-# directions. Adding an object to schema.sql without adding it here fails that
-# test; so does leaving a dropped object behind.
+# directions. Adding an object to the base schema without adding it here
+# fails that test; so does leaving a dropped object behind.
 #
 # Indexes are in scope. A missing index does not raise, so this is the one
 # entry that is about drift rather than about a query that cannot run -- and
 # drift is the point: a database missing jorb_tags_idx was installed from a
-# different revision of schema.sql, which is the exact condition doctor kept
-# certifying. It also matters on its own, since `pj-admin jobs list --tag`
+# different revision of the base schema, which is the exact condition doctor
+# kept certifying. It also matters on its own, since `pj-admin jobs list --tag`
 # sequentially scans the hottest table in the system without it.
 #
 # Triggers are declared below but deliberately left OUT of missing_objects():
@@ -165,7 +161,7 @@ REQUIRED_FUNCTIONS: frozenset[str] = _names("""
     record_jorb_history
 """)
 
-#: Every trigger schema.sql installs. `pj-admin doctor` reads this for its
+#: Every trigger the base schema installs. `pj-admin doctor` reads this for its
 #: "triggers" check, so the platform has one list of them and not two.
 REQUIRED_TRIGGERS: tuple[str, ...] = (
     "jorb_enqueued_notify",
@@ -180,7 +176,8 @@ REQUIRED_TRIGGERS: tuple[str, ...] = (
 REQUIRED_INDEXES: frozenset[str] = _names("""
     jorb_pkey jorb_claim_idx jorb_claimed_at_idx jorb_started_idx
     jorb_inflight_idx jorb_retention_idx jorb_created_idx jorb_timeout_idx
-    jorb_waitfor_job_idx jorb_waitfor_group_idx jorb_run_group_idx jorb_uid_idx
+    jorb_waitfor_job_idx jorb_waitfor_group_idx jorb_run_group_idx
+    jorb_group_unfinished_idx jorb_uid_idx
     jorb_dag_idx jorb_tags_idx jorb_deadline_idx jorb_schedule_id_idx
     jorb_finished_retention_idx
     jorb_queue_pkey
@@ -230,7 +227,7 @@ class MigrationResult:
     ``recorded`` exists so "a fresh install is not double-migrated" is
     observable rather than assumed: on a fresh database every shipped
     migration lands in ``recorded`` (stamped, never executed) and ``applied``
-    is empty, because schema.sql already contains their effects.
+    is empty, because the base schema already contains their effects.
     """
 
     installed_base: bool = False
@@ -266,7 +263,19 @@ def available_migrations() -> list[Migration]:
 
 
 def base_schema_sql() -> str:
-    return (_SQL_ROOT / "schema.sql").read_text()
+    """The whole current schema: the ordered base-schema files, concatenated.
+
+    Lexical order IS the dependency order -- the numeric prefixes exist so
+    that tables come before the functions that read them and the trigger
+    files come last. One string, so the install runs in one transaction and
+    a failure leaves nothing behind.
+    """
+    schema_dir = _SQL_ROOT / "schema"
+    return "".join(
+        entry.read_text()
+        for entry in sorted(schema_dir.iterdir(), key=lambda e: e.name)
+        if entry.name.endswith(".sql")
+    )
 
 
 async def applied_versions(conn: asyncpg.Connection) -> set[int]:
@@ -364,11 +373,11 @@ async def migrate(conn: asyncpg.Connection) -> MigrationResult:
     host's deploy step at the same instant is safe: one process installs or
     upgrades and the others wait, then find nothing left to do.
 
-    A fresh database gets schema.sql and has every shipped migration RECORDED
-    without being run -- schema.sql is the current schema, so re-applying the
-    migrations that produced it would at best be wasted DDL and at worst
-    (dropping and rebuilding an index, deleting orphan rows) real work against
-    a database that never had the problem.
+    A fresh database gets the base schema and has every shipped migration
+    RECORDED without being run -- the base schema is the current schema, so
+    re-applying the migrations that produced it would at best be wasted DDL
+    and at worst (dropping and rebuilding an index, deleting orphan rows)
+    real work against a database that never had the problem.
     """
     await conn.execute("SELECT pg_advisory_lock($1)", MIGRATE_LOCK_KEY)
     try:
@@ -443,9 +452,9 @@ async def status(conn: asyncpg.Connection) -> dict[str, Any]:
         "base_schema_installed": has_jorb,
         "applied": sorted(done),
         # Nothing is pending on a database with no base schema, and nothing is
-        # missing from it either: migrate() will install schema.sql -- which
-        # already contains every migration's effect -- and record them without
-        # running one. Listing them as work-to-do would describe DDL that is
+        # missing from it either: migrate() will install the base schema --
+        # which already contains every migration's effect -- and record them
+        # without running one. Listing them as work-to-do would describe DDL that is
         # never going to execute, and listing sixty absent objects would bury
         # the single fact that matters, which is that there is no schema yet.
         "pending": (

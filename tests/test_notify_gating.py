@@ -4,7 +4,7 @@ Committing a transaction that issued a NOTIFY takes a GLOBAL exclusive lock
 held until that commit completes, because notifications must be delivered in
 commit order and commit order is not known until commits finish. Every
 notifying commit therefore serialises against every other one. The schema's
-answer (sql/schema.sql) is to notify only when a consumer has registered
+answer (sql/schema/90_notify.sql) is to notify only when a consumer has registered
 demand — which is safe only if registration is ordered correctly against the
 producer, so these tests are mostly about ORDER.
 

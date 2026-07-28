@@ -1462,7 +1462,7 @@ class JobClient:
     # Registering demand for the gated notification channels. jorb_done and
     # jorb_event are only emitted for a job somebody is waiting on, so
     # waiting means SAYING SO FIRST — this is the client half of the
-    # ordering argument written out in sql/schema.sql. `AND NOT awaited`
+    # ordering argument written out in sql/schema/90_notify.sql. `AND NOT awaited`
     # makes every registration after the first a no-op at the server. The
     # latch is not a refcount: for a job that terminates it simply dies
     # with the row, and for a job that never terminates (a durable state
@@ -1777,7 +1777,7 @@ class JobClient:
         Send a durable message to a job's mailbox.
 
         Plain INSERT into jorb_mailbox; the receiving job's `recv()` polls
-        for it (there is no mailbox NOTIFY — see sql/schema.sql). External
+        for it (there is no mailbox NOTIFY — see sql/schema/90_notify.sql). External
         senders are not replayed on retry, so no checkpointing is needed on
         this side.
 

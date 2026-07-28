@@ -19,7 +19,7 @@ seconds *at the end*, not the Quartz seconds-first layout) and
 
 | Piece | Where | What it does |
 |---|---|---|
-| `jorb_schedule` | `pyjobby/sql/schema.sql` | one row per schedule: the job to create, the cron expression, the safety limits, the next fire time, the counters |
+| `jorb_schedule` | `pyjobby/sql/schema/70_schedules.sql` | one row per schedule: the job to create, the cron expression, the safety limits, the next fire time, the counters |
 | `jorb_schedule_log` | same | one row per firing: result, skip reason, created job, duration, queue depth, jitter applied |
 | `pyjobby/cron.py` | — | all cron and timezone evaluation. Owns the column layout and the DST rules so no caller can get them half right |
 | `SchedulerWorker` | `pyjobby/scheduler.py` | the poll loop: find due schedules, apply the safety checks, create the job, advance `next_run` |

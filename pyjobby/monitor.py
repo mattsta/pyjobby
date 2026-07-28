@@ -165,7 +165,7 @@ SWEEP_DEAD_WORKER_JOBS_SQL = """
 #: Retire the workers themselves. ($1 grace)
 #:
 #: `idle = FALSE` is not cosmetic: an idle worker is a live subscription to
-#: its queue's jorb_enqueued notifications (sql/schema.sql), so a worker that
+#: its queue's jorb_enqueued notifications (sql/schema/90_notify.sql), so a worker that
 #: died while parked would keep every enqueue on that queue paying the NOTIFY
 #: commit lock forever. This sweep is what bounds that to the liveness grace.
 #: Costing an occasional needless notification is fine; leaking one

@@ -25,7 +25,7 @@ functions, imported for its constants and its checks.
 from __future__ import annotations
 
 #: Every label of the ``jorbstate`` enum, in lifecycle order. Kept in step
-#: with ``pyjobby/sql/schema.sql`` by ``test_declared_states_match_the_enum``,
+#: with ``pyjobby/sql/schema/00_core.sql`` by ``test_declared_states_match_the_enum``,
 #: which reads the enum out of the database rather than trusting this tuple.
 JOB_STATES: tuple[str, ...] = (
     "queued",

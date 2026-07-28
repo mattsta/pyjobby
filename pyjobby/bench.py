@@ -1894,7 +1894,7 @@ CLAIM_PROBE_SQL = """
      LIMIT 1
 """
 
-#: claim_jorb's max_concurrency check, copied from sql/schema.sql. This one
+#: claim_jorb's max_concurrency check, copied from sql/schema/30_claim.sql. This one
 #: runs INSIDE the per-queue advisory lock, which makes it the most expensive
 #: place in the system for a query to be slow: every millisecond it takes is a
 #: millisecond no other claimer on that queue can be admitted, so the capped

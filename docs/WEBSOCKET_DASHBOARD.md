@@ -66,7 +66,7 @@ one documented below.
 
 ## 📦 Components
 
-### 1. Database Triggers (`pyjobby/sql/schema.sql`)
+### 1. Database Triggers (`pyjobby/sql/schema/90_notify.sql`)
 
 Every NOTIFY in the platform goes through one trigger function, `jorb_notify()`,
 which declares each channel's topic, demand gate and payload in one place. The
@@ -79,7 +79,8 @@ two this server listens on:
   it fires at cron rate on `jorb_schedule_log`, not on any hot path.
 
 There is deliberately **no per-transition channel**. Do not add one back; see
-the note in `schema.sql` above the `jorb_notify()` function for the cost.
+the note in `sql/schema/90_notify.sql` above the `jorb_notify()` function for
+the cost.
 
 ### 2. WebSocket Server (`pyjobby/websocket_server.py`)
 
@@ -135,7 +136,7 @@ pj-admin --config ./pyjobby.toml db migrate
 ```
 
 The notification triggers this server relies on ship in
-`pyjobby/sql/schema.sql`; there is nothing extra to install.
+`pyjobby/sql/schema/90_notify.sql`; there is nothing extra to install.
 
 ### Step 2: Start WebSocket Server
 

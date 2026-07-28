@@ -11,7 +11,7 @@ repeats them:
 | Durable execution — steps, checkpoints, replay, invariants | [DXE.md](DXE.md) |
 | Measured throughput, and the write-path decisions behind it | [SCALE.md](SCALE.md) |
 | Running it — health, playbooks, queue controls, timeouts | [OPERATIONS.md](OPERATIONS.md) |
-| Every column, index and trigger, with the reasoning inline | [`pyjobby/sql/schema.sql`](../pyjobby/sql/schema.sql) |
+| Every column, index and trigger, with the reasoning inline | [`pyjobby/sql/schema/`](../pyjobby/sql/schema/) |
 
 ---
 
@@ -195,7 +195,7 @@ as "nothing claimable", identical to an empty queue. The bound is what
 stops one claim held open by a stuck transaction from freezing the queue;
 the *wait* rather than an immediate try-lock is what puts claimers in the
 lock manager's FIFO queue, so they take turns instead of one winner
-starving the rest. `schema.sql` carries the measurements for both.
+starving the rest. `sql/schema/90_notify.sql` carries the measurements for both.
 
 The row itself is picked with `FOR UPDATE SKIP LOCKED` over
 `jorb_claim_idx (queue, prio, run_after) WHERE state = 'queued'`, ordered

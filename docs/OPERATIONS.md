@@ -75,7 +75,7 @@ Prometheus.
 ```console
 $ pj-admin --dsn "$PYJOBBY_DSN" doctor
 PASS database: connected
-PASS schema: installed and complete; migrations [1, 2, 3, 4] are not recorded yet, which the next upgrade reads (run: pj-admin db migrate)
+PASS schema: installed, migrations current (baseline)
 PASS triggers: all schema triggers present (7)
 PASS notify-queue: 0.0% full
 WARN workers: no live workers seen in last 60s

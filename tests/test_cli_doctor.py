@@ -32,7 +32,6 @@ from click.testing import CliRunner
 
 from pyjobby import migrations
 from pyjobby.cli import DOCTOR_REQUIRED_TRIGGERS, cli
-from tests.schema_fixtures import install_legacy_schema
 
 pytestmark = pytest.mark.asyncio
 
@@ -91,20 +90,14 @@ async def scratch_db(db_params: dict):
     admin = await asyncpg.connect(**db_params)
     created: list[str] = []
 
-    async def _make(*, schema: bool = True, legacy: bool = False) -> str:
-        """`legacy=True` installs the frozen pre-migration schema instead of
-        the current one -- a database an older pyjobby release created, which
-        is the shape doctor used to certify and then die on."""
+    async def _make(*, schema: bool = True) -> str:
         name = f"pj_doctor_{uuid.uuid4().hex[:12]}"
         await admin.execute(f'CREATE DATABASE "{name}"')
         created.append(name)
         if schema:
             conn = await asyncpg.connect(**{**db_params, "database": name})
             try:
-                if legacy:
-                    await install_legacy_schema(conn)
-                else:
-                    await migrations.migrate(conn)
+                await migrations.migrate(conn)
             finally:
                 await conn.close()
         return dsn_for(db_params, name)
@@ -217,14 +210,12 @@ class TestDoctorSchema:
         # the command returns immediately: nothing else can be checked
         assert set(checks) == {"database", "schema"}
 
-    async def test_fresh_install_reports_the_migrations_it_recorded(
+    async def test_fresh_install_passes_at_baseline(
         self, scratch_db: ScratchFactory
     ):
-        """A fresh install carries every shipped migration by construction --
-        schema.sql already contains their effects -- so it reports them as
-        applied rather than as 'baseline'."""
+        """Pre-live no migration files ship, so a fresh install has recorded
+        nothing and reports the baseline."""
         fresh = await scratch_db()
-        versions = [m.version for m in migrations.available_migrations()]
 
         result = await run_doctor(fresh)
 
@@ -232,28 +223,34 @@ class TestDoctorSchema:
         checks = parse_checks(result.output)
         assert checks["schema"] == (
             "PASS",
-            f"installed, migrations current ({versions})",
+            "installed, migrations current (baseline)",
         )
         assert checks["triggers"] == (
             "PASS",
             f"all schema triggers present ({len(DOCTOR_REQUIRED_TRIGGERS)})",
         )
 
-    async def test_stale_database_fails_and_names_the_remedy(
+    async def test_drifted_database_fails_and_names_the_missing_objects(
         self, scratch_db: ScratchFactory
     ):
         """THE regression this whole check exists for.
 
-        A database installed by an older release has `jorb`, so the old check
-        ("is jorb there, is anything pending") reported PASS schema -- and the
-        very next check died on `column "job_threads" does not exist`. The
-        health probe certified a database it could not use. Now the check is
-        the SHAPE, it FAILs, it names objects the operator can look up, and it
-        names the command that fixes it.
+        A database at a different shape still has `jorb`, so a presence-only
+        check ("is jorb there") reported PASS schema -- and the very next
+        check died on the missing column. The health probe certified a
+        database it could not use. Now the check is the SHAPE, it FAILs, it
+        names objects the operator can look up, and it names the command.
         """
-        stale = await scratch_db(legacy=True)
+        drifted = await scratch_db()
+        conn = await asyncpg.connect(drifted)
+        try:
+            await conn.execute("ALTER TABLE jorb DROP COLUMN tags")
+            await conn.execute("ALTER TABLE jorb_worker DROP COLUMN job_threads")
+            await conn.execute("DROP FUNCTION claim_jorb")
+        finally:
+            await conn.close()
 
-        result = await run_doctor(stale)
+        result = await run_doctor(drifted)
 
         assert result.exit_code == 1, result.output
         checks = parse_checks(result.output)
@@ -270,19 +267,19 @@ class TestDoctorSchema:
         assert set(checks) == {"database", "schema"}
         assert "Traceback" not in result.output + result.stderr
 
-    async def test_a_stale_database_passes_once_it_is_migrated(
+    async def test_an_empty_database_passes_once_installed(
         self, scratch_db: ScratchFactory
     ):
         """The other half of the contract: FAIL has to be actionable, and the
         action is one documented command."""
-        stale = await scratch_db(legacy=True)
-        conn = await asyncpg.connect(stale)
+        empty = await scratch_db(schema=False)
+        conn = await asyncpg.connect(empty)
         try:
             await migrations.migrate(conn)
         finally:
             await conn.close()
 
-        result = await run_doctor(stale)
+        result = await run_doctor(empty)
 
         assert result.exit_code == 0, result.output
         assert parse_checks(result.output)["schema"][0] == "PASS"
@@ -308,19 +305,23 @@ class TestDoctorSchema:
         assert "column jorb.tags" in message
 
     async def test_unrecorded_but_complete_schema_passes_and_says_so(
-        self, scratch_db: ScratchFactory
+        self, monkeypatch, scratch_db: ScratchFactory
     ):
-        """A database installed from the CURRENT schema.sql by a release that
-        did not record migrations: every object is present, so it runs the
-        code correctly and doctor must not page anyone -- but the record is
-        what the next upgrade reads, so it does not go silently either.
-        """
+        """The post-live branch, exercised with a SYNTHETIC migration: every
+        object a pending file installs is already present (the base schema
+        contains it), so the database runs the code correctly and doctor must
+        not page anyone -- but the record is what the next upgrade reads, so
+        it does not go silently either."""
         installed = await scratch_db()
-        conn = await asyncpg.connect(installed)
-        try:
-            await conn.execute("DELETE FROM schema_migrations")
-        finally:
-            await conn.close()
+        monkeypatch.setattr(
+            migrations,
+            "available_migrations",
+            lambda: [
+                migrations.Migration(
+                    version=1, name="001_synthetic.sql", sql="SELECT 1"
+                )
+            ],
+        )
 
         result = await run_doctor(installed)
 
@@ -348,10 +349,9 @@ class TestDoctorSchema:
         result = await run_doctor(installed)
 
         assert result.exit_code == 0, result.output
-        versions = [m.version for m in migrations.available_migrations()]
         assert parse_checks(result.output)["schema"] == (
             "PASS",
-            f"installed, migrations current ({sorted([*versions, 99])})",
+            "installed, migrations current ([99])",
         )
 
 

@@ -41,8 +41,9 @@ hypothesis_settings.register_profile(
 )
 hypothesis_settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "pyjobby"))
 
-# Path to schema file
-SCHEMA_PATH = Path(__file__).parent.parent / "pyjobby" / "sql" / "schema.sql"
+# The base-schema directory: ordered purpose files whose lexical-order
+# concatenation is the whole current schema.
+SCHEMA_DIR = Path(__file__).parent.parent / "pyjobby" / "sql" / "schema"
 
 # Get database connection from environment or use default
 DEFAULT_TEST_DSN = (
@@ -131,8 +132,14 @@ def _dsn_params(dsn: str) -> dict[str, str | int]:
 
 
 def _schema_fingerprint() -> str:
-    """Content hash of the canonical schema."""
-    return hashlib.sha256(SCHEMA_PATH.read_bytes()).hexdigest()
+    """Content hash of the canonical schema: every base-schema file, in the
+    order the installer concatenates them, names included so a rename or
+    reorder re-fingerprints too."""
+    digest = hashlib.sha256()
+    for entry in sorted(SCHEMA_DIR.glob("*.sql")):
+        digest.update(entry.name.encode())
+        digest.update(entry.read_bytes())
+    return digest.hexdigest()
 
 
 async def _install_schema(params: dict[str, str | int]) -> None:

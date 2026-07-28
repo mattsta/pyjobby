@@ -26,7 +26,6 @@ from click.testing import CliRunner
 from pyjobby import migrations
 from pyjobby.cli import cli
 from pyjobby.client import DEFAULT_PRIO_CEILING
-from tests.schema_fixtures import install_legacy_schema
 
 pytestmark = pytest.mark.asyncio
 
@@ -86,19 +85,24 @@ async def scratch_db(db_params: dict):
     admin = await asyncpg.connect(**db_params)
     created: list[str] = []
 
-    async def _make(*, schema: bool = False, legacy: bool = False) -> str:
-        """`legacy=True` installs the frozen pre-migration schema: a database
-        an older pyjobby release created and this one cannot address."""
+    async def _make(*, schema: bool = False, stale: bool = False) -> str:
+        """`stale=True` installs the current schema and then drops the
+        objects the stale-message tests probe: a database at a different
+        shape than the one this release addresses."""
         name = f"pj_err_{uuid.uuid4().hex[:12]}"
         await admin.execute(f'CREATE DATABASE "{name}"')
         created.append(name)
-        if schema or legacy:
+        if schema or stale:
             conn = await asyncpg.connect(**{**db_params, "database": name})
             try:
-                if legacy:
-                    await install_legacy_schema(conn)
-                else:
-                    await migrations.migrate(conn)
+                await migrations.migrate(conn)
+                if stale:
+                    await conn.execute("ALTER TABLE jorb DROP COLUMN tags")
+                    await conn.execute("ALTER TABLE jorb DROP COLUMN claimed_at")
+                    await conn.execute(
+                        "ALTER TABLE jorb_worker DROP COLUMN job_threads"
+                    )
+                    await conn.execute("DROP FUNCTION claim_jorb")
             finally:
                 await conn.close()
         return name
@@ -1125,27 +1129,21 @@ class TestDbCommands:
         assert "Pending migrations:    none" in result.output
         assert "Missing objects:       none" in result.output
 
-    async def test_status_on_a_stale_database_lists_what_is_missing(
+    async def test_status_on_a_drifted_database_lists_what_is_missing(
         self, db_params, scratch_db
     ):
-        """The line that answers the question the other three cannot.
+        """The line that answers the question the version lines cannot.
 
-        A database installed before the migration runner existed records
-        nothing, so "Applied: none / Pending: none" is literally true of it
-        and of a perfectly current database alike. Only the object list tells
-        them apart."""
-        name = await scratch_db(legacy=True)
+        A drifted database records exactly what a current one records, so
+        "Applied: none / Pending: none" is literally true of both. Only the
+        object list tells them apart."""
+        name = await scratch_db(stale=True)
 
         result = await run_cli("--dsn", dsn_for(db_params, name), "db", "status")
 
         assert result.exit_code == 0, result.output
         assert "Base schema installed: yes" in result.output
-        # Read off the shipped files rather than hardcoded: the point of this
-        # assertion is "everything is pending", which stays true as
-        # migrations are added, and a literal here turns each new one into an
-        # unrelated test failure.
-        pending = [m.version for m in migrations.available_migrations()]
-        assert f"Pending migrations:    {pending}" in result.output
+        assert "Pending migrations:    none" in result.output
         assert "column jorb_worker.job_threads" in result.output
         assert "function claim_jorb" in result.output
 
@@ -1241,7 +1239,7 @@ class TestStaleSchemaMessages:
         assert not isinstance(result.exception, asyncpg.PostgresError)
 
     async def test_workers_list_on_a_stale_database(self, db_params, scratch_db):
-        name = await scratch_db(legacy=True)
+        name = await scratch_db(stale=True)
 
         result = await run_cli("--dsn", dsn_for(db_params, name), "workers", "list")
 
@@ -1249,7 +1247,7 @@ class TestStaleSchemaMessages:
         assert "job_threads" in result.stderr  # the underlying cause is kept
 
     async def test_jobs_tag_filter_on_a_stale_database(self, db_params, scratch_db):
-        name = await scratch_db(legacy=True)
+        name = await scratch_db(stale=True)
 
         result = await run_cli(
             "--dsn", dsn_for(db_params, name), "jobs", "list", "--tag", "customer=acme"
@@ -1259,7 +1257,7 @@ class TestStaleSchemaMessages:
         assert "tags" in result.stderr
 
     async def test_metrics_on_a_stale_database(self, db_params, scratch_db):
-        name = await scratch_db(legacy=True)
+        name = await scratch_db(stale=True)
 
         result = await run_cli("--dsn", dsn_for(db_params, name), "metrics")
 
@@ -1277,14 +1275,14 @@ class TestStaleSchemaMessages:
 
     async def test_the_same_commands_work_once_migrated(self, db_params, scratch_db):
         """Control: the failures above are about the schema, and `db migrate`
-        is genuinely the remedy the message names."""
-        name = await scratch_db(legacy=True)
+        is genuinely the remedy the message names -- on an empty database it
+        installs the whole base schema and every command starts working."""
+        name = await scratch_db()
         dsn = dsn_for(db_params, name)
 
         migrated = await run_cli("--dsn", dsn, "db", "migrate")
         assert migrated.exit_code == 0, migrated.output
-        applied = [m.version for m in migrations.available_migrations()]
-        assert f"Applied migrations: {applied}" in migrated.output
+        assert "Installed base schema" in migrated.output
 
         for args in (["workers", "list"], ["metrics"], ["jobs", "list"]):
             result = await run_cli("--dsn", dsn, *args)

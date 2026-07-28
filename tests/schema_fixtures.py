@@ -3,19 +3,17 @@
 Not a test module (pytest collects `test_*.py` only). It lives apart from
 tests/conftest.py because everything here is about databases the session
 fixture cannot provide: the session database is dropped and reinstalled from
-the current schema.sql whenever that file changes, which is precisely the
-operation no production database can perform and therefore the one the
-upgrade path must never be tested through.
+the current base schema whenever it changes, which is precisely the
+operation these tests need to observe from the outside -- installing into a
+database that is empty, damaging one on purpose, or racing two installers.
 
-Three things are shared, by the three files that need them
+Two things are shared, by the files that need them
 (tests/test_migrations.py, tests/test_cli_doctor.py, tests/test_cli_errors.py):
 
-* the frozen pre-001 schema, so "a database at an older shape" means one real
-  historical shape rather than three approximations of it;
 * the catalog snapshot query, so "the same schema" means the same thing
   everywhere it is asserted;
-* a throwaway-database factory, because damaging or ageing a schema cannot be
-  done to a database other tests are using.
+* a throwaway-database factory, because damaging a schema cannot be done to
+  a database other tests are using.
 """
 
 from __future__ import annotations
@@ -28,11 +26,6 @@ import asyncpg
 
 _SQL = Path(__file__).parent / "sql"
 
-#: The schema as an older pyjobby release installed it. See the header of the
-#: file itself: it is frozen, and it is the "before" side of every upgrade
-#: assertion in the suite.
-LEGACY_SCHEMA_SQL = (_SQL / "schema_before_001.sql").read_text()
-
 CATALOG_SQL = (_SQL / "catalog_snapshot.sql").read_text()
 
 
@@ -41,17 +34,11 @@ async def catalog(conn: asyncpg.Connection) -> list[str]:
     return [r["line"] for r in await conn.fetch(CATALOG_SQL)]
 
 
-async def install_legacy_schema(conn: asyncpg.Connection) -> None:
-    """Put this database into the shape a pre-migration release installed."""
-    await conn.execute(LEGACY_SCHEMA_SQL)
-
-
 class ScratchDatabases:
     """Factory for throwaway databases, all dropped together at teardown.
 
     `install` selects the starting shape:
       * "current" -- run the migration runner, i.e. what a new deployment gets
-      * "legacy"  -- the frozen pre-001 schema, i.e. what an old one has
       * None      -- an empty database
     """
 
@@ -78,9 +65,7 @@ class ScratchDatabases:
         if install is not None:
             conn = await asyncpg.connect(**params)
             try:
-                if install == "legacy":
-                    await install_legacy_schema(conn)
-                elif install == "current":
+                if install == "current":
                     from pyjobby import migrations
 
                     await migrations.migrate(conn)

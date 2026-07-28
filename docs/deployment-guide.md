@@ -13,7 +13,7 @@ pip install git+https://github.com/mattsta/pyjobby.git#main
 ```
 
 Python 3.14 or newer, PostgreSQL, and nothing else — no broker, no cache, no
-sidecar. The wheel carries `pyjobby/sql/schema.sql`, so the database is
+sidecar. The wheel carries the base schema (`pyjobby/sql/schema/`), so the database is
 installed by the package rather than by a file you copy around.
 
 Installing puts seven commands on `PATH`:
@@ -32,40 +32,34 @@ Installing puts seven commands on `PATH`:
 
 ## The database
 
-One command installs the schema, and the same command upgrades it. It is the
-only supported way to do either:
+One command installs the schema, and the same command will apply migrations
+once those exist. It is the only supported way to do either:
 
 ```console
 $ pj-admin --dsn "$PYJOBBY_DSN" db migrate
 Installed base schema
-Recorded migrations [1, 2, 3, 4] (already contained in the base schema)
 ```
 
 ```console
 $ pj-admin --dsn "$PYJOBBY_DSN" db status
 Base schema installed: yes
-Applied migrations:    [1, 2, 3, 4]
+Applied migrations:    none
 Pending migrations:    none
 Missing objects:       none
 ```
 
-**A fresh database** gets `schema.sql` — the whole current schema, one file —
-and every numbered file in `pyjobby/sql/migrations/` is then *recorded*
-without being run, because `schema.sql` already contains their effects. That
-is why the output says "recorded" and not "applied": no migration DDL
-executed.
+**A fresh database** gets the base schema — the ordered files in
+`pyjobby/sql/schema/`, concatenated and executed in one transaction. No
+migration files ship: the base schema **is** the whole current schema, so a
+fresh install is always complete and there is nothing to apply or record.
 
-**An existing database** gets the numbered files it has not recorded in
-`schema_migrations`, oldest first, one transaction each. A database installed
-before the migration runner existed has no `schema_migrations` table at all,
-which reads as "has recorded nothing", so it receives every migration from
-001 — which is correct, because it was installed from an older revision of
-`schema.sql`.
-
-```console
-$ pj-admin --dsn "$PYJOBBY_DSN" db migrate       # a database from an older release
-Applied migrations: [1, 2, 3, 4]
-```
+**Migrations arrive with live deployments.** The runner already handles them
+— an existing database gets any numbered files from
+`pyjobby/sql/migrations/` it has not recorded in `schema_migrations`, oldest
+first, one transaction each, and a fresh install records them without
+running them — but the first such file is minted only when there is a live
+database to upgrade. Until then every schema change lands in the base schema
+directly.
 
 It is idempotent, so running it on every deploy is the intended usage, and it
 takes a PostgreSQL advisory lock for the duration — two hosts running their
@@ -74,14 +68,6 @@ waits and then finds nothing to do. Prefer running it from **one** place, as
 a deploy step or an init container, rather than from every worker's startup:
 concurrency is safe, but a hundred workers queued behind one lock is a slow
 rollout.
-
-**Upgrades take locks on the tables they change.** A migration may add an
-index, and `CREATE INDEX CONCURRENTLY` is not available to a migration runner
-(it cannot run inside a transaction, and a half-applied migration is worse
-than a blocking one). On a large `jorb` this is a maintenance-window
-operation: writes to a table block while its index builds. Read the migration
-files for the release you are moving to — they are plain SQL in
-`pyjobby/sql/migrations/` — and size the window from the tables they touch.
 
 **Verify before you cut traffic over.** `pj-admin doctor`'s schema check reads
 the catalog and compares it against every object this release needs, so it
@@ -105,11 +91,11 @@ Error: The database schema is missing or out of date: column w.job_threads does 
 Error: Install or upgrade it with `pj-admin db migrate`, then confirm with `pj-admin doctor`.
 ```
 
-One case reports PASS while still asking for `db migrate`: a database whose
-objects are all present but whose `schema_migrations` rows are not, which is
-what a database installed from the current `schema.sql` by an older release
-looks like. It runs the current code correctly — hence PASS — but the record
-is what the *next* upgrade reads, so run `db migrate` once to write it.
+One case reports PASS while still asking for `db migrate` (once migration
+files exist): a database whose objects are all present but whose
+`schema_migrations` rows are not. It runs the current code correctly — hence
+PASS — but the record is what the *next* upgrade reads, so run `db migrate`
+once to write it.
 
 Do not hand-write DDL, and do not load the schema from a copy checked into
 your own repository. The schema is one file, it is versioned with the code

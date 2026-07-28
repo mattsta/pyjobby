@@ -57,13 +57,14 @@ Separate *sessions* (e.g. several agents running suites at once) still need
 distinct `PYJOBBY_TEST_DSN` values, for the same reason.
 
 **The schema fingerprint.** `conftest._install_schema` stores a SHA-256 of
-`pyjobby/sql/schema.sql` in a `test_schema_fingerprint` table. If the file has
+the base-schema files (`pyjobby/sql/schema/*.sql`, names and contents, in
+install order) in a `test_schema_fingerprint` table. If any of them has
 changed, the database is dropped (`DROP SCHEMA public CASCADE`) and rebuilt
-from `migrations.migrate()`. pyjobby is forward-only with one canonical schema
-file, so a database installed from an older revision of it is simply wrong —
+from `migrations.migrate()`. pyjobby is forward-only with one canonical base
+schema, so a database installed from an older revision of it is simply wrong —
 and it fails as `function does not exist` / `column does not exist`, which
-reads like a product bug rather than a stale fixture. Editing `schema.sql` is
-therefore the whole of a schema change; nothing else needs touching.
+reads like a product bug rather than a stale fixture. Editing the base-schema
+files is therefore the whole of a schema change; nothing else needs touching.
 
 ### The trap: writing to the worker database and reading the base DSN
 
@@ -72,7 +73,7 @@ therefore the whole of a schema change; nothing else needs touching.
 databases: the write lands in `pyjobby_test_gw3`, the read inspects
 `pyjobby_test`, and the assertion passes or fails on unrelated leftovers. The
 base database is also the one conftest never re-fingerprints, so it silently
-lags behind `schema.sql`.
+lags behind the base schema.
 
 This has happened twice. Both times the failure was intermittent, both times
 it appeared only under `-n auto`, and both times the symptom was blamed on the
@@ -148,7 +149,7 @@ nothing here is simulated:
 **The side-effect ledger** is the other half. Proving that a step "did not
 re-execute" needs an observable effect *outside* the checkpoint table —
 otherwise the test asks the checkpoint table whether the checkpoint table is
-right. `jorb_test_effect` is a test-only table (not in `schema.sql`), created
+right. `jorb_test_effect` is a test-only table (not in the base schema), created
 on demand and scoped by `tag` (tests pass their unique queue name), and jobs
 append one row per real execution. `record_effect` writes on the worker's own
 connection; `record_effect_out_of_band` writes on a separate, immediately

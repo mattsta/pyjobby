@@ -76,7 +76,7 @@ below is a file you can open.
 14. **[TESTING.md](TESTING.md)** — running the suite against any database,
     the shared fixtures (`live_worker`, `wait_for_job_state`), and why
     coverage is a diagnostic rather than a target.
-15. **[The schema itself](../pyjobby/sql/schema.sql)** — the canonical
+15. **[The schema itself](../pyjobby/sql/schema/)** — the canonical
     source, commented end to end, including the measurements behind the
     indexes and autovacuum settings.
 
@@ -91,9 +91,8 @@ covers which process reads what.
 
 - `pyjobby/pj.py` - the worker: claiming, execution, state transitions
 - `pyjobby/client.py` - `JobClient`, the enqueue side
-- `pyjobby/sql/schema.sql` - the canonical schema, shipped in the wheel
-- `pyjobby/sql/migrations/` - the numbered migration files. `pj-admin db migrate` installs `schema.sql` on a fresh database (recording every migration as already contained in it) and applies unrecorded migrations to an existing one
-- `pyjobby/migrations.py` - the runner, plus the required-shape manifest `pj-admin doctor` checks a database against
+- `pyjobby/sql/schema/` - the canonical base schema as ordered purpose files (`00_core.sql` ... `92_history_trigger.sql`), shipped in the wheel; `pj-admin db migrate` executes their concatenation on a fresh database
+- `pyjobby/migrations.py` - the migration runner (numbered files in `pyjobby/sql/migrations/`, none shipped until there are live deployments to upgrade), plus the required-shape manifest `pj-admin doctor` checks a database against
 - `pyjobby/dxe.py` - Durable Execution Engine semantics and SQL
 - `pyjobby/monitor.py` - the reaper (timeouts, dead-worker reclaim, retention)
 - `pyjobby.toml` - Example configuration (TOML, read as data — never executed)

@@ -82,18 +82,18 @@ Commands:
   status   Show applied vs pending schema migrations
 ```
 
-`db migrate` handles **both** histories, and upgrading an existing database
-is one of them:
+`db migrate` handles **both** histories, though only one exists today:
 
-* **A fresh database** gets `schema.sql` — the whole current schema, in one
-  file — and every shipped migration is then *recorded* without being run,
-  because `schema.sql` already contains their effects.
-* **An existing database** gets the numbered files in
+* **A fresh database** gets the base schema — the ordered files in
+  `pyjobby/sql/schema/`, concatenated and executed in one transaction. No
+  migration files ship (the base schema is the whole current schema), so
+  nothing is applied or recorded and the install is complete by
+  construction.
+* **An existing database** gets any numbered files in
   `pyjobby/sql/migrations/` it has not recorded, oldest first, one
-  transaction per file. A database installed before the runner existed has
-  no `schema_migrations` table, which reads as "recorded nothing", so it
-  gets every migration — which is right, because it was installed from an
-  older revision of `schema.sql`.
+  transaction per file — the upgrade path that starts mattering once there
+  are live deployments to upgrade. The first such file is minted at that
+  point; until then every schema change lands in the base schema directly.
 
 Same command either way, and it is idempotent. It is **safe to run from
 every host's deploy step simultaneously**: `migrate()` takes a session-level
@@ -102,31 +102,30 @@ then find nothing to do. (A first install is not idempotent statement by
 statement — `CREATE TYPE jorbstate` has no `IF NOT EXISTS` — which is what
 the lock is there for.)
 
-`db status` on a database that is behind:
+`db status` on a database whose shape has drifted:
 
 ```console
 $ pj-admin db status
 Base schema installed: yes
 Applied migrations:    none
-Pending migrations:    [1, 2, 3, 4]
+Pending migrations:    none
 Missing objects:       3
   index jorb_dag_retention_idx
   index jorb_schedule_log_retention_idx
   index jorb_worker_retention_idx
 ```
 
-`Missing objects` is the load-bearing line. `Pending migrations` can only
-say "this database has not *recorded* migration N", and a database that
-predates the runner records nothing at all while still being stale; the
-missing list is read out of the catalog and compared against the
-required-shape manifest in `pyjobby/migrations.py`. A healthy database
-prints `Missing objects:       none`.
+`Missing objects` is the load-bearing line. The version lines can only say
+what this database *recorded*, and a drifted database records exactly what
+a current one does; the missing list is read out of the catalog and
+compared against the required-shape manifest in `pyjobby/migrations.py`. A
+healthy database prints `Missing objects:       none`.
 
 `db migrate` reports "applied" and "recorded" distinctly, because they are
-different events: a fresh install prints `Installed base schema` followed by
-`Recorded migrations [...] (already contained in the base schema)`, an
-upgrade prints `Applied migrations: [...]`, and a database already current
-prints `Database schema is up to date`.
+different events: a fresh install prints `Installed base schema` (followed
+by `Recorded migrations [...]` once any ship), an upgrade prints
+`Applied migrations: [...]`, and a database already current prints
+`Database schema is up to date`.
 
 See
 [deployment-guide.md § The database](deployment-guide.md#the-database) for
@@ -156,7 +155,7 @@ A live platform, idle:
 ```console
 $ pj-admin --dsn "$PYJOBBY_DSN" doctor
 PASS database: connected
-PASS schema: installed and complete; migrations [1, 2, 3, 4] are not recorded yet, which the next upgrade reads (run: pj-admin db migrate)
+PASS schema: installed, migrations current (baseline)
 PASS triggers: all schema triggers present (7)
 PASS notify-queue: 0.0% full
 WARN workers: no live workers seen in last 60s
@@ -171,7 +170,7 @@ $ echo $?
 ### What the `schema` check actually checks
 
 Presence-and-pending is not enough to certify a schema: a database
-installed from an *older* `schema.sql` has `jorb` and records nothing
+installed from an *older* base schema has `jorb` and records nothing
 pending, so both answers look healthy while the very next query dies on a
 missing column.
 
