@@ -83,7 +83,7 @@ def test_the_extractor_finds_the_statements_that_change_state():
     every test below vacuously pass."""
     found = statement_transitions()
     assert {"run", "finished", "retry", "crashed", "cancelled"} <= set(found)
-    assert found["run"] == (frozenset({"claimed"}), "running")
+    assert found["run"] == (frozenset({"claimed", "running"}), "running")
     assert found["finished"] == (frozenset({"claimed", "running"}), "finished")
 
 

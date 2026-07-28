@@ -745,6 +745,39 @@ class TestWatchJob:
         event = await h.drain(ws, "jorb_done")
         assert event["data"] == {"id": job_id, "state": "finished"}
 
+    async def test_a_watch_survives_the_awaited_latch_being_cleared(
+        self, snapshot_server, db_pool, unique_queue
+    ):
+        """compact() clears jorb.awaited to shed notification cost on a
+        long-lived job; a push-only watch has no fallback poll, so the
+        snapshot loop must re-arm the latch (and catch a completion whose
+        NOTIFY was missed while it was clear). Here the latch is cleared and
+        the job finished in the SAME window the NOTIFY cannot fire, and the
+        re-arm on the next beat must still deliver the completion."""
+        h = await snapshot_server(notify=True)
+        ws = await h.connect()
+        job_id = await db_pool.fetchval(
+            "INSERT INTO jorb (job_class, queue, state) VALUES ('W', $1, 'running')"
+            " RETURNING id",
+            unique_queue,
+        )
+
+        await ws.send_json({"action": "watch_job", "job_id": job_id})
+        await h.drain(ws, "watching")
+
+        # the machine's compact() clears the latch, THEN the job finishes —
+        # so the terminal UPDATE reads awaited=FALSE and emits no NOTIFY
+        await db_pool.execute(
+            "UPDATE jorb SET awaited = FALSE WHERE id = $1", job_id
+        )
+        await db_pool.execute(
+            "UPDATE jorb SET state = 'finished' WHERE id = $1", job_id
+        )
+
+        h.start_feed()  # the snapshot beat re-arms + checks watched jobs
+        event = await h.drain(ws, "jorb_done", timeout=5)
+        assert event["data"] == {"id": job_id, "state": "finished"}
+
     async def test_an_unwatched_job_pushes_nothing(
         self, snapshot_server, db_pool, unique_queue
     ):

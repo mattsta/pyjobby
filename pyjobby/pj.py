@@ -138,6 +138,16 @@ STMTS["now"] = """SELECT now() AS now"""
 # requeued or cancelled between claim and here, and executing the job
 # anyway runs its side effects concurrently with the attempt that replaced
 # it — a non-DXE job would never find out.
+#
+# IDEMPOTENT AT ITS OWN EPOCH: the guard accepts `running` as well as
+# `claimed`, so ex()'s reconnect-replay of a run whose COMMIT ack was lost
+# finds the row already `running` at THIS epoch and returns its id (a
+# no-op self-transition) rather than zero rows. Without this, that replay
+# would return zero, the worker would read it as "superseded" and abandon,
+# and a timeout=0 job (every StateMachineJob) would be stranded `running`
+# on a live worker where no sweep can reach it (no timeout_at, fresh
+# heartbeat, not `claimed`). A DIFFERENT attempt is still fenced out: claim
+# bumps run_epoch, so a superseding attempt never shares this $2.
 STMTS["run"] = """UPDATE jorb
               SET state = 'running',
                   started = now(),
@@ -145,7 +155,7 @@ STMTS["run"] = """UPDATE jorb
                                     ELSE now() + $3::interval END,
                   updated = now()
               WHERE id = $1
-                AND state = 'claimed'
+                AND state IN ('claimed', 'running')
                 AND run_epoch = $2
           RETURNING id"""
 

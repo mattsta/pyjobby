@@ -1335,6 +1335,9 @@ class JobClient:
             timeout,
             f"run_group {run_group} to finish",
             job_id=run_group,
+            # a group has no per-job NOTIFY channel and run_group is not a
+            # job id: pure-poll, do not latch awaited on an unrelated row
+            register_demand=False,
         )
         return members
 
@@ -1411,6 +1414,7 @@ class JobClient:
         timeout: float | None,
         what: str,
         job_id: int,
+        register_demand: bool = True,
     ) -> Any:
         """Run `check` until it returns something other than _PENDING.
 
@@ -1421,13 +1425,16 @@ class JobClient:
 
         Demand for `job_id` is registered before that first check and only
         when a listener exists: a pure-polling client depends on no
-        notification, so it asks for none.
+        notification, so it asks for none. Pass ``register_demand=False``
+        for a wait that has no per-job NOTIFY channel (a group wait, whose
+        `job_id` is a run_group not a job id): it then pure-polls without
+        writing to `jorb` and without a dead waiter Event nothing dispatches.
         """
         loop = asyncio.get_running_loop()
         deadline = None if timeout is None else loop.time() + timeout
 
         waiter: asyncio.Event | None = None
-        if not self.listening and not self._polling_reported:
+        if register_demand and not self.listening and not self._polling_reported:
             # Once per client, not per wait: a pool-only client polls every
             # wait at _PURE_POLL_INTERVAL by design, and nothing else ever
             # says so — a team following the shared-pool construction found
@@ -1439,7 +1446,7 @@ class JobClient:
                 "LISTEN/NOTIFY. Pass db_params (or use create()/"
                 "from_config()) for push latency."
             )
-        if await self._ensure_listener():
+        if register_demand and await self._ensure_listener():
             # BEFORE the first check, never after: a terminal state reached
             # between the check and the registration would be one this
             # client is neither told about nor has already seen.

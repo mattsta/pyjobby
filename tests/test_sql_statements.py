@@ -544,6 +544,37 @@ class TestRunStampsTheDeadline:
         assert job["state"] == "running"
         assert job["timeout_at"] is None
 
+    async def test_run_is_idempotent_at_its_own_epoch(
+        self, db_connection, unique_queue
+    ):
+        """A run whose COMMIT ack was lost is replayed by ex()'s reconnect.
+        The replay must find the already-running row at the same epoch and
+        return its id (a no-op self-transition), not zero rows — otherwise
+        the worker reads it as 'superseded' and abandons a timeout=0 job
+        that no sweep can then recover."""
+        await create_job(
+            db_connection, queue=unique_queue, state="queued", run_after=past()
+        )
+        claimed = await claim(db_connection, unique_queue)
+
+        first = await db_connection.fetch(
+            STMTS["run"], claimed["id"], claimed["run_epoch"], None
+        )
+        assert [r["id"] for r in first] == [claimed["id"]]
+
+        replay = await db_connection.fetch(
+            STMTS["run"], claimed["id"], claimed["run_epoch"], None
+        )
+        assert [r["id"] for r in replay] == [claimed["id"]], (
+            "the lost-ack replay must be a no-op that still returns the id"
+        )
+
+        # a DIFFERENT (superseding) attempt is still fenced out by its epoch
+        stale = await db_connection.fetch(
+            STMTS["run"], claimed["id"], claimed["run_epoch"] - 1, None
+        )
+        assert stale == []
+
 
 class TestEnqueueStatements:
     """Test the enqueue-next statements for job dependencies."""

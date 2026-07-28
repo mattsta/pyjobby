@@ -70,6 +70,7 @@ from aiohttp import web
 from . import db
 from .client import DEFAULT_PRIO_CEILING
 from .client import validate_priority as check_prio_ceiling
+from .lifecycle import TERMINAL_STATES
 
 # Configure logging
 logging.basicConfig(
@@ -1154,6 +1155,49 @@ class WebSocketServer:
                 },
             )
 
+    async def _rearm_job_watches(self) -> None:
+        """Re-arm jorb.awaited for every actively-watched job, and push a
+        completion for any already terminal.
+
+        Bounded by the number of active watches, not by the job table. Runs
+        WATCH_JOB_SQL per watched job — the same statement handle_watch_job
+        uses — which sets awaited (idempotent: `AND NOT awaited`) and returns
+        the current state in one round trip. A terminal state means either
+        the job finished this interval or its NOTIFY was missed while the
+        latch was clear; either way we deliver the jorb_done event the watch
+        promised and drop the watch. A vanished row (state None) is also a
+        terminal outcome for the watch.
+        """
+        if self.db_pool is None:
+            return
+        watched = [
+            (channel, int(channel[len(JOB_CHANNEL_PREFIX) :]))
+            for channel in list(self.subscriptions)
+            if channel.startswith(JOB_CHANNEL_PREFIX)
+        ]
+        for channel, job_id in watched:
+            try:
+                state = await self.db_pool.fetchval(WATCH_JOB_SQL, job_id)
+            except Exception as e:
+                logger.error(f"Error re-arming watch on job {job_id}: {e}")
+                continue
+            if state is not None and state not in TERMINAL_STATES:
+                continue
+            # terminal (or gone): deliver the completion the watch promised,
+            # exactly as a live jorb_done NOTIFY would, then close the watch
+            await self.broadcast_event(
+                channel,
+                {
+                    "event": "jorb_done",
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "data": {"id": job_id, "state": state},
+                },
+            )
+            for ws in list(self.subscriptions.get(channel, ())):
+                client = self.clients.get(ws)
+                if client is not None:
+                    self.detach(ws, client, channel)
+
     async def snapshot_broadcast(self) -> None:
         """Poll aggregates on an interval and push them to subscribers.
 
@@ -1186,6 +1230,19 @@ class WebSocketServer:
                             f"not be re-established ({e}); job watches are "
                             f"stalled until it returns"
                         )
+
+                # Re-arm job watches on the same beat, BEFORE the aggregate-
+                # demand gate (a job watch is its own demand, unrelated to
+                # snapshot subscribers). jorb.awaited is a latch that a
+                # long-lived job's compact() clears to shed notification cost;
+                # a push-only watch has no fallback poll of its own, so
+                # without this a dashboard watching a machine that compacts
+                # would never learn it ended. Re-running WATCH_JOB_SQL sets
+                # the latch back AND returns the current state, so it also
+                # catches a completion whose NOTIFY was missed in the window
+                # the latch was clear.
+                if self.db_pool:
+                    await self._rearm_job_watches()
 
                 if not self.db_pool or not self.snapshot_demand():
                     continue
@@ -1250,7 +1307,14 @@ class WebSocketServer:
             await stop.wait()
             logger.info("Shutdown signal received")
         finally:
-            # snapshot feed first (cancelled AND awaited, so its loop's
+            # HTTP/WS acceptor first: runner.cleanup() stops accepting and
+            # drains in-flight handle_websocket handlers. It MUST precede the
+            # pool close -- a handler still running a query against a closing
+            # pool gets InterfaceError, and asyncpg's Pool.close() blocks on
+            # held connections, so closing the pool first can hang SIGTERM on
+            # one client mid-query.
+            await runner.cleanup()
+            # then the snapshot feed (cancelled AND awaited, so its loop's
             # cleanup runs before the pool it reads from goes away)...
             stats_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1266,7 +1330,6 @@ class WebSocketServer:
                 await self.notify_conn.close()
             if self.db_pool:
                 await self.db_pool.close()
-            await runner.cleanup()
 
 
 async def serve(

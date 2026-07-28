@@ -82,8 +82,11 @@ LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
     # for a tidier table.
     "claimed": frozenset({"running", "queued", "cancelled", "crashed", "finished"}),
     # running -> terminal, or back to queued: retry backoff, self-reschedule,
-    # durable sleep, or a monitor requeue.
-    "running": frozenset({"finished", "crashed", "cancelled", "queued"}),
+    # durable sleep, or a monitor requeue. The running -> running self-edge is
+    # the idempotent `run` statement: ex()'s reconnect-replay of a run whose
+    # COMMIT ack was lost re-applies it to the already-running row at the same
+    # epoch, a no-op transition rather than a spurious "superseded".
+    "running": frozenset({"finished", "crashed", "cancelled", "queued", "running"}),
     # Terminal states are final EXCEPT for an explicit operator requeue. That
     # is the one edge that makes them "terminal for the platform" rather than
     # "immutable", and it is why retention deletes rows instead of trusting
