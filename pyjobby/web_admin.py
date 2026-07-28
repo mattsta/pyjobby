@@ -97,6 +97,10 @@ PROM_RATE_WINDOW_SECONDS = 300
 #   state="queued"     claimable RIGHT NOW. The number an operator pages on.
 #   state="scheduled"  deliberately parked in the future (retry backoff,
 #                      enqueue-at). Not a backlog, and not counted as one.
+#
+# db.QUEUE_STATS_SQL is the semantic contract for those names and for the
+# windowed terminal counts below; these strings stay separate only because
+# their plans are pinned per scrape arm.
 PROM_SQL_LIVE_STATES = """
     SELECT queue, 'queued' AS state, COUNT(*) AS n
       FROM jorb WHERE state = 'queued' AND run_after <= now() GROUP BY queue

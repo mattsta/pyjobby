@@ -1855,15 +1855,21 @@ class JobClient:
     # Queue Operations
     # =========================================================================
 
-    async def queue_depth(self, queue: str = "default") -> int:
+    async def queue_depth(self, queue: str | None = None) -> int:
         """
-        Get number of queued jobs in a queue.
+        How many jobs are claimable RIGHT NOW.
+
+        Counts the runnable backlog only: a job parked in the future (retry
+        backoff, enqueue-at) is where it was asked to be, not waiting for a
+        worker, and counting it as depth makes a healthy install look stuck.
+        The same split :data:`pyjobby.db.QUEUE_STATS_SQL` reports as
+        'queued' vs 'scheduled'.
 
         Args:
-            queue: Queue name (default: 'default')
+            queue: Queue name, or None (the default) for every queue
 
         Returns:
-            Number of queued jobs
+            Number of jobs claimable now
 
         Example:
             depth = await client.queue_depth('emails')
@@ -1874,86 +1880,48 @@ class JobClient:
                 """
                 SELECT COUNT(*)
                 FROM jorb
-                WHERE queue = $1
+                WHERE ($1::text IS NULL OR queue = $1)
                   AND state = 'queued'
+                  AND run_after <= now()
             """,
                 queue,
             )
             return depth
 
-    # Queue statistics without reading each queue's whole history. A single
-    # GROUP BY over jorb read every row the install ever ran — multi-second
-    # within a day at documented rates, as the FIRST thing an operator calls.
-    # One arm per partial index instead (the same construction the websocket
-    # snapshot uses): live states are counted exactly, terminal states within
-    # a recency window — "how many jobs finished, EVER" is an audit question
-    # for SQL, not a dashboard number. ($1 = the window, as an interval.)
-    _QUEUE_STATS_SQL = """
-        SELECT queue, 'queued' AS state, COUNT(*)::bigint AS n
-          FROM jorb WHERE state = 'queued' GROUP BY queue
-        UNION ALL
-        SELECT queue, state::text, COUNT(*)::bigint
-          FROM jorb WHERE state IN ('claimed', 'running') GROUP BY queue, state
-        UNION ALL
-        SELECT queue, 'waiting', COUNT(*)::bigint
-          FROM jorb WHERE state = 'waiting' GROUP BY queue
-        UNION ALL
-        SELECT queue, state::text, COUNT(*)::bigint
-          FROM jorb
-         WHERE state IN ('finished', 'crashed', 'cancelled')
-           AND COALESCE(finished, updated) >= now() - $1::interval
-         GROUP BY queue, state
-    """
-
-    #: Same shape as _QUEUE_STATS_SQL for ONE queue: the $2 = queue predicate
-    #: keeps the aggregate bounded to the queue asked about rather than
-    #: counting every queue in the install and discarding all but one in
-    #: Python — which turned a single-queue dashboard call into a scan whose
-    #: cost grew with the number of OTHER queues.
-    _ONE_QUEUE_STATS_SQL = """
-        SELECT queue, 'queued' AS state, COUNT(*)::bigint AS n
-          FROM jorb WHERE state = 'queued' AND queue = $2 GROUP BY queue
-        UNION ALL
-        SELECT queue, state::text, COUNT(*)::bigint
-          FROM jorb WHERE state IN ('claimed', 'running') AND queue = $2
-         GROUP BY queue, state
-        UNION ALL
-        SELECT queue, 'waiting', COUNT(*)::bigint
-          FROM jorb WHERE state = 'waiting' AND queue = $2 GROUP BY queue
-        UNION ALL
-        SELECT queue, state::text, COUNT(*)::bigint
-          FROM jorb
-         WHERE state IN ('finished', 'crashed', 'cancelled')
-           AND queue = $2
-           AND COALESCE(finished, updated) >= now() - $1::interval
-         GROUP BY queue, state
-    """
-
     async def queue_stats(
-        self, queue: str = "default", window: timedelta = timedelta(hours=1)
+        self, queue: str | None = None, window: timedelta = timedelta(hours=1)
     ) -> dict[str, int]:
         """
-        Per-state counts for a queue: LIVE states exactly, terminal states
-        within `window` (default: the last hour).
+        Per-state counts: LIVE states exactly, terminal states within
+        `window` (default: the last hour).
 
-        Live work (queued/claimed/running/waiting) is bounded and counted
-        in full. Terminal counts are a recent-activity dashboard number,
-        not an all-time audit — the all-time count grows with the install's
-        whole history and belongs to SQL, not to a call every dashboard
-        makes on a timer.
+        Live work (queued/scheduled/claimed/running/waiting) is bounded and
+        counted in full. Terminal counts are a recent-activity dashboard
+        number, not an all-time audit — the all-time count grows with the
+        install's whole history and belongs to SQL, not to a call every
+        dashboard makes on a timer.
+
+        'queued' means claimable RIGHT NOW; a job parked in the future
+        (retry backoff, enqueue-at) is reported as 'scheduled' and is
+        deliberately not counted as backlog. :data:`pyjobby.db.QUEUE_STATS_SQL`
+        is the one home for these semantics — every surface reads it.
 
         Args:
-            queue: Queue name (default: 'default')
+            queue: Queue name, or None (the default) to aggregate EVERY
+                queue in the install
             window: how far back to count finished/crashed/cancelled
+
+        Returns:
+            Every job state plus 'scheduled', zero-filled.
 
         Example:
             stats = await client.queue_stats('emails')
             print(f"Queued: {stats['queued']}, Running: {stats['running']}")
         """
-        rows = await self.pool.fetch(self._ONE_QUEUE_STATS_SQL, window, queue)
-        stats = dict.fromkeys(lifecycle.JOB_STATES, 0)
+        rows = await self.pool.fetch(db.QUEUE_STATS_SQL, window, queue)
+        stats = dict.fromkeys(db.QUEUE_STATS_STATES, 0)
         for row in rows:
-            stats[row["state"]] = row["n"]
+            stats[row["state"]] += row["n"]
         return stats
 
     async def list_queues(
@@ -1961,7 +1929,8 @@ class JobClient:
     ) -> list[dict[str, Any]]:
         """
         Every queue with per-state counts — the same contract as
-        queue_stats(): live states exact, terminal states within `window`,
+        queue_stats() and the same SQL: live states exact (with 'queued'
+        split from deferred 'scheduled'), terminal states within `window`,
         `total` the sum of what is reported.
 
         Example:
@@ -1969,16 +1938,16 @@ class JobClient:
             for q in queues:
                 print(f"{q['queue']}: {q['queued']} queued, {q['running']} running")
         """
-        rows = await self.pool.fetch(self._QUEUE_STATS_SQL, window)
+        rows = await self.pool.fetch(db.QUEUE_STATS_SQL, window, None)
         queues: dict[str, dict[str, Any]] = {}
         for row in rows:
             entry = queues.setdefault(
                 row["queue"],
-                {"queue": row["queue"], **dict.fromkeys(lifecycle.JOB_STATES, 0)},
+                {"queue": row["queue"], **dict.fromkeys(db.QUEUE_STATS_STATES, 0)},
             )
             entry[row["state"]] = row["n"]
         for entry in queues.values():
-            entry["total"] = sum(entry[state] for state in lifecycle.JOB_STATES)
+            entry["total"] = sum(entry[state] for state in db.QUEUE_STATS_STATES)
         return [queues[name] for name in sorted(queues)]
 
     async def purge_queue(self, queue: str, states: list[str] | None = None) -> int:
@@ -3031,13 +3000,13 @@ class SyncJobClient:
         steps: list[dict[str, Any]] = self._run(self._client.get_steps(job_id))
         return steps
 
-    def queue_depth(self, queue: str = "default") -> int:
+    def queue_depth(self, queue: str | None = None) -> int:
         """Synchronous JobClient.queue_depth()."""
         depth: int = self._run(self._client.queue_depth(queue))
         return depth
 
     def queue_stats(
-        self, queue: str = "default", window: timedelta = timedelta(hours=1)
+        self, queue: str | None = None, window: timedelta = timedelta(hours=1)
     ) -> dict[str, int]:
         """Synchronous JobClient.queue_stats()."""
         stats: dict[str, int] = self._run(

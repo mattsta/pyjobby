@@ -615,7 +615,11 @@ class TestJobActionHandlers:
             await server.handle_rerun_job(ws, client, {"job_id": job_id})
 
             assert ws.sent[-1]["event"] == "job_rerun"
-            assert ws.sent[-1]["data"] == {"job_id": job_id, "status": "requeued"}
+            assert ws.sent[-1]["data"] == {
+                "job_id": job_id,
+                "status": "requeued",
+                "fresh": True,
+            }
 
             async with db_pool.acquire() as conn:
                 row = await conn.fetchrow(

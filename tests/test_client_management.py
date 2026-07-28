@@ -480,6 +480,8 @@ class TestQueueManagement:
         assert all("queue" in q for q in queues)
         assert all("total" in q for q in queues)
         assert all("queued" in q for q in queues)
+        # deferred work is reported apart from the claimable backlog
+        assert all("scheduled" in q for q in queues)
 
         # Should have our test queues
         queue_names = {q["queue"] for q in queues}

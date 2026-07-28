@@ -1095,6 +1095,7 @@ def queues_show(ctx: click.Context, queue: str, output_json: bool) -> None:
                 click.echo(f"\n{Colors.BOLD}Depths:{Colors.ENDC}")
                 for state in (
                     "queued",
+                    "scheduled",
                     "claimed",
                     "running",
                     "waiting",

@@ -18,6 +18,8 @@ from typing import Any
 import asyncpg  # type: ignore[import-untyped]
 import orjson
 
+from . import lifecycle
+
 
 class JobState(enum.StrEnum):
     """All states a job row can be in (mirrors the ``jorbstate`` enum)."""
@@ -228,6 +230,84 @@ async def requeue_job(
         reset_errors,
     )
     return requeued
+
+
+#: THE queue-statistics query. Every surface that reports per-queue,
+#: per-state counts reads it from here (client ``queue_stats``/``list_queues``,
+#: ``AdminAPI.queue_stats``) so no two surfaces can disagree about what a
+#: number means. Parameters: $1 = the recency window as an interval,
+#: $2 = a queue name, or NULL for every queue. Every arm returns
+#: ``(queue, state text, n bigint)``.
+#:
+#: TWO THINGS THE SHAPE ENCODES.
+#:
+#: 1. LIVE STATES EXACTLY, TERMINAL STATES WITHIN A WINDOW. Live work
+#:    (queued/scheduled/claimed/running/waiting) is bounded by work in
+#:    progress however big the table gets; the terminal states are bounded by
+#:    nothing at all. "How many jobs finished, EVER" is an audit question for
+#:    SQL, not a number a dashboard asks for on a timer, so the terminal arm
+#:    counts only what landed inside $1. One arm per partial index, rather
+#:    than a single GROUP BY, is also what keeps this off a scan of the whole
+#:    table: a predicate spanning several states matches none of the partial
+#:    indexes and collapses into a sequential scan.
+#:
+#: 2. 'queued' IS SPLIT FROM 'scheduled'. A job whose ``run_after`` is still
+#:    in the future -- a retry backoff, an enqueue-at -- is not backlog. It is
+#:    exactly where it was asked to be, and counting it as queued makes a
+#:    healthy install look like a stuck one, which is the number an operator
+#:    pages on. So:
+#:
+#:      state="queued"     claimable RIGHT NOW.
+#:      state="scheduled"  deliberately parked in the future. Not a backlog.
+#:
+#:    The split is also what gives BOTH halves a real index condition against
+#:    ``jorb_claim_idx`` (queue, prio, run_after) instead of a bare
+#:    ``state = 'queued'`` filter whose index-only-ness depends on when
+#:    autovacuum last ran. ``web_admin.PROM_SQL_LIVE_STATES`` and
+#:    ``websocket_server.SNAPSHOT_SQL`` ask the same two questions with the
+#:    same predicates and emit the same two state names (their strings stay
+#:    separate because their plans are pinned and they carry extra columns);
+#:    web_admin's comment has the full planner history.
+#:
+#: $2 is written as an OR-NULL predicate, which trades the index *condition*
+#: for a filter over each partial index's bounded live set -- the price of one
+#: query shape serving both "this queue" and "all queues".
+QUEUE_STATS_SQL = """
+    SELECT queue, 'queued' AS state, COUNT(*)::bigint AS n
+      FROM jorb
+     WHERE state = 'queued' AND run_after <= now()
+       AND ($2::text IS NULL OR queue = $2)
+     GROUP BY queue
+    UNION ALL
+    SELECT queue, 'scheduled', COUNT(*)::bigint
+      FROM jorb
+     WHERE state = 'queued' AND run_after > now()
+       AND ($2::text IS NULL OR queue = $2)
+     GROUP BY queue
+    UNION ALL
+    SELECT queue, state::text, COUNT(*)::bigint
+      FROM jorb
+     WHERE state IN ('claimed', 'running') AND ($2::text IS NULL OR queue = $2)
+     GROUP BY queue, state
+    UNION ALL
+    SELECT queue, 'waiting', COUNT(*)::bigint
+      FROM jorb
+     WHERE state = 'waiting' AND ($2::text IS NULL OR queue = $2)
+     GROUP BY queue
+    UNION ALL
+    SELECT queue, state::text, COUNT(*)::bigint
+      FROM jorb
+     WHERE state IN ('finished', 'crashed', 'cancelled')
+       AND COALESCE(finished, updated) >= now() - $1::interval
+       AND ($2::text IS NULL OR queue = $2)
+     GROUP BY queue, state
+"""
+
+#: The reported state names :data:`QUEUE_STATS_SQL` can emit: every
+#: ``jorbstate`` label plus the ``scheduled`` split of ``queued``. Callers
+#: zero-fill their result dicts from this so a quiet queue reports 0 rather
+#: than a missing key.
+QUEUE_STATS_STATES: tuple[str, ...] = (*lifecycle.JOB_STATES, "scheduled")
 
 
 CANCEL_SQL = """UPDATE jorb

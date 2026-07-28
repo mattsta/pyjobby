@@ -166,6 +166,7 @@ def mock_admin_api():
         {
             "queue": "default",
             "queued": 10,
+            "scheduled": 3,
             "claimed": 0,
             "running": 5,
             "waiting": 1,

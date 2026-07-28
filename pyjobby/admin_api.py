@@ -43,41 +43,24 @@ DEFAULT_STUCK_AFTER_SECONDS = 300.0
 # once per DXE checkpoint.
 FOOTPRINT_TABLES = ("jorb", "jorb_history", "jorb_step")
 
-#: Queue statistics without reading each queue's whole history — one arm per
-#: partial index, the same construction the client and the websocket
-#: snapshot use. Live states are counted exactly; terminal states within a
-#: recency window ($1). "How many finished, EVER" is an audit question for
-#: SQL. $2 optionally narrows to one queue (NULL = all; written as an
-#: OR-NULL predicate, which trades the index *condition* for a filter over
-#: each partial index's bounded live set — acceptable for an admin call).
-#: oldest_queued_age is measured from run_after over RUNNABLE rows only: a
-#: job deferred to next week is not "old", and measuring from created made
-#: deliberate deferrals read as backlog age.
-ADMIN_QUEUE_STATS_SQL = """
-    SELECT queue, 'queued' AS state, COUNT(*)::bigint AS count,
-           EXTRACT(EPOCH FROM (now() - MIN(run_after)
-               FILTER (WHERE run_after <= now())))::float8
+#: How long the oldest CLAIMABLE job has been waiting, per queue. The state
+#: counts beside it come from :data:`pyjobby.db.QUEUE_STATS_SQL` — this is
+#: the one thing the admin view needs that per-state counts cannot express,
+#: kept as its own small query so the shared statistics query keeps exactly
+#: one meaning for everybody.
+#:
+#: Measured from run_after over RUNNABLE rows only, matching that query's
+#: 'queued' arm: a job deferred to next week is not "old" (it is 'scheduled',
+#: not backlog), and measuring from created made deliberate deferrals read as
+#: backlog age. $1 optionally narrows to one queue (NULL = all).
+ADMIN_OLDEST_QUEUED_AGE_SQL = """
+    SELECT queue,
+           EXTRACT(EPOCH FROM (now() - MIN(run_after)))::float8
                AS oldest_queued_age_seconds
       FROM jorb
-     WHERE state = 'queued' AND ($2::text IS NULL OR queue = $2)
+     WHERE state = 'queued' AND run_after <= now()
+       AND ($1::text IS NULL OR queue = $1)
      GROUP BY queue
-    UNION ALL
-    SELECT queue, state::text, COUNT(*)::bigint, NULL::float8
-      FROM jorb
-     WHERE state IN ('claimed', 'running') AND ($2::text IS NULL OR queue = $2)
-     GROUP BY queue, state
-    UNION ALL
-    SELECT queue, 'waiting', COUNT(*)::bigint, NULL::float8
-      FROM jorb
-     WHERE state = 'waiting' AND ($2::text IS NULL OR queue = $2)
-     GROUP BY queue
-    UNION ALL
-    SELECT queue, state::text, COUNT(*)::bigint, NULL::float8
-      FROM jorb
-     WHERE state IN ('finished', 'crashed', 'cancelled')
-       AND COALESCE(finished, updated) >= now() - $1::interval
-       AND ($2::text IS NULL OR queue = $2)
-     GROUP BY queue, state
 """
 
 
@@ -178,6 +161,10 @@ class QueueStats:
 
     queue: str
     queued: int = 0
+    #: queued jobs parked in the future (retry backoff, enqueue-at). Split
+    #: out of `queued` because deferred work is not backlog — see
+    #: :data:`pyjobby.db.QUEUE_STATS_SQL`.
+    scheduled: int = 0
     claimed: int = 0
     running: int = 0
     waiting: int = 0
@@ -563,11 +550,14 @@ class AdminAPI:
         Get statistics for queues, joined with the jorb_queue control plane
         so operators see paused/limits alongside depths.
 
-        Live states are counted exactly; finished/crashed/cancelled within
-        the LAST HOUR (recent activity, not an all-time audit — the all-time
-        count grows with the install's whole history and belongs to SQL).
-        oldest_queued_age_seconds covers RUNNABLE rows only: a job deferred
-        to next week is deliberately not old.
+        The counts come from :data:`pyjobby.db.QUEUE_STATS_SQL`, the one home
+        for what they mean: live states counted exactly, finished/crashed/
+        cancelled within the LAST HOUR (recent activity, not an all-time
+        audit — the all-time count grows with the install's whole history and
+        belongs to SQL), and 'queued' = claimable NOW with deferred jobs
+        reported separately as 'scheduled'. oldest_queued_age_seconds covers
+        those same RUNNABLE rows only: a job deferred to next week is
+        deliberately not old.
 
         Args:
             queue: Specific queue name, or None for all queues
@@ -575,7 +565,8 @@ class AdminAPI:
         Returns:
             List of queue statistics dictionaries
         """
-        records = await self.conn.fetch(ADMIN_QUEUE_STATS_SQL, timedelta(hours=1), queue)
+        records = await self.conn.fetch(db.QUEUE_STATS_SQL, timedelta(hours=1), queue)
+        ages = await self.conn.fetch(ADMIN_OLDEST_QUEUED_AGE_SQL, queue)
 
         # Aggregate by queue
         queue_stats_map: dict[str, QueueStats] = {}
@@ -587,11 +578,12 @@ class AdminAPI:
 
             stats = queue_stats_map[q]
             state = r["state"]
-            count = r["count"]
+            count = r["n"]
 
             if state == "queued":
                 stats.queued = count
-                stats.oldest_queued_age_seconds = r["oldest_queued_age_seconds"]
+            elif state == "scheduled":
+                stats.scheduled = count
             elif state == "claimed":
                 stats.claimed = count
             elif state == "running":
@@ -606,6 +598,10 @@ class AdminAPI:
                 stats.cancelled = count
 
             stats.total += count
+
+        for a in ages:
+            stats = queue_stats_map.setdefault(a["queue"], QueueStats(queue=a["queue"]))
+            stats.oldest_queued_age_seconds = a["oldest_queued_age_seconds"]
 
         # Merge in the control plane (a control row without jobs still shows)
         control_where = "WHERE name = $1" if queue else ""

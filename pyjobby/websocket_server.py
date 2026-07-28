@@ -172,6 +172,11 @@ DEFAULT_SNAPSHOT_WINDOW_SECONDS = 60.0
 #: out over PROM_SQL_LIVE_STATES: a single predicate spanning several states
 #: matches none of the partial indexes and collapses into a sequential scan.
 #: Each arm gets its own index; the union is what keeps them.
+#:
+#: :data:`pyjobby.db.QUEUE_STATS_SQL` is the semantic contract these counts
+#: answer to (queued = claimable now, scheduled = deferred and NOT backlog,
+#: terminal states windowed); this string stays separate only because its
+#: plan is pinned and it carries the kind/age columns the snapshot needs.
 # f-string ONLY for the liveness constant (a float from monitor.py, not user
 # input): the dashboard's live-worker count must use the same grace as the
 # monitor and pj-web, or the surfaces disagree the day the default changes.

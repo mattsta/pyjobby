@@ -199,7 +199,7 @@ class TestQueueStats:
 
     @pytest.mark.asyncio
     async def test_queue_stats_default(self, client):
-        """Test getting stats for default queue."""
+        """No queue argument aggregates every queue in the install."""
         # Create some jobs in default queue
         await client.enqueue("test.Job1")
         await client.enqueue("test.Job2")
@@ -209,6 +209,7 @@ class TestQueueStats:
         assert isinstance(stats, dict)
         assert "queued" in stats
         assert stats["queued"] >= 2  # At least our 2 jobs
+        assert "scheduled" in stats  # deferred work, reported apart from backlog
 
     @pytest.mark.asyncio
     async def test_queue_depth(self, client):

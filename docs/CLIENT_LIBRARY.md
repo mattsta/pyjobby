@@ -381,21 +381,27 @@ if requeued:
 
 ### Queue Operations
 
-#### `queue_depth(queue='default')`
+#### `queue_depth(queue=None)`
 
-Get number of queued jobs.
+How many jobs are claimable right now — every queue by default, or one
+named queue. Jobs parked in the future (retry backoff, `run_after`) are not
+counted: they are not waiting for a worker.
 
 ```python
 depth = await client.queue_depth("emails")
 print(f"Queue has {depth} jobs waiting")
 ```
 
-#### `queue_stats(queue='default', window=timedelta(hours=1))`
+#### `queue_stats(queue=None, window=timedelta(hours=1))`
 
-Per-state counts for a queue. Live states (`queued`, `claimed`, `running`,
-`waiting`) are counted exactly; terminal states (`finished`, `crashed`,
-`cancelled`) are counted only within `window` (default: the last hour), a
-recent-activity number rather than an all-time total.
+Per-state counts — every queue aggregated by default, or one named queue.
+Live states (`queued`, `scheduled`, `claimed`, `running`, `waiting`) are
+counted exactly; terminal states (`finished`, `crashed`, `cancelled`) are
+counted only within `window` (default: the last hour), a recent-activity
+number rather than an all-time total.
+
+`queued` means claimable **now**; a job deferred to the future is reported
+as `scheduled` and is deliberately not counted as backlog.
 
 ```python
 from datetime import timedelta

@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 import asyncpg
 import pytest
 
+from pyjobby import lifecycle
 from pyjobby.client import (
     JobClient,
     JobInfo,
@@ -403,6 +404,22 @@ class TestJobClientQueueOperations:
         assert depth == 5
 
     @pytest.mark.asyncio
+    async def test_queue_depth_counts_only_runnable_jobs(self, db_pool):
+        """A job parked in the future is not waiting for a worker, so it is
+        not depth — counting it makes a healthy install look stuck."""
+        client = JobClient(db_pool)
+        queue_name = unique_name("runnable_depth")
+
+        await client.enqueue("NowJob", queue=queue_name)
+        await client.enqueue(
+            "LaterJob",
+            queue=queue_name,
+            run_after=datetime.now(UTC) + timedelta(days=1),
+        )
+
+        assert await client.queue_depth(queue_name) == 1
+
+    @pytest.mark.asyncio
     async def test_queue_stats(self, db_pool):
         """Test queue_stats - covers lines 595-623."""
         client = JobClient(db_pool)
@@ -417,6 +434,50 @@ class TestJobClientQueueOperations:
         assert isinstance(stats, dict)
         assert "queued" in stats
         assert stats["queued"] >= 2
+        # Every lifecycle state plus the deferred split, zero-filled.
+        assert set(stats) == {*lifecycle.JOB_STATES, "scheduled"}
+        assert stats["scheduled"] == 0
+
+    @pytest.mark.asyncio
+    async def test_queue_stats_reports_deferred_jobs_as_scheduled(self, db_pool):
+        """A future run_after is a deliberate deferral, not backlog: it must
+        show up under 'scheduled' and leave 'queued' (the number an operator
+        pages on) alone."""
+        client = JobClient(db_pool)
+        queue_name = unique_name("deferred_stats")
+
+        await client.enqueue("NowJob", queue=queue_name)
+        await client.enqueue(
+            "LaterJob",
+            queue=queue_name,
+            run_after=datetime.now(UTC) + timedelta(days=1),
+        )
+
+        stats = await client.queue_stats(queue_name)
+
+        assert stats["queued"] == 1
+        assert stats["scheduled"] == 1
+
+    @pytest.mark.asyncio
+    async def test_queue_stats_with_no_queue_aggregates_every_queue(self, db_pool):
+        """queue_stats() without a queue sums the whole install, so two
+        queues' backlogs both land in the one number."""
+        client = JobClient(db_pool)
+        first = unique_name("agg_a")
+        second = unique_name("agg_b")
+
+        await client.enqueue("StatsJob", queue=first)
+        for _ in range(2):
+            await client.enqueue("StatsJob", queue=second)
+
+        everything = await client.queue_stats()
+        just_first = await client.queue_stats(first)
+        just_second = await client.queue_stats(second)
+
+        assert just_first["queued"] == 1
+        assert just_second["queued"] == 2
+        assert everything["queued"] >= 3
+        assert everything["queued"] >= just_first["queued"] + just_second["queued"]
 
     @pytest.mark.asyncio
     async def test_queue_stats_counts_only_the_named_queue(self, db_pool):

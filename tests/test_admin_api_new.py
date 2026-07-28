@@ -66,6 +66,7 @@ class TestQueueStatsDataclass:
         stats = QueueStats(queue="test_queue")
         assert stats.queue == "test_queue"
         assert stats.queued == 0
+        assert stats.scheduled == 0
         assert stats.claimed == 0
         assert stats.running == 0
         assert stats.waiting == 0
@@ -661,6 +662,38 @@ class TestAdminAPIQueueManagement:
             queue_names = [s["queue"] for s in stats]
             assert queue1 in queue_names
             assert queue2 in queue_names
+
+    @pytest.mark.asyncio
+    async def test_queue_stats_splits_deferred_jobs_out_of_the_backlog(self, db_pool):
+        """Same contract as db.QUEUE_STATS_SQL everywhere else: a job parked
+        in the future counts as 'scheduled', never as backlog, and the
+        oldest-age number ignores it too."""
+        async with db_pool.acquire() as conn:
+            api = AdminAPI(conn)
+            queue = unique_name("deferred_stats")
+
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                VALUES ('NowJob', '{}', $1, 100, 'queued')
+            """,
+                queue,
+            )
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state, run_after)
+                VALUES ('LaterJob', '{}', $1, 100, 'queued', now() + interval '1 day')
+            """,
+                queue,
+            )
+
+            stat = (await api.queue_stats(queue=queue))[0]
+
+            assert stat["queued"] == 1
+            assert stat["scheduled"] == 1
+            assert stat["total"] == 2
+            assert stat["oldest_queued_age_seconds"] is not None
+            assert stat["oldest_queued_age_seconds"] < 60
 
     @pytest.mark.asyncio
     async def test_queue_stats_waiting_cancelled(self, db_pool):

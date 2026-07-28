@@ -23,8 +23,8 @@ import re
 import pytest
 
 from pyjobby import dxe
-from pyjobby.admin_api import ADMIN_QUEUE_STATS_SQL
-from pyjobby.client import JobClient
+from pyjobby.admin_api import ADMIN_OLDEST_QUEUED_AGE_SQL
+from pyjobby.db import QUEUE_STATS_SQL
 from pyjobby.lifecycle import TERMINAL_STATES
 from pyjobby.monitor import (
     DELETE_MAILBOX_SQL,
@@ -722,9 +722,10 @@ class TestRetiredWorkerSweepPlan:
 
 
 class TestClientQueueStatsPlan:
-    """queue_stats()/list_queues() are the first thing an operator calls,
-    usually on a dashboard timer. Their old single GROUP BY read every row
-    the install ever ran; the arm-per-partial-index form (the snapshot's
+    """db.QUEUE_STATS_SQL backs client queue_stats()/list_queues() AND
+    AdminAPI.queue_stats — the first thing an operator calls, usually on a
+    dashboard timer. Its predecessor's single GROUP BY read every row the
+    install ever ran; the arm-per-partial-index form (the snapshot's
     construction) must read live work plus one recency window, never the
     history."""
 
@@ -732,7 +733,7 @@ class TestClientQueueStatsPlan:
         await seed_terminal_jobs(db_pool, unique_queue)
 
         plan = await plan_for(
-            db_pool, JobClient._QUEUE_STATS_SQL, datetime.timedelta(hours=1)
+            db_pool, QUEUE_STATS_SQL, datetime.timedelta(hours=1), None
         )
 
         assert_no_seq_scan(plan)
@@ -756,26 +757,24 @@ class TestClientQueueStatsPlan:
 
 
 class TestAdminQueueStatsPlan:
-    """AdminAPI.queue_stats backs `pj-admin queues stats` and
-    /api/queues/stats — same contract and same construction as the client's:
-    live exact, terminal windowed, nothing shaped like the table."""
+    """The one thing AdminAPI.queue_stats asks beyond the shared counts:
+    how long the oldest CLAIMABLE job has been waiting. It runs on the same
+    `pj-admin queues stats` / /api/queues/stats timer, so it too must be
+    answered from the runnable slice of jorb_claim_idx rather than by
+    reading the table."""
 
-    async def test_the_stats_read_no_history(self, db_pool, unique_queue):
+    async def test_the_oldest_age_reads_only_runnable(self, db_pool, unique_queue):
         await seed_terminal_jobs(db_pool, unique_queue)
 
-        plan = await plan_for(
-            db_pool, ADMIN_QUEUE_STATS_SQL, datetime.timedelta(hours=1), None
-        )
+        plan = await plan_for(db_pool, ADMIN_OLDEST_QUEUED_AGE_SQL, None)
 
         assert_no_seq_scan(plan)
         assert rows_removed_by_filter(plan) <= 5, plan
-        recent = await db_pool.fetchval(
-            """SELECT count(*) FROM jorb
-               WHERE state IN ('finished', 'crashed', 'cancelled')
-                 AND COALESCE(finished, updated) >= now() - interval '1 hour'"""
+        runnable = await db_pool.fetchval(
+            "SELECT count(*) FROM jorb WHERE state = 'queued' AND run_after <= now()"
         )
-        assert buffers_in(plan) <= recent * 2 + 100, (
-            f"{buffers_in(plan)} buffers for {recent} in-window rows\n{plan}"
+        assert buffers_in(plan) <= runnable * 2 + 100, (
+            f"{buffers_in(plan)} buffers for {runnable} runnable rows\n{plan}"
         )
 
 
