@@ -516,7 +516,6 @@ SWEEP_SATISFIED_JOB_WAITERS_SQL = """
           SELECT 1 FROM jorb u
           WHERE u.id = w.waitfor_job AND u.state = 'finished'
       )
-    ORDER BY w.id
     FOR UPDATE SKIP LOCKED
     LIMIT $1
 """
@@ -537,7 +536,6 @@ SWEEP_SATISFIED_GROUP_WAITERS_SQL = """
           SELECT 1 FROM jorb g
           WHERE g.run_group = w.waitfor_group AND g.state != 'finished'
       )
-    ORDER BY w.id
     FOR UPDATE SKIP LOCKED
     LIMIT $1
 """
@@ -582,7 +580,6 @@ SWEEP_UNSATISFIABLE_WAITERS_SQL = """
             AND NOT EXISTS (
                 SELECT 1 FROM jorb g WHERE g.run_group = w.waitfor_group
             )))
-    ORDER BY w.id
     FOR UPDATE SKIP LOCKED
     LIMIT $1
 """

@@ -357,6 +357,7 @@ class TestSubcommandsEmitDocumentedJson:
         assert payload["discard_offenders"] == []
         assert set(payload["queries"]) == {
             "claim",
+            "recv",
             "concurrency_cap",
             "schedule_concurrency",
             "metrics_completions",
@@ -394,6 +395,12 @@ class TestSubcommandsEmitDocumentedJson:
         # the two paths docs/SCALE.md names must reach their own index
         assert "jorb_claim_idx" in payload["queries"]["claim"]["indexes"]
         assert "jorb_retention_idx" in payload["queries"]["expired_jobs"]["indexes"]
+        # recv is the hottest DXE statement; its mailbox probe must ride the
+        # partial pending index (dest_job_id, topic, id) WHERE consumed_at IS
+        # NULL — a scan there would grow with the whole mailbox.
+        assert (
+            "jorb_mailbox_pending_idx" in payload["queries"]["recv"]["indexes"]
+        ), payload["queries"]["recv"]
         # Each sweep must reach the index its own table was given for it --
         # "no seq scan" alone would be satisfied by the wrong index.
         for key, index in (
@@ -407,8 +414,22 @@ class TestSubcommandsEmitDocumentedJson:
             ("schedule_log_backlog", "jorb_schedule_log_retention_idx"),
             ("retired_workers_backlog", "jorb_worker_retention_idx"),
             ("timed_out", "jorb_timeout_idx"),
+            # the stranded-waiter sweeps must reach the partial waitfor
+            # indexes (WHERE state='waiting'), bounding them to parked work.
+            # Their ORDER BY was dropped: a sweep needs any batch of unlocked
+            # rows, not the lowest ids, and ordering by id (which the partial
+            # indexes do not provide) forced a sort or a primary-key walk that
+            # defeated the LIMIT.
+            ("satisfied_job_waiters", "jorb_waitfor_job_idx"),
+            ("satisfied_group_waiters", "jorb_waitfor_group_idx"),
         ):
             assert index in payload["queries"][key]["indexes"], (key, payload)
+        # The unsatisfiable sweep's predicate is an OR across both waitfor
+        # columns; the planner combines the two partial indexes (BitmapOr)
+        # rather than scanning the table, so BOTH must appear.
+        unsat = payload["queries"]["unsatisfiable_waiters"]["indexes"]
+        assert "jorb_waitfor_job_idx" in unsat, unsat
+        assert "jorb_waitfor_group_idx" in unsat, unsat
         # The concurrency-cap count runs inside the per-queue advisory lock,
         # so it is the one query here whose cost is subtracted from a capped
         # queue's entire throughput rather than from one timer. It must reach

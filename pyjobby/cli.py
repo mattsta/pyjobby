@@ -529,6 +529,40 @@ def jobs_cancel(ctx: click.Context, job_ids: tuple[int, ...]) -> None:
     asyncio.run(_cancel())
 
 
+@jobs.command("set-priority")
+@click.argument("job_id", type=int)
+@click.argument("priority", type=int)
+@click.pass_context
+def jobs_set_priority(ctx: click.Context, job_id: int, priority: int) -> None:
+    """Change a queued or waiting job's priority.
+
+    Lower numbers are claimed first. Only jobs still in the queue can be
+    re-prioritised: once claimed, priority no longer decides anything. A
+    priority above the deployment's worker ceiling is refused, because no
+    worker would ever claim the job.
+    """
+
+    async def _set_priority() -> None:
+        conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
+        try:
+            api = AdminAPI(conn)
+            try:
+                updated = await api.update_job_priority(job_id, priority)
+            except ValueError as e:
+                fail(str(e))
+            if updated:
+                print_success(f"Job {job_id} priority set to {priority}")
+            else:
+                fail(
+                    f"Job {job_id} not found or no longer queued/waiting "
+                    f"(only queued or waiting jobs can be re-prioritised)"
+                )
+        finally:
+            await conn.close()
+
+    asyncio.run(_set_priority())
+
+
 @jobs.command("delete")
 @click.argument("job_id", type=int)
 @click.option("--force", "-f", is_flag=True, help="Skip confirmation")

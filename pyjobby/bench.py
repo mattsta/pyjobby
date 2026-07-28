@@ -195,6 +195,13 @@ DEFAULT_MAX_EXISTING_JOBS = 1000
 #: whatever the busy-database guard tolerates already being here, since those
 #: jobs are in the same index. Two orders of magnitude under the seed, so a
 #: regression to table-scale still fails the gate.
+#:
+#: The stranded-waiter sweeps reuse this magnitude for a DIFFERENT bound: a
+#: parked waiter is not work in flight, it is a node in the dependency graph,
+#: bounded by how much work is waiting on other work rather than by the
+#: concurrency cap. The number coincides only because the plan seed sizes the
+#: parked-waiter slice at the same scale as the in-flight slice; the guarantee
+#: it enforces there is "bounded by the graph, never by the table".
 PLAN_IN_FLIGHT_BUDGET = PLAN_IN_FLIGHT + DEFAULT_MAX_EXISTING_JOBS
 
 #: The job class ``pj-bench e2e`` enqueues. It lives here, in the installed
@@ -1923,7 +1930,9 @@ class HotQuery:
     key: str
     what: str
     sql: str
-    args: Callable[[str], list[Any]]
+    #: Built from (queue, seed_result): most cases need only the queue, but the
+    #: recv gate reads the seed's ``anchor`` (the job its mail is addressed to).
+    args: Callable[[str, dict[str, Any]], list[Any]]
     #: Relations a sequential scan of is a FAILURE. Per-query rather than a
     #: global "jorb", because the sweeps added since this gate was written
     #: read jorb_dag, jorb_worker, jorb_mailbox and jorb_schedule_log -- a
@@ -2029,14 +2038,19 @@ SWEEP_GATES: dict[str, SweepGate] = {
         "monitor stranded-waiter wake, group flavor (missed wake edges)",
         ("jorb",),
         takes_window=False,
+        # Walks the waiting set via jorb_waitfor_group_idx and probes the
+        # group, discarding waiters with an unfinished member — bounded by
+        # parked work (the dependency graph), never by the table.
         caught_up_discards=PLAN_IN_FLIGHT_BUDGET,
     ),
     "SWEEP_UNSATISFIABLE_WAITERS_SQL": SweepGate(
         "monitor unsatisfiable-waiter cancel (waitfor target does not exist)",
         ("jorb",),
         takes_window=False,
+        # An OR across both waitfor columns, so the planner combines the two
+        # partial waitfor indexes (BitmapOr) rather than scanning the table.
         # Discards are every waiter whose target DOES exist — the
-        # overwhelmingly normal case, and the honest cost of asking.
+        # overwhelmingly normal case, bounded by parked work, not the table.
         caught_up_discards=PLAN_IN_FLIGHT_BUDGET,
     ),
     "SWEEP_EXPIRED_JOBS_SQL": SweepGate(
@@ -2099,16 +2113,18 @@ def monitor_sweeps() -> dict[str, str]:
     }
 
 
-def _batch_only_args(_queue: str) -> list[Any]:
+def _batch_only_args(_queue: str, _seed: dict[str, Any]) -> list[Any]:
     """Parameters for the one sweep that takes no time window."""
     return [PLAN_BATCH]
 
 
-def _window_args(window: datetime.timedelta) -> Callable[[str], list[Any]]:
+def _window_args(
+    window: datetime.timedelta,
+) -> Callable[[str, dict[str, Any]], list[Any]]:
     """Bind `window` NOW. A closure over the loop variable would hand every
     case the last window built, so the whole gate would measure one state."""
 
-    def args(_queue: str) -> list[Any]:
+    def args(_queue: str, _seed: dict[str, Any]) -> list[Any]:
         return [window, PLAN_BATCH]
 
     return args
@@ -2185,11 +2201,18 @@ def hot_queries() -> tuple[HotQuery, ...]:
     next edit, and then certifies a statement nobody executes.
     """
 
-    def claim_args(queue: str) -> list[Any]:
+    def claim_args(queue: str, _seed: dict[str, Any]) -> list[Any]:
         return [queue, ["bench"], 1000]
 
-    def window_args(_queue: str) -> list[Any]:
+    def window_args(_queue: str, _seed: dict[str, Any]) -> list[Any]:
         return [db.utcnow() - datetime.timedelta(hours=1)]
+
+    def recv_args(_queue: str, seed: dict[str, Any]) -> list[Any]:
+        # $1 dest_job_id (the anchor, the only job with pending mail), $2 a
+        # step_seq the anchor has never checkpointed (so NOT EXISTS(prior) holds
+        # and the consume actually runs), $3 topic, $4 step name, $5 run_epoch
+        # (seeded jobs sit at 0, so the fence passes), $6 started.
+        return [seed["anchor"], 1, "bench", "recv", 0, db.utcnow()]
 
     return (
         HotQuery(
@@ -2199,10 +2222,18 @@ def hot_queries() -> tuple[HotQuery, ...]:
             claim_args,
         ),
         HotQuery(
+            "recv",
+            "Job.recv() mailbox consume — the highest-frequency DXE statement",
+            dxe.RECV_SQL,
+            recv_args,
+            tables=("jorb_mailbox", "jorb_step", "jorb"),
+            mutating=True,
+        ),
+        HotQuery(
             "concurrency_cap",
             "claim_jorb's max_concurrency count, inside the serialised section",
             CAP_COUNT_SQL,
-            lambda queue: [queue],
+            lambda queue, _seed: [queue],
             # It reads the in-flight index and discards other queues' rows.
             # That is the cost of the count being per-queue, and it is bounded
             # by work in flight everywhere, never by the size of jorb.
@@ -2216,7 +2247,7 @@ def hot_queries() -> tuple[HotQuery, ...]:
             # partial on the LIVE states as well as on schedule_id -- without
             # that second clause it still reports no seq scan while counting
             # and discarding every job the schedule has ever created.
-            lambda queue: [1],
+            lambda queue, _seed: [1],
             max_rows_removed=0,
         ),
         HotQuery(
@@ -2620,6 +2651,7 @@ async def seed_plan_data(
         "jorb",
         "jorb_step",
         "jorb_mailbox",
+        "jorb_history",
         "jorb_dag",
         "jorb_schedule",
         "jorb_schedule_log",
@@ -2636,6 +2668,9 @@ async def seed_plan_data(
         "schedules": PLAN_SCHEDULES,
         "schedule_log": rows,
         "workers": rows,
+        # The job every mailbox row is addressed to: the recv gate explains a
+        # consume against it, and it is the one job carrying pending mail.
+        "anchor": anchor,
     }
 
 
@@ -2669,7 +2704,7 @@ async def run_plans(
         seeded = await seed_plan_data(conn, queue, seed)
 
         for query in hot_queries():
-            args = query.args(queue)
+            args = query.args(queue, seeded)
             explain = f"EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, FORMAT JSON) {query.sql}"
             if query.mutating:
                 tx = conn.transaction()

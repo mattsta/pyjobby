@@ -13,6 +13,7 @@ Tests cover:
 """
 
 import json
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -557,6 +558,40 @@ class TestFailedWaitingJobs:
 # =============================================================================
 # Bulk Operations Tests
 # =============================================================================
+
+
+@pytest.mark.asyncio
+class TestCancelAndWait:
+    """cancel_and_wait resolves the cancel's outcome instead of leaving the
+    caller with the 'cancel_requested' promise."""
+
+    async def test_a_queued_job_lands_as_cancelled(self, db_pool, job_client):
+        """A queued job has no worker to outrun the request, so the cancel is
+        immediate and the resolved outcome is 'cancelled'."""
+        job_id = await job_client.enqueue("test.Job", data="x")
+
+        assert await job_client.cancel_and_wait(job_id) == "cancelled"
+
+    async def test_nothing_to_cancel_is_none(self, db_pool, job_client):
+        """A job that does not exist was never cancellable, so the outcome is
+        None -- distinct from any terminal state string."""
+        assert await job_client.cancel_and_wait(2**62) is None
+
+
+@pytest.mark.asyncio
+class TestRunTimeout:
+    async def test_run_cancels_the_job_it_gave_up_waiting_on(
+        self, db_pool, job_client
+    ):
+        """No worker runs the job, so run()'s wait times out. The abandoned
+        job must be cancelled, not left queued and orphaned, and the caller
+        still sees the TimeoutError."""
+        queue = f"run_timeout_{uuid.uuid4().hex}"
+        with pytest.raises(TimeoutError):
+            await job_client.run("test.Job", timeout=0.5, queue=queue, data="x")
+
+        jobs = await job_client.get_jobs(queue=queue)
+        assert [j["state"] for j in jobs] == ["cancelled"]
 
 
 @pytest.mark.asyncio

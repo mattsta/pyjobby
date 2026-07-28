@@ -537,6 +537,54 @@ class TestSyncFacadeParity:
             f"JobClient methods with no SyncJobClient wrapper: {missing}"
         )
 
+    async def test_every_sync_counterpart_keeps_the_async_parameters(self):
+        """A name match is not a signature match: a wrapper that silently
+        drops a keyword (window, timeout, ...) type-checks and passes the
+        presence test above while quietly denying sync callers a capability
+        the async client has. Compare the parameter NAMES, method by method."""
+        import inspect
+
+        from pyjobby.client import SyncJobClient
+
+        offenders: dict[str, list[str]] = {}
+        for name, member in vars(JobClient).items():
+            if name.startswith("_") or not inspect.iscoroutinefunction(member):
+                continue
+            sync = vars(SyncJobClient).get(name)
+            if sync is None:
+                continue  # covered by the presence test
+            sync_sig = inspect.signature(sync)
+            kinds = {p.kind for p in sync_sig.parameters.values()}
+            # A wrapper that forwards through **kwargs (and/or *args) accepts
+            # every keyword the async method takes, so nothing is truly
+            # dropped. Only an explicitly-enumerated wrapper that OMITS a
+            # parameter denies it -- which is the drift this test exists for.
+            forwards_kw = inspect.Parameter.VAR_KEYWORD in kinds
+            forwards_pos = inspect.Parameter.VAR_POSITIONAL in kinds
+            dropped = []
+            for pname, p in inspect.signature(member).parameters.items():
+                if pname == "self" or pname in sync_sig.parameters:
+                    continue
+                keywordable = p.kind in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                    # the async method's own **kwargs is forwarded by the
+                    # sync **kwargs whatever either one names it
+                    inspect.Parameter.VAR_KEYWORD,
+                )
+                positionable = p.kind in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.VAR_POSITIONAL,
+                )
+                if (forwards_kw and keywordable) or (forwards_pos and positionable):
+                    continue
+                dropped.append(pname)
+            if dropped:
+                offenders[name] = sorted(dropped)
+        assert not offenders, (
+            f"SyncJobClient wrappers dropping async parameters: {offenders}"
+        )
+
     async def test_from_config_builds_a_working_sync_client(
         self, db_params, tmp_path
     ):

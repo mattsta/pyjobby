@@ -13,6 +13,7 @@ import asyncio
 import datetime
 import uuid
 
+import asyncpg
 import pytest
 from click.testing import CliRunner
 
@@ -341,6 +342,67 @@ async def test_rerun_job_wipes_checkpoints_by_default_but_fresh_false_keeps(
             await db_pool.fetchval("SELECT state FROM jorb WHERE id = $1", job_id)
             == "queued"
         )
+
+
+async def test_update_job_priority_only_touches_queued_and_waiting(
+    unique_queue, db_pool
+):
+    """The operator re-prioritise verb: queued/waiting jobs move, a running
+    one does not (its priority no longer decides anything), and a priority
+    above the worker ceiling is refused before it becomes an unclaimable
+    black hole."""
+    async with db_pool.acquire() as conn:
+        api = AdminAPI(conn)
+
+        queued = await _insert_job(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {})
+        assert await api.update_job_priority(queued, 5) is True
+        assert (
+            await db_pool.fetchval("SELECT prio FROM jorb WHERE id = $1", queued) == 5
+        )
+
+        running = await _insert_job(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {})
+        await db_pool.execute(
+            "UPDATE jorb SET state = 'running' WHERE id = $1", running
+        )
+        assert await api.update_job_priority(running, 5) is False
+
+        with pytest.raises(ValueError):
+            await api.update_job_priority(queued, api.prio_ceiling + 1)
+
+
+def test_cli_jobs_set_priority(dsn):
+    runner = CliRunner()
+    queue = f"setprio_{uuid.uuid4().hex[:8]}"
+
+    async def _seed() -> int:
+        conn = await asyncpg.connect(dsn)
+        try:
+            jid: int = await conn.fetchval(
+                """INSERT INTO jorb (job_class, kwargs, queue, state)
+                   VALUES ('tests.dxe_jobs.OkJob', '{}', $1, 'queued')
+                   RETURNING id""",
+                queue,
+            )
+            return jid
+        finally:
+            await conn.close()
+
+    async def _read_prio(jid: int) -> int:
+        conn = await asyncpg.connect(dsn)
+        try:
+            prio: int = await conn.fetchval("SELECT prio FROM jorb WHERE id = $1", jid)
+            return prio
+        finally:
+            await conn.close()
+
+    job_id = asyncio.run(_seed())
+
+    result = runner.invoke(
+        cli, ["--dsn", dsn, "jobs", "set-priority", str(job_id), "7"], obj={}
+    )
+    assert result.exit_code == 0, result.output
+    assert "priority set to 7" in result.output
+    assert asyncio.run(_read_prio(job_id)) == 7
 
 
 @pytest.fixture

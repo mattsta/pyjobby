@@ -878,11 +878,28 @@ class JobClient:
         wait_for_result() raises (JobFailedError, JobCancelledError,
         TimeoutError).
 
+        ``timeout`` is how long THIS CALL waits, not the job's execution
+        deadline -- for that, pass ``timeout_seconds`` (an enqueue option) in
+        ``options``. They are different clocks: the wait can give up while the
+        job runs on. When the wait DOES give up (TimeoutError), the job is
+        best-effort cancelled before the error propagates, so an abandoned
+        request/response call does not leave work running unattended.
+
         Example:
-            report = await client.run('myapp.jobs.Report', day='mon', timeout=60)
+            # give up waiting after 60s; the job itself may run up to 120s
+            report = await client.run(
+                'myapp.jobs.Report', day='mon', timeout=60, timeout_seconds=120
+            )
         """
         job_id = await self.enqueue(job_class, **options)
-        return await self.wait_for_result(job_id, timeout=timeout)
+        try:
+            return await self.wait_for_result(job_id, timeout=timeout)
+        except TimeoutError:
+            # The caller has stopped waiting; do not orphan the job. Cancel is
+            # best effort -- the TimeoutError is the caller's answer either way.
+            with contextlib.suppress(Exception):
+                await self.cancel_job(job_id)
+            raise
 
     async def start_machine(
         self, machine: type[Any] | str, **options: Any
@@ -1143,11 +1160,34 @@ class JobClient:
         if not jobs:
             return []
 
+        # These three are supplied by enqueue_batch itself — job_class and
+        # kwargs from each tuple, prio_ceiling from the call. Naming any of
+        # them again in the shared options or a per-job dict would reach
+        # _build_enqueue_row as a duplicate argument and raise a bare
+        # "multiple values for keyword argument" TypeError from deep in the
+        # call; caught here it becomes a message that says which key and where.
+        reserved = {"job_class", "job_kwargs", "prio_ceiling"}
+        collision = reserved & set(options)
+        if collision:
+            raise ValueError(
+                f"enqueue_batch() shared options may not set {sorted(collision)}: "
+                f"job_class and kwargs come from each job tuple, and "
+                f"prio_ceiling is enqueue_batch's own argument"
+            )
+
         ceiling = self.prio_ceiling if prio_ceiling is None else prio_ceiling
         rows = []
-        for item in jobs:
+        for index, item in enumerate(jobs):
             job_class, kwargs, *rest = item
             per_job = rest[0] if rest else {}
+            per_job_collision = reserved & set(per_job)
+            if per_job_collision:
+                raise ValueError(
+                    f"job {index}'s per-job options may not set "
+                    f"{sorted(per_job_collision)}: job_class and kwargs are the "
+                    f"tuple's first two elements, and prio_ceiling is a "
+                    f"batch-level argument"
+                )
             rows.append(
                 self._build_enqueue_row(
                     job_class,
@@ -1238,6 +1278,12 @@ class JobClient:
         async with self.pool.acquire() as conn:
             return await db.cancel_job(conn, job_id)
 
+    #: cancel_and_wait's default wait when the caller passes none. Finite on
+    #: purpose: cancellation lands at the worker's next await point, and a job
+    #: that never reaches one (a tight synchronous loop) would hang an
+    #: unbounded wait forever. The call returns the current state instead.
+    _CANCEL_WAIT_TIMEOUT = 30.0
+
     async def cancel_and_wait(
         self, job_id: int, timeout: float | None = None
     ) -> str | None:
@@ -1248,12 +1294,28 @@ class JobClient:
         the request entirely and finish. This waits for the terminal state
         and returns it ('cancelled', or 'finished'/'crashed' when the job
         beat the cancel), or None when there was nothing to cancel.
+
+        Args:
+            job_id: the job to cancel.
+            timeout: how long to wait for the cancellation to land. None uses
+                a finite default (``_CANCEL_WAIT_TIMEOUT``), NOT an unbounded
+                wait: a worker in a tight synchronous loop never reaches an
+                await point, and waiting forever for it would hang the caller.
+
+        Returns:
+            The job's terminal state, or -- if the wait elapses before the
+            cancel lands -- its current NON-terminal state ('running',
+            'claimed'), which tells the caller the request is still in flight.
+            None only when there was nothing to cancel or the job has since
+            been deleted. Never raises TimeoutError: a timeout is reported as
+            the still-live state, not as an exception.
         """
         outcome = await self.cancel_job(job_id)
         if outcome is None or outcome == "cancelled":
             return outcome
-        with contextlib.suppress(JobError):
-            await self.wait_for_result(job_id, timeout=timeout)
+        wait = self._CANCEL_WAIT_TIMEOUT if timeout is None else timeout
+        with contextlib.suppress(JobError, TimeoutError):
+            await self.wait_for_result(job_id, timeout=wait)
         info = await self.get_job(job_id)
         return info.state if info else None
 
@@ -1800,6 +1862,30 @@ class JobClient:
          GROUP BY queue, state
     """
 
+    #: Same shape as _QUEUE_STATS_SQL for ONE queue: the $2 = queue predicate
+    #: keeps the aggregate bounded to the queue asked about rather than
+    #: counting every queue in the install and discarding all but one in
+    #: Python — which turned a single-queue dashboard call into a scan whose
+    #: cost grew with the number of OTHER queues.
+    _ONE_QUEUE_STATS_SQL = """
+        SELECT queue, 'queued' AS state, COUNT(*)::bigint AS n
+          FROM jorb WHERE state = 'queued' AND queue = $2 GROUP BY queue
+        UNION ALL
+        SELECT queue, state::text, COUNT(*)::bigint
+          FROM jorb WHERE state IN ('claimed', 'running') AND queue = $2
+         GROUP BY queue, state
+        UNION ALL
+        SELECT queue, 'waiting', COUNT(*)::bigint
+          FROM jorb WHERE state = 'waiting' AND queue = $2 GROUP BY queue
+        UNION ALL
+        SELECT queue, state::text, COUNT(*)::bigint
+          FROM jorb
+         WHERE state IN ('finished', 'crashed', 'cancelled')
+           AND queue = $2
+           AND COALESCE(finished, updated) >= now() - $1::interval
+         GROUP BY queue, state
+    """
+
     async def queue_stats(
         self, queue: str = "default", window: timedelta = timedelta(hours=1)
     ) -> dict[str, int]:
@@ -1821,11 +1907,10 @@ class JobClient:
             stats = await client.queue_stats('emails')
             print(f"Queued: {stats['queued']}, Running: {stats['running']}")
         """
-        rows = await self.pool.fetch(self._QUEUE_STATS_SQL, window)
+        rows = await self.pool.fetch(self._ONE_QUEUE_STATS_SQL, window, queue)
         stats = dict.fromkeys(lifecycle.JOB_STATES, 0)
         for row in rows:
-            if row["queue"] == queue:
-                stats[row["state"]] = row["n"]
+            stats[row["state"]] = row["n"]
         return stats
 
     async def list_queues(
@@ -2903,14 +2988,22 @@ class SyncJobClient:
         depth: int = self._run(self._client.queue_depth(queue))
         return depth
 
-    def queue_stats(self, queue: str = "default") -> dict[str, int]:
+    def queue_stats(
+        self, queue: str = "default", window: timedelta = timedelta(hours=1)
+    ) -> dict[str, int]:
         """Synchronous JobClient.queue_stats()."""
-        stats: dict[str, int] = self._run(self._client.queue_stats(queue))
+        stats: dict[str, int] = self._run(
+            self._client.queue_stats(queue, window=window)
+        )
         return stats
 
-    def list_queues(self) -> list[dict[str, Any]]:
+    def list_queues(
+        self, window: timedelta = timedelta(hours=1)
+    ) -> list[dict[str, Any]]:
         """Synchronous JobClient.list_queues()."""
-        queues: list[dict[str, Any]] = self._run(self._client.list_queues())
+        queues: list[dict[str, Any]] = self._run(
+            self._client.list_queues(window=window)
+        )
         return queues
 
     def purge_queue(self, queue: str, states: list[str] | None = None) -> int:

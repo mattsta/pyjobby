@@ -279,6 +279,24 @@ class TestJobClientEnqueueBatch:
                 row = await conn.fetchrow("SELECT queue FROM jorb WHERE id = $1", jid)
                 assert row["queue"] == queue_name
 
+    @pytest.mark.asyncio
+    async def test_enqueue_batch_reserved_key_is_a_named_error(self, db_pool):
+        """A reserved key (job_class/job_kwargs/prio_ceiling) in the shared
+        options or a per-job dict is a clear ValueError, not the bare
+        'multiple values for keyword argument' TypeError from deep inside
+        the row builder."""
+        client = JobClient(db_pool)
+
+        with pytest.raises(ValueError, match="shared options may not set"):
+            await client.enqueue_batch(
+                [("BatchJob", {"i": 0})], job_kwargs={"x": 1}
+            )
+
+        with pytest.raises(ValueError, match="job 0's per-job options"):
+            await client.enqueue_batch(
+                [("BatchJob", {"i": 0}, {"prio_ceiling": 5})]
+            )
+
 
 class TestJobClientJobManagement:
     """Test job inspection and management methods."""
@@ -392,6 +410,22 @@ class TestJobClientQueueOperations:
         assert isinstance(stats, dict)
         assert "queued" in stats
         assert stats["queued"] >= 2
+
+    @pytest.mark.asyncio
+    async def test_queue_stats_counts_only_the_named_queue(self, db_pool):
+        """queue_stats filters to the one queue in SQL, so another queue's
+        backlog never inflates its count (nor costs a scan of every queue)."""
+        client = JobClient(db_pool)
+        mine = unique_name("mine")
+        other = unique_name("other")
+
+        await client.enqueue("StatsJob", queue=mine)
+        for _ in range(3):
+            await client.enqueue("StatsJob", queue=other)
+
+        stats = await client.queue_stats(mine)
+
+        assert stats["queued"] == 1
 
     @pytest.mark.asyncio
     async def test_list_queues(self, db_pool):

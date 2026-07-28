@@ -458,6 +458,29 @@ class AdminAPI:
         # asyncpg returns "DELETE N" where N is number of rows deleted
         return result == "DELETE 1"
 
+    async def update_job_priority(self, job_id: int, new_priority: int) -> bool:
+        """Re-prioritise a job that has not been claimed yet.
+
+        Only queued/waiting jobs: a claimed or running job's priority no
+        longer decides anything, and a terminal job's is history. Refuses a
+        priority above this deployment's worker ceiling for the same reason
+        enqueue does -- a job no worker will claim is a silent black hole
+        (see validate_priority).
+
+        Returns True if the row was updated, False if the job does not exist
+        or has already left the queue.
+        """
+        validate_priority(new_priority, self.prio_ceiling)
+        result: str = await self.conn.execute(
+            """
+            UPDATE jorb SET prio = $2
+             WHERE id = $1 AND state IN ('queued', 'waiting')
+            """,
+            job_id,
+            new_priority,
+        )
+        return result != "UPDATE 0"
+
     async def delete_jobs(
         self,
         queue: str | None = None,
