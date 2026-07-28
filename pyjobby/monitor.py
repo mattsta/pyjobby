@@ -241,16 +241,27 @@ DELETE_EXPIRED_JOBS_SQL = "DELETE FROM jorb WHERE id = ANY($1::bigint[])"
 #: straight back to 20,001 rows discarded. A scalar subquery is not
 #: flattenable, so it stays a per-row primary-key probe on top of the
 #: index-driven scan, which is the plan this sweep needs.
-SWEEP_CHECKPOINT_JOBS_SQL = f"""
+#: state = 'finished' ONLY, deliberately NOT all terminal states. `crashed`
+#: and `cancelled` are RETRYABLE (db.RETRYABLE_STATES), and retry_job resumes
+#: from checkpoints -- so reaping a crashed DXE job's checkpoints after the
+#: short checkpoint window (1 day) would make a DLQ retry re-execute every
+#: already-completed step's side effects. Their checkpoints instead live
+#: until the whole job ages out under --retention-days (30 days) and the
+#: cascade takes them. A `finished` job is only ever re-run by an explicit
+#: `rerun_job` ("do it again anyway"), which is SUPPOSED to re-execute, so
+#: dropping its checkpoints early is correct rather than harmful. The
+#: `state = 'finished'` filter still rides jorb_retention_idx (finished is
+#: one of its partial-predicate states).
+SWEEP_CHECKPOINT_JOBS_SQL = """
     SELECT j.id
     FROM jorb j
-    WHERE j.state IN ({_TERMINAL_STATES_SQL})
+    WHERE j.state = 'finished'
       AND COALESCE(j.finished, j.updated) < now() - $1::interval
       AND (SELECT s.job_id FROM jorb_step s
             WHERE s.job_id = j.id LIMIT 1) IS NOT NULL
     ORDER BY COALESCE(j.finished, j.updated)
     LIMIT $2
-"""  # noqa: S608 - interpolates a module constant, never input
+"""
 
 #: ...and the delete, by the primary key's leading column. Bounded by the
 #: probe's batch, and never executed at all when the probe came back empty --

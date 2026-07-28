@@ -801,6 +801,66 @@ async def test_stale_step_cannot_overwrite_the_live_attempts_checkpoint(
     ] == [(1, "work", {"by": "current"}, None, current)]
 
 
+async def test_an_error_record_never_clobbers_a_committed_success(
+    db_pool, unique_queue
+):
+    """The in-doubt-commit hole: transaction() commits its application write
+    AND the success checkpoint together, but if the COMMIT ack is lost the
+    client cannot tell it committed, runs its error path, and reconnects to
+    write an error at the same seq. That error must NOT overwrite the
+    durable success — otherwise the retry re-runs fn and re-delivers an
+    exactly-once send(). RECORD_STEP_SQL's DO UPDATE guard enforces it.
+    """
+    job_id = await enqueue(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {"x": 1})
+    claimed = await claim_once(db_pool, unique_queue)
+    epoch = claimed["run_epoch"]
+
+    # the committed success (as transaction() writes it)
+    ok = await db_pool.fetch(
+        STMTS["record-step"], job_id, 1, "send", {"delivered": 1}, None, epoch,
+        db.utcnow(),
+    )
+    assert [r["step_seq"] for r in ok] == [1]
+
+    # the stale error write from the lost-commit fallback, SAME seq + epoch.
+    # It writes a row (so _dxe_record does NOT misread it as a stale epoch),
+    # but the CASE preserves the committed success unchanged.
+    clobber = await db_pool.fetch(
+        STMTS["record-step"], job_id, 1, "send", None, "ConnectionError: gone",
+        epoch, db.utcnow(),
+    )
+    assert [r["step_seq"] for r in clobber] == [1]
+
+    row = await db_pool.fetchrow(
+        "SELECT output, error FROM jorb_step WHERE job_id=$1 AND step_seq=1",
+        job_id,
+    )
+    assert row["output"] == {"delivered": 1}
+    assert row["error"] is None  # the success stands; replay fast-forwards
+
+    # positive controls: an error CAN be re-recorded, and a success replaces
+    # an existing error (the retry that finally succeeded)
+    await db_pool.execute("DELETE FROM jorb_step WHERE job_id=$1", job_id)
+    await db_pool.fetch(
+        STMTS["record-step"], job_id, 1, "s", None, "first failure", epoch,
+        db.utcnow(),
+    )
+    reerr = await db_pool.fetch(
+        STMTS["record-step"], job_id, 1, "s", None, "second failure", epoch,
+        db.utcnow(),
+    )
+    assert [r["step_seq"] for r in reerr] == [1]  # error -> error updates
+    win = await db_pool.fetch(
+        STMTS["record-step"], job_id, 1, "s", {"ok": 1}, None, epoch, db.utcnow(),
+    )
+    assert [r["step_seq"] for r in win] == [1]  # error -> success updates
+    final = await db_pool.fetchrow(
+        "SELECT output, error FROM jorb_step WHERE job_id=$1 AND step_seq=1",
+        job_id,
+    )
+    assert final["output"] == {"ok": 1} and final["error"] is None
+
+
 async def test_stale_reschedule_cannot_requeue_the_live_attempt(db_pool, unique_queue):
     """A stale attempt's reschedule must not disturb the running attempt.
 

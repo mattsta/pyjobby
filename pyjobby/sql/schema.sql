@@ -106,6 +106,15 @@ CREATE INDEX jorb_inflight_idx ON jorb (state, updated)
 -- Indexed on the expression the sweep actually filters by.
 CREATE INDEX jorb_retention_idx ON jorb (COALESCE(finished, updated))
     WHERE state IN ('finished', 'crashed', 'cancelled');
+-- checkpoint retention is a SEPARATE, shorter window and a NARROWER state
+-- set: only 'finished' jobs have their checkpoints reaped early, because
+-- 'crashed'/'cancelled' are retryable and a retry resumes from checkpoints.
+-- A dedicated partial index keeps that sweep from walking past (and
+-- discarding) the crashed/cancelled terminal rows the all-terminal index
+-- above would hand it -- on a crash-heavy install that discard is otherwise
+-- proportional to the terminal backlog.
+CREATE INDEX jorb_finished_retention_idx ON jorb (COALESCE(finished, updated))
+    WHERE state = 'finished';
 -- reporting windows. Deliberately on `created` and NOT on `updated`:
 -- `updated` is rewritten by every state change, so indexing it would add an
 -- index write to each of the ~4 updates per job AND block HOT updates on the

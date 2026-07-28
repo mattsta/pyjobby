@@ -1120,11 +1120,15 @@ class TestSweepExpiredJobs:
 
 
 class TestSweepCompletedCheckpoints:
-    """Checkpoints live on their own, much shorter window.
+    """Checkpoints live on their own, much shorter window — but ONLY for
+    `finished` jobs.
 
-    A checkpoint exists to make a job resumable. A terminal job is never
-    resumed, so from the moment it finishes its checkpoints are pure audit —
-    the bulkiest thing on the row with the shortest useful life."""
+    A checkpoint exists to make a job resumable. A `finished` job is only
+    ever re-run by an explicit `rerun_job` ("do it again anyway"), which is
+    supposed to re-execute, so its checkpoints are pure audit from the moment
+    it finishes. But `crashed`/`cancelled` jobs are RETRYABLE, and `retry_job`
+    resumes from their checkpoints — so those must survive the short window
+    and are reaped only when the whole job ages out under --retention-days."""
 
     async def test_terminal_job_loses_checkpoints_and_keeps_everything_else(
         self, db_pool, unique_queue
@@ -1152,21 +1156,35 @@ class TestSweepCompletedCheckpoints:
             "jorb_history": 2,
         }
 
-    async def test_deletes_for_every_terminal_state(self, db_pool, unique_queue):
-        jobs = [
-            await insert_terminal_job(db_pool, unique_queue, state=state, days_ago=3)
+    async def test_reaps_finished_but_preserves_retryable_checkpoints(
+        self, db_pool, unique_queue
+    ):
+        """A crashed or cancelled job's checkpoints are what a DLQ retry
+        resumes from; reaping them early would re-run every completed step.
+        Only `finished` checkpoints (never resumed except by explicit rerun)
+        are dropped on the short window."""
+        by_state = {
+            state: await insert_terminal_job(
+                db_pool, unique_queue, state=state, days_ago=3
+            )
             for state in ("finished", "crashed", "cancelled")
-        ]
-        for job in jobs:
+        }
+        for job in by_state.values():
             await add_checkpoints(db_pool, job, 2)
 
         deleted = await sweep_completed_checkpoints(
             db_pool, checkpoint_retention_days=1
         )
-        assert deleted == 6
+        assert deleted == 2  # only the finished job's two checkpoints
 
-        assert await job_ids(db_pool) == sorted(jobs)
-        assert await db_pool.fetchval("SELECT count(*) FROM jorb_step") == 0
+        assert await job_ids(db_pool) == sorted(by_state.values())
+        remaining = {
+            state: await db_pool.fetchval(
+                "SELECT count(*) FROM jorb_step WHERE job_id = $1", job
+            )
+            for state, job in by_state.items()
+        }
+        assert remaining == {"finished": 0, "crashed": 2, "cancelled": 2}
 
     async def test_job_terminated_inside_the_window_keeps_its_checkpoints(
         self, db_pool, unique_queue

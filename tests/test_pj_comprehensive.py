@@ -682,6 +682,50 @@ class TestJobSystemErrorHandling:
         finally:
             await system.cxn.close()
 
+    async def test_ex_reconnects_on_a_raw_oserror(
+        self, db_pool, db_params, worker_params, unique_queue
+    ):
+        """A failover delivers a socket-level drop as ConnectionResetError/
+        BrokenPipeError (OSError), below asyncpg's own exception types. On
+        the claim path that would escape _process AND run() and kill the
+        worker — the exact opposite of self-healing — unless ex() treats it
+        as a lost connection and reconnects."""
+        system = JobSystem(dsn=db_params, **worker_params)
+        system.cxn = await db.connect(**db_params)
+        system.stmts = {
+            name: await system.cxn.prepare(stmt) for name, stmt in STMTS.items()
+        }
+        system._wake = asyncio.Event()
+        system._current_job_id = None
+        system._exec_task = None
+        job_id = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+               VALUES ($1, $2, $3, 'queued', 100) RETURNING id""",
+            "test.Job",
+            {},
+            unique_queue,
+        )
+
+        tripped = False
+
+        class DropsSocket:
+            async def fetch(self, *args):
+                nonlocal tripped
+                if not tripped:
+                    tripped = True
+                    await system.cxn.close()
+                    raise ConnectionResetError("peer reset the connection")
+                raise AssertionError("should have been replaced on reconnect")
+
+        system.stmts["get-result"] = DropsSocket()
+        try:
+            result = await system.ex("get-result", job_id)
+            assert tripped
+            assert [r["state"] for r in result] == ["queued"]
+            assert not isinstance(system.stmts["get-result"], DropsSocket)
+        finally:
+            await system.cxn.close()
+
     async def test_heartbeat_loop_registers_an_unregistered_worker(
         self, db_params, worker_params
     ):

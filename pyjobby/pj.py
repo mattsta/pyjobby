@@ -416,7 +416,16 @@ class JobSystem:
         while True:
             try:
                 return await self.stmts[op].fetch(*args)  # type: ignore[no-any-return]
-            except (asyncpg.InterfaceError, asyncpg.PostgresConnectionError) as e:
+            except (
+                asyncpg.InterfaceError,
+                asyncpg.PostgresConnectionError,
+                OSError,
+            ) as e:
+                # OSError covers the socket-level drops (ConnectionResetError,
+                # BrokenPipeError) that a failover delivers below asyncpg's
+                # own exception types; _reconnect, _heartbeat_loop and the
+                # scheduler already catch it, and the worker's whole point is
+                # to survive a lost connection rather than exit on the claim.
                 if self.stop:
                     raise
                 if (

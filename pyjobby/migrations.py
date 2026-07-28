@@ -182,6 +182,7 @@ REQUIRED_INDEXES: frozenset[str] = _names("""
     jorb_inflight_idx jorb_retention_idx jorb_created_idx jorb_timeout_idx
     jorb_waitfor_job_idx jorb_waitfor_group_idx jorb_run_group_idx jorb_uid_idx
     jorb_dag_idx jorb_tags_idx jorb_deadline_idx jorb_schedule_id_idx
+    jorb_finished_retention_idx
     jorb_queue_pkey
     jorb_worker_pkey jorb_worker_live_idx jorb_worker_retention_idx
     jorb_worker_idle_idx

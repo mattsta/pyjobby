@@ -237,7 +237,7 @@ class TestCheckpointSweepPlan:
 
         plan = await self.explain_sweep(db_pool, retention_days=3650)
 
-        assert "jorb_retention_idx" in plan, plan
+        assert "jorb_finished_retention_idx" in plan, plan
         assert "Seq Scan on jorb " not in plan, plan
         # the whole point: nothing read, so nothing thrown away. The original
         # form reported 20,000 here while deleting nothing.
@@ -256,18 +256,23 @@ class TestCheckpointSweepPlan:
 
         plan = await self.explain_sweep(db_pool, retention_days=0)
 
-        assert "jorb_retention_idx" in plan, plan
+        # rides the FINISHED-only partial index, not the all-terminal one:
+        # the sweep reaps only finished checkpoints (crashed/cancelled are
+        # retryable), so its index must not hand it crashed/cancelled rows
+        # to walk past and discard.
+        assert "jorb_finished_retention_idx" in plan, plan
         assert "Seq Scan on jorb " not in plan, plan
-        # It walks past step-less jobs to fill a batch, so it does discard
-        # some — but the count scales with the BATCH and the fraction of jobs
-        # that check point (here 1 in 3), never with the table. The form this
-        # replaced discarded every terminal row in existence, every cycle.
+        # It still walks past step-less FINISHED jobs to fill a batch, so it
+        # discards some — but the count scales with the BATCH and the
+        # checkpointed fraction, never with the table or the crash rate.
         assert rows_removed_by_filter(plan) < self.STEP_EVERY * BATCH, plan
 
-    async def test_the_sweep_deletes_only_terminal_jobs_checkpoints(
+    async def test_the_sweep_deletes_only_finished_jobs_checkpoints(
         self, db_pool, unique_queue
     ):
-        """The plan is only worth asserting if the statement is still right."""
+        """The plan is only worth asserting if the statement is still right:
+        finished checkpoints go, crashed/cancelled (retryable) stay, live
+        jobs are never touched."""
         from pyjobby.monitor import sweep_completed_checkpoints
 
         await self.seed(db_pool, unique_queue)
@@ -297,11 +302,21 @@ class TestCheckpointSweepPlan:
         assert (
             await db_pool.fetchval(
                 "SELECT count(*) FROM jorb_step s JOIN jorb j ON j.id = s.job_id "
-                "WHERE j.queue = $1 AND j.state IN ('finished','crashed','cancelled')",
+                "WHERE j.queue = $1 AND j.state = 'finished'",
                 unique_queue,
             )
             == 0
-        ), "terminal jobs kept checkpoints"
+        ), "finished jobs kept checkpoints"
+        # crashed/cancelled are retryable: their checkpoints MUST survive so a
+        # DLQ retry resumes instead of re-running completed steps
+        assert (
+            await db_pool.fetchval(
+                "SELECT count(*) FROM jorb_step s JOIN jorb j ON j.id = s.job_id "
+                "WHERE j.queue = $1 AND j.state IN ('crashed','cancelled')",
+                unique_queue,
+            )
+            > 0
+        ), "retryable jobs' checkpoints were wrongly reaped"
         assert (
             await db_pool.fetchval(
                 "SELECT count(*) FROM jorb_step WHERE job_id = $1", live

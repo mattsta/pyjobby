@@ -119,16 +119,41 @@ LOAD_STEPS_SQL = """SELECT step_seq, name, output, error
 # caller's transaction, "wrote nothing" means "superseded", the raise rolls
 # that transaction back, and the application write goes with it. Exactly-once
 # and fencing are therefore one mechanism, not two.
+#
+# A COMMITTED SUCCESS IS NEVER OVERWRITTEN BY AN ERROR. This closes the
+# in-doubt-commit hole: transaction() commits the application write AND this
+# success checkpoint together, but if the COMMIT ack is lost the client
+# cannot tell it committed, falls into its error path, and reconnects to
+# write an error checkpoint at the same seq. Without protection that error
+# would clobber the durable success and the retry would re-run fn --
+# re-delivering an exactly-once send().
+#
+# Done with a per-column CASE rather than a WHERE on the DO UPDATE, so the
+# statement ALWAYS writes a row when the fence passes and the RETURNING is
+# empty ONLY when the epoch fence itself fails -- keeping "returned nothing"
+# a clean signal of supersession (a WHERE-guarded update returns empty on
+# the keep case too, which _dxe_record would misread as a stale epoch). When
+# the existing row is a success (error IS NULL) and the incoming write is an
+# error, every column keeps its existing value: the success stands and the
+# retry fast-forwards it. Every other case (error->error re-record,
+# error->success, first write) takes the incoming value.
 RECORD_STEP_SQL = """INSERT INTO jorb_step
             (job_id, step_seq, name, output, error, run_epoch, started, finished)
         SELECT $1, $2, $3, $4, $5, $6, $7, now()
         WHERE EXISTS (SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $6)
         ON CONFLICT (job_id, step_seq) DO UPDATE
-            SET output = EXCLUDED.output,
-                error = EXCLUDED.error,
-                run_epoch = EXCLUDED.run_epoch,
-                started = EXCLUDED.started,
-                finished = EXCLUDED.finished
+            SET name = CASE WHEN jorb_step.error IS NULL AND EXCLUDED.error IS NOT NULL
+                            THEN jorb_step.name ELSE EXCLUDED.name END,
+                output = CASE WHEN jorb_step.error IS NULL AND EXCLUDED.error IS NOT NULL
+                            THEN jorb_step.output ELSE EXCLUDED.output END,
+                error = CASE WHEN jorb_step.error IS NULL AND EXCLUDED.error IS NOT NULL
+                            THEN jorb_step.error ELSE EXCLUDED.error END,
+                run_epoch = CASE WHEN jorb_step.error IS NULL AND EXCLUDED.error IS NOT NULL
+                            THEN jorb_step.run_epoch ELSE EXCLUDED.run_epoch END,
+                started = CASE WHEN jorb_step.error IS NULL AND EXCLUDED.error IS NOT NULL
+                            THEN jorb_step.started ELSE EXCLUDED.started END,
+                finished = CASE WHEN jorb_step.error IS NULL AND EXCLUDED.error IS NOT NULL
+                            THEN jorb_step.finished ELSE EXCLUDED.finished END
         RETURNING step_seq"""
 
 # Fenced like every other state-changing write. Without this a superseded
