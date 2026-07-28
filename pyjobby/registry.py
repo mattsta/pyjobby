@@ -54,10 +54,12 @@ from __future__ import annotations
 import inspect
 from collections.abc import Callable
 from datetime import datetime
-from typing import Any, overload
+from typing import TYPE_CHECKING, Any, overload
 
 from .client import JobClient, JobHandle
-from .pj import Job
+
+if TYPE_CHECKING:
+    from .pj import Job
 
 # Parameter names never supplied by enqueue callers: `self` is the job
 # instance, `upstream_result` is injected by the worker at execution time.
@@ -237,6 +239,8 @@ def _register_function(fn: Callable[..., Any]) -> type[Job]:
     Job subclass. The task receives ONLY the enqueued kwargs — no self —
     so DXE primitives need a real Job subclass instead.
     """
+    from .pj import Job  # lazy for the same reason as in job()
+
     if inspect.iscoroutinefunction(fn):
 
         async def task(self: Job, **kwargs: Any) -> Any:
@@ -275,6 +279,12 @@ def job(target: Callable[..., Any]) -> type[Job]: ...
 def job[J: Job](target: type[J] | Callable[..., Any]) -> type[J] | type[Job]:
     """Register a Job subclass or a plain function as a typed, enqueueable
     job (see module docstring for the full contract)."""
+    # imported HERE, not at module top: registry is on the enqueue-only
+    # import path (pyjobby/__init__), and Job lives in the worker runtime —
+    # an application that only enqueues should not pay that import until it
+    # actually decorates a job class in-process
+    from .pj import Job
+
     if isinstance(target, type):
         if not issubclass(target, Job):
             raise TypeError(

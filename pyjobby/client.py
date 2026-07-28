@@ -47,6 +47,7 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, Final
 
 import asyncpg  # type: ignore[import-untyped]
+from loguru import logger
 
 from . import db, fsm, lifecycle
 
@@ -55,24 +56,32 @@ if TYPE_CHECKING:
 
 
 class JobError(Exception):
-    """Base class for job-outcome errors raised by the client library."""
+    """Base class for job-outcome errors raised by the client library.
+
+    Carries ``job_id`` when the error is about one job, so handlers can
+    route on it without parsing the message.
+    """
+
+    def __init__(self, message: str, job_id: int | None = None):
+        super().__init__(message)
+        self.job_id = job_id
 
 
 class JobFailedError(JobError):
     """The awaited job reached the terminal 'crashed' state (the DLQ)."""
 
     def __init__(self, job_id: int, error_message: str | None = None):
-        self.job_id = job_id
+        super().__init__(
+            f"job {job_id} crashed: {error_message or 'unknown error'}", job_id
+        )
         self.error_message = error_message
-        super().__init__(f"job {job_id} crashed: {error_message or 'unknown error'}")
 
 
 class JobCancelledError(JobError):
     """The awaited job reached the terminal 'cancelled' state."""
 
     def __init__(self, job_id: int):
-        self.job_id = job_id
-        super().__init__(f"job {job_id} was cancelled")
+        super().__init__(f"job {job_id} was cancelled", job_id)
 
 
 # Sentinel returned by poll callbacks when the awaited condition is not yet
@@ -244,9 +253,13 @@ class JobHandle:
         info = await self.client.get_job(self.id)
         return info.state if info else None
 
-    async def result(self) -> Any | None:
-        """Stored result if finished (no waiting); see get_job_result()."""
-        return await self.client.get_job_result(self.id)
+    async def result(self, timeout: float | None = None) -> Any:
+        """WAIT for the result — the same contract as MachineHandle.result(),
+        so `await handle.result()` means one thing across both handle kinds.
+        (It used to be a non-blocking peek that returned None for a job that
+        simply hadn't run yet — a silent "no result" branch in every caller
+        that copied the machine idiom. The peek is get_job_result().)"""
+        return await self.client.wait_for_result(self.id, timeout=timeout)
 
     async def cancel(self) -> str | None:
         """Cancel the job; see JobClient.cancel_job()."""
@@ -270,15 +283,15 @@ class UnhandledEventError(JobError):
     """
 
     def __init__(self, job_id: int, state: str, event: str, accepted: list[str]):
-        self.job_id = job_id
-        self.state = state
-        self.event = event
-        self.accepted = accepted
         super().__init__(
             f"machine {job_id} is in {state!r}, which has no transition for "
             f"{event!r}"
-            + (f"; it accepts {accepted}" if accepted else " (a final state)")
+            + (f"; it accepts {accepted}" if accepted else " (a final state)"),
+            job_id,
         )
+        self.state = state
+        self.event = event
+        self.accepted = accepted
 
 
 @dataclass
@@ -325,7 +338,8 @@ class MachineHandle:
         if state is None:
             raise JobError(
                 f"job {self.id} published {self._state_key!r} as {published!r}, "
-                f"which is not a machine state"
+                f"which is not a machine state",
+                job_id=self.id,
             )
         return state
 
@@ -543,6 +557,7 @@ class JobClient:
         # down with one client. The create()/from_config() constructors set
         # this True for the pools they build themselves.
         self._owns_pool = False
+        self._polling_reported = False
         self._db_params = db_params
         self._listener_conn: asyncpg.Connection | None = None
         self._listener_lock = asyncio.Lock()
@@ -854,6 +869,20 @@ class JobClient:
         """
         job_id = await self.enqueue(job_class, **options)
         return JobHandle(id=job_id, client=self)
+
+    async def run(
+        self, job_class: str, timeout: float | None = None, **options: Any
+    ) -> Any:
+        """Enqueue a job and wait for its result — request/response in one
+        call. Same keyword arguments as enqueue(); raises exactly what
+        wait_for_result() raises (JobFailedError, JobCancelledError,
+        TimeoutError).
+
+        Example:
+            report = await client.run('myapp.jobs.Report', day='mon', timeout=60)
+        """
+        job_id = await self.enqueue(job_class, **options)
+        return await self.wait_for_result(job_id, timeout=timeout)
 
     async def start_machine(
         self, machine: type[Any] | str, **options: Any
@@ -1194,6 +1223,25 @@ class JobClient:
         async with self.pool.acquire() as conn:
             return await db.cancel_job(conn, job_id)
 
+    async def cancel_and_wait(
+        self, job_id: int, timeout: float | None = None
+    ) -> str | None:
+        """Cancel a job and wait until the cancellation has actually LANDED.
+
+        'cancel_requested' is a promise, not an outcome: the running worker
+        cancels at its next await point, and a synchronous task may outrun
+        the request entirely and finish. This waits for the terminal state
+        and returns it ('cancelled', or 'finished'/'crashed' when the job
+        beat the cancel), or None when there was nothing to cancel.
+        """
+        outcome = await self.cancel_job(job_id)
+        if outcome is None or outcome == "cancelled":
+            return outcome
+        with contextlib.suppress(JobError):
+            await self.wait_for_result(job_id, timeout=timeout)
+        info = await self.get_job(job_id)
+        return info.state if info else None
+
     async def retry_job(self, job_id: int) -> int | None:
         """
         Retry a job that did not succeed (crashed or cancelled).
@@ -1229,6 +1277,64 @@ class JobClient:
     _LISTEN_POLL_INTERVAL = 2.0
     # Pool-only clients (no db_params) have no LISTEN connection: poll faster.
     _PURE_POLL_INTERVAL = 0.5
+
+    @property
+    def listening(self) -> bool:
+        """True when this client can ride LISTEN/NOTIFY for its waits.
+
+        A client built without db_params (pool-only) has no LISTEN
+        connection and every wait_* polls at {_PURE_POLL_INTERVAL}s by
+        design — construct via create()/from_config(), or pass db_params,
+        to get push latency."""
+        return self._db_params is not None and not self._closed
+
+    async def wait_for_group(
+        self, run_group: int, timeout: float | None = None
+    ) -> int:
+        """Wait until EVERY job in `run_group` has finished; returns the
+        member count. Raises JobError naming the failed members if any
+        member crashed or was cancelled (the group can then never finish),
+        LookupError for a group with no members, TimeoutError on timeout.
+
+        This is the client-side await for create_fan_out(): before it, a
+        fan-out could only be waited on by chaining another job with
+        waitfor_group. Polls at the fallback interval (group completion has
+        no NOTIFY channel; membership is N jobs and demand-latching all of
+        them would write N rows).
+        """
+
+        async def check() -> Any:
+            row = await self.pool.fetchrow(
+                """SELECT count(*) AS members,
+                          count(*) FILTER (WHERE state = 'finished') AS done,
+                          array_agg(id) FILTER (
+                              WHERE state IN ('crashed', 'cancelled')
+                          ) AS failed
+                   FROM jorb WHERE run_group = $1""",
+                run_group,
+            )
+            if not row["members"]:
+                raise LookupError(
+                    f"run_group {run_group} has no jobs, so it can never finish"
+                )
+            if row["failed"]:
+                raise JobError(
+                    f"run_group {run_group} cannot finish: jobs "
+                    f"{sorted(row['failed'])} crashed or were cancelled"
+                )
+            if row["done"] == row["members"]:
+                return int(row["members"])
+            return _PENDING
+
+        members: int = await self._poll_until(
+            self._done_waiters,
+            ("group", run_group),
+            check,
+            timeout,
+            f"run_group {run_group} to finish",
+            job_id=run_group,
+        )
+        return members
 
     async def _ensure_listener(self) -> bool:
         """Lazily open the single shared LISTEN connection.
@@ -1319,6 +1425,18 @@ class JobClient:
         deadline = None if timeout is None else loop.time() + timeout
 
         waiter: asyncio.Event | None = None
+        if not self.listening and not self._polling_reported:
+            # Once per client, not per wait: a pool-only client polls every
+            # wait at _PURE_POLL_INTERVAL by design, and nothing else ever
+            # says so — a team following the shared-pool construction found
+            # out from pg_stat_activity.
+            self._polling_reported = True
+            logger.info(
+                "JobClient was built without db_params: waits poll at "
+                f"{self._PURE_POLL_INTERVAL}s instead of riding "
+                "LISTEN/NOTIFY. Pass db_params (or use create()/"
+                "from_config()) for push latency."
+            )
         if await self._ensure_listener():
             # BEFORE the first check, never after: a terminal state reached
             # between the check and the registration would be one this
@@ -1394,7 +1512,7 @@ class JobClient:
                 job_id,
             )
             if row is None:
-                raise JobError(f"job {job_id} does not exist")
+                raise JobError(f"job {job_id} does not exist", job_id=job_id)
             state = row["state"]
             if state == "finished":
                 return row["result"]
@@ -1461,12 +1579,14 @@ class JobClient:
             if job_state is None:
                 raise JobError(
                     f"job {job_id} does not exist, so event {key!r} will "
-                    f"never be published"
+                    f"never be published",
+                    job_id=job_id,
                 )
             if job_state in _TERMINAL_JOB_STATES:
                 raise JobError(
                     f"job {job_id} ended in {job_state!r} without publishing "
-                    f"event {key!r}"
+                    f"event {key!r}",
+                    job_id=job_id,
                 )
             return _PENDING
 
@@ -1531,7 +1651,8 @@ class JobClient:
                 raise JobError(
                     f"job {job_id} ended in {job_state!r} without "
                     f"event {key!r} reaching an accepted value "
-                    f"(last: {value!r})"
+                    f"(last: {value!r})",
+                    job_id=job_id,
                 )
             # No row at all — a bad id, or retention removed the job. Nothing
             # will ever publish, so waiting the full timeout only delays the
@@ -1540,7 +1661,8 @@ class JobClient:
             if job_state is None:
                 raise JobError(
                     f"job {job_id} does not exist, so event {key!r} will "
-                    f"never be published"
+                    f"never be published",
+                    job_id=job_id,
                 )
             return _PENDING
 
@@ -1659,16 +1781,9 @@ class JobClient:
 
         stats = {row["state"]: row["count"] for row in rows}
 
-        # Ensure all states are present
-        for state in [
-            "queued",
-            "claimed",
-            "running",
-            "waiting",
-            "finished",
-            "crashed",
-            "cancelled",
-        ]:
+        # Zero-fill from the platform's own declaration, so a state added to
+        # the enum cannot quietly vanish from every dashboard reading this
+        for state in lifecycle.JOB_STATES:
             stats.setdefault(state, 0)
 
         return stats
@@ -1921,7 +2036,11 @@ class JobClient:
 
         where_sql = " AND ".join(where_clauses) if where_clauses else "TRUE"
 
-        # Validate order_by to prevent SQL injection
+        # Validate order_by to prevent SQL injection. "priority" is accepted
+        # as the API-side name for the prio column (every enqueue-side knob
+        # calls it priority). An UNKNOWN field raises: silently falling back
+        # to created-order handed back rows in the wrong order with nothing
+        # to say so.
         valid_fields = [
             "id",
             "created",
@@ -1932,8 +2051,13 @@ class JobClient:
             "queue",
             "state",
         ]
+        if order_by == "priority":
+            order_by = "prio"
         if order_by not in valid_fields:
-            order_by = "created"
+            raise ValueError(
+                f"order_by must be one of {valid_fields} (or 'priority'), "
+                f"got {order_by!r}"
+            )
 
         direction = "ASC" if ascending else "DESC"
 
@@ -2366,7 +2490,10 @@ class JobClient:
             async with self.pool.acquire() as conn:
                 await conn.fetchval("SELECT 1")
             return True
-        except Exception:
+        except Exception as e:
+            # the bool is this probe's contract, but the CAUSE must not be
+            # swallowed with it — "unhealthy" with no reason is undebuggable
+            logger.warning(f"health_check failed: {type(e).__name__}: {e}")
             return False
 
     # =========================================================================

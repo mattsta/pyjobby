@@ -414,6 +414,95 @@ class TestEnqueueBatchFidelity:
             )
 
 
+class TestOneCallWorkflows:
+    """The request/response shapes users otherwise hand-roll."""
+
+    async def test_run_enqueues_and_returns_the_result(
+        self, live_worker, unique_queue, client
+    ):
+        await live_worker()
+        result = await client.run(
+            f"{__name__}.CountJob", queue=unique_queue, timeout=20, n=7
+        )
+        assert result == 7
+
+    async def test_handle_result_waits_like_the_machine_one(
+        self, live_worker, unique_queue, client
+    ):
+        """`await handle.result()` means the same thing on both handle
+        kinds now; the non-blocking peek is get_job_result()."""
+        await live_worker()
+        handle = await client.enqueue_handle(
+            f"{__name__}.CountJob", queue=unique_queue, n=3
+        )
+        assert await handle.result(timeout=20) == 3
+
+    async def test_wait_for_group_returns_when_every_member_finishes(
+        self, live_worker, unique_queue, client, db_pool
+    ):
+        await live_worker()
+        leader = await client.enqueue(f"{__name__}.CountJob", queue=unique_queue, n=1)
+        await db_pool.execute(
+            "UPDATE jorb SET run_group = $1 WHERE id = $1", leader
+        )
+        await client.enqueue(
+            f"{__name__}.CountJob", queue=unique_queue, run_group=leader, n=2
+        )
+
+        assert await client.wait_for_group(leader, timeout=20) == 2
+
+    async def test_wait_for_group_raises_when_a_member_fails(
+        self, unique_queue, client, db_pool
+    ):
+        leader = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, kwargs, queue, state)
+               VALUES ('x.Gone', '{}', $1, 'crashed') RETURNING id""",
+            unique_queue,
+        )
+        await db_pool.execute(
+            "UPDATE jorb SET run_group = $1 WHERE id = $1", leader
+        )
+
+        with pytest.raises(Exception, match="cannot finish"):
+            await client.wait_for_group(leader, timeout=5)
+
+    async def test_wait_for_group_with_no_members_fails_fast(self, client):
+        with pytest.raises(LookupError):
+            await client.wait_for_group(2**40, timeout=5)
+
+
+class TestErrorSurface:
+    async def test_job_errors_carry_the_job_id(self, client, db_pool):
+        ghost = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, kwargs, queue, state)
+               VALUES ('x.Gone', '{}', 'q', 'finished') RETURNING id"""
+        )
+        await db_pool.execute("DELETE FROM jorb WHERE id = $1", ghost)
+
+        from pyjobby import JobError
+
+        with pytest.raises(JobError) as raised:
+            await client.wait_for_result(ghost, timeout=5)
+        assert raised.value.job_id == ghost
+
+    async def test_get_jobs_refuses_an_unknown_order_by(self, client):
+        """It used to fall back to created-order silently — rows in the
+        wrong order with nothing to say so."""
+        with pytest.raises(ValueError, match="order_by"):
+            await client.get_jobs(order_by="cleverness")
+
+    async def test_get_jobs_accepts_priority_as_the_api_name_for_prio(
+        self, client, unique_queue, db_pool
+    ):
+        low = await client.enqueue("x.A", queue=unique_queue, priority=900)
+        high = await client.enqueue("x.B", queue=unique_queue, priority=5)
+
+        rows = await client.get_jobs(
+            queue=unique_queue, order_by="priority", ascending=True
+        )
+        assert [r["id"] for r in rows] == [high, low]
+
+
 class TestEnqueueValidation:
     async def test_unserializable_kwargs_fail_at_enqueue(self, client, unique_queue):
         """A value the database cannot store must be the caller's error, not
