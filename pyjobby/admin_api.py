@@ -24,6 +24,7 @@ from .client import (
     validate_tags,
 )
 from .cron import next_cron_run
+from .monitor import DEFAULT_LIVENESS_GRACE_SECONDS
 
 
 class Unset:
@@ -722,7 +723,7 @@ class AdminAPI:
 
     async def list_workers(
         self,
-        stale_after_seconds: float = 60.0,
+        stale_after_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS,
         include_dead_for_seconds: float = 3600.0,
     ) -> list[dict[str, Any]]:
         """
@@ -790,7 +791,7 @@ class AdminAPI:
             workers.append(data)
         return workers
 
-    async def worker_stats(self, stale_after_seconds: float = 60.0) -> dict[str, Any]:
+    async def worker_stats(self, stale_after_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS) -> dict[str, Any]:
         """
         Aggregate worker registry statistics.
 
@@ -968,7 +969,7 @@ class AdminAPI:
         }
 
     async def job_thread_stats(
-        self, stale_after_seconds: float = 60.0
+        self, stale_after_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS
     ) -> dict[str, Any]:
         """
         Workers that are alive and claiming nothing, and how close the rest

@@ -26,6 +26,7 @@ from aiohttp import web
 from . import db
 from .admin_api import AdminAPI
 from .client import DEFAULT_PRIO_CEILING
+from .monitor import DEFAULT_LIVENESS_GRACE_SECONDS
 
 # =============================================================================
 # Request parsing
@@ -171,10 +172,13 @@ PROM_SQL_ENQUEUED_TOTAL = """
 
 PROM_SQL_QUEUE_PAUSED = "SELECT name, paused FROM jorb_queue ORDER BY name"
 
-PROM_SQL_WORKERS_LIVE = """
+# liveness judged by THE threshold (monitor.DEFAULT_LIVENESS_GRACE_SECONDS),
+# interpolated once at import — a literal here drifted from the monitor's
+# flag and called live workers dead
+PROM_SQL_WORKERS_LIVE = f"""
     SELECT COUNT(*) FROM jorb_worker
      WHERE shutdown_at IS NULL
-       AND last_seen > now() - interval '60 seconds'
+       AND last_seen > now() - interval '{int(DEFAULT_LIVENESS_GRACE_SECONDS)} seconds'
 """
 
 _ID_RE = re.compile(r"^[0-9]+$")

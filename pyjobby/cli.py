@@ -22,6 +22,7 @@ from .admin_api import UNSET, AdminAPI, Unset
 from .client import DEFAULT_PRIO_CEILING, validate_priority
 from .configloader import load_config_from_file
 from .db import JobState
+from .monitor import DEFAULT_LIVENESS_GRACE_SECONDS
 
 
 # ANSI color codes for terminal output
@@ -2903,17 +2904,20 @@ def doctor(ctx: click.Context, max_depth: int, max_age_minutes: int) -> None:
             status, message = notify_queue_verdict(notify_usage)
             doc.report(status, "notify-queue", message)
 
-            # Live workers (heartbeats arrive every ~10s)
-            live_workers = await conn.fetchval("""
+            # Live workers, judged by THE liveness threshold the monitor
+            # sweeps with — a literal here drifted from --liveness-grace
+            # and called live workers dead
+            grace = int(DEFAULT_LIVENESS_GRACE_SECONDS)
+            live_workers = await conn.fetchval(f"""
                 SELECT COUNT(*) FROM jorb_worker
                 WHERE shutdown_at IS NULL
-                  AND last_seen > now() - interval '60 seconds'
+                  AND last_seen > now() - interval '{grace} seconds'
             """)
             doc.warn_if(
                 not live_workers,
                 "workers",
-                f"{live_workers} live worker(s) seen in last 60s",
-                "no live workers seen in last 60s",
+                f"{live_workers} live worker(s) seen in last {grace}s",
+                f"no live workers seen in last {grace}s",
             )
 
             # Live workers that are claiming nothing. Checked immediately
@@ -2927,11 +2931,11 @@ def doctor(ctx: click.Context, max_depth: int, max_age_minutes: int) -> None:
             # One row per worker, filtered on the same live predicate
             # jorb_worker_live_idx exists for: bounded by fleet size, never by
             # the job table.
-            stuck = await conn.fetch("""
+            stuck = await conn.fetch(f"""
                 SELECT id, host, pid, queue, job_threads, job_threads_abandoned
                 FROM jorb_worker
                 WHERE shutdown_at IS NULL
-                  AND last_seen > now() - interval '60 seconds'
+                  AND last_seen > now() - interval '{grace} seconds'
                   AND job_threads > 0
                   AND job_threads_abandoned >= job_threads
                 ORDER BY id

@@ -445,6 +445,14 @@ SWEEP_MAILBOX_SQL = """
 #: ...and the delete, by the primary key's leading column.
 DELETE_MAILBOX_SQL = "DELETE FROM jorb_mailbox WHERE id = ANY($1::bigint[])"
 
+#: Seconds without a heartbeat before a worker counts as dead — THE liveness
+#: threshold, defined once. The monitor sweeps by it, and every operator
+#: surface (doctor, /metrics, the workers page) must judge liveness by the
+#: SAME number: when this was written out six separate times, raising
+#: `--liveness-grace` on the monitor left every UI still calling those
+#: workers dead.
+DEFAULT_LIVENESS_GRACE_SECONDS = 60.0
+
 #: History rows past the retention window, oldest first. ($1 window, $2 batch)
 #:
 #: History of a TERMINAL job dies with the job's cascade at this same
@@ -756,7 +764,7 @@ async def sweep_stranded_waiters(pool: asyncpg.Pool, batch_size: int = 500) -> i
 
 async def sweep_dead_workers(
     pool: asyncpg.Pool,
-    liveness_grace_seconds: float = 60,
+    liveness_grace_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS,
     batch_size: int = 500,
 ) -> int:
     """Requeue in-flight jobs owned by workers whose heartbeat went stale,
@@ -1152,7 +1160,7 @@ async def monitor(
     dsn: str,
     check_interval: float = 10,
     batch_size: int = 100,
-    liveness_grace_seconds: float = 60,
+    liveness_grace_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS,
     claimed_grace_seconds: float = 300,
     retention_days: float = 30.0,
     checkpoint_retention_days: float = 1.0,
@@ -1313,7 +1321,7 @@ def cli() -> None:
     )
     @click.option(
         "--liveness-grace",
-        default=60.0,
+        default=DEFAULT_LIVENESS_GRACE_SECONDS,
         show_default=True,
         help="Seconds without a heartbeat before a worker counts as dead",
     )
