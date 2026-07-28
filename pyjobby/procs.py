@@ -6,9 +6,8 @@ worker processes, and importing test helpers from shipped code meant
 `pj-bench e2e` raised ModuleNotFoundError for anyone who installed pyjobby
 instead of cloning it -- the wheel does not package tests/.
 
-A console script that parses ``--help`` proves nothing: this platform has
-shipped a 97%-covered scheduler with no entry point and a 99%-covered
-timeout monitor that was a total no-op. The helpers here start the actual
+A console script that parses ``--help`` proves nothing about whether the
+subsystem behind it is wired up at all. The helpers here start the actual
 process, wait for an observable effect, and then kill the whole process
 group so nothing survives into later tests.
 

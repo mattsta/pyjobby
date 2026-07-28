@@ -170,13 +170,12 @@ $ echo $?
 
 ### What the `schema` check actually checks
 
-It used to ask two questions — is `jorb` there, and does `schema_migrations`
-record something pending — and a database installed from an *older*
-`schema.sql` answers both the way a healthy one does: `jorb` exists, and it
-records nothing, so nothing is pending. `doctor` printed PASS and the next
-check died on `column "job_threads" does not exist`.
+Presence-and-pending is not enough to certify a schema: a database
+installed from an *older* `schema.sql` has `jorb` and records nothing
+pending, so both answers look healthy while the very next query dies on a
+missing column.
 
-So it now checks the **shape**: every table, column, view, function, index
+So the check is the **shape**: every table, column, view, function, index
 and enum label this release addresses, by name, read out of the catalog and
 compared against the manifest in `pyjobby/migrations.py` (which the test
 suite asserts equals a fresh install's catalog in both directions, so it

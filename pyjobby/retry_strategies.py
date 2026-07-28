@@ -1,5 +1,5 @@
 """
-Retry Strategies for Pyjobby Phase 2
+Retry strategies for pyjobby
 
 Provides configurable retry backoff strategies to replace fixed retry intervals.
 Supports exponential, linear, fibonacci, fixed, and quadratic strategies.

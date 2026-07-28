@@ -1011,37 +1011,40 @@ class TestScheduleCommands:
 
 
 class TestHelperFunctions:
-    """Test CLI helper functions."""
+    """The CLI's console helpers must RENDER their message — an exception
+    swallowed into empty output would pass a does-not-raise test while
+    every command using the helper printed nothing."""
 
-    def test_print_success(self, cli_runner):
-        """Test print_success helper."""
+    def test_print_success(self, capsys):
         from pyjobby.cli import print_success
 
-        # Should not raise exception
         print_success("Test message")
+        assert "Test message" in capsys.readouterr().out
 
-    def test_print_error(self, cli_runner):
-        """Test print_error helper."""
+    def test_print_error(self, capsys):
         from pyjobby.cli import print_error
 
-        # Should not raise exception
         print_error("Test error")
+        captured = capsys.readouterr()
+        assert "Test error" in captured.out + captured.err
 
-    def test_print_warning(self, cli_runner):
-        """Test print_warning helper."""
+    def test_print_warning(self, capsys):
         from pyjobby.cli import print_warning
 
-        # Should not raise exception
         print_warning("Test warning")
+        captured = capsys.readouterr()
+        assert "Test warning" in captured.out + captured.err
 
-    def test_print_table(self, cli_runner):
-        """Test print_table helper."""
+    def test_print_table(self, capsys):
+        """The table renders its headers and every row's cells."""
         from pyjobby.cli import print_table
 
         headers = ["ID", "Name", "Status"]
         rows = [["1", "test", "active"], ["2", "demo", "inactive"]]
-        # Should not raise exception
         print_table(headers, rows)
+        out = capsys.readouterr().out
+        for cell in ("ID", "Status", "test", "inactive"):
+            assert cell in out
 
 
 # ============================================================================

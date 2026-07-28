@@ -30,9 +30,10 @@ So, in January 2021 I wrote `pyjobby` and this is all about it.
 
 ---
 
-## 🚀 What's New (2024-2025)
+## What's in the platform
 
-Pyjobby has evolved from a simple job queue into a **production-ready job orchestration platform**:
+Pyjobby is a **production-ready job orchestration platform** on plain
+PostgreSQL:
 
 ### ⚡ DXE: the Durable Execution Engine
 
@@ -73,7 +74,34 @@ class ProcessOrder(Job):
 - `run_epoch` fencing guarantees a superseded execution can never write
   results or checkpoints.
 
-### ✅ Live queue controls & worker registry
+### Durable state machines
+
+Declare states and transitions on a `StateMachineJob` and get a machine
+that lives in the database — parked between events at zero worker cost,
+crash-safe mid-transition, driveable and observable from any client:
+
+```python
+from pyjobby import StateMachineJob
+
+class Order(StateMachineJob):
+    initial = "awaiting_payment"
+    final = frozenset({"shipped", "refunded"})
+    transitions = {
+        "awaiting_payment": {"paid": ("packing", "charge"), "cancel": "refunded"},
+        "packing": {"packed": ("shipped", "buy_label")},
+    }
+
+    async def charge(self, event, payload): ...
+    async def buy_label(self, event, payload): ...
+
+order = await client.start_machine(Order)
+await order.send("paid", amount=100)
+await order.wait_for_state("shipped", timeout=600)
+```
+
+See [docs/STATECHARTS.md](docs/STATECHARTS.md).
+
+### Live queue controls & worker registry
 
 ```bash
 pj-admin queues pause imports          # takes effect on the next claim
@@ -88,7 +116,7 @@ statement — no worker restarts, no config deploys. Dead workers are
 detected by registry heartbeat and their jobs requeued globally by
 `pj-monitor` (jobs resume from their last completed step).
 
-### ✅ Client Library
+### Client Library
 
 Clean, high-performance Python client with:
 
@@ -122,7 +150,7 @@ async with await JobClient.from_config("./pyjobby.conf.py") as client:
 
 See [docs/CLIENT_LIBRARY.md](docs/CLIENT_LIBRARY.md) for complete documentation.
 
-### ✅ Admin Tools (NEW!)
+### Admin Tools
 
 **CLI**: Comprehensive command-line interface (`pj-admin`)
 
@@ -166,7 +194,7 @@ pj-admin db status    # show applied vs pending migrations
 **Web Interface**: Auto-refreshing dashboard (`pj-web`)
 
 ```bash
-pj-web ./pyjobby.conf.py --host 127.0.0.1 --port 8081
+pj-web --config ./pyjobby.conf.py --host 127.0.0.1 --port 8081
 # Open http://127.0.0.1:8081
 ```
 
@@ -184,13 +212,13 @@ Features:
 
 See [docs/ADMIN_TOOLS.md](docs/ADMIN_TOOLS.md) for complete documentation.
 
-### ✅ Realtime Websocket Dashboard (NEW!)
+### Realtime Websocket Dashboard
 
 A live event-stream dashboard server (`pj-ws`) pushes job/queue/worker events
 over websockets as they happen:
 
 ```bash
-pj-ws ./pyjobby.conf.py --host 127.0.0.1 --port 8082
+pj-ws --config ./pyjobby.conf.py --host 127.0.0.1 --port 8082
 ```
 
 Defaults to `127.0.0.1:8082`; the websocket API is unauthenticated, so front
@@ -199,7 +227,7 @@ it with a proxy before exposing it. The standalone client page lives at
 
 See [docs/WEBSOCKET_DASHBOARD.md](docs/WEBSOCKET_DASHBOARD.md) for details.
 
-### ✅ Recurring Scheduler (NEW!)
+### Recurring Scheduler
 
 Cron-based job scheduling with comprehensive safety features:
 
@@ -231,7 +259,7 @@ deadline keys prevent duplicate jobs).
 
 See [docs/RECURRING_SCHEDULER.md](docs/RECURRING_SCHEDULER.md) for complete documentation.
 
-### ✅ Phase 2: Advanced Job Patterns (NEW!)
+### Advanced job patterns
 
 Production-grade features for complex workflows:
 
@@ -351,6 +379,7 @@ Start here:
 Reference:
 
 - [writing-jobs.md](docs/writing-jobs.md) - What goes inside one job, and which durable primitive to reach for
+- [STATECHARTS.md](docs/STATECHARTS.md) - Durable state machines: declaring, driving, and observing them
 - [CLIENT_LIBRARY.md](docs/CLIENT_LIBRARY.md) - Client API reference with examples
 - [EXAMPLES.md](docs/EXAMPLES.md) - Complete applications, executed by the test suite
 - [ADMIN_TOOLS.md](docs/ADMIN_TOOLS.md) - CLI, Web UI, and Admin API
@@ -365,7 +394,7 @@ Reference:
 The full index, with what each document answers, is
 [docs/README.md](docs/README.md).
 
-### ✅ Testing
+### Testing
 
 - The test suite runs against a **real PostgreSQL** instance — no mocked database anywhere in the core paths (count and structure: [TESTING.md](docs/TESTING.md))
 - Covers core job lifecycle, result storage, retries, timeouts, DAGs, the scheduler, and the admin tools
@@ -708,15 +737,6 @@ await client.enqueue("TrainModel", capability="gpu", model="resnet50")
 - Every job state change hits the DB as a committed update (WAL pollution for high volume servers)
 - Using `FOR UPDATE SKIP LOCKED` atomic update primitive (reliable but not highest-performing)
   - We use postgres `LISTEN`/`NOTIFY` only as a wakeup signal for idle workers; we've avoided the in-memory-table pub/sub designs that [some projects use](https://github.com/que-rb/que/blob/master/lib/que/migrations/4/up.sql) for higher performance, preferring simplicity
-
-**Note**: Many limitations from the original 2021 version have been addressed:
-
-- ✅ Web console (added in 2024)
-- ✅ Client library (added in 2024)
-- ✅ Job reclamation on worker crash (added)
-- ✅ Documentation and examples (comprehensive)
-- ✅ Admin tools (CLI + API + Web)
-- ✅ Recurring scheduler (cron-based)
 
 ---
 

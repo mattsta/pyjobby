@@ -196,8 +196,8 @@ Enqueue a single job.
 - `save_result` (bool): Store the job's return value (default: True)
 - `use_result_from` (int): Inject that job's result as `upstream_result`
   (default: None). Pair with `waitfor_job` so it has finished first.
-- `retry_strategy` (str): `'exponential'`, `'linear'`, `'fibonacci'` or
-  `'fixed'` (default: `'exponential'`)
+- `retry_strategy` (str): `'exponential'`, `'linear'`, `'fibonacci'`,
+  `'quadratic'` or `'fixed'` (default: `'exponential'`)
 - `max_retries` (int): Attempts before the dead-letter state (default: 10)
 - `initial_retry_delay` / `max_retry_delay` (int): Backoff floor and ceiling
   in seconds (defaults: 1 and 3600)

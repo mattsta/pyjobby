@@ -510,9 +510,10 @@ a backoff delay until the retry budget is spent:
 
 * `max_retries` (default 10) is the number of *attempts*, not extra ones. It
   is a per-enqueue option; the worker's `--max-retries` is the fallback.
-* `retry_strategy` is `exponential` (default), `linear`, `fibonacci` or
-  `fixed`, shaped by `initial_retry_delay` (1s) and `max_retry_delay`
-  (3600s), with up to 10% jitter so a fleet does not retry in lockstep.
+* `retry_strategy` is `exponential` (default), `linear`, `fibonacci`,
+  `quadratic` or `fixed`, shaped by `initial_retry_delay` (1s) and
+  `max_retry_delay` (3600s), with jitter (up to 10% of the delay, capped
+  at 5s) so a fleet does not retry in lockstep.
 * Override `rescheduleBackoff()` on the class for a policy of your own.
 
 ```python

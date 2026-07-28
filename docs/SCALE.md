@@ -5,8 +5,8 @@ sustained. Every number below was measured on this schema, not estimated. Where
 something is a projection from a smaller measurement, it says so.
 
 The short version: write throughput has **~125× headroom** at this target
-(34,671 jobs/s measured in production shape). It used to be ~43×, and the
-difference was `NOTIFY` — see [Why NOTIFY set the
+(34,671 jobs/s measured in production shape). The single biggest factor in
+that number is `NOTIFY` demand-gating — see [Why NOTIFY set the
 ceiling](#why-notify-set-the-ceiling), which is worth reading before tuning
 anything, because the fix is the opposite of the obvious one.
 
@@ -206,11 +206,10 @@ a busy install can still reach it — so it stays monitored (`notify_queue_usage
 metric, and a `doctor` check that WARNs well before the edge) rather than
 assumed away.
 
-The three notifications per job that used to be `job_state_change` — an
-unfiltered per-transition firehose, no queue filter, broadcast to every
-listener — are gone. No consumer could use ~830 messages/second of individual
-state transitions, and a dashboard wants aggregates, so the channel was deleted
-and the dashboard now polls (see [Why NOTIFY sets the
+There is deliberately NO per-transition notification channel — an
+unfiltered firehose (no queue filter, broadcast to every listener) would be
+~830 messages/second no consumer could use, and a dashboard wants
+aggregates, so the dashboard polls instead (see [Why NOTIFY sets the
 ceiling](#why-notify-set-the-ceiling)).
 
 What remains is gated on demand, which means the notification rate now scales

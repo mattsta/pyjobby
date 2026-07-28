@@ -354,12 +354,13 @@ Finding the due schedules is a single indexed query
 is proportional to the schedules actually due, not to the number configured.
 Each firing is one short transaction, and the created job is one INSERT.
 
-The safety checks run once per firing, and the concurrency one used to be the
-thing that made firing a schedule get slower forever. It counted `jorb` rows by
-`admin_data->>'schedule_id'`; no index could serve an expression inside that
-blob, so **every firing sequentially scanned the whole job table** — a cost set
-by how many jobs the install had ever run rather than by anything about the
-schedule. It is invisible on a young database and it never announces itself.
+The safety checks run once per firing, and the concurrency one is why
+`jorb.schedule_id` is a COLUMN with a partial index rather than an
+`admin_data` key: no index can serve an expression inside a jsonb blob, so
+counting that way would sequentially scan the whole job table on **every
+firing** — a cost set by how many jobs the install has ever run rather than
+by anything about the schedule, invisible on a young database and never
+announcing itself.
 
 `schedule_id` is now a column with a partial index over it:
 

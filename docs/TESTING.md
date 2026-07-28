@@ -241,12 +241,10 @@ notifying commit therefore serialises against every other one.
 
 A single client has nothing to serialise against. Measured serially, the
 NOTIFY cost is **3%** — noise, "not worth touching". Measured concurrently on
-the same schema it is **62%** (~2.6x). The serial number was not merely
-imprecise; it pointed the wrong way, and it is why the firehose channel
-survived as long as it did.
+the same schema it is **62%** (~2.6x). A serial number for a concurrent cost
+is not merely imprecise; it points the wrong way.
 
-Corollary, learned the same way: the lock is per **commit**, not per
-notification. Silencing one of several ungated channels recovered *nothing*
+Corollary: the lock is per **commit**, not per notification. Silencing one of several ungated channels recovered *nothing*
 (the three-per-lifecycle `job_state_change` firehose: ceiling unmoved; gating
 `jorb_done` while the firehose survived: 1.01x). Deleting the last ungated
 channel recovered everything (**2.63–2.95x** on the completion path). Partial
@@ -366,20 +364,14 @@ The floor lives in `pyproject.toml` (`fail_under`, currently **89%**) so it can
 only ratchet upward; the suite measures **91%** against it today.
 
 **Read that number as a map of unexercised behavior, never as a score to
-maximize.** This project has direct evidence of why:
-
-| Module | Coverage during the earlier "coverage march" | Actual state at that coverage |
-|---|---|---|
-| `scheduler.py` | 97% | had **no entry point** — nothing ever ran it; cron never fired |
-| `timeout_monitor.py` | 99% | complete **no-op** — queried `state='running'`, which the worker never wrote |
-| `dag.py` | 100% | `wait_for_dag()` read columns that don't exist — could never detect completion |
-| `client.py` | 90% | `enqueue()` **failed in production** (no JSON codec on the pool) |
-
-Every line in those modules was executed by a test. Line coverage cannot see
-whether a subsystem is *wired up*, whether its state machine is *reachable*,
-or whether the assertion that passed was *meaningful* — some tests in that era
-passed because the worker process they spawned died on a `TypeError` before
-asserting anything.
+maximize.** Line coverage cannot see whether a subsystem is *wired up* (a
+module at 97% with no entry point is fully covered and never runs), whether
+its state machine is *reachable* (a query against a state nothing writes is
+covered and a no-op), or whether the assertion that passed was *meaningful*
+(a spawned process that dies before asserting still executes every line on
+its way down). That is why the entry-point tests launch real console
+scripts and assert observable effects, and why the mutation-control habit
+below exists.
 
 ### What to do instead
 

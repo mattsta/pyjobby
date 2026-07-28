@@ -1,5 +1,5 @@
 """
-DAG Builder - Dynamic Job Graphs (Phase 2)
+DAG Builder - dynamic job graphs
 
 Provides a clean API for building DAGs (Directed Acyclic Graphs) of jobs
 with automatic dependency resolution and parallel execution.

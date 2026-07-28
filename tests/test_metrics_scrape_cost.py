@@ -43,7 +43,7 @@ from pyjobby.web_admin import (
     PROM_SQL_TERMINAL_RECENT,
     WebAdminServer,
 )
-from tests.utils.plans import reset_job_tables
+from tests.utils.plans import plan_for, seed_for_plans
 
 pytestmark = pytest.mark.asyncio
 
@@ -65,57 +65,6 @@ async def web_admin_client(db_params, aiohttp_client):
 PLAN_ROWS = 20_000
 
 
-async def seed_for_plans(pool, rows: int = PLAN_ROWS) -> None:
-    """A steady state at scale: a large terminal history, a small live set.
-
-    The mix is the whole point. The live states are bounded by how much work
-    is in flight no matter how big the table gets, and the terminal states
-    are not -- so seeding a quarter of the table as queued would make a
-    sequential scan the *correct* plan and every assertion below meaningless.
-
-    Timestamps are spread over 60 days so a scrape window covers a real slice
-    rather than the entire table, and jorb_history is populated by the
-    ``jorb_history_record`` trigger on the way in: ~1 history row per job
-    here, against ~4 in production, which only makes these tests kinder to
-    the plans they are trying to catch.
-    """
-    await reset_job_tables(pool)
-    await pool.execute(
-        """
-        INSERT INTO jorb (job_class, kwargs, queue, state, run_count,
-                          created, updated, run_after, claimed_at,
-                          started, finished)
-        -- (i / 40) rather than (i % 5) so the live rows (every 40th) land
-        -- across all five queues instead of piling into one.
-        SELECT 'plan.Job', '{}', 'cost_q' || ((i / 40) % 5),
-               CASE WHEN i % 40 = 0  THEN 'queued'
-                    WHEN i % 400 = 1 THEN 'claimed'
-                    WHEN i % 400 = 2 THEN 'running'
-                    WHEN i % 400 = 3 THEN 'waiting'
-                    WHEN i % 40 = 3  THEN 'crashed'
-                    WHEN i % 40 = 7  THEN 'cancelled'
-                    ELSE 'finished' END::jorbstate,
-               1 + (i % 3),
-               now() - (i % 60) * interval '1 day',
-               now() - (i % 60) * interval '1 day',
-               now() - (i % 60) * interval '1 day',
-               now() - (i % 60) * interval '1 day',
-               now() - (i % 60) * interval '1 day',
-               now() - (i % 60) * interval '1 day'
-        FROM generate_series(1, $1) i
-        """,
-        rows,
-    )
-    # ANALYZE for statistics, VACUUM for the visibility map that index-only
-    # scans need. Autovacuum does both continuously in production; a test
-    # that skips them measures a table no running system ever has.
-    await pool.execute("VACUUM (ANALYZE) jorb")
-    await pool.execute("VACUUM (ANALYZE) jorb_history")
-
-
-async def plan_for(pool, sql: str, *args) -> str:
-    rows = await pool.fetch(f"EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) {sql}", *args)
-    return "\n".join(r["QUERY PLAN"] for r in rows)
 
 
 _BUFFERS_RE = re.compile(r"shared hit=(\d+)(?: read=(\d+))?")

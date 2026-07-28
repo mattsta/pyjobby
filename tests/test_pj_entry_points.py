@@ -28,9 +28,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = str(REPO_ROOT / "pyjobby.conf.py")
 
 
-def run_workit_briefly(args: list[str], cwd: Path, timeout: float = 2) -> None:
-    """Launch `python -m pyjobby.pj <args>` in its own process group and kill
-    the WHOLE group after `timeout`.
+def run_workit_briefly(args: list[str], cwd: Path, timeout: float = 2) -> bool:
+    """Launch `python -m pyjobby.pj <args>` in its own process group, kill
+    the WHOLE group after `timeout`, and report whether it was still ALIVE
+    at the kill — i.e. it started and survived its flags rather than dying
+    on argument parsing or config loading. Callers must assert on that:
+    a launch test that checks nothing passes identically for a launcher
+    that exits instantly on a TypeError.
 
     subprocess.run(timeout=...) only kills the direct child; the workit
     launcher's multiprocessing worker children would leak and keep claiming
@@ -44,13 +48,15 @@ def run_workit_briefly(args: list[str], cwd: Path, timeout: float = 2) -> None:
     )
     try:
         proc.wait(timeout=timeout)
+        alive_at_kill = False  # it exited on its own — startup failed
     except subprocess.TimeoutExpired:
-        pass  # expected - we only exercise startup
+        alive_at_kill = True  # still running when we came to kill it
     finally:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=5)
+    return alive_at_kill
 
 
 # ============================================================================
@@ -287,7 +293,7 @@ class TestWorkitCLIWithConfig:
         """Test workit loads config and launches successfully."""
         # Run workit with a very short timeout to just test startup
         # Use --workers=1 for minimal spawning
-        run_workit_briefly(
+        assert run_workit_briefly(
             ["--config", CONFIG_PATH, "--workers", "1"],
             cwd=REPO_ROOT,
         )
@@ -296,9 +302,11 @@ class TestWorkitCLIWithConfig:
         # We just want to verify it starts correctly
 
     def test_workit_with_multiple_queues(self):
-        """Test workit with multiple queue options (exercises queue padding)."""
-        # Run with multiple queues (more workers than queues to test padding)
-        run_workit_briefly(
+        """Two queues at --workers 3 is six workers, three per queue —
+        the flag is PER QUEUE (behavior proven with registry assertions in
+        test_entry_points; this only checks the launcher survives the
+        invocation)."""
+        assert run_workit_briefly(
             [
                 "--config",
                 CONFIG_PATH,
@@ -314,7 +322,7 @@ class TestWorkitCLIWithConfig:
 
     def test_workit_with_capabilities(self):
         """Test workit with capability options."""
-        run_workit_briefly(
+        assert run_workit_briefly(
             [
                 "--config",
                 CONFIG_PATH,
@@ -330,7 +338,7 @@ class TestWorkitCLIWithConfig:
 
     def test_workit_with_path_option(self):
         """Test workit with extra job-class path options."""
-        run_workit_briefly(
+        assert run_workit_briefly(
             [
                 "--config",
                 CONFIG_PATH,

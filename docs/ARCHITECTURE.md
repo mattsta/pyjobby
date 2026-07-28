@@ -77,9 +77,7 @@ leader.
 A `pj` invocation is a launcher: it forks `--workers N` processes **on each
 `--queue` named** (so two queues at `--workers 4` is eight processes), each
 of which is **one queue, one job at a time**. Repeating a queue name asks for
-nothing extra, and no worker is ever started on a queue that was not named —
-`--workers` used to be a fleet total with the queue list padded out using the
-literal `default`, which put workers on a queue the operator never asked for.
+nothing extra, and no worker is ever started on a queue that was not named.
 Concurrency is process count, not threads. A worker that finds nothing to
 claim parks on a wakeup and re-polls every `--check-interval` (5 s, jittered)
 regardless.

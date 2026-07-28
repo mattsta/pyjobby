@@ -2265,13 +2265,10 @@ def workit(
 ) -> None:
     """Launch a fleet of workers: --workers processes on EACH --queue.
 
-    `--workers` is per queue. It used to be a total, with the queue list
-    padded out to it using the literal "default" -- so `pj --queue emails
-    --workers 4` ran one worker on `emails` and three on a queue the
-    operator never named, silently. Per-queue is the only reading under
-    which naming another queue cannot change the capacity of the queues you
-    already named, and it makes a worker on an unnamed queue impossible
-    rather than merely unlikely."""
+    `--workers` is PER QUEUE: naming another queue never changes the
+    capacity of the queues already named, and a worker is never started on
+    a queue the operator did not name. Repeating a queue name asks for
+    nothing extra."""
     from pyjobby import __version__ as localver
 
     if v:

@@ -23,11 +23,8 @@ pj --queue emails --queue emails --workers 4   # 4 — a repeat asks for nothing
 ```
 
 Naming another queue therefore never changes the capacity of the queues you
-already named. (It used to be a total, with the list padded out using the
-literal `default`: `--queue emails --workers 4` ran ONE worker on `emails`
-and three on a queue nobody asked for.) Scale a single queue by raising
-`--workers`, or by starting another `pj` — nothing coordinates between
-launchers.
+already named. Scale a single queue by raising `--workers`, or by starting
+another `pj` — nothing coordinates between launchers.
 
 Start order does not matter — every process connects independently and
 tolerates the database being briefly unavailable. One command installs or
@@ -339,6 +336,9 @@ Nothing here is an operator action. Watch that the monitor logs
 (`jorb_worker.last_seen`) goes stale; within the monitor's
 `--liveness-grace` (60s default) the monitor requeues its in-flight jobs
 and retires the worker rows. Jobs resume from their last completed step.
+A job claimed by a worker that never managed to register at all has no
+heartbeat to judge by; the monitor requeues those by claim AGE instead,
+after `--claimed-grace` (300s default).
 
 **A job is stuck running / hung.** `pj-admin jobs inspect ID` — if past its
 `timeout_at`, the monitor will retry/dead-letter it per its `on_timeout`

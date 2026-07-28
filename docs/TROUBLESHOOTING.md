@@ -188,10 +188,7 @@ In order:
    queue**, and no worker is ever started on a queue you did not name:
    `pj --queue reports --workers 4` is four workers, all on `reports`, and
    `--queue reports --queue billing --workers 4` is eight processes, four
-   on each. (It used to be a total, with the queue list padded out using
-   the literal `default`, so that first command put one worker on `reports`
-   and three somewhere nobody asked for. A queue that looked unserved while
-   four workers were "live" was usually that.) See
+   on each. See
    [deployment-guide.md § Worker settings](deployment-guide.md#worker-settings).
 4. **Capability.** A job with a `capability` no worker advertises is
    invisible to those workers. Workers advertise with `--cap`.

@@ -43,23 +43,24 @@ WebSocket Clients (browsers)
 **Key Point**: the dashboard feed is a **poll of aggregates**, not a push of
 transitions.
 
-There used to be a `job_state_change` NOTIFY carrying every single state
-transition. It was deleted. Two reasons:
+There is deliberately no per-transition NOTIFY channel. Two reasons:
 
-- **It was the platform's biggest write-path cost.** Committing a transaction
-  that issued a NOTIFY takes a global exclusive lock held through fsync, so
-  notifying commits serialise. The lock is taken per COMMIT, not per
-  notification, so one ungated channel cost as much as all of them — deleting
-  it measured **2.6-2.9x** on the completion path (12,019 -> 31,591 jobs/s on
-  one run, 11,917 -> 35,191 on another; 16 concurrent connections, one
-  transaction per job, median of 5; see `tests/test_notify_gating.py`).
-- **Nobody could consume it.** At a million jobs an hour it was ~830 messages
-  per second of individual transitions. A dashboard wants aggregates.
+- **It would be the platform's biggest write-path cost.** Committing a
+  transaction that issued a NOTIFY takes a global exclusive lock held
+  through fsync, so notifying commits serialise. The lock is taken per
+  COMMIT, not per notification, so one ungated channel costs as much as all
+  of them — measured at **2.6-2.9x** of completion-path throughput (12,019
+  vs 31,591 jobs/s on one run, 11,917 vs 35,191 on another; 16 concurrent
+  connections, one transaction per job, median of 5; see
+  `tests/test_notify_gating.py`).
+- **Nobody could consume it.** At a million jobs an hour that is ~830
+  messages per second of individual transitions. A dashboard wants
+  aggregates.
 
-It could not simply be demand-gated like the other channels, because a browser
-has no polling fallback: a gate would have silently *dropped* dashboard events
-instead of delaying them. So the consumer got a different mechanism, which is
-the one documented below.
+Nor can such a channel be demand-gated like the others, because a browser
+has no polling fallback: a gate would silently *drop* dashboard events
+instead of delaying them. So the dashboard gets a different mechanism, the
+one documented below.
 
 ---
 
@@ -130,7 +131,7 @@ open frontend/live-dashboard.html
 ### Step 1: Create the Schema
 
 ```bash
-pj-admin init ./pyjobby.conf.py
+pj-admin --config ./pyjobby.conf.py db migrate
 ```
 
 The notification triggers this server relies on ship in
@@ -323,8 +324,8 @@ deep — thresholds belong to the operator, not to the feed — and the
 `queue_stats` payload above already carries what an alert would have said
 (`backlog`, `oldest_backlog_age_seconds`, `paused`, `workers_live`), once per
 interval, for every queue. A client that wants an alert compares those to its
-own threshold. An `alerts:queues:{queue}` channel used to be documented here
-and listened for; nothing ever emitted it, so subscribers waited forever.
+own threshold. There is deliberately no server-side alert channel: a
+subscription to a channel nothing emits is a client waiting forever.
 
 ### Actions Sent
 
