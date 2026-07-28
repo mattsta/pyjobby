@@ -47,17 +47,24 @@ class TestJobClientBasics:
     @pytest.mark.asyncio
     async def test_client_close(self, db_pool, db_params):
         """Test client close - covers lines 196-200."""
-        # Create a new pool just for this test
+        # Create a new pool just for this test. The test OWNS it: a client
+        # built from an externally supplied pool does not close it (only the
+        # from_config/from_pool factories set _owns_pool), so leaving it open
+        # leaks a live connection whose socket a later gc.collect() finalizes
+        # -- surfacing as an unraisable ResourceWarning in an unrelated test.
         new_pool = await asyncpg.create_pool(**db_params, min_size=1, max_size=2)
-        client = JobClient(new_pool)
+        try:
+            client = JobClient(new_pool)
 
-        assert client._closed is False
-        await client.close()
-        assert client._closed is True
+            assert client._closed is False
+            await client.close()
+            assert client._closed is True
 
-        # Close again should be safe (idempotent)
-        await client.close()
-        assert client._closed is True
+            # Close again should be safe (idempotent)
+            await client.close()
+            assert client._closed is True
+        finally:
+            await new_pool.close()
 
     @pytest.mark.asyncio
     async def test_client_context_manager(self, db_pool):

@@ -620,21 +620,58 @@ async def superseded_job(pool, queue: str) -> tuple[int, int, int]:
     return job_id, first["run_epoch"], second["run_epoch"]
 
 
+#: The only ``UPDATE jorb`` statements that MAY omit the run_epoch fence,
+#: each with the reason it is safe. They wake DOWNSTREAM waiters, keyed on
+#: another job's terminal state (finished / all-group-members-finished), not
+#: on the running attempt's identity -- level-triggered exactly like the
+#: monitor's stranded-waiter sweep, and correct whichever worker fires them.
+#: A NEW entry here is a deliberate assertion that a jorb write needs no
+#: fence; anything else that writes jorb must carry one.
+FENCE_EXEMPT_JORB_WRITES = {
+    "enqueue-next-self-finished": "wakes waiters on a finished upstream job",
+    "enqueue-next-if-peer-group-is-finished": "wakes waiters on a finished group",
+}
+
+
 async def test_every_state_changing_statement_carries_the_fence():
-    """A new worker statement must not be able to forget the fencing token."""
-    assert [name for name in EPOCH_FENCED if "run_epoch = $" in STMTS[name]] == list(
-        EPOCH_FENCED
+    """A new worker statement must not be able to forget the fencing token.
+
+    Reflective over STMTS rather than a hand-kept list: every statement that
+    UPDATEs the jorb table (the \\b excludes jorb_worker/jorb_step/... which
+    have no run_epoch) must carry ``run_epoch = $n`` unless it is one of the
+    explicitly justified waiter-wake writes. A statement added without a
+    fence and without an exemption fails here, at the point it is written,
+    instead of surfacing as a zombie overwriting a live attempt in
+    production.
+    """
+    import re
+
+    updates_jorb = re.compile(r"\bUPDATE\s+jorb\b", re.IGNORECASE)
+    unfenced = {
+        name
+        for name, sql in STMTS.items()
+        if updates_jorb.search(sql) and "run_epoch = $" not in sql
+    }
+    assert unfenced <= set(FENCE_EXEMPT_JORB_WRITES), (
+        f"jorb-writing statements with no fence and no exemption: "
+        f"{sorted(unfenced - set(FENCE_EXEMPT_JORB_WRITES))}"
     )
+    # the historical hand-kept set stays covered by the reflective sweep
+    assert set(EPOCH_FENCED) <= {
+        name for name, sql in STMTS.items() if "run_epoch = $" in sql
+    }
+
+    # The DXE writes that touch child tables, not jorb, so the sweep above
+    # cannot see them -- each was at some point the LAST unfenced durable
+    # write, and each fence closed a specific zombie hazard.
     assert "AND run_epoch = $6" in STMTS["record-step"]
-    # set-event and send were the last two DXE writes with no fence at all: a
-    # superseded worker could overwrite a live attempt's published events, and
-    # could deliver a mailbox message and only THEN raise on its own
-    # checkpoint -- the effect escaping while the record of it was refused.
+    # set-event / send: a superseded worker could overwrite a live attempt's
+    # published events, or deliver a mailbox message and only THEN raise on
+    # its own checkpoint -- the effect escaping while its record was refused.
     assert "run_epoch = $4" in STMTS["set-event"]
     assert "run_epoch = $5" in STMTS["send"]
-    # recv was the LAST durable-mailbox write with no fence: a superseded
-    # execution could consume (and then fail to checkpoint) a message the
-    # live attempt was entitled to -- the message eaten by a zombie.
+    # recv: a superseded execution could consume (and fail to checkpoint) a
+    # message the live attempt was entitled to -- eaten by a zombie.
     assert "run_epoch = $5" in STMTS["recv"]
 
 

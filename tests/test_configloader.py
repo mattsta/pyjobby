@@ -141,15 +141,24 @@ class TestFailureModes:
     def test_a_python_config_is_refused_by_name(self, tmp_path):
         """The refusal happens BEFORE the file is even opened: an executable
         config format is a remote-code-execution primitive wearing a
-        settings file, and the message says where to move the settings."""
+        settings file, and the message says where to move the settings.
+
+        Proven by an OBSERVABLE side effect, not just by the error: the
+        payload would create a sentinel file if it ran, so its ABSENCE after
+        the refusal is what shows the code never executed. Asserting only the
+        exception would pass even for a loader that ran the file and then
+        raised."""
+        sentinel = tmp_path / "payload-ran"
         path = write(
             tmp_path,
-            "import os; os.system('true')  # must never run\n",
+            f"import pathlib; pathlib.Path({str(sentinel)!r}).write_text('ran')\n",
             name="pyjobby.conf.py",
         )
 
         with pytest.raises(ConfigError, match="never executed"):
             load_config_from_file(path, ["db_params"])
+
+        assert not sentinel.exists(), "the .py config was executed before refusal"
 
     def test_config_errors_are_runtime_errors(self, tmp_path):
         """Callers catching RuntimeError (every CLI entry point) keep

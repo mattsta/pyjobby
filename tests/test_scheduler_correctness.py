@@ -264,9 +264,29 @@ class TestConnectionRecovery:
         task = asyncio.create_task(worker.run())
         await asyncio.sleep(0.2)  # let it poll at least once
         await conn.close()  # the "database restart"
+
+        # A schedule that comes due only AFTER the connection dies: reconnecting
+        # is necessary but not sufficient -- a loop that reconnects yet no
+        # longer fires is exactly the silent failure "survives" must exclude,
+        # so the proof is a job this schedule could only have created by firing
+        # post-recovery.
+        name = f"survives-{uuid.uuid4().hex[:8]}"
+        schedule_id = await db_pool.fetchval(
+            """
+            INSERT INTO jorb_schedule (name, job_class, cron_expr, next_run)
+            VALUES ($1, 'test.Job', '* * * * *', $2)
+            RETURNING id
+            """,
+            name,
+            datetime.now(UTC) - timedelta(minutes=1),
+        )
         await asyncio.sleep(1.0)  # a few cycles to notice and recover
 
         assert not worker.conn.is_closed(), "scheduler did not reconnect"
+        fired = await db_pool.fetchval(
+            "SELECT count(*) FROM jorb WHERE schedule_id = $1", schedule_id
+        )
+        assert fired >= 1, "scheduler reconnected but stopped firing schedules"
         worker.stop()
         await asyncio.wait_for(task, timeout=5.0)
         await worker.conn.close()
