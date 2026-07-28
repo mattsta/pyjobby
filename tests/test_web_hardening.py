@@ -34,8 +34,10 @@ from hypothesis import strategies as st
 
 from pyjobby.client import DEFAULT_PRIO_CEILING
 from pyjobby.web_admin import (
+    MAX_PAGE_LIMIT,
     MAX_QUEUE_NAME_LENGTH,
     MAX_SINCE_HOURS,
+    POOL_COMMAND_TIMEOUT_SECONDS,
     WebAdminServer,
 )
 
@@ -1084,11 +1086,22 @@ class TestMalformedInput:
         # the datetime arithmetic.
         ("/api/jobs?limit=99999999999999999999", 400, "above int64"),
         ("/api/metrics?since_hours=999999999999", 400, "above MAX_SINCE_HOURS"),
+        # A page is bounded on every listing route, not just the busy one.
+        (f"/api/jobs?limit={MAX_PAGE_LIMIT + 1}", 400, "above MAX_PAGE_LIMIT"),
+        (f"/api/dlq?limit={MAX_PAGE_LIMIT + 1}", 400, "above MAX_PAGE_LIMIT"),
+        (
+            f"/api/schedules/{MISSING_ID}/history?limit={MAX_PAGE_LIMIT + 1}",
+            400,
+            "above MAX_PAGE_LIMIT",
+        ),
+        (f"/api/jobs/{MISSING_ID}/history?limit={MAX_PAGE_LIMIT + 1}", 400, "ditto"),
+        (f"/api/jobs/{MISSING_ID}/steps?limit={MAX_PAGE_LIMIT + 1}", 400, "ditto"),
+        (f"/api/metrics?since_hours={MAX_SINCE_HOURS + 1}", 400, "wider than 90 days"),
         # Invalid enum is checked against db.JobState before the query runs.
         ("/api/jobs?state=not_a_state", 400, "invalid state"),
         # Benign cases that DO work, unchanged:
         ("/api/jobs?limit=0", 200, "LIMIT 0 -> empty list"),
-        ("/api/jobs?limit=9223372036854775807", 200, "max bigint accepted"),
+        (f"/api/jobs?limit={MAX_PAGE_LIMIT}", 200, "the bound itself is a page"),
         ("/api/jobs?limit=", 200, "empty value -> default"),
         ("/api/metrics?since_hours=0", 200, "no window"),
         (f"/api/metrics?since_hours={MAX_SINCE_HOURS}", 200, "widest window"),
@@ -1176,7 +1189,8 @@ class TestMalformedInput:
         """A form without a required field is a 400 that names the field, not
         a KeyError escaping as a 500."""
         resp = await web.client.post(
-            "/api/schedules", data={"job_class": "NoName", "cron_expr": "0 * * * *"}
+            "/api/schedules",
+            data={"job_class": "app.jobs.NoName", "cron_expr": "0 * * * *"},
         )
         assert resp.status == 400
         assert (await resp.json())["error"] == "Missing required field(s): name"
@@ -1190,7 +1204,7 @@ class TestMalformedInput:
         # A present-but-empty field is as useless as an absent one.
         resp = await web.client.post(
             "/api/schedules",
-            data={"name": "", "job_class": "NoName", "cron_expr": "0 * * * *"},
+            data={"name": "", "job_class": "app.jobs.NoName", "cron_expr": "0 * * * *"},
         )
         assert resp.status == 400
         assert (await resp.json())["error"] == "Missing required field(s): name"
@@ -1203,7 +1217,7 @@ class TestMalformedInput:
             "/api/schedules",
             data={
                 "name": f"badprio_{uuid.uuid4().hex[:8]}",
-                "job_class": "BadPrio",
+                "job_class": "app.jobs.BadPrio",
                 "cron_expr": "0 * * * *",
                 "priority": "high",
             },
@@ -1223,7 +1237,7 @@ class TestMalformedInput:
             "/api/schedules",
             data={
                 "name": name,
-                "job_class": "OverPrio",
+                "job_class": "app.jobs.OverPrio",
                 "cron_expr": "0 * * * *",
                 "priority": str(DEFAULT_PRIO_CEILING + 1),
             },
@@ -1254,7 +1268,7 @@ class TestMalformedInput:
             "/api/schedules",
             data={
                 "name": name,
-                "job_class": "AtPrio",
+                "job_class": "app.jobs.AtPrio",
                 "cron_expr": "0 * * * *",
                 "priority": str(DEFAULT_PRIO_CEILING),
             },
@@ -1284,7 +1298,7 @@ class TestMalformedInput:
             "/api/schedules",
             data={
                 "name": name,
-                "job_class": "Declared",
+                "job_class": "app.jobs.Declared",
                 "cron_expr": "0 * * * *",
                 "priority": "5000",
             },
@@ -1296,7 +1310,7 @@ class TestMalformedInput:
             "/api/schedules",
             data={
                 "name": refused_name,
-                "job_class": "Declared",
+                "job_class": "app.jobs.Declared",
                 "cron_expr": "0 * * * *",
                 "priority": "5001",
             },
@@ -1345,7 +1359,7 @@ class TestMalformedInput:
             "/api/schedules",
             data={
                 "name": f"badcron_{uuid.uuid4().hex[:8]}",
-                "job_class": "BadCron",
+                "job_class": "app.jobs.BadCron",
                 "cron_expr": "not a cron",
             },
         )
@@ -1360,7 +1374,7 @@ class TestMalformedInput:
         name = f"dupe_{uuid.uuid4().hex[:8]}"
         form: dict[str, Any] = {
             "name": name,
-            "job_class": "Dupe",
+            "job_class": "app.jobs.Dupe",
             "cron_expr": "0 * * * *",
         }
         first = await web.client.post("/api/schedules", data=form)
@@ -1388,3 +1402,459 @@ class TestMalformedInput:
         resp = await web.client.post("/api/jobs")
         await resp.read()
         assert resp.status == 405
+
+
+# =============================================================================
+# 6. Cross-site mutation defense
+# =============================================================================
+
+
+def _own_origin(client: TestClient) -> str:
+    """The origin the server's own pages are served from."""
+    return f"http://{client.host}:{client.port}"
+
+
+class TestCrossSiteMutations:
+    """The admin has no authentication, which makes CSRF *more* dangerous
+    rather than irrelevant: every mutation here is a CORS simple request, so
+    any page the operator visits can auto-submit a form to 127.0.0.1:8081 and
+    the write lands. web_admin.cross_site_guard refuses the browser-initiated
+    version of that while leaving curl and deploy scripts alone; these tests
+    pin both halves, because a guard that also blocked scripting would be
+    quietly removed the first time it broke an operator's shell loop."""
+
+    # One mutation of each shape the router exposes.
+    MUTATIONS: tuple[tuple[str, str], ...] = (
+        ("POST", f"/api/jobs/{MISSING_ID}/retry"),
+        ("POST", f"/api/jobs/{MISSING_ID}/cancel"),
+        ("DELETE", f"/api/jobs/{MISSING_ID}"),
+        ("POST", "/api/queues/csrf-probe/pause"),
+        ("POST", "/api/schedules"),
+        ("DELETE", f"/api/schedules/{MISSING_ID}"),
+        ("POST", f"/api/dlq/{MISSING_ID}/retry"),
+    )
+
+    @pytest.mark.asyncio
+    async def test_cross_site_mutations_are_403(self, web: Harness):
+        """`Sec-Fetch-Site: cross-site` is the browser saying, unforgeably,
+        that another site initiated this. Every mutating route refuses it."""
+        actual = []
+        for method, url in self.MUTATIONS:
+            resp = await web.client.request(
+                method, url, headers={"Sec-Fetch-Site": "cross-site"}
+            )
+            await resp.read()
+            actual.append((method, url, resp.status))
+        assert actual == [(m, u, 403) for m, u in self.MUTATIONS]
+
+    @pytest.mark.asyncio
+    async def test_same_site_is_also_refused(self, web: Harness):
+        """`same-site` is a different host on the same registrable domain --
+        another origin, and this surface has exactly one."""
+        resp = await web.client.post(
+            "/api/queues/csrf-probe/pause", headers={"Sec-Fetch-Site": "same-site"}
+        )
+        await resp.read()
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_the_403_says_why(self, web: Harness):
+        resp = await web.client.post(
+            "/api/queues/csrf-probe/pause", headers={"Sec-Fetch-Site": "cross-site"}
+        )
+        assert resp.status == 403
+        error = (await resp.json())["error"]
+        assert "Cross-site POST refused" in error
+        assert "cross-site" in error
+
+    @pytest.mark.asyncio
+    async def test_cross_site_mutation_has_no_side_effect(
+        self, web: Harness, db_pool: asyncpg.Pool, unique_queue: str
+    ):
+        """The point of the refusal: the write does not happen. The attacker
+        never sees the response either way, so only the row matters."""
+        resp = await web.client.post(
+            f"/api/queues/{unique_queue}/pause",
+            headers={"Sec-Fetch-Site": "cross-site"},
+        )
+        await resp.read()
+        assert resp.status == 403
+
+        async with db_pool.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT COUNT(*) FROM jorb_queue WHERE name = $1", unique_queue
+                )
+                == 0
+            )
+
+    @pytest.mark.asyncio
+    async def test_same_origin_mutations_are_allowed(
+        self, web: Harness, db_pool: asyncpg.Pool, unique_queue: str
+    ):
+        """The admin's own htmx buttons: same-origin fetch metadata plus the
+        page's own Origin. This is the case the guard must never break."""
+        resp = await web.client.post(
+            f"/api/queues/{unique_queue}/pause",
+            headers={
+                "Sec-Fetch-Site": "same-origin",
+                "Origin": _own_origin(web.client),
+            },
+        )
+        await resp.read()
+        assert resp.status == 200
+
+        async with db_pool.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT paused FROM jorb_queue WHERE name = $1", unique_queue
+                )
+                is True
+            )
+
+    @pytest.mark.asyncio
+    async def test_typed_url_is_allowed(self, web: Harness, unique_queue: str):
+        """`Sec-Fetch-Site: none` is a user-initiated navigation -- the
+        operator typing the URL, not a page acting on their behalf."""
+        resp = await web.client.post(
+            f"/api/queues/{unique_queue}/pause", headers={"Sec-Fetch-Site": "none"}
+        )
+        await resp.read()
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_headerless_mutations_are_allowed(
+        self, web: Harness, unique_queue: str
+    ):
+        """curl, a deploy script, this test client: no fetch metadata and no
+        Origin. Allowed on purpose -- the guard defends against BROWSERS, and
+        anything that can open a socket to an unauthenticated admin port can
+        already do everything. Breaking scripting would buy nothing."""
+        resp = await web.client.post(f"/api/queues/{unique_queue}/pause")
+        await resp.read()
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_mismatched_origin_is_403(self, web: Harness, unique_queue: str):
+        """Some browsers send Origin without fetch metadata; a foreign one is
+        the same statement and gets the same answer."""
+        resp = await web.client.post(
+            f"/api/queues/{unique_queue}/pause",
+            headers={"Origin": "http://evil.example.com"},
+        )
+        assert resp.status == 403
+        error = (await resp.json())["error"]
+        assert "Cross-origin POST refused" in error
+        assert "evil.example.com" in error
+
+    @pytest.mark.asyncio
+    async def test_origin_contradicting_same_origin_claim_is_403(
+        self, web: Harness, unique_queue: str
+    ):
+        """Both headers are checked, so a forged `same-origin` claim paired
+        with a foreign Origin still loses."""
+        resp = await web.client.post(
+            f"/api/queues/{unique_queue}/pause",
+            headers={
+                "Sec-Fetch-Site": "same-origin",
+                "Origin": "http://evil.example.com",
+            },
+        )
+        await resp.read()
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_opaque_origin_is_403(self, web: Harness, unique_queue: str):
+        """`Origin: null` is a sandboxed frame or a data: URL -- an origin
+        that deliberately identifies nothing, and matches no host."""
+        resp = await web.client.post(
+            f"/api/queues/{unique_queue}/pause", headers={"Origin": "null"}
+        )
+        await resp.read()
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_matching_origin_without_fetch_metadata_is_allowed(
+        self, web: Harness, unique_queue: str
+    ):
+        resp = await web.client.post(
+            f"/api/queues/{unique_queue}/pause",
+            headers={"Origin": _own_origin(web.client)},
+        )
+        await resp.read()
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_reads_are_never_blocked(self, web: Harness):
+        """GET is not guarded: it changes nothing, and the same-origin policy
+        already stops a cross-site page from reading the response."""
+        for url in ("/", "/api/jobs", "/api/queues", "/metrics"):
+            resp = await web.client.get(url, headers={"Sec-Fetch-Site": "cross-site"})
+            await resp.read()
+            assert resp.status == 200, url
+
+    @pytest.mark.asyncio
+    async def test_cross_site_form_post_shape_is_refused(self, web: Harness):
+        """The real attack, verbatim: a form-encoded POST with the headers a
+        browser attaches to a cross-site form submission."""
+        resp = await web.client.post(
+            "/api/schedules",
+            data={
+                "name": f"csrf_{uuid.uuid4().hex[:8]}",
+                "job_class": "app.jobs.Csrf",
+                "cron_expr": "0 * * * *",
+            },
+            headers={
+                "Sec-Fetch-Site": "cross-site",
+                "Sec-Fetch-Mode": "navigate",
+                "Origin": "http://evil.example.com",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        await resp.read()
+        assert resp.status == 403
+
+
+# =============================================================================
+# 7. job_class shape at the API door
+# =============================================================================
+
+
+class TestJobClassShape:
+    """`jorb_schedule.job_class` is the input to an import on every worker:
+    the module named by everything before the last dot is imported, and its
+    module-level code runs before anything checks that the result is a Job.
+    An anonymous HTTP client writes that column, so the door checks that the
+    value is at least SHAPED like an import path.
+
+    This bounds the shape only -- resolving an arbitrary dotted path is the
+    deliberate feature, and whoever can create a schedule can still name any
+    class importable on the workers' path. That is the documented trust model
+    (docs/ADMIN_TOOLS.md); the surface must not be exposed to an untrusted
+    network."""
+
+    REFUSED: tuple[tuple[str, str], ...] = (
+        ("nodots", "a bare name names no module"),
+        ("a..b", "empty segment"),
+        (".leading.Dot", "leading dot"),
+        ("trailing.dot.", "trailing dot"),
+        (" x.y", "leading whitespace"),
+        ("x.y ", "trailing whitespace"),
+        ("mod ule.Class", "interior whitespace"),
+        ("mod-ule.Class", "not an identifier"),
+        ("os.path/../etc/passwd", "a filesystem path is not an import path"),
+        ("http://evil.example.com/x.py", "nor is a URL"),
+        ("1mod.Class", "identifiers do not start with a digit"),
+        ("mod.Class;rm -rf /", "nor is a shell command"),
+        ("a." + "b" * 300, "longer than the 255-character cap"),
+    )
+
+    @pytest.mark.asyncio
+    async def test_misshapen_job_class_is_400(self, web: Harness):
+        actual = []
+        for job_class, _why in self.REFUSED:
+            resp = await web.client.post(
+                "/api/schedules",
+                data={
+                    "name": f"shape_{uuid.uuid4().hex[:8]}",
+                    "job_class": job_class,
+                    "cron_expr": "0 * * * *",
+                },
+            )
+            await resp.read()
+            actual.append((job_class, resp.status))
+        assert actual == [(jc, 400) for jc, _ in self.REFUSED]
+
+    @pytest.mark.asyncio
+    async def test_empty_job_class_is_the_missing_field_400(self, web: Harness):
+        """An empty string never reaches the validator: it is caught one step
+        earlier as a missing required field. Still a 400, still no row."""
+        resp = await web.client.post(
+            "/api/schedules",
+            data={
+                "name": f"shape_{uuid.uuid4().hex[:8]}",
+                "job_class": "",
+                "cron_expr": "0 * * * *",
+            },
+        )
+        assert resp.status == 400
+        assert (await resp.json())["error"] == "Missing required field(s): job_class"
+
+    @pytest.mark.asyncio
+    async def test_the_400_says_what_a_job_class_looks_like(self, web: Harness):
+        resp = await web.client.post(
+            "/api/schedules",
+            data={
+                "name": f"shape_{uuid.uuid4().hex[:8]}",
+                "job_class": "nodots",
+                "cron_expr": "0 * * * *",
+            },
+        )
+        assert resp.status == 400
+        error = (await resp.json())["error"]
+        assert "invalid job_class 'nodots'" in error
+        assert "myapp.jobs.SendEmail" in error
+
+    @pytest.mark.asyncio
+    async def test_refused_job_class_writes_no_row(
+        self, web: Harness, db_pool: asyncpg.Pool
+    ):
+        name = f"shape_{uuid.uuid4().hex[:8]}"
+        resp = await web.client.post(
+            "/api/schedules",
+            data={"name": name, "job_class": "nodots", "cron_expr": "0 * * * *"},
+        )
+        await resp.read()
+        assert resp.status == 400
+
+        async with db_pool.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT COUNT(*) FROM jorb_schedule WHERE name = $1", name
+                )
+                == 0
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_real_dotted_path_still_works(
+        self, web: Harness, db_pool: asyncpg.Pool
+    ):
+        """The feature the check must not break: any importable dotted path,
+        with no allowlist of modules anywhere."""
+        name = f"shape_{uuid.uuid4().hex[:8]}"
+        resp = await web.client.post(
+            "/api/schedules",
+            data={
+                "name": name,
+                "job_class": "tests.dxe_jobs.OkJob",
+                "cron_expr": "0 * * * *",
+            },
+        )
+        assert resp.status == 200
+
+        async with db_pool.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT job_class FROM jorb_schedule WHERE name = $1", name
+                )
+                == "tests.dxe_jobs.OkJob"
+            )
+
+
+# =============================================================================
+# 8. Bounded pages and bounded windows
+# =============================================================================
+
+
+class TestBoundedResponses:
+    """Every listing route caps its page and the metrics window caps its
+    span, because both are a single anonymous request asking this process to
+    do unbounded work: MAX_PAGE_LIMIT rows must be materialized, shipped and
+    (for format=html) concatenated into one string, and a metrics window is
+    index-backed only while it is narrow."""
+
+    @pytest.mark.asyncio
+    async def test_over_limit_names_the_bound(self, web: Harness):
+        """Refused, not clamped -- a silently clamped limit returns the wrong
+        page while claiming success (see TestMalformedInput)."""
+        resp = await web.client.get(f"/api/jobs?limit={MAX_PAGE_LIMIT + 1}")
+        assert resp.status == 400
+        assert (await resp.json())["error"] == (
+            f"Invalid limit: {MAX_PAGE_LIMIT + 1} is out of range [0, {MAX_PAGE_LIMIT}]"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_metrics_window_is_days_not_centuries(self, web: Harness):
+        """A century-wide window makes /api/metrics read the whole jorb
+        table; 90 days is wider than any retention policy here."""
+        assert MAX_SINCE_HOURS == 24 * 90
+
+        resp = await web.client.get(f"/api/metrics?since_hours={MAX_SINCE_HOURS + 1}")
+        assert resp.status == 400
+        assert "out of range" in (await resp.json())["error"]
+
+    @pytest.mark.asyncio
+    async def test_per_job_trails_are_paged(
+        self, web: Harness, db_pool: asyncpg.Pool, unique_queue: str
+    ):
+        """One job's history is not a bound: a durable machine parked for a
+        month writes transitions and checkpoints without limit."""
+        async with db_pool.acquire() as conn:
+            job_id = await conn.fetchval(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                VALUES ('app.jobs.Trail', '{}', $1, 100, 'queued')
+                RETURNING id
+                """,
+                unique_queue,
+            )
+            # The insert above already produced one trigger-written history
+            # row; add enough to page.
+            await conn.execute(
+                """
+                INSERT INTO jorb_history (job_id, event, detail)
+                SELECT $1, 'queued', '{}'::jsonb FROM generate_series(1, 9)
+                """,
+                job_id,
+            )
+
+        resp = await web.client.get(f"/api/jobs/{job_id}/history?limit=3")
+        assert resp.status == 200
+        assert len(await resp.json()) == 3
+
+        resp = await web.client.get(f"/api/jobs/{job_id}/history")
+        assert resp.status == 200
+        assert len(await resp.json()) == 10
+
+        resp = await web.client.get(f"/api/jobs/{job_id}/history?limit=0")
+        assert resp.status == 200
+        assert await resp.json() == []
+
+    @pytest.mark.asyncio
+    async def test_steps_are_paged(
+        self, web: Harness, db_pool: asyncpg.Pool, unique_queue: str
+    ):
+        async with db_pool.acquire() as conn:
+            job_id = await conn.fetchval(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                VALUES ('app.jobs.Steps', '{}', $1, 100, 'queued')
+                RETURNING id
+                """,
+                unique_queue,
+            )
+            await conn.execute(
+                """
+                INSERT INTO jorb_step (job_id, step_seq, name, run_epoch, started)
+                SELECT $1, g, 'step_' || g, 1, now() FROM generate_series(1, 5) g
+                """,
+                job_id,
+            )
+
+        resp = await web.client.get(f"/api/jobs/{job_id}/steps?limit=2")
+        assert resp.status == 200
+        assert len(await resp.json()) == 2
+
+        resp = await web.client.get(f"/api/jobs/{job_id}/steps")
+        assert resp.status == 200
+        assert len(await resp.json()) == 5
+
+    @pytest.mark.asyncio
+    async def test_admin_pool_bounds_how_long_a_request_holds_a_connection(
+        self, web: Harness
+    ):
+        """Ten anonymous slow requests must not be able to park the whole
+        admin pool: an admin statement that cannot answer in 30 seconds is a
+        bug or an attack, and either way loses its connection."""
+        resp = await web.client.get("/api/jobs")
+        await resp.read()
+        assert resp.status == 200
+
+        pool = web.server.pool
+        assert pool is not None
+        # The timeout every statement on this surface actually runs under,
+        # read off a real pooled connection rather than off the constructor
+        # argument -- db.create_pool wraps the call, and the point is that
+        # the value survives the wrapping.
+        async with pool.acquire() as conn:
+            assert conn._config.command_timeout == POOL_COMMAND_TIMEOUT_SECONDS

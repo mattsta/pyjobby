@@ -12,6 +12,12 @@ concurrency:
 
 env:
   PYJOBBY_TEST_DSN: postgresql://pyjobby_test:pyjobby_test_password@localhost:5432/pyjobby_test
+  # Leak attribution (tests/conftest.py::gc_after_each_test): collect at every
+  # teardown so a leaked connection's ResourceWarning fires in the leaking
+  # test's own teardown. Without it the unraisable-exception plugin fails
+  # whichever innocent test the collector happened to run under, and the name
+  # in the report moves from run to run -- which is the same as no report.
+  PYJOBBY_GC_EACH_TEST: "1"
 
 jobs:
   check:

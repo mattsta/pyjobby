@@ -22,6 +22,7 @@ from typing import Any, cast
 
 import asyncpg  # type: ignore[import-untyped]
 from aiohttp import web
+from aiohttp.typedefs import Handler
 
 from . import db
 from .admin_api import AdminAPI
@@ -44,9 +45,24 @@ MAX_BIGINT = 2**63 - 1
 # jorb_queue.name is free-form text and pausing an unknown queue inserts a row
 # (see api_queue_pause), so the name an anonymous client can store is bounded.
 MAX_QUEUE_NAME_LENGTH = 255
-# `datetime.now(UTC) - timedelta(hours=N)` must stay inside datetime's range; a
-# century of history is far more than any dashboard window asks for.
-MAX_SINCE_HOURS = 24 * 365 * 100
+# The largest page any listing endpoint will return. A `limit` is a promise to
+# materialize that many rows in Postgres, ship them over the wire and (for
+# format=html) concatenate them into one string in this process: an unbounded
+# limit is a one-request memory amplifier for an anonymous client, and no
+# dashboard has ever needed more than a thousand rows in a single fragment.
+# Paging past it is what `offset` is for.
+MAX_PAGE_LIMIT = 1000
+# The widest metrics window. This is a *cost* bound, not a datetime bound: the
+# windowed statements are index-backed only while the window is small, because
+# they ride time-ordered indexes whose whole value is that they stop early.
+# Ask for a century and the planner correctly gives up and reads the entire
+# jorb table, which is exactly the request an anonymous client wants to make.
+# 90 days is longer than any retention policy this system ships with.
+MAX_SINCE_HOURS = 24 * 90
+# How long an admin request may hold a pooled connection before asyncpg
+# cancels the statement. See WebAdminServer._get_pool for why the admin pool
+# sets one when db.create_pool deliberately does not.
+POOL_COMMAND_TIMEOUT_SECONDS = 30.0
 # Window the Prometheus scrape computes its rates over. Short on purpose:
 # rates exist to show a fleet falling behind, and a wide window averages the
 # incident away -- five minutes surfaces it within a scrape or two while
@@ -276,6 +292,86 @@ def _path_queue_name(request: web.Request) -> str:
     return queue
 
 
+# =============================================================================
+# Cross-site request defense
+#
+# THE ATTACK. This surface is unauthenticated by design (bind to localhost, or
+# put a proxy in front). "No credentials" is usually taken to mean CSRF does
+# not apply, and here it means the opposite: every mutating route is reachable
+# by anyone who can send bytes to the port, and a browser sends bytes to the
+# port on any page's say-so. The mutations take HTML form encoding, which
+# makes them CORS *simple requests* -- no preflight, no permission asked. Any
+# page an operator visits while the admin is up can auto-submit a form to
+# http://127.0.0.1:8081/api/queues/critical/pause, or DELETE a job, or create
+# a schedule naming a class the workers will import. The attacker never reads
+# the response (the same-origin policy still hides that) and does not need to:
+# the write already happened.
+#
+# THE RULE, for every method other than GET and HEAD:
+#
+#   * `Sec-Fetch-Site` present and not `same-origin` or `none` -> 403. Browsers
+#     attach this header themselves and scripts cannot forge it, so it is a
+#     trustworthy statement of where the request came from. `same-origin` is
+#     the admin's own htmx buttons; `none` is the user typing the URL.
+#   * `Origin` present and naming a different host -> 403. This is the same
+#     judgment for the browsers that send Origin, and it also catches a
+#     same-origin claim that contradicts the Origin header.
+#   * Neither header -> allowed.
+#
+# WHY THE LAST LINE IS NOT A HOLE. curl, a deploy script and the test client
+# send neither header; a browser always sends at least one on a cross-site
+# form post. So the rule refuses exactly the browser-driven cross-site
+# submission -- which is the attack -- while leaving scripting alone. It is
+# not, and is not trying to be, authentication: anything that can open a
+# socket to this port can still do anything. Nothing here replaces binding to
+# localhost or putting authentication in the proxy.
+# =============================================================================
+
+# Methods that do not mutate, and so do not need the check. Note OPTIONS is
+# absent on purpose: a CORS preflight arrives with cross-site fetch metadata
+# and should be refused like the request it is asking permission for.
+_SAFE_METHODS = frozenset({"GET", "HEAD"})
+
+# The `Sec-Fetch-Site` values a mutation is allowed to carry. Everything else
+# the header can say (`cross-site`, `same-site`, and any value added later) is
+# a request this surface has no reason to accept.
+_ALLOWED_FETCH_SITES = frozenset({"same-origin", "none"})
+
+
+@web.middleware
+async def cross_site_guard(
+    request: web.Request, handler: Handler
+) -> web.StreamResponse:
+    """Refuse browser-initiated cross-site mutations (see the note above)."""
+    if request.method in _SAFE_METHODS:
+        return await handler(request)
+
+    fetch_site = request.headers.get("Sec-Fetch-Site")
+    if fetch_site is not None and fetch_site not in _ALLOWED_FETCH_SITES:
+        raise _api_error(
+            web.HTTPForbidden,
+            f"Cross-site {request.method} refused (Sec-Fetch-Site: "
+            f"{fetch_site!r}): the admin surface accepts mutations only from "
+            f"its own pages",
+        )
+
+    # Host and port only. The scheme is deliberately not compared: a proxy that
+    # terminates TLS forwards `Origin: https://admin.example.com` on a
+    # plain-http hop, and the operator's own dashboard must not be the thing
+    # this rejects. An opaque origin ("null", from a sandboxed frame or a data:
+    # URL) has no netloc and so never matches.
+    origin = request.headers.get("Origin")
+    if origin is not None and urllib.parse.urlsplit(origin).netloc != request.host:
+        raise _api_error(
+            web.HTTPForbidden,
+            f"Cross-origin {request.method} refused (Origin: {origin!r} is "
+            f"not {request.host!r}): the admin surface accepts mutations "
+            f"only from its own pages",
+        )
+
+    return await handler(request)
+
+
 class WebAdminServer:
     """
     Web-based administration interface for pyjobby.
@@ -309,7 +405,7 @@ class WebAdminServer:
         self.prio_ceiling = prio_ceiling
         self.pool: asyncpg.Pool | None = None
         self._pool_lock = asyncio.Lock()
-        self.app = web.Application()
+        self.app = web.Application(middlewares=[cross_site_guard])
         self.app.on_cleanup.append(self._on_cleanup)
         self.setup_routes()
 
@@ -369,8 +465,21 @@ class WebAdminServer:
         if self.pool is None:
             async with self._pool_lock:
                 if self.pool is None:
+                    # command_timeout is set HERE and not in db.create_pool:
+                    # workers legitimately hold a connection for as long as a
+                    # job takes, so a global default would kill real work.
+                    # An admin request is the opposite -- every statement on
+                    # this surface answers a dashboard, and one that cannot
+                    # answer in 30 seconds is either a bug or an attack.
+                    # Either way it must not keep a pooled connection: there
+                    # are ten, and ten anonymous slow requests are the whole
+                    # admin interface, parked, for as long as the caller
+                    # cares to hold it.
                     self.pool = await db.create_pool(
-                        **self.db_params, min_size=1, max_size=10
+                        **self.db_params,
+                        min_size=1,
+                        max_size=10,
+                        command_timeout=POOL_COMMAND_TIMEOUT_SECONDS,
                     )
         return self.pool
 
@@ -1010,7 +1119,7 @@ class WebAdminServer:
         """List jobs (JSON or HTML)"""
         queue = request.query.get("queue")
         state = _query_job_state(request)
-        limit = _query_int(request, "limit", 50)
+        limit = _query_int(request, "limit", 50, maximum=MAX_PAGE_LIMIT)
         offset = _query_int(request, "offset", 0)
         async with self.api() as api:
             format_type = request.query.get("format", "json")
@@ -1068,19 +1177,29 @@ class WebAdminServer:
             return web.json_response(await self._job_or_404(api, job_id))
 
     async def api_job_history(self, request: web.Request) -> web.Response:
-        """Get a job's full transition history (jorb_history, oldest first)"""
+        """Get a job's transition history (jorb_history, oldest first).
+
+        Paged like every other listing: a durable job parked for a month has
+        an unbounded trail, and "one job's history" is not a bound.
+        """
         job_id = _path_id(request, "job_id")
+        limit = _query_int(request, "limit", MAX_PAGE_LIMIT, maximum=MAX_PAGE_LIMIT)
         async with self.api() as api:
             await self._job_or_404(api, job_id)
-            history = await api.get_job_history(job_id)
+            history = await api.get_job_history(job_id, limit=limit)
             return web.json_response(history)
 
     async def api_job_steps(self, request: web.Request) -> web.Response:
-        """Get a job's DXE step checkpoints (jorb_step, in sequence order)"""
+        """Get a job's DXE step checkpoints (jorb_step, in sequence order).
+
+        Paged for the same reason as the history beside it: a long-running
+        durable machine writes a checkpoint per step, without limit.
+        """
         job_id = _path_id(request, "job_id")
+        limit = _query_int(request, "limit", MAX_PAGE_LIMIT, maximum=MAX_PAGE_LIMIT)
         async with self.api() as api:
             await self._job_or_404(api, job_id)
-            steps = await api.get_job_steps(job_id)
+            steps = await api.get_job_steps(job_id, limit=limit)
             return web.json_response(steps)
 
     async def api_job_retry(self, request: web.Request) -> web.Response:
@@ -1379,7 +1498,7 @@ class WebAdminServer:
 
     async def api_dlq_list(self, request: web.Request) -> web.Response:
         """List Dead Letter Queue jobs (terminal crashed state)"""
-        limit = _query_int(request, "limit", 100)
+        limit = _query_int(request, "limit", 100, maximum=MAX_PAGE_LIMIT)
         async with self.api() as api:
             jobs = await api.list_dlq(limit=limit)
             if request.query.get("format") == "html":
@@ -1963,7 +2082,7 @@ class WebAdminServer:
         run.
         """
         schedule_id = _path_id(request, "schedule_id")
-        limit = _query_int(request, "limit", 50)
+        limit = _query_int(request, "limit", 50, maximum=MAX_PAGE_LIMIT)
         async with self.api() as api:
             # Query directly: jorb_schedule_log is ordered by id (schema v1
             # has actual_time, not a 'created' column)

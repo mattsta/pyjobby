@@ -10,6 +10,7 @@ All methods are async and return structured data (dicts/lists).
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta
@@ -72,6 +73,59 @@ ADMIN_OLDEST_QUEUED_AGE_SQL = """
        AND ($1::text IS NULL OR queue = $1)
      GROUP BY queue
 """
+
+
+#: Default page size for the per-job trails (get_job_history, get_job_steps).
+#: Matches web_admin.MAX_PAGE_LIMIT, which is the bound the HTTP surface
+#: enforces on the same two routes.
+DEFAULT_HISTORY_LIMIT = 1000
+
+#: Longest dotted path `validate_job_class` accepts. Real module paths are
+#: nowhere near this; the cap exists so the column cannot be used as storage.
+MAX_JOB_CLASS_LENGTH = 255
+
+#: A dotted path of Python identifiers with at least one dot -- `module.Class`
+#: at minimum. Anchored, so no leading or trailing dot, no empty segment
+#: (`a..b`), no whitespace, no path separator, no url, no shell.
+_JOB_CLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$")
+
+
+def validate_job_class(job_class: str) -> str:
+    """Refuse a `job_class` that is not shaped like an importable dotted path.
+
+    `jorb_schedule.job_class` is not data: every firing hands it to a worker,
+    which imports the module named by everything before the last dot. Import
+    runs module-level code -- before, and regardless of, the `issubclass(...,
+    Job)` check that follows it. So the column is the input to an import, and
+    a column an anonymous HTTP client can write should not reach one shaped
+    like anything at all.
+
+    WHAT THIS DOES AND DOES NOT BOUND. It bounds the SHAPE only. Resolving an
+    arbitrary dotted path is the deliberate feature -- there is no allowlist
+    of modules and there is not going to be one, because the whole point is
+    that a deployment names its own job classes. Whoever can create a schedule
+    can still name any class importable on the workers' path, and that is the
+    documented trust model: the admin surface is as privileged as the workers
+    (see docs/ADMIN_TOOLS.md). What the check removes is the class of input
+    that was never a job class in the first place -- an empty string, a
+    filesystem path, a URL, a 4 KB blob -- so a typo or a probe fails here,
+    at the door, with a message, instead of inside an import on a worker.
+    """
+    # Length before the pattern, so a megabyte of input is refused by a
+    # comparison rather than by a regex engine walking all of it.
+    if not isinstance(job_class, str) or len(job_class) > MAX_JOB_CLASS_LENGTH:
+        raise ValueError(
+            f"invalid job_class: an import path is at most "
+            f"{MAX_JOB_CLASS_LENGTH} characters"
+        )
+    if not _JOB_CLASS_RE.match(job_class):
+        raise ValueError(
+            f"invalid job_class {job_class!r}: a job class is the dotted "
+            f"import path of the class the workers run, like "
+            f"'myapp.jobs.SendEmail' -- module path, a dot, then the class "
+            f"name (identifiers only, at least one dot)"
+        )
+    return job_class
 
 
 def _rate(count: int | None, window_seconds: float) -> float:
@@ -1400,9 +1454,11 @@ class AdminAPI:
     # History & DXE Steps
     # =========================================================================
 
-    async def get_job_history(self, job_id: int) -> list[dict[str, Any]]:
+    async def get_job_history(
+        self, job_id: int, limit: int = DEFAULT_HISTORY_LIMIT
+    ) -> list[dict[str, Any]]:
         """
-        Get the full transition trail for a job, oldest first.
+        Get the transition trail for a job, oldest first.
 
         Every state transition is trigger-recorded in jorb_history, so this
         includes per-attempt detail (worker, epoch, errors) across retries
@@ -1410,6 +1466,12 @@ class AdminAPI:
 
         Args:
             job_id: Job ID
+            limit: Most transitions to return, oldest first (default
+                :data:`DEFAULT_HISTORY_LIMIT`). One job's history is not a
+                bound: a durable machine parked for a month accumulates
+                transitions without limit, and a caller that asks for "the
+                history" should not be able to ask for a gigabyte of it by
+                accident. Pass a bigger number deliberately.
 
         Returns:
             List of history dictionaries (at serialized as ISO string)
@@ -1420,8 +1482,10 @@ class AdminAPI:
             FROM jorb_history
             WHERE job_id = $1
             ORDER BY id
+            LIMIT $2
             """,
             job_id,
+            limit,
         )
 
         history = []
@@ -1431,12 +1495,18 @@ class AdminAPI:
             history.append(data)
         return history
 
-    async def get_job_steps(self, job_id: int) -> list[dict[str, Any]]:
+    async def get_job_steps(
+        self, job_id: int, limit: int = DEFAULT_HISTORY_LIMIT
+    ) -> list[dict[str, Any]]:
         """
         Get a job's DXE step checkpoints, ordered by step sequence.
 
         Args:
             job_id: Job ID
+            limit: Most checkpoints to return, in step order (default
+                :data:`DEFAULT_HISTORY_LIMIT`). Bounded for the same reason
+                as get_job_history: a long-running durable machine writes a
+                checkpoint per step, forever.
 
         Returns:
             List of step dictionaries (timestamps serialized as ISO
@@ -1451,8 +1521,10 @@ class AdminAPI:
             FROM jorb_step
             WHERE job_id = $1
             ORDER BY step_seq
+            LIMIT $2
             """,
             job_id,
+            limit,
         )
 
         steps = []
@@ -1603,7 +1675,7 @@ class AdminAPI:
             cron_expr: Cron expression (e.g., "0 2 * * *" for 2am daily)
             queue: Target queue (default: 'default')
             kwargs: Job arguments (default: {})
-            prio: Job priority (default: 100)
+            priority: Job priority (default: 100)
             capability: Required worker capability (optional)
             timezone: Schedule timezone (default: 'UTC')
             enabled: Is schedule active? (default: True)
@@ -1624,6 +1696,10 @@ class AdminAPI:
         # the same imported ceiling -- a schedule writes `jorb.prio` on every
         # firing without ever passing through the client.
         validate_priority(priority, self.prio_ceiling)
+
+        # The workers import this string. Shape-check it at the door -- see
+        # validate_job_class for what that does and does not buy.
+        validate_job_class(job_class)
 
         # Reject the expression here rather than at fire time: a schedule
         # that cannot be evaluated is a schedule that silently never runs.
@@ -1715,6 +1791,12 @@ class AdminAPI:
         # same unbounded stream of unclaimable jobs.
         if "prio" in updates:
             validate_priority(updates["prio"], self.prio_ceiling)
+
+        # The second door onto jorb_schedule.job_class, and it gets the same
+        # shape check as create_schedule: a schedule pointed at a new class by
+        # update is just as imported as one created pointing at it.
+        if "job_class" in updates:
+            validate_job_class(updates["job_class"])
 
         # If cron_expr or timezone changed, recalculate next_run
         if "cron_expr" in updates or "timezone" in updates:

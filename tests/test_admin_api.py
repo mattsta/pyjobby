@@ -8,8 +8,13 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from pyjobby.admin_api import AdminAPI
+from pyjobby.admin_api import (
+    DEFAULT_HISTORY_LIMIT,
+    AdminAPI,
+    validate_job_class,
+)
 from pyjobby.client import DEFAULT_PRIO_CEILING
+from pyjobby.web_admin import MAX_PAGE_LIMIT
 
 
 @pytest.fixture
@@ -401,16 +406,30 @@ class TestQueueManagement:
         assert stats[0]["total"] == 2
 
     async def test_queue_stats_oldest_age(self, admin_api, db_connection):
-        """Test oldest queued job age calculation"""
-        # Create queued job
+        """The age reported is the OLDEST claimable job's wait, measured from
+        run_after.
+
+        Seeded at a known age rather than asserted `>= 0`: the number an
+        operator pages on is "how far behind is this queue", so it has to be
+        the oldest row's wait and not the newest one's (nor any other
+        non-negative number).
+        """
+        # 90 seconds behind. now() is the transaction's timestamp, and the
+        # read below runs in the SAME transaction, so this age is exact.
+        await db_connection.execute(
+            """INSERT INTO jorb (job_class, kwargs, queue, state, run_after)
+               VALUES ('job.test.TestJob', '{}', 'test', 'queued',
+                       now() - interval '90 seconds')"""
+        )
+        # ...and a fresh one, which must NOT be the answer
         await create_test_job(db_connection, queue="test", state="queued")
 
-        # Get stats
         stats = await admin_api.queue_stats(queue="test")
 
         assert len(stats) == 1
-        assert stats[0]["oldest_queued_age_seconds"] is not None
-        assert stats[0]["oldest_queued_age_seconds"] >= 0
+        age = stats[0]["oldest_queued_age_seconds"]
+        assert age is not None
+        assert 89 <= age <= 95, age
 
     async def test_clear_queue(self, admin_api, db_connection):
         """Test clearing queue: unstarted work by default"""
@@ -742,6 +761,144 @@ class TestSchedulePriorityCeiling:
             sched["id"], priority=DEFAULT_PRIO_CEILING
         )
         assert updated["prio"] == DEFAULT_PRIO_CEILING
+
+
+class TestJobClassShapeValidation:
+    """`job_class` is the input to an import on every worker: the module
+    named by everything before the last dot is imported, and its module-level
+    code runs before anything checks the result is a Job. Both doors onto the
+    column (create and update) shape-check it.
+
+    SHAPE ONLY. The dotted-path resolution is the feature -- there is no
+    allowlist of modules, and whoever can write a schedule can still name any
+    importable class. That is the documented trust model; this check only
+    removes input that was never a job class to begin with.
+    """
+
+    BAD = (
+        "",
+        "nodots",
+        "a..b",
+        ".leading",
+        "trailing.",
+        " x.y",
+        "x.y ",
+        "mod ule.Class",
+        "mod-ule.Class",
+        "os.path/../etc/passwd",
+        "http://evil.example.com/x.py",
+        "1mod.Class",
+        "a." + "b" * 300,
+    )
+
+    def test_misshapen_paths_are_refused(self):
+        for job_class in self.BAD:
+            with pytest.raises(ValueError, match="job_class"):
+                validate_job_class(job_class)
+
+    def test_real_paths_are_accepted(self):
+        for job_class in (
+            "app.Job",
+            "myapp.jobs.SendEmail",
+            "a.b.c.d.E",
+            "_private.mod._Class",
+            "mod2.Class3",
+        ):
+            assert validate_job_class(job_class) == job_class
+
+    def test_the_message_says_what_a_job_class_looks_like(self):
+        with pytest.raises(ValueError) as exc:
+            validate_job_class("nodots")
+        assert "myapp.jobs.SendEmail" in str(exc.value)
+
+    async def test_create_refuses_and_writes_no_row(
+        self, admin_api, db_connection, test_id
+    ):
+        with pytest.raises(ValueError, match="job_class"):
+            await admin_api.create_schedule(
+                name=test_id, job_class="nodots", cron_expr="0 2 * * *"
+            )
+        assert (
+            await db_connection.fetchval(
+                "SELECT COUNT(*) FROM jorb_schedule WHERE name = $1", test_id
+            )
+            == 0
+        )
+
+    async def test_update_refuses_and_leaves_the_row_alone(
+        self, admin_api, db_connection, test_id
+    ):
+        """The second door onto the same column: a schedule REPOINTED at a
+        new class is just as imported as one created pointing at it."""
+        sched = await admin_api.create_schedule(
+            name=test_id, job_class="tests.dxe_jobs.OkJob", cron_expr="0 2 * * *"
+        )
+
+        with pytest.raises(ValueError, match="job_class"):
+            await admin_api.update_schedule(sched["id"], job_class="/etc/passwd")
+
+        assert (
+            await db_connection.fetchval(
+                "SELECT job_class FROM jorb_schedule WHERE id = $1", sched["id"]
+            )
+            == "tests.dxe_jobs.OkJob"
+        )
+
+        # The mirror: a well-shaped path goes through.
+        updated = await admin_api.update_schedule(
+            sched["id"], job_class="tests.dxe_jobs.OtherJob"
+        )
+        assert updated["job_class"] == "tests.dxe_jobs.OtherJob"
+
+
+class TestPerJobTrailsArePaged:
+    """A parked durable machine writes history rows and step checkpoints
+    forever, and its job row never terminates -- so "one job's trail" is not
+    a bound. Both readers take a LIMIT, defaulting to DEFAULT_HISTORY_LIMIT.
+    """
+
+    async def test_history_respects_the_limit(self, admin_api, db_connection):
+        job_id = await create_test_job(db_connection)
+        await db_connection.execute(
+            """
+            INSERT INTO jorb_history (job_id, event, detail)
+            SELECT $1, 'queued', '{}'::jsonb FROM generate_series(1, 9)
+            """,
+            job_id,
+        )
+
+        # The INSERT above the generate_series is one trigger-written row.
+        assert len(await admin_api.get_job_history(job_id)) == 10
+        assert len(await admin_api.get_job_history(job_id, limit=3)) == 3
+        assert await admin_api.get_job_history(job_id, limit=0) == []
+
+    async def test_history_pages_from_the_oldest_end(self, admin_api, db_connection):
+        """The order is unchanged (oldest first), so a limited read is the
+        FIRST n transitions -- the ones that explain how the job started."""
+        job_id = await create_test_job(db_connection)
+        full = await admin_api.get_job_history(job_id)
+        first = await admin_api.get_job_history(job_id, limit=1)
+        assert first == full[:1]
+
+    async def test_steps_respect_the_limit(self, admin_api, db_connection):
+        job_id = await create_test_job(db_connection)
+        await db_connection.execute(
+            """
+            INSERT INTO jorb_step (job_id, step_seq, name, run_epoch, started)
+            SELECT $1, g, 'step_' || g, 1, now() FROM generate_series(1, 5) g
+            """,
+            job_id,
+        )
+
+        assert len(await admin_api.get_job_steps(job_id)) == 5
+        steps = await admin_api.get_job_steps(job_id, limit=2)
+        assert [s["step_seq"] for s in steps] == [1, 2]
+        assert await admin_api.get_job_steps(job_id, limit=0) == []
+
+    def test_the_default_matches_the_http_page_bound(self):
+        """The two numbers are the same bound seen from two layers; if they
+        drift, the HTTP route silently pages differently from the API."""
+        assert DEFAULT_HISTORY_LIMIT == MAX_PAGE_LIMIT
 
 
 class TestJobInfoTracksTheSchema:

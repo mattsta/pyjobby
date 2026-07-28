@@ -962,7 +962,7 @@ class TestSchedulesAPI:
             "/api/schedules",
             data={
                 "name": name,
-                "job_class": "CreateJob",
+                "job_class": "app.jobs.CreateJob",
                 "cron_expr": "0 2 * * *",
                 "queue": "test",
                 "priority": "100",
@@ -979,7 +979,11 @@ class TestSchedulesAPI:
         name = unique_name("invalid_cron")
         resp = await web_admin_client.post(
             "/api/schedules",
-            data={"name": name, "job_class": "InvalidJob", "cron_expr": "invalid cron"},
+            data={
+                "name": name,
+                "job_class": "app.jobs.InvalidJob",
+                "cron_expr": "invalid cron",
+            },
         )
 
         # Should return 400 for invalid cron

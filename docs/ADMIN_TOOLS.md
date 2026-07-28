@@ -443,6 +443,7 @@ Rate limit:          100 start(s) per 60s ('-' = unlimited)
 
 Depths:
   queued       0
+  scheduled    0
   claimed      0
   running      0
   waiting      0
@@ -687,9 +688,24 @@ daemon takes); it does not read `PYJOBBY_DSN`.
 Defaults are `127.0.0.1:8081`. **There is no authentication**, and the API
 can cancel, retry and delete jobs — bind it to localhost, or put an
 authenticating proxy in front. `--host 0.0.0.0` exposes an unauthenticated
-control plane.
+control plane. This surface must never be reachable from an untrusted
+network: creating a schedule names a `job_class` that every worker then
+imports, so write access here is as privileged as the worker processes
+themselves (the API checks that the value is shaped like a dotted import
+path, which bounds typos and probes, not intent).
+
+Mutating requests (everything except `GET`/`HEAD`) are refused with `403`
+when a browser says they came from another site — `Sec-Fetch-Site` other
+than `same-origin`/`none`, or an `Origin` naming a different host. Requests
+with neither header (curl, deploy scripts) are allowed, so scripting the API
+is unchanged; the check exists because a form-encoded `POST` is a CORS
+simple request, which means any page an operator visits could otherwise
+submit to `127.0.0.1:8081` on their behalf.
 
 Pages: `/`, `/jobs`, `/queues`, `/workers`, `/dlq`, `/schedules`.
+
+Listing endpoints take `limit` (max 1000; over that is a `400`, never a
+silent clamp) and `/api/metrics` takes `since_hours` (max 90 days).
 
 JSON API:
 
@@ -774,10 +790,14 @@ Three shapes are worth stating because they are easy to assume wrong:
   given. A retry requeues the row a job has had since it was enqueued;
   there is no new id to follow.
 * `cancel_job`, `retry_job`, `rerun_job` and `retry_from_dlq` always return
-  `{"job_id", "status"}` and never raise for a job they will not touch: a
-  missing job and a job in a refusing state are the same `'not_cancellable'`
-  / `'not_retriable'` / `'not_rerunnable'` answer. The bulk forms
-  (`cancel_jobs`, `retry_jobs`) return one such dict per id, in order.
+  at least `{"job_id", "status"}` and never raise for a job they will not
+  touch: a missing job and a job in a refusing state are the same
+  `'not_cancellable'` / `'not_retriable'` / `'not_rerunnable'` answer.
+  `rerun_job` adds a third key, `fresh`, echoing which mode was asked for —
+  "restart from step 1" (the default) and "resume from checkpoints" are
+  opposite answers to the same verb, so the reply says which one happened.
+  The bulk forms (`cancel_jobs`, `retry_jobs`) return one such dict per id,
+  in order.
 * `list_dlq()` is `state = 'crashed'`, ordered by `updated`. It is not
   filtered on an error count.
 

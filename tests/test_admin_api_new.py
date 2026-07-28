@@ -1133,7 +1133,7 @@ class TestAdminAPIScheduleManagement:
 
             schedule = await api.create_schedule(
                 name=name,
-                job_class="CreateScheduleJob",
+                job_class="app.jobs.CreateScheduleJob",
                 cron_expr="0 2 * * *",
                 queue="test",
                 kwargs={"key": "value"},
@@ -1143,7 +1143,7 @@ class TestAdminAPIScheduleManagement:
             )
 
             assert schedule["name"] == name
-            assert schedule["job_class"] == "CreateScheduleJob"
+            assert schedule["job_class"] == "app.jobs.CreateScheduleJob"
             assert schedule["cron_expr"] == "0 2 * * *"
             assert schedule["next_run"] is not None
 
@@ -1156,7 +1156,9 @@ class TestAdminAPIScheduleManagement:
 
             with pytest.raises(ValueError) as excinfo:
                 await api.create_schedule(
-                    name=name, job_class="InvalidCronJob", cron_expr="invalid cron"
+                    name=name,
+                    job_class="app.jobs.InvalidCronJob",
+                    cron_expr="invalid cron",
                 )
             assert "malformed cron expression" in str(excinfo.value)
 
