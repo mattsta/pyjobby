@@ -1,8 +1,9 @@
 """
-Extended Hypothesis Property-Based Tests - Phase 2
+Extended Hypothesis property-based tests.
 
 Comprehensive edge case testing using property-based testing with Hypothesis.
-Tests invariants, boundary conditions, and edge cases across all Phase 2 features.
+Tests invariants, boundary conditions, and edge cases across retry, result,
+timeout, and DAG features.
 
 Test categories:
 1. Retry strategy edge cases (large error counts, boundary values)

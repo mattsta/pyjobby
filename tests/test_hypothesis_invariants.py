@@ -1,8 +1,8 @@
 """
-Phase 2: Hypothesis Property-Based Tests
+Hypothesis property tests for retry delays, DAGs, timeouts, and result storage.
 
-Property-based fuzz testing for Phase 2 features using Hypothesis.
-Tests mathematical properties and edge cases that would be hard to discover manually.
+Property-based fuzz testing of mathematical invariants and edge cases that
+would be hard to discover manually.
 """
 
 import json

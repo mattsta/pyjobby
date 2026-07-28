@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Reset test database (drop and recreate, then install schema + migrations)
+# Reset test database (drop and recreate, then install the base schema)
 #
 
 set -euo pipefail
@@ -29,7 +29,7 @@ echo -e "${GREEN}[INFO]${NC} Recreating test database..."
 psql -U postgres -c "CREATE DATABASE $DB_NAME OWNER $DB_USER;" 2>/dev/null \
     || sudo -u postgres psql -c "CREATE DATABASE $DB_NAME OWNER $DB_USER;"
 
-echo -e "${GREEN}[INFO]${NC} Installing schema + migrations..."
+echo -e "${GREEN}[INFO]${NC} Installing base schema (pj-admin db migrate)..."
 PYJOBBY_DSN="postgresql://$DB_USER:$DB_PASS@localhost:5432/$DB_NAME" \
     poetry run pj-admin db migrate
 

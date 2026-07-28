@@ -1,5 +1,5 @@
 """
-Performance & Scalability Tests - Phase 2
+Performance & scalability tests.
 
 Benchmark tests for throughput, latency, scalability, and resource usage.
 These tests verify that the system meets performance requirements under load.

@@ -1,5 +1,5 @@
 """
-Phase 2: DAG Execution Tests
+DAG execution tests.
 
 Comprehensive tests for Dynamic Job Graphs (DAGs):
 - DAG builder API

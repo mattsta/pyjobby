@@ -1,5 +1,5 @@
 """
-Phase 2: Retry Strategies Tests
+Retry-strategy integration tests (delay calculation through live DB retries).
 
 Comprehensive tests for configurable retry strategies:
 - Exponential backoff

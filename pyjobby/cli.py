@@ -2041,7 +2041,7 @@ def schedule_stats(ctx: click.Context, output_json: bool) -> None:
 
 
 # =========================================================================
-# Phase 2: DAG Management Commands
+# DAG Management Commands
 # =========================================================================
 
 
@@ -2376,7 +2376,7 @@ def dag_visualize(ctx: click.Context, dag_id: int) -> None:
 
 
 # =========================================================================
-# Phase 2: Job Statistics Commands
+# Job Statistics Commands
 # =========================================================================
 
 

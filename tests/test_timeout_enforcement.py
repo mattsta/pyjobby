@@ -1,5 +1,5 @@
 """
-Phase 2: Timeout Enforcement Tests
+Job timeout enforcement tests.
 
 Comprehensive tests for job timeout enforcement:
 - Database timeout tracking (timeout_at column)

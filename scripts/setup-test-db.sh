@@ -4,7 +4,7 @@
 #
 # 1. Checks PostgreSQL is installed and accepting connections
 # 2. Creates test user and database (direct superuser psql, or sudo fallback)
-# 3. Installs schema + migrations via `pj-admin db migrate`
+# 3. Installs the base schema via `pj-admin db migrate`
 #
 
 set -euo pipefail
@@ -62,7 +62,7 @@ if run_su_psql "SELECT 1" > /dev/null 2>&1 && \
         run_su_psql "DROP DATABASE IF EXISTS $DB_NAME;"
         run_su_psql "DROP USER IF EXISTS $DB_USER;"
     else
-        log_info "Using existing database (running migrations only)"
+        log_info "Using existing database (verifying via pj-admin db migrate)"
         PYJOBBY_DSN="postgresql://$DB_USER:$DB_PASS@localhost:5432/$DB_NAME" \
             poetry run pj-admin db migrate
         exit 0
@@ -86,8 +86,8 @@ run_su_psql "CREATE DATABASE $DB_NAME OWNER $DB_USER;" 2>/dev/null || {
 log_info "Granting privileges..."
 run_su_psql "GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;"
 
-# Install schema + all migrations through the unified runner
-log_info "Installing schema + migrations..."
+# Install the base schema through the unified runner
+log_info "Installing base schema (pj-admin db migrate)..."
 PYJOBBY_DSN="postgresql://$DB_USER:$DB_PASS@localhost:5432/$DB_NAME" \
     poetry run pj-admin db migrate
 

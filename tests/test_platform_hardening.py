@@ -1,5 +1,5 @@
 """
-Tests for Phase 4 improvements from comprehensive platform audit.
+Platform-hardening tests.
 
 These tests validate:
 - Job cancellation API (pyjobby.db.cancel_job — the one shared cancel path)

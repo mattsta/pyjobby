@@ -714,15 +714,15 @@ class JobClient:
         deadline_key: str | None = None,
         admin_data: dict[str, Any] | None = None,
         tags: dict[str, Any] | None = None,
-        # Phase 2: Result Storage & Passing
+        # result storage & passing
         save_result: bool = True,
         use_result_from: int | None = None,
-        # Phase 2: Retry Strategies
+        # retry strategy
         retry_strategy: str = "exponential",
         max_retries: int = 10,
         initial_retry_delay: int = 1,
         max_retry_delay: int = 3600,
-        # Phase 2: Timeout Enforcement
+        # timeout enforcement
         timeout_seconds: int | None = None,
         on_timeout: str = "retry",
         prio_ceiling: int | None = None,
@@ -759,10 +759,10 @@ class JobClient:
             use_result_from: Inject the (run-time) result of this job ID into
                 this job's kwargs as 'upstream_result' when it executes.
                 Combine with waitfor_job so the upstream has finished first.
-            retry_strategy: 'exponential', 'linear', 'fibonacci', 'fixed' (Phase 2)
-            max_retries: Maximum retry attempts (Phase 2, default: 10)
-            initial_retry_delay: Starting retry delay in seconds (Phase 2, default: 1)
-            max_retry_delay: Maximum retry delay cap (Phase 2, default: 3600)
+            retry_strategy: 'exponential', 'linear', 'fibonacci', 'fixed'
+            max_retries: Maximum retry attempts (default: 10)
+            initial_retry_delay: Starting retry delay in seconds (default: 1)
+            max_retry_delay: Maximum retry delay cap (default: 3600)
             timeout_seconds: This job's deadline in seconds, overriding the
                 job class's `timeout` attribute and the worker's
                 --default-timeout. 0 means "no deadline at all"; None (the
@@ -816,11 +816,11 @@ class JobClient:
                 payment_id=payment_id
             )
 
-            # Pipeline with result passing (Phase 2)
+            # Pipeline with result passing
             job1 = await client.enqueue('FetchData', url='...', save_result=True)
             job2 = await client.enqueue('ProcessData', waitfor_job=job1, use_result_from=job1)
 
-            # Job with timeout and exponential backoff (Phase 2)
+            # Job with timeout and exponential backoff
             job_id = await client.enqueue(
                 'ApiCall',
                 timeout_seconds=30,
@@ -2613,7 +2613,7 @@ class JobClient:
             return False
 
     # =========================================================================
-    # Phase 2: DAG Support
+    # DAG Support
     # =========================================================================
 
     def dag(self, name: str | None = None, **common_options: Any) -> DAGBuilder:
@@ -2723,7 +2723,7 @@ class JobClient:
         return await wait_for_dag(self.pool, dag_id, timeout)
 
     # =========================================================================
-    # Phase 2: Pipeline with Result Passing
+    # Pipeline with Result Passing
     # =========================================================================
 
     async def create_pipeline_with_results(

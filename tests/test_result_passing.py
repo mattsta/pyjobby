@@ -1,5 +1,5 @@
 """
-Phase 2: Job Result Storage and Passing Tests
+Job result storage and passing tests.
 
 Comprehensive tests for result storage and passing between jobs in pipelines.
 Tests both database storage and the worker's RUN-time result injection
@@ -157,7 +157,7 @@ class TestResultPassing:
         downstream_id = await db_pool.fetchval(
             """INSERT INTO jorb (job_class, kwargs, queue, admin_data)
                VALUES ($1,$2,$3,$4) RETURNING id""",
-            "tests.test_phase2_result_passing.EchoUpstreamJob",
+            "tests.test_result_passing.EchoUpstreamJob",
             {"param": "value"},
             unique_queue,
             {"use_result_from": upstream_id},
@@ -188,7 +188,7 @@ class TestResultPassing:
         downstream_id = await db_pool.fetchval(
             """INSERT INTO jorb (job_class, kwargs, queue, admin_data)
                VALUES ($1,$2,$3,$4) RETURNING id""",
-            "tests.test_phase2_result_passing.EchoUpstreamJob",
+            "tests.test_result_passing.EchoUpstreamJob",
             {},
             unique_queue,
             {"use_result_from": upstream_id, "max_retries": 1},
