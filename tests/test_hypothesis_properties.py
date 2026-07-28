@@ -340,7 +340,7 @@ class TestRecoveryInvariants:
 
     Schema v1 removed the worker-side 'recover-abandoned' statement; the
     equivalent primitive is the monitor's unregistered-claim sweep
-    (pyjobby.monitor.sweep_unregistered_claims), which requeues 'claimed'
+    (pyjobby.monitor.sweep_stuck_claims), which requeues 'claimed'
     jobs with no registry reference once they age past a grace period."""
 
     @settings(
@@ -357,7 +357,7 @@ class TestRecoveryInvariants:
     ):
         """Property: Claims from dead workers older than the grace period
         should be requeued."""
-        from pyjobby.monitor import sweep_unregistered_claims
+        from pyjobby.monitor import sweep_stuck_claims
 
         # Create claimed jobs from a "crashed" (never registered) worker
         job_ids = []
@@ -375,7 +375,7 @@ class TestRecoveryInvariants:
             job_ids.append(job_id)
 
         # Recover abandoned claims
-        recovered = await sweep_unregistered_claims(
+        recovered = await sweep_stuck_claims(
             db_pool,
             claimed_grace_seconds=recovery_timeout_minutes * 60,
             batch_size=crashed_job_count,
@@ -405,7 +405,7 @@ class TestRecoveryInvariants:
         self, db_pool, old_job_count: int, recent_job_count: int
     ):
         """Property: Only claims older than the grace period are requeued."""
-        from pyjobby.monitor import sweep_unregistered_claims
+        from pyjobby.monitor import sweep_stuck_claims
 
         # Create old jobs (should be recovered)
         old_job_ids = []
@@ -434,7 +434,7 @@ class TestRecoveryInvariants:
             recent_job_ids.append(job_id)
 
         # Recover with 5 minute grace
-        recovered = await sweep_unregistered_claims(db_pool, claimed_grace_seconds=300)
+        recovered = await sweep_stuck_claims(db_pool, claimed_grace_seconds=300)
 
         # Invariant: Only old jobs should be recovered
         assert recovered == old_job_count

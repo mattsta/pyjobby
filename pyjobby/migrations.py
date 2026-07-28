@@ -45,6 +45,8 @@ from typing import Any
 import asyncpg  # type: ignore[import-untyped]
 from loguru import logger
 
+from . import lifecycle
+
 _SQL_ROOT = files("pyjobby") / "sql"
 
 _MIGRATION_NAME = re.compile(r"^(\d+)_.+\.sql$")
@@ -194,18 +196,10 @@ REQUIRED_INDEXES: frozenset[str] = _names("""
     jorb_dependencies_pkey jorb_dependencies_depends_on_idx
 """)
 
-#: The jorbstate labels, in order. A label added to the enum without a
-#: migration is a value the database will reject at runtime.
+#: The jorbstate labels, in order — read from lifecycle, the ONE Python home
+#: for the state list (tests bind that home to pg_enum and to db.JobState).
 REQUIRED_ENUM_LABELS: dict[str, tuple[str, ...]] = {
-    "jorbstate": (
-        "queued",
-        "claimed",
-        "running",
-        "waiting",
-        "finished",
-        "crashed",
-        "cancelled",
-    ),
+    "jorbstate": lifecycle.JOB_STATES,
 }
 
 #: What doctor tells the operator to do about any of it. One string, because
@@ -259,6 +253,15 @@ def available_migrations() -> list[Migration]:
                 )
             )
     migrations.sort(key=lambda m: m.version)
+    versions = [m.version for m in migrations]
+    if len(set(versions)) != len(versions):
+        # Two files sharing a number would both be applied while only one is
+        # recorded, and the other then re-applies on every migrate() forever.
+        dupes = sorted({v for v in versions if versions.count(v) > 1})
+        raise RuntimeError(
+            f"duplicate migration version number(s) {dupes} in "
+            f"{migrations_dir}: every NNN_*.sql must have a unique prefix"
+        )
     return migrations
 
 
@@ -271,11 +274,21 @@ def base_schema_sql() -> str:
     a failure leaves nothing behind.
     """
     schema_dir = _SQL_ROOT / "schema"
-    return "".join(
-        entry.read_text()
-        for entry in sorted(schema_dir.iterdir(), key=lambda e: e.name)
-        if entry.name.endswith(".sql")
-    )
+    try:
+        entries = sorted(schema_dir.iterdir(), key=lambda e: e.name)
+    except (FileNotFoundError, NotADirectoryError) as e:
+        raise RuntimeError(
+            f"base schema directory {schema_dir} is missing from the "
+            f"installed package -- the wheel was built without pyjobby/sql/"
+            f"schema/, so there is nothing to install"
+        ) from e
+    sql = "".join(e.read_text() for e in entries if e.name.endswith(".sql"))
+    if not sql.strip():
+        raise RuntimeError(
+            f"base schema directory {schema_dir} contains no SQL -- the "
+            f"installed package is broken, so there is nothing to install"
+        )
+    return sql
 
 
 async def applied_versions(conn: asyncpg.Connection) -> set[int]:

@@ -67,7 +67,7 @@ leader.
 | Process | Script | What it owns | What it does **not** do |
 |---|---|---|---|
 | **Worker** | `pj` | Claiming, executing job code, this attempt's state transitions, its own registry row and heartbeat, its own job-thread pool | Decide whether a queue may run at all — `claim_jorb()` does. Recover its own crash — the monitor does. Enforce any other worker's deadline. |
-| **Monitor** | `pj-monitor` | Every safety-net sweep in the platform: timeouts, dead-worker reclaim, unregistered-claim reclaim, and seven retention sweeps | Execute jobs, enqueue anything, elect a leader. Several instances are safe; every sweep is one atomic statement or a transaction holding its own row locks. |
+| **Monitor** | `pj-monitor` | Every safety-net sweep in the platform: timeouts, dead-worker reclaim, stuck-claim reclaim, stranded-waiter recovery, and seven retention sweeps | Execute jobs, enqueue anything, elect a leader. Several instances are safe; every sweep is one atomic statement or a transaction holding its own row locks. |
 | **Scheduler** | `pj-scheduler` | Firing due `jorb_schedule` rows into `jorb`, the safety checks around that (concurrency, backpressure, jitter, circuit breaker), and `jorb_schedule_log` | Run the jobs it creates — it only inserts them. Several instances are safe: each schedule is row-locked `FOR UPDATE SKIP LOCKED` while it fires, and `deadline_key` makes a duplicate insert fail. |
 | **Admin CLI** | `pj-admin` | Nothing at runtime. It is a client: schema install/migrate, queue controls, DLQ, requeue, `doctor` | Participate in execution. |
 | **Web admin** | `pj-web` | HTML operator UI, a JSON API, and `GET /metrics` for Prometheus | Authenticate anybody. Keep it on localhost or behind a proxy. |

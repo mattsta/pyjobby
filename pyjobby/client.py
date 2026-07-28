@@ -50,6 +50,13 @@ import asyncpg  # type: ignore[import-untyped]
 from loguru import logger
 
 from . import db, fsm, lifecycle
+from .retry_strategies import (
+    DEFAULT_INITIAL_RETRY_DELAY,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_MAX_RETRY_DELAY,
+    DEFAULT_RETRY_STRATEGY,
+    RetryStrategy,
+)
 
 if TYPE_CHECKING:
     from .dag import DAGBuilder
@@ -121,6 +128,10 @@ _TAG_VALUE_TYPES = (str, int, float, bool, type(None))
 # unrecognized value is not ignored -- it dead-letters the job on its first
 # overrun. Checked at enqueue, where the caller is still there to be told.
 _ON_TIMEOUT_POLICIES = frozenset({"retry", "fail"})
+
+#: The retry strategies enqueue accepts, derived from the enum so a strategy
+#: added to retry_strategies.py is accepted here the moment it exists.
+_RETRY_STRATEGIES = frozenset(RetryStrategy)
 
 # The priority ceiling a worker claims under, and the default for `pj
 # --max-prio`. `claim_jorb()` takes only jobs whose `prio <= the claiming
@@ -718,10 +729,10 @@ class JobClient:
         save_result: bool = True,
         use_result_from: int | None = None,
         # retry strategy
-        retry_strategy: str = "exponential",
-        max_retries: int = 10,
-        initial_retry_delay: int = 1,
-        max_retry_delay: int = 3600,
+        retry_strategy: str = DEFAULT_RETRY_STRATEGY,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        initial_retry_delay: int = DEFAULT_INITIAL_RETRY_DELAY,
+        max_retry_delay: int = DEFAULT_MAX_RETRY_DELAY,
         # timeout enforcement
         timeout_seconds: int | None = None,
         on_timeout: str = "retry",
@@ -759,7 +770,9 @@ class JobClient:
             use_result_from: Inject the (run-time) result of this job ID into
                 this job's kwargs as 'upstream_result' when it executes.
                 Combine with waitfor_job so the upstream has finished first.
-            retry_strategy: 'exponential', 'linear', 'fibonacci', 'fixed'
+            retry_strategy: 'exponential', 'linear', 'quadratic',
+                'fibonacci', 'fixed' — anything else is refused (an unknown
+                strategy would silently fall back to exponential)
             max_retries: Maximum retry attempts (default: 10)
             initial_retry_delay: Starting retry delay in seconds (default: 1)
             max_retry_delay: Maximum retry delay cap (default: 3600)
@@ -893,11 +906,16 @@ class JobClient:
         job_id = await self.enqueue(job_class, **options)
         try:
             return await self.wait_for_result(job_id, timeout=timeout)
-        except TimeoutError:
-            # The caller has stopped waiting; do not orphan the job. Cancel is
-            # best effort -- the TimeoutError is the caller's answer either way.
+        except (TimeoutError, asyncio.CancelledError):
+            # The caller has stopped waiting; do not orphan the job. This
+            # catches BOTH give-up paths: our own timeout, and the ordinary
+            # async abandonments -- asyncio.timeout()/wait_for around this
+            # call, or the whole task cancelled on client disconnect -- which
+            # arrive as CancelledError. The cancel RPC is shielded so the
+            # in-flight cancellation cannot kill the cleanup it triggered;
+            # best effort either way, and the exception propagates unchanged.
             with contextlib.suppress(Exception):
-                await self.cancel_job(job_id)
+                await asyncio.shield(self.cancel_job(job_id))
             raise
 
     async def start_machine(
@@ -986,10 +1004,10 @@ class JobClient:
         tags: dict[str, Any] | None = None,
         save_result: bool = True,
         use_result_from: int | None = None,
-        retry_strategy: str = "exponential",
-        max_retries: int = 10,
-        initial_retry_delay: int = 1,
-        max_retry_delay: int = 3600,
+        retry_strategy: str = DEFAULT_RETRY_STRATEGY,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        initial_retry_delay: int = DEFAULT_INITIAL_RETRY_DELAY,
+        max_retry_delay: int = DEFAULT_MAX_RETRY_DELAY,
         timeout_seconds: int | None = None,
         on_timeout: str = "retry",
         prio_ceiling: int = DEFAULT_PRIO_CEILING,
@@ -1086,6 +1104,17 @@ class JobClient:
                 f"{sorted(_ON_TIMEOUT_POLICIES)}, got "
                 f"{admin_data['on_timeout']!r} — the worker treats anything "
                 f"that is not 'retry' as 'fail', so a typo dead-letters silently"
+            )
+
+        # Same rationale as on_timeout: calculate_retry_delay treats any
+        # unrecognised strategy as exponential, so a typo'd strategy would be
+        # accepted here and silently produce the wrong backoff forever.
+        merged_strategy = admin_data.get("retry_strategy", retry_strategy)
+        if merged_strategy not in _RETRY_STRATEGIES:
+            raise ValueError(
+                f"retry_strategy must be one of {sorted(_RETRY_STRATEGIES)}, "
+                f"got {merged_strategy!r} — an unknown strategy would fall "
+                f"back to exponential silently"
             )
 
         return [

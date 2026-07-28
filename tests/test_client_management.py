@@ -12,6 +12,7 @@ Tests cover:
 - Bulk operations
 """
 
+import asyncio
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -589,6 +590,32 @@ class TestRunTimeout:
         queue = f"run_timeout_{uuid.uuid4().hex}"
         with pytest.raises(TimeoutError):
             await job_client.run("test.Job", timeout=0.5, queue=queue, data="x")
+
+        jobs = await job_client.get_jobs(queue=queue)
+        assert [j["state"] for j in jobs] == ["cancelled"]
+
+    async def test_run_cancels_the_job_when_the_caller_is_cancelled(
+        self, db_pool, job_client
+    ):
+        """The ordinary async abandonment: asyncio.timeout / wait_for /
+        task-cancel around run() delivers CancelledError, not TimeoutError.
+        The abandoned job must still be cancelled, and the cancellation must
+        still propagate to the caller."""
+        queue = f"run_cancel_{uuid.uuid4().hex}"
+        task = asyncio.create_task(
+            job_client.run("test.Job", timeout=30, queue=queue, data="x")
+        )
+        # let run() get as far as enqueue + wait
+        for _ in range(100):
+            jobs = await job_client.get_jobs(queue=queue)
+            if jobs:
+                break
+            await asyncio.sleep(0.02)
+        assert jobs, "run() never enqueued"
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
         jobs = await job_client.get_jobs(queue=queue)
         assert [j["state"] for j in jobs] == ["cancelled"]

@@ -366,8 +366,8 @@ class TestSubcommandsEmitDocumentedJson:
             "timed_out",
             "dead_worker_jobs",
             "dead_worker_jobs_backlog",
-            "unregistered_claims",
-            "unregistered_claims_backlog",
+            "stuck_claims",
+            "stuck_claims_backlog",
             # the stranded-waiter sweeps take no window, so no _backlog state
             "satisfied_job_waiters",
             "satisfied_group_waiters",

@@ -1130,6 +1130,23 @@ class TestDbCommands:
         assert "Pending migrations:    none" in result.output
         assert "Missing objects:       none" in result.output
 
+    async def test_migrate_on_a_drifted_database_fails_and_names_the_objects(
+        self, db_params, scratch_db
+    ):
+        """`db migrate` must never say "up to date" about a database doctor
+        FAILs. With jorb present and nothing pending there is no DDL that
+        repairs drift, so the closed loop doctor -> migrate -> doctor needs
+        migrate to be the one that breaks it: exit nonzero and name what is
+        missing and what to do."""
+        name = await scratch_db(stale=True)
+
+        result = await run_cli("--dsn", dsn_for(db_params, name), "db", "migrate")
+
+        assert result.exit_code == 1, result.output
+        assert "Database schema is up to date" not in result.output
+        assert "column jorb.tags" in result.stderr
+        assert "Recreate" in result.stderr
+
     async def test_status_on_a_drifted_database_lists_what_is_missing(
         self, db_params, scratch_db
     ):

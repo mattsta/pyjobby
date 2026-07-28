@@ -531,8 +531,8 @@ worse than one that is absent.
 Retention cannot delete a worker registry row whose jobs are still `claimed`
 or `running` — `claimed_by` has no foreign key, so removing the row would
 strand that work where neither recovery sweep can find it (the dead-worker
-sweep JOINs `jorb_worker`; the unregistered-claim sweep only looks for
-`claimed_by IS NULL`). The obvious way to ask "does this worker still hold
+sweep JOINs `jorb_worker`; the stuck-claims sweep covers only `claimed`
+rows). The obvious way to ask "does this worker still hold
 anything?" is an index on `jorb.claimed_by`.
 
 Same test as the rollup and the GIN index: **who pays when it is unused.**

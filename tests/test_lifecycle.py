@@ -212,3 +212,16 @@ async def test_declared_states_match_the_enum(db_pool):
         "WHERE enumtypid = 'jorbstate'::regtype ORDER BY enumsortorder"
     )
     assert {row["enumlabel"] for row in labels} == set(JOB_STATES)
+
+
+async def test_every_python_state_list_is_the_same_list():
+    """Three modules declare the jorbstate labels: lifecycle.JOB_STATES (the
+    checked-against-the-database home, above), db.JobState (the EXPORTED enum
+    that validates user input in web_admin), and the migrations manifest's
+    REQUIRED_ENUM_LABELS. Binding the other two to the first means adding a
+    state cannot silently break the one that faces users."""
+    from pyjobby import migrations
+    from pyjobby.db import JobState
+
+    assert tuple(JobState) == JOB_STATES
+    assert migrations.REQUIRED_ENUM_LABELS["jorbstate"] == JOB_STATES

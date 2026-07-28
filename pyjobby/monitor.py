@@ -178,12 +178,22 @@ RETIRE_DEAD_WORKERS_SQL = """
       AND last_seen < now() - $1::interval
 """
 
-#: Jobs stuck in 'claimed' with no registry reference. ($1 grace, $2 batch)
-SWEEP_UNREGISTERED_CLAIMS_SQL = """
+#: Jobs stuck in 'claimed' too long, WHOEVER claims them. ($1 grace, $2 batch)
+#:
+#: 'claimed' is a transit state: the worker moves it to 'running' within
+#: milliseconds, so a claim older than the grace is stranded no matter what
+#: the registry says. The two ways it happens: a claim with no registry
+#: reference (worker died before registering), and a LOST CLAIM ACK -- the
+#: server commits the claim, the connection drops before the rows reach the
+#: worker, and ex() reconnects and claims a DIFFERENT job. In the second
+#: case the worker is alive and heartbeating, so the dead-worker sweep never
+#: fires and the timeout sweep (state='running') never sees it; this sweep
+#: is the only thing that can. Requeue bumps run_epoch, so if the claimer
+#: somehow does come back for it, its writes are fenced out.
+SWEEP_STUCK_CLAIMS_SQL = """
     WITH doomed AS MATERIALIZED (
         SELECT id FROM jorb
         WHERE state = 'claimed'
-          AND claimed_by IS NULL
           AND updated < now() - $1::interval
         FOR UPDATE SKIP LOCKED
         LIMIT $2
@@ -407,9 +417,9 @@ SWEEP_RETIRED_WORKERS_SQL = """
 #: registry row of a worker that still owns in-flight work would strand those
 #: jobs permanently. SWEEP_DEAD_WORKER_JOBS_SQL finds them by JOINing jorb to
 #: jorb_worker, so with the worker row gone there is nothing left to join to,
-#: and SWEEP_UNREGISTERED_CLAIMS_SQL cannot pick them up either — it looks
-#: for ``claimed_by IS NULL``, and these rows point at an id that no longer
-#: exists. The job would sit in 'running' until somebody noticed by hand.
+#: and SWEEP_STUCK_CLAIMS_SQL only covers 'claimed' — a 'running' job
+#: pointing at a deleted worker id would sit there until somebody noticed
+#: by hand.
 #:
 #: The check runs on the DELETE rather than in the probe on purpose: it is
 #: driven by ``jorb_inflight_idx``, whose partial predicate is exactly these
@@ -655,9 +665,14 @@ async def handle_timed_out_job(
     error_count: int,
 ) -> None:
     """Retry or dead-letter one job that exceeded its timeout."""
+    from .retry_strategies import get_retry_config
+
     admin = admin_data or {}
     on_timeout = admin.get("on_timeout", "retry")
-    max_retries = admin.get("max_retries", 10)
+    # The retry budget comes from the ONE home (retry_strategies defaults),
+    # so whether a job dead-letters cannot depend on whether the worker or
+    # this monitor noticed the failure.
+    max_retries = get_retry_config(admin)["max_retries"]
     attempt = error_count + 1
 
     logger.warning(
@@ -770,12 +785,20 @@ async def sweep_stranded_waiters(pool: asyncpg.Pool, batch_size: int = 500) -> i
             rows = await conn.fetch(probe, batch_size)
             if rows:
                 ids = [r["id"] for r in rows]
-                await conn.execute(WAKE_WAITERS_SQL, ids)
-                logger.warning(
-                    f"Woke {len(ids)} waiting jobs whose dependency was "
-                    f"already satisfied (missed wake): {ids[:10]}"
+                # Count what the wake ACTUALLY changed, not what the probe
+                # found: the wake re-verifies the dependency under the lock,
+                # so a probe hit whose upstream was re-run in the gap is
+                # correctly refused -- and must not be logged as woken.
+                woken = await conn.fetch(
+                    WAKE_WAITERS_SQL + " RETURNING w.id", ids
                 )
-                moved += len(ids)
+                if woken:
+                    woken_ids = [r["id"] for r in woken]
+                    logger.warning(
+                        f"Woke {len(woken_ids)} waiting jobs whose dependency "
+                        f"was already satisfied (missed wake): {woken_ids[:10]}"
+                    )
+                    moved += len(woken_ids)
 
     async with pool.acquire() as conn, conn.transaction():
         rows = await conn.fetch(SWEEP_UNSATISFIABLE_WAITERS_SQL, batch_size)
@@ -827,22 +850,26 @@ async def sweep_dead_workers(
     return len(requeued)
 
 
-async def sweep_unregistered_claims(
+async def sweep_stuck_claims(
     pool: asyncpg.Pool,
     claimed_grace_seconds: float = 300,
     batch_size: int = 100,
 ) -> int:
-    """Requeue jobs stuck in 'claimed' with no registry reference.
+    """Requeue jobs stuck in 'claimed' past the grace, whoever claims them.
 
-    Covers the rare gap where a worker claimed a job while the registry was
-    unavailable and then died: nothing heartbeats for it, so age is the only
-    signal. A healthy worker moves claimed -> running almost immediately."""
+    A healthy worker moves claimed -> running almost immediately, so age is
+    the whole signal. Covers the worker that claimed while the registry was
+    unavailable and died (nothing heartbeats for it), AND the lost claim
+    ack: the claim commits, the connection drops before the rows reach the
+    worker, and the reconnecting worker claims a different job -- leaving
+    this one owned by a live, heartbeating worker that has never heard of
+    it, invisible to the dead-worker and timeout sweeps."""
     grace = datetime.timedelta(seconds=claimed_grace_seconds)
-    requeued = await pool.fetch(SWEEP_UNREGISTERED_CLAIMS_SQL, grace, batch_size)
+    requeued = await pool.fetch(SWEEP_STUCK_CLAIMS_SQL, grace, batch_size)
 
     for row in requeued:
         logger.warning(
-            f"Requeued unregistered stale claim {row['id']} ({row['job_class']}) "
+            f"Requeued stuck claim {row['id']} ({row['job_class']}) "
             f"from {row['worker_host']}"
         )
 
@@ -1090,8 +1117,8 @@ async def sweep_retired_workers(
     A worker that still owns 'claimed' or 'running' jobs is refused whatever
     its age. ``jorb.claimed_by`` has no foreign key, so deleting the row
     would strand that work: the dead-worker sweep finds orphaned jobs by
-    joining to this table, and the unregistered-claim sweep only looks at
-    ``claimed_by IS NULL``. Neither can see a job pointing at an id that no
+    joining to this table, and the stuck-claims sweep only covers
+    'claimed'. Neither can see a running job pointing at an id that no
     longer exists.
 
     Probe then delete, the same two-statement shape as the other sweeps: the
@@ -1260,8 +1287,8 @@ async def monitor(
                 lambda: sweep_dead_workers(pool, liveness_grace_seconds),
             )
             await _run_sweep(
-                "unregistered claims",
-                lambda: sweep_unregistered_claims(pool, claimed_grace_seconds),
+                "stuck claims",
+                lambda: sweep_stuck_claims(pool, claimed_grace_seconds),
             )
             await _run_sweep(
                 "stranded waiters",
@@ -1376,7 +1403,7 @@ def cli() -> None:
         "--claimed-grace",
         default=300.0,
         show_default=True,
-        help="Age before an unregistered 'claimed' job counts as abandoned",
+        help="Age before a 'claimed' job counts as stuck and is requeued",
     )
     @click.option(
         "--retention-days",

@@ -3134,8 +3134,9 @@ def db_migrate(ctx: click.Context) -> None:
             # Reported distinctly, because "applied" and "recorded" are
             # different events and an operator reading a deploy log needs to
             # tell them apart: a fresh install RECORDS every migration without
-            # running any of them (schema.sql already contains their effects),
-            # and saying "applied" there would claim DDL that never ran.
+            # running any of them (the base schema already contains their
+            # effects), and saying "applied" there would claim DDL that
+            # never ran.
             if result.installed_base:
                 print_success("Installed base schema")
                 if result.recorded:
@@ -3145,7 +3146,26 @@ def db_migrate(ctx: click.Context) -> None:
                     )
             if result.applied:
                 print_success(f"Applied migrations: {result.applied}")
-            elif not result.installed_base:
+            # The shape check, so this command can never say "up to date"
+            # about a database `doctor` FAILs. A database with jorb present
+            # but objects missing was installed from a DIFFERENT schema
+            # revision; with nothing pending there is no DDL that will
+            # repair it, and pretending otherwise sends the operator around
+            # the doctor -> migrate -> doctor loop forever.
+            missing = await migrations.missing_objects(conn)
+            if missing:
+                for name in missing[:10]:
+                    print_error(f"  missing: {name}")
+                if len(missing) > 10:
+                    print_error(f"  ... and {len(missing) - 10} more")
+                fail(
+                    f"Schema is installed but {len(missing)} object(s) this "
+                    f"release needs are missing (listed above).",
+                    "No pending migration repairs this: the database was "
+                    "installed from a different schema revision. Recreate "
+                    "it, or reconcile the listed objects by hand.",
+                )
+            elif not result.changed:
                 print_success("Database schema is up to date")
         finally:
             await conn.close()

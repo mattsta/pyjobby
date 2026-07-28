@@ -68,9 +68,9 @@ import asyncpg  # type: ignore[import-untyped]
 from aiohttp import web
 
 from . import db
-from .client import DEFAULT_PRIO_CEILING
-from .client import validate_priority as check_prio_ceiling
+from .client import DEFAULT_PRIO_CEILING, validate_priority
 from .lifecycle import TERMINAL_STATES
+from .monitor import DEFAULT_LIVENESS_GRACE_SECONDS
 
 # Configure logging
 logging.basicConfig(
@@ -172,7 +172,10 @@ DEFAULT_SNAPSHOT_WINDOW_SECONDS = 60.0
 #: out over PROM_SQL_LIVE_STATES: a single predicate spanning several states
 #: matches none of the partial indexes and collapses into a sequential scan.
 #: Each arm gets its own index; the union is what keeps them.
-SNAPSHOT_SQL = """
+# f-string ONLY for the liveness constant (a float from monitor.py, not user
+# input): the dashboard's live-worker count must use the same grace as the
+# monitor and pj-web, or the surfaces disagree the day the default changes.
+SNAPSHOT_SQL = f"""
     SELECT 'backlog'::text AS kind, queue, 'queued'::text AS state,
            COUNT(*)::bigint AS n,
            EXTRACT(EPOCH FROM (now() - MIN(run_after)))::float8 AS age
@@ -204,7 +207,8 @@ SNAPSHOT_SQL = """
     UNION ALL
     SELECT 'workers', NULL::text, NULL::text, COUNT(*)::bigint, NULL::float8
       FROM jorb_worker
-     WHERE shutdown_at IS NULL AND last_seen > now() - interval '60 seconds'
+     WHERE shutdown_at IS NULL
+       AND last_seen > now() - interval '{DEFAULT_LIVENESS_GRACE_SECONDS} seconds'
 """
 
 #: Registers a client's interest in one specific job and reports that job's
@@ -586,7 +590,7 @@ class WebSocketServer:
                 f"new_priority must be between {MIN_INT32} and {MAX_INT32}"
             )
         try:
-            check_prio_ceiling(value, self.prio_ceiling)
+            validate_priority(value, self.prio_ceiling)
         except ValueError:
             raise InvalidMessage(
                 f"new_priority {value} is above the worker priority ceiling "
@@ -951,7 +955,9 @@ class WebSocketServer:
             for r in rows
         }
 
-    async def get_live_worker_count(self, stale_after_seconds: float = 60.0) -> int:
+    async def get_live_worker_count(
+        self, stale_after_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS
+    ) -> int:
         """Count live workers in the registry (no shutdown, fresh heartbeat)."""
         assert self.db_pool is not None
         count: int = await self.db_pool.fetchval(

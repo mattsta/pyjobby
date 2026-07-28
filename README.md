@@ -323,7 +323,8 @@ pj-monitor --dsn postgresql://... --check-interval 10
 `pj-monitor` is the platform's reaper: it enforces `timeout_at` on running
 jobs, requeues in-flight jobs owned by workers whose registry heartbeat
 went stale (`--liveness-grace`, default 60s — this is how jobs on a dead
-host recover, on any host), and recovers unregistered stale claims
+host recover, on any host), and recovers stuck claims — jobs `claimed`
+past the grace whoever claims them, which also covers a lost claim ack
 (`--claimed-grace`, default 300s). It connects via `--dsn` (or the
 `PYJOBBY_DSN` environment variable) or `--config`.
 

@@ -7,8 +7,8 @@ Covers every sweep the monitor daemon performs:
   and ``max_retries``
 - dead-worker reclaim: in-flight jobs of workers whose ``jorb_worker``
   heartbeat went stale are requeued and the workers retired
-- unregistered-claim reclaim: 'claimed' jobs with no registry reference are
-  requeued after a grace period
+- stuck-claim reclaim: jobs 'claimed' past the grace are requeued whoever
+  claims them (covers unregistered claimers AND lost claim acks)
 - job retention: terminal jobs past the window are deleted with every child
   row; live work is never deleted at any age; on by default, with 0 as the
   keep-forever escape hatch
@@ -48,8 +48,8 @@ from pyjobby.monitor import (
     sweep_retired_workers,
     sweep_schedule_log,
     sweep_stranded_waiters,
+    sweep_stuck_claims,
     sweep_timed_out_jobs,
-    sweep_unregistered_claims,
 )
 from pyjobby.pj import STMTS
 from pyjobby.procs import dsn_from
@@ -855,8 +855,8 @@ class TestSweepDeadWorkers:
         earlier sweep that found its heartbeat stale. Either way, a job still
         'running' behind a long-dead heartbeat has no one executing it — and
         skipping those rows stranded them permanently: this sweep ignored
-        retired workers and the unregistered-claim sweep only covers claims
-        with no worker reference at all."""
+        retired workers and the stuck-claims sweep only covers 'claimed'
+        rows, not 'running' ones."""
         retired = await insert_worker(db_pool, unique_queue, last_seen_age_seconds=300)
         await db_pool.execute(
             "UPDATE jorb_worker SET shutdown_at = now() WHERE id = $1", retired
@@ -920,19 +920,19 @@ class TestSweepDeadWorkers:
 
 
 # ============================================================================
-# unregistered-claim reclaim
+# stuck-claim reclaim
 # ============================================================================
 
 
-class TestSweepUnregisteredClaims:
-    async def test_requeues_stale_unregistered_claim(self, db_pool, unique_queue):
+class TestSweepStuckClaims:
+    async def test_requeues_a_stale_unregistered_claim(self, db_pool, unique_queue):
         job_id = await insert_job(db_pool, unique_queue, state="claimed")
         await db_pool.execute(
             "UPDATE jorb SET updated = now() - interval '10 minutes' WHERE id = $1",
             job_id,
         )
 
-        requeued = await sweep_unregistered_claims(db_pool, claimed_grace_seconds=300)
+        requeued = await sweep_stuck_claims(db_pool, claimed_grace_seconds=300)
         assert requeued == 1
 
         job = await get_job(db_pool, job_id)
@@ -942,16 +942,21 @@ class TestSweepUnregisteredClaims:
     async def test_leaves_fresh_claims_alone(self, db_pool, unique_queue):
         job_id = await insert_job(db_pool, unique_queue, state="claimed")
 
-        requeued = await sweep_unregistered_claims(db_pool, claimed_grace_seconds=300)
+        requeued = await sweep_stuck_claims(db_pool, claimed_grace_seconds=300)
         assert requeued == 0
         assert (await get_job(db_pool, job_id))["state"] == "claimed"
 
-    async def test_leaves_registered_claims_to_the_dead_worker_sweep(
+    async def test_requeues_a_lost_ack_claim_under_a_live_worker(
         self, db_pool, unique_queue
     ):
-        """Claims with a registry reference are the dead-worker sweep's
-        business, however old they are."""
-        worker_id = await insert_worker(db_pool, unique_queue)
+        """THE lost-ack case: the claim committed, the connection dropped
+        before the rows reached the worker, and the reconnecting worker
+        claimed a different job. The claimer is alive and heartbeating, so
+        the dead-worker sweep never fires and the timeout sweep (running
+        only) never sees it — a stale 'claimed' is stranded no matter what
+        the registry says, and the epoch bump fences the claimer out if it
+        ever does come back."""
+        worker_id = await insert_worker(db_pool, unique_queue)  # live heartbeat
         job_id = await insert_job(
             db_pool, unique_queue, state="claimed", claimed_by=worker_id
         )
@@ -959,10 +964,14 @@ class TestSweepUnregisteredClaims:
             "UPDATE jorb SET updated = now() - interval '10 minutes' WHERE id = $1",
             job_id,
         )
+        epoch_before = (await get_job(db_pool, job_id))["run_epoch"]
 
-        requeued = await sweep_unregistered_claims(db_pool, claimed_grace_seconds=300)
-        assert requeued == 0
-        assert (await get_job(db_pool, job_id))["state"] == "claimed"
+        requeued = await sweep_stuck_claims(db_pool, claimed_grace_seconds=300)
+        assert requeued == 1
+
+        job = await get_job(db_pool, job_id)
+        assert job["state"] == "queued"
+        assert job["run_epoch"] > epoch_before
 
 
 # ============================================================================
@@ -1754,9 +1763,9 @@ class TestSweepRetiredWorkers:
         self, db_pool, unique_queue
     ):
         """The dangerous one. jorb.claimed_by carries no foreign key, so
-        deleting this row would strand the job permanently: the dead-worker
-        sweep finds orphans by JOINing to jorb_worker, and the
-        unregistered-claim sweep only looks at claimed_by IS NULL."""
+        deleting this row would strand a RUNNING job permanently: the
+        dead-worker sweep finds orphans by JOINing to jorb_worker, and the
+        stuck-claims sweep only covers 'claimed' rows."""
         holder = await insert_worker(db_pool, unique_queue)
         stranded = await insert_job(
             db_pool, unique_queue, state="running", claimed_by=holder

@@ -105,6 +105,17 @@ def calculate_retry_delay(
     return datetime.timedelta(seconds=delay)
 
 
+#: The platform's retry defaults, in ONE place. Every surface that fills a
+#: gap in a job's retry config -- enqueue's keyword defaults, the worker's
+#: --max-retries fallback, the monitor's timeout handler -- reads these, so
+#: whether a job dead-letters can never depend on WHICH component noticed
+#: the failure.
+DEFAULT_RETRY_STRATEGY = "exponential"
+DEFAULT_MAX_RETRIES = 10
+DEFAULT_INITIAL_RETRY_DELAY = 1
+DEFAULT_MAX_RETRY_DELAY = 3600
+
+
 def get_retry_config(admin_data: dict | None) -> dict:
     """
     Extract retry configuration from admin_data.
@@ -124,10 +135,12 @@ def get_retry_config(admin_data: dict | None) -> dict:
         admin_data = {}
 
     return {
-        "retry_strategy": admin_data.get("retry_strategy", "exponential"),
-        "max_retries": admin_data.get("max_retries", 10),
-        "initial_retry_delay": admin_data.get("initial_retry_delay", 1),
-        "max_retry_delay": admin_data.get("max_retry_delay", 3600),
+        "retry_strategy": admin_data.get("retry_strategy", DEFAULT_RETRY_STRATEGY),
+        "max_retries": admin_data.get("max_retries", DEFAULT_MAX_RETRIES),
+        "initial_retry_delay": admin_data.get(
+            "initial_retry_delay", DEFAULT_INITIAL_RETRY_DELAY
+        ),
+        "max_retry_delay": admin_data.get("max_retry_delay", DEFAULT_MAX_RETRY_DELAY),
     }
 
 

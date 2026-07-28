@@ -56,6 +56,7 @@ from loguru import logger
 from . import db, dxe
 from .client import DEFAULT_PRIO_CEILING
 from .configloader import load_config_from_file
+from .retry_strategies import DEFAULT_MAX_RETRIES
 
 fmt = (
     "<yellow>{process.id:>}:{process.name:<}</yellow> "
@@ -370,7 +371,8 @@ class JobSystem:
     pid: int = field(default_factory=lambda: os.getpid())
     node: str = field(default_factory=lambda: platform.node())
     cache: dict[str, Any] = field(default_factory=dict)
-    max_retries: int = 10  # Maximum attempts before terminal 'crashed'
+    # Maximum attempts before terminal 'crashed' (one home: retry_strategies)
+    max_retries: int = DEFAULT_MAX_RETRIES
     default_timeout: int = 3600  # Default job timeout in seconds (1 hour)
     heartbeat_interval: float = 10.0  # seconds between registry heartbeats
     # Size of this worker's own job-thread pool, and therefore the number of
@@ -1445,6 +1447,15 @@ class JobSystem:
                     attempt,
                     reason,
                 )
+            else:
+                # The epoch moved on (monitor timeout/requeue won the race):
+                # the dead-letter write was fenced out, so the error that
+                # exhausted the budget reaches no jorb row. A lost outcome
+                # must be said out loud, like the retry branch above.
+                logger.warning(
+                    f"[job {jid}] Superseded (epoch moved on); dead-letter "
+                    f"not recorded here: {error}"
+                )
 
 
 #: Returned by ``Job._dxe_resume`` when there is no usable checkpoint and
@@ -2269,7 +2280,7 @@ def runAndDone(
 )
 @click.option(
     "--max-retries",
-    default=10,
+    default=DEFAULT_MAX_RETRIES,
     help="Maximum attempts before a job is dead-lettered (state 'crashed')",
     show_default=True,
 )

@@ -2017,8 +2017,8 @@ SWEEP_GATES: dict[str, SweepGate] = {
         caught_up_discards=PLAN_IN_FLIGHT_BUDGET,
         backlog_discards=PLAN_IN_FLIGHT_BUDGET,
     ),
-    "SWEEP_UNREGISTERED_CLAIMS_SQL": SweepGate(
-        "monitor unregistered-claim requeue (claimed with no registry row)",
+    "SWEEP_STUCK_CLAIMS_SQL": SweepGate(
+        "monitor stuck-claim requeue (claimed too long, any worker state)",
         ("jorb",),
         mutating=True,
         # Same index, and here the discards are claimed rows that DO have a

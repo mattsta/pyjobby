@@ -249,6 +249,16 @@ async def _cleanup_database(db_params: dict[str, str]) -> None:
         await conn.execute("DELETE FROM jorb_history")
         await conn.execute("DELETE FROM jorb_worker")
         await conn.execute("DELETE FROM jorb_queue")
+        # Test-only side-effect tables, created on demand by their fixtures
+        # with CREATE TABLE IF NOT EXISTS. DROPPED, not deleted: IF NOT
+        # EXISTS means a changed fixture DDL would otherwise no-op against
+        # the stale table forever on any machine that ran the suite before
+        # -- the exact stale-fixture class the schema fingerprint kills for
+        # the pyjobby schema, closed here for the fixtures' own tables.
+        await conn.execute(
+            "DROP TABLE IF EXISTS "
+            "jorb_test_effect, example_order, example_row, guide_payment"
+        )
     finally:
         await conn.close()
 

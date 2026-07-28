@@ -32,7 +32,7 @@ from pyjobby import db, dxe
 from pyjobby.monitor import (
     handle_timed_out_job,
     sweep_dead_workers,
-    sweep_unregistered_claims,
+    sweep_stuck_claims,
 )
 from pyjobby.pj import STMTS, Job
 from pyjobby.procs import spawn, terminate, wait_until
@@ -494,16 +494,16 @@ async def test_unregistered_claim_is_reclaimed_only_after_the_grace_period(
     assert claimed["run_epoch"] == 1
 
     # fresh claim: untouched
-    assert await sweep_unregistered_claims(db_pool, claimed_grace_seconds=300) == 0
+    assert await sweep_stuck_claims(db_pool, claimed_grace_seconds=300) == 0
     # still inside the grace period: untouched
     assert await age_claim(db_pool, job_id, 60) == "UPDATE 1"
-    assert await sweep_unregistered_claims(db_pool, claimed_grace_seconds=300) == 0
+    assert await sweep_stuck_claims(db_pool, claimed_grace_seconds=300) == 0
     still = await db_pool.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
     assert still["state"] == "claimed"
 
     # past the grace period: reclaimed
     assert await age_claim(db_pool, job_id, 600) == "UPDATE 1"
-    assert await sweep_unregistered_claims(db_pool, claimed_grace_seconds=300) == 1
+    assert await sweep_stuck_claims(db_pool, claimed_grace_seconds=300) == 1
     requeued = await db_pool.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
     assert requeued["state"] == "queued"
     assert requeued["timeout_at"] is None
