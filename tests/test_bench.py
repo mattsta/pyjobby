@@ -398,7 +398,10 @@ class TestSubcommandsEmitDocumentedJson:
         # "no seq scan" alone would be satisfied by the wrong index.
         for key, index in (
             ("expired_jobs", "jorb_retention_idx"),
-            ("checkpoint_jobs", "jorb_retention_idx"),
+            # the checkpoint sweep reaps FINISHED jobs only (crashed/cancelled
+            # are retryable and resume from checkpoints), on its own partial
+            # index rather than the all-terminal one
+            ("checkpoint_jobs", "jorb_finished_retention_idx"),
             ("mailbox_backlog", "jorb_mailbox_consumed_idx"),
             ("orphaned_dags_backlog", "jorb_dag_retention_idx"),
             ("schedule_log_backlog", "jorb_schedule_log_retention_idx"),

@@ -212,15 +212,18 @@ class TestScrapeQueryPlans:
 
         assert "jorb_started_idx" in plan, plan
 
-    async def test_duration_quantiles_ride_the_retention_index(self, db_pool):
-        """Quantiles used to filter on bare `finished`, which no index covers
-        -- `jorb_retention_idx` is on COALESCE(finished, updated), and for a
-        finished job the two are the same instant."""
+    async def test_duration_quantiles_ride_the_finished_retention_index(
+        self, db_pool
+    ):
+        """Quantiles filter on `state = 'finished'` over the window, which
+        the FINISHED-only partial index covers exactly (and more tightly than
+        the all-terminal jorb_retention_idx the planner used before that index
+        existed) -- COALESCE(finished, updated) is the finished instant."""
         await seed_for_plans(db_pool)
 
         plan = await plan_for(db_pool, PROM_SQL_DURATION_QUANTILES, WINDOW)
 
-        assert "jorb_retention_idx" in plan, plan
+        assert "jorb_finished_retention_idx" in plan, plan
 
     async def test_the_enqueued_counter_reads_no_table_at_all(self, db_pool):
         """The cumulative counter comes from the sequence, so it costs the

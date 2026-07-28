@@ -21,14 +21,17 @@ recovery:
    indefinitely accumulates every completed job forever otherwise, and a
    retention policy nobody remembers to switch on is not a policy. Pass
    ``--retention-days 0`` to keep everything forever.
-5. **Checkpoint retention**: ``jorb_step`` rows of terminal jobs older than
-   ``--checkpoint-retention-days`` (default 1) are deleted while the job row
-   itself stays. Checkpoints exist to make a job RESUMABLE; the moment it
-   reaches a terminal state resume is impossible, so they are the bulkiest
-   thing on the row with the shortest useful life. They outlive the job's
-   terminal transition only far enough to debug it. ``0`` keeps them for as
-   long as the job.
-6. **The four tables the job cascade cannot reach**, all on the same
+5. **Checkpoint retention**: ``jorb_step`` rows of ``finished`` jobs older
+   than ``--checkpoint-retention-days`` (default 1) are deleted while the job
+   row itself stays. FINISHED only, deliberately: ``crashed`` and
+   ``cancelled`` are retryable, and ``retry_job`` resumes from checkpoints,
+   so reaping those early would make a DLQ retry re-execute every completed
+   step. A finished job is only re-run by an explicit ``rerun_job``, which is
+   meant to re-execute, so its checkpoints — the bulkiest thing on the row —
+   are pure audit from the moment it finishes. Crashed/cancelled checkpoints
+   live until the whole job ages out under ``--retention-days``. ``0`` keeps
+   finished checkpoints for as long as the job.
+6. **The five tables the job cascade cannot reach**, all on the same
    ``--retention-days`` window, because none of them has a lifetime argument
    of its own — they are all "as long as the jobs they describe":
 
@@ -46,6 +49,10 @@ recovery:
    * ``jorb_worker`` — one row per worker PROCESS START, never deleted, only
      stamped ``shutdown_at``. A fleet that redeploys daily accumulates rows
      indefinitely.
+   * ``jorb_history`` — the cascade reaches it only when the job is deleted,
+     which never happens for a job that never terminates: a parked durable
+     machine writes ~3 history rows per wake forever, so age-based retention
+     is the only thing that bounds it.
 
 Every retention sweep DRAINS: a cycle keeps taking batches until it is caught
 up or spends ``--retention-max-seconds``, then yields. One batch per cycle
@@ -1116,6 +1123,7 @@ async def _drain(
     sweep: Callable[[], Awaitable[int]],
     batch_size: int,
     max_seconds: float,
+    stop: asyncio.Event | None = None,
 ) -> int:
     """Run one batched retention sweep until it is caught up or out of time.
 
@@ -1148,6 +1156,13 @@ async def _drain(
                 logger.info(f"Retention {name}: deleted {total}, caught up")
             return total
 
+        if stop is not None and stop.is_set():
+            # SIGTERM arrived mid-drain: yield now rather than keep taking
+            # batches. Retention resumes on the next start; a shutdown that
+            # waited out every sweep's budget would blow past the
+            # orchestrator's stop grace and get SIGKILLed mid-transaction.
+            return total
+
         if loop.time() >= deadline:
             logger.warning(
                 f"Retention {name}: deleted {total} and stopped on its "
@@ -1162,9 +1177,12 @@ async def _run_retention(
     sweep: Callable[[], Awaitable[int]],
     batch_size: int,
     max_seconds: float,
+    stop: asyncio.Event | None = None,
 ) -> int:
     """Drain one retention sweep with the same failure isolation as the rest."""
-    return await _run_sweep(name, lambda: _drain(name, sweep, batch_size, max_seconds))
+    return await _run_sweep(
+        name, lambda: _drain(name, sweep, batch_size, max_seconds, stop)
+    )
 
 
 async def monitor(
@@ -1247,9 +1265,10 @@ async def monitor(
                     ),
                     retention_batch_size,
                     retention_max_seconds,
+                    stop,
                 )
 
-            if retention_days:
+            if retention_days and not stop.is_set():
                 await _run_retention(
                     "expired jobs",
                     lambda: sweep_expired_jobs(
@@ -1257,6 +1276,7 @@ async def monitor(
                     ),
                     retention_batch_size,
                     retention_max_seconds,
+                    stop,
                 )
                 # immediately after the jobs, so a DAG emptied by the sweep
                 # above is reaped on the same cycle rather than spending one
@@ -1268,6 +1288,7 @@ async def monitor(
                     ),
                     retention_batch_size,
                     retention_max_seconds,
+                    stop,
                 )
                 await _run_retention(
                     "schedule log",
@@ -1276,6 +1297,7 @@ async def monitor(
                     ),
                     retention_batch_size,
                     retention_max_seconds,
+                    stop,
                 )
                 await _run_retention(
                     "retired workers",
@@ -1284,6 +1306,7 @@ async def monitor(
                     ),
                     retention_batch_size,
                     retention_max_seconds,
+                    stop,
                 )
                 await _run_retention(
                     "consumed mailbox",
@@ -1292,6 +1315,7 @@ async def monitor(
                     ),
                     retention_batch_size,
                     retention_max_seconds,
+                    stop,
                 )
                 await _run_retention(
                     "job history",
@@ -1300,6 +1324,7 @@ async def monitor(
                     ),
                     retention_batch_size,
                     retention_max_seconds,
+                    stop,
                 )
 
             # wait out the interval, or leave immediately on SIGTERM/SIGINT

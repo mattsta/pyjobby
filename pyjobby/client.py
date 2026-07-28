@@ -2738,9 +2738,18 @@ class SyncJobClient:
         """
         self._loop = asyncio.new_event_loop()
         self._closed = False
-        self._client: JobClient = self._loop.run_until_complete(
-            self._create(dsn, connect_kwargs, min_size, max_size, prio_ceiling)
-        )
+        try:
+            self._client: JobClient = self._loop.run_until_complete(
+                self._create(dsn, connect_kwargs, min_size, max_size, prio_ceiling)
+            )
+        except BaseException:
+            # a bad DSN / unreachable database / bad kwargs raises here, and
+            # __init__ leaves no object to call close() on — so the loop
+            # (with its epoll fd and self-pipe) must be closed before the
+            # exception propagates, or a retry loop leaks a loop per attempt
+            self._closed = True
+            self._loop.close()
+            raise
 
     @staticmethod
     async def _create(
@@ -3038,11 +3047,20 @@ class SyncJobClient:
         return SyncMachine(self._client.machine(job_id, machine), self._run)
 
     def close(self) -> None:
-        """Close the underlying client (pool + listener) and the loop."""
-        if not self._closed:
+        """Close the underlying client (pool + listener) and the loop.
+
+        Idempotent, and the loop is closed even if the pool close raises (a
+        dead server): otherwise a `finally: client.close()` retry would
+        re-enter run_until_complete on a live loop, and the loop would leak.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        try:
             self._loop.run_until_complete(self._client.close())
+            self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+        finally:
             self._loop.close()
-            self._closed = True
 
     def __enter__(self) -> SyncJobClient:
         return self

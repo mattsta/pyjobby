@@ -148,6 +148,13 @@ STMTS["now"] = """SELECT now() AS now"""
 # on a live worker where no sweep can reach it (no timeout_at, fresh
 # heartbeat, not `claimed`). A DIFFERENT attempt is still fenced out: claim
 # bumps run_epoch, so a superseding attempt never shares this $2.
+# RETURNING cancel_requested too: a cancel that landed while the row was
+# still `claimed` set the flag but did not fire jorb_cancel_notify (which
+# gates on state='running'), and this state transition does not re-fire it
+# either (the trigger is ON UPDATE OF cancel_requested). Reading it here is
+# how the worker delivers a cancel that arrived in the claim->run window,
+# instead of running the job to completion and then misreporting the
+# undelivered cancel as "the task never yielded".
 STMTS["run"] = """UPDATE jorb
               SET state = 'running',
                   started = now(),
@@ -157,7 +164,7 @@ STMTS["run"] = """UPDATE jorb
               WHERE id = $1
                 AND state IN ('claimed', 'running')
                 AND run_epoch = $2
-          RETURNING id"""
+          RETURNING id, cancel_requested"""
 
 # Terminal success. Epoch-fenced: if the reaper or an operator requeued this
 # job while we ran, our (stale) completion is a no-op.
@@ -550,6 +557,13 @@ class JobSystem:
             __version__,
             self.job_threads,
         )
+        # The fresh jorb_worker row starts idle=FALSE (its schema default).
+        # While unregistered, _set_idle only updated the in-memory flag, so
+        # it may be True now -- which would make the busy<->parked guard
+        # think the DB already reflects "idle" and never write it, leaving
+        # this worker invisible to the jorb_enqueued gate for life. Align the
+        # in-memory flag with the row so the next park actually publishes.
+        self._idle = False
 
     async def _heartbeat_loop(self) -> None:
         failures = 0
@@ -1136,6 +1150,17 @@ class JobSystem:
                 )
                 return
 
+            if started_rows[0]["cancel_requested"]:
+                # a cancel landed in the claim->run window; its NOTIFY never
+                # fired (the row was 'claimed' then, not 'running'), so honor
+                # it here rather than run the job and misreport it after
+                await self.ex("cancelled", jid, epoch)
+                logger.info(
+                    f"[job {jid}] Cancelled before execution began "
+                    f"(operator request landed while claimed)"
+                )
+                return
+
             start_counter = time.perf_counter()
             # DXE: ONE deadline for this job. It is what _execute enforces and
             # the ceiling every per-step budget is measured against (see
@@ -1197,9 +1222,23 @@ class JobSystem:
             )
 
         except dxe.StaleExecutionError:
-            # a newer attempt owns the row (monitor/operator requeue while
-            # we ran); abandon quietly — our writes were fenced out anyway
-            logger.warning(f"[job {jid}] Superseded mid-run; abandoning stale attempt")
+            # A fenced-out durable write. Two causes, and they are not the
+            # same event: a monitor/operator requeue took the row (genuine
+            # supersession), OR the job called reschedule()/sleep() — which
+            # bump the epoch themselves — and then attempted another durable
+            # write, which reschedule()'s own contract says not to do. The
+            # flag tells them apart so the log does not cry "superseded" at a
+            # job that requeued itself.
+            if klass is not None and klass._dxe_rescheduled:
+                logger.warning(
+                    f"[job {jid}] Durable write after reschedule()/sleep() was "
+                    f"fenced out — reschedule() must be the LAST durable "
+                    f"statement in a task (the row is already re-queued)"
+                )
+            else:
+                logger.warning(
+                    f"[job {jid}] Superseded mid-run; abandoning stale attempt"
+                )
 
         except asyncio.CancelledError:
             if not self._cancel_current:
@@ -2114,6 +2153,12 @@ class Job:
 
         A job that reschedules itself stays 'queued' for the future run —
         the reschedule wins over normal completion.
+
+        This MUST be the last durable statement in your task. Requeuing the
+        row advances its run_epoch, which fences THIS execution out: a
+        ``step()``/``set_event()``/``send()`` after a ``reschedule()`` matches
+        zero rows and raises ``StaleExecutionError``. Do the durable work
+        first, reschedule last, then return.
 
         Units are from timedelta:
             "microseconds milliseconds seconds minutes hours days weeks"

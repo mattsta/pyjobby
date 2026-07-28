@@ -546,30 +546,30 @@ class TestAsyncGeneratorWithTimeout:
         assert job["result"] == ["direct_0", "direct_1"]
 
 
-class TestUnhonoredCancel:
-    """A cancel the task never yields for is outrun, not honored — and that
-    outcome must be visible, not recorded as plain success."""
+class TestCancelInTheClaimRunWindow:
+    """A cancel that lands while the row is 'claimed' (between claim and run)
+    sets cancel_requested but never fires jorb_cancel_notify — which gates on
+    state='running'. The worker reads cancel_requested from run's RETURNING
+    and HONORS the cancel before executing, rather than running the job to
+    completion and then misreporting the undelivered cancel."""
 
-    async def test_completion_with_a_pending_cancel_keeps_the_flag(
+    async def test_a_cancel_pending_at_run_is_honored_not_executed(
         self, live_worker, unique_queue, db_pool
     ):
-        """cancel_requested set before the run (no NOTIFY fires for a
-        non-running job, so nothing can deliver the cancellation): the job
-        completes, and the row records BOTH facts — finished, and that a
-        cancel was asked for and never took effect. The worker logs the
-        contradiction; this asserts the durable trace of it."""
         job_id = await enqueue(
             db_pool, unique_queue, f"{THIS}.SyncQuickJob", {"value": "outran"}
         )
+        # cancel_requested TRUE at claim time (as CANCEL_SQL sets it for a
+        # claimed row); its NOTIFY cannot reach a not-yet-running worker
         await db_pool.execute(
             "UPDATE jorb SET cancel_requested = TRUE WHERE id = $1", job_id
         )
 
         await live_worker()
-        job = await wait_for_job_state(db_pool, job_id, ("finished",))
+        job = await wait_for_job_state(db_pool, job_id, ("cancelled",))
 
-        assert job["result"] == "quick: outran"
-        assert job["cancel_requested"] is True  # the unhonored ask, on record
+        assert job["state"] == "cancelled"
+        assert job["result"] is None  # the job never executed
 
 
 # ============================================================================

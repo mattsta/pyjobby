@@ -553,6 +553,34 @@ class TestSyncFacadeParity:
 
         assert await asyncio.to_thread(_drive) is True
 
+    async def test_construction_failure_does_not_leak_the_event_loop(self):
+        """A bad DSN raises out of __init__, which leaves no object to
+        close() — so the loop must be closed before the exception
+        propagates, or a retry loop leaks one loop (epoll fd + self-pipe)
+        per attempt."""
+        from pyjobby.client import SyncJobClient
+
+        def _count_loops() -> int:
+            import asyncio as _a
+            import gc
+
+            return sum(
+                1 for o in gc.get_objects() if isinstance(o, _a.AbstractEventLoop)
+            )
+
+        def _attempt() -> None:
+            before = _count_loops()
+            for _ in range(5):
+                with pytest.raises(Exception):
+                    SyncJobClient(dsn="postgresql://nobody@127.0.0.1:1/none")
+            import gc
+
+            gc.collect()
+            after = _count_loops()
+            assert after <= before + 1, f"leaked loops: {before} -> {after}"
+
+        await asyncio.to_thread(_attempt)
+
 
 class TestEnqueueValidation:
     async def test_unserializable_kwargs_fail_at_enqueue(self, client, unique_queue):

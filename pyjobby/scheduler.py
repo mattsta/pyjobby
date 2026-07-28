@@ -994,13 +994,18 @@ async def run_scheduler(
     worker.db_params = db_params  # enables reconnect after a lost connection
 
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, worker.stop)
+    with contextlib.suppress(NotImplementedError):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, worker.stop)
 
     try:
         await worker.run()
     finally:
-        await conn.close()
+        # worker.conn, NOT the local `conn`: _reconnect rebinds worker.conn
+        # after a lost connection, so closing the original here would leak
+        # the live session and close an already-dead handle.
+        with contextlib.suppress(Exception):
+            await worker.conn.close()
 
 
 def main() -> None:
