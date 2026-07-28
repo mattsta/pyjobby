@@ -92,7 +92,7 @@ import asyncpg
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.jobs = await JobClient.from_config("./pyjobby.conf.py")
+    app.state.jobs = await JobClient.from_config("./pyjobby.toml")
     yield
     await app.state.jobs.close()
 
@@ -554,7 +554,7 @@ at creation, rather than silently never firing.
 A separate process fires the due schedules:
 
 ```bash
-pj-scheduler --config ./pyjobby.conf.py
+pj-scheduler --config ./pyjobby.toml
 ```
 
 Each firing creates an ordinary job carrying `schedule_id` — a column on

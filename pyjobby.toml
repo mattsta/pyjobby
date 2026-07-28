@@ -1,0 +1,14 @@
+# Sample pyjobby configuration (TOML, read as data — never executed).
+# Secrets: any string of the exact form "${ENV_VAR}" is replaced from the
+# environment at load time; an unset variable is a loud startup error.
+
+[db_params]
+database = "pyjobby_test"
+user = "pyjobby_test"
+password = "pyjobby_test_password"
+host = "localhost"
+port = 5432
+
+[web_listen]
+sites = [{ host = "127.0.0.1", port = 8080 }]
+paths = []

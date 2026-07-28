@@ -10,7 +10,7 @@ Public API::
             ...
 
     # enqueue work
-    async with await JobClient.from_config("./pyjobby.conf.py") as client:
+    async with await JobClient.from_config("./pyjobby.toml") as client:
         await client.enqueue("myapp.jobs.SendEmail", to="user@example.com")
 
 Heavier subsystems (AdminAPI, SchedulerWorker, WebSocketServer, migrations)

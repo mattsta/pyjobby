@@ -1,167 +1,145 @@
-"""
-Comprehensive tests for configloader.py - configuration loading utilities.
-Using LIVE file operations with NO MOCKS for maximum correctness guarantees!
+"""The config loader reads DATA, never code.
+
+pyjobby config is a TOML file. These tests pin the whole contract:
+requested keys come back (case-insensitively) and nothing else; secrets
+arrive via explicit ``"${VAR}"`` environment references that fail LOUDLY
+when unset; and the failure modes are parse errors at a line — a config
+file can no longer execute anything, and a ``.py`` config is refused by
+name with the migration hint rather than run.
 """
 
-import os
-import sys
-import tempfile
-from pathlib import Path
+from __future__ import annotations
 
 import pytest
 
-from pyjobby.configloader import (
-    chdir_addpath,
-    get_config_from_filename,
-    get_config_from_module_name,
-    load_config_from_file,
-    load_config_from_module_name_or_filename,
-)
+from pyjobby.configloader import ConfigError, load_config_from_file
 
 
-class TestChdirAddpath:
-    """Test directory changing and path manipulation - covers lines 16-20."""
-
-    def test_chdir_addpath_changes_directory(self):
-        """Test that chdir_addpath changes to the specified directory."""
-        original_dir = Path.cwd()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            chdir_addpath(tmpdir)
-            # realpath: macOS tempdirs live behind the /var -> /private/var symlink
-            assert Path.cwd().resolve() == Path(tmpdir).resolve()
-            assert tmpdir in sys.path
-            # Restore original directory
-            os.chdir(original_dir)
-            sys.path.remove(tmpdir)
-
-    def test_chdir_addpath_adds_to_sys_path(self):
-        """Test that path is added to sys.path - covers lines 19-20."""
-        original_dir = Path.cwd()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Ensure it's not already in path
-            if tmpdir in sys.path:
-                sys.path.remove(tmpdir)
-
-            chdir_addpath(tmpdir)
-            assert tmpdir in sys.path
-            # Check it's at the front
-            assert sys.path[0] == tmpdir
-
-            # Restore
-            os.chdir(original_dir)
-            sys.path.remove(tmpdir)
+def write(tmp_path, text: str, name: str = "pyjobby.toml"):
+    path = tmp_path / name
+    path.write_text(text)
+    return str(path)
 
 
-class TestGetConfigFromFilename:
-    """Test loading config from Python files - covers lines 24-48."""
+class TestLoading:
+    def test_requested_keys_come_back_and_nothing_else(self, tmp_path):
+        path = write(
+            tmp_path,
+            """
+prio_ceiling = 900
+unrelated = "ignored"
 
-    def test_get_config_from_py_file(self):
-        """Test loading config from .py file - covers lines 31-41."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            f.write('db_params = {"host": "localhost", "port": 5432}\n')
-            f.write('web_listen = {"port": 8080}\n')
-            f.write("test_value = 42\n")
-            f.name
-            f.flush()
+[db_params]
+host = "localhost"
+port = 5432
 
-            try:
-                config = get_config_from_filename(f.name)
-                assert config["db_params"] == {"host": "localhost", "port": 5432}
-                assert config["web_listen"] == {"port": 8080}
-                assert config["test_value"] == 42
-            finally:
-                Path(f.name).unlink()
-
-    def test_get_config_from_nonexistent_file_raises(self):
-        """Test that non-existent file raises RuntimeError - covers line 24-25."""
-        with pytest.raises(RuntimeError) as excinfo:
-            get_config_from_filename("/nonexistent/path/config.py")
-        assert "doesn't exist" in str(excinfo.value)
-
-    def test_get_config_from_non_py_extension(self):
-        """Test loading config from non-.py file - covers lines 34-37."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False) as f:
-            f.write('custom_setting = "test"\n')
-            f.flush()
-
-            try:
-                config = get_config_from_filename(f.name)
-                assert config["custom_setting"] == "test"
-            finally:
-                Path(f.name).unlink()
-
-
-class TestGetConfigFromModuleName:
-    """Test loading config from Python module - covers line 52."""
-
-    def test_get_config_from_module_name(self):
-        """Test loading config from module name - covers line 52."""
-        # Use a built-in module
-        config = get_config_from_module_name("os")
-        assert "getcwd" in config
-        assert callable(config["getcwd"])
-
-
-class TestLoadConfigFromModuleNameOrFilename:
-    """Test combined loader - covers lines 63-74."""
-
-    def test_load_from_python_prefix(self):
-        """Test loading with python: prefix - covers lines 63-65."""
-        config = load_config_from_module_name_or_filename(
-            "python:os.path", keys={"join", "exists", "dirname"}
+[web_listen]
+sites = [{ host = "127.0.0.1", port = 8080 }]
+paths = []
+""",
         )
-        assert "join" in config
-        assert "exists" in config
-        assert "dirname" in config
 
-    def test_load_from_file_prefix(self):
-        """Test loading with file: prefix - covers lines 67-68."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            f.write('db_params = {"host": "test"}\n')
-            f.write("web_listen = None\n")
-            f.flush()
+        cfg = load_config_from_file(path, ["db_params", "prio_ceiling"])
 
-            try:
-                config = load_config_from_module_name_or_filename(
-                    f"file:{f.name}", keys={"db_params", "web_listen"}
-                )
-                assert config["db_params"] == {"host": "test"}
-                assert config["web_listen"] is None
-            finally:
-                Path(f.name).unlink()
+        assert cfg == {
+            "prio_ceiling": 900,
+            "db_params": {"host": "localhost", "port": 5432},
+        }
+        assert "unrelated" not in cfg
+        assert "web_listen" not in cfg  # not requested
 
-    def test_load_from_filename_no_prefix(self):
-        """Test loading without prefix - covers lines 69-70."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            f.write('setting1 = "value1"\n')
-            f.write("setting2 = 123\n")
-            f.flush()
+    def test_keys_are_matched_case_insensitively(self, tmp_path):
+        path = write(tmp_path, 'DB_PARAMS = { host = "h" }\n')
 
-            try:
-                config = load_config_from_module_name_or_filename(
-                    f.name, keys={"setting1", "setting2"}
-                )
-                assert config["setting1"] == "value1"
-                assert config["setting2"] == 123
-            finally:
-                Path(f.name).unlink()
+        cfg = load_config_from_file(path, ["db_params"])
+
+        assert cfg["db_params"] == {"host": "h"}
+
+    def test_absent_keys_are_simply_absent(self, tmp_path):
+        """TOML has no null: optional settings are omitted, and callers use
+        .get() — a missing web_listen means no web listener."""
+        path = write(tmp_path, '[db_params]\nhost = "h"\n')
+
+        cfg = load_config_from_file(path, ["db_params", "web_listen"])
+
+        assert cfg.get("web_listen") is None
 
 
-class TestLoadConfigFromFile:
-    """Test main entry point - covers line 86."""
+class TestEnvSubstitution:
+    def test_a_whole_string_env_reference_is_replaced(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PYJOBBY_TEST_SECRET", "s3cr3t")
+        path = write(
+            tmp_path,
+            '[db_params]\npassword = "${PYJOBBY_TEST_SECRET}"\nhost = "h"\n',
+        )
 
-    def test_load_config_from_file(self):
-        """Test main entry point function - covers line 86."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            f.write('db_params = {"host": "localhost", "user": "test"}\n')
-            f.write('web_listen = {"port": 9000}\n')
-            f.write('extra = "ignored"\n')
-            f.flush()
+        cfg = load_config_from_file(path, ["db_params"])
 
-            try:
-                config = load_config_from_file(f.name, keys={"db_params", "web_listen"})
-                assert "db_params" in config
-                assert "web_listen" in config
-                assert "extra" not in config  # Should be filtered out
-            finally:
-                Path(f.name).unlink()
+        assert cfg["db_params"]["password"] == "s3cr3t"
+        assert cfg["db_params"]["host"] == "h"
+
+    def test_substitution_reaches_into_arrays_and_tables(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("PYJOBBY_TEST_HOST", "10.0.0.9")
+        path = write(
+            tmp_path,
+            '[web_listen]\nsites = [{ host = "${PYJOBBY_TEST_HOST}", port = 1 }]\n',
+        )
+
+        cfg = load_config_from_file(path, ["web_listen"])
+
+        assert cfg["web_listen"]["sites"][0]["host"] == "10.0.0.9"
+
+    def test_an_unset_variable_is_a_loud_error_naming_it(
+        self, tmp_path, monkeypatch
+    ):
+        """A config that silently loads with a missing secret fails later,
+        further from the cause."""
+        monkeypatch.delenv("PYJOBBY_TEST_UNSET", raising=False)
+        path = write(
+            tmp_path, '[db_params]\npassword = "${PYJOBBY_TEST_UNSET}"\n'
+        )
+
+        with pytest.raises(ConfigError, match="PYJOBBY_TEST_UNSET"):
+            load_config_from_file(path, ["db_params"])
+
+    def test_partial_references_are_left_alone(self, tmp_path):
+        """Only a value that IS an env reference substitutes; embedded
+        "${A}:${B}" templating invites quoting bugs and is not offered."""
+        path = write(tmp_path, '[db_params]\nhost = "prefix-${NOT_A_REF}"\n')
+
+        cfg = load_config_from_file(path, ["db_params"])
+
+        assert cfg["db_params"]["host"] == "prefix-${NOT_A_REF}"
+
+
+class TestFailureModes:
+    def test_missing_file(self, tmp_path):
+        with pytest.raises(ConfigError, match="doesn't exist"):
+            load_config_from_file(str(tmp_path / "absent.toml"), ["db_params"])
+
+    def test_invalid_toml_is_a_parse_error(self, tmp_path):
+        path = write(tmp_path, "= not toml\n")
+
+        with pytest.raises(ConfigError, match="Failed to parse config file"):
+            load_config_from_file(path, ["db_params"])
+
+    def test_a_python_config_is_refused_by_name(self, tmp_path):
+        """The refusal happens BEFORE the file is even opened: an executable
+        config format is a remote-code-execution primitive wearing a
+        settings file, and the message says where to move the settings."""
+        path = write(
+            tmp_path,
+            "import os; os.system('true')  # must never run\n",
+            name="pyjobby.conf.py",
+        )
+
+        with pytest.raises(ConfigError, match="never executed"):
+            load_config_from_file(path, ["db_params"])
+
+    def test_config_errors_are_runtime_errors(self, tmp_path):
+        """Callers catching RuntimeError (every CLI entry point) keep
+        working."""
+        with pytest.raises(RuntimeError):
+            load_config_from_file(str(tmp_path / "absent.toml"), ["db_params"])

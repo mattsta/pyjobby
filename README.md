@@ -130,7 +130,7 @@ Clean, high-performance Python client with:
 ```python
 from pyjobby import JobClient
 
-async with await JobClient.from_config("./pyjobby.conf.py") as client:
+async with await JobClient.from_config("./pyjobby.toml") as client:
     # Simple job
     job_id = await client.enqueue("myapp.jobs.SendEmail", to="user@example.com")
 
@@ -194,7 +194,7 @@ pj-admin db status    # show applied vs pending migrations
 **Web Interface**: Auto-refreshing dashboard (`pj-web`)
 
 ```bash
-pj-web --config ./pyjobby.conf.py --host 127.0.0.1 --port 8081
+pj-web --config ./pyjobby.toml --host 127.0.0.1 --port 8081
 # Open http://127.0.0.1:8081
 ```
 
@@ -218,7 +218,7 @@ A live event-stream dashboard server (`pj-ws`) pushes job/queue/worker events
 over websockets as they happen:
 
 ```bash
-pj-ws --config ./pyjobby.conf.py --host 127.0.0.1 --port 8082
+pj-ws --config ./pyjobby.toml --host 127.0.0.1 --port 8082
 ```
 
 Defaults to `127.0.0.1:8082`; the websocket API is unauthenticated, so front
@@ -241,7 +241,7 @@ pj-admin schedule add daily-cleanup \
     --circuit-breaker 5
 
 # Start the schedule executor (polls every 60s by default)
-pj-scheduler --config ./pyjobby.conf.py --poll-interval 60
+pj-scheduler --config ./pyjobby.toml --poll-interval 60
 ```
 
 The scheduler is a separate process from `pj` workers: it only enqueues jobs
@@ -491,14 +491,14 @@ find nothing left to do.
 
 ```bash
 createdb pyjobby
-pj-admin --config ./pyjobby.conf.py db migrate
+pj-admin --config ./pyjobby.toml db migrate
 
 # What is applied, what is pending, and — the line that matters —
 # what objects this release needs that the database does not have
-pj-admin --config ./pyjobby.conf.py db status
+pj-admin --config ./pyjobby.toml db status
 
 # Confirm the platform agrees (exits 1 on any FAIL)
-pj-admin --config ./pyjobby.conf.py doctor
+pj-admin --config ./pyjobby.toml doctor
 ```
 
 For local development, `make setup-db` (which runs
@@ -537,30 +537,30 @@ class SendEmailJob(Job):
 
 ### 2. Configure Pyjobby
 
-```python
-# pyjobby.conf.py
-db_params = {
-    "database": "pyjobby",
-    "user": "postgres",
-    "password": "",
-    "host": "localhost",
-    "port": "5432",
-}
+```toml
+# pyjobby.toml — data, never code. Secrets: "${ENV_VAR}" values are
+# substituted from the environment at load time.
+[db_params]
+database = "pyjobby"
+user = "postgres"
+password = "${PYJOBBY_DB_PASSWORD}"
+host = "localhost"
+port = 5432
 ```
 
-(See [`sample.conf.py`](sample.conf.py) for all options, including the
-experimental `web_listen` per-worker web endpoints.)
+(See [`pyjobby.toml`](pyjobby.toml) in the repository root for the annotated
+example, including the experimental `web_listen` per-worker web endpoints.)
 
 ### 3. Start Worker
 
 ```bash
 # Start job workers (pj is a flat command: no subcommands, no positional args)
 # --workers is PER --queue: this is 4 processes, all on `default`.
-pj --config ./pyjobby.conf.py --queue default --workers 4
+pj --config ./pyjobby.toml --queue default --workers 4
 
 # Two queues, 4 workers on each = 8 processes. No worker ever lands on a
 # queue you did not name.
-pj --config ./pyjobby.conf.py --queue emails --queue billing --workers 4
+pj --config ./pyjobby.toml --queue emails --queue billing --workers 4
 ```
 
 ### 4. Enqueue Jobs
@@ -573,7 +573,7 @@ import asyncio
 
 
 async def main():
-    async with await JobClient.from_config("./pyjobby.conf.py") as client:
+    async with await JobClient.from_config("./pyjobby.toml") as client:
         job_id = await client.enqueue(
             "jobs.email.SendEmailJob",
             to="user@example.com",

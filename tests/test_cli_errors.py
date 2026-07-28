@@ -122,16 +122,29 @@ class TestConfigFile:
     async def test_valid_config_file_is_used(self, tmp_path, db_params):
         """Control case: the --config path really works, so the failures below
         are about the failure, not about a broken config loader."""
-        conf = tmp_path / "pyjobby.conf.py"
-        conf.write_text(f"db_params = {db_params!r}\n")
+        from pyjobby.procs import write_config_toml
+
+        conf = write_config_toml(tmp_path / "pyjobby.toml", db_params)
 
         result = await run_cli("--config", str(conf), "jobs", "list")
 
         assert result.exit_code == 0, result.output
         assert "No jobs found" in result.output
 
+    async def test_python_config_is_refused_by_name(self, tmp_path, db_params):
+        """A .py config is an executable-config format; the loader refuses
+        it with the migration hint rather than executing it."""
+        conf = tmp_path / "pyjobby.conf.py"
+        conf.write_text(f"db_params = {db_params!r}\n")
+
+        result = await run_cli("--config", str(conf), "jobs", "list")
+
+        assert result.exit_code == 1
+        assert "is a Python file; pyjobby config is TOML" in result.stderr
+        assert "never executed" in result.stderr
+
     async def test_missing_config_file_exits_one(self, tmp_path):
-        missing = tmp_path / "absent.conf.py"
+        missing = tmp_path / "absent.toml"
 
         result = await run_cli("--config", str(missing), "jobs", "list")
 
@@ -148,7 +161,7 @@ class TestConfigFile:
         assert "Failed to connect to database" not in result.stderr
 
     async def test_config_without_db_params_exits_one(self, tmp_path):
-        conf = tmp_path / "nodb.conf.py"
+        conf = tmp_path / "nodb.toml"
         conf.write_text("workers = 4\n")
 
         result = await run_cli("--config", str(conf), "jobs", "list")
@@ -159,23 +172,25 @@ class TestConfigFile:
         assert "Failed to connect to database" not in result.stderr
 
     async def test_config_with_empty_db_params_exits_one(self, tmp_path):
-        conf = tmp_path / "empty.conf.py"
-        conf.write_text("db_params = {}\n")
+        conf = tmp_path / "empty.toml"
+        conf.write_text("[db_params]\n")
 
         result = await run_cli("--config", str(conf), "queues", "list")
 
         assert result.exit_code == 1
         assert f"Error: No db_params found in config file: {conf}" in result.stderr
 
-    async def test_config_that_raises_on_import_exits_one(self, tmp_path):
-        conf = tmp_path / "broken.conf.py"
-        conf.write_text("raise RuntimeError('bad config')\n")
+    async def test_config_with_invalid_toml_exits_one(self, tmp_path):
+        """Config is DATA now: the failure mode is a parse error at a line,
+        never arbitrary code raising during import."""
+        conf = tmp_path / "broken.toml"
+        conf.write_text("= this is not toml\n")
 
         result = await run_cli("--config", str(conf), "jobs", "list")
 
         assert result.exit_code == 1
         assert f"Error: Could not load config file: {conf}" in result.stderr
-        assert f"Error: Failed to read config file: {conf}: bad config" in result.stderr
+        assert f"Error: Failed to parse config file {conf}:" in result.stderr
         assert (
             "Error: Use --config to point at a pyjobby conf file, or --dsn to "
             "connect directly." in result.stderr
@@ -185,8 +200,8 @@ class TestConfigFile:
     async def test_unreadable_config_file_exits_one(self, tmp_path):
         if os.geteuid() == 0:
             pytest.skip("root ignores file permissions, so 000 is still readable")
-        conf = tmp_path / "locked.conf.py"
-        conf.write_text("db_params = {}\n")
+        conf = tmp_path / "locked.toml"
+        conf.write_text("[db_params]\n")
         conf.chmod(0o000)
         try:
             result = await run_cli("--config", str(conf), "jobs", "list")
@@ -206,7 +221,7 @@ class TestConfigFile:
     async def test_dsn_overrides_a_broken_config(self, tmp_path, dsn):
         """--dsn wins, so a stale config file cannot block an emergency."""
         result = await run_cli(
-            "--config", str(tmp_path / "absent.conf.py"), "--dsn", dsn, "jobs", "list"
+            "--config", str(tmp_path / "absent.toml"), "--dsn", dsn, "jobs", "list"
         )
 
         assert result.exit_code == 0, result.output

@@ -69,7 +69,7 @@ asyncio.run(main())
 ### Using Configuration File
 
 ```python
-async with await JobClient.from_config("./pyjobby.conf.py") as client:
+async with await JobClient.from_config("./pyjobby.toml") as client:
     job_id = await client.enqueue("myapp.jobs.ProcessData", data_id=123)
 ```
 
@@ -96,7 +96,7 @@ client = await JobClient.create(
 )
 
 # Method 2: From configuration file
-client = await JobClient.from_config("./pyjobby.conf.py")
+client = await JobClient.from_config("./pyjobby.toml")
 
 # Method 3: From existing pool
 import asyncpg
@@ -613,7 +613,7 @@ pj --queue backfill --max-prio 5000            # the workers that will claim it
 ```python
 client = JobClient(pool, prio_ceiling=5000)
 # or: await JobClient.create(..., prio_ceiling=5000)
-# or: await JobClient.from_config("./pyjobby.conf.py", prio_ceiling=5000)
+# or: await JobClient.from_config("./pyjobby.toml", prio_ceiling=5000)
 # or, for one call only:
 await client.enqueue("myapp.jobs.Whenever", priority=5000, prio_ceiling=5000)
 ```
@@ -808,7 +808,7 @@ scripts and cron jobs — every method above exists on it under the same name
 the config file a script already has. Machines come back as `SyncMachine`:
 
 ```python
-with SyncJobClient.from_config("./pyjobby.conf.py") as client:
+with SyncJobClient.from_config("./pyjobby.toml") as client:
     order = client.start_machine(Order)
     order.send("paid", amount=100)
     order.wait_for_state("shipped", timeout=600)
@@ -1129,7 +1129,7 @@ class OrderProcessor:
 
 # Usage
 async def main():
-    async with await JobClient.from_config("./pyjobby.conf.py") as client:
+    async with await JobClient.from_config("./pyjobby.toml") as client:
         processor = OrderProcessor(client)
 
         # Process new order

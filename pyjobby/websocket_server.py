@@ -1296,7 +1296,7 @@ def main() -> None:
     @click.option(
         "--config",
         "-c",
-        default="./pyjobby.conf.py",
+        default="./pyjobby.toml",
         show_default=True,
         help="Config file path (must define db_params; may define "
         "prio_ceiling) — the same -c/--config every other pyjobby daemon "

@@ -126,33 +126,33 @@ those tables, verify the settings survived.
 
 Every process reaches the database one of two ways.
 
-**A config file** — a Python module defining `db_params`:
+**A config file** — a TOML file defining `db_params`:
 
-```python
-# /etc/pyjobby/pyjobby.conf.py
-import os
-
-db_params = {
-    "database": "pyjobby",
-    "user": "pyjobby",
-    "password": os.environ["PYJOBBY_DB_PASSWORD"],
-    "host": "postgres.internal",  # or a directory for a unix socket
-    "port": 5432,
-    "command_timeout": 60,  # optional
-}
-```
-
-It is executed as Python, so secrets can be read from the environment, a
-mounted file, or a secrets manager at load time.
-
-The file may also define `prio_ceiling` (an int): the worker fleet's
-priority ceiling, read by `pj`, `pj-scheduler`, `pj-web` and `pj-ws` when
-their `--max-prio` flag is not given — one declaration instead of the same
-number repeated on four command lines. An explicit flag always wins.
-
-```python
+```toml
+# /etc/pyjobby/pyjobby.toml
 prio_ceiling = 1000  # must match what your `pj` workers claim under
+
+[db_params]
+database = "pyjobby"
+user = "pyjobby"
+password = "${PYJOBBY_DB_PASSWORD}"
+host = "postgres.internal"   # or a directory for a unix socket
+port = 5432
+command_timeout = 60         # optional
 ```
+
+The file is **data, never code**: it is parsed with the standard library's
+`tomllib` and nothing in it can execute. Secrets come from the environment
+explicitly — any string value of the exact form `"${VAR_NAME}"` is replaced
+with that environment variable at load time, and a reference to an unset
+variable is a loud startup error naming the variable. (A `.py` config is
+refused by name: an executable config format means every daemon runs
+arbitrary code from whatever path it is pointed at.)
+
+`prio_ceiling` (an int) is the worker fleet's priority ceiling, read by
+`pj`, `pj-scheduler`, `pj-web` and `pj-ws` when their `--max-prio` flag is
+not given — one declaration instead of the same number repeated on four
+command lines. An explicit flag always wins.
 
 `db_params` is **`asyncpg.connect()` keyword arguments**, and only those.
 Do not put `min_size` or `max_size` in it: workers, the scheduler,
@@ -172,10 +172,10 @@ your deployment:
 
 | Process | Config file | `--dsn` / `PYJOBBY_DSN` |
 |---|---|---|
-| `pj` | `-c`, default `./pyjobby.conf.py` | no |
-| `pj-scheduler` | `-c`, default `./pyjobby.conf.py` | no |
-| `pj-web` | positional argument | no |
-| `pj-ws` | positional argument | no |
+| `pj` | `-c`, default `./pyjobby.toml` | no |
+| `pj-scheduler` | `-c`, default `./pyjobby.toml` | no |
+| `pj-web` | `-c/--config`, default `./pyjobby.toml` | no |
+| `pj-ws` | `-c/--config`, default `./pyjobby.toml` | no |
 | `pj-monitor` | `--config` | yes |
 | `pj-admin` | `-c/--config` | yes (wins over `--config`) |
 | `pj-bench` | `-c/--config` | yes (wins over `--config`) |
@@ -188,9 +188,9 @@ configuration, so a supervisor's restart-on-failure and a deploy script's
 `set -e` both work:
 
 ```console
-$ pj-admin -c /nonexistent.conf.py doctor
-Error: Could not load config file: /nonexistent.conf.py
-Error: '/nonexistent.conf.py' doesn't exist
+$ pj-admin -c /nonexistent.toml doctor
+Error: Could not load config file: /nonexistent.toml
+Error: '/nonexistent.toml' doesn't exist
 Error: Use --config to point at a pyjobby conf file, or --dsn to connect directly.
 FAIL config: unusable
 $ echo $?
@@ -226,7 +226,7 @@ it survives. `pj-monitor` is the backstop for the rest, and it is a single
 process for the whole install — not one per host.
 
 ```console
-$ pj-monitor --config /etc/pyjobby/pyjobby.conf.py
+$ pj-monitor --config /etc/pyjobby/pyjobby.toml
 Starting monitor (check every 10.0s)...
 DSN: localhost:5432/pyjobby
 Retention: jobs older than 30.0d, checkpoints 1.0d after the job terminates
@@ -271,7 +271,7 @@ Falling behind is reported at WARNING; see
 ### Worker settings
 
 ```bash
-pj --config /etc/pyjobby/pyjobby.conf.py \
+pj --config /etc/pyjobby/pyjobby.toml \
    --queue reports --workers 4 \
    --max-retries 10 --default-timeout 3600 --job-threads 8
 ```
@@ -365,7 +365,7 @@ WorkingDirectory=/opt/pyjobby
 Environment="PYTHONPATH=/opt/pyjobby"
 # %i is the queue name: `systemctl start pyjobby-worker@reports`
 ExecStart=/opt/pyjobby/.venv/bin/pj \
-    --config /etc/pyjobby/pyjobby.conf.py \
+    --config /etc/pyjobby/pyjobby.toml \
     --queue %i --workers 4
 Restart=always
 RestartSec=10s
@@ -385,7 +385,7 @@ After=network.target
 Type=simple
 User=pyjobby
 ExecStart=/opt/pyjobby/.venv/bin/pj-monitor \
-    --config /etc/pyjobby/pyjobby.conf.py \
+    --config /etc/pyjobby/pyjobby.toml \
     --retention-days 30 --checkpoint-retention-days 1
 Restart=always
 RestartSec=10s
@@ -421,7 +421,7 @@ RUN pip install --no-cache-dir git+https://github.com/mattsta/pyjobby.git#main
 COPY job/ /app/job/
 USER pyjobby
 
-CMD ["pj", "--config", "/etc/pyjobby/pyjobby.conf.py"]
+CMD ["pj", "--config", "/etc/pyjobby/pyjobby.toml"]
 ```
 
 The image needs your job classes on the import path and a config file
@@ -458,8 +458,8 @@ services:
     build: .
     depends_on: [migrate]
     volumes:
-      - ./pyjobby.conf.py:/etc/pyjobby/pyjobby.conf.py:ro
-    command: ["pj", "--config", "/etc/pyjobby/pyjobby.conf.py",
+      - ./pyjobby.toml:/etc/pyjobby/pyjobby.toml:ro
+    command: ["pj", "--config", "/etc/pyjobby/pyjobby.toml",
               "--queue", "default", "--queue", "default",
               "--queue", "default", "--queue", "default", "--workers", "4"]
     restart: always
@@ -530,7 +530,7 @@ spec:
       containers:
         - name: worker
           image: myregistry/pyjobby:latest
-          command: ["pj", "--config", "/etc/pyjobby/pyjobby.conf.py",
+          command: ["pj", "--config", "/etc/pyjobby/pyjobby.toml",
                     "--queue", "default", "--queue", "default",
                     "--queue", "default", "--queue", "default",
                     "--workers", "4"]

@@ -14,7 +14,7 @@ Features:
 - Async context manager support
 
 Example:
-    async with await JobClient.from_config('./pyjobby.conf.py') as client:
+    async with await JobClient.from_config('./pyjobby.toml') as client:
         # Simple job
         job_id = await client.enqueue('myapp.jobs.SendEmail', to='user@example.com')
 
@@ -510,7 +510,7 @@ class JobClient:
 
     Usage:
         # Context manager (recommended)
-        async with await JobClient.from_config('./pyjobby.conf.py') as client:
+        async with await JobClient.from_config('./pyjobby.toml') as client:
             job_id = await client.enqueue('MyJob', arg=123)
 
         # Manual lifecycle
@@ -638,7 +638,7 @@ class JobClient:
         Create client from pyjobby config file.
 
         Args:
-            config_path: Path to pyjobby.conf.py
+            config_path: Path to pyjobby.toml
             min_size: Minimum pool size (default: 5)
             max_size: Maximum pool size (default: 20)
             prio_ceiling: this fleet's worker priority ceiling
@@ -649,7 +649,7 @@ class JobClient:
             JobClient instance
 
         Example:
-            client = await JobClient.from_config('./pyjobby.conf.py')
+            client = await JobClient.from_config('./pyjobby.toml')
         """
         from .configloader import load_config_from_file
 
@@ -2753,7 +2753,7 @@ class SyncJobClient:
         max_size: int = 4,
         prio_ceiling: int = DEFAULT_PRIO_CEILING,
     ) -> SyncJobClient:
-        """Build from a pyjobby.conf.py, like JobClient.from_config() —
+        """Build from a pyjobby.toml, like JobClient.from_config() —
         scripts and cron jobs are exactly where a config file lives."""
         from .configloader import load_config_from_file
 

@@ -142,7 +142,7 @@ nothing here is simulated:
   That is the failure the monitor's dead-worker sweep exists for. Returns -9.
 - `age_worker_heartbeats` / `age_claim` — backdate the registry or a claim so
   a test reaches the monitor's grace period without sleeping through it.
-- `write_worker_config(tmp_path, db_params)` — a `pyjobby.conf.py` the real
+- `write_worker_config(tmp_path, db_params)` — a `pyjobby.toml` the real
   `pj` launcher will read.
 
 **The side-effect ledger** is the other half. Proving that a step "did not

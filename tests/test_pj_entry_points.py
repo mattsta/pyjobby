@@ -22,10 +22,8 @@ from pyjobby.pj import STMTS, JobSystem, workit
 from .conftest import wait_for_job_state
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-# stays a str: it is passed straight into argv lists and into
-# load_config_from_file(), whose "python:"/"file:" prefix handling is string
-# surgery on the value it is given
-CONFIG_PATH = str(REPO_ROOT / "pyjobby.conf.py")
+# stays a str: it is passed straight into argv lists
+CONFIG_PATH = str(REPO_ROOT / "pyjobby.toml")
 
 
 def run_workit_briefly(args: list[str], cwd: Path, timeout: float = 2) -> bool:
@@ -190,7 +188,7 @@ class TestWorkitCLI:
         # Run with a non-existent config to trigger early exit
         # This still validates the option parsing
         result = runner.invoke(
-            workit, ["--config", "/nonexistent/nonexistent_pyjobby.conf.py"]
+            workit, ["--config", "/nonexistent/nonexistent_pyjobby.toml"]
         )
 
         # Should fail due to missing config, but options should parse

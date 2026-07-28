@@ -445,9 +445,7 @@ class TestDaemonsShutDownCleanly:
         assert proc.returncode == 0
 
     async def test_pj_ws_exits_zero_on_sigterm(self, dsn, tmp_path):
-        config = tmp_path / "conf.py"
-        params = dsn_from_parts(dsn)
-        config.write_text(f"db_params = {params!r}\n")
+        config = write_config(tmp_path, dsn)
         port = await free_port()
         proc = spawn("pj-ws", "--config", str(config), "--port", str(port))
         try:
@@ -462,18 +460,6 @@ class TestDaemonsShutDownCleanly:
         assert proc.returncode == 0
 
 
-def dsn_from_parts(dsn: str) -> dict[str, object]:
-    """asyncpg-style params from a DSN, for writing a config file."""
-    from urllib.parse import urlparse
-
-    parts = urlparse(dsn)
-    return {
-        "host": parts.hostname,
-        "port": parts.port or 5432,
-        "user": parts.username,
-        "password": parts.password,
-        "database": parts.path.lstrip("/"),
-    }
 
 
 class TestMonitorEntryPoint:
@@ -769,22 +755,22 @@ class TestMigrateEntryPoint:
 
 
 def write_config(tmp_path, dsn: str) -> object:
-    """Write a pyjobby.conf.py pointing at `dsn` and return its path."""
+    """Write a pyjobby.toml pointing at `dsn` and return its path."""
     from urllib.parse import unquote, urlparse
 
+    from pyjobby.procs import write_config_toml
+
     p = urlparse(dsn)
-    config = tmp_path / "pyjobby.conf.py"
-    config.write_text(
-        "db_params = {\n"
-        f"    'host': {p.hostname!r},\n"
-        f"    'port': {p.port or 5432!r},\n"
-        f"    'user': {unquote(p.username or '')!r},\n"
-        f"    'password': {unquote(p.password or '')!r},\n"
-        f"    'database': {(p.path or '').lstrip('/')!r},\n"
-        "}\n"
-        "web_listen = None\n"
+    return write_config_toml(
+        tmp_path / "pyjobby.toml",
+        {
+            "host": p.hostname,
+            "port": p.port or 5432,
+            "user": unquote(p.username or ""),
+            "password": unquote(p.password or ""),
+            "database": (p.path or "").lstrip("/"),
+        },
     )
-    return config
 
 
 async def run_to_completion(*args: str, timeout: float = 30):

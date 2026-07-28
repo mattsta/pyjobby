@@ -7,11 +7,11 @@ wrong. The executable version of the health section is `pj-admin doctor`.
 
 | Process | Command | Count | Purpose |
 |---|---|---|---|
-| Workers | `pj --config ./pyjobby.conf.py --queue Q --workers N` | N processes **per named queue**, per host | claim + execute jobs |
-| Monitor | `pj-monitor --config ./pyjobby.conf.py` | 1 (more are safe) | timeout enforcement, dead-worker reclaim, stranded-waiter recovery |
-| Scheduler | `pj-scheduler --config ./pyjobby.conf.py` | 1 (more are safe) | fires cron schedules |
-| Web admin | `pj-web --config ./pyjobby.conf.py --host 127.0.0.1 --port 8081` | optional | HTML admin + `/metrics` |
-| Websocket | `pj-ws --config ./pyjobby.conf.py --port 8082` | optional | realtime dashboard feed |
+| Workers | `pj --config ./pyjobby.toml --queue Q --workers N` | N processes **per named queue**, per host | claim + execute jobs |
+| Monitor | `pj-monitor --config ./pyjobby.toml` | 1 (more are safe) | timeout enforcement, dead-worker reclaim, stranded-waiter recovery |
+| Scheduler | `pj-scheduler --config ./pyjobby.toml` | 1 (more are safe) | fires cron schedules |
+| Web admin | `pj-web --config ./pyjobby.toml --host 127.0.0.1 --port 8081` | optional | HTML admin + `/metrics` |
+| Websocket | `pj-ws --config ./pyjobby.toml --port 8082` | optional | realtime dashboard feed |
 
 `--workers N` is **per queue**, and a worker is never started on a queue you
 did not name:
@@ -252,7 +252,7 @@ that happening quietly:
   places:
 
   ```bash
-  pj --config ./pyjobby.conf.py --queue backfill --max-prio 5000
+  pj --config ./pyjobby.toml --queue backfill --max-prio 5000
   ```
   ```python
   client = JobClient(

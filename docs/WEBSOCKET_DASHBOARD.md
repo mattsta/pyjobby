@@ -94,13 +94,13 @@ Python WebSocket server using aiohttp and asyncpg:
 **Start**:
 
 ```bash
-python -m pyjobby.websocket_server ./pyjobby.conf.py --port 8082
+python -m pyjobby.websocket_server ./pyjobby.toml --port 8082
 ```
 
 Or with custom host:
 
 ```bash
-python -m pyjobby.websocket_server ./pyjobby.conf.py --host 0.0.0.0 --port 8082
+python -m pyjobby.websocket_server ./pyjobby.toml --host 0.0.0.0 --port 8082
 ```
 
 ### 3. Live Dashboard (`frontend/live-dashboard.html`)
@@ -131,7 +131,7 @@ open frontend/live-dashboard.html
 ### Step 1: Create the Schema
 
 ```bash
-pj-admin --config ./pyjobby.conf.py db migrate
+pj-admin --config ./pyjobby.toml db migrate
 ```
 
 The notification triggers this server relies on ship in
@@ -140,7 +140,7 @@ The notification triggers this server relies on ship in
 ### Step 2: Start WebSocket Server
 
 ```bash
-pj-ws --config ./pyjobby.conf.py --snapshot-interval 1.0
+pj-ws --config ./pyjobby.toml --snapshot-interval 1.0
 ```
 
 You should see:
@@ -164,7 +164,7 @@ import asyncio
 
 
 async def test_live_updates():
-    async with await JobClient.from_config("./pyjobby.conf.py") as client:
+    async with await JobClient.from_config("./pyjobby.toml") as client:
         # Enqueue jobs - watch them appear in dashboard!
         for i in range(10):
             await client.enqueue("test.DemoJob", task_id=i, queue="default")
@@ -548,7 +548,7 @@ After=network.target postgresql.service
 Type=simple
 User=pyjobby
 WorkingDirectory=/opt/pyjobby
-ExecStart=/usr/bin/python3 -m pyjobby.websocket_server /opt/pyjobby/pyjobby.conf.py --host 0.0.0.0 --port 8082
+ExecStart=/usr/bin/python3 -m pyjobby.websocket_server /opt/pyjobby/pyjobby.toml --host 0.0.0.0 --port 8082
 Restart=always
 RestartSec=5
 

@@ -265,7 +265,7 @@ async def get_connection(
 
 
 @click.group(cls=PyjobbyCLI)
-@click.option("--config", "-c", default="./pyjobby.conf.py", help="Config file path")
+@click.option("--config", "-c", default="./pyjobby.toml", help="Config file path")
 @click.option(
     "--dsn",
     envvar="PYJOBBY_DSN",

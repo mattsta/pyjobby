@@ -173,7 +173,7 @@ class TestDoctorDatabaseReachability:
         Blaming the database for an unreadable config file sends the operator
         to debug the wrong system, so the check line names config and the
         reason names the file and points at --config/--dsn."""
-        missing = tmp_path / "absent.conf.py"
+        missing = tmp_path / "absent.toml"
 
         def _invoke():
             return CliRunner().invoke(cli, ["--config", str(missing), "doctor"])

@@ -80,7 +80,7 @@ below is a file you can open.
     source, commented end to end, including the measurements behind the
     indexes and autovacuum settings.
 
-Configuration is not a separate document: `sample.conf.py` in the
+Configuration is not a separate document: `pyjobby.toml` in the
 repository root is the annotated example, and
 [deployment-guide.md § Configuration](deployment-guide.md#configuration)
 covers which process reads what.
@@ -96,32 +96,32 @@ covers which process reads what.
 - `pyjobby/migrations.py` - the runner, plus the required-shape manifest `pj-admin doctor` checks a database against
 - `pyjobby/dxe.py` - Durable Execution Engine semantics and SQL
 - `pyjobby/monitor.py` - the reaper (timeouts, dead-worker reclaim, retention)
-- `sample.conf.py` - Example configuration
+- `pyjobby.toml` - Example configuration (TOML, read as data — never executed)
 
 ### Common Commands
 
 ```bash
 # Install or upgrade the database schema (fresh install, or pending migrations)
-pj-admin db migrate --config ./pyjobby.conf.py
-pj-admin db status --config ./pyjobby.conf.py
+pj-admin db migrate --config ./pyjobby.toml
+pj-admin db status --config ./pyjobby.toml
 
 # Is the platform healthy? (exits 1 on any FAIL, so it works as a CI gate)
 pj-admin --dsn "$PYJOBBY_DSN" doctor
 
 # Start workers: --workers is PER --queue, so this is 4 processes on `default`
-pj --queue default --workers 4 --config ./pyjobby.conf.py
+pj --queue default --workers 4 --config ./pyjobby.toml
 
 # Start the reaper: timeouts, dead-worker reclaim, retention. NOT optional.
-pj-monitor --config ./pyjobby.conf.py
+pj-monitor --config ./pyjobby.toml
 
 # Start the recurring (cron) schedule executor
-pj-scheduler --config ./pyjobby.conf.py
+pj-scheduler --config ./pyjobby.toml
 
 # Start the web admin UI (localhost:8081, no auth)
-pj-web --config ./pyjobby.conf.py
+pj-web --config ./pyjobby.toml
 
 # Start the realtime websocket dashboard server (localhost:8082)
-pj-ws --config ./pyjobby.conf.py
+pj-ws --config ./pyjobby.toml
 
 # View help
 pj --help
@@ -137,7 +137,7 @@ from pyjobby import JobClient
 
 
 async def submit_job(job_class: str, **kwargs):
-    async with await JobClient.from_config("./pyjobby.conf.py") as client:
+    async with await JobClient.from_config("./pyjobby.toml") as client:
         return await client.enqueue(job_class, queue="default", **kwargs)
 ```
 

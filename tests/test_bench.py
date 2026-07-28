@@ -1193,4 +1193,4 @@ class TestTargetResolution:
 
     def test_a_missing_config_is_a_config_problem_not_a_database_problem(self):
         with pytest.raises(bench.ConfigProblem):
-            bench.resolve_target("/nonexistent/pyjobby.conf.py", None)
+            bench.resolve_target("/nonexistent/pyjobby.toml", None)

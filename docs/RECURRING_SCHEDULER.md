@@ -30,8 +30,8 @@ seconds *at the end*, not the Quartz seconds-first layout) and
 ## Running it
 
 ```bash
-pj-scheduler --config ./pyjobby.conf.py          # polls every 60s
-pj-scheduler --config ./pyjobby.conf.py --poll-interval 15
+pj-scheduler --config ./pyjobby.toml          # polls every 60s
+pj-scheduler --config ./pyjobby.toml --poll-interval 15
 ```
 
 The config file need only define `db_params`. It is a separate process from

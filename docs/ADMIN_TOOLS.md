@@ -20,7 +20,7 @@ run against a live database; the outputs are real.
 ```bash
 pj-admin --dsn postgresql://user:pass@host:5432/pyjobby doctor
 export PYJOBBY_DSN=postgresql://user:pass@host:5432/pyjobby   # same thing
-pj-admin -c /etc/pyjobby/pyjobby.conf.py doctor               # config file
+pj-admin -c /etc/pyjobby/pyjobby.toml doctor               # config file
 ```
 
 ```console
@@ -640,7 +640,7 @@ measured over the window and comparable across window sizes; **levels**
 ## `pj-web` — the HTML admin
 
 ```bash
-pj-web --config /etc/pyjobby/pyjobby.conf.py --host 127.0.0.1 --port 8081
+pj-web --config /etc/pyjobby/pyjobby.toml --host 127.0.0.1 --port 8081
 ```
 
 It takes a config file positionally; it does not read `PYJOBBY_DSN`.

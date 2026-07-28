@@ -543,9 +543,9 @@ class TestSyncFacadeParity:
         """Scripts and cron jobs are exactly where a config file lives, and
         the sync facade is the class built for them."""
         from pyjobby.client import SyncJobClient
+        from pyjobby.procs import write_config_toml
 
-        config = tmp_path / "pyjobby.conf.py"
-        config.write_text(f"db_params = {db_params!r}\n")
+        config = write_config_toml(tmp_path / "pyjobby.toml", db_params)
 
         def _drive() -> bool:
             with SyncJobClient.from_config(str(config)) as client:

@@ -77,7 +77,7 @@ running, and epoch-only-guarded writes — checkpoints, events, mailbox sends �
 must stop applying the moment the row leaves its attempt, not at the next
 claim.
 
-Run it: ``pj-monitor --config ./pyjobby.conf.py`` (one instance is enough;
+Run it: ``pj-monitor --config ./pyjobby.toml`` (one instance is enough;
 several are safe — every sweep is a single atomic statement or a
 transaction holding its row locks).
 """
@@ -1314,7 +1314,7 @@ def cli() -> None:
         help="PostgreSQL DSN (or use PYJOBBY_DSN env var)",
     )
     @click.option(
-        "--config", type=click.Path(exists=True), help="Path to pyjobby.conf.py"
+        "--config", type=click.Path(exists=True), help="Path to pyjobby.toml"
     )
     @click.option(
         "--check-interval", default=10.0, show_default=True, help="Sweep interval (s)"

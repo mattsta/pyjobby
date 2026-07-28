@@ -75,9 +75,9 @@ Every entry point exits non-zero when it cannot resolve or load its
 configuration, and says which of the two failed:
 
 ```console
-$ pj-admin -c /nonexistent.conf.py doctor
-Error: Could not load config file: /nonexistent.conf.py
-Error: '/nonexistent.conf.py' doesn't exist
+$ pj-admin -c /nonexistent.toml doctor
+Error: Could not load config file: /nonexistent.toml
+Error: '/nonexistent.toml' doesn't exist
 Error: Use --config to point at a pyjobby conf file, or --dsn to connect directly.
 FAIL config: unusable
 ```

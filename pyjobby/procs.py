@@ -69,6 +69,34 @@ def script_path(name: str) -> Path:
     return executable
 
 
+def write_config_toml(
+    path: Path, db_params: dict[str, object], **extra: object
+) -> Path:
+    """Write a pyjobby.toml holding ``db_params`` (plus optional scalar
+    ``extra`` keys like prio_ceiling) and return its path.
+
+    One writer for every harness that spawns real daemons (tests and
+    pj-bench e2e), because hand-formatted config strings copied per file
+    are how the last format's writers drifted. Values are TOML basic
+    strings/ints only — exactly what connection parameters are.
+    """
+
+    def _v(value: object) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, int | float):
+            return str(value)
+        escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+
+    lines = [f"{k} = {_v(v)}" for k, v in extra.items()]
+    lines.append("")
+    lines.append("[db_params]")
+    lines.extend(f"{k} = {_v(v)}" for k, v in db_params.items() if v is not None)
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
 def spawn(
     *args: str,
     env: dict[str, str] | None = None,

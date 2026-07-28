@@ -206,17 +206,15 @@ def sigkill_group(proc: subprocess.Popen[bytes], grace: float = 10.0) -> int:
 
 
 def write_worker_config(tmp_path: Path, db_params: dict[str, Any]) -> Path:
-    """Write a pyjobby.conf.py for the real ``pj`` launcher and return it."""
-    config = tmp_path / "pyjobby.conf.py"
-    config.write_text(
-        "db_params = {\n"
-        f"    'host': {db_params['host']!r},\n"
-        f"    'port': {db_params['port']!r},\n"
-        f"    'user': {db_params['user']!r},\n"
-        f"    'password': {db_params['password']!r},\n"
-        f"    'database': {db_params['database']!r},\n"
-        "}\n"
-        "web_listen = None\n"
+    """Write a pyjobby.toml for the real ``pj`` launcher and return it."""
+    from pyjobby.procs import write_config_toml
+
+    config = write_config_toml(
+        tmp_path / "pyjobby.toml",
+        {
+            k: db_params[k]
+            for k in ("host", "port", "user", "password", "database")
+        },
     )
     return config
 

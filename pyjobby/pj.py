@@ -2245,7 +2245,7 @@ def runAndDone(
 @click.option(
     "--config",
     "-c",
-    default="./pyjobby.conf.py",
+    default="./pyjobby.toml",
     help="config file path",
     show_default=True,
 )
@@ -2295,6 +2295,10 @@ def workit(
     if max_prio is None:
         max_prio = loadedConfig.get("prio_ceiling") or DEFAULT_PRIO_CEILING
 
+    if not loadedConfig.get("db_params"):
+        logger.error("No db_params found in config: {}", config)
+        sys.exit(1)
+
     # One full set of workers per DISTINCT named queue. Duplicates collapse
     # (asking for the same queue twice asks for the same set twice), which
     # also means `--queue Q --queue Q --workers 2` is two workers on Q
@@ -2331,7 +2335,9 @@ def workit(
                 tuple(lcap),
                 idx,
                 loadedConfig["db_params"],
-                loadedConfig["web_listen"],
+                # absent key = no web listener (TOML has no null; the loader
+                # simply omits keys the file does not define)
+                loadedConfig.get("web_listen"),
             ),
             kwargs={
                 "max_retries": max_retries,
