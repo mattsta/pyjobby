@@ -78,8 +78,8 @@ So `1` means "I tried and could not", `2` means "I did not try". An empty
 show` for a queue with no jobs and no control row, exit 0.
 
 Machine-readable output is `--json`, available on `jobs list`, `jobs
-inspect`, `jobs history`, `jobs steps`, `jobs retry-stats`, `jobs
-timeout-stats`, `queues list`, `queues show`, `queues stats`, `workers
+inspect`, `jobs why`, `jobs history`, `jobs steps`, `jobs retry-stats`,
+`jobs timeout-stats`, `queues list`, `queues show`, `queues stats`, `workers
 list`, `workers stats`, `dlq list`, `metrics`, `schedule list`, `schedule
 show`, `schedule history`, `schedule stats`, `dag list`, `dag show`, `dag
 visualize`, `doctor` and `db status`.
@@ -263,6 +263,7 @@ Commands:
   set-priority   Change a queued or waiting job's priority.
   steps          Show a job's DXE step checkpoints
   timeout-stats  Show timeout statistics (from jorb.timeout_at/state)
+  why            Explain, in one command, why a job is not running
 ```
 
 ### Finding jobs
@@ -343,6 +344,135 @@ No step checkpoints for job 48148
 
 `steps` shows the DXE checkpoints of a durable job — what completed, so
 what a resume will skip. See [DXE.md](DXE.md).
+
+### Why is this job not running?
+
+`jobs why ID` answers it in one command. The answers come from the claim
+path itself — `claim_jorb()`, the function every worker calls — so they
+are exactly the ways a job can fail to be claimed, with the numbers behind
+each one.
+
+```console
+$ pj-admin jobs why 48821
+
+Job 48821: above_worker_ceiling
+queued  reports  myapp.jobs.NightlyRollup  prio 5000
+--------------------------------------------------
+This job's prio is 5000, above the ceiling of EVERY live worker on 'reports' (highest is 1000) — claim_jorb admits only prio <= the claiming worker's --max-prio, so every one of the 1 live worker(s) is blind to it. Lower the job (`pj-admin jobs set-priority`) or run a worker with a higher --max-prio. Remember lower prio = more urgent.
+
+    prio:                            5000
+    max_live_ceiling:                1000
+    live_workers:                    1
+    workers_at_or_above_prio:        0
+```
+
+That one is the reason the verb exists: the row is healthy, the fleet is
+healthy, and every live worker is blind to it. Nothing fails, so nothing
+reaches the DLQ. It is answerable at all because a worker publishes its
+ceiling (`jorb_worker.max_prio`) when it registers, next to its
+capabilities.
+
+```console
+$ pj-admin jobs why 48822
+
+Job 48822: capability_unmet
+queued  reports  myapp.jobs.RenderVideo  prio 100  cap gpu
+--------------------------------------------------
+This job requires capability 'gpu' and none of the 1 live worker(s) on 'reports' advertises it (they advertise: cpu). Start a worker with `pj --queue reports --cap gpu`.
+
+    capability:                      gpu
+    live_workers:                    1
+    workers_with_capability:         0
+    advertised_capabilities:         cpu
+
+$ pj-admin jobs why 48831
+
+Job 48831: waiting_on_job
+waiting  reports  myapp.jobs.Load  prio 100
+--------------------------------------------------
+Waiting on job 48830 — that job is crashed, and the wake fires only on 'finished', so this one will never start on its own.
+
+    blocking_job_id:                 48830
+    blocking_job_state:              crashed
+    blocking_job_class:              myapp.jobs.Extract
+    waiting_seconds:                 46.892624
+
+$ pj-admin jobs why 48842
+
+Job 48842: claimable
+queued  reports  myapp.jobs.Email  prio 100
+--------------------------------------------------
+Nothing is blocking it: this job is claimable RIGHT NOW on 'reports' (1 live worker(s)), and 3 claimable job(s) sort ahead of it. If it is still sitting here, the fleet is behind — check `pj-admin metrics` and `pj-admin doctor`.
+
+    queue:                           reports
+    live_workers:                    1
+    jobs_ahead:                      3
+    jobs_ahead_capped:               False
+    queue_serialised:                False
+```
+
+The `reason` is a stable machine-readable code; the summary and the
+indented block below it are the same answer for a human. Every reason:
+
+| Reason | What it means |
+| --- | --- |
+| `finished` / `crashed` / `cancelled` | Terminal. `crashed` carries the error; both it and `cancelled` name `jobs retry`. |
+| `claimed` / `running` | A worker has it — which one (host, pid), since when, its deadline, and **whether that worker is still heartbeating**. |
+| `waiting_on_job` | Parked on job N, with N's state. Both dependency wakes fire only on `finished`, so a crashed or missing upstream is reported as never-waking. |
+| `waiting_on_group` | Parked on a group, with the count of members not yet finished. |
+| `waiting_unblocked` | `waiting` with no dependency recorded: nothing anywhere can wake it. |
+| `deferred` | `run_after` is in the future, and by how long. Retry backoff, `enqueue_at` and durable sleep all look like this, and none of them is a fault. |
+| `queue_paused` | The queue is paused; claims stop before any row is looked at. |
+| `no_live_workers` | Nothing is on that queue — read the queue, not the fleet total. |
+| `above_worker_ceiling` | The job's `prio` is above every live worker's `--max-prio`. |
+| `capability_unmet` | No live worker on the queue advertises the capability, and the answer names what they *do* advertise. |
+| `queue_at_max_concurrency` | In-flight count against the cap. |
+| `rate_limited` | Admissions in the window against the limit. |
+| `claimable` | Nothing declines it: how many claimable jobs sort ahead of it in claim order (`prio`, then `run_after`). |
+
+`--json` emits the whole structure, which is what a monitoring script
+wants — `reason` is the field to branch on:
+
+```console
+$ pj-admin jobs why 48821 --json
+{
+  "job_id": 48821,
+  "state": "queued",
+  "queue": "reports",
+  "job_class": "myapp.jobs.NightlyRollup",
+  "prio": 5000,
+  "capability": null,
+  "run_after": "2026-07-28T23:25:02.825604+00:00",
+  "created": "2026-07-28T23:25:02.825604+00:00",
+  "updated": "2026-07-28T23:25:02.825604+00:00",
+  "reason": "above_worker_ceiling",
+  "summary": "This job's prio is 5000, above the ceiling of EVERY live worker on 'reports' ...",
+  "details": {
+    "prio": 5000,
+    "max_live_ceiling": 1000,
+    "live_workers": 1,
+    "workers_at_or_above_prio": 0
+  }
+}
+
+$ pj-admin jobs why 99999
+Error: Job 99999 not found
+$ echo $?
+1
+```
+
+Two ways `claim_jorb` declines that are deliberately **not** reasons: a
+claimer losing the 50 ms queue lock, and `SKIP LOCKED` passing over a row
+another claimer holds. Both mean the queue is being drained by somebody
+else this millisecond, not that this job is blocked — so a claimable job on
+a queue with a concurrency cap or rate limit reports `queue_serialised:
+True` instead, which is why it can take a poll longer than one on an
+uncontrolled queue.
+
+Every query behind the verb is bounded (a primary-key lookup, an aggregate,
+or a `LIMIT`), and all of them use indexes the schema already keeps — it is
+safe to run against a table with hundreds of millions of rows, and safe to
+run from a monitoring loop.
 
 ### Acting on jobs
 

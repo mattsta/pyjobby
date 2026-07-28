@@ -128,6 +128,7 @@ def run_worker_process(
             worker.pid,
             queue,
             list(worker.capabilities),
+            worker.prio,
             __version__,
             worker.job_threads,
         )

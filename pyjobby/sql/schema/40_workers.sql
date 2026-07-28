@@ -7,6 +7,8 @@ CREATE TABLE jorb_worker (
     pid          INTEGER     NOT NULL,
     queue        TEXT        NOT NULL,
     capabilities TEXT[]      NOT NULL DEFAULT '{}',
+    -- the OTHER half of what this worker will claim (see COMMENT below)
+    max_prio     INTEGER     NOT NULL DEFAULT 1000,
     version      TEXT,
     started      TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -39,6 +41,7 @@ CREATE INDEX jorb_worker_idle_idx ON jorb_worker (queue)
     WHERE idle AND shutdown_at IS NULL;
 
 COMMENT ON TABLE jorb_worker IS 'One row per worker process; heartbeats update last_seen. A live worker = shutdown_at IS NULL and recent last_seen.';
+COMMENT ON COLUMN jorb_worker.max_prio IS 'This worker''s priority CEILING (`pj --max-prio`, default 1000): claim_jorb() admits it only jobs with prio <= this, so everything above it is invisible to this worker. Recorded for the same reason capabilities are -- the two columns together are the whole of what this worker will accept, and a job the fleet cannot claim is otherwise SILENT: it stays queued forever, never fails, never reaches the DLQ, and no query could answer "is this job above every live worker''s ceiling?" because the ceiling existed only in each worker''s own process. Written once at registration and never rewritten: the ceiling is a startup constant, so the heartbeat has nothing to say about it (a worker started with a new ceiling is a new process and therefore a new row). `pj-admin jobs why` reads MAX(max_prio) over the live workers on a queue; without this column that reason code could not exist.';
 COMMENT ON COLUMN jorb_worker.idle IS 'This worker found nothing to claim and is now parked on the jorb_enqueued wakeup. Set BEFORE the claim that finds nothing, cleared when it claims again; cleared on graceful shutdown and by the monitor when it retires a dead worker, so a crashed worker cannot leave notifications switched on forever.';
 COMMENT ON COLUMN jorb_worker.job_threads IS 'Size of this worker''s own job-thread pool (--job-threads). Published because job_threads_abandoned cannot be READ without it: the budget being filled is a per-worker choice, so the same count of abandoned threads is headroom on one worker and a dead worker on the next. 0 means nothing here was written by a pyjobby worker heartbeat, and both counts should be ignored.';
 COMMENT ON COLUMN jorb_worker.job_threads_abandoned IS 'Job threads this worker started that are STILL RUNNING while no job of its own is: threads left behind by synchronous jobs that exceeded their deadline, which nothing can interrupt. job_threads_abandoned >= job_threads (with job_threads > 0) is exactly the refusing-to-claim state -- the worker will not admit a job it cannot start, so it keeps heartbeating, stays healthy by every other signal here, and does no work at all. That silence is why this lives in the registry: it is written by the heartbeat UPDATE that already runs every cycle, so the whole platform (doctor, /metrics, workers list, the dashboard) can see the condition for no extra statement. Stored as the two counts rather than the one boolean they imply because the boolean hides the approach: 7 of 8 abandoned is one timed-out job away from a worker doing nothing, and reads identically to 0 of 8.';

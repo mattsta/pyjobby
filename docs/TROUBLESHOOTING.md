@@ -58,6 +58,7 @@ draining is fine; an old queue is not. Tune the thresholds per install with
 
 | Symptom | Section |
 |---|---|
+| One named job is not running | `pj-admin jobs why ID`, then [Nothing is being claimed](#nothing-is-being-claimed) |
 | Jobs sit in `queued`, workers look idle | [Nothing is being claimed](#nothing-is-being-claimed) |
 | A worker heartbeats but never claims | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing) |
 | Queue depth or age climbing | [The backlog is growing](#the-backlog-is-growing) |
@@ -180,7 +181,34 @@ this version of pyjobby; run `db migrate` and confirm with `doctor`.
 
 ## Nothing is being claimed
 
-In order:
+**If you have a job id, start with `pj-admin jobs why ID`.** It is the
+executable version of this whole section: it asks the claim path itself
+which of these conditions is refusing the job and answers with the numbers
+behind it — the paused queue, the cap and what is filling it, the missing
+capability and what *is* advertised, the priority ceiling, the `run_after`,
+the blocking job and its state. The priority-ceiling case in particular
+cannot be reached any other way at runtime.
+
+```console
+$ pj-admin jobs why 48822
+
+Job 48822: capability_unmet
+queued  reports  myapp.jobs.RenderVideo  prio 100  cap gpu
+--------------------------------------------------
+This job requires capability 'gpu' and none of the 1 live worker(s) on 'reports' advertises it (they advertise: cpu). Start a worker with `pj --queue reports --cap gpu`.
+
+    capability:                      gpu
+    live_workers:                    1
+    workers_with_capability:         0
+    advertised_capabilities:         cpu
+```
+
+`--json` gives a monitoring script the same answer with a stable `reason`
+code; the reason table is in
+[ADMIN_TOOLS.md § Why is this job not running?](ADMIN_TOOLS.md#why-is-this-job-not-running).
+
+The rest of this section is the same walk by hand — for when the symptom is
+"the queue is not moving" and there is no one job to point at:
 
 1. **`pj-admin doctor`.** A `WARN job-threads` line names any worker that
    is alive and claiming nothing — that is a different problem, below.
@@ -376,8 +404,15 @@ Everything a schedule means is in
 Usually it is not stuck — it is being handled.
 
 ```bash
-pj-admin jobs inspect ID
+pj-admin jobs why ID       # who holds it, since when, and is that worker alive
+pj-admin jobs inspect ID   # the whole row
 ```
+
+`jobs why` answers the question that decides what to do here: it names the
+worker (host, pid), when the job was claimed, its deadline, and **whether
+that worker is still heartbeating** — a registered worker the registry no
+longer counts as live is the difference between "busy" and "the monitor is
+about to requeue this".
 
 If it is past its `timeout_at`, `pj-monitor` will retry or dead-letter it
 per its `on_timeout` policy on its next sweep (10s by default). If its

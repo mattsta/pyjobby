@@ -131,8 +131,8 @@ REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
         updated
     """),
     "jorb_worker": _names("""
-        id host pid queue capabilities version started last_seen shutdown_at
-        idle job_threads job_threads_abandoned
+        id host pid queue capabilities max_prio version started last_seen
+        shutdown_at idle job_threads job_threads_abandoned
     """),
     "jorb_step": _names("""
         job_id step_seq name output error run_epoch started finished

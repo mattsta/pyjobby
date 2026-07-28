@@ -26,7 +26,7 @@ from .client import (
     validate_tags,
 )
 from .cron import next_cron_run
-from .lifecycle import TERMINAL_STATES_SQL
+from .lifecycle import TERMINAL_STATES, TERMINAL_STATES_SQL
 from .monitor import DEFAULT_LIVENESS_GRACE_SECONDS
 
 
@@ -73,6 +73,81 @@ ADMIN_OLDEST_QUEUED_AGE_SQL = """
        AND ($1::text IS NULL OR queue = $1)
      GROUP BY queue
 """
+
+
+# ============================================================================
+# Why a job is not running: the reasons, and what each one maps to
+# ============================================================================
+# `claim_jorb()` (pyjobby/sql/schema/30_claim.sql) is the ONLY thing that ever
+# admits a job, so the set of answers `explain_job` can give is not a design
+# choice -- it is fixed by that function. Every way it declines a row gets a
+# reason code here, plus the states a row can be in before it is a candidate
+# at all. The mapping is written down so the two cannot drift in silence: a
+# condition added to claim_jorb with no entry here becomes a job the verb
+# cheerfully reports as "claimable now" while nothing claims it, which is the
+# exact failure this whole verb exists to end.
+#
+# TWO WAYS claim_jorb DECLINES THAT ARE DELIBERATELY NOT REASON CODES, because
+# neither is a property of the job and neither survives long enough to be
+# observed after the fact:
+#
+#   * `claim_queue_lock()` timing out (50 ms) on a queue that has
+#     max_concurrency or rate_limit set. A claimer that loses the lock is
+#     behind another claimer, not blocked -- the queue is being drained, just
+#     not by that caller this millisecond.
+#   * `FOR UPDATE OF j SKIP LOCKED` skipping the head row because a concurrent
+#     claimer holds it. Same shape: the row is being claimed, by somebody else.
+#
+# Both are contention on a queue that IS working, so both land in `claimable`,
+# whose details carry `queue_serialised` to say that claims on this queue take
+# the lock at all.
+EXPLAIN_REASONS: dict[str, str] = {
+    # --- states a row is in before claim_jorb's predicate can apply ---
+    "finished": "state = 'finished' (terminal; the row is not a candidate)",
+    "crashed": "state = 'crashed' (terminal; this IS the dead letter queue)",
+    "cancelled": "state = 'cancelled' (terminal; the row is not a candidate)",
+    "claimed": "state = 'claimed' -- already admitted, not yet started",
+    "running": "state = 'running' -- a worker is executing it right now",
+    "waiting_on_job": "state = 'waiting': the predicate wants 'queued'. Woken "
+    "only when waitfor_job reaches 'finished'",
+    "waiting_on_group": "state = 'waiting': the predicate wants 'queued'. Woken "
+    "only when NO member of waitfor_group is unfinished",
+    "waiting_unblocked": "state = 'waiting' with neither waitfor_job nor "
+    "waitfor_group set -- no completion can ever wake it",
+    # --- the row-level predicate inside claim_jorb's SELECT ---
+    "deferred": "j.run_after <= now() is false",
+    "above_worker_ceiling": "j.prio <= p_max_prio is false for EVERY live "
+    "worker's ceiling (jorb_worker.max_prio)",
+    "capability_unmet": "j.capability = ANY(p_capabilities) is false for every "
+    "live worker on the queue (and j.capability IS NOT NULL)",
+    "no_live_workers": "j.queue = p_queue never runs, because nothing on this "
+    "queue is calling claim_jorb at all",
+    # --- the jorb_queue control plane, checked before the SELECT ---
+    "queue_paused": "COALESCE(q.paused, FALSE) -> RETURN",
+    "queue_at_max_concurrency": "q.max_concurrency <= count(claimed+running "
+    "on the queue) -> RETURN",
+    "rate_limited": "q.rate_limit <= count(claimed_at inside "
+    "q.rate_period_seconds) -> RETURN",
+    # --- nothing declines it ---
+    "claimable": "every condition above passes: the row is admissible now, "
+    "and its position in ORDER BY prio, run_after is how soon",
+}
+
+#: How far `explain_job` counts into the claim queue ahead of a claimable job.
+#: The count is what makes "claimable now" actionable ("behind 40,000 jobs" is
+#: a different answer from "next"), but the honest unbounded version is a scan
+#: of the whole queue depth, and this verb must stay cheap on a large table.
+#: Past the bound the answer is reported as capped rather than as a number.
+EXPLAIN_AHEAD_LIMIT = 1000
+
+#: Same bound, for the unfinished members of a `waitfor_group`. A group is as
+#: wide as its fan-out, and the operator's question ("is anything still
+#: running?") is answered by the first few either way.
+EXPLAIN_GROUP_LIMIT = 1000
+
+#: Most distinct capabilities `explain_job` lists as live on a queue. A fleet
+#: advertising more than this has an answer that no longer fits on a line.
+EXPLAIN_CAPABILITY_LIMIT = 50
 
 
 #: Default page size for the per-job trails (get_job_history, get_job_steps).
@@ -137,6 +212,27 @@ def _rate(count: int | None, window_seconds: float) -> float:
     if window_seconds <= 0:
         return 0.0
     return (count or 0) / window_seconds
+
+
+def _iso(value: datetime | None) -> str | None:
+    """A timestamp as an ISO string, or None: what a JSON-bound dict wants."""
+    return value.isoformat() if value else None
+
+
+def _span(seconds: float) -> str:
+    """A span of time in the coarsest unit that still reads honestly.
+
+    Used only inside the human `summary` lines -- every number a script would
+    branch on is in `details`, in seconds, unrounded.
+    """
+    seconds = abs(seconds)
+    if seconds < 120:
+        return f"{seconds:.0f}s"
+    if seconds < 7200:
+        return f"{seconds / 60:.1f}m"
+    if seconds < 172800:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 86400:.1f}d"
 
 
 @dataclass
@@ -391,6 +487,565 @@ class AdminAPI:
         if not record:
             return None
         return JobInfo.from_record(record).to_dict()
+
+    # =========================================================================
+    # Why is this job not running?
+    # =========================================================================
+
+    async def explain_job(
+        self,
+        job_id: int,
+        stale_after_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS,
+    ) -> dict[str, Any] | None:
+        """Why job `job_id` is not running, as one structured answer.
+
+        The reasons are exactly :data:`EXPLAIN_REASONS` -- every way
+        ``claim_jorb()`` declines a row, plus the states a row can be in
+        before it is a candidate at all -- so this cannot answer "no idea",
+        and it cannot invent a cause the claim path does not have.
+
+        THE ORDER THE CONDITIONS ARE TESTED IN is deliberately NOT
+        claim_jorb's. That function checks the cheap queue-wide gates before
+        it touches the job table, which is the right order for a statement
+        run thousands of times a second and the wrong one for a human asking
+        about ONE job: several conditions usually hold at once, and the
+        useful answer is the most DURABLE of them. So this walks from the
+        facts that will still be true tomorrow to the ones that are true this
+        second -- the job's own row, then what an operator switched on
+        (paused), then the shape of the fleet (no workers / ceiling /
+        capability), and only then the two counters a draining queue moves on
+        its own (concurrency, rate). Every condition is still reported; only
+        which one gets to be the headline changes.
+
+        Cost: bounded at every step, because a stuck-job question gets asked
+        against the largest table in the system. The job is a primary-key
+        lookup; the claim-order position counts through
+        ``jorb_claim_idx (queue, prio, run_after) WHERE state = 'queued'`` and
+        stops at :data:`EXPLAIN_AHEAD_LIMIT`; unfinished group members come
+        from ``jorb_group_unfinished_idx`` and stop at
+        :data:`EXPLAIN_GROUP_LIMIT`; in-flight and rate counts are the same
+        aggregates ``inflight_stats`` and claim_jorb itself use
+        (``jorb_inflight_idx``, ``jorb_claimed_at_idx``); everything about
+        workers reads ``jorb_worker``, which holds one row per worker process.
+        Nothing here scans a job table, and no index exists for this verb.
+
+        Args:
+            job_id: the job to explain
+            stale_after_seconds: heartbeat age past which a worker is not
+                counted as live (default: 60), matching `list_workers`
+
+        Returns:
+            ``{job_id, state, queue, job_class, prio, capability, run_after,
+            created, updated, reason, summary, details}``, or None when no
+            such job exists -- absence is the caller's to report, exactly as
+            `get_job` leaves it.
+        """
+        # now() once, in the database, for every span this answer reports:
+        # the row's own age and the claim path's clock have to agree, and the
+        # caller's wall clock is not that clock.
+        row = await self.conn.fetchrow(
+            """
+            SELECT j.id, j.state::text AS state, j.queue, j.job_class, j.prio,
+                   j.capability, j.run_after, j.created, j.updated,
+                   j.started, j.finished, j.claimed_at, j.timeout_at,
+                   j.claimed_by, j.worker_host, j.worker_pid,
+                   j.run_count, j.error_count, j.error_message,
+                   j.cancel_requested, j.waitfor_job, j.waitfor_group,
+                   EXTRACT(EPOCH FROM (j.run_after - now()))::float8
+                       AS run_after_in_seconds,
+                   EXTRACT(EPOCH FROM (now() - j.updated))::float8
+                       AS in_state_seconds,
+                   EXTRACT(EPOCH FROM (j.timeout_at - now()))::float8
+                       AS timeout_in_seconds
+              FROM jorb j
+             WHERE j.id = $1
+            """,
+            job_id,
+        )
+        if row is None:
+            return None
+
+        state: str = row["state"]
+        if state in TERMINAL_STATES:
+            reason, summary, details = self._explain_terminal(row)
+        elif state in ("claimed", "running"):
+            reason, summary, details = await self._explain_inflight(
+                row, stale_after_seconds
+            )
+        elif state == "waiting":
+            reason, summary, details = await self._explain_waiting(row)
+        else:
+            reason, summary, details = await self._explain_queued(
+                row, stale_after_seconds
+            )
+
+        return {
+            "job_id": row["id"],
+            "state": state,
+            "queue": row["queue"],
+            "job_class": row["job_class"],
+            "prio": row["prio"],
+            "capability": row["capability"],
+            "run_after": _iso(row["run_after"]),
+            "created": _iso(row["created"]),
+            "updated": _iso(row["updated"]),
+            "reason": reason,
+            "summary": summary,
+            "details": details,
+        }
+
+    @staticmethod
+    def _explain_terminal(row: asyncpg.Record) -> tuple[str, str, dict[str, Any]]:
+        """A job that is not running because it is over."""
+        # `finished` is the timestamp of the terminal write; `updated` is the
+        # fallback for a row whose terminal transition predates it being set.
+        when = _iso(row["finished"]) or _iso(row["updated"])
+        details: dict[str, Any] = {
+            "terminal_at": when,
+            "run_count": row["run_count"],
+            "error_count": row["error_count"],
+        }
+        state: str = row["state"]
+        if state == "crashed":
+            details["error_message"] = row["error_message"]
+            return (
+                "crashed",
+                f"Crashed at {when} after {row['run_count']} attempt(s) and is "
+                f"in the dead letter queue"
+                + (f": {row['error_message']}" if row["error_message"] else "")
+                + ". Requeue it with `pj-admin jobs retry`.",
+                details,
+            )
+        if state == "cancelled":
+            return (
+                "cancelled",
+                f"Cancelled at {when}. Requeue it with `pj-admin jobs retry`.",
+                details,
+            )
+        return (
+            "finished",
+            f"Finished successfully at {when} after {row['run_count']} "
+            f"attempt(s) — there is nothing left to run. `pj-admin jobs rerun` "
+            f"runs it again (and repeats its side effects).",
+            details,
+        )
+
+    async def _explain_inflight(
+        self, row: asyncpg.Record, stale_after_seconds: float
+    ) -> tuple[str, str, dict[str, Any]]:
+        """A job that IS running, or has been admitted and is about to.
+
+        Whether its worker is still alive is the whole question for a job
+        that has sat in `claimed` for an hour, so the registry row is read
+        (one primary-key lookup) rather than left for the operator to chase
+        through `workers list`.
+        """
+        worker = None
+        if row["claimed_by"] is not None:
+            worker = await self.conn.fetchrow(
+                """
+                SELECT (shutdown_at IS NULL
+                        AND last_seen > now() - make_interval(secs => $2))
+                           AS live,
+                       EXTRACT(EPOCH FROM (now() - last_seen))::float8
+                           AS last_seen_age_seconds
+                  FROM jorb_worker
+                 WHERE id = $1
+                """,
+                row["claimed_by"],
+                stale_after_seconds,
+            )
+
+        held = float(row["in_state_seconds"] or 0.0)
+        details: dict[str, Any] = {
+            "worker_id": row["claimed_by"],
+            "worker_host": row["worker_host"],
+            "worker_pid": row["worker_pid"],
+            "worker_live": worker["live"] if worker else None,
+            "worker_last_seen_age_seconds": (
+                worker["last_seen_age_seconds"] if worker else None
+            ),
+            "claimed_at": _iso(row["claimed_at"]),
+            "started": _iso(row["started"]),
+            "timeout_at": _iso(row["timeout_at"]),
+            "timeout_in_seconds": row["timeout_in_seconds"],
+            "in_state_seconds": held,
+        }
+
+        who = (
+            f"worker {row['claimed_by']} ({row['worker_host']}:{row['worker_pid']})"
+            if row["claimed_by"] is not None
+            else f"an UNREGISTERED worker ({row['worker_host']}:{row['worker_pid']})"
+        )
+        # A registered worker the registry no longer calls live is the answer
+        # to "claimed an hour ago and nothing happened": the monitor requeues
+        # this job once the grace expires, and saying so beats an operator
+        # deciding the platform lost it.
+        dead = worker is not None and not worker["live"]
+        deadline = (
+            f", deadline {_iso(row['timeout_at'])}"
+            f" ({_span(row['timeout_in_seconds'])}"
+            f"{' ago' if (row['timeout_in_seconds'] or 0) < 0 else ' away'})"
+            if row["timeout_at"]
+            else ", no deadline"
+        )
+
+        state: str = row["state"]
+        if state == "running":
+            summary = (
+                f"Running on {who} since {_iso(row['started'])} "
+                f"({_span(held)} in this state){deadline}."
+            )
+        else:
+            summary = (
+                f"Claimed by {who} at {_iso(row['claimed_at'])} "
+                f"({_span(held)} ago) and has not started executing yet"
+                f"{deadline}."
+            )
+        if dead:
+            summary += (
+                " That worker is NOT heartbeating: the monitor requeues its "
+                "in-flight jobs once --liveness-grace expires."
+            )
+        return (state, summary, details)
+
+    async def _explain_waiting(
+        self, row: asyncpg.Record
+    ) -> tuple[str, str, dict[str, Any]]:
+        """A job parked on a dependency.
+
+        A `waiting` row is woken by the completion path of what it waits on
+        (pj.py's `enqueue-next-self-finished` / `-if-peer-group-is-finished`),
+        and BOTH wakes fire only on 'finished'. So an upstream that crashed or
+        was cancelled leaves this job parked forever, which is the thing worth
+        saying out loud rather than leaving as "waiting".
+        """
+        if row["waitfor_job"] is not None:
+            blocker = await self.conn.fetchrow(
+                "SELECT state::text AS state, job_class FROM jorb WHERE id = $1",
+                row["waitfor_job"],
+            )
+            blocking_state = blocker["state"] if blocker else None
+            details: dict[str, Any] = {
+                "blocking_job_id": row["waitfor_job"],
+                "blocking_job_state": blocking_state,
+                "blocking_job_class": blocker["job_class"] if blocker else None,
+                "waiting_seconds": row["in_state_seconds"],
+            }
+            if blocking_state is None:
+                tail = (
+                    " — that job NO LONGER EXISTS, so nothing can ever wake "
+                    "this one; requeue it with `pj-admin jobs retry`."
+                )
+            elif blocking_state in ("crashed", "cancelled"):
+                tail = (
+                    f" — that job is {blocking_state}, and the wake fires only "
+                    f"on 'finished', so this one will never start on its own."
+                )
+            elif blocking_state == "finished":
+                tail = (
+                    " — that job is already finished, so the wake was missed; "
+                    "requeue this job with `pj-admin jobs retry`."
+                )
+            else:
+                tail = f" — that job is {blocking_state}."
+            return (
+                "waiting_on_job",
+                f"Waiting on job {row['waitfor_job']}{tail}",
+                details,
+            )
+
+        if row["waitfor_group"] is not None:
+            # Bounded: the group is as wide as its fan-out, and the answer
+            # ("is anything still unfinished?") does not need the exact tail.
+            # Served by jorb_group_unfinished_idx, whose predicate this
+            # subquery spells out so it can be used at all.
+            unfinished = await self.conn.fetchval(
+                """
+                SELECT count(*) FROM (
+                    SELECT 1 FROM jorb
+                     WHERE run_group = $1
+                       AND run_group IS NOT NULL
+                       AND state != 'finished'
+                     LIMIT $2
+                ) m
+                """,
+                row["waitfor_group"],
+                EXPLAIN_GROUP_LIMIT,
+            )
+            capped = unfinished >= EXPLAIN_GROUP_LIMIT
+            details = {
+                "blocking_group": row["waitfor_group"],
+                "unfinished_members": unfinished,
+                "unfinished_members_capped": capped,
+                "waiting_seconds": row["in_state_seconds"],
+            }
+            return (
+                "waiting_on_group",
+                f"Waiting on group {row['waitfor_group']}: "
+                f"{unfinished}{'+' if capped else ''} member(s) are not "
+                f"finished yet. The whole group must reach 'finished' — a "
+                f"member that crashes holds this job forever.",
+                details,
+            )
+
+        return (
+            "waiting_unblocked",
+            "Waiting on nothing: the row is 'waiting' with neither "
+            "waitfor_job nor waitfor_group set, so no completion anywhere can "
+            "wake it. Requeue it with `pj-admin jobs retry`.",
+            {"waiting_seconds": row["in_state_seconds"]},
+        )
+
+    async def _explain_queued(
+        self, row: asyncpg.Record, stale_after_seconds: float
+    ) -> tuple[str, str, dict[str, Any]]:
+        """A row claim_jorb could admit — so why has nothing admitted it?
+
+        Everything here is a condition in that function (see
+        :data:`EXPLAIN_REASONS`); the order is the one the docstring of
+        `explain_job` explains, and each query runs only if the answer has
+        not already been found.
+        """
+        queue = row["queue"]
+
+        if (row["run_after_in_seconds"] or 0.0) > 0:
+            wait = float(row["run_after_in_seconds"])
+            return (
+                "deferred",
+                f"Deferred: run_after is {_span(wait)} in the future "
+                f"({_iso(row['run_after'])}). This is how retry backoff, "
+                f"`enqueue_at` and durable sleep are implemented — nothing is "
+                f"wrong.",
+                {
+                    "run_after": _iso(row["run_after"]),
+                    "seconds_until_run_after": wait,
+                },
+            )
+
+        control = await self.conn.fetchrow(
+            """
+            SELECT paused, max_concurrency, rate_limit, rate_period_seconds,
+                   updated
+              FROM jorb_queue WHERE name = $1
+            """,
+            queue,
+        )
+        # No control row is the common case and means unpaused/unlimited.
+        paused = bool(control["paused"]) if control else False
+        max_concurrency = control["max_concurrency"] if control else None
+        rate_limit = control["rate_limit"] if control else None
+        rate_period = float(control["rate_period_seconds"]) if control else 60.0
+
+        if paused:
+            return (
+                "queue_paused",
+                f"Queue {queue!r} is PAUSED: claim_jorb returns without "
+                f"looking at any row, for every claimer. Resume it with "
+                f"`pj-admin queues resume {queue}`.",
+                {
+                    "queue": queue,
+                    "paused": True,
+                    "paused_since": _iso(control["updated"]) if control else None,
+                },
+            )
+
+        # One pass over the registry, which holds one row per worker process:
+        # how many are live on this queue, the highest ceiling among them, and
+        # how many of them would accept THIS job's prio and capability.
+        fleet = await self.conn.fetchrow(
+            """
+            SELECT count(*)                                   AS live,
+                   max(max_prio)                              AS max_ceiling,
+                   count(*) FILTER (WHERE max_prio >= $3)     AS at_prio,
+                   count(*) FILTER (
+                       WHERE $4::text IS NULL OR $4 = ANY(capabilities)
+                   )                                          AS capable
+              FROM jorb_worker
+             WHERE queue = $1
+               AND shutdown_at IS NULL
+               AND last_seen > now() - make_interval(secs => $2)
+            """,
+            queue,
+            stale_after_seconds,
+            row["prio"],
+            row["capability"],
+        )
+        live = fleet["live"] or 0
+
+        if live == 0:
+            return (
+                "no_live_workers",
+                f"No live worker is on queue {queue!r} at all, so nothing is "
+                f"calling claim_jorb for it. Start one with "
+                f"`pj --queue {queue}`, and check `pj-admin workers list` for "
+                f"workers that registered and stopped heartbeating.",
+                {
+                    "queue": queue,
+                    "live_workers": 0,
+                    "liveness_grace_seconds": stale_after_seconds,
+                },
+            )
+
+        if fleet["at_prio"] == 0:
+            # The platform's quietest failure: the row is perfectly healthy
+            # and every live worker is blind to it. Only reachable because
+            # jorb_worker.max_prio is published at registration.
+            return (
+                "above_worker_ceiling",
+                f"This job's prio is {row['prio']}, above the ceiling of "
+                f"EVERY live worker on {queue!r} (highest is "
+                f"{fleet['max_ceiling']}) — claim_jorb admits only "
+                f"prio <= the claiming worker's --max-prio, so every one of "
+                f"the {live} live worker(s) is blind to it. Lower the job "
+                f"(`pj-admin jobs set-priority`) or run a worker with a "
+                f"higher --max-prio. Remember lower prio = more urgent.",
+                {
+                    "prio": row["prio"],
+                    "max_live_ceiling": fleet["max_ceiling"],
+                    "live_workers": live,
+                    "workers_at_or_above_prio": 0,
+                },
+            )
+
+        if row["capability"] is not None and fleet["capable"] == 0:
+            advertised = await self.conn.fetchval(
+                """
+                SELECT coalesce(array_agg(DISTINCT c ORDER BY c), '{}')
+                  FROM (
+                    SELECT unnest(capabilities) AS c
+                      FROM jorb_worker
+                     WHERE queue = $1
+                       AND shutdown_at IS NULL
+                       AND last_seen > now() - make_interval(secs => $2)
+                     LIMIT $3
+                  ) s
+                """,
+                queue,
+                stale_after_seconds,
+                EXPLAIN_CAPABILITY_LIMIT,
+            )
+            advertised = list(advertised or [])
+            return (
+                "capability_unmet",
+                f"This job requires capability {row['capability']!r} and none "
+                f"of the {live} live worker(s) on {queue!r} advertises it "
+                f"(they advertise: "
+                f"{', '.join(advertised) if advertised else 'nothing'}). "
+                f"Start a worker with `pj --queue {queue} --cap "
+                f"{row['capability']}`.",
+                {
+                    "capability": row["capability"],
+                    "live_workers": live,
+                    "workers_with_capability": 0,
+                    "advertised_capabilities": advertised,
+                },
+            )
+
+        if max_concurrency is not None:
+            # The same count claim_jorb takes under the queue lock.
+            inflight = await self.conn.fetchval(
+                """
+                SELECT count(*) FROM jorb
+                 WHERE queue = $1 AND state IN ('claimed', 'running')
+                """,
+                queue,
+            )
+            if max_concurrency <= inflight:
+                return (
+                    "queue_at_max_concurrency",
+                    f"Queue {queue!r} is at its concurrency cap: "
+                    f"{inflight} job(s) claimed or running against a cap of "
+                    f"{max_concurrency}. This job is admitted as soon as one "
+                    f"of them finishes; raise the cap with "
+                    f"`pj-admin queues limits {queue} --max-concurrency N`.",
+                    {
+                        "queue": queue,
+                        "max_concurrency": max_concurrency,
+                        "inflight": inflight,
+                    },
+                )
+
+        if rate_limit is not None:
+            # Admissions, not starts: claim_jorb counts claimed_at, because
+            # `started` is written after the claim commits (see jorb.claimed_at).
+            admissions = await self.conn.fetchval(
+                """
+                SELECT count(*) FROM jorb
+                 WHERE queue = $1
+                   AND claimed_at > now() - make_interval(secs => $2)
+                """,
+                queue,
+                rate_period,
+            )
+            if rate_limit <= admissions:
+                return (
+                    "rate_limited",
+                    f"Queue {queue!r} is rate limited: {admissions} job(s) "
+                    f"admitted in the last {rate_period:g}s against a limit of "
+                    f"{rate_limit}. Claims resume as the window rolls forward; "
+                    f"change it with `pj-admin queues limits {queue} "
+                    f"--rate-limit N`.",
+                    {
+                        "queue": queue,
+                        "rate_limit": rate_limit,
+                        "rate_period_seconds": rate_period,
+                        "recent_admissions": admissions,
+                    },
+                )
+
+        # Nothing declines it. How soon it runs is its position in claim
+        # order (ORDER BY prio, run_after), counted through jorb_claim_idx and
+        # bounded -- the row comparison is exactly that index's leading
+        # columns, and the LIMIT stops the count at a queue depth no operator
+        # needs counted exactly.
+        #
+        # Every claimable row on the queue counts, including ones THIS job's
+        # claimer could not take (a capability it lacks, a prio above its
+        # ceiling): claim order is a property of the queue, but which rows a
+        # given worker may take is a property of that worker, and a number
+        # computed for one worker would be wrong for the fleet.
+        ahead = await self.conn.fetchval(
+            """
+            SELECT count(*) FROM (
+                SELECT 1 FROM jorb
+                 WHERE queue = $1
+                   AND state = 'queued'
+                   AND run_after <= now()
+                   AND (prio, run_after) < ($2, $3)
+                 LIMIT $4
+            ) q
+            """,
+            queue,
+            row["prio"],
+            row["run_after"],
+            EXPLAIN_AHEAD_LIMIT,
+        )
+        capped = ahead >= EXPLAIN_AHEAD_LIMIT
+        serialised = max_concurrency is not None or rate_limit is not None
+        position = (
+            "it is next in claim order"
+            if ahead == 0
+            else f"{ahead}{'+' if capped else ''} claimable job(s) sort ahead of it"
+        )
+        return (
+            "claimable",
+            f"Nothing is blocking it: this job is claimable RIGHT NOW on "
+            f"{queue!r} ({live} live worker(s)), and {position}. If it is "
+            f"still sitting here, the fleet is behind — check "
+            f"`pj-admin metrics` and `pj-admin doctor`.",
+            {
+                "queue": queue,
+                "live_workers": live,
+                "jobs_ahead": ahead,
+                "jobs_ahead_capped": capped,
+                # Claims on a controlled queue serialise on an advisory lock
+                # and can also lose a row to SKIP LOCKED. Neither is a reason
+                # (see EXPLAIN_REASONS), but both are why a claimable job on
+                # such a queue can take a poll or two longer than one here.
+                "queue_serialised": serialised,
+            },
+        )
 
     async def retry_job(self, job_id: int) -> dict[str, Any]:
         """

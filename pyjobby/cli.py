@@ -437,6 +437,60 @@ def jobs_inspect(ctx: click.Context, job_id: int, output_json: bool) -> None:
     asyncio.run(_inspect())
 
 
+@jobs.command("why")
+@click.argument("job_id", type=int)
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON")
+@click.pass_context
+def jobs_why(ctx: click.Context, job_id: int, output_json: bool) -> None:
+    """Explain, in one command, why a job is not running
+
+    The answer comes from the claim path itself (the `claim_jorb()` function
+    every worker calls), so it covers every way a job can fail to be
+    claimed — terminal, held by a worker, parked on a dependency, deferred,
+    a paused queue, a concurrency cap or rate limit, no live workers on the
+    queue, a capability nobody advertises, or a priority above every live
+    worker's ceiling — and says which one, with the numbers behind it.
+
+    Assembling this by hand took `jobs inspect`, `queues show`, `workers
+    list` and a query, and the priority-ceiling case could not be answered
+    at all.
+    """
+
+    async def _why() -> None:
+        conn, api = await get_api(ctx)
+        try:
+            answer = await api.explain_job(job_id)
+
+            if not answer:
+                fail(f"Job {job_id} not found")
+
+            if output_json:
+                click.echo(json.dumps(answer, indent=2, default=str))
+                return
+
+            click.echo(f"\n{Colors.BOLD}Job {job_id}: {answer['reason']}{Colors.ENDC}")
+            click.echo(
+                f"{answer['state']}  {answer['queue']}  "
+                f"{answer['job_class']}  prio {answer['prio']}"
+                + (f"  cap {answer['capability']}" if answer["capability"] else "")
+            )
+            click.echo("-" * 50)
+            click.echo(answer["summary"])
+            if answer["details"]:
+                click.echo("")
+                for key, value in answer["details"].items():
+                    shown = (
+                        ", ".join(str(v) for v in value)
+                        if isinstance(value, list)
+                        else value
+                    )
+                    click.echo(f"    {key + ':':<32} {shown}")
+        finally:
+            await conn.close()
+
+    asyncio.run(_why())
+
+
 @jobs.command("retry")
 @click.argument("job_ids", nargs=-1, type=int, required=True)
 @click.pass_context

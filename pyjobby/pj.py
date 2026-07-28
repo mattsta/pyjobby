@@ -323,9 +323,18 @@ STMTS["worker-idle"] = """UPDATE jorb_worker
                 AND idle IS DISTINCT FROM $2"""
 
 # Worker registry (executed on the heartbeat connection, not prepared).
+#
+# `capabilities` and `max_prio` are published together because together they
+# are the whole of what this worker will claim -- claim_jorb() filters on
+# `capability = ANY($2)` and `prio <= $3`, and both values live in this
+# process and nowhere else. Publishing only the first left "this job's prio
+# is above every live worker's ceiling" unanswerable at runtime, which is the
+# platform's quietest failure: the job stays queued forever without ever
+# failing. The ceiling is a STARTUP constant, so it is written here and never
+# again -- the heartbeat below rewrites only what changes.
 WORKER_REGISTER_SQL = """INSERT INTO jorb_worker
-        (host, pid, queue, capabilities, version, job_threads)
-        VALUES ($1, $2, $3, $4, $5, $6) RETURNING id"""
+        (host, pid, queue, capabilities, max_prio, version, job_threads)
+        VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id"""
 # The heartbeat carries the job-thread saturation with it. A worker whose pool
 # is full of abandoned threads refuses to claim (see _too_many_abandoned_
 # threads) but goes on beating, so every liveness signal the platform has says
@@ -572,6 +581,7 @@ class JobSystem:
             self.pid,
             self.qname,
             list(self.capabilities),
+            self.prio,
             __version__,
             self.job_threads,
         )
