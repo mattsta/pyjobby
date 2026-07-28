@@ -1,14 +1,26 @@
-# Sample pyjobby configuration (TOML, read as data — never executed).
+# pyjobby configuration (TOML, read as data — never executed).
+#
+# Every pyjobby process takes this file with -c/--config — pj, pj-admin,
+# pj-monitor, pj-scheduler, pj-web, pj-ws — and JobClient.from_config()
+# reads the same file from application code.
+#
 # Secrets: any string of the exact form "${ENV_VAR}" is replaced from the
 # environment at load time; an unset variable is a loud startup error.
 
 [db_params]
-database = "pyjobby_test"
-user = "pyjobby_test"
-password = "pyjobby_test_password"
+database = "pyjobby"
+user = "postgres"
+password = "${PYJOBBY_DB_PASSWORD}"
 host = "localhost"
 port = 5432
 
-[web_listen]
-sites = [{ host = "127.0.0.1", port = 8080 }]
-paths = []
+# The priority ceiling this deployment's workers run with (`pj --max-prio`).
+# Declared once here so every enqueuing surface refuses a job no worker
+# would ever claim. LOWER numbers are MORE urgent; default 1000.
+prio_ceiling = 1000
+
+# Experimental per-worker HTTP endpoints (pj workers only). Off by default —
+# uncomment to enable; there is no authentication.
+# [web_listen]
+# sites = [{ host = "127.0.0.1", port = 8080 }]
+# paths = []

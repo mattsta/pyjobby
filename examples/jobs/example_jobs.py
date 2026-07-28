@@ -200,10 +200,13 @@ class CachedResourceJob(Job):
 # Example job submission functions
 
 
+# These take a pyjobby connection (``await pyjobby.db.connect(...)``): its JSONB
+# codec takes dicts directly, while a bare asyncpg connection would need
+# json.dumps(...) plus a ``$2::jsonb`` cast.
+
+
 async def submit_basic_job(db_conn):
     """Submit a simple job"""
-    import orjson
-
     job_id = await db_conn.fetchval(
         """
         INSERT INTO jorb (job_class, kwargs, queue)
@@ -211,7 +214,7 @@ async def submit_basic_job(db_conn):
         RETURNING id
     """,
         "examples.jobs.example_jobs.BasicJob",
-        orjson.dumps({"message": "Hello from pyjobby!"}),
+        {"message": "Hello from pyjobby!"},
         "default",
     )
 
@@ -221,8 +224,6 @@ async def submit_basic_job(db_conn):
 
 async def submit_failing_job(db_conn, fail_count=3):
     """Submit a job that will fail and retry"""
-    import orjson
-
     job_id = await db_conn.fetchval(
         """
         INSERT INTO jorb (job_class, kwargs, queue)
@@ -230,7 +231,7 @@ async def submit_failing_job(db_conn, fail_count=3):
         RETURNING id
     """,
         "examples.jobs.example_jobs.FailingJob",
-        orjson.dumps({"fail_count": fail_count}),
+        {"fail_count": fail_count},
         "default",
     )
 
@@ -240,8 +241,6 @@ async def submit_failing_job(db_conn, fail_count=3):
 
 async def submit_timeout_job(db_conn):
     """Submit a job that will timeout"""
-    import orjson
-
     job_id = await db_conn.fetchval(
         """
         INSERT INTO jorb (job_class, kwargs, queue)
@@ -249,7 +248,7 @@ async def submit_timeout_job(db_conn):
         RETURNING id
     """,
         "examples.jobs.example_jobs.TimeoutJob",
-        orjson.dumps({"sleep_duration": 10}),  # Will timeout after 5s
+        {"sleep_duration": 10},  # Will timeout after 5s
         "default",
     )
 
@@ -263,8 +262,9 @@ Example Jobs for Pyjobby
 
 To use these jobs:
 
-1. Start workers:
-   pj --workers 2 --path ./examples
+1. Start workers (from the repository root, so `examples.jobs.example_jobs`
+   is importable):
+   pj --workers 2 --path .
 
 2. Submit jobs using the submit_* functions above, or manually:
    psql -c "INSERT INTO jorb (job_class, kwargs) VALUES ('examples.jobs.example_jobs.BasicJob', '{}')"

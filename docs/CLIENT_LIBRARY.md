@@ -26,14 +26,17 @@ Clean, well-encapsulated Python client for job submission and management with fu
 
 ## Installation
 
-```bash
-pip install pyjobby
-```
-
-Or with Poetry:
+Pyjobby is installed from git (it is not published on PyPI):
 
 ```bash
-poetry add pyjobby
+# uv
+uv add git+https://github.com/mattsta/pyjobby.git
+
+# pip
+pip install "git+https://github.com/mattsta/pyjobby.git@main"
+
+# poetry
+poetry add git+https://github.com/mattsta/pyjobby.git@main
 ```
 
 ---

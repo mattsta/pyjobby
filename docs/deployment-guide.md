@@ -446,8 +446,7 @@ services:
     volumes:
       - ./pyjobby.toml:/etc/pyjobby/pyjobby.toml:ro
     command: ["pj", "--config", "/etc/pyjobby/pyjobby.toml",
-              "--queue", "default", "--queue", "default",
-              "--queue", "default", "--queue", "default", "--workers", "4"]
+              "--queue", "default", "--workers", "4"]
     restart: always
 
 volumes:
@@ -517,9 +516,7 @@ spec:
         - name: worker
           image: myregistry/pyjobby:latest
           command: ["pj", "--config", "/etc/pyjobby/pyjobby.toml",
-                    "--queue", "default", "--queue", "default",
-                    "--queue", "default", "--queue", "default",
-                    "--workers", "4"]
+                    "--queue", "default", "--workers", "4"]
           volumeMounts:
             - {name: config, mountPath: /etc/pyjobby, readOnly: true}
           resources:

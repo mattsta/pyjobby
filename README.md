@@ -94,6 +94,8 @@ class Order(StateMachineJob):
     async def charge(self, event, payload): ...
     async def buy_label(self, event, payload): ...
 
+# machines run on their own queue ('machines') unless you pass queue=...,
+# so staff it: pj --queue machines --workers 1
 order = await client.start_machine(Order)
 await order.send("paid", amount=100)
 await order.wait_for_state("shipped", timeout=600)
@@ -316,7 +318,7 @@ await client.enqueue(
     on_timeout='retry'  # or 'fail'
 )
 
-# Background monitor for safety
+# NOT optional: timeouts, dead-worker recovery, retention
 pj-monitor --dsn postgresql://... --check-interval 10
 ```
 
@@ -416,7 +418,7 @@ The full index, with what each document answers, is
 - **capability** - a string value set on a **job (storage)** row also needing to match exactly one of the capability strings provided by `pj` on launch. by default, each worker advertises its own hostname as capability `f"hostname:{platform.node()}"`
 - **run_after** - a minimum start time for the job to run
 - **priority** - a finishing position, so the **smallest** number is selected first and a job added later can run before jobs already queued. each worker also has a **ceiling** (`pj --max-prio`, default 1000) and selects only `prio <=` it, so past the ceiling a bigger number means "never selected", not "selected later" — the client refuses those enqueues
-- **deadline key** - a unique constraint on `(deadline_key, state==queued)` per queue. allows you to request the same job multiple times, but the server will only schedule one instance
+- **deadline key** - a unique constraint on `(deadline_key, state==queued)` per queue. while a queued row holds that key, a second enqueue of it **raises** `asyncpg.UniqueViolationError` instead of adding a duplicate — catch it and treat it as "already scheduled"
 - **run_group** - multiple tasks may be assigned the same `run_group` value if you would like to run other jobs only when _all_ jobs in a group move to a _finished_ state
 - **waitfor_group** - jobs in _waiting_ state with a `waitfor_group` value will run **only** when _all_ job rows with the matching `run_group` have moved to a _finished_ state
 - **waitfor_job** - same as **waitfor_group** except only waits on a specific `id` to become _finished_ before running
@@ -461,10 +463,10 @@ and works with both **uv** and **poetry** (both lockfiles are committed).
 uv add git+https://github.com/mattsta/pyjobby.git
 
 # poetry
-poetry add git+https://github.com/mattsta/pyjobby.git#main
+poetry add git+https://github.com/mattsta/pyjobby.git@main
 
 # pip
-pip install git+https://github.com/mattsta/pyjobby.git#main
+pip install "git+https://github.com/mattsta/pyjobby.git@main"
 ```
 
 ### Working on a checkout
@@ -492,7 +494,13 @@ It is idempotent, and safe to run from every host's deploy step at once: it
 takes an advisory lock, so one process does the work and the others wait and
 find nothing left to do.
 
+The sample config reads the database password from the environment, and an
+unset `${PYJOBBY_DB_PASSWORD}` is a loud startup error rather than an empty
+password — export it before running anything that loads the config.
+
 ```bash
+export PYJOBBY_DB_PASSWORD=...
+
 createdb pyjobby
 pj-admin --config ./pyjobby.toml db migrate
 
@@ -549,6 +557,9 @@ user = "postgres"
 password = "${PYJOBBY_DB_PASSWORD}"
 host = "localhost"
 port = 5432
+
+# The priority ceiling this deployment's workers run with (`pj --max-prio`).
+prio_ceiling = 1000
 ```
 
 (See [`pyjobby.toml`](pyjobby.toml) in the repository root for the annotated
@@ -564,6 +575,14 @@ pj --config ./pyjobby.toml --queue default --workers 4
 # Two queues, 4 workers on each = 8 processes. No worker ever lands on a
 # queue you did not name.
 pj --config ./pyjobby.toml --queue emails --queue billing --workers 4
+```
+
+Then start the reaper. `pj-monitor` is **not optional** — it is the only
+thing that recovers work: timeouts, dead-worker recovery, and retention all
+live there. One process for the whole install, not one per host.
+
+```bash
+pj-monitor --config ./pyjobby.toml
 ```
 
 ### 4. Enqueue Jobs
@@ -589,7 +608,13 @@ async def main():
 asyncio.run(main())
 ```
 
-**Using Direct SQL:**
+**Using Direct SQL (not the recommended path):**
+
+Enqueue through the client rather than with a hand-written `INSERT`: the
+client validates what the database cannot reject on its own — a `priority`
+above the worker fleet's ceiling, tag values that are not filterable, an
+unusable retry strategy or `on_timeout` — and a raw insert is the usual way
+an unclaimable row gets into the table.
 
 ```python
 import asyncpg
@@ -670,13 +695,22 @@ job_ids = await client.enqueue_batch(jobs)
 
 ### Idempotent Jobs (Prevent Duplicates)
 
+While a queued row holds that key, a second enqueue raises instead of
+creating a duplicate:
+
 ```python
-await client.enqueue(
-    "ProcessPayment",
-    deadline_key=f"payment:{payment_id}",
-    payment_id=payment_id,
-    amount=99.99,
-)
+import asyncpg
+
+try:
+    job_id = await client.enqueue(
+        "ProcessPayment",
+        deadline_key=f"payment:{payment_id}",
+        payment_id=payment_id,
+        amount=99.99,
+    )
+    print(f"Payment job created: {job_id}")
+except asyncpg.UniqueViolationError:
+    print("Payment already processing")
 ```
 
 ### Priority

@@ -150,7 +150,7 @@ gets into the table. Full API:
 ### Job Class Template
 
 ```python
-from pyjobby.pj import Job
+from pyjobby import Job
 
 
 class MyJob(Job):
