@@ -130,6 +130,17 @@ Jobs flow through the following states:
 - **crashed** - Failed with error
 - **cancelled** - Manually cancelled
 
+### Security: `job_class` is trusted input
+
+`job_class` is a dotted import path, and the worker resolves it by importing
+the named module before checking that the target is a `Job` subclass. That
+import runs the module's top-level code. Being able to set `job_class` is
+therefore equivalent to being able to name any importable module for the
+worker to import — so `job_class` must come from your own code, never
+straight from an untrusted source (a request body, a webhook payload). Put a
+whitelist of allowed job names in front of `enqueue()` if end users can
+influence what gets enqueued.
+
 ---
 
 ## API Reference
