@@ -461,7 +461,12 @@ class SchedulerWorker:
     comprehensive safety checks and logging.
     """
 
-    def __init__(self, conn: asyncpg.Connection, poll_interval: int = 60):
+    def __init__(
+        self,
+        conn: asyncpg.Connection,
+        poll_interval: int = 60,
+        prio_ceiling: int | None = None,
+    ):
         """
         Initialize scheduler worker.
 
@@ -471,6 +476,17 @@ class SchedulerWorker:
         """
         self.conn = conn
         self.poll_interval = poll_interval
+        #: The worker fleet's priority ceiling (`pj --max-prio`). Checked at
+        #: FIRE time, not only at schedule creation: a schedule mints a job
+        #: on every firing, and a job above every worker's ceiling is never
+        #: claimed — one bad number becomes an unbounded stream of jobs
+        #: nobody runs. A firing refused by the ceiling DISABLES the
+        #: schedule with the reason, exactly like an unevaluatable cron.
+        from .client import DEFAULT_PRIO_CEILING
+
+        self.prio_ceiling = (
+            DEFAULT_PRIO_CEILING if prio_ceiling is None else prio_ceiling
+        )
         self.safety = ScheduleSafetyManager(conn)
         self.manager = ScheduleManager(conn)
         #: Connection parameters for reconnecting after a lost connection.
@@ -556,26 +572,28 @@ class SchedulerWorker:
             # Nested transaction = savepoint when run() already holds a
             # transaction, so a UniqueViolationError here cannot poison the
             # outer transaction's later statements (log_execution etc).
+            #
+            # THE shared enqueue path — the same row construction and the
+            # same INSERT as every client enqueue. The scheduler used to
+            # hand-roll its own INSERT, which silently skipped priority
+            # validation and every option the row builder handles; a second
+            # enqueue path is a second place for the two to disagree.
+            from .client import _ENQUEUE_SQL, JobClient
+
+            args = JobClient._build_enqueue_row(
+                schedule["job_class"],
+                queue=schedule["queue"],
+                priority=schedule["prio"],
+                run_after=run_after_time,
+                capability=schedule["capability"],
+                deadline_key=deadline_key,
+                admin_data=admin_data,
+                schedule_id=schedule["id"],
+                job_kwargs=dict(schedule["kwargs"] or {}),
+                prio_ceiling=self.prio_ceiling,
+            )
             async with self.conn.transaction():
-                job_id: int = await self.conn.fetchval(
-                    """
-                    INSERT INTO jorb (
-                        job_class, kwargs, queue, prio, capability,
-                        deadline_key, run_after, admin_data, schedule_id,
-                        state
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued')
-                    RETURNING id
-                """,
-                    schedule["job_class"],
-                    schedule["kwargs"],  # Dict - custom codec handles conversion
-                    schedule["queue"],
-                    schedule["prio"],
-                    schedule["capability"],
-                    deadline_key,
-                    run_after_time,
-                    admin_data,  # Dict - custom codec handles conversion
-                    schedule["id"],
-                )
+                job_id: int = await self.conn.fetchval(_ENQUEUE_SQL, *args)
 
             logger.info(
                 f"Created job {job_id} for schedule '{schedule['name']}'",
@@ -776,6 +794,23 @@ class SchedulerWorker:
                     result="skipped", skip_reason="duplicate"
                 )
 
+        except ValueError as e:
+            # The shared row builder refused the firing — priority above the
+            # fleet's ceiling, or an invalid option. Retrying next poll
+            # cannot change the answer, so DISABLE the schedule with the
+            # reason (the same treatment an unevaluatable cron gets) instead
+            # of minting one failure per poll forever.
+            await self.manager.record_execution_failure(schedule["id"])
+            await self.manager.disable_unevaluatable(schedule["id"], str(e))
+            duration_ms = int((time.time() - start_time) * 1000)
+            logger.error(
+                f"Schedule '{schedule['name']}' DISABLED: {e}",
+                extra={"schedule_id": schedule["id"], "duration_ms": duration_ms},
+            )
+            return ScheduleExecutionResult(
+                result="failure", error_message=str(e), duration_ms=duration_ms
+            )
+
         except Exception as e:
             # Failure!
             await self.manager.record_execution_failure(schedule["id"])
@@ -942,14 +977,20 @@ class SchedulerWorker:
         self._stop_event.set()
 
 
-async def run_scheduler(db_params: dict[str, Any], poll_interval: int = 60) -> None:
+async def run_scheduler(
+    db_params: dict[str, Any],
+    poll_interval: int = 60,
+    prio_ceiling: int | None = None,
+) -> None:
     """Connect and run a SchedulerWorker until SIGTERM/SIGINT."""
     import signal
 
     from . import db
 
     conn = await db.connect(**db_params)
-    worker = SchedulerWorker(conn, poll_interval=poll_interval)
+    worker = SchedulerWorker(
+        conn, poll_interval=poll_interval, prio_ceiling=prio_ceiling
+    )
     worker.db_params = db_params  # enables reconnect after a lost connection
 
     loop = asyncio.get_running_loop()
@@ -980,7 +1021,16 @@ def main() -> None:
         show_default=True,
         help="Seconds between schedule polls",
     )
-    def cli(config: str, poll_interval: int) -> None:
+    @click.option(
+        "--max-prio",
+        default=None,
+        type=int,
+        help="The worker fleet's priority ceiling (`pj --max-prio`). A "
+        "schedule whose priority is above it is DISABLED at fire time "
+        "rather than minting jobs nobody will ever claim. Defaults to the "
+        "config file's prio_ceiling, else 1000.",
+    )
+    def cli(config: str, poll_interval: int, max_prio: int | None) -> None:
         """Run the recurring (cron) schedule executor.
 
         Polls jorb_schedule for due schedules and enqueues their jobs.
@@ -989,12 +1039,19 @@ def main() -> None:
         """
         from .configloader import load_config_from_file
 
-        cfg = load_config_from_file(config, keys=["db_params"])
+        cfg = load_config_from_file(config, keys=["db_params", "prio_ceiling"])
         db_params = cfg.get("db_params")
         if not db_params:
             raise click.ClickException(f"No db_params found in config: {config}")
 
-        asyncio.run(run_scheduler(db_params, poll_interval=poll_interval))
+        # precedence: explicit flag > config file's prio_ceiling > default
+        ceiling = max_prio if max_prio is not None else cfg.get("prio_ceiling")
+
+        asyncio.run(
+            run_scheduler(
+                db_params, poll_interval=poll_interval, prio_ceiling=ceiling
+            )
+        )
 
     cli()
 

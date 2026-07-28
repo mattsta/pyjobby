@@ -101,9 +101,9 @@ _ENQUEUE_SQL = """
         job_class, kwargs, queue, prio, run_after,
         capability, uid, run_group,
         waitfor_job, waitfor_group,
-        deadline_key, admin_data, tags, state
+        deadline_key, admin_data, tags, state, schedule_id
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
     RETURNING id
 """
 
@@ -978,6 +978,7 @@ class JobClient:
         on_timeout: str = "retry",
         prio_ceiling: int = DEFAULT_PRIO_CEILING,
         job_kwargs: dict[str, Any] | None = None,
+        schedule_id: int | None = None,
         **kwargs: Any,
     ) -> list[Any]:
         """Validate enqueue options and build the parameter row for
@@ -1073,6 +1074,7 @@ class JobClient:
             admin_data,  # Dict - custom codec handles conversion
             job_tags,  # Dict - custom codec handles conversion
             state,
+            schedule_id,
         ]
 
     async def enqueue_batch(
@@ -1150,14 +1152,14 @@ class JobClient:
                     job_class, kwargs, queue, prio, run_after,
                     capability, uid, run_group,
                     waitfor_job, waitfor_group,
-                    deadline_key, admin_data, tags, state
+                    deadline_key, admin_data, tags, state, schedule_id
                 )
                 SELECT * FROM UNNEST(
                     $1::text[], $2::jsonb[], $3::text[], $4::int[],
                     $5::timestamptz[], $6::text[], $7::bigint[],
                     $8::bigint[], $9::bigint[], $10::bigint[],
                     $11::text[], $12::jsonb[], $13::jsonb[],
-                    $14::jorbstate[]
+                    $14::jorbstate[], $15::bigint[]
                 )
                 RETURNING id
             """,

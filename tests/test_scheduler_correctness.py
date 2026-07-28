@@ -192,6 +192,43 @@ class TestGracefulShutdown:
             assert time.monotonic() - started < 5.0
 
 
+class TestFireTimeCeiling:
+    async def test_a_schedule_above_the_ceiling_is_disabled_not_spun(
+        self, db_connection
+    ):
+        """The scheduler mints a job per firing through the SHARED enqueue
+        path, so the fleet's priority ceiling is enforced at fire time — a
+        schedule above it used to stream unclaimable jobs forever with no
+        validation anywhere. Disabling with the reason (the unevaluatable-
+        cron treatment) beats one failure per poll forever."""
+        schedule_id = await _insert_schedule(db_connection, cron_expr="* * * * *")
+        await db_connection.execute(
+            "UPDATE jorb_schedule SET prio = 5000 WHERE id = $1", schedule_id
+        )
+        schedule = dict(
+            await db_connection.fetchrow(
+                "SELECT * FROM jorb_schedule WHERE id = $1", schedule_id
+            )
+        )
+
+        worker = SchedulerWorker(db_connection, prio_ceiling=1000)
+        result = await worker.execute_schedule(schedule)
+
+        assert result.result == "failure"
+        assert "ceiling" in (result.error_message or "")
+        row = await db_connection.fetchrow(
+            "SELECT enabled, failure_count FROM jorb_schedule WHERE id = $1",
+            schedule_id,
+        )
+        assert row["enabled"] is False
+        assert row["failure_count"] >= 1
+        # and no unclaimable job escaped
+        minted = await db_connection.fetchval(
+            "SELECT count(*) FROM jorb WHERE schedule_id = $1", schedule_id
+        )
+        assert minted == 0
+
+
 class TestConnectionRecovery:
     """A scheduler that stops firing after a database restart has failed at
     its one job. The loop reconnects with backoff instead."""
