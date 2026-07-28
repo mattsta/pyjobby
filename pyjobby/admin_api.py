@@ -43,6 +43,43 @@ DEFAULT_STUCK_AFTER_SECONDS = 300.0
 # once per DXE checkpoint.
 FOOTPRINT_TABLES = ("jorb", "jorb_history", "jorb_step")
 
+#: Queue statistics without reading each queue's whole history — one arm per
+#: partial index, the same construction the client and the websocket
+#: snapshot use. Live states are counted exactly; terminal states within a
+#: recency window ($1). "How many finished, EVER" is an audit question for
+#: SQL. $2 optionally narrows to one queue (NULL = all; written as an
+#: OR-NULL predicate, which trades the index *condition* for a filter over
+#: each partial index's bounded live set — acceptable for an admin call).
+#: oldest_queued_age is measured from run_after over RUNNABLE rows only: a
+#: job deferred to next week is not "old", and measuring from created made
+#: deliberate deferrals read as backlog age.
+ADMIN_QUEUE_STATS_SQL = """
+    SELECT queue, 'queued' AS state, COUNT(*)::bigint AS count,
+           EXTRACT(EPOCH FROM (now() - MIN(run_after)
+               FILTER (WHERE run_after <= now())))::float8
+               AS oldest_queued_age_seconds
+      FROM jorb
+     WHERE state = 'queued' AND ($2::text IS NULL OR queue = $2)
+     GROUP BY queue
+    UNION ALL
+    SELECT queue, state::text, COUNT(*)::bigint, NULL::float8
+      FROM jorb
+     WHERE state IN ('claimed', 'running') AND ($2::text IS NULL OR queue = $2)
+     GROUP BY queue, state
+    UNION ALL
+    SELECT queue, 'waiting', COUNT(*)::bigint, NULL::float8
+      FROM jorb
+     WHERE state = 'waiting' AND ($2::text IS NULL OR queue = $2)
+     GROUP BY queue
+    UNION ALL
+    SELECT queue, state::text, COUNT(*)::bigint, NULL::float8
+      FROM jorb
+     WHERE state IN ('finished', 'crashed', 'cancelled')
+       AND COALESCE(finished, updated) >= now() - $1::interval
+       AND ($2::text IS NULL OR queue = $2)
+     GROUP BY queue, state
+"""
+
 
 def _rate(count: int | None, window_seconds: float) -> float:
     """Per-second rate, comparable across window sizes.
@@ -503,35 +540,19 @@ class AdminAPI:
         Get statistics for queues, joined with the jorb_queue control plane
         so operators see paused/limits alongside depths.
 
+        Live states are counted exactly; finished/crashed/cancelled within
+        the LAST HOUR (recent activity, not an all-time audit — the all-time
+        count grows with the install's whole history and belongs to SQL).
+        oldest_queued_age_seconds covers RUNNABLE rows only: a job deferred
+        to next week is deliberately not old.
+
         Args:
             queue: Specific queue name, or None for all queues
 
         Returns:
             List of queue statistics dictionaries
         """
-        where_sql = ""
-        params = []
-
-        if queue:
-            where_sql = "WHERE queue = $1"
-            params.append(queue)
-
-        # Get counts by state for each queue
-        query = f"""
-            SELECT
-                queue,
-                state,
-                COUNT(*) as count,
-                MIN(CASE WHEN state = 'queued'
-                    THEN EXTRACT(EPOCH FROM (now() - created))
-                    ELSE NULL END) as oldest_queued_age_seconds
-            FROM jorb
-            {where_sql}
-            GROUP BY queue, state
-            ORDER BY queue, state
-        """
-
-        records = await self.conn.fetch(query, *params)
+        records = await self.conn.fetch(ADMIN_QUEUE_STATS_SQL, timedelta(hours=1), queue)
 
         # Aggregate by queue
         queue_stats_map: dict[str, QueueStats] = {}
@@ -565,8 +586,9 @@ class AdminAPI:
 
         # Merge in the control plane (a control row without jobs still shows)
         control_where = "WHERE name = $1" if queue else ""
+        control_args = [queue] if queue else []
         controls = await self.conn.fetch(
-            f"SELECT * FROM jorb_queue {control_where} ORDER BY name", *params
+            f"SELECT * FROM jorb_queue {control_where} ORDER BY name", *control_args
         )
         for c in controls:
             stats = queue_stats_map.setdefault(c["name"], QueueStats(queue=c["name"]))

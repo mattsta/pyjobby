@@ -23,6 +23,7 @@ import re
 import pytest
 
 from pyjobby import dxe
+from pyjobby.admin_api import ADMIN_QUEUE_STATS_SQL
 from pyjobby.client import JobClient
 from pyjobby.lifecycle import TERMINAL_STATES
 from pyjobby.monitor import (
@@ -39,6 +40,7 @@ from pyjobby.scheduler import BACKPRESSURE_COUNT_SQL, CONCURRENCY_COUNT_SQL
 from tests.utils.plans import (
     assert_no_seq_scan,
     assert_reads_far_less_than_a_scan,
+    buffers_in,
     plan_for,
     reset_job_tables,
     rows_removed_by_filter,
@@ -733,8 +735,30 @@ class TestClientQueueStatsPlan:
                WHERE state IN ('finished', 'crashed', 'cancelled')
                  AND COALESCE(finished, updated) >= now() - interval '1 hour'"""
         )
-        from tests.utils.plans import buffers_in
+        assert buffers_in(plan) <= recent * 2 + 100, (
+            f"{buffers_in(plan)} buffers for {recent} in-window rows\n{plan}"
+        )
 
+
+class TestAdminQueueStatsPlan:
+    """AdminAPI.queue_stats backs `pj-admin queues stats` and
+    /api/queues/stats — same contract and same construction as the client's:
+    live exact, terminal windowed, nothing shaped like the table."""
+
+    async def test_the_stats_read_no_history(self, db_pool, unique_queue):
+        await seed_terminal_jobs(db_pool, unique_queue)
+
+        plan = await plan_for(
+            db_pool, ADMIN_QUEUE_STATS_SQL, datetime.timedelta(hours=1), None
+        )
+
+        assert_no_seq_scan(plan)
+        assert rows_removed_by_filter(plan) <= 5, plan
+        recent = await db_pool.fetchval(
+            """SELECT count(*) FROM jorb
+               WHERE state IN ('finished', 'crashed', 'cancelled')
+                 AND COALESCE(finished, updated) >= now() - interval '1 hour'"""
+        )
         assert buffers_in(plan) <= recent * 2 + 100, (
             f"{buffers_in(plan)} buffers for {recent} in-window rows\n{plan}"
         )
