@@ -157,15 +157,33 @@ class PyjobbyCLI(click.Group):
             )
 
 
+#: Why a cancel/retry/rerun was refused, in the operator's words. The verbs
+#: answer with one refused status ('not_cancellable'/'not_retriable'/
+#: 'not_rerunnable') whether the job is missing or in a state the verb will
+#: not touch, so each message names BOTH possibilities and the states the
+#: verb does accept -- "no" without saying what would have worked is not an
+#: answer an operator can act on.
+NOT_CANCELLABLE = "cannot be cancelled (not found, or already terminal)"
+NOT_RETRIABLE = "cannot be retried (not found, or not crashed/cancelled)"
+NOT_RERUNNABLE = "cannot be rerun (not found, or not crashed, cancelled, or finished)"
+NOT_IN_DLQ = "is not in the DLQ (not found, or not crashed)"
+
+
 def report_cancel(result: dict[str, Any]) -> None:
     """Report a cancellation truthfully.
 
     db.cancel_job returns 'cancelled' when the job was stopped outright and
     'cancel_requested' when the request still has to reach a worker; saying
     "cancelled" for the second case tells operators a running job stopped
-    when it may not have.
+    when it may not have. A refused cancel is reported as an error line and
+    counted as a failure by the bulk caller, which exits non-zero once every
+    id has been reported; the single-job form fails immediately via fail(),
+    with the same message text.
     """
-    if result["status"] == "cancel_requested":
+    status = result["status"]
+    if status == "not_cancellable":
+        print_error(f"Job {result['job_id']} {NOT_CANCELLABLE}")
+    elif status == "cancel_requested":
         print_warning(
             f"Job {result['job_id']}: cancellation requested "
             f"(running — the worker stops it at its next await point)"
@@ -451,21 +469,21 @@ def jobs_retry(ctx: click.Context, job_ids: tuple[int, ...]) -> None:
 
             if len(job_ids) == 1:
                 # Single job
-                try:
-                    result = await api.retry_job(job_ids[0])
-                    print_success(f"Job {result['job_id']} requeued for retry")
-                except ValueError as e:
-                    print_error(str(e))
-                    sys.exit(1)
+                result = await api.retry_job(job_ids[0])
+                if result["status"] == "not_retriable":
+                    fail(f"Job {result['job_id']} {NOT_RETRIABLE}")
+                print_success(f"Job {result['job_id']} requeued for retry")
             else:
                 # Multiple jobs
                 results = await api.retry_jobs(list(job_ids))
-                success_count = sum(1 for r in results if r["status"] != "error")
+                success_count = sum(
+                    1 for r in results if r["status"] != "not_retriable"
+                )
                 error_count = len(results) - success_count
 
                 for result in results:
-                    if result["status"] == "error":
-                        print_error(f"Job {result['job_id']}: {result['error']}")
+                    if result["status"] == "not_retriable":
+                        print_error(f"Job {result['job_id']} {NOT_RETRIABLE}")
                     else:
                         print_success(f"Job {result['job_id']} requeued")
 
@@ -501,22 +519,20 @@ def jobs_cancel(ctx: click.Context, job_ids: tuple[int, ...]) -> None:
 
             if len(job_ids) == 1:
                 # Single job
-                try:
-                    result = await api.cancel_job(job_ids[0])
-                except ValueError as e:
-                    fail(str(e))
+                result = await api.cancel_job(job_ids[0])
+                if result["status"] == "not_cancellable":
+                    fail(f"Job {result['job_id']} {NOT_CANCELLABLE}")
                 report_cancel(result)
             else:
                 # Multiple jobs
                 results = await api.cancel_jobs(list(job_ids))
-                success_count = sum(1 for r in results if r["status"] != "error")
+                success_count = sum(
+                    1 for r in results if r["status"] != "not_cancellable"
+                )
                 error_count = len(results) - success_count
 
                 for result in results:
-                    if result["status"] == "error":
-                        print_error(f"Job {result['job_id']}: {result['error']}")
-                    else:
-                        report_cancel(result)
+                    report_cancel(result)
 
                 click.echo(f"\n{Colors.BOLD}Summary:{Colors.ENDC}")
                 print_success(f"  Cancelled: {success_count}")
@@ -734,10 +750,10 @@ def jobs_rerun(ctx: click.Context, job_id: int, resume: bool) -> None:
         try:
             api = AdminAPI(conn)
             result = await api.rerun_job(job_id, fresh=not resume)
+            if result["status"] == "not_rerunnable":
+                fail(f"Job {result['job_id']} {NOT_RERUNNABLE}")
             mode = "fresh restart" if result["fresh"] else "resume with checkpoints"
             print_success(f"Job {result['job_id']} requeued ({mode})")
-        except ValueError as e:
-            fail(str(e))
         finally:
             await conn.close()
 
@@ -1319,14 +1335,13 @@ def dlq_retry(ctx: click.Context, job_id: int) -> None:
         try:
             api = AdminAPI(conn)
             result = await api.retry_from_dlq(job_id)
+            if result["status"] == "not_retriable":
+                fail(f"Job {result['job_id']} {NOT_IN_DLQ}")
 
             print_success(
                 f"DLQ job {result['job_id']} requeued (error count reset to 0)"
             )
 
-        except ValueError as e:
-            print_error(str(e))
-            sys.exit(1)
         finally:
             await conn.close()
 

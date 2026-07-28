@@ -313,7 +313,10 @@ async def test_a_sync_loop_can_stop_itself_when_cancelled(
     )
     await wait_for_job_state(client.pool, job_id, ("running",))
 
-    assert await client.cancel_job(job_id) == "cancel_requested"
+    assert await client.cancel_job(job_id) == {
+        "job_id": job_id,
+        "status": "cancel_requested",
+    }
     row = await wait_for_job_state(client.pool, job_id, ("cancelled",))
     assert row["state"] == "cancelled"
 

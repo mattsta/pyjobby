@@ -311,17 +311,18 @@ class TestAdminAPIJobManagement:
 
     @pytest.mark.asyncio
     async def test_retry_job_not_found(self, db_pool):
-        """Test retrying non-existent job raises ValueError."""
+        """Test retrying non-existent job reports not_retriable."""
         async with db_pool.acquire() as conn:
             api = AdminAPI(conn)
 
-            with pytest.raises(ValueError) as excinfo:
-                await api.retry_job(99999999)
-            assert "not found" in str(excinfo.value)
+            assert await api.retry_job(99999999) == {
+                "job_id": 99999999,
+                "status": "not_retriable",
+            }
 
     @pytest.mark.asyncio
     async def test_retry_job_not_retriable(self, db_pool):
-        """Test retrying job in non-retriable state raises ValueError."""
+        """Test retrying job in non-retriable state reports not_retriable."""
         async with db_pool.acquire() as conn:
             api = AdminAPI(conn)
 
@@ -331,9 +332,12 @@ class TestAdminAPIJobManagement:
                 RETURNING id
             """)
 
-            with pytest.raises(ValueError) as excinfo:
-                await api.retry_job(job_id)
-            assert "running" in str(excinfo.value)
+            assert await api.retry_job(job_id) == {
+                "job_id": job_id,
+                "status": "not_retriable",
+            }
+            job = await api.get_job(job_id)
+            assert job["state"] == "running"
 
     @pytest.mark.asyncio
     async def test_retry_jobs_bulk(self, db_pool):
@@ -381,8 +385,8 @@ class TestAdminAPIJobManagement:
             assert len(results) == 2
             # First should succeed
             assert results[0] == {"job_id": crashed_id, "status": "requeued"}
-            # Second should fail
-            assert results[1]["status"] == "error"
+            # Second is refused, and the batch still reports every id
+            assert results[1] == {"job_id": running_id, "status": "not_retriable"}
 
     @pytest.mark.asyncio
     async def test_cancel_job(self, db_pool):
@@ -422,13 +426,14 @@ class TestAdminAPIJobManagement:
 
     @pytest.mark.asyncio
     async def test_cancel_job_not_found(self, db_pool):
-        """Test cancelling non-existent job raises ValueError."""
+        """Test cancelling non-existent job reports not_cancellable."""
         async with db_pool.acquire() as conn:
             api = AdminAPI(conn)
 
-            with pytest.raises(ValueError) as excinfo:
-                await api.cancel_job(99999999)
-            assert "not found" in str(excinfo.value)
+            assert await api.cancel_job(99999999) == {
+                "job_id": 99999999,
+                "status": "not_cancellable",
+            }
 
     @pytest.mark.asyncio
     async def test_cancel_running_job_requests_cancellation(self, db_pool):
@@ -450,8 +455,8 @@ class TestAdminAPIJobManagement:
             assert job["cancel_requested"] is True
 
     @pytest.mark.asyncio
-    async def test_cancel_job_terminal_raises(self, db_pool):
-        """Terminal jobs cannot be cancelled."""
+    async def test_cancel_job_terminal_is_not_cancellable(self, db_pool):
+        """Terminal jobs cannot be cancelled — reported, not raised."""
         async with db_pool.acquire() as conn:
             api = AdminAPI(conn)
 
@@ -461,9 +466,12 @@ class TestAdminAPIJobManagement:
                 RETURNING id
             """)
 
-            with pytest.raises(ValueError) as excinfo:
-                await api.cancel_job(job_id)
-            assert "cannot be cancelled" in str(excinfo.value)
+            assert await api.cancel_job(job_id) == {
+                "job_id": job_id,
+                "status": "not_cancellable",
+            }
+            job = await api.get_job(job_id)
+            assert job["state"] == "finished"
 
     @pytest.mark.asyncio
     async def test_cancel_jobs_bulk(self, db_pool):
@@ -956,13 +964,15 @@ class TestAdminAPIDLQ:
         async with db_pool.acquire() as conn:
             api = AdminAPI(conn)
 
-            with pytest.raises(ValueError) as excinfo:
-                await api.retry_from_dlq(99999999)
-            assert "not found" in str(excinfo.value)
+            assert await api.retry_from_dlq(99999999) == {
+                "job_id": 99999999,
+                "status": "not_retriable",
+            }
 
     @pytest.mark.asyncio
     async def test_retry_from_dlq_not_crashed(self, db_pool):
-        """Test retry from DLQ with non-crashed job."""
+        """A job that is not in the DLQ is refused — the DLQ is the crashed
+        jobs, and the refusal carries retry's own not_retriable status."""
         async with db_pool.acquire() as conn:
             api = AdminAPI(conn)
 
@@ -972,9 +982,12 @@ class TestAdminAPIDLQ:
                 RETURNING id
             """)
 
-            with pytest.raises(ValueError) as excinfo:
-                await api.retry_from_dlq(job_id)
-            assert "not in DLQ" in str(excinfo.value)
+            assert await api.retry_from_dlq(job_id) == {
+                "job_id": job_id,
+                "status": "not_retriable",
+            }
+            job = await api.get_job(job_id)
+            assert job["state"] == "queued"
 
 
 class TestAdminAPIScheduleManagement:

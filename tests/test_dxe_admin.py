@@ -282,8 +282,11 @@ async def test_requeue_resume_keeps_checkpoints_fresh_wipes_them(
         )
 
         # a queued job cannot be rerun again
-        with pytest.raises(ValueError, match="cannot"):
-            await api.rerun_job(job_id)
+        assert await api.rerun_job(job_id) == {
+            "job_id": job_id,
+            "status": "not_rerunnable",
+            "fresh": True,
+        }
 
         await api.resume_queue(unique_queue)
         row = await wait_for_job_state(db_pool, job_id, ("finished",), timeout=15)

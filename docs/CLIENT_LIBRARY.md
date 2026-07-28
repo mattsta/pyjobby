@@ -357,27 +357,40 @@ else:
 
 #### `cancel_job(job_id)`
 
-Cancel a queued or waiting job.
+Cancel a job wherever it is in its lifecycle. Returns `{"job_id", "status"}`
+with status `'cancelled'` (queued/waiting jobs stop immediately),
+`'cancel_requested'` (a running worker stops at its next await point), or
+`'not_cancellable'` — which is also the answer for a job that does not
+exist, since it is not running either way.
 
 ```python
-if await client.cancel_job(12345):
-    print("Job cancelled")
+result = await client.cancel_job(12345)
+if result["status"] == "not_cancellable":
+    print("Job not found or already terminal")
 else:
-    print("Job not found or already running")
+    print(f"Cancel: {result['status']}")
 ```
 
 #### `retry_job(job_id)`
 
 Retry a crashed or cancelled job. The job keeps its id — the same row is
-requeued and the per-attempt history lives in `jorb_history`. Returns the
-job id if it was requeued, or `None` if it was not in a retriable state (a
-job that already finished is not retriable; see `rerun_job`).
+requeued and the per-attempt history lives in `jorb_history`. Returns
+`{"job_id", "status"}` with status `'requeued'`, or `'not_retriable'` when
+the job is missing or in a state retry refuses (a job that already finished
+is not retriable; see `rerun_job`).
 
 ```python
-requeued = await client.retry_job(12345)
-if requeued:
-    print(f"Job {requeued} requeued")
+if (await client.retry_job(12345))["status"] == "requeued":
+    print("Job requeued")
 ```
+
+#### `rerun_job(job_id, *, fresh=True)`
+
+Run a terminal job again, including one that already finished (repeating its
+side effects). Returns `{"job_id", "status", "fresh"}` with status
+`'requeued'` or `'not_rerunnable'`; `fresh` echoes the mode asked for —
+`True` wipes DXE checkpoints and restarts from step 1, `False` resumes from
+them.
 
 ### Queue Operations
 

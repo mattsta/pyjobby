@@ -330,22 +330,34 @@ class TestJobsUnknownId:
         assert result.stdout == ""
 
     async def test_cancel_exits_one(self, dsn):
+        """cancel/retry/rerun answer one refusal for "missing" and "wrong
+        state" alike, so the message names both -- an operator must not have
+        to guess which one they hit."""
         result = await run_cli("--dsn", dsn, "jobs", "cancel", str(MISSING_ID))
 
         assert result.exit_code == 1
-        assert f"Error: Job {MISSING_ID} not found" in result.stderr
+        assert (
+            f"Error: Job {MISSING_ID} cannot be cancelled "
+            "(not found, or already terminal)" in result.stderr
+        )
 
     async def test_retry_exits_one(self, dsn):
         result = await run_cli("--dsn", dsn, "jobs", "retry", str(MISSING_ID))
 
         assert result.exit_code == 1
-        assert f"Error: Job {MISSING_ID} not found" in result.stderr
+        assert (
+            f"Error: Job {MISSING_ID} cannot be retried "
+            "(not found, or not crashed/cancelled)" in result.stderr
+        )
 
     async def test_rerun_exits_one(self, dsn):
         result = await run_cli("--dsn", dsn, "jobs", "rerun", str(MISSING_ID))
 
         assert result.exit_code == 1
-        assert f"Error: Job {MISSING_ID} not found" in result.stderr
+        assert (
+            f"Error: Job {MISSING_ID} cannot be rerun "
+            "(not found, or not crashed, cancelled, or finished)" in result.stderr
+        )
 
     async def test_rerun_resume_exits_one(self, dsn):
         result = await run_cli(
@@ -353,7 +365,10 @@ class TestJobsUnknownId:
         )
 
         assert result.exit_code == 1
-        assert f"Error: Job {MISSING_ID} not found" in result.stderr
+        assert (
+            f"Error: Job {MISSING_ID} cannot be rerun "
+            "(not found, or not crashed, cancelled, or finished)" in result.stderr
+        )
 
     async def test_delete_exits_one(self, dsn):
         result = await run_cli(
@@ -420,8 +435,8 @@ class TestJobsWrongState:
 
         assert result.exit_code == 1
         assert (
-            f"Error: Job {job_id} is in state '{state}' and cannot be cancelled"
-            in result.stderr
+            f"Error: Job {job_id} cannot be cancelled "
+            "(not found, or already terminal)" in result.stderr
         )
         assert (
             await db_pool.fetchval("SELECT state::text FROM jorb WHERE id = $1", job_id)
@@ -438,8 +453,8 @@ class TestJobsWrongState:
 
         assert result.exit_code == 1
         assert (
-            f"Error: Job {job_id} is in state '{state}', "
-            "can only retry crashed or cancelled jobs" in result.stderr
+            f"Error: Job {job_id} cannot be retried "
+            "(not found, or not crashed/cancelled)" in result.stderr
         )
 
     async def test_retry_crashed_job_succeeds(self, dsn, db_pool, unique_queue):
@@ -467,8 +482,8 @@ class TestJobsWrongState:
 
         assert result.exit_code == 1
         assert (
-            f"Error: Job {job_id} is in state '{state}' and cannot be rerun "
-            "(must be crashed, cancelled, or finished)" in result.stderr
+            f"Error: Job {job_id} cannot be rerun "
+            "(not found, or not crashed, cancelled, or finished)" in result.stderr
         )
 
     async def test_bulk_retry_exits_one_when_every_job_failed(self, dsn):
@@ -479,8 +494,8 @@ class TestJobsWrongState:
         result = await run_cli("--dsn", dsn, "jobs", "retry", str(a), str(b))
 
         assert result.exit_code == 1
-        assert f"Error: Job {a}: Job {a} not found" in result.stderr
-        assert f"Error: Job {b}: Job {b} not found" in result.stderr
+        assert f"Error: Job {a} cannot be retried" in result.stderr
+        assert f"Error: Job {b} cannot be retried" in result.stderr
         assert "Retried: 0" in result.output
         assert "Error:   Failed: 2" in result.stderr
 
@@ -512,8 +527,8 @@ class TestJobsWrongState:
         assert result.exit_code == 1
         assert f"Job {good} cancelled" in result.output
         assert (
-            f"Error: Job {done}: Job {done} is in state 'finished' and cannot "
-            "be cancelled" in result.stderr
+            f"Error: Job {done} cannot be cancelled "
+            "(not found, or already terminal)" in result.stderr
         )
         assert "Cancelled: 1" in result.output
         assert "Error:   Failed: 1" in result.stderr
@@ -585,7 +600,10 @@ class TestDlq:
         result = await run_cli("--dsn", dsn, "dlq", "retry", str(MISSING_ID))
 
         assert result.exit_code == 1
-        assert f"Error: Job {MISSING_ID} not found" in result.stderr
+        assert (
+            f"Error: Job {MISSING_ID} is not in the DLQ (not found, or not crashed)"
+            in result.stderr
+        )
 
     @pytest.mark.parametrize("state", ["queued", "running", "finished", "cancelled"])
     async def test_retry_job_that_is_not_crashed_exits_one(
@@ -596,7 +614,10 @@ class TestDlq:
         result = await run_cli("--dsn", dsn, "dlq", "retry", str(job_id))
 
         assert result.exit_code == 1
-        assert f"Error: Job {job_id} is not in DLQ (state: {state})" in result.stderr
+        assert (
+            f"Error: Job {job_id} is not in the DLQ (not found, or not crashed)"
+            in result.stderr
+        )
         assert (
             await db_pool.fetchval("SELECT state::text FROM jorb WHERE id = $1", job_id)
             == state

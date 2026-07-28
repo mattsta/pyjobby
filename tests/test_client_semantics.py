@@ -11,6 +11,8 @@ Covered:
   results, not "no result"
 - get_job_result() and wait_for_result() must agree about the same job
 - bulk_cancel() is cancel_job() applied to a list (running jobs included)
+- cancel/retry/rerun answer {job_id, status} whether or not they happened —
+  a missing job is a refused status, not an exception
 - a closed client opens nothing new (no leaked LISTEN connection)
 - an unstorable argument is the enqueuer's error, not a worker's
 - a priority above the workers' claim ceiling is refused at every door
@@ -203,6 +205,65 @@ class TestBulkCancel:
 
         assert await client.bulk_cancel([job_id, job_id + 10_000_000]) == 0
         assert (await client.get_job(job_id)).state == "finished"
+
+
+# ---------------------------------------------------------------------------
+# Refused cancel/retry/rerun
+# ---------------------------------------------------------------------------
+
+
+class TestRefusedVerbsAnswerInTheSameShape:
+    """cancel/retry/rerun answer with {job_id, status} whatever happens.
+
+    A job that is missing and a job in a state the verb will not touch are
+    the SAME answer -- "this did not happen" -- so an application reads one
+    key instead of catching an exception for one case and testing a value
+    for the other.
+    """
+
+    MISSING_ID = 2**62
+
+    async def test_cancel_of_a_missing_job_is_not_cancellable(self, client):
+        assert await client.cancel_job(self.MISSING_ID) == {
+            "job_id": self.MISSING_ID,
+            "status": "not_cancellable",
+        }
+
+    async def test_retry_of_a_missing_job_is_not_retriable(self, client):
+        assert await client.retry_job(self.MISSING_ID) == {
+            "job_id": self.MISSING_ID,
+            "status": "not_retriable",
+        }
+
+    async def test_rerun_of_a_missing_job_is_not_rerunnable(self, client):
+        """The refusal still echoes `fresh`: the caller's request is reported
+        back whether or not it ran."""
+        assert await client.rerun_job(self.MISSING_ID, fresh=False) == {
+            "job_id": self.MISSING_ID,
+            "status": "not_rerunnable",
+            "fresh": False,
+        }
+
+    async def test_queued_job_is_refused_by_retry_and_rerun_alike(
+        self, client, unique_queue
+    ):
+        """A live job is neither retriable (it has not failed) nor rerunnable
+        (it has not finished), and neither refusal touches it."""
+        job_id = await client.enqueue("tests.dxe_jobs.OkJob", queue=unique_queue, x=1)
+
+        assert (await client.retry_job(job_id))["status"] == "not_retriable"
+        assert (await client.rerun_job(job_id))["status"] == "not_rerunnable"
+        assert (await client.get_job(job_id)).state == "queued"
+
+    async def test_cancel_and_wait_still_answers_with_a_state(
+        self, client, unique_queue
+    ):
+        """cancel_and_wait is the exception: it reports the job's STATE, not
+        the dict, and None when there was nothing to cancel."""
+        job_id = await client.enqueue("tests.dxe_jobs.OkJob", queue=unique_queue, x=1)
+
+        assert await client.cancel_and_wait(job_id) == "cancelled"
+        assert await client.cancel_and_wait(self.MISSING_ID) is None
 
 
 # ---------------------------------------------------------------------------

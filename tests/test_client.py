@@ -345,7 +345,7 @@ class TestJobClientJobManagement:
         # Cancel: queued jobs are cancelled immediately
         result = await client.cancel_job(job_id)
 
-        assert result == "cancelled"
+        assert result == {"job_id": job_id, "status": "cancelled"}
 
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow("SELECT state FROM jorb WHERE id = $1", job_id)
@@ -353,12 +353,13 @@ class TestJobClientJobManagement:
 
     @pytest.mark.asyncio
     async def test_cancel_job_not_found(self, db_pool):
-        """Test cancel_job with non-existent ID."""
+        """A job that does not exist is 'not_cancellable', not an exception
+        and not a different shape: callers read one key on every outcome."""
         client = JobClient(db_pool)
 
         result = await client.cancel_job(-99999)
 
-        assert result is None
+        assert result == {"job_id": -99999, "status": "not_cancellable"}
 
     @pytest.mark.asyncio
     async def test_retry_job(self, db_pool):
@@ -375,9 +376,9 @@ class TestJobClientJobManagement:
             )
 
         # Retry requeues the SAME row: job identity is stable across retries
-        requeued_id = await client.retry_job(job_id)
+        result = await client.retry_job(job_id)
 
-        assert requeued_id == job_id
+        assert result == {"job_id": job_id, "status": "requeued"}
 
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)

@@ -736,11 +736,16 @@ Method groups, all `async`:
   `update_schedule`, `delete_schedule`, `enable_schedule`,
   `disable_schedule`, `get_schedule_history`, `get_schedule_stats`.
 
-Two shapes are worth stating because they are easy to assume wrong:
+Three shapes are worth stating because they are easy to assume wrong:
 
 * `retry_job` and `retry_from_dlq` return the **same** `job_id` they were
   given. A retry requeues the row a job has had since it was enqueued;
   there is no new id to follow.
+* `cancel_job`, `retry_job`, `rerun_job` and `retry_from_dlq` always return
+  `{"job_id", "status"}` and never raise for a job they will not touch: a
+  missing job and a job in a refusing state are the same `'not_cancellable'`
+  / `'not_retriable'` / `'not_rerunnable'` answer. The bulk forms
+  (`cancel_jobs`, `retry_jobs`) return one such dict per id, in order.
 * `list_dlq()` is `state = 'crashed'`, ordered by `updated`. It is not
   filtered on an error count.
 

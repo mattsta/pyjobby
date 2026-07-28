@@ -1087,23 +1087,37 @@ class WebAdminServer:
         """Retry a job (404 if it does not exist, 400 if its state forbids it)"""
         job_id = _path_id(request, "job_id")
         async with self.api() as api:
-            await self._job_or_404(api, job_id)
-            try:
-                result = await api.retry_job(job_id)
-                return web.json_response(result)
-            except ValueError as e:
-                return web.json_response({"error": str(e)}, status=400)
+            job = await self._job_or_404(api, job_id)
+            result = await api.retry_job(job_id)
+            if result["status"] == "not_retriable":
+                # the job exists (404 already ruled absence out), so the only
+                # thing left is a state the retry verb refuses
+                return web.json_response(
+                    {
+                        "error": f"Job {job_id} is in state '{job['state']}', "
+                        f"can only retry crashed or cancelled jobs"
+                    },
+                    status=400,
+                )
+            return web.json_response(result)
 
     async def api_job_cancel(self, request: web.Request) -> web.Response:
         """Cancel a job (404 if it does not exist, 400 if it is terminal)"""
         job_id = _path_id(request, "job_id")
         async with self.api() as api:
-            await self._job_or_404(api, job_id)
-            try:
-                result = await api.cancel_job(job_id)
-                return web.json_response(result)
-            except ValueError as e:
-                return web.json_response({"error": str(e)}, status=400)
+            job = await self._job_or_404(api, job_id)
+            result = await api.cancel_job(job_id)
+            if result["status"] == "not_cancellable":
+                # the job exists (404 already ruled absence out), so it is
+                # terminal
+                return web.json_response(
+                    {
+                        "error": f"Job {job_id} is in state '{job['state']}' "
+                        f"and cannot be cancelled"
+                    },
+                    status=400,
+                )
+            return web.json_response(result)
 
     async def api_job_delete(self, request: web.Request) -> web.Response:
         """Delete a job"""
@@ -1372,11 +1386,15 @@ class WebAdminServer:
         """
         job_id = _path_id(request, "job_id")
         async with self.api() as api:
-            await self._job_or_404(api, job_id)
-            try:
-                result = await api.retry_from_dlq(job_id)
-            except ValueError as e:
-                return web.json_response({"error": str(e)}, status=400)
+            job = await self._job_or_404(api, job_id)
+            result = await api.retry_from_dlq(job_id)
+            if result["status"] == "not_retriable":
+                # the job exists (404 already ruled absence out), so it is
+                # simply not a DLQ job
+                return web.json_response(
+                    {"error": f"Job {job_id} is not in DLQ (state: {job['state']})"},
+                    status=400,
+                )
             if request.query.get("format") == "html":
                 # Refresh the DLQ table for htmx buttons
                 jobs = await api.list_dlq(limit=100)

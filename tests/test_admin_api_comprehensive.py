@@ -321,7 +321,7 @@ class TestAdminAPIJobManagement:
 
     @pytest.mark.asyncio
     async def test_retry_job_invalid_state(self, db_pool):
-        """Test retrying a job in invalid state raises error."""
+        """Test retrying a job in invalid state is refused, not raised."""
         api = AdminAPI(db_pool)
 
         async with db_pool.acquire() as conn:
@@ -339,10 +339,10 @@ class TestAdminAPIJobManagement:
                 100,
             )
 
-        with pytest.raises(
-            ValueError, match="can only retry crashed or cancelled jobs"
-        ):
-            await api.retry_job(job_id)
+        assert await api.retry_job(job_id) == {
+            "job_id": job_id,
+            "status": "not_retriable",
+        }
 
     @pytest.mark.asyncio
     async def test_cancel_job_queued(self, db_pool):
@@ -997,18 +997,21 @@ class TestAdminAPIDLQ:
                 15,
             )
 
-        with pytest.raises(ValueError, match="is not in DLQ"):
-            await api.retry_from_dlq(job_id)
+        assert await api.retry_from_dlq(job_id) == {
+            "job_id": job_id,
+            "status": "not_retriable",
+        }
 
     @pytest.mark.asyncio
     async def test_retry_from_dlq_job_not_found(self, db_pool):
-        """Test retry_from_dlq raises error when job doesn't exist."""
+        """Test retry_from_dlq refuses a job that doesn't exist."""
         async with db_pool.acquire() as conn:
             api = AdminAPI(conn)
 
-            # Try to retry non-existent job - covers line 731
-            with pytest.raises(ValueError, match="Job 999999 not found"):
-                await api.retry_from_dlq(999999)
+            assert await api.retry_from_dlq(999999) == {
+                "job_id": 999999,
+                "status": "not_retriable",
+            }
 
 
 # =============================================================================
@@ -1969,8 +1972,10 @@ class TestAdminAPIErrorPaths:
         """Test retry_job with non-existent job ID."""
         api = AdminAPI(db_pool)
 
-        with pytest.raises(ValueError, match="Job .* not found"):
-            await api.retry_job(999999)
+        assert await api.retry_job(999999) == {
+            "job_id": 999999,
+            "status": "not_retriable",
+        }
 
     @pytest.mark.asyncio
     async def test_retry_job_wrong_state(self, db_pool):
@@ -1992,19 +1997,21 @@ class TestAdminAPIErrorPaths:
                 100,
             )
 
-        with pytest.raises(
-            ValueError, match="can only retry crashed or cancelled jobs"
-        ):
-            await api.retry_job(job_id)
+        assert await api.retry_job(job_id) == {
+            "job_id": job_id,
+            "status": "not_retriable",
+        }
 
     @pytest.mark.asyncio
     async def test_cancel_job_not_found(self, db_pool):
         """Test cancel_job with non-existent job ID."""
         api = AdminAPI(db_pool)
 
-        # cancel_job raises ValueError when job not found
-        with pytest.raises(ValueError, match="Job .* not found"):
-            await api.cancel_job(999999)
+        # a missing job is not_cancellable, not an exception
+        assert await api.cancel_job(999999) == {
+            "job_id": 999999,
+            "status": "not_cancellable",
+        }
 
     @pytest.mark.asyncio
     async def test_cancel_job_wrong_state(self, db_pool):
@@ -2026,9 +2033,11 @@ class TestAdminAPIErrorPaths:
                 100,
             )
 
-        # Should raise ValueError for terminal state
-        with pytest.raises(ValueError, match="cannot be cancelled"):
-            await api.cancel_job(job_id)
+        # A terminal state is refused, with the refusal in the status
+        assert await api.cancel_job(job_id) == {
+            "job_id": job_id,
+            "status": "not_cancellable",
+        }
 
     @pytest.mark.asyncio
     async def test_retry_jobs_bulk_with_errors(self, db_pool):
@@ -2051,16 +2060,15 @@ class TestAdminAPIErrorPaths:
                 100,
             )
 
-        # Mix valid and invalid IDs - this will trigger error path (lines 288-289)
+        # Mix valid and invalid IDs - the batch reports every id
         results = await api.retry_jobs([valid_id, 999999, 999998])
 
         assert len(results) == 3
         # First should succeed (same-row requeue)
         assert results[0] == {"job_id": valid_id, "status": "requeued"}
-        # Second and third should be errors
-        assert results[1]["status"] == "error"
-        assert "not found" in results[1]["error"].lower()
-        assert results[2]["status"] == "error"
+        # Missing ids are refused, in place, with retry's own refusal status
+        assert results[1] == {"job_id": 999999, "status": "not_retriable"}
+        assert results[2] == {"job_id": 999998, "status": "not_retriable"}
 
     @pytest.mark.asyncio
     async def test_delete_jobs_no_filters(self, db_pool):
@@ -2142,18 +2150,14 @@ class TestAdminAPIErrorPaths:
         # job2 (waiting) is cancelled immediately
         assert results[1] == {"job_id": job2, "status": "cancelled"}
 
-        # 999999 (invalid) errors
-        assert results[2]["status"] == "error"
-        assert results[2]["job_id"] == 999999
-        assert "error" in results[2]
+        # 999999 (invalid) is refused in place
+        assert results[2] == {"job_id": 999999, "status": "not_cancellable"}
 
         # job3 (running) gets a cancellation request delivered
         assert results[3] == {"job_id": job3, "status": "cancel_requested"}
 
-        # job4 (finished) is terminal: error
-        assert results[4]["status"] == "error"
-        assert results[4]["job_id"] == job4
-        assert "error" in results[4]
+        # job4 (finished) is terminal: the same refusal as a missing job
+        assert results[4] == {"job_id": job4, "status": "not_cancellable"}
 
     @pytest.mark.asyncio
     async def test_delete_jobs_by_queue(self, db_pool):

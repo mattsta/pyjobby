@@ -174,18 +174,24 @@ class TestJobManagement:
         assert job["error_message"] is None
 
     async def test_retry_job_not_retriable(self, admin_api, db_connection):
-        """Test retrying a job in non-retriable state"""
+        """A job in a non-retriable state is REPORTED, not raised about"""
         # Create running job
         job_id = await create_test_job(db_connection, state="running")
 
-        # Attempt retry
-        with pytest.raises(ValueError, match="can only retry crashed or cancelled"):
-            await admin_api.retry_job(job_id)
+        result = await admin_api.retry_job(job_id)
+
+        assert result == {"job_id": job_id, "status": "not_retriable"}
+        # ...and the job is untouched
+        job = await admin_api.get_job(job_id)
+        assert job["state"] == "running"
 
     async def test_retry_job_not_found(self, admin_api):
-        """Test retrying non-existent job"""
-        with pytest.raises(ValueError, match="not found"):
-            await admin_api.retry_job(999999)
+        """A missing job is the same 'not_retriable' answer, not an exception:
+        absence and a refusing state both mean "this job was not requeued"."""
+        assert await admin_api.retry_job(999999) == {
+            "job_id": 999999,
+            "status": "not_retriable",
+        }
 
     async def test_retry_jobs_bulk(self, admin_api, db_connection):
         """Test bulk retry of multiple jobs"""
@@ -243,12 +249,25 @@ class TestJobManagement:
         assert job["state"] == "running"
         assert job["cancel_requested"] is True
 
-    async def test_cancel_job_terminal_raises(self, admin_api, db_connection):
-        """Terminal jobs cannot be cancelled"""
+    async def test_cancel_job_terminal_is_not_cancellable(
+        self, admin_api, db_connection
+    ):
+        """Terminal jobs cannot be cancelled — reported, not raised"""
         job_id = await create_test_job(db_connection, state="finished")
 
-        with pytest.raises(ValueError, match="cannot be cancelled"):
-            await admin_api.cancel_job(job_id)
+        result = await admin_api.cancel_job(job_id)
+
+        assert result == {"job_id": job_id, "status": "not_cancellable"}
+        job = await admin_api.get_job(job_id)
+        assert job["state"] == "finished"
+
+    async def test_cancel_job_not_found(self, admin_api):
+        """A missing job is 'not_cancellable' too: it is not running either
+        way, so absence is not an exception on this verb."""
+        assert await admin_api.cancel_job(999999) == {
+            "job_id": 999999,
+            "status": "not_cancellable",
+        }
 
     async def test_cancel_jobs_bulk(self, admin_api, db_connection):
         """Test bulk cancellation"""
@@ -272,8 +291,8 @@ class TestJobManagement:
         # Running gets a cancellation request delivered to its worker
         assert results[2]["status"] == "cancel_requested"
 
-        # Terminal jobs fail
-        assert results[3]["status"] == "error"
+        # Terminal jobs are refused, with the same status the single verb uses
+        assert results[3] == {"job_id": finished_id, "status": "not_cancellable"}
 
     async def test_delete_job(self, admin_api, db_connection):
         """Test deleting a job"""

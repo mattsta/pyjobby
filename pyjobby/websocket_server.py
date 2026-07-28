@@ -831,8 +831,12 @@ class WebSocketServer:
                 # shared cancel path: immediate for queued/waiting, delivered
                 # to the executing worker for claimed/running
                 outcome = await db.cancel_job(conn, job_id)
+                # the shared {job_id, status} shape, sent through as the
+                # event payload so this surface says what the client and
+                # admin API say
+                result = {"job_id": job_id, "status": outcome or "not_cancellable"}
 
-                if outcome is None:
+                if result["status"] == "not_cancellable":
                     await self.send_error(
                         ws, f"Job {job_id} not found or cannot be cancelled"
                     )
@@ -842,10 +846,10 @@ class WebSocketServer:
                         {
                             "event": "job_cancelled",
                             "timestamp": datetime.now(UTC).isoformat(),
-                            "data": {"job_id": job_id, "status": outcome},
+                            "data": result,
                         },
                     )
-                    logger.info(f"Job {job_id} cancel outcome: {outcome}")
+                    logger.info(f"Job {job_id} cancel outcome: {result['status']}")
 
         except Exception as e:
             logger.error(f"Error cancelling job: {e}")
@@ -874,18 +878,19 @@ class WebSocketServer:
                 # opposite answers to the same button, so the payload must
                 # say which one happened.
                 requeued = await db.rerun_job(conn, job_id, fresh=True)
+                result = {
+                    "job_id": job_id,
+                    "status": "requeued" if requeued else "not_rerunnable",
+                    "fresh": True,
+                }
 
-                if requeued:
+                if result["status"] == "requeued":
                     await self.send_to_client(
                         ws,
                         {
                             "event": "job_rerun",
                             "timestamp": datetime.now(UTC).isoformat(),
-                            "data": {
-                                "job_id": job_id,
-                                "status": "requeued",
-                                "fresh": True,
-                            },
+                            "data": result,
                         },
                     )
                     logger.info(f"Job {job_id} requeued via WebSocket")

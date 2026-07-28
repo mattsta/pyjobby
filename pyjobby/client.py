@@ -271,7 +271,7 @@ class JobHandle:
         get_job_result()."""
         return await self.client.wait_for_result(self.id, timeout=timeout)
 
-    async def cancel(self) -> str | None:
+    async def cancel(self) -> dict[str, Any]:
         """Cancel the job; see JobClient.cancel_job()."""
         return await self.client.cancel_job(self.id)
 
@@ -431,7 +431,7 @@ class MachineHandle:
         """Wait for the machine to reach a final state and return its result."""
         return await self.client.wait_for_result(self.id, timeout=timeout)
 
-    async def cancel(self) -> str | None:
+    async def cancel(self) -> dict[str, Any]:
         """Stop the machine wherever it is. Its last state stays published."""
         return await self.client.cancel_job(self.id)
 
@@ -1281,7 +1281,7 @@ class JobClient:
 
         return JobInfo(**dict(row))
 
-    async def cancel_job(self, job_id: int) -> str | None:
+    async def cancel_job(self, job_id: int) -> dict[str, Any]:
         """
         Cancel a job wherever it is in its lifecycle.
 
@@ -1293,16 +1293,20 @@ class JobClient:
             job_id: Job ID
 
         Returns:
-            'cancelled' (done now), 'cancel_requested' (running; delivery in
-            progress), or None (not found / already terminal)
+            {"job_id", "status"} where status is 'cancelled' (done now),
+            'cancel_requested' (running; delivery in progress), or
+            'not_cancellable'. A job that does not exist is
+            'not_cancellable' too, not an exception: the caller asked for
+            the job to be stopped, and it is not running either way.
 
         Example:
-            outcome = await client.cancel_job(12345)
-            if outcome:
-                print(f"Cancel: {outcome}")
+            result = await client.cancel_job(12345)
+            if result["status"] != "not_cancellable":
+                print(f"Cancel: {result['status']}")
         """
         async with self.pool.acquire() as conn:
-            return await db.cancel_job(conn, job_id)
+            outcome = await db.cancel_job(conn, job_id)
+        return {"job_id": job_id, "status": outcome or "not_cancellable"}
 
     #: cancel_and_wait's default wait when the caller passes none. Finite on
     #: purpose: cancellation lands at the worker's next await point, and a job
@@ -1329,23 +1333,26 @@ class JobClient:
                 await point, and waiting forever for it would hang the caller.
 
         Returns:
-            The job's terminal state, or -- if the wait elapses before the
-            cancel lands -- its current NON-terminal state ('running',
-            'claimed'), which tells the caller the request is still in flight.
-            None only when there was nothing to cancel or the job has since
-            been deleted. Never raises TimeoutError: a timeout is reported as
-            the still-live state, not as an exception.
+            A STATE string, not the {job_id, status} dict cancel_job()
+            returns: the job's terminal state, or -- if the wait elapses
+            before the cancel lands -- its current NON-terminal state
+            ('running', 'claimed'), which tells the caller the request is
+            still in flight. None only when there was nothing to cancel or
+            the job has since been deleted. Never raises TimeoutError: a
+            timeout is reported as the still-live state, not as an exception.
         """
-        outcome = await self.cancel_job(job_id)
-        if outcome is None or outcome == "cancelled":
-            return outcome
+        status = (await self.cancel_job(job_id))["status"]
+        if status == "not_cancellable":
+            return None
+        if status == "cancelled":
+            return "cancelled"
         wait = self._CANCEL_WAIT_TIMEOUT if timeout is None else timeout
         with contextlib.suppress(JobError, TimeoutError):
             await self.wait_for_result(job_id, timeout=wait)
         info = await self.get_job(job_id)
         return info.state if info else None
 
-    async def rerun_job(self, job_id: int, *, fresh: bool = True) -> int | None:
+    async def rerun_job(self, job_id: int, *, fresh: bool = True) -> dict[str, Any]:
         """
         RE-RUN a terminal job — including one that already FINISHED, whose
         side effects it will repeat. Asked for by name, never implied:
@@ -1355,14 +1362,20 @@ class JobClient:
         step 1). Pass fresh=False to RESUME an interrupted durable job from
         its recorded checkpoints instead.
 
-        Returns the job id if requeued, or None if it was not in a terminal
-        state.
+        Returns:
+            {"job_id", "status", "fresh"} where status is 'requeued' or
+            'not_rerunnable' (not in a terminal state, or no such job);
+            `fresh` reports which mode was asked for.
         """
         async with self.pool.acquire() as conn:
             requeued = await db.rerun_job(conn, job_id, fresh=fresh)
-        return requeued
+        return {
+            "job_id": job_id,
+            "status": "requeued" if requeued else "not_rerunnable",
+            "fresh": fresh,
+        }
 
-    async def retry_job(self, job_id: int) -> int | None:
+    async def retry_job(self, job_id: int) -> dict[str, Any]:
         """
         Retry a job that did not succeed (crashed or cancelled).
 
@@ -1377,16 +1390,20 @@ class JobClient:
             job_id: Job ID to retry
 
         Returns:
-            The job id if requeued, or None if it wasn't retriable
+            {"job_id", "status"} where status is 'requeued' or
+            'not_retriable' (wrong state, or no such job)
 
         Example:
-            if await client.retry_job(12345):
+            if (await client.retry_job(12345))["status"] == "requeued":
                 print("Job requeued")
         """
         async with self.pool.acquire() as conn:
             requeued = await db.retry_job(conn, job_id)
 
-        return requeued
+        return {
+            "job_id": job_id,
+            "status": "requeued" if requeued else "not_retriable",
+        }
 
     # =========================================================================
     # Waiting on jobs (LISTEN/NOTIFY with polling fallback)
@@ -2911,20 +2928,20 @@ class SyncJobClient:
         """Synchronous JobClient.wait_for_result()."""
         return self._run(self._client.wait_for_result(job_id, timeout=timeout))
 
-    def cancel_job(self, job_id: int) -> str | None:
+    def cancel_job(self, job_id: int) -> dict[str, Any]:
         """Synchronous JobClient.cancel_job()."""
-        outcome: str | None = self._run(self._client.cancel_job(job_id))
-        return outcome
+        result: dict[str, Any] = self._run(self._client.cancel_job(job_id))
+        return result
 
-    def retry_job(self, job_id: int) -> int | None:
+    def retry_job(self, job_id: int) -> dict[str, Any]:
         """Synchronous JobClient.retry_job()."""
-        requeued: int | None = self._run(self._client.retry_job(job_id))
-        return requeued
+        result: dict[str, Any] = self._run(self._client.retry_job(job_id))
+        return result
 
-    def rerun_job(self, job_id: int, *, fresh: bool = True) -> int | None:
+    def rerun_job(self, job_id: int, *, fresh: bool = True) -> dict[str, Any]:
         """Synchronous JobClient.rerun_job()."""
-        requeued: int | None = self._run(self._client.rerun_job(job_id, fresh=fresh))
-        return requeued
+        result: dict[str, Any] = self._run(self._client.rerun_job(job_id, fresh=fresh))
+        return result
 
     def get_event(self, job_id: int, key: str, timeout: float | None = None) -> Any:
         """Synchronous JobClient.get_event()."""

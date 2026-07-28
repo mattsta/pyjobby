@@ -339,26 +339,18 @@ class AdminAPI:
             job_id: ID of job to retry
 
         Returns:
-            Dictionary with job_id and status
-
-        Raises:
-            ValueError: If job not found or not in retriable state
+            {"job_id", "status"} where status is 'requeued' or
+            'not_retriable'. A job that does not exist is 'not_retriable'
+            too: absence and a state that forbids the retry are the same
+            answer to the caller ("this job was not requeued"), and neither
+            is an exception.
         """
-        # Check if job exists and is in a retriable state
-        job = await self.conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
+        requeued = await db.retry_job(self.conn, job_id)
 
-        if not job:
-            raise ValueError(f"Job {job_id} not found")
-
-        if job["state"] not in ["crashed", "cancelled"]:
-            raise ValueError(
-                f"Job {job_id} is in state '{job['state']}', "
-                f"can only retry crashed or cancelled jobs"
-            )
-
-        await db.retry_job(self.conn, job_id)
-
-        return {"job_id": job_id, "status": "requeued"}
+        return {
+            "job_id": job_id,
+            "status": "requeued" if requeued else "not_retriable",
+        }
 
     async def retry_jobs(self, job_ids: list[int]) -> list[dict[str, Any]]:
         """
@@ -368,16 +360,10 @@ class AdminAPI:
             job_ids: List of job IDs to retry
 
         Returns:
-            List of retry results
+            One retry_job() result per id, in order — refusals carry
+            status 'not_retriable' rather than interrupting the batch
         """
-        results = []
-        for job_id in job_ids:
-            try:
-                result = await self.retry_job(job_id)
-                results.append(result)
-            except ValueError as e:
-                results.append({"job_id": job_id, "status": "error", "error": str(e)})
-        return results
+        return [await self.retry_job(job_id) for job_id in job_ids]
 
     async def cancel_job(self, job_id: int) -> dict[str, Any]:
         """
@@ -390,25 +376,14 @@ class AdminAPI:
             job_id: ID of job to cancel
 
         Returns:
-            Dictionary with job_id and status ('cancelled' or
-            'cancel_requested')
-
-        Raises:
-            ValueError: If job not found or already terminal
+            {"job_id", "status"} where status is 'cancelled',
+            'cancel_requested', or 'not_cancellable'. A job that does not
+            exist is 'not_cancellable' too, not an exception: it is not
+            running either way.
         """
         outcome = await db.cancel_job(self.conn, job_id)
 
-        if outcome is None:
-            job = await self.conn.fetchrow(
-                "SELECT id, state FROM jorb WHERE id = $1", job_id
-            )
-            if not job:
-                raise ValueError(f"Job {job_id} not found")
-            raise ValueError(
-                f"Job {job_id} is in state '{job['state']}' and cannot be cancelled"
-            )
-
-        return {"job_id": job_id, "status": outcome}
+        return {"job_id": job_id, "status": outcome or "not_cancellable"}
 
     async def cancel_jobs(self, job_ids: list[int]) -> list[dict[str, Any]]:
         """
@@ -418,16 +393,10 @@ class AdminAPI:
             job_ids: List of job IDs to cancel
 
         Returns:
-            List of cancellation results
+            One cancel_job() result per id, in order — refusals carry
+            status 'not_cancellable' rather than interrupting the batch
         """
-        results = []
-        for job_id in job_ids:
-            try:
-                result = await self.cancel_job(job_id)
-                results.append(result)
-            except ValueError as e:
-                results.append({"job_id": job_id, "status": "error", "error": str(e)})
-        return results
+        return [await self.cancel_job(job_id) for job_id in job_ids]
 
     async def delete_job(self, job_id: int) -> bool:
         """
@@ -1382,24 +1351,22 @@ class AdminAPI:
             job_id: ID of DLQ (crashed) job to retry
 
         Returns:
-            Dictionary with job_id and status
+            {"job_id", "status"} where status is 'requeued_from_dlq', or
+            'not_retriable' when the job is not in the DLQ (not crashed, or
+            no such job) — the same refusal shape as retry_job()
         """
         # Same as regular retry, but errors reset to zero (fresh attempt
-        # budget for the operator-driven re-run)
-        job = await self.conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-
-        if not job:
-            raise ValueError(f"Job {job_id} not found")
-
-        if job["state"] != "crashed":
-            raise ValueError(f"Job {job_id} is not in DLQ (state: {job['state']})")
-
-        await db.requeue_job(
+        # budget for the operator-driven re-run) and the guard is narrower:
+        # the DLQ is the crashed jobs, so a cancelled job is not in it.
+        requeued = await db.requeue_job(
             self.conn,
             job_id,
             reset_errors=True,
             allowed_states=("crashed",),  # DLQ is crashed by definition
         )
+
+        if requeued is None:
+            return {"job_id": job_id, "status": "not_retriable"}
 
         return {"job_id": job_id, "status": "requeued_from_dlq"}
 
@@ -1490,28 +1457,17 @@ class AdminAPI:
                 the recorded checkpoints
 
         Returns:
-            {"job_id", "status": "requeued", "fresh"} — `fresh` reports
-            which mode actually ran
-
-        Raises:
-            ValueError: If job not found or not in a rerunnable state
+            {"job_id", "status", "fresh"} where status is 'requeued' or
+            'not_rerunnable' (not in a terminal state, or no such job);
+            `fresh` reports which mode was asked for
         """
-        job = await self.conn.fetchrow(
-            "SELECT id, state FROM jorb WHERE id = $1", job_id
-        )
-        if not job:
-            raise ValueError(f"Job {job_id} not found")
+        requeued = await db.rerun_job(self.conn, job_id, reset_errors=True, fresh=fresh)
 
-        requeued = await db.rerun_job(
-            self.conn, job_id, reset_errors=True, fresh=fresh
-        )
-        if requeued is None:
-            raise ValueError(
-                f"Job {job_id} is in state '{job['state']}' and cannot "
-                f"be rerun (must be crashed, cancelled, or finished)"
-            )
-
-        return {"job_id": job_id, "status": "requeued", "fresh": fresh}
+        return {
+            "job_id": job_id,
+            "status": "requeued" if requeued else "not_rerunnable",
+            "fresh": fresh,
+        }
 
     # =========================================================================
     # Schedule Management

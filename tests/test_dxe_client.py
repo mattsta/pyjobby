@@ -124,8 +124,9 @@ async def test_handle_wait_cancel_roundtrip(
     assert isinstance(handle, JobHandle)
 
     await wait_for_job_state(db_pool, handle.id, ("running",))
-    outcome = await handle.cancel()
-    assert outcome in ("cancelled", "cancel_requested")
+    result = await handle.cancel()
+    assert result["job_id"] == handle.id
+    assert result["status"] in ("cancelled", "cancel_requested")
 
     with pytest.raises(JobCancelledError):
         await handle.wait(timeout=20)
@@ -277,6 +278,6 @@ def test_sync_job_client_smoke(db_params, unique_queue):
         assert info.queue == unique_queue
 
         # terminal transitions surface synchronously too
-        assert client.cancel_job(job_id) == "cancelled"
+        assert client.cancel_job(job_id) == {"job_id": job_id, "status": "cancelled"}
         with pytest.raises(JobCancelledError):
             client.wait_for_result(job_id, timeout=5)

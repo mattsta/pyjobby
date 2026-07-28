@@ -175,8 +175,8 @@ class TestJobCancel:
         """Test cancelling a queued job."""
         job_id = await client.enqueue("test.Job")
 
-        outcome = await client.cancel_job(job_id)
-        assert outcome == "cancelled"
+        result = await client.cancel_job(job_id)
+        assert result == {"job_id": job_id, "status": "cancelled"}
 
         # Verify state changed
         job = await client.get_job(job_id)
@@ -184,9 +184,9 @@ class TestJobCancel:
 
     @pytest.mark.asyncio
     async def test_cancel_nonexistent_job(self, client):
-        """Test cancelling non-existent job returns None."""
-        outcome = await client.cancel_job(999999)
-        assert outcome is None
+        """Test cancelling non-existent job reports not_cancellable."""
+        result = await client.cancel_job(999999)
+        assert result == {"job_id": 999999, "status": "not_cancellable"}
 
 
 # =============================================================================

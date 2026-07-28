@@ -574,6 +574,84 @@ class TestJobsCommands:
             assert "requeued" in result.output
             mock_admin_api.retry_job.assert_called_once_with(1)
 
+    def test_jobs_retry_refused_exits_one(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        """'not_retriable' is an answer, not an exception — the CLI is the
+        layer that turns it into a message and a non-zero exit."""
+        mock_admin_api.retry_job.return_value = {
+            "job_id": 1,
+            "status": "not_retriable",
+        }
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "jobs", "retry", "1"]
+            )
+
+            assert result.exit_code == 1
+            assert (
+                "Job 1 cannot be retried (not found, or not crashed/cancelled)"
+                in result.stderr
+            )
+
+    def test_jobs_cancel_refused_exits_one(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        mock_admin_api.cancel_job.return_value = {
+            "job_id": 1,
+            "status": "not_cancellable",
+        }
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "jobs", "cancel", "1"]
+            )
+
+            assert result.exit_code == 1
+            assert (
+                "Job 1 cannot be cancelled (not found, or already terminal)"
+                in result.stderr
+            )
+
+    def test_jobs_cancel_bulk_counts_refusals_as_failures(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        """The bulk form reports every id and still exits non-zero, so a
+        refused member cannot be chained past with `&&`."""
+        mock_admin_api.cancel_jobs.return_value = [
+            {"job_id": 1, "status": "cancelled"},
+            {"job_id": 2, "status": "not_cancellable"},
+        ]
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "jobs", "cancel", "1", "2"]
+            )
+
+            assert result.exit_code == 1
+            assert "Job 1 cancelled" in result.stdout
+            assert "Cancelled: 1" in result.stdout
+            assert "Job 2 cannot be cancelled" in result.stderr
+            assert "Failed: 1" in result.stderr
+
+    def test_jobs_rerun_refused_exits_one(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        mock_admin_api.rerun_job.return_value = {
+            "job_id": 1,
+            "status": "not_rerunnable",
+            "fresh": True,
+        }
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "jobs", "rerun", "1"]
+            )
+
+            assert result.exit_code == 1
+            assert (
+                "Job 1 cannot be rerun "
+                "(not found, or not crashed, cancelled, or finished)"
+                in result.stderr
+            )
+
     def test_jobs_rerun(self, cli_runner, mock_admin_api, mock_db_params):
         """jobs rerun defaults to a FRESH restart (that is what rerun means)."""
         with mock_cli_context(mock_admin_api, mock_db_params):
@@ -848,6 +926,26 @@ class TestDLQCommands:
 
             assert result.exit_code == 0
             mock_admin_api.retry_from_dlq.assert_called_once_with(10)
+
+    def test_dlq_retry_refused_exits_one(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        """A refused DLQ retry is a status, and the CLI turns it into an
+        error message and a non-zero exit."""
+        mock_admin_api.retry_from_dlq.return_value = {
+            "job_id": 10,
+            "status": "not_retriable",
+        }
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "dlq", "retry", "10"]
+            )
+
+            assert result.exit_code == 1
+            assert (
+                "Job 10 is not in the DLQ (not found, or not crashed)"
+                in result.stderr
+            )
 
 
 # ============================================================================
