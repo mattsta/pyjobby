@@ -134,6 +134,37 @@ Jobs flow through the following states:
 
 ## API Reference
 
+### One-call workflows
+
+```python
+# Enqueue and wait — request/response in one call. Raises what
+# wait_for_result raises (JobFailedError, JobCancelledError, TimeoutError).
+report = await client.run("myapp.jobs.Report", day="mon", timeout=60)
+
+# Cancel and wait for the cancellation to LAND. 'cancel_requested' is a
+# promise, not an outcome: this returns the terminal state — 'cancelled',
+# or 'finished'/'crashed' when the job outran the cancel.
+final = await client.cancel_and_wait(job_id, timeout=30)
+
+# Await a whole fan-out. Returns the member count when every job in the
+# group finished; raises if a member crashed/was cancelled (the group can
+# then never finish) or the group has no members.
+group_id, job_ids = await client.create_fan_out("myapp.jobs.Resize", items)
+await client.wait_for_group(group_id, timeout=600)
+```
+
+A payload key named like an option (`queue`, `priority`, ...) can always be
+delivered by passing the payload as a dict instead of splatting it:
+`enqueue("j.Job", job_kwargs={"queue": "the-jobs-own-argument"})` keeps
+payload and options in separate namespaces.
+
+Errors follow one contract: `get_*` methods are snapshots and return `None`
+for a missing row; `wait_*`/`run` methods raise — `JobError` (with a
+`.job_id` attribute) and its subclasses `JobFailedError`/`JobCancelledError`
+for job outcomes, `TimeoutError` when your `timeout=` elapsed (never an
+outcome), and plain `ValueError` for invalid arguments caught before any
+database work.
+
 ### Job Submission
 
 #### `enqueue(job_class, **kwargs)`
@@ -771,13 +802,16 @@ publish one — as machine events, or into your own table from inside a
 
 ### Synchronously
 
-`SyncJobClient.start_machine()` and `.machine()` return a `SyncMachine` with
-the same methods, blocking:
+`SyncJobClient` mirrors JobClient's **whole** async surface, blocking, for
+scripts and cron jobs — every method above exists on it under the same name
+(held complete by a mirror test), plus `SyncJobClient.from_config()` for
+the config file a script already has. Machines come back as `SyncMachine`:
 
 ```python
-order = client.start_machine(Order)
-order.send("paid", amount=100)
-order.wait_for_state("shipped", timeout=600)
+with SyncJobClient.from_config("./pyjobby.conf.py") as client:
+    order = client.start_machine(Order)
+    order.send("paid", amount=100)
+    order.wait_for_state("shipped", timeout=600)
 ```
 
 ---

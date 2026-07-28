@@ -19,6 +19,8 @@ Covered:
 
 from __future__ import annotations
 
+import asyncio
+
 import asyncpg
 import pytest
 import pytest_asyncio
@@ -501,6 +503,55 @@ class TestErrorSurface:
             queue=unique_queue, order_by="priority", ascending=True
         )
         assert [r["id"] for r in rows] == [high, low]
+
+
+class TestSyncFacadeParity:
+    async def test_every_public_async_method_has_a_sync_counterpart(self):
+        """SyncJobClient is written out by hand, so it can fall behind.
+
+        Deliberate metaprogramming over the class dictionaries, like the
+        SyncMachine mirror test: a method added to JobClient without a sync
+        wrapper is invisible until a script author calls it, and scripts
+        are exactly the callers least likely to be covered by tests.
+        """
+        import inspect
+
+        from pyjobby.client import SyncJobClient
+
+        excluded = {
+            # takes the CALLER's asyncpg connection mid-transaction — there
+            # is no synchronous shape for someone else's async transaction
+            "enqueue_in_transaction",
+            # JobHandle's methods are coroutines bound to the async client;
+            # run()/wait_for_result() are the sync shapes of that workflow
+            "enqueue_handle",
+        }
+        async_public = {
+            name
+            for name, member in vars(JobClient).items()
+            if not name.startswith("_") and inspect.iscoroutinefunction(member)
+        }
+        sync_names = set(vars(SyncJobClient))
+        missing = sorted(async_public - excluded - sync_names)
+        assert not missing, (
+            f"JobClient methods with no SyncJobClient wrapper: {missing}"
+        )
+
+    async def test_from_config_builds_a_working_sync_client(
+        self, db_params, tmp_path
+    ):
+        """Scripts and cron jobs are exactly where a config file lives, and
+        the sync facade is the class built for them."""
+        from pyjobby.client import SyncJobClient
+
+        config = tmp_path / "pyjobby.conf.py"
+        config.write_text(f"db_params = {db_params!r}\n")
+
+        def _drive() -> bool:
+            with SyncJobClient.from_config(str(config)) as client:
+                return client.health_check()
+
+        assert await asyncio.to_thread(_drive) is True
 
 
 class TestEnqueueValidation:

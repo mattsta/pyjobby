@@ -2718,12 +2718,38 @@ class SyncJobClient:
     ) -> JobClient:
         if dsn is not None:
             pool = await db.create_pool(dsn, min_size=min_size, max_size=max_size)
-            return JobClient(pool, db_params=dsn, prio_ceiling=prio_ceiling)
-        pool = await db.create_pool(
-            min_size=min_size, max_size=max_size, **connect_kwargs
-        )
-        return JobClient(
-            pool, db_params=dict(connect_kwargs), prio_ceiling=prio_ceiling
+            client = JobClient(pool, db_params=dsn, prio_ceiling=prio_ceiling)
+        else:
+            pool = await db.create_pool(
+                min_size=min_size, max_size=max_size, **connect_kwargs
+            )
+            client = JobClient(
+                pool, db_params=dict(connect_kwargs), prio_ceiling=prio_ceiling
+            )
+        # the pool is this facade's own creation; nobody else can close it
+        client._owns_pool = True
+        return client
+
+    @classmethod
+    def from_config(
+        cls,
+        config_path: str,
+        *,
+        min_size: int = 1,
+        max_size: int = 4,
+        prio_ceiling: int = DEFAULT_PRIO_CEILING,
+    ) -> SyncJobClient:
+        """Build from a pyjobby.conf.py, like JobClient.from_config() —
+        scripts and cron jobs are exactly where a config file lives."""
+        from .configloader import load_config_from_file
+
+        config = load_config_from_file(config_path, keys=["db_params"])
+        db_params = config.get("db_params", {})
+        return cls(
+            min_size=min_size,
+            max_size=max_size,
+            prio_ceiling=prio_ceiling,
+            **db_params,
         )
 
     def _run(self, coro: Awaitable[Any]) -> Any:
@@ -2767,6 +2793,200 @@ class SyncJobClient:
             self._client.send_message(dest_job_id, message, topic=topic)
         )
         return message_id
+
+    # ---------------------------------------------------------------------
+    # Full parity with JobClient's async surface. Hand-written like
+    # SyncMachine, and held complete the same way: the mirror test compares
+    # this class against JobClient's public async methods, so a method added
+    # there without a wrapper here fails CI. Excluded, with reasons, in that
+    # test: enqueue_in_transaction (takes the CALLER's async connection) and
+    # enqueue_handle (JobHandle's methods are coroutines bound to the async
+    # client — run()/wait_for_result() are the sync shapes of that workflow).
+    # ---------------------------------------------------------------------
+
+    def run(
+        self, job_class: str, timeout: float | None = None, **options: Any
+    ) -> Any:
+        """Synchronous JobClient.run()."""
+        return self._run(self._client.run(job_class, timeout=timeout, **options))
+
+    def enqueue_batch(
+        self,
+        jobs: list[tuple[Any, ...]],
+        prio_ceiling: int | None = None,
+        **options: Any,
+    ) -> list[int]:
+        """Synchronous JobClient.enqueue_batch()."""
+        ids: list[int] = self._run(
+            self._client.enqueue_batch(jobs, prio_ceiling=prio_ceiling, **options)
+        )
+        return ids
+
+    def wait_for_event(
+        self,
+        job_id: int,
+        key: str,
+        accept: Callable[[Any], bool] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        """Synchronous JobClient.wait_for_event()."""
+        return self._run(
+            self._client.wait_for_event(job_id, key, accept=accept, timeout=timeout)
+        )
+
+    def wait_for_group(self, run_group: int, timeout: float | None = None) -> int:
+        """Synchronous JobClient.wait_for_group()."""
+        members: int = self._run(
+            self._client.wait_for_group(run_group, timeout=timeout)
+        )
+        return members
+
+    def cancel_and_wait(
+        self, job_id: int, timeout: float | None = None
+    ) -> str | None:
+        """Synchronous JobClient.cancel_and_wait()."""
+        state: str | None = self._run(
+            self._client.cancel_and_wait(job_id, timeout=timeout)
+        )
+        return state
+
+    def get_steps(self, job_id: int) -> list[dict[str, Any]]:
+        """Synchronous JobClient.get_steps()."""
+        steps: list[dict[str, Any]] = self._run(self._client.get_steps(job_id))
+        return steps
+
+    def queue_depth(self, queue: str = "default") -> int:
+        """Synchronous JobClient.queue_depth()."""
+        depth: int = self._run(self._client.queue_depth(queue))
+        return depth
+
+    def queue_stats(self, queue: str = "default") -> dict[str, int]:
+        """Synchronous JobClient.queue_stats()."""
+        stats: dict[str, int] = self._run(self._client.queue_stats(queue))
+        return stats
+
+    def list_queues(self) -> list[dict[str, Any]]:
+        """Synchronous JobClient.list_queues()."""
+        queues: list[dict[str, Any]] = self._run(self._client.list_queues())
+        return queues
+
+    def purge_queue(self, queue: str, states: list[str] | None = None) -> int:
+        """Synchronous JobClient.purge_queue()."""
+        purged: int = self._run(self._client.purge_queue(queue, states=states))
+        return purged
+
+    def get_job_full(self, job_id: int) -> dict[str, Any] | None:
+        """Synchronous JobClient.get_job_full()."""
+        row: dict[str, Any] | None = self._run(self._client.get_job_full(job_id))
+        return row
+
+    def get_job_result(self, job_id: int) -> Any | None:
+        """Synchronous JobClient.get_job_result()."""
+        return self._run(self._client.get_job_result(job_id))
+
+    def delete_job(self, job_id: int) -> bool:
+        """Synchronous JobClient.delete_job()."""
+        deleted: bool = self._run(self._client.delete_job(job_id))
+        return deleted
+
+    def update_job_priority(self, job_id: int, new_priority: int) -> bool:
+        """Synchronous JobClient.update_job_priority()."""
+        updated: bool = self._run(
+            self._client.update_job_priority(job_id, new_priority)
+        )
+        return updated
+
+    def get_jobs(self, **filters: Any) -> list[dict[str, Any]]:
+        """Synchronous JobClient.get_jobs()."""
+        rows: list[dict[str, Any]] = self._run(self._client.get_jobs(**filters))
+        return rows
+
+    def search_jobs(self, **filters: Any) -> list[dict[str, Any]]:
+        """Synchronous JobClient.search_jobs()."""
+        rows: list[dict[str, Any]] = self._run(self._client.search_jobs(**filters))
+        return rows
+
+    def get_failed_jobs(self, **filters: Any) -> list[dict[str, Any]]:
+        """Synchronous JobClient.get_failed_jobs()."""
+        rows: list[dict[str, Any]] = self._run(
+            self._client.get_failed_jobs(**filters)
+        )
+        return rows
+
+    def get_waiting_jobs(self, **filters: Any) -> list[dict[str, Any]]:
+        """Synchronous JobClient.get_waiting_jobs()."""
+        rows: list[dict[str, Any]] = self._run(
+            self._client.get_waiting_jobs(**filters)
+        )
+        return rows
+
+    def bulk_cancel(self, job_ids: list[int]) -> int:
+        """Synchronous JobClient.bulk_cancel()."""
+        cancelled: int = self._run(self._client.bulk_cancel(job_ids))
+        return cancelled
+
+    def bulk_retry(self, job_ids: list[int]) -> list[int]:
+        """Synchronous JobClient.bulk_retry()."""
+        requeued: list[int] = self._run(self._client.bulk_retry(job_ids))
+        return requeued
+
+    def bulk_delete(self, job_ids: list[int]) -> int:
+        """Synchronous JobClient.bulk_delete()."""
+        deleted: int = self._run(self._client.bulk_delete(job_ids))
+        return deleted
+
+    def bulk_update_priority(self, job_ids: list[int], new_priority: int) -> int:
+        """Synchronous JobClient.bulk_update_priority()."""
+        updated: int = self._run(
+            self._client.bulk_update_priority(job_ids, new_priority)
+        )
+        return updated
+
+    def create_pipeline(
+        self, jobs: list[tuple[str, dict[str, Any]]], **options: Any
+    ) -> list[int]:
+        """Synchronous JobClient.create_pipeline()."""
+        ids: list[int] = self._run(self._client.create_pipeline(jobs, **options))
+        return ids
+
+    def create_fan_out(self, *args: Any, **options: Any) -> Any:
+        """Synchronous JobClient.create_fan_out()."""
+        return self._run(self._client.create_fan_out(*args, **options))
+
+    def create_pipeline_with_results(self, *args: Any, **options: Any) -> Any:
+        """Synchronous JobClient.create_pipeline_with_results()."""
+        return self._run(
+            self._client.create_pipeline_with_results(*args, **options)
+        )
+
+    def health_check(self) -> bool:
+        """Synchronous JobClient.health_check()."""
+        healthy: bool = self._run(self._client.health_check())
+        return healthy
+
+    def dag(self, name: str | None = None, **common_options: Any) -> DAGBuilder:
+        """A DAGBuilder (plain object); execute it with execute_dag()."""
+        return self._client.dag(name, **common_options)
+
+    def execute_dag(self, dag: DAGBuilder) -> dict:
+        """Synchronous JobClient.execute_dag()."""
+        mapping: dict = self._run(self._client.execute_dag(dag))
+        return mapping
+
+    def get_dag_status(self, dag_id: int) -> dict[str, Any]:
+        """Synchronous JobClient.get_dag_status()."""
+        status: dict[str, Any] = self._run(self._client.get_dag_status(dag_id))
+        return status
+
+    def wait_for_dag(self, dag_id: int, timeout: float | None = None) -> bool:
+        """Synchronous JobClient.wait_for_dag()."""
+        outcome: bool = self._run(self._client.wait_for_dag(dag_id, timeout))
+        return outcome
+
+    @property
+    def listening(self) -> bool:
+        """Synchronous JobClient.listening."""
+        return self._client.listening
 
     # ---------------------------------------------------------------------
     # State machines
