@@ -12,14 +12,14 @@ does not have — a web framework, a payment provider — are marked
 
 Its companions:
 
-* **[writing-jobs.md](writing-jobs.md)** — what goes *inside* one job, and
+- **[writing-jobs.md](writing-jobs.md)** — what goes _inside_ one job, and
   which durable primitive to reach for. This document applies those choices
   rather than re-explaining them; when an example uses `step()` or
   `transaction()`, the reasoning is there.
-* **[CLIENT_LIBRARY.md](CLIENT_LIBRARY.md)** — the full enqueue API, every
+- **[CLIENT_LIBRARY.md](CLIENT_LIBRARY.md)** — the full enqueue API, every
   option, and the sync client.
-* **[RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md)** — cron schedules.
-* **[OPERATIONS.md](OPERATIONS.md)** — running the workers these examples
+- **[RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md)** — cron schedules.
+- **[OPERATIONS.md](OPERATIONS.md)** — running the workers these examples
   assume are already running.
 
 ## Contents
@@ -125,7 +125,7 @@ async def upload_status(job_id: int):
 ```
 
 `deadline_key` is a unique index on `(deadline_key, queue)` **over `queued`
-rows only**, so the duplicate enqueue *raises* rather than returning the first
+rows only**, so the duplicate enqueue _raises_ rather than returning the first
 id — catch `asyncpg.UniqueViolationError` and treat it as success. Two
 consequences worth knowing: the same key in a different queue is a different
 job, and once the first job leaves `queued` the key is free again, so it
@@ -181,7 +181,7 @@ class LoadWarehouse(Job):
 ```
 
 The wiring is two options on the enqueue, and they are separate concerns:
-`waitfor_job` is the *ordering* edge, `use_result_from` is the *data* edge.
+`waitfor_job` is the _ordering_ edge, `use_result_from` is the _data_ edge.
 
 ```python
 extract = await client.enqueue(
@@ -204,7 +204,7 @@ load = await client.enqueue(
 
 Both downstream rows are created in state `waiting`, not `queued`: no worker
 can see them until their dependency finishes. The result is injected at
-*run* time from the upstream row, so if retention has already deleted that
+_run_ time from the upstream row, so if retention has already deleted that
 row the job fails with a `LookupError` rather than computing a wrong answer
 from a missing input. Use `save_result=False` only on jobs nothing reads.
 
@@ -230,7 +230,7 @@ than a crontab entry.
 
 ## 3. Fan-out / fan-in
 
-Many independent units in parallel, then one job that runs when *all* of them
+Many independent units in parallel, then one job that runs when _all_ of them
 have finished.
 
 ```python
@@ -269,7 +269,7 @@ gallery = await client.enqueue(
 
 `create_fan_out()` returns `(job_ids, group_id)`; the group id is what
 `waitfor_group` takes. The test asserts the gallery is `waiting` while the
-resizes run and that it *started* only after the last one's `finished`
+resizes run and that it _started_ only after the last one's `finished`
 timestamp — so this is a real barrier, not a race you usually win.
 
 `waitfor_job` and `waitfor_group` are mutually exclusive: passing both raises
@@ -330,17 +330,17 @@ class ChargeCards(Job):
 
 Three things are load-bearing here:
 
-* **The loop is deterministic.** Its length comes from `refs`, a checkpointed
+- **The loop is deterministic.** Its length comes from `refs`, a checkpointed
   argument, so every attempt makes the same sequence of `sleep()` and
   `step()` calls. `sleep()` consumes a sequence number exactly like `step()`
   does, so a loop whose length depends on the clock, or a `sleep()` inside an
   `if self.job["error_count"] == 0:`, dead-letters with a
   `NondeterminismError`. See
   [the determinism obligation](writing-jobs.md#the-determinism-obligation).
-* **Each charge is its own step**, so the retry after a provider error
+- **Each charge is its own step**, so the retry after a provider error
   re-sends only the call that failed. The test fails the second card once and
   asserts the ledger reads `[a, b, b, c]` — `b` retried, `a` not resent.
-* **The idempotency key is still required.** `step()` is at-least-once for
+- **The idempotency key is still required.** `step()` is at-least-once for
   anything outside this database: the charge lands, then the checkpoint does,
   and a crash in that window re-sends it. Only the provider can close that
   window, which is what the key is for.
@@ -430,7 +430,7 @@ await ImportRow.enqueue(client, queue="imports", sku="x", unts=1)  # TypeError
 
 ## 8. Priority and capability routing
 
-**A smaller number runs sooner.** Priority here is a *finishing position*,
+**A smaller number runs sooner.** Priority here is a _finishing position_,
 not a rating: `priority=1` means "first", the way it does in a race, and the
 big numbers are the ones that wait. The default is 100.
 
@@ -441,7 +441,7 @@ await client.enqueue("myapp.Job", priority=900, ...)  # backfill
 ```
 
 Claiming is `ORDER BY prio, run_after`, and the test starts a worker after
-enqueueing all three and asserts they *started* in exactly that order.
+enqueueing all three and asserts they _started_ in exactly that order.
 
 The direction has a consequence at the far end: a worker claims only jobs
 **at or below its own ceiling** (`pj --max-prio`, default 1000), so a number
@@ -469,6 +469,7 @@ flag:
 ```bash
 pj --queue backfill --max-prio 5000        # the workers that will claim it
 ```
+
 ```python
 client = JobClient(pool, prio_ceiling=5000)  # the client allowed to enqueue it
 ```
@@ -600,28 +601,28 @@ message comes back with it — and `JobCancelledError` if it is cancelled.
 
 This is a synchronous request wearing an asynchronous coat, so it is worth
 being deliberate: a web request that waits for a job holds a worker
-*and* an HTTP connection for the whole run. Prefer accepting the job and
+_and_ an HTTP connection for the whole run. Prefer accepting the job and
 polling — example 1 — for anything that is not fast and bounded.
 
 ---
 
 ## Patterns at a glance
 
-| You want | Reach for |
-|---|---|
-| fire and forget | `enqueue(...)` |
-| run later | `enqueue(..., run_after=when)` |
-| never twice for the same request | `enqueue(..., deadline_key=key)`, catch `UniqueViolationError` |
-| A then B then C | `waitfor_job=`, or `create_pipeline([...])` |
-| B needs A's result | `waitfor_job=a, use_result_from=a` → `upstream_result` |
-| many in parallel, then one | `create_fan_out(...)` → `enqueue(..., waitfor_group=g)` |
-| thousands of identical rows | `enqueue_batch([...])` |
-| the job must not outlive its order | `JobClient.enqueue_in_transaction(conn, ...)` |
-| this one first | `priority=` a **smaller** number than 100 (10 goes before 100) |
-| only on that hardware | `capability="gpu"`, and `pj --cap gpu` |
-| every night at 2am | `pj-admin schedule add` + `pj-scheduler` |
-| the caller wants the value | `enqueue_handle(...)` → `await handle.wait()` |
-| find it later | `tags={...}` → `search_jobs(tags=...)` |
+| You want                           | Reach for                                                      |
+| ---------------------------------- | -------------------------------------------------------------- |
+| fire and forget                    | `enqueue(...)`                                                 |
+| run later                          | `enqueue(..., run_after=when)`                                 |
+| never twice for the same request   | `enqueue(..., deadline_key=key)`, catch `UniqueViolationError` |
+| A then B then C                    | `waitfor_job=`, or `create_pipeline([...])`                    |
+| B needs A's result                 | `waitfor_job=a, use_result_from=a` → `upstream_result`         |
+| many in parallel, then one         | `create_fan_out(...)` → `enqueue(..., waitfor_group=g)`        |
+| thousands of identical rows        | `enqueue_batch([...])`                                         |
+| the job must not outlive its order | `JobClient.enqueue_in_transaction(conn, ...)`                  |
+| this one first                     | `priority=` a **smaller** number than 100 (10 goes before 100) |
+| only on that hardware              | `capability="gpu"`, and `pj --cap gpu`                         |
+| every night at 2am                 | `pj-admin schedule add` + `pj-scheduler`                       |
+| the caller wants the value         | `enqueue_handle(...)` → `await handle.wait()`                  |
+| find it later                      | `tags={...}` → `search_jobs(tags=...)`                         |
 
 ## Practices these examples are built on
 
@@ -633,7 +634,7 @@ polling — example 1 — for anything that is not fast and bounded.
    this database. `step()` is at-least-once for everything else.
 4. **Queues are separated by what they need**, not by importance: a queue for
    blocking jobs, a queue for GPU jobs, a queue for the slow nightly batch.
-   Priority orders work *within* a queue; it does not isolate it.
+   Priority orders work _within_ a queue; it does not isolate it.
 5. **Duplicates are prevented at enqueue** with `deadline_key`, so the
    producer's own retry is free.
 6. **Failures are visible.** `crashed` is the dead-letter state; the row keeps
@@ -642,9 +643,9 @@ polling — example 1 — for anything that is not fast and bounded.
 
 ## See also
 
-* [writing-jobs.md](writing-jobs.md) — what goes inside a job
-* [CLIENT_LIBRARY.md](CLIENT_LIBRARY.md) — the complete client API
-* [RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md) — cron scheduling
-* [ADMIN_TOOLS.md](ADMIN_TOOLS.md) — `pj-admin` and the web interface
-* [OPERATIONS.md](OPERATIONS.md) — running and watching the workers
-* [ARCHITECTURE.md](ARCHITECTURE.md) — how the platform is built
+- [writing-jobs.md](writing-jobs.md) — what goes inside a job
+- [CLIENT_LIBRARY.md](CLIENT_LIBRARY.md) — the complete client API
+- [RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md) — cron scheduling
+- [ADMIN_TOOLS.md](ADMIN_TOOLS.md) — `pj-admin` and the web interface
+- [OPERATIONS.md](OPERATIONS.md) — running and watching the workers
+- [ARCHITECTURE.md](ARCHITECTURE.md) — how the platform is built

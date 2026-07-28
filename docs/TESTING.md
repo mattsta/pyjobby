@@ -4,7 +4,7 @@ The suite is the platform's correctness proof: **over 1,700 tests** against a
 real PostgreSQL, no mocked database anywhere in the core paths. Live workers,
 real NOTIFY delivery, real transactions, real SIGKILLs.
 
-Read the second half of this document *before* you measure anything. Every
+Read the second half of this document _before_ you measure anything. Every
 rule in it was gotten wrong here first, and each mistake produced a
 confidently wrong number that someone then wrote down and defended.
 
@@ -47,8 +47,8 @@ deleted stays a measurement instead of decaying into a claim in a comment.
 **What the marker holds is comparisons between configurations, and nothing
 else.** A `performance` test never runs in CI, so an invariant asserted only
 inside one is an invariant no commit is ever checked against. Claim
-exclusivity — *every job claimed exactly once under concurrent claimers, none
-lost, none claimed twice, none left behind* — used to be reachable only that
+exclusivity — _every job claimed exactly once under concurrent claimers, none
+lost, none claimed twice, none left behind_ — used to be reachable only that
 way, as a line inside the timeout sweep and the throughput comparison. It is
 now `TestClaimExclusivityUnderContention` in `tests/test_claim_contention.py`,
 which runs in the default suite and in CI: twelve concurrent claimers draining
@@ -56,7 +56,7 @@ which runs in the default suite and in CI: twelve concurrent claimers draining
 advisory lock) and once against an uncapped one (no lock at all, exclusivity
 resting on `FOR UPDATE … SKIP LOCKED`), in **0.4 s** together. Exactly-once is
 an invariant, not a number — it does not become true at 2,000 jobs and false
-at 600 — so scale here buys only the *chance to break it*, and both tests were
+at 600 — so scale here buys only the _chance to break it_, and both tests were
 confirmed to fail against a `claim_jorb` with its row locking removed (2,487
 and 2,888 claims for 600 jobs).
 
@@ -64,8 +64,8 @@ What is left behind the marker in that file is the tuning evidence and nothing
 that has to hold: `TestClaimLockTimeout` sweeps five `lock_timeout` settings to
 justify the shipped 50 ms, and `TestCappedClaimThroughput` prices the bounded
 wait against the try-lock it replaced. Their remaining full-drain assertions
-are measurement preconditions — *this timed interval covers the same work as
-the other conditions* — not the invariant, which is why they now say so.
+are measurement preconditions — _this timed interval covers the same work as
+the other conditions_ — not the invariant, which is why they now say so.
 
 Both benchmarks edit the installed `claim_queue_lock` **in the catalog**
 (`ALTER FUNCTION … SET lock_timeout`, `CREATE OR REPLACE` of the old try-lock
@@ -74,7 +74,7 @@ fingerprint. The sweep scopes each change to a `claim_lock_timeout()` context
 manager so the restore also runs on `KeyboardInterrupt` and on cancellation —
 and because no `finally` survives a SIGKILL, an OOM kill or an xdist worker
 dying, `conftest._reset_claim_lock` reasserts the shipped definition (body
-*and* settings, read from `pyjobby/sql/schema/30_claim.sql`) before every test
+_and_ settings, read from `pyjobby/sql/schema/30_claim.sql`) before every test
 in the suite. Without that, one killed benchmark leaves a database where every
 later claim stampedes or gives up in a millisecond, silently, forever.
 
@@ -87,7 +87,7 @@ the aggregate views are global tables, so workers sharing one database would
 see each other's rows and truncate each other's data mid-test. It also lets
 tests assert exact global counts.
 
-Separate *sessions* (e.g. several agents running suites at once) still need
+Separate _sessions_ (e.g. several agents running suites at once) still need
 distinct `PYJOBBY_TEST_DSN` values, for the same reason.
 
 **The schema fingerprint.** `conftest._install_schema` stores a SHA-256 of
@@ -112,7 +112,7 @@ lags behind the base schema.
 This has happened twice. Both times the failure was intermittent, both times
 it appeared only under `-n auto`, and both times the symptom was blamed on the
 newest change in the diff rather than on the fixture. Once the tests were
-passing *only* because the two databases happened to agree.
+passing _only_ because the two databases happened to agree.
 
 The rule: anything that needs a DSN string builds it from `db_params`. Use
 `pyjobby.procs.dsn_from(db_params)` — never `conftest.TEST_DSN`, never
@@ -131,16 +131,16 @@ tests — a deleted row is not a gone row. See
 Reusable pieces live in the suite itself; extend these rather than writing
 one-off scaffolding.
 
-| Piece | What it gives you |
-|---|---|
-| `live_worker` fixture (`conftest.py`) | a REAL `JobSystem` running in-process (registry, heartbeat, LISTEN wakeups, DXE checkpoint binding); call it again for a second worker |
-| `wait_for_job_state(conn, id, states)` | poll a job to a target state with a useful failure message |
-| `unique_queue` / `test_id` fixtures | per-test namespacing so tests never collide on shared tables |
-| `tests/dxe_jobs.py` | shared job classes (`OkJob`, `FailJob`, `SlowJob`, `StepPipelineJob`, `SleeperJob`, `PingJob`, `PongJob`) resolved by dotted path like production jobs |
-| `tests/utils/factories.py` | v1-safe row builders (aware UTC, non-NULL jsonb) |
-| `pyjobby/procs.py` | launch real console scripts and reap their process groups |
-| `tests/utils/faults.py` | fault injection and the side-effect ledger |
-| `tests/utils/plans.py` | seeding and assertions for query-plan tests |
+| Piece                                  | What it gives you                                                                                                                                      |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `live_worker` fixture (`conftest.py`)  | a REAL `JobSystem` running in-process (registry, heartbeat, LISTEN wakeups, DXE checkpoint binding); call it again for a second worker                 |
+| `wait_for_job_state(conn, id, states)` | poll a job to a target state with a useful failure message                                                                                             |
+| `unique_queue` / `test_id` fixtures    | per-test namespacing so tests never collide on shared tables                                                                                           |
+| `tests/dxe_jobs.py`                    | shared job classes (`OkJob`, `FailJob`, `SlowJob`, `StepPipelineJob`, `SleeperJob`, `PingJob`, `PongJob`) resolved by dotted path like production jobs |
+| `tests/utils/factories.py`             | v1-safe row builders (aware UTC, non-NULL jsonb)                                                                                                       |
+| `pyjobby/procs.py`                     | launch real console scripts and reap their process groups                                                                                              |
+| `tests/utils/faults.py`                | fault injection and the side-effect ledger                                                                                                             |
+| `tests/utils/plans.py`                 | seeding and assertions for query-plan tests                                                                                                            |
 
 ### `pyjobby/procs.py` — real processes
 
@@ -181,14 +181,14 @@ nothing here is simulated:
   `pj` launcher will read.
 
 **The side-effect ledger** is the other half. Proving that a step "did not
-re-execute" needs an observable effect *outside* the checkpoint table —
+re-execute" needs an observable effect _outside_ the checkpoint table —
 otherwise the test asks the checkpoint table whether the checkpoint table is
 right. `jorb_test_effect` is a test-only table (not in the base schema), created
 on demand and scoped by `tag` (tests pass their unique queue name), and jobs
 append one row per real execution. `record_effect` writes on the worker's own
 connection; `record_effect_out_of_band` writes on a separate, immediately
 committed connection, which is what lets a test see that a transactional write
-is *staged but not committed* and kill at exactly that instant.
+is _staged but not committed_ and kill at exactly that instant.
 `effect_counts` / `effect_counts_per_job` return dicts, for exact-value
 assertions rather than "at least one".
 
@@ -213,24 +213,24 @@ assertions rather than "at least one".
   ancestor and reports a query as several times more expensive than it is.
 - `assert_no_seq_scan(plan)`, `assert_reads_far_less_than_a_scan(pool, plan)`
   (the probe touched under a tenth of what reading the table costs, calibrated
-  against the table's *current* page count).
+  against the table's _current_ page count).
 
 ### `pj-bench` — the permanent benchmark harness
 
 Every number in `docs/SCALE.md` was once measured by a script that was then
-thrown away. `pj-bench` is the replacement: each subcommand *reproduces* one
+thrown away. `pj-bench` is the replacement: each subcommand _reproduces_ one
 of those measurements.
 
-| Subcommand | What it measures |
-|---|---|
-| `pj-bench enqueue` | insert throughput and what NOTIFY costs at the commit lock; three modes (`production`, `serial_contrast`, `bulk_contrast`) and five trigger variants |
-| `pj-bench claim` | claim throughput through the real `claim_jorb()`, lock contention, and what a capped queue *sustains* — five interleaved arms |
-| `pj-bench e2e` | real `pj` worker processes: completed jobs/s, plus `enqueue_to_finished` and `claim_to_finished` latency separately |
-| `pj-bench notify` | notifications per job lifecycle, **unobserved and observed**, because on a demand-gated schema that question has two correct answers |
-| `pj-bench plans` | `EXPLAIN (ANALYZE, BUFFERS)` every hot query in **two states** (caught up and backlogged); **exits non-zero on a sequential scan of any gated table, or on a discard budget overrun**. Its sweep cases are derived from monitor.py's `SWEEP_*_SQL` constants, so a new sweep with no gate entry is an error rather than a gap |
-| `pj-bench resolve` | per-job class resolution in four interleaved arms — cached, the `--reload` mtime check, no cache at all, and a real re-import. Each arm reports whether the class object was actually rebuilt, so an arm that stops doing what it is named cannot publish the wrong number |
-| `pj-bench replay` | what a long checkpoint log costs to resume — a resume loads every step a job ever recorded, and a durable machine records one per transition *and* one per idle wake, so this is the number that decides how long such a machine may live |
-| `pj-bench all` | everything, with one summary table |
+| Subcommand         | What it measures                                                                                                                                                                                                                                                                                                              |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pj-bench enqueue` | insert throughput and what NOTIFY costs at the commit lock; three modes (`production`, `serial_contrast`, `bulk_contrast`) and five trigger variants                                                                                                                                                                          |
+| `pj-bench claim`   | claim throughput through the real `claim_jorb()`, lock contention, and what a capped queue _sustains_ — five interleaved arms                                                                                                                                                                                                 |
+| `pj-bench e2e`     | real `pj` worker processes: completed jobs/s, plus `enqueue_to_finished` and `claim_to_finished` latency separately                                                                                                                                                                                                           |
+| `pj-bench notify`  | notifications per job lifecycle, **unobserved and observed**, because on a demand-gated schema that question has two correct answers                                                                                                                                                                                          |
+| `pj-bench plans`   | `EXPLAIN (ANALYZE, BUFFERS)` every hot query in **two states** (caught up and backlogged); **exits non-zero on a sequential scan of any gated table, or on a discard budget overrun**. Its sweep cases are derived from monitor.py's `SWEEP_*_SQL` constants, so a new sweep with no gate entry is an error rather than a gap |
+| `pj-bench resolve` | per-job class resolution in four interleaved arms — cached, the `--reload` mtime check, no cache at all, and a real re-import. Each arm reports whether the class object was actually rebuilt, so an arm that stops doing what it is named cannot publish the wrong number                                                    |
+| `pj-bench replay`  | what a long checkpoint log costs to resume — a resume loads every step a job ever recorded, and a durable machine records one per transition _and_ one per idle wake, so this is the number that decides how long such a machine may live                                                                                     |
+| `pj-bench all`     | everything, with one summary table                                                                                                                                                                                                                                                                                            |
 
 `pj-bench plans --force` **is the CI gate** (`.github/workflows/ci.yml`), and
 it is the only subcommand safe to gate on: it asserts plans, not durations.
@@ -242,7 +242,7 @@ and `--warmup/--no-warmup`, and the busy-database guard (`--max-existing-jobs`,
 `--force`) which refuses to run alongside real work — that measures the
 contention, not the platform. `pj-bench enqueue` will not disable triggers
 without `--allow-trigger-toggle`, and restores them from a `finally`, a SIGTERM
-handler, *and* an `atexit` hook on a fresh connection: a
+handler, _and_ an `atexit` hook on a fresh connection: a
 `jorb_enqueued_notify` left disabled is a silent install-wide outage, not a
 slow query.
 
@@ -280,7 +280,7 @@ NOTIFY cost is **3%** — noise, "not worth touching". Measured concurrently on
 the same schema it is **62%** (~2.6x). A serial number for a concurrent cost
 is not merely imprecise; it points the wrong way.
 
-Corollary: the lock is per **commit**, not per notification. Silencing one of several ungated channels recovered *nothing*
+Corollary: the lock is per **commit**, not per notification. Silencing one of several ungated channels recovered _nothing_
 (the three-per-lifecycle `job_state_change` firehose: ceiling unmoved; gating
 `jorb_done` while the firehose survived: 1.01x). Deleting the last ungated
 channel recovered everything (**2.63–2.95x** on the completion path). Partial
@@ -312,7 +312,7 @@ dropped**. A plan is a fact; a duration is a statement about hardware.
 correct while getting slower forever — the one you otherwise discover in
 production, months in, when the table is finally big enough to matter.
 
-Where a number is unavoidable, gate on the *waste* rather than the rate. The
+Where a number is unavoidable, gate on the _waste_ rather than the rate. The
 claim-lock timeout sweep measured 627 / 839 / 766 / 830 / 862 claims/s on a
 quiet box and 219 / 616 / 691 / 618 / 239 on a loaded one — unusable — while
 the empty-return counts stayed a clean step function in both. The assertions
@@ -348,7 +348,7 @@ Plain `VACUUM` does not rescue it either: it marks pages reusable rather than
 returning them, so the table stays large and the rows stay spread.
 
 **And a ratio threshold does not rescue it.** Dead tuples inflate the table's
-page count *and* the buffers the probe touches, so both sides of
+page count _and_ the buffers the probe touches, so both sides of
 `touched * 10 < pages` move together and the assertion drifts out of meaning
 in either direction. Calibrating against the current size (as
 `assert_reads_far_less_than_a_scan` does) is still right — an absolute
@@ -371,7 +371,7 @@ A performance test that fails because the machine is busy trains everyone to
 ignore performance tests. That is why they carry the `performance` marker and
 are excluded from `addopts`, and why they are run `-p no:xdist`.
 
-### 8. The test for a new index or rollup is *who pays when it is unused*
+### 8. The test for a new index or rollup is _who pays when it is unused_
 
 Not "is it cheap". Both of the following are "add an index or a table to make
 a read cheaper", and only one of them was accepted:
@@ -400,10 +400,10 @@ The floor lives in `pyproject.toml` (`fail_under`, currently **89%**) so it can
 only ratchet upward; the suite measures **91%** against it today.
 
 **Read that number as a map of unexercised behavior, never as a score to
-maximize.** Line coverage cannot see whether a subsystem is *wired up* (a
+maximize.** Line coverage cannot see whether a subsystem is _wired up_ (a
 module at 97% with no entry point is fully covered and never runs), whether
-its state machine is *reachable* (a query against a state nothing writes is
-covered and a no-op), or whether the assertion that passed was *meaningful*
+its state machine is _reachable_ (a query against a state nothing writes is
+covered and a no-op), or whether the assertion that passed was _meaningful_
 (a spawned process that dies before asserting still executes every line on
 its way down). That is why the entry-point tests launch real console
 scripts and assert observable effects, and why the mutation-control habit
@@ -411,15 +411,15 @@ below exists.
 
 ### What to do instead
 
-1. Run coverage to **find** untested regions, then ask: *what contract is
-   untested here?* Write a test for that contract. Never write a test whose
+1. Run coverage to **find** untested regions, then ask: _what contract is
+   untested here?_ Write a test for that contract. Never write a test whose
    purpose is to touch a line.
 2. **Mutation-test your own assertion.** Break the implementation on purpose —
    drop the index, delete the trigger, remove the fence, return the wrong
    epoch — and confirm the test fails. An assertion that has never been seen
    to fail is a hypothesis, not a test. Build the control into the test where
    you can: the epoch-fencing suite fires every fenced statement at a
-   superseded epoch *and* keeps a positive control at the current epoch, so a
+   superseded epoch _and_ keeps a positive control at the current epoch, so a
    statement that simply stopped working could never pass.
 3. **Prefer real processes and real databases to mocks.** Start the real
    console script, drive the real command, kill the real process group, assert
@@ -436,7 +436,6 @@ below exists.
 
    The ledger counts what really executed; the checkpoint table is never
    consulted for the claim.
-
    - `transaction()` — after the kill `{attempt: 1}` (the write is staged,
      invisible, and never commits); at the end `{attempt: 2, write: 1}` —
      **exactly once**.
@@ -446,6 +445,7 @@ below exists.
    That duplicate is not a bug in `step()`; it is what at-least-once means,
    and it is why `transaction()` exists. Pinning both rows is what stops the
    two primitives being "simplified" back into one.
+
 6. Suspect any test that cannot fail: no assertion on the subject, an
    assertion satisfied by the setup alone, or a swallowed exception.
 7. When a bug is found, the fix is a **behavioral** test at the contract level
@@ -460,7 +460,7 @@ PostgreSQL 18 service container:
 2. `pj-admin db migrate` followed by `pj-admin doctor` — proving a fresh
    install is actually usable, not just that migration returned zero.
 3. The suite with `-n auto` and the coverage floor (`performance` tests are
-   excluded by `addopts`; see rule 7). Every invariant is therefore in *this*
+   excluded by `addopts`; see rule 7). Every invariant is therefore in _this_
    step — see [the `performance` marker](#the-performance-marker) for the rule
    that keeps it that way, and for the claim-exclusivity tests that moved here
    because of it.

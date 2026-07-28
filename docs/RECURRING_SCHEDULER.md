@@ -4,28 +4,28 @@ Cron schedules that live in the database instead of a crontab: a row per
 schedule, with execution history, statistics, an enable/disable switch, and
 the safety limits that stop a slow job turning a schedule into a runaway.
 
-A schedule does not *run* anything. It creates an ordinary job at the right
+A schedule does not _run_ anything. It creates an ordinary job at the right
 instant; a worker runs it like any other. Everything in
 [writing-jobs.md](writing-jobs.md) applies unchanged to a scheduled job.
 
 **Two things here are subtle enough to be worth reading before you write a
 schedule**: the [cron column layout](#cron-expressions) (the sixth field is
-seconds *at the end*, not the Quartz seconds-first layout) and
+seconds _at the end_, not the Quartz seconds-first layout) and
 [what happens at a DST transition](#daylight-saving-time). Both are pinned by
 `tests/test_cron_semantics.py`; the scheduler's failure handling is pinned by
 `tests/test_scheduler_correctness.py`.
 
 ## The moving parts
 
-| Piece | Where | What it does |
-|---|---|---|
-| `jorb_schedule` | `pyjobby/sql/schema/70_schedules.sql` | one row per schedule: the job to create, the cron expression, the safety limits, the next fire time, the counters |
-| `jorb_schedule_log` | same | one row per firing: result, skip reason, created job, duration, queue depth, jitter applied |
-| `pyjobby/cron.py` | — | all cron and timezone evaluation. Owns the column layout and the DST rules so no caller can get them half right |
-| `SchedulerWorker` | `pyjobby/scheduler.py` | the poll loop: find due schedules, apply the safety checks, create the job, advance `next_run` |
-| `ScheduleSafetyManager` | same | concurrency, backpressure, circuit breaker, jitter |
-| `ScheduleManager` | same | create, next-run arithmetic, the bookkeeping updates |
-| `AdminAPI.*_schedule` | `pyjobby/admin_api.py` | the management API the CLI and the web interface both use |
+| Piece                   | Where                                 | What it does                                                                                                      |
+| ----------------------- | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `jorb_schedule`         | `pyjobby/sql/schema/70_schedules.sql` | one row per schedule: the job to create, the cron expression, the safety limits, the next fire time, the counters |
+| `jorb_schedule_log`     | same                                  | one row per firing: result, skip reason, created job, duration, queue depth, jitter applied                       |
+| `pyjobby/cron.py`       | —                                     | all cron and timezone evaluation. Owns the column layout and the DST rules so no caller can get them half right   |
+| `SchedulerWorker`       | `pyjobby/scheduler.py`                | the poll loop: find due schedules, apply the safety checks, create the job, advance `next_run`                    |
+| `ScheduleSafetyManager` | same                                  | concurrency, backpressure, circuit breaker, jitter                                                                |
+| `ScheduleManager`       | same                                  | create, next-run arithmetic, the bookkeeping updates                                                              |
+| `AdminAPI.*_schedule`   | `pyjobby/admin_api.py`                | the management API the CLI and the web interface both use                                                         |
 
 ## Running it
 
@@ -147,7 +147,7 @@ assumed from documentation.
 ```
 
 > **The sixth field is seconds at the END.** Quartz and Spring put seconds
-> *first*, so the same six numbers mean different times under the two
+> _first_, so the same six numbers mean different times under the two
 > conventions. `0 2 * * * 30` here is **02:00:30 daily**, not "every 2am
 > minute, 30 seconds in". If you are porting expressions from a Quartz-based
 > scheduler, re-read every six-column one.
@@ -186,7 +186,7 @@ the next section applies only to zones that observe daylight saving.
 ## Daylight saving time
 
 Two days a year, "02:00 daily" is ambiguous or impossible, and the
-right answer depends on what the schedule *means*. pyjobby distinguishes the
+right answer depends on what the schedule _means_. pyjobby distinguishes the
 two cases by the **hour field**: an expression that enumerates hours is
 anchored to the wall clock, and one with a wildcard or a step is an interval.
 That is the rule vixie cron settled on, for the same reason.
@@ -205,14 +205,14 @@ On 2027-11-07 `America/New_York` repeats 01:00–02:00. 01:30 occurs twice —
 once at UTC-4, once at UTC-5 — and croniter yields both, because as a
 wall-clock expression both really are matches.
 
-* **A wall-clock-anchored schedule fires ONCE.** `30 1 * * *` means "once a
+- **A wall-clock-anchored schedule fires ONCE.** `30 1 * * *` means "once a
   day, at half past one". Firing on both passes would run a daily job twice
   and duplicate every side effect it has: a second invoice, a second email, a
   second charge. `next_cron_run()` skips the pass marked `fold=1` — the
   replay of a wall-clock time the schedule has already fired at — and the
   schedule resumes normally the next day.
-* **An interval schedule fires on BOTH passes.** `0 * * * *` means every hour
-  of *real* time. Skipping one would leave a two-hour gap, which is the
+- **An interval schedule fires on BOTH passes.** `0 * * * *` means every hour
+  of _real_ time. Skipping one would leave a two-hour gap, which is the
   opposite mistake. Measured in UTC, the cadence through the transition is
   exactly 3600 seconds per step.
 
@@ -262,7 +262,7 @@ higher for fast stateless ones.
 ### 3. Backpressure — `backpressure_threshold` (default 1000, `None` disables)
 
 Counts `queued`, `claimed` and `running` rows in the schedule's **queue** —
-not just this schedule's jobs, and *not* `waiting` ones, which are blocked on
+not just this schedule's jobs, and _not_ `waiting` ones, which are blocked on
 a dependency rather than competing for a worker. Over the threshold, the
 firing is skipped: adding work to an overloaded queue makes the overload
 worse, and a skipped run of a non-critical schedule is cheap.
@@ -296,7 +296,7 @@ its own jobs and how a job identifies the schedule that made it
 (`self.job["schedule_id"]`, a `bigint`, `None` for a job nobody scheduled).
 
 It is a column because it is the one thing about a scheduled job that anything
-*queries by*, and while it lived in the `admin_data` blob no index could serve
+_queries by_, and while it lived in the `admin_data` blob no index could serve
 that query — see [Performance](#performance). The `admin_data` copy is **gone**
 rather than kept alongside: two copies of one fact disagree eventually.
 There is nothing to backfill: `jorb.schedule_id` is a column of the **base
@@ -311,7 +311,7 @@ row, or an expression a newer croniter no longer accepts — is a special case,
 because such a schedule can never compute a new `next_run` and would
 therefore be due forever.
 
-The scheduler resolves the *following* fire time **before** it fires. If that
+The scheduler resolves the _following_ fire time **before** it fires. If that
 fails, the schedule is **disabled**, the failure is counted
 (`run_count`, `failure_count`, `consecutive_failures`, `last_run`,
 `last_failure`), and a `failure` row naming the error is written to
@@ -352,7 +352,7 @@ prevented duplicate, `ERROR` for a failure or a tripped circuit breaker.
 3. Is `pj-scheduler` running at all?
 4. `pj-admin schedule history <name>` — a run of `skipped` rows names the
    safety check that skipped them.
-5. If firings succeed but nothing happens, the *jobs* are the problem, not
+5. If firings succeed but nothing happens, the _jobs_ are the problem, not
    the schedule: is a worker running on that queue, and does it advertise the
    schedule's `capability`?
 
@@ -385,7 +385,7 @@ nothing to it — measured at 27,941 vs 28,010 jobs/s across nine interleaved
 `pj-bench enqueue --concurrency 16 --repeat 3` pairs, which is no difference.
 The live-state list is what stops the fix becoming the original problem: a
 schedule accumulates jobs forever (a minutely one, ~525k a year), so an index
-on `schedule_id` alone would hand the check every job the schedule had *ever*
+on `schedule_id` alone would hand the check every job the schedule had _ever_
 created and make it discard the finished ones — an index scan that reads a
 table's worth of rows costs a table's worth. Restricted to the live states, the
 check reads only in-flight work, which `max_concurrent_jobs` itself bounds.
@@ -396,7 +396,7 @@ the check spells out the same state list rather than binding it as a parameter.
 `tests/test_scale_plans.py` EXPLAINs the scheduler's own statement and fails on
 a sequential scan, on a wrong access method, and on rows read and thrown away.
 
-The backpressure check counts unfinished rows in the schedule's *queue*, which
+The backpressure check counts unfinished rows in the schedule's _queue_, which
 is a different question and unaffected by any of this.
 
 ## Migrating to it
@@ -411,7 +411,7 @@ layout](#cron-expressions) if you are carrying over six-column expressions.
 
 ## See also
 
-* [writing-jobs.md](writing-jobs.md) — what goes inside the scheduled job
-* [EXAMPLES.md](EXAMPLES.md#9-a-recurring-report) — the whole path, end to end
-* [ADMIN_TOOLS.md](ADMIN_TOOLS.md) — the rest of `pj-admin`
-* [OPERATIONS.md](OPERATIONS.md) — running the workers that execute the jobs
+- [writing-jobs.md](writing-jobs.md) — what goes inside the scheduled job
+- [EXAMPLES.md](EXAMPLES.md#9-a-recurring-report) — the whole path, end to end
+- [ADMIN_TOOLS.md](ADMIN_TOOLS.md) — the rest of `pj-admin`
+- [OPERATIONS.md](OPERATIONS.md) — running the workers that execute the jobs

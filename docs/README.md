@@ -6,16 +6,16 @@ below is a file you can open.
 
 ## Where to start
 
-| If you want to… | Read |
-|---|---|
-| understand how the platform is shaped | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| get it running in production | [deployment-guide.md](deployment-guide.md) |
-| write your first job | [writing-jobs.md](writing-jobs.md) |
-| submit jobs from your application | [CLIENT_LIBRARY.md](CLIENT_LIBRARY.md) |
-| see whole applications, not snippets | [EXAMPLES.md](EXAMPLES.md) |
-| model a workflow as a state machine | [STATECHARTS.md](STATECHARTS.md) |
-| run and watch the fleet | [OPERATIONS.md](OPERATIONS.md) |
-| find out why something is broken | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
+| If you want to…                       | Read                                       |
+| ------------------------------------- | ------------------------------------------ |
+| understand how the platform is shaped | [ARCHITECTURE.md](ARCHITECTURE.md)         |
+| get it running in production          | [deployment-guide.md](deployment-guide.md) |
+| write your first job                  | [writing-jobs.md](writing-jobs.md)         |
+| submit jobs from your application     | [CLIENT_LIBRARY.md](CLIENT_LIBRARY.md)     |
+| see whole applications, not snippets  | [EXAMPLES.md](EXAMPLES.md)                 |
+| model a workflow as a state machine   | [STATECHARTS.md](STATECHARTS.md)           |
+| run and watch the fleet               | [OPERATIONS.md](OPERATIONS.md)             |
+| find out why something is broken      | [TROUBLESHOOTING.md](TROUBLESHOOTING.md)   |
 
 ## The documents
 
@@ -33,7 +33,7 @@ below is a file you can open.
 
 ### Building on it
 
-4. **[writing-jobs.md](writing-jobs.md)** — what goes *inside* one job:
+4. **[writing-jobs.md](writing-jobs.md)** — what goes _inside_ one job:
    `task()`, sync vs async vs generator, which durable primitive to reach
    for, the determinism obligation, timeouts, retries, tags, and a
    checklist for a new job class.
@@ -62,7 +62,7 @@ below is a file you can open.
     inventory, `pj-admin doctor`, the state machine, timeouts, abandoned job
     threads, live queue controls, priority and the worker ceiling,
     retention, and the failure playbooks.
-11. **[ADMIN_TOOLS.md](ADMIN_TOOLS.md)** — the reference for *what exists*:
+11. **[ADMIN_TOOLS.md](ADMIN_TOOLS.md)** — the reference for _what exists_:
     every `pj-admin` command with real output, `pj-web`, and the
     `AdminAPI` Python interface.
 12. **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — the symptom index. Start
@@ -200,21 +200,21 @@ jorb_history; pj-monitor reaps timeouts and jobs of dead workers
 
 ## Database Schema Summary
 
-| Column            | Purpose                                                        |
-| ----------------- | -------------------------------------------------------------- |
-| `id`              | Primary key                                                    |
-| `queue`           | Route jobs to specific workers                                 |
-| `state`           | Current status (queued → claimed → running → finished/crashed) |
+| Column            | Purpose                                                                                                                                                           |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`              | Primary key                                                                                                                                                       |
+| `queue`           | Route jobs to specific workers                                                                                                                                    |
+| `state`           | Current status (queued → claimed → running → finished/crashed)                                                                                                    |
 | `prio`            | Priority as a finishing position: the **smallest** number is claimed first, and each worker claims only `prio <=` its own ceiling (`pj --max-prio`, default 1000) |
-| `run_after`       | Minimum start time                                             |
-| `job_class`       | Python class path                                              |
-| `kwargs`          | Arguments (JSONB)                                              |
-| `result`          | Return value (JSONB)                                           |
-| `error_backtrace` | Stack trace on failure                                         |
-| `waitfor_job`     | Dependency on specific job                                     |
-| `waitfor_group`   | Dependency on job group                                        |
-| `run_group`       | Group identifier for this job                                  |
-| `deadline_key`    | Unique key for singleton scheduling                            |
+| `run_after`       | Minimum start time                                                                                                                                                |
+| `job_class`       | Python class path                                                                                                                                                 |
+| `kwargs`          | Arguments (JSONB)                                                                                                                                                 |
+| `result`          | Return value (JSONB)                                                                                                                                              |
+| `error_backtrace` | Stack trace on failure                                                                                                                                            |
+| `waitfor_job`     | Dependency on specific job                                                                                                                                        |
+| `waitfor_group`   | Dependency on job group                                                                                                                                           |
+| `run_group`       | Group identifier for this job                                                                                                                                     |
+| `deadline_key`    | Unique key for singleton scheduling                                                                                                                               |
 
 ## Example Workflows
 
@@ -267,7 +267,7 @@ a second copy here would drift away from the benchmarks that produce them.
 The two facts worth carrying out of it: enqueue is **not** the bottleneck
 (measured throughput has roughly two orders of magnitude of headroom over
 1M jobs/hour), and what breaks first is anything that has to read or retain
-the *accumulated* table — which is what retention exists for.
+the _accumulated_ table — which is what retention exists for.
 
 ## Design Trade-offs
 
@@ -278,7 +278,7 @@ the *accumulated* table — which is what retention exists for.
 - Every state change writes to WAL
 - FOR UPDATE SKIP LOCKED (not advisory locks)
 
-Note that polling is *not* on that list: enqueue fires a `NOTIFY` and an
+Note that polling is _not_ on that list: enqueue fires a `NOTIFY` and an
 idle worker wakes immediately. `--check-interval` (5 s, jittered) is the
 fallback for a missed wakeup, not the normal path.
 

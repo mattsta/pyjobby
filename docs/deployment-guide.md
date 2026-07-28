@@ -18,15 +18,15 @@ installed by the package rather than by a file you copy around.
 
 Installing puts seven commands on `PATH`:
 
-| Command | Role |
-|---|---|
-| `pj` | worker processes: claim and execute jobs |
-| `pj-monitor` | the reaper: timeouts, dead-worker reclaim, retention |
-| `pj-scheduler` | fires cron schedules |
-| `pj-web` | HTML admin + `/metrics` |
-| `pj-ws` | realtime dashboard feed |
-| `pj-admin` | operator CLI (see [ADMIN_TOOLS.md](ADMIN_TOOLS.md)) |
-| `pj-bench` | benchmark and plan-regression harness |
+| Command        | Role                                                 |
+| -------------- | ---------------------------------------------------- |
+| `pj`           | worker processes: claim and execute jobs             |
+| `pj-monitor`   | the reaper: timeouts, dead-worker reclaim, retention |
+| `pj-scheduler` | fires cron schedules                                 |
+| `pj-web`       | HTML admin + `/metrics`                              |
+| `pj-ws`        | realtime dashboard feed                              |
+| `pj-admin`     | operator CLI (see [ADMIN_TOOLS.md](ADMIN_TOOLS.md))  |
+| `pj-bench`     | benchmark and plan-regression harness                |
 
 `pj -v` prints the version.
 
@@ -94,7 +94,7 @@ Error: Install or upgrade it with `pj-admin db migrate`, then confirm with `pj-a
 One case reports PASS while still asking for `db migrate` (once migration
 files exist): a database whose objects are all present but whose
 `schema_migrations` rows are not. It runs the current code correctly — hence
-PASS — but the record is what the *next* upgrade reads, so run `db migrate`
+PASS — but the record is what the _next_ upgrade reads, so run `db migrate`
 once to write it.
 
 Do not hand-write DDL, and do not load the schema from a copy checked into
@@ -156,15 +156,15 @@ export PYJOBBY_DSN="postgresql://user:password@host:5432/pyjobby"
 Which process accepts which is not uniform, and it decides how you package
 your deployment:
 
-| Process | Config file | `--dsn` / `PYJOBBY_DSN` |
-|---|---|---|
-| `pj` | `-c`, default `./pyjobby.toml` | no |
-| `pj-scheduler` | `-c`, default `./pyjobby.toml` | no |
-| `pj-web` | `-c/--config`, default `./pyjobby.toml` | no |
-| `pj-ws` | `-c/--config`, default `./pyjobby.toml` | no |
-| `pj-monitor` | `--config` | yes |
-| `pj-admin` | `-c/--config` | yes (wins over `--config`) |
-| `pj-bench` | `-c/--config` | yes (wins over `--config`) |
+| Process        | Config file                             | `--dsn` / `PYJOBBY_DSN`    |
+| -------------- | --------------------------------------- | -------------------------- |
+| `pj`           | `-c`, default `./pyjobby.toml`          | no                         |
+| `pj-scheduler` | `-c`, default `./pyjobby.toml`          | no                         |
+| `pj-web`       | `-c/--config`, default `./pyjobby.toml` | no                         |
+| `pj-ws`        | `-c/--config`, default `./pyjobby.toml` | no                         |
+| `pj-monitor`   | `--config`                              | yes                        |
+| `pj-admin`     | `-c/--config`                           | yes (wins over `--config`) |
+| `pj-bench`     | `-c/--config`                           | yes (wins over `--config`) |
 
 So workers, the scheduler and the two web surfaces need a config file on
 disk. A container image that ships no config must mount one.
@@ -185,13 +185,13 @@ $ echo $?
 
 ## The processes to run
 
-| Process | Count | Required? |
-|---|---|---|
-| `pj` | per queue and host as needed | yes — nothing executes without it |
-| `pj-monitor` | 1 (more are safe) | **yes** |
-| `pj-scheduler` | 1 (more are safe) | only if you use cron schedules |
-| `pj-web` | 0 or 1 | optional |
-| `pj-ws` | 0 or 1 | optional |
+| Process        | Count                        | Required?                         |
+| -------------- | ---------------------------- | --------------------------------- |
+| `pj`           | per queue and host as needed | yes — nothing executes without it |
+| `pj-monitor`   | 1 (more are safe)            | **yes**                           |
+| `pj-scheduler` | 1 (more are safe)            | only if you use cron schedules    |
+| `pj-web`       | 0 or 1                       | optional                          |
+| `pj-ws`        | 0 or 1                       | optional                          |
 
 Start order does not matter: every process connects independently and
 reconnects with backoff if the database goes away.
@@ -200,11 +200,11 @@ reconnects with backoff if the database goes away.
 
 It is the only thing that recovers work. Without it:
 
-* a job whose worker host died stays `claimed` forever — nothing else
+- a job whose worker host died stays `claimed` forever — nothing else
   requeues it;
-* a job that blew its timeout in a way the worker could not interrupt (a
+- a job that blew its timeout in a way the worker could not interrupt (a
   synchronous task, a killed process) stays `running` forever;
-* every terminal job, its history, its events, its mailbox and its
+- every terminal job, its history, its events, its mailbox and its
   checkpoints accumulate without limit, because retention lives here.
 
 The worker enforces timeouts in-process as well, but only for the failures
@@ -245,8 +245,8 @@ deliberately. The design argument for the two independent windows is in
 
 Two knobs control how hard it works:
 
-* `--retention-batch-size` (1000) — rows per delete batch.
-* `--retention-max-seconds` (5.0) — time budget per sweep per cycle. A
+- `--retention-batch-size` (1000) — rows per delete batch.
+- `--retention-max-seconds` (5.0) — time budget per sweep per cycle. A
   sweep keeps taking batches until it is caught up or the budget runs out,
   so it can catch up on a busy install without ever delaying timeout
   enforcement or dead-worker recovery.
@@ -268,18 +268,18 @@ and nothing anywhere else. Naming a second queue adds four more on it —
 each — so adding a queue never changes the capacity of the queues you already
 named.
 
-| Flag | Default | What it decides |
-|---|---|---|
-| `--queue` | `default` | a queue to staff; repeatable, duplicates collapse |
-| `--cap` | none | capabilities this host advertises; repeatable |
-| `--workers` | CPU count / 2 | worker processes **per queue** |
-| `--max-prio` | 1000 | priority ceiling; jobs above it are not claimed |
-| `--max-retries` | 10 | attempts before a job is dead-lettered (`crashed`) |
-| `--default-timeout` | 3600 | fallback job timeout in seconds; `0` disables |
-| `--check-interval` | 5.0 | idle poll interval; LISTEN/NOTIFY wakes workers sooner |
-| `--job-threads` | 8 | this worker's own job-thread pool |
-| `--path` | `.` | extra import paths for job classes; repeatable |
-| `--reload` | off | re-import a job module when its source changes |
+| Flag                | Default       | What it decides                                        |
+| ------------------- | ------------- | ------------------------------------------------------ |
+| `--queue`           | `default`     | a queue to staff; repeatable, duplicates collapse      |
+| `--cap`             | none          | capabilities this host advertises; repeatable          |
+| `--workers`         | CPU count / 2 | worker processes **per queue**                         |
+| `--max-prio`        | 1000          | priority ceiling; jobs above it are not claimed        |
+| `--max-retries`     | 10            | attempts before a job is dead-lettered (`crashed`)     |
+| `--default-timeout` | 3600          | fallback job timeout in seconds; `0` disables          |
+| `--check-interval`  | 5.0           | idle poll interval; LISTEN/NOTIFY wakes workers sooner |
+| `--job-threads`     | 8             | this worker's own job-thread pool                      |
+| `--path`            | `.`           | extra import paths for job classes; repeatable         |
+| `--reload`          | off           | re-import a job module when its source changes         |
 
 Leave `--reload` off in production: on it re-executes module code on every
 job.
@@ -317,14 +317,14 @@ Because they are enforced in the database they bind every claimer, not just
 Connection counts are fixed by the code, not by configuration, so the
 budget is arithmetic:
 
-| Process | Connections |
-|---|---|
-| each `pj` worker process | 2 (one for work, one dedicated to heartbeats) |
-| `pj-scheduler` | 1 |
-| `pj-monitor` | 1–2 (pool) |
-| `pj-web` | 1–10 (pool, lazy) |
-| `pj-ws` | 2–10 (pool) + 1 dedicated LISTEN connection |
-| each `pj-admin` invocation | 1, for its lifetime |
+| Process                    | Connections                                   |
+| -------------------------- | --------------------------------------------- |
+| each `pj` worker process   | 2 (one for work, one dedicated to heartbeats) |
+| `pj-scheduler`             | 1                                             |
+| `pj-monitor`               | 1–2 (pool)                                    |
+| `pj-web`                   | 1–10 (pool, lazy)                             |
+| `pj-ws`                    | 2–10 (pool) + 1 dedicated LISTEN connection   |
+| each `pj-admin` invocation | 1, for its lifetime                           |
 
 `pj --workers N` forks N worker processes, so one such command is 2N
 connections. Add whatever your application's `JobClient` pool uses to
@@ -445,8 +445,16 @@ services:
     depends_on: [migrate]
     volumes:
       - ./pyjobby.toml:/etc/pyjobby/pyjobby.toml:ro
-    command: ["pj", "--config", "/etc/pyjobby/pyjobby.toml",
-              "--queue", "default", "--workers", "4"]
+    command:
+      [
+        "pj",
+        "--config",
+        "/etc/pyjobby/pyjobby.toml",
+        "--queue",
+        "default",
+        "--workers",
+        "4",
+      ]
     restart: always
 
 volumes:
@@ -477,7 +485,7 @@ spec:
           env:
             - name: PYJOBBY_DSN
               valueFrom:
-                secretKeyRef: {name: pyjobby-db, key: dsn}
+                secretKeyRef: { name: pyjobby-db, key: dsn }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -486,10 +494,10 @@ metadata:
 spec:
   replicas: 1
   selector:
-    matchLabels: {app: pyjobby-monitor}
+    matchLabels: { app: pyjobby-monitor }
   template:
     metadata:
-      labels: {app: pyjobby-monitor}
+      labels: { app: pyjobby-monitor }
     spec:
       containers:
         - name: monitor
@@ -498,7 +506,7 @@ spec:
           env:
             - name: PYJOBBY_DSN
               valueFrom:
-                secretKeyRef: {name: pyjobby-db, key: dsn}
+                secretKeyRef: { name: pyjobby-db, key: dsn }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -507,24 +515,32 @@ metadata:
 spec:
   replicas: 3
   selector:
-    matchLabels: {app: pyjobby-worker, queue: default}
+    matchLabels: { app: pyjobby-worker, queue: default }
   template:
     metadata:
-      labels: {app: pyjobby-worker, queue: default}
+      labels: { app: pyjobby-worker, queue: default }
     spec:
       containers:
         - name: worker
           image: myregistry/pyjobby:latest
-          command: ["pj", "--config", "/etc/pyjobby/pyjobby.toml",
-                    "--queue", "default", "--workers", "4"]
+          command:
+            [
+              "pj",
+              "--config",
+              "/etc/pyjobby/pyjobby.toml",
+              "--queue",
+              "default",
+              "--workers",
+              "4",
+            ]
           volumeMounts:
-            - {name: config, mountPath: /etc/pyjobby, readOnly: true}
+            - { name: config, mountPath: /etc/pyjobby, readOnly: true }
           resources:
-            requests: {memory: "512Mi", cpu: "500m"}
-            limits:   {memory: "2Gi",   cpu: "2000m"}
+            requests: { memory: "512Mi", cpu: "500m" }
+            limits: { memory: "2Gi", cpu: "2000m" }
       volumes:
         - name: config
-          configMap: {name: pyjobby-config}
+          configMap: { name: pyjobby-config }
 ```
 
 A worker that has lost its database is still a healthy process — it

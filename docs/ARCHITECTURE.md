@@ -6,12 +6,12 @@ shaped the way it is.
 This document is the map. Three others are the territory, and nothing here
 repeats them:
 
-| For | Read |
-|---|---|
-| Durable execution — steps, checkpoints, replay, invariants | [DXE.md](DXE.md) |
-| Measured throughput, and the write-path decisions behind it | [SCALE.md](SCALE.md) |
-| Running it — health, playbooks, queue controls, timeouts | [OPERATIONS.md](OPERATIONS.md) |
-| Every column, index and trigger, with the reasoning inline | [`pyjobby/sql/schema/`](../pyjobby/sql/schema/) |
+| For                                                         | Read                                            |
+| ----------------------------------------------------------- | ----------------------------------------------- |
+| Durable execution — steps, checkpoints, replay, invariants  | [DXE.md](DXE.md)                                |
+| Measured throughput, and the write-path decisions behind it | [SCALE.md](SCALE.md)                            |
+| Running it — health, playbooks, queue controls, timeouts    | [OPERATIONS.md](OPERATIONS.md)                  |
+| Every column, index and trigger, with the reasoning inline  | [`pyjobby/sql/schema/`](../pyjobby/sql/schema/) |
 
 ---
 
@@ -64,15 +64,15 @@ leader.
 
 ## The components
 
-| Process | Script | What it owns | What it does **not** do |
-|---|---|---|---|
-| **Worker** | `pj` | Claiming, executing job code, this attempt's state transitions, its own registry row and heartbeat, its own job-thread pool | Decide whether a queue may run at all — `claim_jorb()` does. Recover its own crash — the monitor does. Enforce any other worker's deadline. |
-| **Monitor** | `pj-monitor` | Every safety-net sweep in the platform: timeouts, dead-worker reclaim, stuck-claim reclaim, stranded-waiter recovery, and seven retention sweeps | Execute jobs, enqueue anything, elect a leader. Several instances are safe; every sweep is one atomic statement or a transaction holding its own row locks. |
-| **Scheduler** | `pj-scheduler` | Firing due `jorb_schedule` rows into `jorb`, the safety checks around that (concurrency, backpressure, jitter, circuit breaker), and `jorb_schedule_log` | Run the jobs it creates — it only inserts them. Several instances are safe: each schedule is row-locked `FOR UPDATE SKIP LOCKED` while it fires, and `deadline_key` makes a duplicate insert fail. |
-| **Admin CLI** | `pj-admin` | Nothing at runtime. It is a client: schema install/migrate, queue controls, DLQ, requeue, `doctor` | Participate in execution. |
-| **Web admin** | `pj-web` | HTML operator UI, a JSON API, and `GET /metrics` for Prometheus | Authenticate anybody. Keep it on localhost or behind a proxy. |
-| **Websocket** | `pj-ws` | The aggregate dashboard feed (one polled query per interval, shared by every client) and per-job watches | Tail individual transitions — see [the notification model](#the-notification-model). Also unauthenticated. |
-| **Benchmarks** | `pj-bench` | Reproducing every number in SCALE.md, and the `pj-bench plans` CI gate that fails when a hot query stops using its index | Anything outside its own uniquely-named queue, which it deletes in a `finally`. |
+| Process        | Script         | What it owns                                                                                                                                             | What it does **not** do                                                                                                                                                                            |
+| -------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Worker**     | `pj`           | Claiming, executing job code, this attempt's state transitions, its own registry row and heartbeat, its own job-thread pool                              | Decide whether a queue may run at all — `claim_jorb()` does. Recover its own crash — the monitor does. Enforce any other worker's deadline.                                                        |
+| **Monitor**    | `pj-monitor`   | Every safety-net sweep in the platform: timeouts, dead-worker reclaim, stuck-claim reclaim, stranded-waiter recovery, and seven retention sweeps         | Execute jobs, enqueue anything, elect a leader. Several instances are safe; every sweep is one atomic statement or a transaction holding its own row locks.                                        |
+| **Scheduler**  | `pj-scheduler` | Firing due `jorb_schedule` rows into `jorb`, the safety checks around that (concurrency, backpressure, jitter, circuit breaker), and `jorb_schedule_log` | Run the jobs it creates — it only inserts them. Several instances are safe: each schedule is row-locked `FOR UPDATE SKIP LOCKED` while it fires, and `deadline_key` makes a duplicate insert fail. |
+| **Admin CLI**  | `pj-admin`     | Nothing at runtime. It is a client: schema install/migrate, queue controls, DLQ, requeue, `doctor`                                                       | Participate in execution.                                                                                                                                                                          |
+| **Web admin**  | `pj-web`       | HTML operator UI, a JSON API, and `GET /metrics` for Prometheus                                                                                          | Authenticate anybody. Keep it on localhost or behind a proxy.                                                                                                                                      |
+| **Websocket**  | `pj-ws`        | The aggregate dashboard feed (one polled query per interval, shared by every client) and per-job watches                                                 | Tail individual transitions — see [the notification model](#the-notification-model). Also unauthenticated.                                                                                         |
+| **Benchmarks** | `pj-bench`     | Reproducing every number in SCALE.md, and the `pj-bench plans` CI gate that fails when a hot query stops using its index                                 | Anything outside its own uniquely-named queue, which it deletes in a `finally`.                                                                                                                    |
 
 A `pj` invocation is a launcher: it forks `--workers N` processes **on each
 `--queue` named** (so two queues at `--workers 4` is eight processes), each
@@ -117,14 +117,14 @@ Concretely, one attempt:
    registry, `DAGBuilder`). A row with `waitfor_job`/`waitfor_group` is
    inserted `waiting` instead of `queued`. A `deadline_key` makes the
    enqueue idempotent: a partial unique index over `(deadline_key, queue)
-   WHERE state = 'queued'` means the second insert of the same future job
+WHERE state = 'queued'` means the second insert of the same future job
    raises a unique violation rather than duplicating the work.
 
 2. **Claim.** The worker calls `claim_jorb()`, which returns at most one
    row and does everything in one statement: state → `claimed`, `run_count
-   + 1`, **`run_epoch + 1`**, `claimed_at`, `claimed_by`, `worker_pid`,
-   `worker_host`. Zero rows back means "nothing claimable", which covers
-   an empty queue, a paused queue, and a queue at its cap identically.
+   - 1`, **`run_epoch + 1`**, `claimed_at`, `claimed_by`, `worker_pid`,
+`worker_host`. Zero rows back means "nothing claimable", which covers
+     an empty queue, a paused queue, and a queue at its cap identically.
 
 3. **Prepare.** The worker resolves the job class (cached — importing per
    job re-executes module code), loads any `jorb_step` checkpoints and
@@ -133,7 +133,7 @@ Concretely, one attempt:
    and stamps `timeout_at`.
 
 4. **Run.** `claimed → running` stamps `started`. Then the job's `run()`
-   goes to *this worker's own* thread pool — not the event loop's default
+   goes to _this worker's own_ thread pool — not the event loop's default
    executor, so a runaway job cannot take the worker's own I/O down with
    it — under exactly one deadline. Whatever comes back is reduced: a
    coroutine is awaited, an async generator is drained.
@@ -171,12 +171,12 @@ worker composes. That is the load-bearing choice in the whole design.
 `jorb_queue` is a live control plane: a row per queue carrying `paused`,
 `max_concurrency`, `rate_limit` and `rate_period_seconds` (an absent row
 means unpaused and unlimited). Those controls are checked **inside the
-claim**, which means they bind *every* claimer — the worker, a test
+claim**, which means they bind _every_ claimer — the worker, a test
 harness, a benchmark, anything anybody writes next — rather than only the
 clients that remember to enforce them. An operator pausing a queue does not
 have to trust that the code claiming from it is well-behaved.
 
-Enforcing them there is also the only way they can be *correct*. Under READ
+Enforcing them there is also the only way they can be _correct_. Under READ
 COMMITTED a statement sees the snapshot taken when it began, so two
 simultaneous claims cannot see each other's uncommitted rows, and a
 concurrency cap of 1 would admit both. A cap needs the claims for a
@@ -193,7 +193,7 @@ The lock wait is bounded (`lock_timeout = 50 ms`, in a wrapper function so
 the timeout covers the acquisition and nothing else). A timeout is reported
 as "nothing claimable", identical to an empty queue. The bound is what
 stops one claim held open by a stuck transaction from freezing the queue;
-the *wait* rather than an immediate try-lock is what puts claimers in the
+the _wait_ rather than an immediate try-lock is what puts claimers in the
 lock manager's FIFO queue, so they take turns instead of one winner
 starving the rest. `sql/schema/30_claim.sql` carries the measurements for both.
 
@@ -227,10 +227,10 @@ the consumers are never asleep.
 Hence the policy, applied uniformly:
 
 > **A notification is emitted only when a consumer has registered demand for
-> its topic, and demand is registered *before* that consumer's last look at
+> its topic, and demand is registered _before_ that consumer's last look at
 > the underlying state.**
 
-The cost then scales *inversely* with load, which is exactly right: when
+The cost then scales _inversely_ with load, which is exactly right: when
 the system is busy nobody is parked and a notification would be pure
 overhead paid at the global commit lock; when the system is idle, latency
 matters but volume is low and the lock is free. Measured end to end: **zero
@@ -242,20 +242,20 @@ arguments are `(channel, demand kind)`, and the topic, the gate and the
 payload for all five channels are declared in that one body — so changing
 the convention is one edit, not five.
 
-| Channel | Fires on | Demand | "Somebody is waiting" means |
-|---|---|---|---|
-| `jorb_enqueued` | `jorb` insert/state → `queued` | `idle_worker` | some worker on that queue published `jorb_worker.idle` |
-| `jorb_done` | `jorb` state → terminal | `row_local` | `jorb.awaited` on the very row changing |
-| `jorb_event` | `jorb_event` insert/update | `job_awaited` | `jorb.awaited` on the publishing job |
-| `jorb_cancel` | `jorb.cancel_requested` set | `row_local` | the job is actually `running` |
-| `schedule_executed` | `jorb_schedule_log` insert | **ungated** | — see below |
+| Channel             | Fires on                       | Demand        | "Somebody is waiting" means                            |
+| ------------------- | ------------------------------ | ------------- | ------------------------------------------------------ |
+| `jorb_enqueued`     | `jorb` insert/state → `queued` | `idle_worker` | some worker on that queue published `jorb_worker.idle` |
+| `jorb_done`         | `jorb` state → terminal        | `row_local`   | `jorb.awaited` on the very row changing                |
+| `jorb_event`        | `jorb_event` insert/update     | `job_awaited` | `jorb.awaited` on the publishing job                   |
+| `jorb_cancel`       | `jorb.cancel_requested` set    | `row_local`   | the job is actually `running`                          |
+| `schedule_executed` | `jorb_schedule_log` insert     | **ungated**   | — see below                                            |
 
 The gate runs before the payload is built, so a write path that turns out
 not to need a notification does not pay to construct one.
 
 ### Two shapes of correctness argument
 
-The demand *storage* is deliberately not uniform — each channel uses the
+The demand _storage_ is deliberately not uniform — each channel uses the
 cheapest correct signal for its own shape — and that produces two different
 proofs that no wakeup is lost.
 
@@ -263,12 +263,12 @@ proofs that no wakeup is lost.
 `jorb.awaited` sits on the same row as the state change, so the waiter and
 the worker take the same row lock and PostgreSQL orders them:
 
-* The waiter's `awaited = TRUE` commits first → the worker's terminal
+- The waiter's `awaited = TRUE` commits first → the worker's terminal
   `UPDATE` either already saw it, or blocked on the row lock and
   re-evaluated against the newest version, where it is true. The trigger
   fires; the waiter is woken.
-* The terminal `UPDATE` commits first → the waiter's registration
-  necessarily commits after it, so the waiter's *first* state read — which
+- The terminal `UPDATE` commits first → the waiter's registration
+  necessarily commits after it, so the waiter's _first_ state read — which
   always runs before it waits — already sees the terminal state, and it
   never waits.
 
@@ -297,14 +297,14 @@ set idle = TRUE  →  claim  →  got a job?  clear idle, run it
 
 An enqueue whose gate runs after that commit sees the worker and notifies
 it. An enqueue that committed before the following claim's snapshot is
-found *by* that claim. There is no order in which a job is both unseen and
+found _by_ that claim. There is no order in which a job is both unseen and
 unannounced, apart from the sub-millisecond window between an enqueue's WAL
 flush and its visibility — covered by the worker's unconditional poll every
 `--check-interval`. Reversing the worker's order would widen that window to
 a whole claim round trip on every park.
 
 `jorb_event` is the honest third case: the demand is on another table
-*and* the trigger is not deferred, because `get_event()` routinely waits
+_and_ the trigger is not deferred, because `get_event()` routinely waits
 for a key the job has not published yet, so there is no row to hang a
 row-local flag on. A client that registers while a `set_event()` is
 mid-commit can miss that one notification and learns the value from its 2 s
@@ -336,7 +336,7 @@ The five channels above are all of them. Nothing notifies on
 `queued → claimed → running → finished`, and adding such a trigger would
 undo the whole model in one edit — the lock is per commit, so a single
 ungated channel firing four times per job costs exactly what all five
-would. Reinstating it measures 2.6–2.9× *slower* on the completion path
+would. Reinstating it measures 2.6–2.9× _slower_ on the completion path
 (`tests/test_notify_gating.py` builds that trigger on purpose so the number
 stays measurable).
 
@@ -347,7 +347,7 @@ which no dashboard renders and no human reads, so `pj-ws` **polls
 aggregates**: one index-backed `UNION ALL` per second, shared by every
 connected dashboard, and none at all while nobody is subscribed. That is
 O(1) in both dashboards and job throughput. A client that genuinely needs
-one job watches *that* job, which rides `jorb_done` and is gated on
+one job watches _that_ job, which rides `jorb_done` and is gated on
 `jorb.awaited` like any other waiter.
 
 ---
@@ -362,7 +362,7 @@ heartbeats `last_seen` on a **dedicated connection**, so a long-running job
 on the main connection can never delay liveness reporting. Liveness is that
 heartbeat and nothing else — not a pid, not a grace period, not a guess.
 The same heartbeat statement also publishes the worker's job-thread pool
-size and how many of its threads are *abandoned* (left behind by timed-out
+size and how many of its threads are _abandoned_ (left behind by timed-out
 synchronous jobs, which nothing can interrupt), because a worker whose pool
 is full of those refuses to claim while looking healthy by every other
 signal. Publishing it in the registry is what makes that visible to the
@@ -371,28 +371,28 @@ whole platform for no extra statement.
 **The sweeps.** `pj-monitor` runs them all, every `--check-interval`
 (10 s), each isolated so one failure cannot cancel the rest of the cycle:
 
-* *Timeout enforcement* — `running` jobs past `timeout_at` are retried or
+- _Timeout enforcement_ — `running` jobs past `timeout_at` are retried or
   dead-lettered per their `on_timeout` policy. Workers enforce timeouts
   in-process too; this catches the ones that died mid-job.
-* *Dead-worker reclaim* — jobs `claimed`/`running` behind a stale
+- _Dead-worker reclaim_ — jobs `claimed`/`running` behind a stale
   `last_seen` are requeued, on any host, and their workers retired (which
   also clears `idle`, bounding the leaked subscription to the liveness
   grace).
-* *Unregistered-claim reclaim* — jobs stuck `claimed` with no
+- _Unregistered-claim reclaim_ — jobs stuck `claimed` with no
   `claimed_by`, past a longer grace. A worker died between claiming and
   registering, or the registry was unavailable; age is the only signal
   available.
 
 **The fence.** `run_epoch` is the token that makes all of this safe, and it
 is deliberately **not** an attempt counter (`run_count` is). It advances
-whenever a job *enters* an attempt (a claim) or is *abandoned* by one — a
+whenever a job _enters_ an attempt (a claim) or is _abandoned_ by one — a
 retry, a monitor requeue, an operator requeue. Every state-changing
 statement a worker issues carries `AND run_epoch = $n`.
 
 So a "dead" worker that was merely partitioned, and is still executing, can
 do no harm when it comes back: its completion matches zero rows, its
 checkpoint writes match zero rows and raise `StaleExecutionError`, and it
-abandons the attempt quietly. Requeueing bumps the epoch *itself* rather
+abandons the attempt quietly. Requeueing bumps the epoch _itself_ rather
 than leaving that to the next claim, because otherwise the abandoned
 execution would keep the current epoch for the whole window between requeue
 and re-claim and could still write checkpoints for an attempt that has been
@@ -414,15 +414,15 @@ Seven sweeps on two windows. `--checkpoint-retention-days` governs the first;
 a lifetime of its own to argue for — they all mean "as long as the work they
 describe".
 
-| Sweep | Default | What goes | Why this window |
-|---|---|---|---|
-| Checkpoints | 1 day | `jorb_step` rows of terminal jobs; the job row stays | Checkpoints exist to make a job *resumable*. The instant it terminates, resume is impossible — so they are the bulkiest thing hanging off a job with the shortest useful life. They outlive the terminal transition only far enough to debug it. |
-| Jobs | 30 days | The whole `jorb` row, and its history, events, mailbox, checkpoints and DAG edges by `ON DELETE CASCADE` | The job's own audit lifetime. |
-| Consumed mail | 30 days | `jorb_mailbox` rows with `consumed_at` set | The job-scoped cascade cannot reach these: a long-lived workflow reads mail for months and never terminates, so nothing else would ever free them. |
-| History | 30 days | `jorb_history` rows past the window | The audit trail lives as long as the work it describes. A durable machine that never terminates is never reached by the job cascade, so nothing else bounds its wake/sleep history. |
-| Orphaned DAGs | 30 days | `jorb_dag` rows past the window with no jobs left | Jobs point **at** a DAG (`ON DELETE SET NULL`), so job retention never touches it. Left alone it does not merely linger, it keeps *answering*: `jorb_dag_status` LEFT JOINs `jorb`, so an emptied DAG reports `total_jobs = 0` forever. |
-| Schedule log | 30 days | `jorb_schedule_log` rows, except each schedule's newest | It cascades only from `jorb_schedule`, which operators disable rather than delete — so it had no upper bound of any kind, at cron rate, for the life of the install. |
-| Retired workers | 30 days | `jorb_worker` rows both retired and silent for the window | One row per worker *process start*, and nothing ever deleted one: a fleet that redeploys accumulates registry rows for as long as it exists. |
+| Sweep           | Default | What goes                                                                                                | Why this window                                                                                                                                                                                                                                  |
+| --------------- | ------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Checkpoints     | 1 day   | `jorb_step` rows of terminal jobs; the job row stays                                                     | Checkpoints exist to make a job _resumable_. The instant it terminates, resume is impossible — so they are the bulkiest thing hanging off a job with the shortest useful life. They outlive the terminal transition only far enough to debug it. |
+| Jobs            | 30 days | The whole `jorb` row, and its history, events, mailbox, checkpoints and DAG edges by `ON DELETE CASCADE` | The job's own audit lifetime.                                                                                                                                                                                                                    |
+| Consumed mail   | 30 days | `jorb_mailbox` rows with `consumed_at` set                                                               | The job-scoped cascade cannot reach these: a long-lived workflow reads mail for months and never terminates, so nothing else would ever free them.                                                                                               |
+| History         | 30 days | `jorb_history` rows past the window                                                                      | The audit trail lives as long as the work it describes. A durable machine that never terminates is never reached by the job cascade, so nothing else bounds its wake/sleep history.                                                              |
+| Orphaned DAGs   | 30 days | `jorb_dag` rows past the window with no jobs left                                                        | Jobs point **at** a DAG (`ON DELETE SET NULL`), so job retention never touches it. Left alone it does not merely linger, it keeps _answering_: `jorb_dag_status` LEFT JOINs `jorb`, so an emptied DAG reports `total_jobs = 0` forever.          |
+| Schedule log    | 30 days | `jorb_schedule_log` rows, except each schedule's newest                                                  | It cascades only from `jorb_schedule`, which operators disable rather than delete — so it had no upper bound of any kind, at cron rate, for the life of the install.                                                                             |
+| Retired workers | 30 days | `jorb_worker` rows both retired and silent for the window                                                | One row per worker _process start_, and nothing ever deleted one: a fleet that redeploys accumulates registry rows for as long as it exists.                                                                                                     |
 
 The two lifetimes are deliberately independent — that is the whole point of
 splitting them. Every one of these sweeps also **refuses** to delete a row
@@ -439,7 +439,7 @@ latency-critical sweeps above, which decide how long a stuck job stays
 stuck. Falling behind is logged at WARNING, because silence would read
 exactly like being caught up.
 
-A checkpoint of a *non-terminal* job is never touched at any age — a
+A checkpoint of a _non-terminal_ job is never touched at any age — a
 durable sleep parks a job in `queued` for months holding the very
 checkpoint that records when to wake. And a terminal job that something is
 still `waiting` on is kept regardless of age: `waitfor_job` and
@@ -468,21 +468,21 @@ steady-state probe.
 
 **One row per job, for its whole life.** `jorb.id` is stable across every
 retry, resume and operator requeue, so a caller's handle never goes stale.
-Everything per-*attempt* lives elsewhere.
+Everything per-_attempt_ lives elsewhere.
 
-| Table | Grain | Lifetime |
-|---|---|---|
-| `jorb` | one row per job, forever | retention window |
-| `jorb_history` | one row per transition (~4 per job) — the per-attempt trail | cascade from `jorb` |
-| `jorb_step` | one row per DXE checkpoint | its own, much shorter window |
-| `jorb_event` | one row per `(job, key)` published | cascade from `jorb` |
-| `jorb_mailbox` | one row per durable message | cascade, **or** the consumed-mail sweep |
-| `jorb_dependencies` | DAG edges, two FKs to `jorb`, both cascading | cascade from either end |
-| `jorb_queue` | one row per *controlled* queue; absent = defaults | operator-managed |
-| `jorb_worker` | one row per worker *process* | retired by the monitor, then the retired-worker sweep; never while it owns in-flight jobs |
-| `jorb_schedule` | one cron definition | operator-managed |
-| `jorb_schedule_log` | one row per schedule *execution* | the schedule-log sweep, which always keeps each schedule's newest |
-| `jorb_dag` | one DAG header; `jorb.dag_id` is `ON DELETE SET NULL` | the orphaned-DAG sweep, once it is past the window **and** has no jobs left |
+| Table               | Grain                                                       | Lifetime                                                                                  |
+| ------------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `jorb`              | one row per job, forever                                    | retention window                                                                          |
+| `jorb_history`      | one row per transition (~4 per job) — the per-attempt trail | cascade from `jorb`                                                                       |
+| `jorb_step`         | one row per DXE checkpoint                                  | its own, much shorter window                                                              |
+| `jorb_event`        | one row per `(job, key)` published                          | cascade from `jorb`                                                                       |
+| `jorb_mailbox`      | one row per durable message                                 | cascade, **or** the consumed-mail sweep                                                   |
+| `jorb_dependencies` | DAG edges, two FKs to `jorb`, both cascading                | cascade from either end                                                                   |
+| `jorb_queue`        | one row per _controlled_ queue; absent = defaults           | operator-managed                                                                          |
+| `jorb_worker`       | one row per worker _process_                                | retired by the monitor, then the retired-worker sweep; never while it owns in-flight jobs |
+| `jorb_schedule`     | one cron definition                                         | operator-managed                                                                          |
+| `jorb_schedule_log` | one row per schedule _execution_                            | the schedule-log sweep, which always keeps each schedule's newest                         |
+| `jorb_dag`          | one DAG header; `jorb.dag_id` is `ON DELETE SET NULL`       | the orphaned-DAG sweep, once it is past the window **and** has no jobs left               |
 
 `jorb_history` is recorded **by trigger**, not by the writers. The worker,
 monitor, scheduler, admin API and websocket server all mutate `jorb`;
@@ -491,9 +491,9 @@ of them has to know it exists. `jorb_dag.completed` is stamped the same way
 for the same reason.
 
 `jorb.tags` and `jorb.admin_data` are deliberately different columns.
-`tags` is the *caller's* labels (customer, region, batch) — flat, and the
+`tags` is the _caller's_ labels (customer, region, batch) — flat, and the
 only JSONB with an index, because filtering on them is a thing applications
-do. `admin_data` is the *platform's* own execution config (`max_retries`,
+do. `admin_data` is the _platform's_ own execution config (`max_retries`,
 `timeout_seconds`, `on_timeout`, `save_result`, schedule metadata), which
 nobody filters on, so indexing it would tax every enqueue to make no query
 faster.
@@ -512,36 +512,36 @@ arbitrary once you have this:
 > **The write path does the minimum necessary work inside the transaction.
 > Everything optional is either made conditional, or moved out.**
 
-*Made conditional:*
+_Made conditional:_
 
-* Notifications fire only against registered demand — the gate is
+- Notifications fire only against registered demand — the gate is
   evaluated before the payload is built, and for `jorb_done` it is the
   trigger's `WHEN` clause, so the function is not even entered.
-* The claim's serialising lock is taken only for queues that actually have
+- The claim's serialising lock is taken only for queues that actually have
   a control set; everything else keeps the lock-free path.
-* `idle` and `awaited` are written only on transition, so the flags cost
+- `idle` and `awaited` are written only on transition, so the flags cost
   one write per park and per await, not one per poll.
-* The GIN index on `tags` is partial, so an untagged enqueue — the hot
+- The GIN index on `tags` is partial, so an untagged enqueue — the hot
   shape — is not in the index at all. Same reasoning for `run_group`,
   `uid` and `dag_id`.
-* `updated` is deliberately *not* indexed: it is rewritten by every state
+- `updated` is deliberately _not_ indexed: it is rewritten by every state
   change, so an index on it would add a write to each of the ~4 updates per
   job and block HOT updates on the hottest table in the system. Reporting
   windows key off `created`, which is written once.
 
-*Moved out:*
+_Moved out:_
 
-* The dashboard firehose became a polled aggregate — cost O(1) in both
+- The dashboard firehose became a polled aggregate — cost O(1) in both
   dashboards and throughput, instead of O(transitions).
-* Retention, timeout enforcement and crash recovery are all the monitor's
+- Retention, timeout enforcement and crash recovery are all the monitor's
   work on its own schedule, never a producer's or a worker's.
-* Durable sleep leaves the process entirely: the sleep is a future
+- Durable sleep leaves the process entirely: the sleep is a future
   `run_after` in the database, not a parked worker.
-* Job code runs on the worker's own thread pool, off the event loop that
+- Job code runs on the worker's own thread pool, off the event loop that
   is holding the deadline.
 
 The counterweight, so this does not become an excuse to do too little: the
-minimum genuinely necessary work stays *inside* the transaction. The
+minimum genuinely necessary work stays _inside_ the transaction. The
 history trigger, the epoch fence and the claim's control checks are all on
 the write path precisely because moving them out would make them
 optional — and a correctness property that a caller can forget to enforce

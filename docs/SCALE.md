@@ -11,7 +11,7 @@ ceiling](#why-notify-set-the-ceiling), which is worth reading before tuning
 anything, because the fix is the opposite of the obvious one.
 
 What breaks first is now unambiguously everything that has to read or retain
-the *accumulated* table, not the writes.
+the _accumulated_ table, not the writes.
 
 Every number here is reproducible with `pj-bench` — see [Reproducing
 these numbers](#reproducing-these-numbers). They are not hand-measurements.
@@ -20,12 +20,12 @@ these numbers](#reproducing-these-numbers). They are not hand-measurements.
 
 ## What one job costs
 
-| Per job | Count | At 278 jobs/s |
-|---|---|---|
-| `jorb` row writes (insert + claim + run + terminal) | 4 | ~1,100 writes/s |
-| `jorb_history` rows (trigger, one per transition) | 4 | ~1,100 inserts/s, **96M rows/day** |
-| Notifications emitted | **0** unobserved, 1–2 observed | ~0/s (was ~1,390/s) |
-| `jorb_step` rows | 1 per `step()` call | workload-dependent |
+| Per job                                             | Count                          | At 278 jobs/s                      |
+| --------------------------------------------------- | ------------------------------ | ---------------------------------- |
+| `jorb` row writes (insert + claim + run + terminal) | 4                              | ~1,100 writes/s                    |
+| `jorb_history` rows (trigger, one per transition)   | 4                              | ~1,100 inserts/s, **96M rows/day** |
+| Notifications emitted                               | **0** unobserved, 1–2 observed | ~0/s (was ~1,390/s)                |
+| `jorb_step` rows                                    | 1 per `step()` call            | workload-dependent                 |
 
 ### Measuring enqueue honestly
 
@@ -62,18 +62,18 @@ wall and recovered ~20× by moving notifications out of the commit path
 
 Measured here, 16 concurrent connections, one transaction per job:
 
-| | jobs/s |
-|---|---|
-| as shipped when this was measured (all channels) | 11,326 |
-| `job_state_change` firehose disabled | 11,668 |
-| all `NOTIFY` triggers disabled | **28,790** |
+|                                                  | jobs/s     |
+| ------------------------------------------------ | ---------- |
+| as shipped when this was measured (all channels) | 11,326     |
+| `job_state_change` firehose disabled             | 11,668     |
+| all `NOTIFY` triggers disabled                   | **28,790** |
 
 **The cost is per-COMMIT, not per-notification.** Disabling the transition
 firehose alone — four of the five notifications a job emitted, one per
 transition through `queued -> claimed -> running -> finished` — recovered only
 **3%**: the lock is per COMMIT, so a transaction that still issues one
 `NOTIFY` pays exactly what a transaction that issued several paid, and every
-commit on every path still issued one. Reducing notification *volume* does not
+commit on every path still issued one. Reducing notification _volume_ does not
 raise the ceiling; only removing `NOTIFY` from the commit path does.
 
 **What was done about it.** Every channel is now emitted only when a consumer
@@ -88,17 +88,17 @@ Measured on the completion path, 16 concurrent connections, one transaction per
 job, median of 5 (`tests/test_notify_gating.py`, which rebuilds the deleted
 trigger so the "before" stays measurable):
 
-| | jobs/s |
-|---|---|
-| before: a client waiting, firehose on | 11,917 |
-| before: fire and forget, firehose on | 12,193 |
-| after: `job_state_change` deleted | **35,191** |
+|                                       | jobs/s     |
+| ------------------------------------- | ---------- |
+| before: a client waiting, firehose on | 11,917     |
+| before: fire and forget, firehose on  | 12,193     |
+| after: `job_state_change` deleted     | **35,191** |
 
 Gating the completion channel alone bought 1.02x; deleting the firehose as
 well bought **2.9x**. Repeat runs land between 2.6x and 2.9x — the benchmark
 is a median of 5 interleaved rounds, not a single ordered pass, precisely so
 that drift shows up as noise rather than as a result. Same lesson, now paid for: it is the number of
-*notifying commits* that matters, not the number of notifications.
+_notifying commits_ that matters, not the number of notifications.
 
 This is the single most important thing to understand before tuning: it is
 invisible to a serial benchmark (3% there) and invisible to a bulk benchmark,
@@ -110,11 +110,11 @@ shape.
 Now measured under the production shape, 16 concurrent connections, one
 transaction per job, median of 3 (`pj-bench enqueue --allow-trigger-toggle`):
 
-| | jobs/s |
-|---|---|
-| as shipped | 29,768 |
-| history trigger off | 41,431 |
-| all NOTIFY off | 36,238 |
+|                                | jobs/s |
+| ------------------------------ | ------ |
+| as shipped                     | 29,768 |
+| history trigger off            | 41,431 |
+| all NOTIFY off                 | 36,238 |
 | all NOTIFY **and** history off | 42,112 |
 
 So history costs roughly **1.4×** — real, but nowhere near what isolating it in
@@ -140,35 +140,35 @@ on your own hardware rather than trusting these.
 
 ### 1. Anything that scans the accumulated table
 
-This is the real scaling wall, and it is entirely about *plans*, not volume. A
+This is the real scaling wall, and it is entirely about _plans_, not volume. A
 query that reads the whole job table stays correct as the table grows and
 simply gets slower, which is the failure you discover months in.
 
 Measured on the retention probe — the query the monitor runs every cycle,
 forever, whose honest answer once caught up is usually "nothing expired":
 
-| | Buffers | Rows examined |
-|---|---|---|
-| unindexed, 300k rows | 5,741 | 300,000 → returns 0 |
-| unindexed, 20k rows, `ORDER BY id` | 465 | 20,000 → returns 0 |
-| indexed + ordered by the indexed expression | **2** | 0 |
+|                                             | Buffers | Rows examined       |
+| ------------------------------------------- | ------- | ------------------- |
+| unindexed, 300k rows                        | 5,741   | 300,000 → returns 0 |
+| unindexed, 20k rows, `ORDER BY id`          | 465     | 20,000 → returns 0  |
+| indexed + ordered by the indexed expression | **2**   | 0                   |
 
 Two things were required, because the index alone was not enough:
 
-* `jorb_retention_idx` on `COALESCE(finished, updated)`, partial over terminal
+- `jorb_retention_idx` on `COALESCE(finished, updated)`, partial over terminal
   states.
-* **Ordering by that same expression.** `ORDER BY id` makes the planner prefer
+- **Ordering by that same expression.** `ORDER BY id` makes the planner prefer
   a primary-key scan to avoid a sort, then filter every row anyway. Ordering by
   the indexed expression is a 2-buffer index scan — and "oldest first" is what
   retention means regardless.
 
-`tests/test_scale_plans.py` asserts the *plan* for these paths, not a duration.
+`tests/test_scale_plans.py` asserts the _plan_ for these paths, not a duration.
 Timings flake on a loaded CI box and pass on a fast one with the index dropped;
 a plan is a fact.
 
 The same file checks that **every foreign key to `jorb` has a leading index**.
 Postgres does not create one automatically, and a cascade delete without one is
-a sequential scan of the child table *per deleted row* — precisely what
+a sequential scan of the child table _per deleted row_ — precisely what
 retention does in bulk. That check found `jorb_dependencies.depends_on`, which
 had no index because the primary key leads with the other column.
 
@@ -242,7 +242,7 @@ ALTER TABLE jorb SET (autovacuum_vacuum_scale_factor  = 0.02,
 
 `fillfactor` leaves room on each page for an updated row version to live beside
 its original, which is what allows a **HOT update** — one that does not have to
-touch every index. That is also why `jorb.updated` is deliberately *not*
+touch every index. That is also why `jorb.updated` is deliberately _not_
 indexed: it is rewritten by every state transition, so an index on it would add
 a write to each of the ~4 updates per job and defeat HOT, paying permanent
 write-path bloat for a read that happens once per scrape. Reporting windows use
@@ -255,16 +255,16 @@ keeping up" is a survival question at this rate and nothing else answers it.
 
 ## What holds up
 
-* **Claiming.** `claim_jorb()` uses `FOR UPDATE SKIP LOCKED` against a partial
+- **Claiming.** `claim_jorb()` uses `FOR UPDATE SKIP LOCKED` against a partial
   index over claimable rows only, so claim cost is independent of how many
   finished jobs are in the table. Workers never block each other.
-* **Enqueue.** 34,671 jobs/s in the production shape — 16 concurrent
+- **Enqueue.** 34,671 jobs/s in the production shape — 16 concurrent
   connections, one transaction per job — against a 278/s requirement. (The
   68k figure is the single-bulk-transaction number, which
   [measures the wrong thing](#measuring-enqueue-honestly).)
-* **Fencing.** `run_epoch` comparisons are per-row and add nothing measurable.
-* **Cascade deletes** — now that every foreign key has a leading index.
-* **Resolving the job class.** 0.49 µs/job from the class cache, and the
+- **Fencing.** `run_epoch` comparisons are per-row and add nothing measurable.
+- **Cascade deletes** — now that every foreign key has a leading index.
+- **Resolving the job class.** 0.49 µs/job from the class cache, and the
   `--reload` dev flag adds 5 µs — measured, not assumed; see
   [Caching the resolved job class](#caching-the-resolved-job-class-and-what-the-reload-flag-costs).
 
@@ -281,20 +281,20 @@ million-jobs-per-hour queue under a cap and expect uncapped throughput.
 Measured, on the shape where the lock is the only thing binding — a cap too
 high to refuse, short jobs, claimers to spare — that ceiling is **3,211
 claims/s, 11.6× the reference workload**, so it is a caveat and not a wall.
-Raising it further would take claiming a *batch* per lock acquisition; that was
+Raising it further would take claiming a _batch_ per lock acquisition; that was
 measured against this number and [rejected](#claiming-a-batch-per-lock-acquisition-rejected-on-the-measurement),
 along with what would change the answer.
 
-A cap that is *low* is a different thing entirely and no claim strategy touches
+A cap that is _low_ is a different thing entirely and no claim strategy touches
 it: `max_concurrency` bounds in-flight work, so the queue permits
 `cap / job duration` and that is the whole story.
 
-What the lock choice *does* decide is what happens to a claimer that loses it.
+What the lock choice _does_ decide is what happens to a claimer that loses it.
 The lock waits up to 50ms rather than failing instantly, and the reason is
 worth knowing because it is not the obvious one:
 
-A worker does not retry in a tight loop. It reads an empty claim as *"the queue
-is empty"* — so it publishes idle demand, which re-arms that queue's enqueue
+A worker does not retry in a tight loop. It reads an empty claim as _"the queue
+is empty"_ — so it publishes idle demand, which re-arms that queue's enqueue
 notifications for **every producer** (see [Why NOTIFY set the
 ceiling](#why-notify-set-the-ceiling)), and then parks for `checkInterval`, 5
 seconds by default, waiting for a wakeup nobody is going to send. Measured with
@@ -314,11 +314,11 @@ never freeze the queue, which is what the non-blocking version was protecting.
 
 Per million jobs, with an average of 3 steps each:
 
-| Table | Rows | Notes |
-|---|---|---|
-| `jorb` | 1M | plus 3 dead versions each until vacuumed |
-| `jorb_history` | 4M | the largest table; one row per transition |
-| `jorb_step` | 3M | prunable on a much shorter window than the job row |
+| Table          | Rows | Notes                                              |
+| -------------- | ---- | -------------------------------------------------- |
+| `jorb`         | 1M   | plus 3 dead versions each until vacuumed           |
+| `jorb_history` | 4M   | the largest table; one row per transition          |
+| `jorb_step`    | 3M   | prunable on a much shorter window than the job row |
 
 `jorb_step` exists to make a job **resumable**. Once the job reaches a terminal
 state, resume is impossible and every checkpoint it holds is dead weight kept
@@ -331,13 +331,13 @@ These grow on their own clocks, which is exactly why they were missed: none of
 them is reachable from a job's `ON DELETE CASCADE`, so job retention could run
 perfectly and leave all three growing forever.
 
-| Table | Grows with | Bounded by |
-|---|---|---|
-| `jorb_dag` | DAG executions | the DAG sweep, once its jobs are gone |
-| `jorb_schedule_log` | schedule *fires* (cron rate, not job rate) | the schedule-log sweep, minus one row per schedule |
-| `jorb_worker` | worker process **starts** — i.e. deploys | the retired-worker sweep |
+| Table               | Grows with                                 | Bounded by                                         |
+| ------------------- | ------------------------------------------ | -------------------------------------------------- |
+| `jorb_dag`          | DAG executions                             | the DAG sweep, once its jobs are gone              |
+| `jorb_schedule_log` | schedule _fires_ (cron rate, not job rate) | the schedule-log sweep, minus one row per schedule |
+| `jorb_worker`       | worker process **starts** — i.e. deploys   | the retired-worker sweep                           |
 
-`jorb_worker` is the one that surprises people: it is a *deployment* clock,
+`jorb_worker` is the one that surprises people: it is a _deployment_ clock,
 completely unrelated to throughput. A 100-worker fleet redeployed daily writes
 36,500 rows a year at zero jobs/second.
 
@@ -353,7 +353,7 @@ A state machine (`start_machine`) is a job that parks on `recv()` waiting for
 the next event, so its cost scales with **how many machines are alive at
 once**, not with job throughput:
 
-* **A machine holds a worker only while it is awaiting.** `recv()` parks a
+- **A machine holds a worker only while it is awaiting.** `recv()` parks a
   worker for at most `wait_seconds`; when that times out with no event the
   machine checkpoints a wake time, requeues itself and **unwinds** — the
   worker is released and the machine waits `idle_seconds` in the database
@@ -366,10 +366,10 @@ once**, not with job throughput:
   ~9% — roughly one worker per eleven idle machines. Machines still default
   to their own `machines` queue so a burst of simultaneous wakes cannot
   starve the workers serving latency-sensitive job queues. Size that queue's
-  `--workers` to concurrent *awaiting* machines; raising `idle_seconds`
+  `--workers` to concurrent _awaiting_ machines; raising `idle_seconds`
   lowers occupancy and adds up to that much delay to an event arriving just
   after a park ends.
-* **A long-lived machine accumulates `jorb_history` and consumed mail.** The
+- **A long-lived machine accumulates `jorb_history` and consumed mail.** The
   job-scoped `ON DELETE CASCADE` never fires for a machine that never
   terminates, so its wake/sleep history and read messages are bounded only by
   the history and mailbox sweeps (`--retention-days`), not by job completion.
@@ -392,7 +392,7 @@ way the job-cost numbers above were measured.
    completions/sec versus arrivals/sec. Those three catch almost everything.
 4. Watch that retention reports "caught up" rather than "out of budget".
 5. Run `pj-bench plans` in CI. It is the only item here that catches a problem
-   *before* it reaches production.
+   _before_ it reaches production.
 
 Nothing on this list asks you to disable a notification channel. That used to
 be step 3, and it was wrong: the channels that remain are gated on demand, so
@@ -434,8 +434,8 @@ machines; absolute numbers do not.
 Two measurement traps these tools exist to avoid, both of which produced wrong
 answers here before the harness existed:
 
-* **Bulk inserts amortise per-commit costs.** Measure one transaction per job.
-* **The NOTIFY commit lock only appears under concurrency.** A serial benchmark
+- **Bulk inserts amortise per-commit costs.** Measure one transaction per job.
+- **The NOTIFY commit lock only appears under concurrency.** A serial benchmark
   reports 3% for something that costs 62% in production.
 
 ---
@@ -474,10 +474,10 @@ maintain — so it was measured before it was kept, with the arms interleaved
 because the box was under load 45 and straight before/after runs were swinging
 2.5k–20k jobs/s for reasons unrelated to the change:
 
-| untagged enqueue | jobs/s |
-|---|---|
-| without `jorb_tags_idx` | 28,700 |
-| with `jorb_tags_idx` | 28,854 (1.005×) |
+| untagged enqueue        | jobs/s          |
+| ----------------------- | --------------- |
+| without `jorb_tags_idx` | 28,700          |
+| with `jorb_tags_idx`    | 28,854 (1.005×) |
 
 Identical, and that is the whole argument. The index is partial
 (`WHERE tags <> '{}'`), so an enqueue that sets no tags never matches the
@@ -502,10 +502,10 @@ It became a real `jorb.schedule_id` column rather than an expression index,
 measured the same way tags was — nine interleaved A/B pairs on two identically
 installed databases:
 
-| enqueue | jobs/s (median of 9) |
-|---|---|
-| without the column and index | 27,941 |
-| with them | 28,010 |
+| enqueue                      | jobs/s (median of 9) |
+| ---------------------------- | -------------------- |
+| without the column and index | 27,941               |
+| with them                    | 28,010               |
 
 1.002×, against a within-run spread of 10–33%. No difference, which is the
 argument.
@@ -570,7 +570,7 @@ reads the in-flight set rather than merely "used an index".
 `jorb_dag_status` LEFT JOINs `jorb`, so a DAG whose jobs retention removed
 reports `total_jobs = 0` forever. The cheap fix is an inner join — hide DAGs
 with no jobs — and it is wrong, because **a view cannot tell "never had jobs"
-from "had jobs, they aged out"**. A DAG with no jobs *yet* is a real state:
+from "had jobs, they aged out"**. A DAG with no jobs _yet_ is a real state:
 `DAGBuilder` writes that row before the jobs it will own, so an inner join
 would hide a DAG from `dag list` exactly while it is being built.
 
@@ -621,13 +621,13 @@ proposal is sound; it is the requirement that is missing.
 Measured with `pj-bench claim --workers 8 --jobs 2000 --repeat 7`, all arms
 **interleaved** (median of 7, PostgreSQL 18.3, 10-core box under load ~4):
 
-| arm | claimers | cap | job | claims/s | vs 278/s |
-|---|---|---|---|---|---|
-| uncapped, no completion | 8 | none | — | 19,037 | 68× |
-| capped, no completion | 8 | 3,000 | — | 2,953 | 10.6× |
-| uncapped, short jobs | 32 | none | 5 ms | 5,042 | 18× |
-| **capped, short jobs** | 32 | 1,000 | 5 ms | **3,211** | **11.6×** |
-| capped, short jobs | 2 | 2 | 5 ms | 236 | 0.85× |
+| arm                     | claimers | cap   | job  | claims/s  | vs 278/s  |
+| ----------------------- | -------- | ----- | ---- | --------- | --------- |
+| uncapped, no completion | 8        | none  | —    | 19,037    | 68×       |
+| capped, no completion   | 8        | 3,000 | —    | 2,953     | 10.6×     |
+| uncapped, short jobs    | 32       | none  | 5 ms | 5,042     | 18×       |
+| **capped, short jobs**  | 32       | 1,000 | 5 ms | **3,211** | **11.6×** |
+| capped, short jobs      | 2        | 2     | 5 ms | 236       | 0.85×     |
 
 The fourth row is the whole question: a cap too high to ever refuse, jobs short
 enough that admission is all the work there is, and enough claimers that the
@@ -639,7 +639,7 @@ with no cap (row 4 vs row 3) — that is the price of the lock, paid, and it is
 already priced in above.
 
 **Read these to one significant figure.** Repeat runs of the capped short-job
-arm land at 2,969–3,260 claims/s (10.7–11.7×), and its *within-run* spread was
+arm land at 2,969–3,260 claims/s (10.7–11.7×), and its _within-run_ spread was
 16% on one run and 89% on another on the same unchanged schema — it is the
 noisiest arm here, because it is the one whose rate is set by a serialised
 section competing with everything else on the box. That is survivable for this
@@ -651,7 +651,7 @@ contention.
 **A low cap does not need batching; it forbids it.** `max_concurrency` bounds
 in-flight work, so the rate it permits is `cap / duration` and nothing else —
 row 5 is cap 2 on 5 ms jobs, which permits 400/s in theory and measures
-210–236/s because the claim and completion round trips land *on top of* the
+210–236/s because the claim and completion round trips land _on top of_ the
 job, not inside it. A batch cannot admit more than the cap has slots for. When a capped
 queue is too slow, the cap is the thing that is too small; every other answer
 is arithmetic denial.
@@ -665,7 +665,7 @@ per-job while admission became per-batch, and "how big a batch, and does one
 greedy worker starve the others" turns into a policy with a tuning knob and a
 fairness bug waiting in it. That is a permanent tax on the entire worker model
 to speed up the one shape that already has 11.6× headroom. Same test as the
-rollup above: not "is it cheap", but *who pays when it is unused*.
+rollup above: not "is it cheap", but _who pays when it is unused_.
 
 **What would change this answer**, in the order it is likely to arrive:
 
@@ -673,15 +673,15 @@ rollup above: not "is it cheap", but *who pays when it is unused*.
    sustained — 11M jobs/hour through one cap. Two capped queues at half the
    rate are not this: the lock is per queue.
 2. **The cap count losing its index.** The `count(*)` over
-   `state IN ('claimed','running')` runs *inside* the lock, so it is subtracted
+   `state IN ('claimed','running')` runs _inside_ the lock, so it is subtracted
    from the queue's whole throughput rather than from one timer. It is gated as
    `concurrency_cap` by `pj-bench plans`, which measures it at **33–34 buffers**
    through `jorb_inflight_idx` with 200 jobs in flight in a 200k-row table.
    That plan holds while in-flight is a small fraction of the table, which is
-   what a cap *makes* it. Drive in-flight up to the whole table and the planner
+   what a cap _makes_ it. Drive in-flight up to the whole table and the planner
    correctly switches to a scan: 20,000 jobs claimed and none completing
    measured **581 claims/s** — still 2.1× the requirement, but that is the
-   number that falls with *table* size instead of with the queue's own load.
+   number that falls with _table_ size instead of with the queue's own load.
    A capped queue holding tens of thousands of jobs in flight means jobs are
    not finishing; fix the count, or the workers, before touching the claim.
 
@@ -703,12 +703,12 @@ Hypothesis tests. Its effect on throughput was never measured, and "turn
 **interleaved** (median of 7, Python 3.14, PostgreSQL 18.3, 10-core box under
 load ~3):
 
-| arm | µs/job | vs cached | ceiling, if resolution were the only work |
-|---|---|---|---|
-| cached — `--reload` off | **0.49** | — | 2,020,000 jobs/s |
-| `--reload` on, module unchanged: the mtime **check** | **5.5** | 11× | 182,000 jobs/s |
-| no class cache: `pydoc.locate` per job | **7.0** | 14× | 144,000 jobs/s |
-| `--reload` on, module edited: the **reload** | **104** | 211× | 9,600 jobs/s |
+| arm                                                  | µs/job   | vs cached | ceiling, if resolution were the only work |
+| ---------------------------------------------------- | -------- | --------- | ----------------------------------------- |
+| cached — `--reload` off                              | **0.49** | —         | 2,020,000 jobs/s                          |
+| `--reload` on, module unchanged: the mtime **check** | **5.5**  | 11×       | 182,000 jobs/s                            |
+| no class cache: `pydoc.locate` per job               | **7.0**  | 14×       | 144,000 jobs/s                            |
+| `--reload` on, module edited: the **reload**         | **104**  | 211×      | 9,600 jobs/s                              |
 
 Rows two and four are different questions and the gap between them is the flag's
 whole design. **The check is what a production worker with `--reload` left on
@@ -729,7 +729,7 @@ its own. The throughput argument never existed.
 
 **What the cache is worth is mostly correctness too — but not entirely.**
 Dropping it costs 6.5 µs/job (14×), which is still a 144,000 jobs/s ceiling and
-would not be visible end to end. Making resolution *unconditional* in the old
+would not be visible end to end. Making resolution _unconditional_ in the old
 sense — `importlib.reload` on every job — costs 104 µs and implies **9,600
 jobs/s, below the 19,037 claims/s the claim path sustains**. That is the shape
 that turns a per-job overhead into the system's bottleneck, and it is the number
@@ -743,7 +743,7 @@ only ever return "no difference" — and there, "no difference" is
 indistinguishable from "the flag never reached the workers" and from "the
 harness is broken". A measurement with no failure mode is not a measurement.
 Two runs at 200 jobs on 4 workers landed at 1,454 jobs/s with the flag off and
-1,497 with it on; the flag-on run was *faster*, which is the noise floor
+1,497 with it on; the flag-on run was _faster_, which is the noise floor
 demonstrating itself. `pj-bench e2e --reload` exists for exactly that smell test
 and is documented as not being an arm.
 
@@ -752,7 +752,7 @@ and is documented as not being an arm.
 1. **A different operating system.** The check is two `stat()` calls, so its
    cost belongs to the kernel and the filesystem rather than to this platform —
    5 µs is APFS on macOS. A Linux box with a warm dentry cache stats faster, and
-   unusually for this document the *ratio* will not travel either, because its
+   unusually for this document the _ratio_ will not travel either, because its
    numerator is a syscall and its denominator is a dict lookup. Re-take it with
    `pj-bench resolve`; do not quote this row.
 2. **A jobs module that does real work at import time.** `importlib.reload`

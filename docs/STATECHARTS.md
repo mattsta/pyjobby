@@ -35,11 +35,11 @@ class Order(StateMachineJob):
 
 An edge takes any of three shapes:
 
-| Written as | Means |
-|---|---|
-| `("packing", "charge")` | go to `packing`, running `self.charge` on the way |
-| `"refunded"` | go to `refunded`, no action |
-| `Transition("packing", "charge")` | the same as the tuple, named |
+| Written as                        | Means                                             |
+| --------------------------------- | ------------------------------------------------- |
+| `("packing", "charge")`           | go to `packing`, running `self.charge` on the way |
+| `"refunded"`                      | go to `refunded`, no action                       |
+| `Transition("packing", "charge")` | the same as the tuple, named                      |
 
 **The declaration is checked when the class is created, not when a transition
 fires.** A target state that appears nowhere else, an `initial` that is not a
@@ -87,18 +87,18 @@ await order.wait_for_state("shipped", timeout=600)
 result = await order.result()  # {"final_state": "shipped", "turns": 2}
 ```
 
-| Call | Does |
-|---|---|
-| `client.start_machine(Order, **enqueue_options)` | enqueue a machine, return a handle |
-| `client.machine(job_id, Order)` | a handle for one already running — no I/O |
-| `await handle.send(event, **payload)` | deliver a transition event |
-| `await handle.may(event)` | would this event be accepted right now? |
-| `await handle.state()` | current state |
-| `await handle.wait_for_state(*states, timeout=)` | block until it is in one of them |
-| `await handle.result(timeout=)` | wait for a final state and return the result |
-| `await handle.history()` | the current stretch of checkpointed transitions |
-| `await handle.cancel()` | stop it wherever it is |
-| `handle.diagram()` | Mermaid, rendered locally from the declaration |
+| Call                                             | Does                                            |
+| ------------------------------------------------ | ----------------------------------------------- |
+| `client.start_machine(Order, **enqueue_options)` | enqueue a machine, return a handle              |
+| `client.machine(job_id, Order)`                  | a handle for one already running — no I/O       |
+| `await handle.send(event, **payload)`            | deliver a transition event                      |
+| `await handle.may(event)`                        | would this event be accepted right now?         |
+| `await handle.state()`                           | current state                                   |
+| `await handle.wait_for_state(*states, timeout=)` | block until it is in one of them                |
+| `await handle.result(timeout=)`                  | wait for a final state and return the result    |
+| `await handle.history()`                         | the current stretch of checkpointed transitions |
+| `await handle.cancel()`                          | stop it wherever it is                          |
+| `handle.diagram()`                               | Mermaid, rendered locally from the declaration  |
 
 `SyncJobClient.start_machine()` and `.machine()` return a `SyncMachine` with the
 same methods, blocking, for scripts and cron jobs.
@@ -155,10 +155,10 @@ pj --queue machines --workers 4
 
 Two class attributes set the trade between latency and worker occupancy:
 
-| Attribute | Default | Meaning |
-|---|---|---|
-| `wait_seconds` | 30 | how long one `recv()` holds a worker before the machine gives it back |
-| `idle_seconds` | 300 | how long it then waits in the database, holding nothing |
+| Attribute      | Default | Meaning                                                               |
+| -------------- | ------- | --------------------------------------------------------------------- |
+| `wait_seconds` | 30      | how long one `recv()` holds a worker before the machine gives it back |
+| `idle_seconds` | 300     | how long it then waits in the database, holding nothing               |
 
 A machine occupies a worker about `wait / (wait + idle)` of the time — 9% at the
 defaults, so roughly one worker per eleven idle machines. Raising `idle_seconds`
@@ -188,17 +188,17 @@ trail, publish one: as machine events, or into your own table from inside a
 
 ## What a machine gets that an in-process FSM cannot
 
-* It survives `SIGKILL` at any instant and resumes where it was, with completed
+- It survives `SIGKILL` at any instant and resumes where it was, with completed
   actions skipped rather than re-run.
-* A worker presumed dead but still alive **cannot drive it forward** once
+- A worker presumed dead but still alive **cannot drive it forward** once
   another worker takes over — `run_epoch` fences every durable write, including
   the state publish and outbound messages.
-* An action that writes to this database can be exactly-once.
-* Timers are database rows, so a machine can wait six months without a process,
+- An action that writes to this database can be exactly-once.
+- Timers are database rows, so a machine can wait six months without a process,
   a connection or a thread.
-* `pj-admin jobs steps <id>` shows which transition ran, when, how long it took
+- `pj-admin jobs steps <id>` shows which transition ran, when, how long it took
   and what it failed with.
-* A client cannot silently lose an event.
+- A client cannot silently lose an event.
 
 ## What a machine is not
 
@@ -225,9 +225,9 @@ interpret them; your transition function does.
 
 ## See also
 
-* [DXE.md](DXE.md) — the durable primitives underneath: `step()`,
+- [DXE.md](DXE.md) — the durable primitives underneath: `step()`,
   `transaction()`, `sleep()`, events, mailboxes, fencing, and `compact()`.
-* [CLIENT_LIBRARY.md](CLIENT_LIBRARY.md#state-machines) — the client API in
+- [CLIENT_LIBRARY.md](CLIENT_LIBRARY.md#state-machines) — the client API in
   context with the rest of the enqueue surface.
-* [OPERATIONS.md](OPERATIONS.md) — running and watching the fleet the machines
+- [OPERATIONS.md](OPERATIONS.md) — running and watching the fleet the machines
   run on.

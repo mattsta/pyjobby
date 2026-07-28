@@ -61,7 +61,7 @@ class ProcessOrder(Job):
 
 - **Steps** checkpoint into the database; retries fast-forward past
   completed work and re-execute only what failed (your retry budget applies
-  to the *failing* step — an improvement over replay-the-recorded-error
+  to the _failing_ step — an improvement over replay-the-recorded-error
   designs).
 - **Durable sleeps** are rows, not processes — a million sleeping jobs cost
   zero workers.
@@ -83,6 +83,7 @@ crash-safe mid-transition, driveable and observable from any client:
 ```python
 from pyjobby import StateMachineJob
 
+
 class Order(StateMachineJob):
     initial = "awaiting_payment"
     final = frozenset({"shipped", "refunded"})
@@ -93,6 +94,7 @@ class Order(StateMachineJob):
 
     async def charge(self, event, payload): ...
     async def buy_label(self, event, payload): ...
+
 
 # machines run on their own queue ('machines') unless you pass queue=...,
 # so staff it: pj --queue machines --workers 1
@@ -113,7 +115,7 @@ pj-admin workers list                  # real registry: idle workers visible,
 pj-admin doctor                        # executable health runbook
 ```
 
-Pause, concurrency caps, and rate limits are enforced *inside* the claim
+Pause, concurrency caps, and rate limits are enforced _inside_ the claim
 statement — no worker restarts, no config deploys. Dead workers are
 detected by registry heartbeat and their jobs requeued globally by
 `pj-monitor` (jobs resume from their last completed step).

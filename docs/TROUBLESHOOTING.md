@@ -36,19 +36,19 @@ FAIL means the platform cannot function and is the only thing that changes
 the exit code. Lost capacity is a WARN, deliberately: "no live workers at
 all" is a WARN, so one worker of ten refusing to claim cannot be graver.
 
-| Check | FAIL / WARN means | Go to |
-|---|---|---|
-| `database` | cannot connect with the DSN or config given | [Config and connection](#the-database-is-unreachable-or-the-config-is-wrong) |
-| `schema` | no schema at all, or a schema **missing objects this release needs** (each one named) | [Schema is missing or stale](#the-schema-is-missing-or-stale) |
-| `triggers` | one of the schema's triggers is missing — NOTIFY waiters degrade to polling, or history stops being recorded | [Schema is missing or stale](#the-schema-is-missing-or-stale) |
-| `notify-queue` | WARN at 25% full, FAIL past 50% | [NOTIFY queue saturation](#notify-queue-saturation) |
-| `workers` | no heartbeat in the last 60s | [Nothing is being claimed](#nothing-is-being-claimed) |
-| `job-threads` | live workers that claim nothing | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing) |
-| `queue <name>` | backlog past `--max-depth` (10000) or `--max-age-minutes` (60) | [The backlog is growing](#the-backlog-is-growing) |
-| `blocked-waiters` | jobs in `waiting` whose upstream crashed or was cancelled — the monitor leaves them alone, so this is the only place they show up | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq) |
-| `mailbox` | unread durable mail older than a day — usually a sender using a topic nothing `recv()`s | [STATECHARTS.md § Waiting](STATECHARTS.md#waiting) |
-| `dlq` | jobs have exhausted their retries | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq) |
-| `schedules` | an enabled schedule is overdue by >5m | [A schedule is not firing](#a-schedule-is-not-firing) |
+| Check             | FAIL / WARN means                                                                                                                 | Go to                                                                                    |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `database`        | cannot connect with the DSN or config given                                                                                       | [Config and connection](#the-database-is-unreachable-or-the-config-is-wrong)             |
+| `schema`          | no schema at all, or a schema **missing objects this release needs** (each one named)                                             | [Schema is missing or stale](#the-schema-is-missing-or-stale)                            |
+| `triggers`        | one of the schema's triggers is missing — NOTIFY waiters degrade to polling, or history stops being recorded                      | [Schema is missing or stale](#the-schema-is-missing-or-stale)                            |
+| `notify-queue`    | WARN at 25% full, FAIL past 50%                                                                                                   | [NOTIFY queue saturation](#notify-queue-saturation)                                      |
+| `workers`         | no heartbeat in the last 60s                                                                                                      | [Nothing is being claimed](#nothing-is-being-claimed)                                    |
+| `job-threads`     | live workers that claim nothing                                                                                                   | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing) |
+| `queue <name>`    | backlog past `--max-depth` (10000) or `--max-age-minutes` (60)                                                                    | [The backlog is growing](#the-backlog-is-growing)                                        |
+| `blocked-waiters` | jobs in `waiting` whose upstream crashed or was cancelled — the monitor leaves them alone, so this is the only place they show up | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq)                              |
+| `mailbox`         | unread durable mail older than a day — usually a sender using a topic nothing `recv()`s                                           | [STATECHARTS.md § Waiting](STATECHARTS.md#waiting)                                       |
+| `dlq`             | jobs have exhausted their retries                                                                                                 | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq)                              |
+| `schedules`       | an enabled schedule is overdue by >5m                                                                                             | [A schedule is not firing](#a-schedule-is-not-firing)                                    |
 
 Age is the more honest queue alarm than depth: a deep queue that is
 draining is fine; an old queue is not. Tune the thresholds per install with
@@ -56,21 +56,21 @@ draining is fine; an old queue is not. Tune the thresholds per install with
 
 ## Symptom index
 
-| Symptom | Section |
-|---|---|
-| One named job is not running | `pj-admin jobs why ID`, then [Nothing is being claimed](#nothing-is-being-claimed) |
-| Jobs sit in `queued`, workers look idle | [Nothing is being claimed](#nothing-is-being-claimed) |
-| A worker heartbeats but never claims | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing) |
-| Queue depth or age climbing | [The backlog is growing](#the-backlog-is-growing) |
-| The table grows even though retention is on | [Retention is falling behind](#retention-is-falling-behind) |
-| Enqueues start failing platform-wide | [NOTIFY queue saturation](#notify-queue-saturation) |
-| A cron schedule stopped running | [A schedule is not firing](#a-schedule-is-not-firing) |
-| Jobs stuck in `claimed` or `running` | [A job is stuck](#a-job-is-stuck-in-claimed-or-running) |
-| `crashed` count rising | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq) |
-| `column ... does not exist`, `relation "jorb" does not exist` | [Schema is missing or stale](#the-schema-is-missing-or-stale) |
-| `Job class not found` | [A job class cannot be imported](#a-job-class-cannot-be-imported) |
-| A job ran twice | [A job ran more than once](#a-job-ran-more-than-once) |
-| A process exits immediately at startup | [Config and connection](#the-database-is-unreachable-or-the-config-is-wrong) |
+| Symptom                                                       | Section                                                                                  |
+| ------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| One named job is not running                                  | `pj-admin jobs why ID`, then [Nothing is being claimed](#nothing-is-being-claimed)       |
+| Jobs sit in `queued`, workers look idle                       | [Nothing is being claimed](#nothing-is-being-claimed)                                    |
+| A worker heartbeats but never claims                          | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing) |
+| Queue depth or age climbing                                   | [The backlog is growing](#the-backlog-is-growing)                                        |
+| The table grows even though retention is on                   | [Retention is falling behind](#retention-is-falling-behind)                              |
+| Enqueues start failing platform-wide                          | [NOTIFY queue saturation](#notify-queue-saturation)                                      |
+| A cron schedule stopped running                               | [A schedule is not firing](#a-schedule-is-not-firing)                                    |
+| Jobs stuck in `claimed` or `running`                          | [A job is stuck](#a-job-is-stuck-in-claimed-or-running)                                  |
+| `crashed` count rising                                        | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq)                              |
+| `column ... does not exist`, `relation "jorb" does not exist` | [Schema is missing or stale](#the-schema-is-missing-or-stale)                            |
+| `Job class not found`                                         | [A job class cannot be imported](#a-job-class-cannot-be-imported)                        |
+| A job ran twice                                               | [A job ran more than once](#a-job-ran-more-than-once)                                    |
+| A process exits immediately at startup                        | [Config and connection](#the-database-is-unreachable-or-the-config-is-wrong)             |
 
 ---
 
@@ -93,7 +93,7 @@ mounts no config will start `pj-monitor` and `pj-admin` fine and fail every
 worker. The full matrix is in
 [deployment-guide.md § Configuration](deployment-guide.md#configuration).
 
-A database that goes away *after* startup is not an incident: workers, the
+A database that goes away _after_ startup is not an incident: workers, the
 monitor and the scheduler reconnect with backoff and re-prepare their
 statements. Nothing needs restarting, and restarting a worker only
 abandons its in-flight jobs to the monitor.
@@ -114,7 +114,7 @@ $ echo $?
 
 **A schema of the wrong shape** — installed from a different revision of
 the base schema, so it has `jorb` and records nothing pending, and a
-presence-only check would pass it. `doctor` checks the schema's *shape*
+presence-only check would pass it. `doctor` checks the schema's _shape_
 against the manifest of objects this release actually addresses
 (`pyjobby/migrations.py`), and names what is absent:
 
@@ -141,7 +141,7 @@ Missing objects:       3
 ```
 
 `Missing objects` is the line that matters. The version lines can only say
-what this database *recorded*, and a drifted database records exactly what
+what this database _recorded_, and a drifted database records exactly what
 a current one does — only the object list tells them apart.
 
 Both checks stop the report: every line below `schema` queries something
@@ -169,7 +169,7 @@ $ echo $?
 1
 ```
 
-The same handler covers a missing *column* (`column "job_threads" does not
+The same handler covers a missing _column_ (`column "job_threads" does not
 exist`), a missing function and a missing schema, and it sits on the root
 command group — so every `pj-admin` subcommand, including ones added later,
 answers a stale database the same way.
@@ -185,7 +185,7 @@ this version of pyjobby; run `db migrate` and confirm with `doctor`.
 executable version of this whole section: it asks the claim path itself
 which of these conditions is refusing the job and answers with the numbers
 behind it — the paused queue, the cap and what is filling it, the missing
-capability and what *is* advertised, the priority ceiling, the `run_after`,
+capability and what _is_ advertised, the priority ceiling, the `run_after`,
 the blocking job and its state. The priority-ceiling case in particular
 cannot be reached any other way at runtime.
 
@@ -216,7 +216,7 @@ The rest of this section is the same walk by hand — for when the symptom is
    `Max concurrency` or `Rate limit` set and binding? Both are enforced in
    the database, so they bind every claimer, and a paused queue stops
    claims within a fraction of a second.
-3. **`pj-admin workers list`.** Are there live workers *on that queue*?
+3. **`pj-admin workers list`.** Are there live workers _on that queue_?
    Read the Queue column, not the worker count. `--workers` is **per
    queue**, and no worker is ever started on a queue you did not name:
    `pj --queue reports --workers 4` is four workers, all on `reports`, and
@@ -238,7 +238,7 @@ The rest of this section is the same walk by hand — for when the symptom is
    the job's `prio` or by running a worker with a `--max-prio` that covers
    it — see
    [OPERATIONS.md § Priority](OPERATIONS.md#priority-and-the-ceiling-a-worker-claims-under).
-6. **`run_after`.** A job with a future `run_after` is *supposed* to be
+6. **`run_after`.** A job with a future `run_after` is _supposed_ to be
    invisible — that is how retry backoff and durable sleep are
    implemented. `pj-admin jobs inspect ID` shows it.
 7. **The worker's own log**, for `NOT CLAIMING` (next section).
@@ -292,10 +292,10 @@ Avg Duration:      0.00s
 Avg Queue Wait:    7.00s
 ```
 
-* **Arrivals sustained above throughput** is the definition of falling
+- **Arrivals sustained above throughput** is the definition of falling
   behind. Add workers, or raise `--max-concurrency` if a cap is binding.
-* **Rising queue wait with flat duration** is capacity.
-* **Rising duration** is a code or dependency problem — profile the job,
+- **Rising queue wait with flat duration** is capacity.
+- **Rising duration** is a code or dependency problem — profile the job,
   not the platform.
 
 If the backlog is a runaway producer rather than missing capacity,
@@ -358,7 +358,7 @@ demand-gated (an unobserved job emits none). The fifth,
 `schedule_executed`, is **ungated on purpose** — its consumer, the
 websocket dashboard, has no polling fallback, so a gate would drop events
 rather than delay them — and it costs nothing here, because it fires once
-per schedule *execution* on `jorb_schedule_log`, at cron rate, never on a
+per schedule _execution_ on `jorb_schedule_log`, at cron rate, never on a
 job hot path. Full argument:
 [SCALE.md § NOTIFY queue saturation](SCALE.md#3-notify-queue-saturation--the-cliff).
 
@@ -381,17 +381,17 @@ In order:
    separate process from the workers.
 2. **Is the schedule enabled?** `pj-admin schedule show NAME`. Two things
    disable a schedule on their own, and both log at ERROR:
-   * **The circuit breaker** — `Schedule 'X' disabled: Circuit breaker
-     triggered: 5 consecutive failures (threshold: 5)`. Fix the job, then
+   - **The circuit breaker** — `Schedule 'X' disabled: Circuit breaker
+triggered: 5 consecutive failures (threshold: 5)`. Fix the job, then
      `pj-admin schedule enable NAME`.
-   * **Unevaluatable** — `Schedule N disabled: ...`. A cron expression or
+   - **Unevaluatable** — `Schedule N disabled: ...`. A cron expression or
      timezone that cannot be evaluated can never get a new `next_run`, so
      leaving it enabled would make it due forever and fail on every poll.
      Disabling it is the only outcome that both stops the spin and is
      visible. Delete and re-add it with a valid expression; `schedule add`
      validates both up front.
 3. **Was it skipped rather than failed?** `pj-admin schedule history NAME
-   --result skipped` — `max_concurrent` and the backpressure threshold both
+--result skipped` — `max_concurrent` and the backpressure threshold both
    skip a fire deliberately.
 4. **Missed fires are not backfilled.** A scheduler that was down at fire
    time skips those ticks; `next_run` advances from now.
@@ -433,7 +433,7 @@ superseded execution out of writing results or checkpoints; a manual update
 does not, and the two executions race. Use `pj-admin jobs rerun ID`.
 
 A note on what a timeout can interrupt: async code is genuinely stopped at
-its await point. A *synchronous* `task()` runs in a worker thread — the
+its await point. A _synchronous_ `task()` runs in a worker thread — the
 deadline fires on time and the job is recorded as timed out, but the thread
 runs to completion and its result is discarded. That thread is the one that
 later shows up as abandoned. Details in
@@ -471,7 +471,7 @@ TypeError: job.email.SendEmail is not a pyjobby Job subclass (got ...)
 ```
 
 The worker resolves `job_class` as a dotted path at execution time, so the
-class must be importable *by the worker process*, not by whatever enqueued
+class must be importable _by the worker process_, not by whatever enqueued
 it — and the message prints the search path it used. Check, in order: the
 dotted path recorded on the job (`pj-admin jobs inspect ID` prints it,
 case-sensitively), the worker's `--path` flags, and `PYTHONPATH` in the
@@ -489,14 +489,14 @@ Retries re-run `task()` from the beginning unless the job checkpoints its
 work. That is the design: at-least-once execution, with the tools to make
 it exactly-once where it matters.
 
-* **Durable steps** — `self.step(...)` records each completed step, and a
+- **Durable steps** — `self.step(...)` records each completed step, and a
   completed step never runs twice, fenced by `run_epoch` against a zombie
   execution. This is the real answer for side effects. See
   [DXE.md](DXE.md).
-* **`deadline_key`** — a partial unique index makes one *queued* row per
+- **`deadline_key`** — a partial unique index makes one _queued_ row per
   `(deadline_key, queue)`, so duplicate submissions collapse into one job.
   This is the enqueue-side guard, not the execution-side one.
-* **Idempotent side effects** — the fallback when neither applies.
+- **Idempotent side effects** — the fallback when neither applies.
 
 Note that a re-run you asked for is a separate verb precisely because it
 repeats side effects: `jobs retry` refuses a finished job, `jobs rerun`

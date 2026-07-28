@@ -191,8 +191,8 @@ Enqueue a single job.
 
 - `job_class` (str): Full Python class path (e.g., `'myapp.jobs.SendEmail'`)
 - `queue` (str): Queue name (default: `'default'`)
-- `priority` (int): Priority as a **finishing position** — a *smaller*
-  number runs *sooner*, the way `priority=1` means "first" in a race
+- `priority` (int): Priority as a **finishing position** — a _smaller_
+  number runs _sooner_, the way `priority=1` means "first" in a race
   (default: 100). Workers claim in ascending `prio` order and only take
   jobs at or below their ceiling (`pj --max-prio`, default 1000), so a
   number above the ceiling is not "run last", it is "never run". This
@@ -449,6 +449,7 @@ synchronous twin on `SyncJobClient` with the same signature, except the two
 marked "async only" below.
 
 **Inspection**
+
 - `get_job_full(job_id)` — complete row: kwargs, result, error, timestamps.
 - `get_job_result(job_id)` — a finished job's stored result, without waiting.
 - `get_steps(job_id)` — a job's recorded DXE checkpoints, oldest first.
@@ -457,20 +458,24 @@ marked "async only" below.
 - `list_queues(window=timedelta(hours=1))` — every queue with per-state counts (same contract as `queue_stats`).
 
 **Events & mail** (see also State Machines below)
+
 - `send_message(dest_job_id, message, topic=None)` — put a durable message in a job's mailbox.
 - `get_event(job_id, key, timeout=None)` — wait for a job's published event value.
-- `wait_for_event(job_id, key, accept=None, timeout=None)` — wait until the event exists *and* satisfies `accept`.
+- `wait_for_event(job_id, key, accept=None, timeout=None)` — wait until the event exists _and_ satisfies `accept`.
 
 **Bulk operations** (the single-job verbs over a list of ids)
+
 - `bulk_retry(job_ids)`, `bulk_cancel(job_ids)`, `bulk_delete(job_ids)`, `bulk_update_priority(job_ids, new_priority)`.
 - `delete_job(job_id)`, `purge_queue(queue, states=None)` — delete one job, or a queue's jobs by state.
 
 **Advanced enqueue**
+
 - `enqueue_handle(...)` — enqueue and get a `JobHandle` (`.result()`, `.wait_for_result()`, `.cancel()`, `.event()`) (async only; a handle's own methods are coroutines bound to the async client, so `run()` / `wait_for_result()` are the sync shapes of this workflow).
 - `enqueue_in_transaction(conn, ...)` — enqueue on the CALLER's asyncpg connection, inside their transaction (async only; no sync twin).
 - `create_pipeline_with_results(stages, ...)` — a pipeline where each stage receives the previous stage's result.
 
 **Property**
+
 - `listening` — True when this client can ride LISTEN/NOTIFY for its waits (constructed with `db_params`) rather than polling only.
 
 ---
@@ -600,8 +605,8 @@ transform = dag.add("etl.Transform", depends_on=[extract])
 load = dag.add("etl.Load", depends_on=[transform])
 notify = dag.add("etl.Notify", depends_on=[load])
 
-nodes = await client.execute_dag(dag)      # {node: job_id}
-dag_id = nodes[extract]                     # any node's job id identifies the DAG
+nodes = await client.execute_dag(dag)  # {node: job_id}
+dag_id = nodes[extract]  # any node's job id identifies the DAG
 
 # Wait for the whole graph, or inspect it without waiting.
 ok = await client.wait_for_dag(dag_id, timeout=3600)
@@ -706,11 +711,12 @@ A refused enqueue writes nothing.
 
 **Raising the ceiling takes both halves.** The ceiling belongs to the worker
 fleet and nothing about it is visible over a connection, so the client takes
-it as a *declaration* rather than trying to observe it:
+it as a _declaration_ rather than trying to observe it:
 
 ```bash
 pj --queue backfill --max-prio 5000            # the workers that will claim it
 ```
+
 ```python
 client = JobClient(pool, prio_ceiling=5000)
 # or: await JobClient.create(..., prio_ceiling=5000)
@@ -766,7 +772,7 @@ await client.enqueue("myapp.jobs.SyncData", capability="us-west", region="us-wes
 
 ### 8. Job Tags
 
-Find jobs by something *your application* means — which customer, which
+Find jobs by something _your application_ means — which customer, which
 region, which nightly batch — rather than by queue and job class.
 
 ```python
@@ -795,7 +801,7 @@ pj-admin jobs list --tag 'batch="42"'      # matches the STRING "42"
 **Tags are not `admin_data`.** `admin_data` is pyjobby's own execution
 config — retry strategy, timeout, schedule bookkeeping — and it is not
 indexed, because nobody filters on it and indexing it would tax every
-enqueue to make no query faster. `tags` is yours, and it *is* indexed.
+enqueue to make no query faster. `tags` is yours, and it _is_ indexed.
 
 **Tags are not `uid`.** `uid` is a single BIGINT, so it answers "which
 tenant" and nothing else. Reach for it when integer tenancy is the whole
@@ -809,7 +815,7 @@ Rules, all enforced at enqueue time with a `ValueError`:
   arrays, because they cannot be expressed as `--tag key=value` and a tag
   you cannot filter by is not a tag;
 - matching is **containment**: asking for `{"customer": "acme"}` finds a job
-  tagged with customer *and* region *and* batch. Extra tags never disqualify
+  tagged with customer _and_ region _and_ batch. Extra tags never disqualify
   a job.
 
 Tagging costs the write path nothing measurable — the index is partial
@@ -868,7 +874,7 @@ await order.send("packed")
 This is not a nicety borrowed from in-process FSM libraries. There, an
 unhandled event raises on the machine's thread and your event is still in your
 hand. Here the event travels through a durable mailbox, and the machine
-*consumes* the message and checkpoints having consumed it whether or not any
+_consumes_ the message and checkpoints having consumed it whether or not any
 transition fires. An event sent to the wrong state is not deferred, not
 re-queued and not returned — it is gone, and the only symptom is that nothing
 happened.
@@ -895,7 +901,7 @@ await order.history()  # this turn's transitions, from jorb_step
 order.diagram()  # Mermaid, rendered from the declaration
 ```
 
-`history()` is the *current turn*: the machine compacts its checkpoint log at
+`history()` is the _current turn_: the machine compacts its checkpoint log at
 each turn boundary so that replay stays bounded no matter how long it lives
 (see [DXE.md](DXE.md#bounding-replay-compact)). For a permanent audit trail,
 publish one — as machine events, or into your own table from inside a

@@ -5,12 +5,12 @@ reach for, and what the platform promises about each one.
 
 This is the task-oriented guide. Its companions:
 
-* **[DXE.md](DXE.md)** — the durable execution engine itself: the checkpoint
+- **[DXE.md](DXE.md)** — the durable execution engine itself: the checkpoint
   table, the fencing model, the invariants, and why they hold. Read it when
-  you want to know *why*; read this when you want to know *what to write*.
-* **[CLIENT_LIBRARY.md](CLIENT_LIBRARY.md)** — enqueueing, waiting for
+  you want to know _why_; read this when you want to know _what to write_.
+- **[CLIENT_LIBRARY.md](CLIENT_LIBRARY.md)** — enqueueing, waiting for
   results, pipelines, tags, DAGs.
-* **[OPERATIONS.md](OPERATIONS.md)** — running workers, retention, what a
+- **[OPERATIONS.md](OPERATIONS.md)** — running workers, retention, what a
   stuck queue looks like from outside.
 
 Every complete job class below is executed against a real worker by
@@ -40,11 +40,11 @@ by the worker process (`pj --path ...`).
 **Arguments** are the enqueue call's keyword arguments. They are stored in
 `jorb.kwargs` as `JSONB` and handed back as `task(**kwargs)`, so:
 
-* they must be JSON-serializable — pass an id, not an ORM object, and not a
+- they must be JSON-serializable — pass an id, not an ORM object, and not a
   `datetime`;
-* they are keyword arguments only. A task with a required *positional-only*
+- they are keyword arguments only. A task with a required _positional-only_
   parameter can never be given one, and `@job` rejects it at import time;
-* they survive the process. A retry six hours later gets the same arguments.
+- they survive the process. A retry six hours later gets the same arguments.
 
 **The return value** is stored in `jorb.result` as `JSONB` and must be
 JSON-serializable too. Return a reference (an S3 key, a row id) rather than a
@@ -72,11 +72,11 @@ class StreamBatches(Job):
 
 Which to write:
 
-| Shape | Use it when | Cost |
-|---|---|---|
-| `def task(...)` | the work is blocking (a C library, `requests`, heavy CPU) | runs in a worker thread; **cannot be interrupted** by any timeout |
-| `async def task(...)` | the work waits on I/O, or uses any DXE primitive | interruptible at every `await`; required for `step()`, `sleep()`, `recv()` |
-| `async def task(...)` + `yield` | you want partial progress recorded in the result | the stored result is the list of every value yielded |
+| Shape                           | Use it when                                               | Cost                                                                       |
+| ------------------------------- | --------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `def task(...)`                 | the work is blocking (a C library, `requests`, heavy CPU) | runs in a worker thread; **cannot be interrupted** by any timeout          |
+| `async def task(...)`           | the work waits on I/O, or uses any DXE primitive          | interruptible at every `await`; required for `step()`, `sleep()`, `recv()` |
+| `async def task(...)` + `yield` | you want partial progress recorded in the result          | the stored result is the list of every value yielded                       |
 
 DXE primitives are `await`ed, so a job that checkpoints anything is an
 `async def task`.
@@ -86,15 +86,15 @@ overriding it is also how a job gets at the row before dispatch.
 
 ### What you have on `self`
 
-* `self.job` — the job's row as a dict: `id`, `kwargs`, `queue`, `prio`,
+- `self.job` — the job's row as a dict: `id`, `kwargs`, `queue`, `prio`,
   `uid`, `tags`, `error_count`, `run_count`, `run_epoch`, `admin_data`. The
   examples below use `self.job["error_count"]` to mean "which attempt is
   this".
-* `self.s` — the `JobSystem` running the job. `self.s.cxn` is the worker's
+- `self.s` — the `JobSystem` running the job. `self.s.cxn` is the worker's
   own PostgreSQL connection (also what `transaction()` hands you) and
   `self.s.cache` is a plain per-worker dict for expensive objects you want to
   build once per process, not once per job.
-* `self.cancelled` — see [cooperative cancellation](#selfcancelled--stop-a-long-synchronous-loop).
+- `self.cancelled` — see [cooperative cancellation](#selfcancelled--stop-a-long-synchronous-loop).
 
 ---
 
@@ -161,15 +161,15 @@ This is the decision the rest of the document exists for. Plain code is the
 default; everything else buys a specific guarantee at the price of a database
 write.
 
-| Reach for | When | What you get |
-|---|---|---|
-| plain code | cheap, deterministic, side-effect-free work | nothing durable — it simply re-runs on the next attempt |
-| `await self.step(name, fn, ...)` | expensive or side-effecting work you do not want repeated | **at-least-once**: once its checkpoint commits, `fn` never runs again |
-| `await self.transaction(name, fn, ...)` | the work is a write to **this** database | **exactly-once**: the write and the checkpoint are one commit |
-| `await self.sleep(seconds)` | you need to wait | the job leaves the worker entirely and resumes later |
-| `await self.set_event(key, value)` | someone outside wants progress | a durable key/value readable by clients and operators |
-| `await self.send(id, msg)` / `await self.recv(topic)` | jobs must coordinate | a durable mailbox, each message consumed once |
-| `if self.cancelled:` | a long **synchronous** loop | an operator's cancel can actually stop it |
+| Reach for                                             | When                                                      | What you get                                                          |
+| ----------------------------------------------------- | --------------------------------------------------------- | --------------------------------------------------------------------- |
+| plain code                                            | cheap, deterministic, side-effect-free work               | nothing durable — it simply re-runs on the next attempt               |
+| `await self.step(name, fn, ...)`                      | expensive or side-effecting work you do not want repeated | **at-least-once**: once its checkpoint commits, `fn` never runs again |
+| `await self.transaction(name, fn, ...)`               | the work is a write to **this** database                  | **exactly-once**: the write and the checkpoint are one commit         |
+| `await self.sleep(seconds)`                           | you need to wait                                          | the job leaves the worker entirely and resumes later                  |
+| `await self.set_event(key, value)`                    | someone outside wants progress                            | a durable key/value readable by clients and operators                 |
+| `await self.send(id, msg)` / `await self.recv(topic)` | jobs must coordinate                                      | a durable mailbox, each message consumed once                         |
+| `if self.cancelled:`                                  | a long **synchronous** loop                               | an operator's cancel can actually stop it                             |
 
 Two rules apply to all of them, and they are the whole contract:
 
@@ -285,7 +285,7 @@ future, and unwinds. While it sleeps the job is `queued` with a future
 exactly that before waiting for the finish. Sleeping an hour costs nothing;
 `await asyncio.sleep(3600)` costs a worker for an hour.
 
-On resume, execution continues *past* the sleep. A job requeued early sleeps
+On resume, execution continues _past_ the sleep. A job requeued early sleeps
 out the remainder rather than starting the wait again.
 
 For "run me again later, from the top", use `await self.reschedule(30,
@@ -355,10 +355,10 @@ after the cancel, against a loop that would otherwise have run for 30.
 
 Two things `self.cancelled` is **not**:
 
-* **It is not a timeout signal.** It reports only that an operator requested
+- **It is not a timeout signal.** It reports only that an operator requested
   cancellation. Neither the job's deadline nor a step budget sets it. A
   synchronous loop that wants to bound itself must watch its own clock.
-* **It is not observable from a blocking call inside an async job.** The flag
+- **It is not observable from a blocking call inside an async job.** The flag
   is set by the worker's event loop, so a synchronous `fn` that blocks the
   loop inside `await self.step(...)` never sees it change. It works in a
   wholly synchronous `task()`, which the worker runs in a thread while the
@@ -369,7 +369,7 @@ Two things `self.cancelled` is **not**:
 ## The determinism obligation
 
 Checkpoints are keyed by **position**: the first checkpointed call in an
-attempt is step 1, the second is step 2. So the *sequence* of those calls
+attempt is step 1, the second is step 2. So the _sequence_ of those calls
 must be the same on every attempt — `step()`, `transaction()`, `sleep()`,
 `send()` and `recv()` all consume a number.
 
@@ -485,7 +485,7 @@ completed prefix and re-runs only the step that hung. The test asserts both
 halves: `gather`'s output survives, `render` carries the error.
 
 **How they compose.** The job deadline is a ceiling: a step budget is armed
-only while it is *strictly tighter* than the time the job has left. Once the
+only while it is _strictly tighter_ than the time the job has left. Once the
 job's own deadline binds, the step budget is not armed at all and the job
 timeout fires alone. A step can never extend the job, and one overrun is
 never reported as two failures.
@@ -508,13 +508,13 @@ instead of the invented result.
 Any exception out of the job is a failure. The **same row** is requeued with
 a backoff delay until the retry budget is spent:
 
-* `max_retries` (default 10) is the number of *attempts*, not extra ones. It
+- `max_retries` (default 10) is the number of _attempts_, not extra ones. It
   is a per-enqueue option; the worker's `--max-retries` is the fallback.
-* `retry_strategy` is `exponential` (default), `linear`, `fibonacci`,
+- `retry_strategy` is `exponential` (default), `linear`, `fibonacci`,
   `quadratic` or `fixed`, shaped by `initial_retry_delay` (1s) and
   `max_retry_delay` (3600s), with jitter (up to 10% of the delay, capped
   at 5s) so a fleet does not retry in lockstep.
-* Override `rescheduleBackoff()` on the class for a policy of your own.
+- Override `rescheduleBackoff()` on the class for a policy of your own.
 
 ```python
 class AlwaysFails(Job):
@@ -527,7 +527,7 @@ class AlwaysFails(Job):
 Enqueued with `max_retries=2`, this attempts twice and ends `crashed` with
 `error_count == 2`.
 
-**`crashed` is terminal, and it *is* the dead-letter queue** — there is no
+**`crashed` is terminal, and it _is_ the dead-letter queue** — there is no
 separate table. The row keeps its arguments, its `error_message`, its
 `error_backtrace`, and every checkpoint it wrote, which is what makes a
 dead-lettered job debuggable and resumable:
@@ -538,18 +538,18 @@ pj-admin jobs rerun <id> --resume   # resume: completed steps fast-forward
 pj-admin jobs rerun <id>            # restart: discard checkpoints first
 ```
 
-Use `--fresh` when the recorded results are *wrong* (you fixed a bug in a
+Use `--fresh` when the recorded results are _wrong_ (you fixed a bug in a
 step), not merely incomplete.
 
 Failures that are not exceptions from your code:
 
-| Situation | Recorded as | Retried? |
-|---|---|---|
-| the job's deadline expires | `Job timed out after Ns` | yes, unless `on_timeout='fail'` |
-| a step blows its budget | `StepTimeoutError` on that step | yes, as an ordinary step failure |
-| the step sequence changed | `NondeterminismError` | yes, and it will keep failing until the code is fixed |
-| an operator cancels | state `cancelled` | no — terminal |
-| the worker is superseded mid-run | nothing; the attempt is abandoned | the live attempt owns the row |
+| Situation                        | Recorded as                       | Retried?                                              |
+| -------------------------------- | --------------------------------- | ----------------------------------------------------- |
+| the job's deadline expires       | `Job timed out after Ns`          | yes, unless `on_timeout='fail'`                       |
+| a step blows its budget          | `StepTimeoutError` on that step   | yes, as an ordinary step failure                      |
+| the step sequence changed        | `NondeterminismError`             | yes, and it will keep failing until the code is fixed |
+| an operator cancels              | state `cancelled`                 | no — terminal                                         |
+| the worker is superseded mid-run | nothing; the attempt is abandoned | the live attempt owns the row                         |
 
 ---
 
@@ -566,7 +566,7 @@ jobs = await client.search_jobs(tags={"customer": "acme"})
 
 ...and `pj-admin jobs list --tag customer=acme`. They are a flat dict of
 scalars, matched by containment (extra tags never disqualify a job), and they
-are deliberately *not* `admin_data`, which is the platform's own execution
+are deliberately _not_ `admin_data`, which is the platform's own execution
 config. Full rules in
 [CLIENT_LIBRARY.md](CLIENT_LIBRARY.md#8-job-tags).
 
@@ -580,7 +580,7 @@ config. Full rules in
 4. Is every external effect idempotent, or is it a `transaction()` on this
    database?
 5. Is the sequence of checkpointed calls the same on every attempt?
-6. Does anything nondeterministic that a branch depends on live *inside* a
+6. Does anything nondeterministic that a branch depends on live _inside_ a
    step?
 7. Does every wait use `sleep()` rather than `asyncio.sleep()`?
 8. Does the slowest step have a `timeout=`, and does the job have a `timeout`

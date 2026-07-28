@@ -2,13 +2,13 @@
 
 Three ways to drive a running platform, over one backend:
 
-| | What it is | Best for |
-|---|---|---|
-| `pj-admin` | the operator CLI | everything below; scripting |
-| `pj-web` | HTML admin + `/metrics`, no auth | dashboards, browsing |
-| `pyjobby.admin_api.AdminAPI` | the Python API both of the above call | custom automation |
+|                              | What it is                            | Best for                    |
+| ---------------------------- | ------------------------------------- | --------------------------- |
+| `pj-admin`                   | the operator CLI                      | everything below; scripting |
+| `pj-web`                     | HTML admin + `/metrics`, no auth      | dashboards, browsing        |
+| `pyjobby.admin_api.AdminAPI` | the Python API both of the above call | custom automation           |
 
-This is the reference for *what exists*. What to do with it when something
+This is the reference for _what exists_. What to do with it when something
 is wrong is [OPERATIONS.md](OPERATIONS.md) (playbooks) and
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md) (symptoms). Every command here was
 run against a live database; the outputs are real.
@@ -74,7 +74,7 @@ $ echo $?
 ```
 
 So `1` means "I tried and could not", `2` means "I did not try". An empty
-*answer* is not a failure either — `dlq list` on an empty DLQ, or `queues
+_answer_ is not a failure either — `dlq list` on an empty DLQ, or `queues
 show` for a queue with no jobs and no control row, exit 0.
 
 Machine-readable output is `--json`, available on `jobs list`, `jobs
@@ -99,12 +99,12 @@ Commands:
 
 `db migrate` handles **both** histories, though only one exists today:
 
-* **A fresh database** gets the base schema — the ordered files in
+- **A fresh database** gets the base schema — the ordered files in
   `pyjobby/sql/schema/`, concatenated and executed in one transaction. No
   migration files ship (the base schema is the whole current schema), so
   nothing is applied or recorded and the install is complete by
   construction.
-* **An existing database** gets any numbered files in
+- **An existing database** gets any numbered files in
   `pyjobby/sql/migrations/` it has not recorded, oldest first, one
   transaction per file — the upgrade path that starts mattering once there
   are live deployments to upgrade. The first such file is minted at that
@@ -131,7 +131,7 @@ Missing objects:       3
 ```
 
 `Missing objects` is the load-bearing line. The version lines can only say
-what this database *recorded*, and a drifted database records exactly what
+what this database _recorded_, and a drifted database records exactly what
 a current one does; the missing list is read out of the catalog and
 compared against the required-shape manifest in `pyjobby/migrations.py`. A
 healthy database prints `Missing objects:       none`.
@@ -193,7 +193,7 @@ $ echo $?
 ### What the `schema` check actually checks
 
 Presence-and-pending is not enough to certify a schema: a database
-installed from an *older* base schema has `jorb` and records nothing
+installed from an _older_ base schema has `jorb` and records nothing
 pending, so both answers look healthy while the very next query dies on a
 missing column.
 
@@ -203,11 +203,11 @@ compared against the manifest in `pyjobby/migrations.py` (which the test
 suite asserts equals a fresh install's catalog in both directions, so it
 cannot rot). Three verdicts:
 
-| Verdict | Line |
-|---|---|
-| FAIL | `base schema not installed (run: pj-admin db migrate)` |
-| FAIL | `installed, but N object(s) this release needs are missing: …` — up to five named, then a count |
-| PASS | `installed, migrations current (…)`, or `installed and complete; migrations […] are not recorded yet, which the next upgrade reads` |
+| Verdict | Line                                                                                                                                |
+| ------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| FAIL    | `base schema not installed (run: pj-admin db migrate)`                                                                              |
+| FAIL    | `installed, but N object(s) this release needs are missing: …` — up to five named, then a count                                     |
+| PASS    | `installed, migrations current (…)`, or `installed and complete; migrations […] are not recorded yet, which the next upgrade reads` |
 
 A stale schema, named:
 
@@ -224,13 +224,13 @@ something it just reported missing, and a health report that crashes halfway
 through is worse than one that stops. `pj-admin db status` prints the full
 missing list.
 
-A schema that is complete but has *unrecorded* migrations — the third line
+A schema that is complete but has _unrecorded_ migrations — the third line
 in that table — is a **PASS**, not a FAIL: the shape check just proved every
 object those files install is already present, so the running code can
 address this database and only the bookkeeping is behind. Waking someone at
 3am over a missing row in `schema_migrations` is how a health probe teaches
 people to ignore it. It is still said out loud, because that record is what
-the *next* upgrade reads: until `db migrate` runs, a later release cannot
+the _next_ upgrade reads: until `db migrate` runs, a later release cannot
 tell this database from one that never applied the migration at all.
 
 Triggers get their own check for the same reason the shape does: nothing
@@ -286,7 +286,7 @@ Filters: `-q/--queue`, `-s/--state`, `--job-class` (patterns), `--uid`,
 The table truncates long values for width — use `--json` when you need the
 full queue name or class path.
 
-`--tag` matches jobs *containing* the pair, so extra tags on the job are
+`--tag` matches jobs _containing_ the pair, so extra tags on the job are
 fine, and values are read as JSON when they look like it: `batch=7` matches
 the number 7, `batch='"7"'` the string.
 
@@ -414,21 +414,21 @@ Nothing is blocking it: this job is claimable RIGHT NOW on 'reports' (1 live wor
 The `reason` is a stable machine-readable code; the summary and the
 indented block below it are the same answer for a human. Every reason:
 
-| Reason | What it means |
-| --- | --- |
-| `finished` / `crashed` / `cancelled` | Terminal. `crashed` carries the error; both it and `cancelled` name `jobs retry`. |
-| `claimed` / `running` | A worker has it — which one (host, pid), since when, its deadline, and **whether that worker is still heartbeating**. |
-| `waiting_on_job` | Parked on job N, with N's state. Both dependency wakes fire only on `finished`, so a crashed or missing upstream is reported as never-waking. |
-| `waiting_on_group` | Parked on a group, with the count of members not yet finished. |
-| `waiting_unblocked` | `waiting` with no dependency recorded: nothing anywhere can wake it. |
-| `deferred` | `run_after` is in the future, and by how long. Retry backoff, `enqueue_at` and durable sleep all look like this, and none of them is a fault. |
-| `queue_paused` | The queue is paused; claims stop before any row is looked at. |
-| `no_live_workers` | Nothing is on that queue — read the queue, not the fleet total. |
-| `above_worker_ceiling` | The job's `prio` is above every live worker's `--max-prio`. |
-| `capability_unmet` | No live worker on the queue advertises the capability, and the answer names what they *do* advertise. |
-| `queue_at_max_concurrency` | In-flight count against the cap. |
-| `rate_limited` | Admissions in the window against the limit. |
-| `claimable` | Nothing declines it: how many claimable jobs sort ahead of it in claim order (`prio`, then `run_after`). |
+| Reason                               | What it means                                                                                                                                 |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `finished` / `crashed` / `cancelled` | Terminal. `crashed` carries the error; both it and `cancelled` name `jobs retry`.                                                             |
+| `claimed` / `running`                | A worker has it — which one (host, pid), since when, its deadline, and **whether that worker is still heartbeating**.                         |
+| `waiting_on_job`                     | Parked on job N, with N's state. Both dependency wakes fire only on `finished`, so a crashed or missing upstream is reported as never-waking. |
+| `waiting_on_group`                   | Parked on a group, with the count of members not yet finished.                                                                                |
+| `waiting_unblocked`                  | `waiting` with no dependency recorded: nothing anywhere can wake it.                                                                          |
+| `deferred`                           | `run_after` is in the future, and by how long. Retry backoff, `enqueue_at` and durable sleep all look like this, and none of them is a fault. |
+| `queue_paused`                       | The queue is paused; claims stop before any row is looked at.                                                                                 |
+| `no_live_workers`                    | Nothing is on that queue — read the queue, not the fleet total.                                                                               |
+| `above_worker_ceiling`               | The job's `prio` is above every live worker's `--max-prio`.                                                                                   |
+| `capability_unmet`                   | No live worker on the queue advertises the capability, and the answer names what they _do_ advertise.                                         |
+| `queue_at_max_concurrency`           | In-flight count against the cap.                                                                                                              |
+| `rate_limited`                       | Admissions in the window against the limit.                                                                                                   |
+| `claimable`                          | Nothing declines it: how many claimable jobs sort ahead of it in claim order (`prio`, then `run_after`).                                      |
 
 `--json` emits the whole structure, which is what a monitoring script
 wants — `reason` is the field to branch on:
@@ -496,21 +496,21 @@ Options:
             re-executing
 ```
 
-* `jobs retry ID...` — for jobs that did **not** succeed (`crashed` or
+- `jobs retry ID...` — for jobs that did **not** succeed (`crashed` or
   `cancelled`). Refuses anything else.
-* `jobs rerun ID` — also accepts a **finished** job. Running successful
+- `jobs rerun ID` — also accepts a **finished** job. Running successful
   work again repeats its side effects, which is why it is a separate verb.
-* `jobs cancel ID...` — queued and waiting jobs are cancelled immediately;
-  a claimed or running job gets a cancellation *request* delivered to its
+- `jobs cancel ID...` — queued and waiting jobs are cancelled immediately;
+  a claimed or running job gets a cancellation _request_ delivered to its
   worker, reported distinctly, because a job whose worker has died stays
   running with only the request recorded.
-* `jobs set-priority ID PRIORITY` — re-prioritise a **queued or waiting**
+- `jobs set-priority ID PRIORITY` — re-prioritise a **queued or waiting**
   job (lower numbers are claimed first). Once a job is claimed its priority
   no longer decides anything, so those are refused; a priority above the
   deployment's worker ceiling is refused too, since no worker would claim
   it. The ceiling comes from the config file's `prio_ceiling`, and
   `--max-prio N` overrides it for one command.
-* `jobs delete ID...` — permanent, one line per id, prompts once for the
+- `jobs delete ID...` — permanent, one line per id, prompts once for the
   whole list unless `-f/--force`.
 
 The retry-versus-rerun distinction is expanded in
@@ -625,14 +625,14 @@ This reads the `jorb_worker` registry: live workers plus recently
 shut-down ones, each with the job it currently holds. Two columns carry the
 important signal:
 
-* **Status** — `live`, or **`not claiming`** for a worker that heartbeats
+- **Status** — `live`, or **`not claiming`** for a worker that heartbeats
   perfectly and does no work, because abandoned job threads fill its pool:
 
   ```
   2   host-b    9910   heavy  not claiming  8/8      3s ago     -
   ```
 
-* **Threads** — `abandoned/pool`. `8/8` *is* the refusing state; `7/8` is
+- **Threads** — `abandoned/pool`. `8/8` _is_ the refusing state; `7/8` is
   one timed-out job away from it and reads nothing like `0/8`.
 
 Both are explained in
@@ -751,7 +751,7 @@ delete NAME_OR_ID` prompts unless `-f/--force`, like every other destructive
 verb here. Prefer `disable` to `delete` either way: it keeps the execution
 log.
 
-Everything a schedule *means* — cron syntax, jitter, backpressure, the
+Everything a schedule _means_ — cron syntax, jitter, backpressure, the
 circuit breaker, timezone handling — is in
 [RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md). Nothing fires unless
 `pj-scheduler` is running; `doctor` warns about schedules overdue by more
@@ -806,15 +806,15 @@ number live here and must not be confused: **rates** (`jobs/s`) are
 measured over the window and comparable across window sizes; **levels**
 (backlog, in flight, storage, NOTIFY usage) are instants.
 
-* **Throughput vs Arrivals** is the only pair that can say "falling
+- **Throughput vs Arrivals** is the only pair that can say "falling
   behind". Sustained arrivals above completions is the definition, and no
   single number expresses it.
-* **Queue Wait vs Duration** are reported separately on purpose. Rising
+- **Queue Wait vs Duration** are reported separately on purpose. Rising
   wait with flat duration is a capacity problem; rising duration is a code
   or dependency problem. A blended "how long did the job take" cannot tell
   those apart, so it is not reported. See
   [OPERATIONS.md § Reading the latency numbers](OPERATIONS.md#reading-the-latency-numbers).
-* **Dead Tuples** is a survival question at rate — it answers "is
+- **Dead Tuples** is a survival question at rate — it answers "is
   autovacuum keeping up" and nothing else does. See
   [SCALE.md § Vacuum pressure](SCALE.md#4-vacuum-pressure).
 
@@ -850,20 +850,20 @@ silent clamp) and `/api/metrics` takes `since_hours` (max 90 days).
 
 JSON API:
 
-| Method | Path |
-|---|---|
-| GET | `/api/jobs`, `/api/jobs/{id}`, `/api/jobs/{id}/history`, `/api/jobs/{id}/steps` |
-| POST | `/api/jobs/{id}/retry`, `/api/jobs/{id}/cancel` |
-| DELETE | `/api/jobs/{id}` |
-| GET | `/api/queues`, `/api/queues/{queue}/stats` |
-| POST | `/api/queues/{queue}/pause`, `/api/queues/{queue}/resume` |
-| GET | `/api/workers`, `/api/workers/stats` |
-| GET | `/api/dlq` |
-| POST | `/api/dlq/{id}/retry` |
-| GET | `/api/metrics` |
-| GET | `/api/schedules`, `/api/schedules/{id}`, `/api/schedules/{id}/history` |
-| POST | `/api/schedules`, `/api/schedules/{id}/enable`, `/api/schedules/{id}/disable` |
-| DELETE | `/api/schedules/{id}` |
+| Method | Path                                                                            |
+| ------ | ------------------------------------------------------------------------------- |
+| GET    | `/api/jobs`, `/api/jobs/{id}`, `/api/jobs/{id}/history`, `/api/jobs/{id}/steps` |
+| POST   | `/api/jobs/{id}/retry`, `/api/jobs/{id}/cancel`                                 |
+| DELETE | `/api/jobs/{id}`                                                                |
+| GET    | `/api/queues`, `/api/queues/{queue}/stats`                                      |
+| POST   | `/api/queues/{queue}/pause`, `/api/queues/{queue}/resume`                       |
+| GET    | `/api/workers`, `/api/workers/stats`                                            |
+| GET    | `/api/dlq`                                                                      |
+| POST   | `/api/dlq/{id}/retry`                                                           |
+| GET    | `/api/metrics`                                                                  |
+| GET    | `/api/schedules`, `/api/schedules/{id}`, `/api/schedules/{id}/history`          |
+| POST   | `/api/schedules`, `/api/schedules/{id}/enable`, `/api/schedules/{id}/disable`   |
+| DELETE | `/api/schedules/{id}`                                                           |
 
 `GET /metrics` (not `/api/metrics`) is the Prometheus scrape endpoint. The
 gauges and counters it exposes:
@@ -911,26 +911,26 @@ for job in crashed:
 
 Method groups, all `async`:
 
-* **Jobs** — `list_jobs`, `get_job`, `get_job_history`, `get_job_steps`,
+- **Jobs** — `list_jobs`, `get_job`, `get_job_history`, `get_job_steps`,
   `retry_job`, `retry_jobs`, `rerun_job`, `cancel_job`, `cancel_jobs`,
   `update_job_priority`, `delete_job`, `delete_jobs`.
-* **Queues** — `list_queues`, `queue_stats`, `clear_queue`,
+- **Queues** — `list_queues`, `queue_stats`, `clear_queue`,
   `list_queue_controls`, `get_queue_control`, `set_queue_control`,
   `pause_queue`, `resume_queue`.
-* **Workers** — `list_workers`, `worker_stats`, `job_thread_stats`.
-* **Health and metrics** — `get_metrics`, `backlog_stats`,
+- **Workers** — `list_workers`, `worker_stats`, `job_thread_stats`.
+- **Health and metrics** — `get_metrics`, `backlog_stats`,
   `inflight_stats`, `storage_stats`, `notify_queue_usage`.
-* **DLQ** — `list_dlq`, `retry_from_dlq`.
-* **Schedules** — `list_schedules`, `get_schedule`, `create_schedule`,
+- **DLQ** — `list_dlq`, `retry_from_dlq`.
+- **Schedules** — `list_schedules`, `get_schedule`, `create_schedule`,
   `update_schedule`, `delete_schedule`, `enable_schedule`,
   `disable_schedule`, `get_schedule_history`, `get_schedule_stats`.
 
 Three shapes are worth stating because they are easy to assume wrong:
 
-* `retry_job` and `retry_from_dlq` return the **same** `job_id` they were
+- `retry_job` and `retry_from_dlq` return the **same** `job_id` they were
   given. A retry requeues the row a job has had since it was enqueued;
   there is no new id to follow.
-* `cancel_job`, `retry_job`, `rerun_job` and `retry_from_dlq` always return
+- `cancel_job`, `retry_job`, `rerun_job` and `retry_from_dlq` always return
   at least `{"job_id", "status"}` and never raise for a job they will not
   touch: a missing job and a job in a refusing state are the same
   `'not_cancellable'` / `'not_retriable'` / `'not_rerunnable'` answer.
@@ -939,7 +939,7 @@ Three shapes are worth stating because they are easy to assume wrong:
   opposite answers to the same verb, so the reply says which one happened.
   The bulk forms (`cancel_jobs`, `retry_jobs`) return one such dict per id,
   in order.
-* `list_dlq()` is `state = 'crashed'`, ordered by `updated`. It is not
+- `list_dlq()` is `state = 'crashed'`, ordered by `updated`. It is not
   filtered on an error count.
 
 The docstrings in `pyjobby/admin_api.py` are the full reference, including

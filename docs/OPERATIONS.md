@@ -5,13 +5,13 @@ wrong. The executable version of the health section is `pj-admin doctor`.
 
 ## The processes
 
-| Process | Command | Count | Purpose |
-|---|---|---|---|
-| Workers | `pj --config ./pyjobby.toml --queue Q --workers N` | N processes **per named queue**, per host | claim + execute jobs |
-| Monitor | `pj-monitor --config ./pyjobby.toml` | 1 (more are safe) | timeout enforcement, dead-worker reclaim, stranded-waiter recovery |
-| Scheduler | `pj-scheduler --config ./pyjobby.toml` | 1 (more are safe) | fires cron schedules |
-| Web admin | `pj-web --config ./pyjobby.toml --host 127.0.0.1 --port 8081` | optional | HTML admin + `/metrics` |
-| Websocket | `pj-ws --config ./pyjobby.toml --port 8082` | optional | realtime dashboard feed |
+| Process   | Command                                                       | Count                                     | Purpose                                                            |
+| --------- | ------------------------------------------------------------- | ----------------------------------------- | ------------------------------------------------------------------ |
+| Workers   | `pj --config ./pyjobby.toml --queue Q --workers N`            | N processes **per named queue**, per host | claim + execute jobs                                               |
+| Monitor   | `pj-monitor --config ./pyjobby.toml`                          | 1 (more are safe)                         | timeout enforcement, dead-worker reclaim, stranded-waiter recovery |
+| Scheduler | `pj-scheduler --config ./pyjobby.toml`                        | 1 (more are safe)                         | fires cron schedules                                               |
+| Web admin | `pj-web --config ./pyjobby.toml --host 127.0.0.1 --port 8081` | optional                                  | HTML admin + `/metrics`                                            |
+| Websocket | `pj-ws --config ./pyjobby.toml --port 8082`                   | optional                                  | realtime dashboard feed                                            |
 
 `--workers N` is **per queue**, and a worker is never started on a queue you
 did not name:
@@ -45,13 +45,13 @@ Every process handles `SIGTERM` and `SIGINT` (Ctrl-C) as a graceful stop, so
 than killing work mid-flight. No process needs `SIGKILL` under normal
 operation.
 
-| Process | On SIGTERM |
-|---|---|
-| Worker (`pj`) | Stops claiming new jobs and finishes the one it is running, then exits. In-flight work is not abandoned; give the container a stop grace period at least as long as your longest job (or its timeout). |
-| Monitor (`pj-monitor`) | Ends at the next clean point: it stops between sweeps, and a sweep that is mid-drain yields after the current batch rather than mid-statement. |
-| Scheduler (`pj-scheduler`) | Cuts its poll sleep short and exits before the next firing; a schedule already firing completes. |
-| Websocket (`pj-ws`) | Stops accepting connections, drains the aiohttp runner, then closes its pool. |
-| Web admin (`pj-web`) | Stops serving and exits. |
+| Process                    | On SIGTERM                                                                                                                                                                                             |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Worker (`pj`)              | Stops claiming new jobs and finishes the one it is running, then exits. In-flight work is not abandoned; give the container a stop grace period at least as long as your longest job (or its timeout). |
+| Monitor (`pj-monitor`)     | Ends at the next clean point: it stops between sweeps, and a sweep that is mid-drain yields after the current batch rather than mid-statement.                                                         |
+| Scheduler (`pj-scheduler`) | Cuts its poll sleep short and exits before the next firing; a schedule already firing completes.                                                                                                       |
+| Websocket (`pj-ws`)        | Stops accepting connections, drains the aiohttp runner, then closes its pool.                                                                                                                          |
+| Web admin (`pj-web`)       | Stops serving and exits.                                                                                                                                                                               |
 
 A worker that is killed with `SIGKILL` (or whose host dies) does not corrupt
 anything: its in-flight jobs are reclaimed by the monitor's dead-worker sweep
@@ -109,18 +109,18 @@ queued -> claimed -> running -> finished          (success)
 waiting -> queued                                  (dependency satisfied)
 ```
 
-* A job keeps **one row for life**. Retries requeue the same row;
+- A job keeps **one row for life**. Retries requeue the same row;
   `run_epoch` increments on every claim and fences superseded executions
   out of writing anything. Per-attempt details are in `jorb_history`
   (`pj-admin jobs history ID`).
-* **`crashed` is terminal**: the dead letter queue is exactly
+- **`crashed` is terminal**: the dead letter queue is exactly
   `state = 'crashed'`. `pj-admin dlq list` / `pj-admin dlq retry ID`
   (errors reset) or `pj-admin jobs rerun ID`.
-* **DXE jobs** (using `self.step(...)`) resume from their last completed
+- **DXE jobs** (using `self.step(...)`) resume from their last completed
   checkpoint on any retry — `pj-admin jobs steps ID` shows what completed.
   `pj-admin jobs rerun ID` wipes checkpoints for a from-scratch rerun;
   `--resume` keeps them.
-* **Durable sleeps** hold no worker: a sleeping job is simply `queued` with
+- **Durable sleeps** hold no worker: a sleeping job is simply `queued` with
   a future `run_after`.
 
 ## Timeouts
@@ -129,12 +129,12 @@ A job's timeout is `admin_data.timeout_seconds`, else the job class's
 `timeout`, else the worker's `--default-timeout` (3600s). `0` disables it.
 It is **one** number, enforced in two places:
 
-* **In-process, by the worker.** A single deadline wraps the whole
+- **In-process, by the worker.** A single deadline wraps the whole
   execution, so a job configured for N seconds stops being run at N seconds
   — not at 2N because it spent time producing its coroutine, and not
   indefinitely because it streamed its results from an async generator.
   Reaching it applies `on_timeout` (`retry`, the default, or `fail`).
-* **Out-of-process, by the monitor.** `jorb.timeout_at` is written when the
+- **Out-of-process, by the monitor.** `jorb.timeout_at` is written when the
   job starts running and cleared by every terminal transition; the monitor
   sweeps rows past it and applies the same `on_timeout` policy. This is the
   backstop for everything the worker cannot enforce itself — a killed
@@ -143,27 +143,27 @@ It is **one** number, enforced in two places:
 
 **What the in-process deadline can actually interrupt.** It is delivered as
 a cancellation at an await point, so async code is genuinely stopped where
-it is suspended, `finally` blocks and all. A *synchronous* `task()` runs in
+it is suspended, `finally` blocks and all. A _synchronous_ `task()` runs in
 a worker thread: the deadline still fires on time and the job is recorded as
 timed out, but nothing stops the thread — it runs to completion in the
 background and its result is discarded. Synchronous code called **inline**
 from an async `task()` is worse: it blocks the event loop and starves the
 timer, so its deadline is advisory until it returns. For both, the monitor
 (or ending the process) is what bounds the rest. Note that `self.cancelled`
-is the **operator** cancel signal (`pj-admin jobs cancel`) and is *not* set
+is the **operator** cancel signal (`pj-admin jobs cancel`) and is _not_ set
 by a timeout: a long synchronous loop that wants to stop itself early has to
 watch its own clock.
 
 **A job cannot report success past its own deadline.** Catching the
 cancellation to clean up and re-raising is correct and unchanged. Catching it
-and *returning a value* used to store that value as a success — for an
+and _returning a value_ used to store that value as a success — for an
 attempt the worker had already given up on, and terminally, so the monitor
 could never correct it. The worker now refuses that result and records the
 timeout, applying `on_timeout` exactly as if the cancellation had propagated.
 This is keyed on the deadline's timer having fired while the job was still
 running, not on a clock read taken afterwards, so a job that finishes just
 inside its deadline is still a success no matter how long the worker then
-takes to store it. An *exception* raised after the deadline is still recorded
+takes to store it. An _exception_ raised after the deadline is still recorded
 as that exception (message and traceback intact), which means it follows
 `max_retries` rather than `on_timeout`.
 
@@ -174,8 +174,8 @@ sized by `--job-threads` (default 8). A timed-out synchronous job leaves its
 thread running — nothing can stop it — so those threads accumulate on a
 worker whose jobs keep blocking past their deadlines.
 
-A worker runs one job at a time, so between jobs *every live job thread is an
-abandoned one*. When they fill the pool the worker **stops claiming and says
+A worker runs one job at a time, so between jobs _every live job thread is an
+abandoned one_. When they fill the pool the worker **stops claiming and says
 so**, at ERROR, immediately and then every 30s until it recovers:
 
 ```
@@ -203,16 +203,16 @@ indistinguishable from a healthy idle one — which is the worst shape of
 outage there is. The worker therefore publishes the condition on its own
 registry row, on the heartbeat statement that already ran every cycle:
 
-| Column | Meaning |
-|---|---|
-| `jorb_worker.job_threads` | this worker's pool size (`--job-threads`) |
+| Column                              | Meaning                                        |
+| ----------------------------------- | ---------------------------------------------- |
+| `jorb_worker.job_threads`           | this worker's pool size (`--job-threads`)      |
 | `jorb_worker.job_threads_abandoned` | live threads belonging to no job it is running |
 
 `job_threads_abandoned >= job_threads` **is** the refusing state. Both counts
 are published rather than that one boolean because the boolean hides the
 approach: 7 of 8 is one timed-out job away from a worker doing nothing, and
-reads identically to 0 of 8. A thread belonging to a job that is *currently
-running* is never counted, so a healthy worker reads 0 even mid-job.
+reads identically to 0 of 8. A thread belonging to a job that is _currently
+running_ is never counted, so a healthy worker reads 0 even mid-job.
 
 Everything else reads that row:
 
@@ -234,7 +234,7 @@ throughput, the backlog check says so from the queue's side. The web
 dashboard's worker table shows the same status, and `/api/metrics` carries it
 under `job_threads`.
 
-`pyjobby_workers_live` still counts these workers, deliberately: they *are*
+`pyjobby_workers_live` still counts these workers, deliberately: they _are_
 alive. That is why the second gauge sits next to it.
 
 **If you see it:** that queue's job class blocks far past its timeout. Fix it
@@ -269,15 +269,16 @@ fails, never retries, never reaches the DLQ, and no age-based check sees it,
 because none of them look at `queued`. It simply sits there. Two things stop
 that happening quietly:
 
-* **The client refuses the enqueue.** `client.enqueue(..., priority=5000)`
+- **The client refuses the enqueue.** `client.enqueue(..., priority=5000)`
   raises `ValueError` naming the ceiling — at the caller, where it can still
-  be fixed. The ceiling is a *worker* setting the client cannot observe, so a
+  be fixed. The ceiling is a _worker_ setting the client cannot observe, so a
   deployment that really runs less-urgent work declares it once, and in both
   places:
 
   ```bash
   pj --config ./pyjobby.toml --queue backfill --max-prio 5000
   ```
+
   ```python
   client = JobClient(
       pool, prio_ceiling=5000
@@ -288,7 +289,7 @@ that happening quietly:
   written and still never claimed; the flag alone is enough for a worker but
   the client will keep refusing to feed it.
 
-* **An idle worker reports what is hiding above it.** For rows that arrived
+- **An idle worker reports what is hiding above it.** For rows that arrived
   another way — raw SQL, a schedule, a tool — a worker with nothing to claim
   logs this at most once a minute, and never while it has work to do:
 
@@ -308,10 +309,10 @@ Retention is **on by default** (`--retention-days 30`) and runs in the
 monitor. Two windows, and the second one exists because checkpoints are the
 bulkiest rows in the system with the shortest useful life:
 
-| Window | Deletes |
-|---|---|
-| `--retention-days` (30) | terminal jobs — and with them, by cascade, their history, events, mail and checkpoints — plus **the five tables no cascade reaches**: consumed mailbox rows of *live* jobs, history rows of *live* jobs (a durable machine that never terminates writes ~3 per wake, forever), emptied DAGs, schedule executions, retired worker registry rows |
-| `--checkpoint-retention-days` (1) | the `jorb_step` checkpoints of terminal jobs, keeping the job row itself |
+| Window                            | Deletes                                                                                                                                                                                                                                                                                                                                        |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--retention-days` (30)           | terminal jobs — and with them, by cascade, their history, events, mail and checkpoints — plus **the five tables no cascade reaches**: consumed mailbox rows of _live_ jobs, history rows of _live_ jobs (a durable machine that never terminates writes ~3 per wake, forever), emptied DAGs, schedule executions, retired worker registry rows |
+| `--checkpoint-retention-days` (1) | the `jorb_step` checkpoints of terminal jobs, keeping the job row itself                                                                                                                                                                                                                                                                       |
 
 `0` on either means keep forever; that sweep does not run at all.
 
@@ -321,20 +322,20 @@ mean "as long as the work they describe". Checkpoints get the second knob
 because they genuinely do.
 
 The three tables added last are the ones a cascade can never reach, and two
-of them were leaking an *answer*, not just rows:
+of them were leaking an _answer_, not just rows:
 
-* **`jorb_dag`** — jobs point **at** a DAG (`ON DELETE SET NULL`), so
+- **`jorb_dag`** — jobs point **at** a DAG (`ON DELETE SET NULL`), so
   deleting jobs never touches it. Left alone, `pj-admin dag list` fills up
   with DAGs reporting `total_jobs = 0` — DAGs that appear to have run
   nothing, forever, when in fact they completed and their jobs aged out. A
   DAG is reaped once it is past the window **and has no jobs left**; one with
   even a single job, in any state, is kept at any age.
-* **`jorb_schedule_log`** — cascades only from `jorb_schedule`, which you
+- **`jorb_schedule_log`** — cascades only from `jorb_schedule`, which you
   disable rather than delete, so it had no upper bound at all. Each
   schedule's **most recent execution is never deleted**, however old: a
   quarterly schedule must not read as "never ran" in
   `pj-admin schedule history` while `last_run` says otherwise.
-* **`jorb_worker`** — one row per worker *process start*, previously only
+- **`jorb_worker`** — one row per worker _process start_, previously only
   stamped `shutdown_at`, never removed; a fleet that redeploys daily
   accumulates rows indefinitely. Only rows that are both retired **and**
   silent for the whole window are candidates, so a live worker — or one the
@@ -397,15 +398,15 @@ automatically and re-prepare their statements; nothing needs a restart.
 
 ## Observability quick reference
 
-| Question | Answer |
-|---|---|
-| Fleet health | `pj-admin doctor`, `pj-admin workers list` |
-| A worker is alive but doing nothing | `pyjobby_workers_not_claiming`, `doctor`'s `job-threads` check |
-| Queue depths/ages | `pj-admin queues list`, `/metrics` gauges |
-| What happened to job N | `pj-admin jobs history N`, `jobs steps N` |
-| Throughput/error rates | `/metrics` counters + duration quantiles |
-| Live event stream | `pj-ws`, then the dashboard it serves at `http://127.0.0.1:8082/` |
-| Progress of a running job | `client.get_event(job_id, "progress")` (if the job publishes) |
+| Question                            | Answer                                                            |
+| ----------------------------------- | ----------------------------------------------------------------- |
+| Fleet health                        | `pj-admin doctor`, `pj-admin workers list`                        |
+| A worker is alive but doing nothing | `pyjobby_workers_not_claiming`, `doctor`'s `job-threads` check    |
+| Queue depths/ages                   | `pj-admin queues list`, `/metrics` gauges                         |
+| What happened to job N              | `pj-admin jobs history N`, `jobs steps N`                         |
+| Throughput/error rates              | `/metrics` counters + duration quantiles                          |
+| Live event stream                   | `pj-ws`, then the dashboard it serves at `http://127.0.0.1:8082/` |
+| Progress of a running job           | `client.get_event(job_id, "progress")` (if the job publishes)     |
 
 ## Queue controls: what the limits actually promise
 
@@ -413,10 +414,10 @@ automatically and re-prepare their statements; nothing needs a restart.
 database, not by the workers, so they bind every claimer — a worker, a
 script, anything that admits a job. Two consequences worth knowing:
 
-* **The limits are exact, not approximate.** Claims for a queue that has
+- **The limits are exact, not approximate.** Claims for a queue that has
   either limit set are serialized against each other, so simultaneous
   claims cannot each read a stale count and admit past the cap.
-* **They cost nothing when unset.** A queue with no limits never takes the
+- **They cost nothing when unset.** A queue with no limits never takes the
   lock and claims exactly as fast as it did before.
 
 `rate_limit` counts **admissions** in the trailing `rate_period_seconds`
@@ -427,9 +428,9 @@ differ by one statement, and counting the latter let a burst slip through.
 
 Two different verbs, because they carry different risk:
 
-* **Retry** — `pj-admin jobs retry ID`, `pj-admin dlq retry ID`. For a job
-  that did *not* succeed (`crashed` or `cancelled`).
-* **Re-run** — `pj-admin jobs rerun ID`. Also accepts a **finished** job.
+- **Retry** — `pj-admin jobs retry ID`, `pj-admin dlq retry ID`. For a job
+  that did _not_ succeed (`crashed` or `cancelled`).
+- **Re-run** — `pj-admin jobs rerun ID`. Also accepts a **finished** job.
   Running successful work again repeats its side effects, so it is a
   separate verb rather than a permissive retry.
 
@@ -443,10 +444,10 @@ durable job is resumed.
 
 `pj-admin metrics` reports queue wait and execution duration separately:
 
-* **Avg/Max Queue Wait** — how long jobs sat before a worker picked them up
+- **Avg/Max Queue Wait** — how long jobs sat before a worker picked them up
   (`claimed_at - run_after`). Rising wait with flat duration is a **capacity**
   problem: add workers, or raise `max_concurrency`.
-* **Avg Duration** — how long jobs ran once picked up (`finished - started`).
+- **Avg Duration** — how long jobs ran once picked up (`finished - started`).
   Rising duration is a **code or dependency** problem.
 
 A single blended "how long did the job take" number cannot tell these apart,

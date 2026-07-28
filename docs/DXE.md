@@ -1,6 +1,6 @@
 # DXE — the Durable Execution Engine
 
-DXE is what makes a pyjobby job *resumable*. A plain job runs from the top
+DXE is what makes a pyjobby job _resumable_. A plain job runs from the top
 every time it is attempted. A DXE job records what it has already done, so a
 retry — after a crash, a timeout, a killed worker, a machine reboot — picks up
 where it left off instead of repeating work that already happened.
@@ -24,17 +24,17 @@ class ChargeAndShip(Job):
         return {"charge": charge, "label": label, "note": note}
 ```
 
-| Primitive | Backing table | What it guarantees |
-|---|---|---|
-| `await self.step(name, fn, *a, **kw)` | `jorb_step` | `fn` runs **at least once**; once its checkpoint commits it never runs again |
-| `await self.transaction(name, fn, *a, **kw)` | `jorb_step` | **exactly once** for work `fn` does on the connection it is handed — that write and the checkpoint are one commit |
-| `timeout=` on either of those (or `step_timeout` on the class) | `jorb_step` | one step is bounded on its own; blowing the budget records a **timeout against that step** and retries the job |
-| `await self.sleep(seconds)` | `jorb_step` | the job resumes after the delay **without occupying a worker** |
-| `await self.set_event(key, value)` | `jorb_event` | a durable key/value another job or an operator can read |
-| `await self.get_event(key)` | `jorb_event` | reads one back — this job's, or another's by id. **Not a step**: an event is durable state, so reading it is a query, and recording the answer would freeze the first value read into every later replay |
-| `await self.send(job_id, msg)` / `await self.recv(topic)` | `jorb_mailbox` | a durable mailbox, **exactly-once on both ends**: a send commits with its checkpoint (it runs through `transaction()`), and a recv consumes and checkpoints in one statement — no crash timing can deliver twice, consume twice, or eat a message unrecorded |
-| `await self.compact()` | `jorb_step` | discards this job's checkpoint log and restarts its step sequence, bounding replay for a job that lives indefinitely |
-| `self.cancelled` | `jorb.cancel_requested` | cooperative cancellation for long synchronous loops |
+| Primitive                                                      | Backing table           | What it guarantees                                                                                                                                                                                                                                           |
+| -------------------------------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `await self.step(name, fn, *a, **kw)`                          | `jorb_step`             | `fn` runs **at least once**; once its checkpoint commits it never runs again                                                                                                                                                                                 |
+| `await self.transaction(name, fn, *a, **kw)`                   | `jorb_step`             | **exactly once** for work `fn` does on the connection it is handed — that write and the checkpoint are one commit                                                                                                                                            |
+| `timeout=` on either of those (or `step_timeout` on the class) | `jorb_step`             | one step is bounded on its own; blowing the budget records a **timeout against that step** and retries the job                                                                                                                                               |
+| `await self.sleep(seconds)`                                    | `jorb_step`             | the job resumes after the delay **without occupying a worker**                                                                                                                                                                                               |
+| `await self.set_event(key, value)`                             | `jorb_event`            | a durable key/value another job or an operator can read                                                                                                                                                                                                      |
+| `await self.get_event(key)`                                    | `jorb_event`            | reads one back — this job's, or another's by id. **Not a step**: an event is durable state, so reading it is a query, and recording the answer would freeze the first value read into every later replay                                                     |
+| `await self.send(job_id, msg)` / `await self.recv(topic)`      | `jorb_mailbox`          | a durable mailbox, **exactly-once on both ends**: a send commits with its checkpoint (it runs through `transaction()`), and a recv consumes and checkpoints in one statement — no crash timing can deliver twice, consume twice, or eat a message unrecorded |
+| `await self.compact()`                                         | `jorb_step`             | discards this job's checkpoint log and restarts its step sequence, bounding replay for a job that lives indefinitely                                                                                                                                         |
+| `self.cancelled`                                               | `jorb.cancel_requested` | cooperative cancellation for long synchronous loops                                                                                                                                                                                                          |
 
 ---
 
@@ -44,11 +44,11 @@ class ChargeAndShip(Job):
 
 A checkpoint is keyed `(job_id, step_seq)`.
 
-* **`job_id` is stable for the job's entire life.** A retry re-queues the
-  *same row* — it never creates a new job — so checkpoints written on attempt 1
+- **`job_id` is stable for the job's entire life.** A retry re-queues the
+  _same row_ — it never creates a new job — so checkpoints written on attempt 1
   are still addressed by attempt 5. This is why retries reuse the row rather
   than inserting a new one.
-* **`step_seq` is assigned by call order**, not by name: the first `step()` in
+- **`step_seq` is assigned by call order**, not by name: the first `step()` in
   an attempt is 1, the second is 2, and so on (`_dxe_next_seq`).
 
 Sequencing by call order is what makes the fast-forward cheap and exact, and it
@@ -57,7 +57,7 @@ is also the source of DXE's single obligation on your code:
 > **Job code must be deterministic outside steps.** The sequence of `step()`
 > calls must be the same on every attempt.
 
-That obligation is *enforced*, not merely documented. The step's `name` is
+That obligation is _enforced_, not merely documented. The step's `name` is
 recorded alongside its sequence number, and on replay a mismatch raises
 `NondeterminismError` rather than silently returning another step's result:
 
@@ -74,7 +74,7 @@ if random.random() < 0.5:  # ← changes the step sequence
 await self.step("always", ...)  # ← becomes step 1 or 2 depending
 ```
 
-Put the nondeterminism *inside* a step, where its result is checkpointed:
+Put the nondeterminism _inside_ a step, where its result is checkpointed:
 
 ```python
 choice = await self.step("choose", lambda: random.random() < 0.5)
@@ -94,12 +94,12 @@ SELECT step_seq, name, output, error FROM jorb_step
 
 Then, for each `step()` call:
 
-| Recorded state | What happens |
-|---|---|
-| no row for this `step_seq` | the function **executes**, and the result is recorded |
-| row exists, `error IS NULL` | the recorded `output` is **returned without executing** |
-| row exists, `error` is set | the function **re-executes** (a failed step is not a result) |
-| row exists, different `name` | `NondeterminismError` — nothing executes |
+| Recorded state               | What happens                                                 |
+| ---------------------------- | ------------------------------------------------------------ |
+| no row for this `step_seq`   | the function **executes**, and the result is recorded        |
+| row exists, `error IS NULL`  | the recorded `output` is **returned without executing**      |
+| row exists, `error` is set   | the function **re-executes** (a failed step is not a result) |
+| row exists, different `name` | `NondeterminismError` — nothing executes                     |
 
 A retry therefore fast-forwards through the completed prefix at the cost of one
 query and a dict lookup per step, then does real work only from the point of
@@ -111,7 +111,7 @@ even when that output is `NULL`. This matters most for a `recv()` that timed
 out — it checkpoints its empty-handed result unconditionally, so on every later
 replay that call site returns `None` forever, even if the message arrived a
 millisecond after the timeout expired. That is required for determinism, not an
-oversight, and the message is not lost: a *later* `recv()`, at a new sequence
+oversight, and the message is not lost: a _later_ `recv()`, at a new sequence
 number, still picks it up. Write the retry loop as a new call, never as a
 re-entry into the same one.
 
@@ -126,7 +126,7 @@ and why) without making a transient error permanent.
 `step()` is at-least-once, because the step's effect and its checkpoint commit
 separately (see [Invariants](#invariants)). When the step's work is a write to
 **this** database, that window can be closed completely: put the effect and the
-checkpoint in the *same* transaction, so they commit or roll back together.
+checkpoint in the _same_ transaction, so they commit or roll back together.
 
 ```python
 async def task(self, order_id: int) -> dict:
@@ -155,7 +155,7 @@ checkpoint insert matches zero rows — which raises `StaleExecutionError` insid
 the transaction and rolls the application write back with it. A zombie worker
 cannot commit application data for a job another worker has taken over.
 
-**When `fn` raises**, the transaction is rolled back — the work *and* its
+**When `fn` raises**, the transaction is rolled back — the work _and_ its
 checkpoint — and the error checkpoint is then written in a **separate**
 transaction. Observability that rolled back with the failure would be no
 observability at all, so `pj-admin jobs steps <id>` still shows which step
@@ -163,17 +163,17 @@ failed and why, for work that left nothing else behind.
 
 The trade is real, and it is exactly as wide as the connection:
 
-* **`fn` must use the connection it is handed.** Anything it does on another
+- **`fn` must use the connection it is handed.** Anything it does on another
   connection — a second pool, an HTTP call, a file — is outside the transaction
   and is **not** rolled back with it. That work is at-least-once, exactly like
   `step()`. This cannot be enforced (a function is free to ignore its argument);
   it is documented, and pinned by a test.
-* `fn` must not commit, roll back, or close the connection.
-* If the worker's connection already holds a transaction, the inner one becomes
+- `fn` must not commit, roll back, or close the connection.
+- If the worker's connection already holds a transaction, the inner one becomes
   a savepoint: the write and the checkpoint still stand or fall together, they
   just commit with the enclosing transaction.
-* Because the guarantee lives on one connection, the checkpoint inside a
-  transaction is written *without* the worker's transparent reconnect. A
+- Because the guarantee lives on one connection, the checkpoint inside a
+  transaction is written _without_ the worker's transparent reconnect. A
   reconnect there would commit the checkpoint on a new connection while the
   server rolled the write back — a checkpoint for work that no longer exists.
   Inside a transaction, a lost connection is an error, which fails the step and
@@ -211,7 +211,7 @@ forwarded to `fn`, so a function that wants its own `timeout=` keyword must be
 bound to it first: `self.step("x", partial(fn, timeout=5), timeout=30)`.
 
 **What a blown budget does.** It raises `StepTimeoutError`, which is recorded
-as *that step's* error and then takes the **ordinary retry path** — the same
+as _that step's_ error and then takes the **ordinary retry path** — the same
 one an exception from the step takes. The next attempt fast-forwards the
 completed prefix and re-executes only the step that hung, so retrying a
 timeout is as cheap as retrying any other step failure, and a step that keeps
@@ -229,7 +229,7 @@ Seq  Name    Epoch  Status  Duration  Error
 2    hang     1     error    0.301s   StepTimeoutError: step 'hang' exceeded...
 ```
 
-Only the *budget* is reported that way. A `TimeoutError` a step raises on its
+Only the _budget_ is reported that way. A `TimeoutError` a step raises on its
 own account — an inner `asyncio.timeout`, an HTTP client's deadline — is an
 ordinary failure: it is recorded as `TimeoutError`, not relabelled as a blown
 budget, and not reported as the job's timeout either (so the job's `on_timeout`
@@ -243,7 +243,7 @@ policy is not applied to a deadline the operator never set).
 > binding constraint, the step budget is not armed at all and the job timeout
 > fires alone.
 
-So per-step budgets *subdivide* the job's budget and never extend it; a step
+So per-step budgets _subdivide_ the job's budget and never extend it; a step
 timeout cannot outlive the job's deadline; the job timeout still fires however
 the work is split into steps, reported as a job timeout with the job's
 `on_timeout` policy applied; and the two can never race to report one overrun
@@ -264,12 +264,12 @@ been tried and failed.
 
 A timeout is delivered as a **cancellation at an await point**.
 
-* An **async** `fn` is genuinely stopped: it is cancelled where it is
+- An **async** `fn` is genuinely stopped: it is cancelled where it is
   suspended, its `finally` blocks run, and the step then raises
   `StepTimeoutError`. Inside `transaction()` the cancellation aborts whatever
   statement is in flight, and the raise rolls the application write back on
   the way out — the connection is left clean and idle, never mid-transaction.
-* A **synchronous** `fn` that blocks the event loop **cannot be interrupted by
+- A **synchronous** `fn` that blocks the event loop **cannot be interrupted by
   anything**. It starves the very timer that would fire, so neither the step
   budget nor the job's in-process deadline can touch it. It runs to
   completion, and if it succeeded its result is recorded as a success — a step
@@ -298,14 +298,14 @@ result for an attempt the worker had already given up on — terminal under its
 own power, so the monitor's out-of-process sweep could not correct it either.
 Both scopes now refuse that:
 
-* the job's deadline reports `JobTimeout` and applies the job's `on_timeout`
+- the job's deadline reports `JobTimeout` and applies the job's `on_timeout`
   policy, exactly as if the cancellation had propagated;
-* a step's budget records `StepTimeoutError` against that step, and the step
+- a step's budget records `StepTimeoutError` against that step, and the step
   re-executes on the retry instead of fast-forwarding a value it invented.
 
-**This cannot produce a spurious timeout.** The question asked is *did this
-scope's timer fire while the job was still inside it* (`Timeout.expired()`),
-never *what time is it now compared to the deadline*. Leaving the scope
+**This cannot produce a spurious timeout.** The question asked is _did this
+scope's timer fire while the job was still inside it_ (`Timeout.expired()`),
+never _what time is it now compared to the deadline_. Leaving the scope
 cancels the timer, so a job that returns even a microsecond before its
 deadline is a success however long the worker then takes to store it, and a
 blocking synchronous call never trips it at all — it starves the timer that
@@ -350,21 +350,21 @@ continues past it.
 
 ## Fencing: why a zombie cannot corrupt a checkpoint
 
-The dangerous case is not a crash — it is a worker that is *presumed* dead but
+The dangerous case is not a crash — it is a worker that is _presumed_ dead but
 is still running. Its network partition heals, or its timed-out task finally
 returns, and it tries to write results for a job another worker has taken over.
 
 `jorb.run_epoch` is the fencing token that makes those writes impossible.
 
-* It **advances whenever the job enters an attempt** (claim) **or leaves
+- It **advances whenever the job enters an attempt** (claim) **or leaves
   one** — finish, crash, cancel, retry, reschedule, monitor requeue, operator
   requeue. Leaving covers the terminal writes too: the execution a terminal
   state ends may still be alive (a synchronous task in a thread is
   unstoppable), and it must not keep writing checkpoints, events, or mail
   for a job the platform has moved past.
-* It is **not an attempt counter** — `run_count` is. It is monotonic and
+- It is **not an attempt counter** — `run_count` is. It is monotonic and
   carries no other meaning.
-* Every state-changing statement carries `AND run_epoch = $n`, so a statement
+- Every state-changing statement carries `AND run_epoch = $n`, so a statement
   issued by a superseded execution matches zero rows and does nothing.
 
 The checkpoint write is fenced the same way — the insert is conditional on the
@@ -397,7 +397,7 @@ step the old attempts completed.
 1. **A step whose checkpoint committed never executes again**, across every
    attempt, forever.
 
-   Read that precisely. The guarantee is anchored on the *checkpoint*, not on
+   Read that precisely. The guarantee is anchored on the _checkpoint_, not on
    the step's side effect, and the two are written in separate transactions:
 
    ```
@@ -414,12 +414,13 @@ step the old attempts completed.
    and `recv()` consumes and checkpoints in one statement, so both are
    exactly-once.)
 
-   For work against *this* database the window is closed, not merely narrow:
+   For work against _this_ database the window is closed, not merely narrow:
    `transaction()` writes the effect and the checkpoint in one transaction on
    one connection, so the pair commits or rolls back together and the step is
    **exactly-once**. See [Transactional steps](#transactional-steps) — and note
    that the guarantee covers only what `fn` does on the connection it is
    handed.
+
 2. **A job keeps one row for its entire life.** Retries requeue it;
    `jorb_history` is the per-attempt audit trail.
 3. **`run_epoch` only increases**, and a write at a stale epoch is a no-op.
@@ -433,7 +434,7 @@ step the old attempts completed.
    before anything runs.
 6. **A step's result is JSON-serializable**, or it cannot be checkpointed.
 7. **A failed step is re-executed**, not replayed.
-8. **`crashed` is terminal** — it *is* the dead letter queue.
+8. **`crashed` is terminal** — it _is_ the dead letter queue.
 9. **A durable sleep holds no worker.**
 10. **A per-step budget never outlives the job's deadline**, and only the
     tighter of the two is ever armed — a blown step budget is a step failure
@@ -464,7 +465,7 @@ pj-admin jobs rerun <id> --resume
 pj-admin jobs rerun <id>       # restart: deletes checkpoints, runs from step 1
 ```
 
-Use `--fresh` when the recorded results are *wrong* rather than merely
+Use `--fresh` when the recorded results are _wrong_ rather than merely
 incomplete — after fixing a bug in a step, for instance. It is the operator's
 way to discard checkpoints for a job that is going to run again.
 
@@ -543,7 +544,7 @@ failed, and why" after an incident — and the job row, its result and its
 history for thirty.
 
 `--retention-days` drives six separate sweeps, not one. Five of the tables
-it covers are not reachable from a job at all — `jorb_dag` is the *parent* of
+it covers are not reachable from a job at all — `jorb_dag` is the _parent_ of
 its jobs, `jorb_schedule_log` cascades only from `jorb_schedule`,
 `jorb_worker` is referenced by nothing, and a live job's consumed mail and
 its history outlive any job deletion — so deleting jobs would never free them.
@@ -554,21 +555,21 @@ the DXE-relevant half is below.
 
 The job sweep is deliberately conservative:
 
-* it removes only jobs in a **terminal** state (`finished`, `crashed`,
+- it removes only jobs in a **terminal** state (`finished`, `crashed`,
   `cancelled`) past the window. A `queued`, `claimed`, `running` or `waiting`
   job is never deleted at any age: a job waiting on a dependency can
   legitimately be very old.
-* it will not delete a terminal job that a `waiting` job still depends on
+- it will not delete a terminal job that a `waiting` job still depends on
   (via `waitfor_job` or `waitfor_group`), which would strand the waiter.
-* it **drains** rather than taking one batch per cycle — a sweep that deletes
+- it **drains** rather than taking one batch per cycle — a sweep that deletes
   slower than jobs arrive is retention in name only — under a per-cycle time
   budget so it can never starve the latency-critical sweeps.
-* consumed mailbox messages are pruned by a sweep of their own, even when
+- consumed mailbox messages are pruned by a sweep of their own, even when
   their job is still alive: a long-running workflow reads messages for months
   and the job-scoped cascade would never reach them. Only messages `recv` has
   already consumed are candidates — unread mail is kept at any age, because it
   is still deliverable.
-* `jorb_history` is pruned by a sweep of its own for the same reason: a
+- `jorb_history` is pruned by a sweep of its own for the same reason: a
   durable machine that never terminates is never reached by the job cascade,
   so nothing else would ever bound its wake/sleep audit trail.
 

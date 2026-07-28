@@ -13,7 +13,7 @@ Live, interactive dashboard for monitoring and managing pyjobby jobs in real-tim
   per interval, shared by every connected dashboard**, and none at all while
   nobody is subscribed
 - **Per-Job Watches**: Follow one specific job to completion, on a channel the
-  database only emits *because* you asked for that job
+  database only emits _because_ you asked for that job
 - **Interactive Management**: Cancel, retry, and adjust job priorities from the UI
 - **Pure PostgreSQL**: Uses LISTEN/NOTIFY - no Redis or external message broker needed
 - **Clean Frontend**: Pure HTML/CSS/JavaScript - no framework bloat
@@ -58,7 +58,7 @@ There is deliberately no per-transition NOTIFY channel. Two reasons:
   aggregates.
 
 Nor can such a channel be demand-gated like the others, because a browser
-has no polling fallback: a gate would silently *drop* dashboard events
+has no polling fallback: a gate would silently _drop_ dashboard events
 instead of delaying them. So the dashboard gets a different mechanism, the
 one documented below.
 
@@ -232,7 +232,7 @@ ws.onopen = () => {
 
 The aggregate snapshot, on the `jobs` channel, once per `--snapshot-interval`.
 Counts are per queue and fleet-wide; ages are in seconds; `backlog` counts only
-*claimable* work, so a job deliberately scheduled for next week is `queued` but
+_claimable_ work, so a job deliberately scheduled for next week is `queued` but
 is not backlog.
 
 ```json
@@ -244,18 +244,33 @@ is not backlog.
     "window_seconds": 60.0,
     "workers_live": 12,
     "totals": {
-      "queued": 431, "claimed": 8, "running": 24, "waiting": 3,
-      "backlog": 402, "scheduled": 29, "oldest_backlog_age_seconds": 37.2,
+      "queued": 431,
+      "claimed": 8,
+      "running": 24,
+      "waiting": 3,
+      "backlog": 402,
+      "scheduled": 29,
+      "oldest_backlog_age_seconds": 37.2,
       "oldest_inflight_age_seconds": 4.1,
-      "finished": 1893, "crashed": 4, "cancelled": 0
+      "finished": 1893,
+      "crashed": 4,
+      "cancelled": 0
     },
     "queues": {
       "default": {
-        "queued": 431, "claimed": 8, "running": 24, "waiting": 3,
-        "backlog": 402, "scheduled": 29, "oldest_backlog_age_seconds": 37.2,
+        "queued": 431,
+        "claimed": 8,
+        "running": 24,
+        "waiting": 3,
+        "backlog": 402,
+        "scheduled": 29,
+        "oldest_backlog_age_seconds": 37.2,
         "oldest_inflight_age_seconds": 4.1,
-        "finished": 1893, "crashed": 4, "cancelled": 0,
-        "paused": false, "workers_live": 12
+        "finished": 1893,
+        "crashed": 4,
+        "cancelled": 0,
+        "paused": false,
+        "workers_live": 12
       }
     }
   }
@@ -303,17 +318,24 @@ not fetched separately.
   "timestamp": "2025-11-18T10:30:05.000Z",
   "data": {
     "queue": "default",
-    "queued": 42, "claimed": 2, "running": 5, "waiting": 3,
-    "backlog": 40, "scheduled": 2,
+    "queued": 42,
+    "claimed": 2,
+    "running": 5,
+    "waiting": 3,
+    "backlog": 40,
+    "scheduled": 2,
     "oldest_backlog_age_seconds": 12.4,
     "oldest_inflight_age_seconds": 3.0,
-    "finished": 190, "crashed": 1, "cancelled": 0,
-    "paused": false, "workers_live": 12
+    "finished": 190,
+    "crashed": 1,
+    "cancelled": 0,
+    "paused": false,
+    "workers_live": 12
   }
 }
 ```
 
-`queued` and `backlog` are the same number — jobs claimable *now* — under the
+`queued` and `backlog` are the same number — jobs claimable _now_ — under the
 two names this feed serves: `backlog` pairs with `oldest_backlog_age_seconds`
 for the dashboard, `queued` is the state name the rest of the platform uses.
 `scheduled` (queued with a `run_after` in the future) is reported separately
@@ -418,12 +440,20 @@ diagnostic, not the dashboard feed (that is `dashboard`, above).
   "timestamp": "2025-11-18T10:30:14.000Z",
   "data": {
     "server": {
-      "total_connections": 42, "current_connections": 7,
-      "messages_sent": 9130, "messages_received": 88,
-      "events_received": 311, "snapshot_queries": 1304, "errors": 0
+      "total_connections": 42,
+      "current_connections": 7,
+      "messages_sent": 9130,
+      "messages_received": 88,
+      "events_received": 311,
+      "snapshot_queries": 1304,
+      "errors": 0
     },
     "queues": {
-      "default": { "paused": false, "max_concurrency": null, "rate_limit": null }
+      "default": {
+        "paused": false,
+        "max_concurrency": null,
+        "rate_limit": null
+      }
     },
     "workers_live": 12,
     "client": {
@@ -483,7 +513,7 @@ Follow one specific job to its terminal state. This is the per-job primitive —
 there is no feed of every transition to filter.
 
 Registering a watch sets `jorb.awaited` on that row, which is the demand gate
-`jorb_done` is built on: the database emits a completion notification *because*
+`jorb_done` is built on: the database emits a completion notification _because_
 you asked, and emits nothing for jobs nobody watched. The `watching` reply
 carries the job's current state, so watching an already-finished job answers
 immediately instead of hanging.
@@ -654,8 +684,8 @@ package; edit it there (or edit a copy and serve it yourself).
 ### The WebSocket URL is derived, not configured
 
 ```javascript
-const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://')
-    + location.host + '/ws';
+const WS_URL =
+  (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
 ```
 
 The page connects back to the server that served it, so a different host,
@@ -876,7 +906,9 @@ ws.on("message", (data) => {
   if (event.event === "dashboard") {
     for (const [queue, stats] of Object.entries(event.data.queues)) {
       if (stats.oldest_backlog_age_seconds > 300) {
-        console.warn(`${queue} head of queue is ${stats.oldest_backlog_age_seconds}s old`);
+        console.warn(
+          `${queue} head of queue is ${stats.oldest_backlog_age_seconds}s old`,
+        );
       }
     }
   }
