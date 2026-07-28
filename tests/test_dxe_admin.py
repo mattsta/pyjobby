@@ -265,9 +265,9 @@ async def test_requeue_resume_keeps_checkpoints_fresh_wipes_them(
             assert s["duration_seconds"] is not None
             datetime.datetime.fromisoformat(s["started"])
 
-        # --- resume-style requeue: checkpoints survive ---
+        # --- resume-style rerun: checkpoints survive ---
         await api.pause_queue(unique_queue)
-        result = await api.requeue_job(job_id)
+        result = await api.rerun_job(job_id, fresh=False)
         assert result == {"job_id": job_id, "status": "requeued", "fresh": False}
 
         assert (
@@ -281,17 +281,17 @@ async def test_requeue_resume_keeps_checkpoints_fresh_wipes_them(
             == 3
         )
 
-        # a queued job cannot be requeued again
+        # a queued job cannot be rerun again
         with pytest.raises(ValueError, match="cannot"):
-            await api.requeue_job(job_id)
+            await api.rerun_job(job_id)
 
         await api.resume_queue(unique_queue)
         row = await wait_for_job_state(db_pool, job_id, ("finished",), timeout=15)
         assert row["result"] == {"final": 14}
 
-        # --- fresh requeue: checkpoints wiped, restart from step 1 ---
+        # --- fresh rerun (the default): checkpoints wiped, restart from step 1
         await api.pause_queue(unique_queue)
-        result = await api.requeue_job(job_id, fresh=True)
+        result = await api.rerun_job(job_id)
         assert result["fresh"] is True
         assert (
             await db_pool.fetchval(
@@ -498,7 +498,7 @@ def test_cli_workers_and_jobs_commands_run(dsn):
     assert result.exit_code == 0, result.output
     assert "Live workers" in result.output
 
-    # requeueing a nonexistent job fails cleanly
-    result = runner.invoke(cli, ["--dsn", dsn, "jobs", "requeue", "999999999"], obj={})
+    # rerunning a nonexistent job fails cleanly
+    result = runner.invoke(cli, ["--dsn", dsn, "jobs", "rerun", "999999999"], obj={})
     assert result.exit_code == 1
     assert "not found" in result.output

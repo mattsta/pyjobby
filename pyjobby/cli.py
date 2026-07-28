@@ -708,37 +708,40 @@ def jobs_steps(ctx: click.Context, job_id: int, output_json: bool) -> None:
     asyncio.run(_steps())
 
 
-@jobs.command("requeue")
+@jobs.command("rerun")
 @click.argument("job_id", type=int)
 @click.option(
-    "--fresh",
+    "--resume",
     is_flag=True,
-    help="Wipe DXE checkpoints first: restart from step 1 instead of resuming",
+    help="Keep DXE checkpoints: completed steps fast-forward instead of re-executing",
 )
 @click.pass_context
-def jobs_requeue(ctx: click.Context, job_id: int, fresh: bool) -> None:
-    """Requeue a terminal job for another run (also: RESUME an interrupted job)
+def jobs_rerun(ctx: click.Context, job_id: int, resume: bool) -> None:
+    """RE-RUN a terminal job — including a FINISHED one (repeats side effects)
 
-    By default the job keeps its DXE step checkpoints, so completed steps
-    fast-forward and execution resumes where it left off — use this to
-    resume interrupted durable jobs. Pass --fresh to wipe the checkpoints
-    and restart from step 1.
+    By default the run is fresh: DXE checkpoints are wiped and the job
+    re-executes from step 1, which is what "run it again" means. Pass
+    --resume to keep the checkpoints instead — completed steps fast-forward
+    and execution continues where it left off, which is how an interrupted
+    durable job is resumed.
+
+    `jobs retry` is the verb for jobs that did NOT succeed; it refuses
+    finished jobs precisely because re-running them repeats their effects.
     """
 
-    async def _requeue() -> None:
+    async def _rerun() -> None:
         conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
         try:
             api = AdminAPI(conn)
-            result = await api.requeue_job(job_id, fresh=fresh)
+            result = await api.rerun_job(job_id, fresh=not resume)
             mode = "fresh restart" if result["fresh"] else "resume with checkpoints"
             print_success(f"Job {result['job_id']} requeued ({mode})")
         except ValueError as e:
-            print_error(str(e))
-            sys.exit(1)
+            fail(str(e))
         finally:
             await conn.close()
 
-    asyncio.run(_requeue())
+    asyncio.run(_rerun())
 
 
 # =========================================================================

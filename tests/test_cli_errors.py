@@ -341,15 +341,15 @@ class TestJobsUnknownId:
         assert result.exit_code == 1
         assert f"Error: Job {MISSING_ID} not found" in result.stderr
 
-    async def test_requeue_exits_one(self, dsn):
-        result = await run_cli("--dsn", dsn, "jobs", "requeue", str(MISSING_ID))
+    async def test_rerun_exits_one(self, dsn):
+        result = await run_cli("--dsn", dsn, "jobs", "rerun", str(MISSING_ID))
 
         assert result.exit_code == 1
         assert f"Error: Job {MISSING_ID} not found" in result.stderr
 
-    async def test_requeue_fresh_exits_one(self, dsn):
+    async def test_rerun_resume_exits_one(self, dsn):
         result = await run_cli(
-            "--dsn", dsn, "jobs", "requeue", str(MISSING_ID), "--fresh"
+            "--dsn", dsn, "jobs", "rerun", str(MISSING_ID), "--resume"
         )
 
         assert result.exit_code == 1
@@ -458,16 +458,16 @@ class TestJobsWrongState:
         )
 
     @pytest.mark.parametrize("state", ["queued", "running", "claimed"])
-    async def test_requeue_non_terminal_job_exits_one(
+    async def test_rerun_non_terminal_job_exits_one(
         self, dsn, db_pool, unique_queue, state
     ):
         job_id = await make_job(db_pool, unique_queue, state)
 
-        result = await run_cli("--dsn", dsn, "jobs", "requeue", str(job_id))
+        result = await run_cli("--dsn", dsn, "jobs", "rerun", str(job_id))
 
         assert result.exit_code == 1
         assert (
-            f"Error: Job {job_id} is in state '{state}' and cannot be requeued "
+            f"Error: Job {job_id} is in state '{state}' and cannot be rerun "
             "(must be crashed, cancelled, or finished)" in result.stderr
         )
 

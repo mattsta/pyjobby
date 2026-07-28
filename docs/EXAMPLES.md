@@ -638,7 +638,7 @@ polling — example 1 — for anything that is not fast and bounded.
    producer's own retry is free.
 6. **Failures are visible.** `crashed` is the dead-letter state; the row keeps
    its arguments, its backtrace and its checkpoints, and
-   `pj-admin jobs requeue <id>` resumes from the last completed step.
+   `pj-admin jobs rerun <id> --resume` resumes from the last completed step.
 
 ## See also
 

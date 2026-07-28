@@ -234,7 +234,7 @@ Commands:
   history        Show a job's full transition trail (including per-attempt errors)
   inspect        Show detailed information about a job
   list           List jobs with optional filtering
-  requeue        Requeue a terminal job for another run (also: RESUME an interrupted job)
+  rerun          RE-RUN a terminal job — including a FINISHED one (repeats side effects)
   retry          Retry one or more crashed jobs
   retry-stats    Show retry statistics from the jorb_history audit trail
   set-priority   Change a queued or waiting job's priority.
@@ -324,23 +324,28 @@ what a resume will skip. See [DXE.md](DXE.md).
 ### Acting on jobs
 
 ```console
-$ pj-admin jobs requeue --help
-Usage: pj-admin jobs requeue [OPTIONS] JOB_ID
+$ pj-admin jobs rerun --help
+Usage: pj-admin jobs rerun [OPTIONS] JOB_ID
 
-  Requeue a terminal job for another run (also: RESUME an interrupted job)
+  RE-RUN a terminal job — including a FINISHED one (repeats side effects)
 
-  By default the job keeps its DXE step checkpoints, so completed steps fast-
-  forward and execution resumes where it left off — use this to resume
-  interrupted durable jobs. Pass --fresh to wipe the checkpoints and restart
-  from step 1.
+  By default the run is fresh: DXE checkpoints are wiped and the job re-
+  executes from step 1, which is what "run it again" means. Pass --resume to
+  keep the checkpoints instead — completed steps fast-forward and execution
+  continues where it left off, which is how an interrupted durable job is
+  resumed.
+
+  `jobs retry` is the verb for jobs that did NOT succeed; it refuses finished
+  jobs precisely because re-running them repeats their effects.
 
 Options:
-  --fresh  Wipe DXE checkpoints first: restart from step 1 instead of resuming
+  --resume  Keep DXE checkpoints: completed steps fast-forward instead of
+            re-executing
 ```
 
 * `jobs retry ID...` — for jobs that did **not** succeed (`crashed` or
   `cancelled`). Refuses anything else.
-* `jobs requeue ID` — also accepts a **finished** job. Running successful
+* `jobs rerun ID` — also accepts a **finished** job. Running successful
   work again repeats its side effects, which is why it is a separate verb.
 * `jobs cancel ID...` — queued and waiting jobs are cancelled immediately;
   a claimed or running job gets a cancellation *request* delivered to its
@@ -718,7 +723,7 @@ for job in crashed:
 Method groups, all `async`:
 
 * **Jobs** — `list_jobs`, `get_job`, `get_job_history`, `get_job_steps`,
-  `retry_job`, `retry_jobs`, `requeue_job`, `cancel_job`, `cancel_jobs`,
+  `retry_job`, `retry_jobs`, `rerun_job`, `cancel_job`, `cancel_jobs`,
   `update_job_priority`, `delete_job`, `delete_jobs`.
 * **Queues** — `list_queues`, `queue_stats`, `clear_queue`,
   `list_queue_controls`, `get_queue_control`, `set_queue_control`,

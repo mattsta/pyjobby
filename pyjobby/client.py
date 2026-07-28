@@ -1345,13 +1345,30 @@ class JobClient:
         info = await self.get_job(job_id)
         return info.state if info else None
 
+    async def rerun_job(self, job_id: int, *, fresh: bool = True) -> int | None:
+        """
+        RE-RUN a terminal job — including one that already FINISHED, whose
+        side effects it will repeat. Asked for by name, never implied:
+        `retry_job` is the verb that refuses finished jobs.
+
+        By default the run is fresh (DXE checkpoints wiped, re-executes from
+        step 1). Pass fresh=False to RESUME an interrupted durable job from
+        its recorded checkpoints instead.
+
+        Returns the job id if requeued, or None if it was not in a terminal
+        state.
+        """
+        async with self.pool.acquire() as conn:
+            requeued = await db.rerun_job(conn, job_id, fresh=fresh)
+        return requeued
+
     async def retry_job(self, job_id: int) -> int | None:
         """
         Retry a job that did not succeed (crashed or cancelled).
 
         A job that already FINISHED is deliberately not retriable — re-running
-        successful work repeats its side effects (see db.rerun_job, the
-        operator verb for that).
+        successful work repeats its side effects (see rerun_job, the
+        verb for that).
 
         The job keeps its id (retries reuse the same row; per-attempt
         history lives in jorb_history).
@@ -2933,6 +2950,11 @@ class SyncJobClient:
     def retry_job(self, job_id: int) -> int | None:
         """Synchronous JobClient.retry_job()."""
         requeued: int | None = self._run(self._client.retry_job(job_id))
+        return requeued
+
+    def rerun_job(self, job_id: int, *, fresh: bool = True) -> int | None:
+        """Synchronous JobClient.rerun_job()."""
+        requeued: int | None = self._run(self._client.rerun_job(job_id, fresh=fresh))
         return requeued
 
     def get_event(self, job_id: int, key: str, timeout: float | None = None) -> Any:

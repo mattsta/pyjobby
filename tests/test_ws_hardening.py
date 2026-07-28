@@ -839,7 +839,9 @@ class TestUnauthenticatedMutationBoundary:
 
         reply = await ask(ws, {"action": "rerun_job", "job_id": job_id})
         assert reply["event"] == "job_rerun"
-        assert reply["data"] == {"job_id": job_id, "status": "requeued"}
+        # `fresh` states the mode: the dashboard's rerun is a restart, not a
+        # resume, and the payload must say which one happened.
+        assert reply["data"] == {"job_id": job_id, "status": "requeued", "fresh": True}
 
         row = await job_row(db_pool, job_id)
         assert row["state"] == "queued"
@@ -853,7 +855,9 @@ class TestUnauthenticatedMutationBoundary:
         job_id = await make_job(db_pool, unique_queue, "crashed", error_count=9)
 
         reply = await ask(ws, {"action": "rerun_job", "job_id": job_id})
-        assert reply["data"] == {"job_id": job_id, "status": "requeued"}
+        # `fresh` states the mode: the dashboard's rerun is a restart, not a
+        # resume, and the payload must say which one happened.
+        assert reply["data"] == {"job_id": job_id, "status": "requeued", "fresh": True}
 
         row = await job_row(db_pool, job_id)
         assert row["state"] == "queued"

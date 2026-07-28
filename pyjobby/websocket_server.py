@@ -863,8 +863,12 @@ class WebSocketServer:
         assert self.db_pool is not None
         try:
             async with self.db_pool.acquire() as conn:
-                # shared re-run verb — jobs keep their ids across reruns
-                requeued = await db.rerun_job(conn, job_id)
+                # shared re-run verb — jobs keep their ids across reruns.
+                # fresh is stated, not defaulted, and echoed in the event:
+                # "restart from step 1" vs "resume from checkpoints" are
+                # opposite answers to the same button, so the payload must
+                # say which one happened.
+                requeued = await db.rerun_job(conn, job_id, fresh=True)
 
                 if requeued:
                     await self.send_to_client(
@@ -875,6 +879,7 @@ class WebSocketServer:
                             "data": {
                                 "job_id": job_id,
                                 "status": "requeued",
+                                "fresh": True,
                             },
                         },
                     )

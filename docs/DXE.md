@@ -459,9 +459,9 @@ running the same code shape, and asserts that the effect happened **twice** for
 
 ```
 pj-admin jobs steps <id>       # what completed, what failed, timings
-pj-admin jobs requeue <id>     # resume: completed steps fast-forward
-pj-admin jobs requeue <id> --fresh
-                               # restart: deletes checkpoints, runs from step 1
+pj-admin jobs rerun <id> --resume
+                               # resume: completed steps fast-forward
+pj-admin jobs rerun <id>       # restart: deletes checkpoints, runs from step 1
 ```
 
 Use `--fresh` when the recorded results are *wrong* rather than merely

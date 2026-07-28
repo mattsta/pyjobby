@@ -386,7 +386,7 @@ cancellation within about a second and stop at their next await point.
 the row back to a claimer while the original execution may still be alive.
 The platform's own recovery advances `run_epoch`, which is what fences a
 superseded execution out of writing results or checkpoints; a manual update
-does not, and the two executions race. Use `pj-admin jobs requeue ID`.
+does not, and the two executions race. Use `pj-admin jobs rerun ID`.
 
 A note on what a timeout can interrupt: async code is genuinely stopped at
 its await point. A *synchronous* `task()` runs in a worker thread — the
@@ -412,8 +412,8 @@ failures exist.
 
 After a code fix, `pj-admin dlq retry ID` requeues the same row with a
 fresh attempt budget. A DXE job resumes from its last completed
-checkpoint; `pj-admin jobs requeue ID --fresh` wipes the checkpoints and
-restarts from step 1.
+checkpoint; `pj-admin jobs rerun ID` wipes the checkpoints and
+restarts from step 1 (`--resume` keeps them).
 
 Watch `DLQ Growth` in `pj-admin metrics` and `Retry Pressure` next to it —
 retries that eventually succeed cost throughput without ever reaching the
@@ -455,7 +455,7 @@ it exactly-once where it matters.
 * **Idempotent side effects** — the fallback when neither applies.
 
 Note that a re-run you asked for is a separate verb precisely because it
-repeats side effects: `jobs retry` refuses a finished job, `jobs requeue`
+repeats side effects: `jobs retry` refuses a finished job, `jobs rerun`
 accepts one. See
 [OPERATIONS.md § Retry vs. re-run](OPERATIONS.md#retry-vs-re-run).
 

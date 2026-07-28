@@ -534,8 +534,8 @@ dead-lettered job debuggable and resumable:
 
 ```
 pj-admin jobs steps <id>            # which step failed, and why
-pj-admin jobs requeue <id>          # resume: completed steps fast-forward
-pj-admin jobs requeue <id> --fresh  # restart: discard checkpoints first
+pj-admin jobs rerun <id> --resume   # resume: completed steps fast-forward
+pj-admin jobs rerun <id>            # restart: discard checkpoints first
 ```
 
 Use `--fresh` when the recorded results are *wrong* (you fixed a bug in a

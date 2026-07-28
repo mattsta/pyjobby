@@ -1475,25 +1475,30 @@ class AdminAPI:
             steps.append(data)
         return steps
 
-    async def requeue_job(self, job_id: int, fresh: bool = False) -> dict[str, Any]:
+    async def rerun_job(self, job_id: int, fresh: bool = True) -> dict[str, Any]:
         """
-        Requeue a terminal job for another run — also how an interrupted
-        durable job is RESUMED.
+        RE-RUN a terminal job — including one that already FINISHED, whose
+        side effects it will repeat. That is what the verb means everywhere
+        (db.rerun_job, the websocket rerun action, `pj-admin jobs rerun`);
+        `retry` is the verb that refuses finished jobs.
 
-        By default the job's DXE checkpoints are kept, so completed steps
-        fast-forward on the next run (resume). With fresh=True the
-        checkpoints are deleted first and the job restarts from step 1.
-        Either way the same row is requeued with its error budget reset.
+        By default the run is fresh: the job's DXE checkpoints are deleted
+        so it actually re-executes from step 1. Pass fresh=False to RESUME
+        instead — checkpoints are kept and completed steps fast-forward,
+        which is how an interrupted durable job is continued. Either way the
+        same row is requeued with its error budget reset.
 
         Args:
             job_id: Job ID
-            fresh: Delete jorb_step checkpoints before requeuing
+            fresh: True (default) restarts from step 1; False resumes from
+                the recorded checkpoints
 
         Returns:
-            Dictionary with job_id, status, and fresh flag
+            {"job_id", "status": "requeued", "fresh"} — `fresh` reports
+            which mode actually ran
 
         Raises:
-            ValueError: If job not found or not in a requeueable state
+            ValueError: If job not found or not in a rerunnable state
         """
         job = await self.conn.fetchrow(
             "SELECT id, state FROM jorb WHERE id = $1", job_id
@@ -1507,7 +1512,7 @@ class AdminAPI:
         if requeued is None:
             raise ValueError(
                 f"Job {job_id} is in state '{job['state']}' and cannot "
-                f"be requeued (must be crashed, cancelled, or finished)"
+                f"be rerun (must be crashed, cancelled, or finished)"
             )
 
         return {"job_id": job_id, "status": "requeued", "fresh": fresh}

@@ -111,11 +111,11 @@ waiting -> queued                                  (dependency satisfied)
   (`pj-admin jobs history ID`).
 * **`crashed` is terminal**: the dead letter queue is exactly
   `state = 'crashed'`. `pj-admin dlq list` / `pj-admin dlq retry ID`
-  (errors reset) or `pj-admin jobs requeue ID`.
+  (errors reset) or `pj-admin jobs rerun ID`.
 * **DXE jobs** (using `self.step(...)`) resume from their last completed
   checkpoint on any retry — `pj-admin jobs steps ID` shows what completed.
-  `pj-admin jobs requeue ID --fresh` wipes checkpoints for a from-scratch
-  rerun.
+  `pj-admin jobs rerun ID` wipes checkpoints for a from-scratch rerun;
+  `--resume` keeps them.
 * **Durable sleeps** hold no worker: a sleeping job is simply `queued` with
   a future `run_after`.
 
@@ -425,12 +425,15 @@ Two different verbs, because they carry different risk:
 
 * **Retry** — `pj-admin jobs retry ID`, `pj-admin dlq retry ID`. For a job
   that did *not* succeed (`crashed` or `cancelled`).
-* **Re-run** — `pj-admin jobs requeue ID`. Also accepts a **finished** job.
+* **Re-run** — `pj-admin jobs rerun ID`. Also accepts a **finished** job.
   Running successful work again repeats its side effects, so it is a
   separate verb rather than a permissive retry.
 
-Add `--fresh` to a re-run to drop the DXE step checkpoints and start from
-step 1; without it, completed steps fast-forward and the job resumes.
+A re-run is FRESH by default: the DXE step checkpoints are dropped and the
+job re-executes from step 1 — that is what "run it again" means. Add
+`--resume` to keep the checkpoints instead; completed steps fast-forward
+and the job continues where it stopped, which is how an interrupted
+durable job is resumed.
 
 ## Reading the latency numbers
 

@@ -264,10 +264,10 @@ def mock_admin_api():
     mock_api.get_queue_control.return_value = _control
     mock_api.set_queue_control.return_value = _control
 
-    mock_api.requeue_job.return_value = {
+    mock_api.rerun_job.return_value = {
         "job_id": 1,
         "status": "requeued",
-        "fresh": False,
+        "fresh": True,
     }
     mock_api.get_job_history.return_value = [
         {
@@ -573,32 +573,32 @@ class TestJobsCommands:
             assert "requeued" in result.output
             mock_admin_api.retry_job.assert_called_once_with(1)
 
-    def test_jobs_requeue(self, cli_runner, mock_admin_api, mock_db_params):
-        """Test jobs requeue command (resume with checkpoints by default)."""
+    def test_jobs_rerun(self, cli_runner, mock_admin_api, mock_db_params):
+        """jobs rerun defaults to a FRESH restart (that is what rerun means)."""
         with mock_cli_context(mock_admin_api, mock_db_params):
             result = cli_runner.invoke(
-                cli, ["--config", "test.py", "jobs", "requeue", "1"]
-            )
-
-            assert result.exit_code == 0
-            assert "resume with checkpoints" in result.output
-            mock_admin_api.requeue_job.assert_called_once_with(1, fresh=False)
-
-    def test_jobs_requeue_fresh(self, cli_runner, mock_admin_api, mock_db_params):
-        """Test jobs requeue --fresh wipes checkpoints."""
-        mock_admin_api.requeue_job.return_value = {
-            "job_id": 1,
-            "status": "requeued",
-            "fresh": True,
-        }
-        with mock_cli_context(mock_admin_api, mock_db_params):
-            result = cli_runner.invoke(
-                cli, ["--config", "test.py", "jobs", "requeue", "1", "--fresh"]
+                cli, ["--config", "test.py", "jobs", "rerun", "1"]
             )
 
             assert result.exit_code == 0
             assert "fresh restart" in result.output
-            mock_admin_api.requeue_job.assert_called_once_with(1, fresh=True)
+            mock_admin_api.rerun_job.assert_called_once_with(1, fresh=True)
+
+    def test_jobs_rerun_resume(self, cli_runner, mock_admin_api, mock_db_params):
+        """jobs rerun --resume keeps checkpoints (continue an interrupted job)."""
+        mock_admin_api.rerun_job.return_value = {
+            "job_id": 1,
+            "status": "requeued",
+            "fresh": False,
+        }
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "jobs", "rerun", "1", "--resume"]
+            )
+
+            assert result.exit_code == 0
+            assert "resume with checkpoints" in result.output
+            mock_admin_api.rerun_job.assert_called_once_with(1, fresh=False)
 
     def test_jobs_history(self, cli_runner, mock_admin_api, mock_db_params):
         """Test jobs history command."""
