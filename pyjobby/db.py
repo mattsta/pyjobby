@@ -57,7 +57,10 @@ def utcnow() -> datetime.datetime:
 
 
 def build_requeue_sql(
-    allowed_states: tuple[str, ...] = ("crashed",), *, many: bool = False
+    allowed_states: tuple[str, ...] = ("crashed",),
+    *,
+    many: bool = False,
+    wipe_checkpoints: bool = False,
 ) -> str:
     """SQL that puts a terminal/in-flight job back in the queue.
 
@@ -75,11 +78,18 @@ def build_requeue_sql(
     also guard on state IN ('claimed','running'). Checkpoints are loaded
     without an epoch filter, so bumping costs no resume capability.
 
+    ``wipe_checkpoints`` deletes the job's jorb_step rows in the same
+    statement: a resume replays checkpoints regardless of epoch, so a re-RUN
+    ("do it again anyway", repeating side effects) must discard them or the
+    durable job would fast-forward over the very work it was asked to redo.
+    Retry leaves them (that IS resume). One statement, so the wipe and the
+    requeue commit together and no re-claim can land between them.
+
     Parameters: $1 job_id, $2 delay (interval), $3 reset_errors (bool).
     """
     states = ", ".join(f"'{s}'" for s in allowed_states)
     target = "id = ANY($1::bigint[])" if many else "id = $1::bigint"
-    return f"""UPDATE jorb
+    requeue = f"""UPDATE jorb
             SET state = 'queued',
                 run_epoch = run_epoch + 1,
                 run_after = now() + $2::interval,
@@ -94,6 +104,14 @@ def build_requeue_sql(
             WHERE {target}
               AND state IN ({states})
             RETURNING id"""
+    if not wipe_checkpoints:
+        return requeue
+    return f"""WITH bumped AS (
+            {requeue}
+        ), wiped AS (
+            DELETE FROM jorb_step WHERE job_id IN (SELECT id FROM bumped)
+        )
+        SELECT id FROM bumped"""
 
 
 #: States a RETRY may start from. Retry means "this job did not succeed;
@@ -160,11 +178,19 @@ async def rerun_job(
     *,
     delay: datetime.timedelta | None = None,
     reset_errors: bool = True,
+    fresh: bool = True,
 ) -> int | None:
     """Run a terminal job again, INCLUDING one that already finished.
 
     Separate from :func:`retry_job` on purpose: re-running successful work
     repeats its side effects, so callers must ask for it by name.
+
+    ``fresh`` (the default) discards the job's DXE checkpoint log so the run
+    actually re-executes -- a durable job's checkpoints are replayed with no
+    epoch filter, so without the wipe a rerun would fast-forward over the
+    very steps it was asked to redo and repeat nothing. Pass ``fresh=False``
+    to keep the checkpoints, i.e. RESUME an interrupted durable job from
+    where it stopped rather than restart it.
     """
     return await requeue_job(
         conn,
@@ -172,6 +198,7 @@ async def rerun_job(
         delay=delay,
         reset_errors=reset_errors,
         allowed_states=RERUNNABLE_STATES,
+        wipe_checkpoints=fresh,
     )
 
 
@@ -182,16 +209,23 @@ async def requeue_job(
     delay: datetime.timedelta | None = None,
     reset_errors: bool = True,
     allowed_states: tuple[str, ...] = RETRYABLE_STATES,
+    wipe_checkpoints: bool = False,
 ) -> int | None:
     """Low-level requeue used by :func:`retry_job` and :func:`rerun_job`,
     and by the monitor (which requeues in-flight states). Prefer the named
     verbs; pass ``allowed_states`` only for a genuinely different guard.
 
+    ``wipe_checkpoints`` discards the job's DXE checkpoint log so the next
+    attempt re-executes from the start; retry leaves it to resume.
+
     Returns the job id, or None if it wasn't in an allowed state."""
     if delay is None:
         delay = datetime.timedelta(0)
     requeued: int | None = await conn.fetchval(
-        build_requeue_sql(allowed_states), job_id, delay, reset_errors
+        build_requeue_sql(allowed_states, wipe_checkpoints=wipe_checkpoints),
+        job_id,
+        delay,
+        reset_errors,
     )
     return requeued
 

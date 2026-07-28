@@ -656,6 +656,34 @@ class TestDoctorBlockedWaiters:
         assert status == "WARN"
         assert "blocked on a crashed/cancelled upstream" in summary
 
+    async def test_a_group_waiter_with_a_crashed_member_warns(
+        self, dsn, db_pool, unique_queue
+    ):
+        """A group whose members all exist never trips the unsatisfiable
+        sweep, and never gets woken while one member is crashed -- so a group
+        waiter is stranded just like a job waiter, and doctor must surface it
+        the same way."""
+        leader = await db_pool.fetchval(
+            """INSERT INTO jorb (job_class, queue, state)
+               VALUES ('tests.dxe_jobs.OkJob', $1, 'crashed') RETURNING id""",
+            unique_queue,
+        )
+        await db_pool.execute(
+            "UPDATE jorb SET run_group = $1 WHERE id = $1", leader
+        )
+        await db_pool.execute(
+            """INSERT INTO jorb (job_class, queue, state, waitfor_group)
+               VALUES ('tests.dxe_jobs.OkJob', $1, 'waiting', $2)""",
+            unique_queue,
+            leader,
+        )
+
+        result = await run_doctor(dsn)
+
+        status, summary = parse_checks(result.output)["blocked-waiters"]
+        assert status == "WARN"
+        assert "blocked on a crashed/cancelled upstream" in summary
+
     async def test_ordinary_waiters_do_not_warn(self, dsn, db_pool, unique_queue):
         upstream = await db_pool.fetchval(
             """INSERT INTO jorb (job_class, queue, state)

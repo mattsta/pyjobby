@@ -546,11 +546,20 @@ SWEEP_SATISFIED_GROUP_WAITERS_SQL = """
 #: moved (a concurrent cancel, the edge-triggered wake beating us) is left
 #: alone; the loser of that race loses quietly, as everywhere else.
 WAKE_WAITERS_SQL = """
-    UPDATE jorb
+    UPDATE jorb w
     SET state = 'queued',
         updated = now()
-    WHERE id = ANY($1::bigint[])
-      AND state = 'waiting'
+    WHERE w.id = ANY($1::bigint[])
+      AND w.state = 'waiting'
+      AND (
+        (w.waitfor_job IS NOT NULL AND EXISTS (
+            SELECT 1 FROM jorb u
+            WHERE u.id = w.waitfor_job AND u.state = 'finished'))
+        OR (w.waitfor_group IS NOT NULL
+            AND EXISTS (SELECT 1 FROM jorb g WHERE g.run_group = w.waitfor_group)
+            AND NOT EXISTS (
+                SELECT 1 FROM jorb g
+                WHERE g.run_group = w.waitfor_group AND g.state != 'finished')))
 """
 
 #: Waiting jobs that can never be woken: their waitfor target does not
@@ -584,20 +593,25 @@ SWEEP_UNSATISFIABLE_WAITERS_SQL = """
 #: because a DLQ retry re-queues the row and it would then RUN with its
 #: dependency unsatisfied.
 CANCEL_UNSATISFIABLE_WAITERS_SQL = """
-    UPDATE jorb
+    UPDATE jorb AS j
     SET state = 'cancelled',
         error_message = CASE
-            WHEN waitfor_job IS NOT NULL THEN
-                'cancelled by the monitor: waitfor_job ' || waitfor_job
+            WHEN j.waitfor_job IS NOT NULL THEN
+                'cancelled by the monitor: waitfor_job ' || j.waitfor_job
                 || ' does not exist'
             ELSE
-                'cancelled by the monitor: waitfor_group ' || waitfor_group
+                'cancelled by the monitor: waitfor_group ' || j.waitfor_group
                 || ' has no jobs'
         END,
         finished = now(),
         updated = now()
-    WHERE id = ANY($1::bigint[])
-      AND state = 'waiting'
+    WHERE j.id = ANY($1::bigint[])
+      AND j.state = 'waiting'
+      AND ((j.waitfor_job IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM jorb u WHERE u.id = j.waitfor_job))
+        OR (j.waitfor_group IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM jorb g WHERE g.run_group = j.waitfor_group)))
     RETURNING id
 """
 

@@ -309,6 +309,40 @@ async def test_requeue_resume_keeps_checkpoints_fresh_wipes_them(
         assert [s["step_seq"] for s in steps] == [1, 2, 3]
 
 
+async def test_rerun_job_wipes_checkpoints_by_default_but_fresh_false_keeps(
+    unique_queue, db_pool
+):
+    """db.rerun_job is the "do it again, repeat side effects" verb: a durable
+    job replays its checkpoints with no epoch filter, so a rerun that kept
+    them would fast-forward over the work and repeat nothing. Default wipes;
+    fresh=False is the explicit RESUME opt-out that keeps them."""
+    for keep in (False, True):
+        job_id = await _insert_job(
+            db_pool, unique_queue, "tests.dxe_jobs.OkJob", {}
+        )
+        await db_pool.execute(
+            "UPDATE jorb SET state = 'finished', finished = now() WHERE id = $1",
+            job_id,
+        )
+        await db_pool.execute(
+            """INSERT INTO jorb_step (job_id, step_seq, name, output, run_epoch)
+               VALUES ($1, 1, 'did-it', '"done"'::jsonb, 0)""",
+            job_id,
+        )
+
+        requeued = await db.rerun_job(db_pool, job_id, fresh=not keep)
+
+        assert requeued == job_id
+        steps = await db_pool.fetchval(
+            "SELECT count(*) FROM jorb_step WHERE job_id = $1", job_id
+        )
+        assert steps == (1 if keep else 0)
+        assert (
+            await db_pool.fetchval("SELECT state FROM jorb WHERE id = $1", job_id)
+            == "queued"
+        )
+
+
 @pytest.fixture
 def dsn(db_params: dict) -> str:
     """The DSN of THIS session's database.

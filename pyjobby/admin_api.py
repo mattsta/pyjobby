@@ -1478,17 +1478,14 @@ class AdminAPI:
         if not job:
             raise ValueError(f"Job {job_id} not found")
 
-        async with self.conn.transaction():
-            if fresh:
-                await self.conn.execute(
-                    "DELETE FROM jorb_step WHERE job_id = $1", job_id
-                )
-            requeued = await db.rerun_job(self.conn, job_id, reset_errors=True)
-            if requeued is None:
-                raise ValueError(
-                    f"Job {job_id} is in state '{job['state']}' and cannot "
-                    f"be requeued (must be crashed, cancelled, or finished)"
-                )
+        requeued = await db.rerun_job(
+            self.conn, job_id, reset_errors=True, fresh=fresh
+        )
+        if requeued is None:
+            raise ValueError(
+                f"Job {job_id} is in state '{job['state']}' and cannot "
+                f"be requeued (must be crashed, cancelled, or finished)"
+            )
 
         return {"job_id": job_id, "status": "requeued", "fresh": fresh}
 

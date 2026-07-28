@@ -34,6 +34,8 @@ from loguru import logger
 
 from pyjobby import monitor as monitor_module
 from pyjobby.monitor import (
+    CANCEL_UNSATISFIABLE_WAITERS_SQL,
+    WAKE_WAITERS_SQL,
     _drain,
     handle_timed_out_job,
     monitor,
@@ -718,6 +720,43 @@ class TestSweepStrandedWaiters:
         row = await get_job(db_pool, waiter)
         assert row["state"] == "cancelled"
         assert f"waitfor_group {ghost} has no jobs" in row["error_message"]
+
+    async def test_cancel_re_checks_the_target_still_absent_under_lock(
+        self, db_pool, unique_queue
+    ):
+        """The probe found the group empty, but a member is inserted before
+        the cancel fires. The cancel statement re-verifies target-absence, so
+        it must NOT cancel a waiter whose group now exists — closing the
+        window where incrementally-built groups get their waiter cancelled."""
+        group = await insert_job(db_pool, unique_queue, state="running")
+        await db_pool.execute(
+            "UPDATE jorb SET run_group = $1 WHERE id = $1", group
+        )
+        waiter = await insert_job(
+            db_pool, unique_queue, state="waiting", waitfor_group=group
+        )
+
+        # A member of the group now exists (the probe's snapshot did not see it).
+        cancelled = await db_pool.fetch(CANCEL_UNSATISFIABLE_WAITERS_SQL, [waiter])
+
+        assert cancelled == []
+        assert (await get_job(db_pool, waiter))["state"] == "waiting"
+
+    async def test_wake_re_checks_the_upstream_still_finished_under_lock(
+        self, db_pool, unique_queue
+    ):
+        """The probe found the upstream finished, but it is requeued (a rerun)
+        before the wake fires. The wake re-verifies the upstream is still
+        finished, so it must NOT wake a waiter whose dependency is running
+        again."""
+        upstream = await insert_job(db_pool, unique_queue, state="queued")
+        waiter = await insert_job(
+            db_pool, unique_queue, state="waiting", waitfor_job=upstream
+        )
+
+        await db_pool.execute(WAKE_WAITERS_SQL, [waiter])
+
+        assert (await get_job(db_pool, waiter))["state"] == "waiting"
 
     async def test_woken_waiter_is_claimable_and_actually_runs(
         self, db_pool, unique_queue, live_worker
