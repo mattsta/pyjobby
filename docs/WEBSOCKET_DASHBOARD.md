@@ -589,11 +589,28 @@ ws.send(
 
 ---
 
-## 🔒 Rate Limiting
+## 🔒 Resource Bounds
 
+`/ws` is unauthenticated, so every one of these is a bound on what an
+anonymous client can make the server hold — not a protocol limit.
+
+- **Max connections per server**: 100 (`MAX_CLIENTS`, `max_clients=`). Beyond
+  it the handshake is answered with **503** and logged. The per-connection
+  limits below bound what ONE client costs; nothing in them bounds N clients,
+  and every accepted connection is a task and a pair of buffers.
 - **Max subscriptions per client**: 100 channels
-- **Max actions per second**: 10 actions/second
-- **Automatic cleanup**: Dead connections removed automatically
+- **Max actions per second**: 10 actions/second — charged per inbound frame,
+  before it is parsed, so a flood of garbage is metered like a flood of work
+- **Max inbound frame**: 64 KiB (`MAX_MESSAGE_LENGTH`), enforced by aiohttp's
+  `max_msg_size` **while the frame is being framed** — an oversized frame is
+  refused with close code 1009 instead of being buffered to aiohttp's 4 MiB
+  default and only then rejected
+- **Error replies**: capped at 200 characters and never carrying a database
+  message. A failing handler logs the exception server-side and tells the
+  client only that it failed: asyncpg's text quotes the SQL, the relation and
+  the column, and this surface has no authentication to hand that to.
+- **Automatic cleanup**: Dead connections removed automatically (which is
+  what frees a connection slot)
 - **Heartbeat**: 30-second ping/pong to detect disconnections
 
 ---
@@ -776,6 +793,7 @@ NGINX handles SSL termination, forwards to local WebSocket server.
 
 ### High Memory Usage
 
+- Lower `max_clients` (default: 100) — the server-wide connection cap
 - Limit max subscriptions per client (default: 100)
 - Raise `--snapshot-interval` (default: 1 second)
 - Limit job list size in frontend (default: 100 jobs)

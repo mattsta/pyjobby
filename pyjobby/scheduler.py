@@ -271,7 +271,11 @@ class ScheduleManager:
             name: Unique schedule name
             job_class: Python job class to execute
             cron_expr: Cron expression
-            **kwargs: Additional schedule fields (queue, kwargs, etc.)
+            **kwargs: Additional schedule fields (queue, priority, kwargs,
+                capability, timezone, enabled, ...). The API vocabulary is
+                ``priority``, as it is on enqueue and on AdminAPI; ``prio``
+                is the COLUMN name and stays on the SQL side of the INSERT
+                below.
 
         Returns:
             Schedule ID
@@ -308,7 +312,7 @@ class ScheduleManager:
             job_class,
             kwargs.get("kwargs", {}),
             kwargs.get("queue", "default"),
-            kwargs.get("prio", 100),
+            kwargs.get("priority", 100),
             kwargs.get("capability"),
             cron_expr,
             timezone,

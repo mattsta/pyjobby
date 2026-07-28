@@ -67,13 +67,20 @@ pj-admin schedule disable daily-revenue
 pj-admin schedule enable daily-revenue           # also resets the failure streak
 pj-admin schedule history daily-revenue --result failure
 pj-admin schedule stats
-pj-admin schedule delete daily-revenue
+pj-admin schedule delete daily-revenue --force   # prompts without -f/--force
 ```
 
 Every command that names a schedule takes a name **or** an id. `--priority`,
-`--capability`, `--jitter`, `--backpressure` and `--disabled` (create it
-switched off) are the remaining `add` options, and `list`, `show`, `history`
-and `stats` all take `--json`; `pj-admin schedule --help` is authoritative.
+`--max-prio`, `--capability`, `--jitter`, `--backpressure` and `--disabled`
+(create it switched off) are the remaining `add` options, and `list`, `show`,
+`history` and `stats` all take `--json`; `pj-admin schedule --help` is
+authoritative.
+
+`--priority` is refused above the deployment's worker priority ceiling — a
+schedule firing into a priority no worker will claim produces a job that sits
+`queued` forever — and `--max-prio N` raises the ceiling this one command
+checks against, exactly as it does for `pj-admin jobs set-priority`.
+`schedule delete` prompts for confirmation unless given `-f/--force`.
 
 ### Python
 

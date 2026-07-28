@@ -1,9 +1,13 @@
-"""Regression tests for DAG orchestration correctness.
+"""Regression tests for multi-job orchestration correctness.
 
-Each test here pins a property that DAGBuilder got wrong: a dependent that
-could be released before its dependencies finished, a graph that was written
-to the database piecemeal, dependency edges that were never recorded, and a
+Each test here pins a property that a graph builder got wrong: a dependent
+that could be released before its dependencies finished, a graph written to
+the database piecemeal, dependency edges that were never recorded, and a
 "success" verdict for a DAG that never ran to completion.
+
+The pipeline and fan-out builders live here too, next to DAGBuilder: they
+are the linear and the flat graph, they owe the same all-or-nothing property
+for the same reason, and the reason is worth stating once.
 """
 
 from __future__ import annotations
@@ -31,6 +35,13 @@ async def _jobs(db_pool, job_ids):
         list(job_ids),
     )
     return {r["id"]: dict(r) for r in rows}
+
+
+async def _queue_count(db_pool, queue) -> int:
+    count: int = await db_pool.fetchval(
+        "SELECT count(*) FROM jorb WHERE queue = $1", queue
+    )
+    return count
 
 
 class TestFanInGrouping:
@@ -167,6 +178,162 @@ class TestDAGCreationIsAtomic:
             mapping[c],
         )
         assert {r["depends_on"] for r in edges} == {mapping[a], mapping[b]}
+
+
+class TestChainCreationIsAtomic:
+    """create_pipeline / create_pipeline_with_results / create_fan_out owe
+    the property TestDAGCreationIsAtomic pins for DAGBuilder.
+
+    They are the linear and the flat graph builders, and they used to write
+    one job per pool connection: stage 0 committed on its own, immediately
+    claimable, while the stages that depend on it were still being written.
+    A failure after that left a head with no tail — and a fan-out left a
+    run_group whose waiter can never be satisfied, because the members that
+    would have completed it do not exist.
+    """
+
+    async def test_pipeline_failure_midway_leaves_no_jobs(
+        self, db_pool, client, unique_queue
+    ):
+        """The second stage is refused by validation; the first must not
+        survive it.
+
+        No monkeypatching: `on_timeout` is a real enqueue option, and a bad
+        one is refused by build_enqueue_row — after stage 0's INSERT has
+        already run inside the transaction, which is exactly the window the
+        transaction exists to close.
+        """
+        with pytest.raises(ValueError, match="on_timeout"):
+            await client.create_pipeline(
+                [
+                    ("chain.First", {}),
+                    ("chain.Second", {"on_timeout": "explode"}),
+                    ("chain.Third", {}),
+                ],
+                queue=unique_queue,
+            )
+
+        assert await _queue_count(db_pool, unique_queue) == 0
+
+    async def test_pipeline_with_results_failure_midway_leaves_no_jobs(
+        self, db_pool, client, unique_queue, monkeypatch
+    ):
+        """Same property for the result-passing verb, failing the way the DAG
+        test does: the third row builder raises, so two jobs are already
+        written when it happens."""
+        real_build = JobClient.build_enqueue_row
+        calls = {"n": 0}
+
+        def explode(job_class, **options):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise RuntimeError("enqueue exploded")
+            return real_build(job_class, **options)
+
+        monkeypatch.setattr(JobClient, "build_enqueue_row", staticmethod(explode))
+
+        with pytest.raises(RuntimeError, match="exploded"):
+            await client.create_pipeline_with_results(
+                [
+                    ("chain.Fetch", {}, True),
+                    ("chain.Process", {}, True),
+                    ("chain.Store", {}, False),
+                ],
+                queue=unique_queue,
+            )
+
+        assert calls["n"] == 3, "test did not reach the failing stage"
+        assert await _queue_count(db_pool, unique_queue) == 0
+
+    async def test_fan_out_failure_midway_leaves_no_group(
+        self, db_pool, client, unique_queue, monkeypatch
+    ):
+        """A half-written group is worse than none: `waitfor_group` is
+        satisfied by the members that exist, so a waiter on a truncated group
+        runs early rather than never."""
+        real_build = JobClient.build_enqueue_row
+        calls = {"n": 0}
+
+        def explode(job_class, **options):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("fan-out exploded")
+            return real_build(job_class, **options)
+
+        monkeypatch.setattr(JobClient, "build_enqueue_row", staticmethod(explode))
+
+        with pytest.raises(RuntimeError, match="exploded"):
+            await client.create_fan_out(
+                "chain.Item",
+                [{"item": 1}, {"item": 2}, {"item": 3}],
+                queue=unique_queue,
+            )
+
+        assert await _queue_count(db_pool, unique_queue) == 0
+
+    async def test_pipeline_still_links_every_stage_to_the_previous(
+        self, db_pool, client, unique_queue
+    ):
+        """The happy path is unchanged by the transaction: stage 0 queued,
+        every later stage waiting on the one before it."""
+        job_ids = await client.create_pipeline(
+            [("chain.A", {}), ("chain.B", {}), ("chain.C", {})],
+            queue=unique_queue,
+            priority=42,
+        )
+
+        rows = await _jobs(db_pool, job_ids)
+        assert len(job_ids) == 3
+        assert rows[job_ids[0]]["waitfor_job"] is None
+        assert rows[job_ids[0]]["state"] == "queued"
+        assert rows[job_ids[1]]["waitfor_job"] == job_ids[0]
+        assert rows[job_ids[2]]["waitfor_job"] == job_ids[1]
+        assert rows[job_ids[1]]["state"] == "waiting"
+        assert rows[job_ids[2]]["state"] == "waiting"
+
+        priorities = await db_pool.fetch(
+            "SELECT prio FROM jorb WHERE id = ANY($1)", job_ids
+        )
+        assert {r["prio"] for r in priorities} == {42}
+
+    async def test_pipeline_with_results_threads_use_result_from(
+        self, db_pool, client, unique_queue
+    ):
+        """Result passing survives the move into one transaction: each stage
+        reads the previous stage's result exactly when that stage saved it."""
+        job_ids = await client.create_pipeline_with_results(
+            [
+                ("chain.Fetch", {}, True),
+                ("chain.Process", {}, False),
+                ("chain.Store", {}, True),
+            ],
+            queue=unique_queue,
+        )
+
+        admin = {
+            r["id"]: r["admin_data"]
+            for r in await db_pool.fetch(
+                "SELECT id, admin_data FROM jorb WHERE id = ANY($1)", job_ids
+            )
+        }
+        # stage 0 saves and has no upstream; stage 1 reads stage 0's result;
+        # stage 2 has an upstream that did NOT save, so it reads nothing.
+        assert "use_result_from" not in admin[job_ids[0]]
+        assert admin[job_ids[1]]["use_result_from"] == job_ids[0]
+        assert "use_result_from" not in admin[job_ids[2]]
+        assert admin[job_ids[1]]["save_result"] is False
+
+    async def test_fan_out_members_share_one_group(self, db_pool, client, unique_queue):
+        """The happy path still returns (ids, group) with every member in it."""
+        job_ids, run_group = await client.create_fan_out(
+            "chain.Item",
+            [{"item": 1}, {"item": 2}, {"item": 3}],
+            queue=unique_queue,
+        )
+
+        rows = await _jobs(db_pool, job_ids)
+        assert len(job_ids) == 3
+        assert {r["run_group"] for r in rows.values()} == {run_group}
 
 
 class TestWaitForDAG:

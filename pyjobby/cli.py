@@ -835,14 +835,20 @@ def queues_stats(ctx: click.Context, output_json: bool) -> None:
                     print_warning("No stats available")
                     return
 
+                # Every state Total sums gets a column, in `queues show`'s
+                # order. Total counts scheduled/claimed/cancelled too, so
+                # omitting them printed a row whose numbers did not add up.
                 headers = [
                     "Queue",
                     "Paused",
                     "Queued",
+                    "Scheduled",
+                    "Claimed",
                     "Running",
                     "Waiting",
                     "Finished",
                     "Crashed",
+                    "Cancelled",
                     "Total",
                     "Limits",
                 ]
@@ -860,16 +866,19 @@ def queues_stats(ctx: click.Context, output_json: bool) -> None:
                             s["queue"],
                             "yes" if s["paused"] else "no",
                             str(s["queued"]),
+                            str(s["scheduled"]),
+                            str(s["claimed"]),
                             str(s["running"]),
                             str(s["waiting"]),
                             str(s["finished"]),
                             str(s["crashed"]),
+                            str(s["cancelled"]),
                             str(s["total"]),
                             ", ".join(limits) or "-",
                         ]
                     )
 
-                print_table(headers, rows, max_width=120)
+                print_table(headers, rows, max_width=160)
 
                 # Show oldest queued job age if available
                 for s in stats:

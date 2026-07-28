@@ -415,7 +415,7 @@ class TestScheduleManager:
             job_class="test.Job",
             cron_expr="*/5 * * * *",
             queue="test_queue",
-            prio=200,
+            priority=200,
             kwargs={"key": "value"},
         )
 
@@ -444,7 +444,7 @@ class TestScheduleManager:
             cron_expr="0 * * * *",
             description="Test schedule with all options",
             queue="custom_queue",
-            prio=500,
+            priority=500,
             capability="special",
             timezone="America/Los_Angeles",
             enabled=False,

@@ -638,6 +638,106 @@ class TestSyncFacadeParity:
             f"SyncJobClient wrappers dropping async parameters: {offenders}"
         )
 
+    async def test_every_sync_counterpart_keeps_the_names_and_defaults(self):
+        """The test above cannot see a wrapper that RENAMED a parameter.
+
+        A `**kwargs` wrapper waves every keyword through, so nothing is
+        "dropped" — but the name a caller has to write is the wrapper's, not
+        the async method's. SyncJobClient.create_pipeline took ``jobs`` where
+        JobClient.create_pipeline takes ``steps``, so
+        ``client.create_pipeline(steps=[...])`` — the call the documentation
+        promises is identical on both clients — was a TypeError, and no
+        signature test noticed.
+
+        Two rules, one per wrapper shape:
+
+        * a wrapper that ENUMERATES parameters must use the async method's
+          names, in the async method's order, with the async method's
+          defaults — otherwise it is a differently-shaped method wearing the
+          same name;
+        * a wrapper that forwards through ``*args``/``**kwargs`` must still
+          NAME the async method's required parameters, so that forwarding is
+          checked against something rather than being unconditionally
+          exempt.
+        """
+        import inspect
+
+        from pyjobby.client import SyncJobClient
+
+        empty = inspect.Parameter.empty
+        variadic = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+
+        offenders: dict[str, str] = {}
+        for name, member in vars(JobClient).items():
+            if name.startswith("_") or not inspect.iscoroutinefunction(member):
+                continue
+            sync = vars(SyncJobClient).get(name)
+            if sync is None:
+                continue  # covered by the presence test
+
+            async_params = [
+                p
+                for pname, p in inspect.signature(member).parameters.items()
+                if pname != "self"
+            ]
+            async_by_name = {p.name: p for p in async_params}
+            async_order = [p.name for p in async_params]
+            sync_params = [
+                p
+                for pname, p in inspect.signature(sync).parameters.items()
+                if pname != "self"
+            ]
+            enumerated = [p for p in sync_params if p.kind not in variadic]
+
+            complaint = None
+            for p in enumerated:
+                target = async_by_name.get(p.name)
+                if target is None:
+                    complaint = (
+                        f"names {p.name!r}, which JobClient.{name} does not "
+                        f"take (it takes {async_order})"
+                    )
+                    break
+                if p.default != target.default or (
+                    (p.default is empty) is not (target.default is empty)
+                ):
+                    complaint = (
+                        f"{p.name} defaults to {p.default!r}, "
+                        f"JobClient.{name}'s to {target.default!r}"
+                    )
+                    break
+
+            if complaint is None:
+                positions = [
+                    async_order.index(p.name)
+                    for p in enumerated
+                    if p.name in async_order
+                ]
+                if positions != sorted(positions):
+                    complaint = (
+                        f"orders {[p.name for p in enumerated]} differently "
+                        f"from JobClient.{name}'s {async_order}"
+                    )
+
+            if complaint is None:
+                required = [
+                    p.name
+                    for p in async_params
+                    if p.default is empty and p.kind not in variadic
+                ]
+                unnamed = [r for r in required if r not in {p.name for p in enumerated}]
+                if unnamed:
+                    complaint = (
+                        f"forwards required parameter(s) {unnamed} without "
+                        f"naming them, so nothing checks the name a caller "
+                        f"has to write"
+                    )
+
+            if complaint is not None:
+                offenders[name] = complaint
+
+        assert not offenders, f"SyncJobClient signature mismatches: {offenders}"
+
     async def test_from_config_builds_a_working_sync_client(self, db_params, tmp_path):
         """Scripts and cron jobs are exactly where a config file lives, and
         the sync facade is the class built for them."""
@@ -947,6 +1047,83 @@ class TestFromConfig:
                 return client._client.prio_ceiling
 
         assert await asyncio.to_thread(_drive) == 500
+
+    async def test_a_ceiling_of_zero_is_a_ceiling_not_an_absent_value(
+        self, db_params, unique_queue, tmp_path
+    ):
+        """`prio_ceiling = 0` is a fleet that claims ONLY prio-0 work.
+
+        It is also the one value `or` cannot tell from "the file said
+        nothing", and getting that wrong hands the client the 1000 default —
+        so it would accept, silently, exactly the work its workers refuse to
+        claim. Both doors are checked: the ceiling itself is still
+        enqueueable, one above it is not.
+        """
+        config = self.write(tmp_path, db_params, prio_ceiling=0)
+
+        client = await JobClient.from_config(config)
+        try:
+            assert client.prio_ceiling == 0
+
+            with pytest.raises(ValueError) as refused:
+                await client.enqueue(
+                    "tests.test_client_semantics.CountJob",
+                    queue=unique_queue,
+                    priority=1,
+                    n=1,
+                )
+            assert "above the worker priority ceiling (0)" in str(refused.value)
+
+            job_id = await client.enqueue(
+                "tests.test_client_semantics.CountJob",
+                queue=unique_queue,
+                priority=0,
+                n=1,
+            )
+            assert (
+                await client.pool.fetchval(
+                    "SELECT prio FROM jorb WHERE id = $1", job_id
+                )
+            ) == 0
+        finally:
+            await client.close()
+
+    async def test_the_sync_facade_reads_a_zero_ceiling_too(
+        self, db_params, unique_queue, tmp_path
+    ):
+        """SyncJobClient.from_config resolves the ceiling separately from
+        JobClient.from_config, so the zero case is pinned separately too."""
+        from pyjobby.client import SyncJobClient
+
+        config = self.write(tmp_path, db_params, prio_ceiling=0)
+
+        def _drive() -> tuple[int, str, int]:
+            with SyncJobClient.from_config(config) as client:
+                ceiling = client._client.prio_ceiling
+                try:
+                    client.enqueue(
+                        "tests.test_client_semantics.CountJob",
+                        queue=unique_queue,
+                        priority=1,
+                        n=1,
+                    )
+                except ValueError as refused:
+                    message = str(refused)
+                else:
+                    message = "ACCEPTED"
+                accepted = client.enqueue(
+                    "tests.test_client_semantics.CountJob",
+                    queue=unique_queue,
+                    priority=0,
+                    n=1,
+                )
+                return ceiling, message, accepted
+
+        ceiling, message, accepted = await asyncio.to_thread(_drive)
+
+        assert ceiling == 0
+        assert "above the worker priority ceiling (0)" in message
+        assert accepted > 0
 
     async def test_enqueue_against_an_unmigrated_database_says_so(
         self, db_params, unique_queue, tmp_path

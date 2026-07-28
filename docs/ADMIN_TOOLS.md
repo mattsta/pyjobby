@@ -461,10 +461,14 @@ and `queues stats` are the fleet-wide views:
 
 ```console
 $ pj-admin queues stats
-Queue        Paused  Queued  Running  Waiting  Finished  Crashed  Total  Limits
---------------------------------------------------------------------------------------
-maintenance  no      0       0        0        0         0        0      conc=8, rate=
+Queue        Paused  Queued  Scheduled  Claimed  Running  Waiting  Finished  Crashed  Cancelled  Total  Limits
+-----------------------------------------------------------------------------------------------------------------------
+maintenance  no      0       0          0        0        0        0         0        0          0      conc=8, rate=100/60s
 ```
+
+Every state the `Total` sums has a column, so the row adds up: `Queued` is
+work claimable **now** and `Scheduled` is queued-but-deferred, the same split
+`/metrics` and the websocket dashboard report.
 
 `queues clear QUEUE` deletes **queued and waiting** jobs — work that has not
 started — and prompts unless `-f/--force`, naming the states it is about to
@@ -563,10 +567,15 @@ $ pj-admin schedule add nightly-cleanup examples.jobs.example_jobs.BasicJob "0 2
   Queue:    maintenance
 ```
 
-`add` also takes `-p/--priority`, `--capability`, `--timezone`, `--jitter`,
-`--max-concurrent`, `--backpressure`, `--circuit-breaker`, `--description`
-and `--disabled`. The cron expression and timezone are validated at this
-point, not at fire time.
+`add` also takes `-p/--priority`, `--max-prio`, `--capability`,
+`--timezone`, `--jitter`, `--max-concurrent`, `--backpressure`,
+`--circuit-breaker`, `--description` and `--disabled`. `--max-prio N`
+overrides the deployment's worker priority ceiling for this one command,
+exactly as it does for `jobs set-priority`: a schedule's priority is checked
+against the ceiling when the schedule is created, because a schedule that
+fires into an unclaimable priority is worse than one that never existed. The
+cron expression and timezone are validated at this point too, not at fire
+time.
 
 ```console
 $ pj-admin schedule show nightly-cleanup
@@ -607,8 +616,10 @@ Last Failure:          Never
 ```
 
 `schedule history NAME_OR_ID` takes `--result success|failure|skipped`,
-`-l/--limit` and `--json`; `schedule stats` is the fleet view. Prefer
-`disable` to `delete`: it keeps the execution log.
+`-l/--limit` and `--json`; `schedule stats` is the fleet view. `schedule
+delete NAME_OR_ID` prompts unless `-f/--force`, like every other destructive
+verb here. Prefer `disable` to `delete` either way: it keeps the execution
+log.
 
 Everything a schedule *means* — cron syntax, jitter, backpressure, the
 circuit breaker, timezone handling — is in

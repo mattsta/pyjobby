@@ -445,7 +445,8 @@ else:
 ### More methods
 
 The rest of the public surface, one line each. Every async method has a
-synchronous twin on `SyncJobClient` with the same signature.
+synchronous twin on `SyncJobClient` with the same signature, except the two
+marked "async only" below.
 
 **Inspection**
 - `get_job_full(job_id)` — complete row: kwargs, result, error, timestamps.
@@ -465,7 +466,7 @@ synchronous twin on `SyncJobClient` with the same signature.
 - `delete_job(job_id)`, `purge_queue(queue, states=None)` — delete one job, or a queue's jobs by state.
 
 **Advanced enqueue**
-- `enqueue_handle(...)` — enqueue and get a `JobHandle` (`.result()`, `.wait_for_result()`, `.cancel()`, `.event()`).
+- `enqueue_handle(...)` — enqueue and get a `JobHandle` (`.result()`, `.wait_for_result()`, `.cancel()`, `.event()`) (async only; a handle's own methods are coroutines bound to the async client, so `run()` / `wait_for_result()` are the sync shapes of this workflow).
 - `enqueue_in_transaction(conn, ...)` — enqueue on the CALLER's asyncpg connection, inside their transaction (async only; no sync twin).
 - `create_pipeline_with_results(stages, ...)` — a pipeline where each stage receives the previous stage's result.
 
@@ -902,9 +903,11 @@ publish one — as machine events, or into your own table from inside a
 
 ### Synchronously
 
-`SyncJobClient` mirrors JobClient's **whole** async surface, blocking, for
-scripts and cron jobs — every method above exists on it under the same name
-(held complete by a mirror test), plus `SyncJobClient.from_config()` for
+`SyncJobClient` mirrors JobClient's async surface, blocking, for scripts and
+cron jobs — every method above except the two marked "async only"
+(`enqueue_handle`, `enqueue_in_transaction`) exists on it under the same
+name, with the same parameter names and defaults (held complete and
+signature-identical by mirror tests), plus `SyncJobClient.from_config()` for
 the config file a script already has. Machines come back as `SyncMachine`:
 
 ```python

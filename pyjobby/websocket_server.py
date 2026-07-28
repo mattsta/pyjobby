@@ -86,15 +86,41 @@ logger = logging.getLogger(__name__)
 # amplification or memory-growth primitive, not because of a protocol limit.
 # =============================================================================
 
-#: Largest inbound TEXT frame accepted, in characters. Bigger frames are
-#: refused before they are parsed.
+#: Largest inbound TEXT frame accepted. Enforced TWICE, in two units, and
+#: deliberately with the same number:
+#:
+#: * as BYTES, by aiohttp's ``max_msg_size`` on the WebSocketResponse, so an
+#:   oversized frame is refused while it is being FRAMED. Without it aiohttp
+#:   buffers up to its own 4 MiB default before anything here gets a look —
+#:   the memory is already spent by the time the frame is rejected.
+#: * as CHARACTERS, by handle_text_frame, on the decoded string.
+#:
+#: A character is at least one byte, so the byte bound is the stricter of the
+#: two and is what a client actually meets: a 64 Ki-character frame of
+#: multi-byte text is refused by the framing layer even though its character
+#: count is within the limit. That is the conservative direction for a bound
+#: whose whole purpose is to cap memory, and the character check remains as
+#: the guard for any caller that hands handle_text_frame a string directly.
 MAX_MESSAGE_LENGTH = 64 * 1024
+#: How many websockets one server accepts at once. The per-client rate limit
+#: bounds what ONE connection can cost; nothing in it bounds N connections,
+#: and every accepted connection is a task, a pair of buffers and a row in
+#: ``clients``/``subscriptions``. Beyond this the handshake is refused with
+#: 503 — an answer the client can act on — rather than accepted into a
+#: server that is out of memory.
+MAX_CLIENTS = 100
 #: Longest channel name accepted. Channel names become dict keys in
 #: ``WebSocketServer.subscriptions``, so their length is server memory.
 MAX_CHANNEL_NAME_LENGTH = 255
 #: Error replies quote client-supplied text (an unknown action, a channel
 #: name); truncating bounds the reply so a big frame cannot amplify.
 MAX_ERROR_MESSAGE_LENGTH = 200
+#: What an anonymous client is told when a handler raises. Server-side
+#: failures are reported to the LOG with their exception text and to the
+#: client with this: the exception is usually asyncpg's, and asyncpg quotes
+#: the SQL, the relation and the column that failed — a schema readout that
+#: /ws, which has no authentication, must not hand out.
+INTERNAL_ERROR_MESSAGE = "Internal server error — see the server log"
 
 MAX_BIGINT = 2**63 - 1
 MIN_INT32 = -(2**31)
@@ -280,6 +306,7 @@ class WebSocketServer:
         db_params: dict[str, Any],
         max_subscriptions: int = 100,
         max_actions_per_second: int = 10,
+        max_clients: int = MAX_CLIENTS,
         snapshot_interval: float = DEFAULT_SNAPSHOT_INTERVAL,
         snapshot_window_seconds: float = DEFAULT_SNAPSHOT_WINDOW_SECONDS,
         prio_ceiling: int = DEFAULT_PRIO_CEILING,
@@ -287,6 +314,9 @@ class WebSocketServer:
         self.db_params = db_params
         self.max_subscriptions = max_subscriptions
         self.max_actions_per_second = max_actions_per_second
+        # The server-wide connection cap (see MAX_CLIENTS). Per-connection
+        # limits say nothing about how many connections there are.
+        self.max_clients = max_clients
         # The priority ceiling this deployment's workers run with (`pj
         # --max-prio`). `adjust_priority` writes jorb.prio directly, so a
         # dashboard could otherwise push a job above every worker's ceiling
@@ -417,11 +447,38 @@ class WebSocketServer:
 
         return "jobs"
 
-    async def handle_websocket(self, request: web.Request) -> web.WebSocketResponse:
-        """Handle WebSocket connection"""
+    async def handle_websocket(self, request: web.Request) -> web.StreamResponse:
+        """Handle WebSocket connection.
+
+        Returns a 503 instead of a websocket when the server is already at
+        MAX_CLIENTS: refusing at the handshake is the only refusal a client
+        library reports as a failed connect, and a slot is freed the moment
+        an accepted connection's handler reaches its `finally` and drops the
+        client from `self.clients`.
+        """
+        if len(self.clients) >= self.max_clients:
+            logger.warning(
+                f"WebSocket refused: at capacity "
+                f"({len(self.clients)}/{self.max_clients}) — {request.remote}"
+            )
+            self.stats["errors"] += 1
+            return web.Response(
+                status=503,
+                text=f"WebSocket server at capacity ({self.max_clients} clients)",
+            )
+
         ws = web.WebSocketResponse(
             heartbeat=30,  # Send ping every 30 seconds
             timeout=60,  # Close if no pong in 60 seconds
+            # Refuse an oversized frame at the framing layer rather than
+            # buffering aiohttp's 4 MiB default first. Bytes here; see
+            # MAX_MESSAGE_LENGTH for why the same number is right in both
+            # units. The `+ 1` is aiohttp's bound, not ours: it refuses a
+            # frame whose size is `>= max_msg_size`, so passing the limit
+            # itself would reject a frame of exactly MAX_MESSAGE_LENGTH bytes
+            # while the character check one layer up accepts exactly
+            # MAX_MESSAGE_LENGTH characters. Two layers, one limit.
+            max_msg_size=MAX_MESSAGE_LENGTH + 1,
         )
         await ws.prepare(request)
 
@@ -529,11 +586,27 @@ class WebSocketServer:
             await self.send_error(ws, "Invalid JSON")
             return
 
+        # `"a bare string"`, `123`, `[]` and `null` are all valid JSON and
+        # none of them is a message. Refused by SHAPE here, so the dispatcher
+        # can assume a mapping: without this the AttributeError from
+        # `data.get(...)` fell into the handler below, and the client -- who
+        # asked a well-formed question badly -- got "Internal server error"
+        # instead of the one sentence that says what was wrong.
+        if not isinstance(data, dict):
+            await self.send_error(ws, "Message must be a JSON object")
+            return
+
         try:
             await self.handle_message(ws, client, data)
         except Exception as e:
-            logger.error(f"Error handling message: {e}")
-            await self.send_error(ws, f"Error: {str(e)}")
+            # The DETAIL goes to the log, never to the frame. /ws is
+            # unauthenticated, and an unhandled exception here is usually the
+            # driver's: asyncpg quotes the failing SQL, the relation and the
+            # column, which is a free schema readout for anyone who can
+            # connect. The client is told that it failed, which is all it can
+            # act on; the server operator is told why.
+            logger.error(f"Error handling message: {type(e).__name__}: {e}")
+            await self.send_error(ws, INTERNAL_ERROR_MESSAGE)
             self.stats["errors"] += 1
 
     @staticmethod
@@ -778,8 +851,8 @@ class WebSocketServer:
         try:
             state = await self.db_pool.fetchval(WATCH_JOB_SQL, job_id)
         except Exception as e:
-            logger.error(f"Error watching job: {e}")
-            await self.send_error(ws, f"Failed to watch job: {str(e)}")
+            logger.error(f"Error watching job {job_id}: {type(e).__name__}: {e}")
+            await self.send_error(ws, f"Failed to watch job. {INTERNAL_ERROR_MESSAGE}")
             self.stats["errors"] += 1
             return
 
@@ -854,8 +927,8 @@ class WebSocketServer:
                     logger.info(f"Job {job_id} cancel outcome: {result['status']}")
 
         except Exception as e:
-            logger.error(f"Error cancelling job: {e}")
-            await self.send_error(ws, f"Failed to cancel job: {str(e)}")
+            logger.error(f"Error cancelling job {job_id}: {type(e).__name__}: {e}")
+            await self.send_error(ws, f"Failed to cancel job. {INTERNAL_ERROR_MESSAGE}")
             self.stats["errors"] += 1
 
     async def handle_rerun_job(
@@ -902,8 +975,8 @@ class WebSocketServer:
                     )
 
         except Exception as e:
-            logger.error(f"Error rerunning job: {e}")
-            await self.send_error(ws, f"Failed to rerun job: {str(e)}")
+            logger.error(f"Error rerunning job {job_id}: {type(e).__name__}: {e}")
+            await self.send_error(ws, f"Failed to rerun job. {INTERNAL_ERROR_MESSAGE}")
             self.stats["errors"] += 1
 
     async def handle_adjust_priority(
@@ -950,8 +1023,12 @@ class WebSocketServer:
                     )
 
         except Exception as e:
-            logger.error(f"Error adjusting priority: {e}")
-            await self.send_error(ws, f"Failed to adjust priority: {str(e)}")
+            logger.error(
+                f"Error adjusting priority of job {job_id}: {type(e).__name__}: {e}"
+            )
+            await self.send_error(
+                ws, f"Failed to adjust priority. {INTERNAL_ERROR_MESSAGE}"
+            )
             self.stats["errors"] += 1
 
     async def get_queue_controls(self) -> dict[str, dict[str, Any]]:

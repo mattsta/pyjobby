@@ -33,10 +33,13 @@ import pytest_asyncio
 from aiohttp import web
 from aiohttp.test_utils import TestClient
 
+from pyjobby import websocket_server
 from pyjobby.client import DEFAULT_PRIO_CEILING
 from pyjobby.procs import wait_until
 from pyjobby.websocket_server import (
+    INTERNAL_ERROR_MESSAGE,
     MAX_CHANNEL_NAME_LENGTH,
+    MAX_CLIENTS,
     MAX_ERROR_MESSAGE_LENGTH,
     MAX_MESSAGE_LENGTH,
     WebSocketServer,
@@ -292,16 +295,27 @@ class TestRateLimiterUnderAdversarialTraffic:
 
     @pytest.mark.asyncio
     async def test_oversized_frames_are_metered(self, ws_factory):
-        """So is a frame that is refused for its size."""
+        """So is a frame that is refused for its size.
+
+        An oversized frame cannot be sent over the wire any more -- aiohttp's
+        max_msg_size closes the connection first (see
+        TestFrameSizeIsBoundedAtTheFramingLayer) -- so the character bound and
+        its metering are driven the only way anything can still reach them:
+        by handing handle_text_frame the string directly, which is exactly
+        what the guard is retained for.
+        """
         h = await ws_factory(max_actions_per_second=2, pool=False)
         ws = await h.connect()
-        blob = {"action": "x" * (MAX_MESSAGE_LENGTH + 1)}
+        server_ws = h.server_side()
+        client = h.server.clients[server_ws]
+        blob = "x" * (MAX_MESSAGE_LENGTH + 1)
 
         for _ in range(2):
-            reply = await ask(ws, blob)
-            assert reply["data"]["message"].startswith("Message too large")
+            await h.server.handle_text_frame(server_ws, client, blob)
+            assert (await recv(ws))["data"]["message"].startswith("Message too large")
 
-        assert (await ask(ws, blob))["data"]["message"] == "Rate limit exceeded"
+        await h.server.handle_text_frame(server_ws, client, blob)
+        assert (await recv(ws))["data"]["message"] == "Rate limit exceeded"
 
 
 # =============================================================================
@@ -334,12 +348,16 @@ EXACT_FRAME_CASES: tuple[tuple[Any, str], ...] = (
     ("not json at all", "Invalid JSON"),
     ("{not json", "Invalid JSON"),
     ("", "Invalid JSON"),
-    ('"a bare string"', "Error: 'str' object has no attribute 'get'"),
-    ("123", "Error: 'int' object has no attribute 'get'"),
-    ("null", "Error: 'NoneType' object has no attribute 'get'"),
-    ("[]", "Error: 'list' object has no attribute 'get'"),
-    ("[1, 2, 3]", "Error: 'list' object has no attribute 'get'"),
-    ("true", "Error: 'bool' object has no attribute 'get'"),
+    # Valid JSON, but not a message. Refused by shape, and told so: these
+    # used to answer with the AttributeError from `data.get(...)`, which
+    # named a Python type and an attribute to a client that asked a
+    # well-formed question badly.
+    ('"a bare string"', "Message must be a JSON object"),
+    ("123", "Message must be a JSON object"),
+    ("null", "Message must be a JSON object"),
+    ("[]", "Message must be a JSON object"),
+    ("[1, 2, 3]", "Message must be a JSON object"),
+    ("true", "Message must be a JSON object"),
     ({"no_action_here": 1}, "Missing 'action' field"),
     ({"action": None}, "Missing 'action' field"),
     ({"action": ""}, "Missing 'action' field"),
@@ -456,25 +474,17 @@ class TestHostileFrames:
         assert h.server.stats["messages_received"] == 1
 
     @pytest.mark.asyncio
-    async def test_one_megabyte_frame_is_refused_without_amplification(
-        self, ws_factory
-    ):
-        """A frame over MAX_MESSAGE_LENGTH is refused before it is parsed, and
-        no reply ever echoes an unbounded amount of client text: an error is
-        capped at MAX_ERROR_MESSAGE_LENGTH characters, so a big request can
-        never buy a bigger response."""
+    async def test_a_large_reply_is_never_bought_with_a_large_frame(self, ws_factory):
+        """No reply ever echoes an unbounded amount of client text: an error
+        is capped at MAX_ERROR_MESSAGE_LENGTH characters, so a big request can
+        never buy a bigger response.
+
+        The frame here FITS (a frame that does not is handled a layer lower —
+        see TestFrameSizeIsBoundedAtTheFramingLayer); the point is that even a
+        legal frame's echoed content is truncated rather than mirrored."""
         h = await ws_factory(max_actions_per_second=10_000, pool=False)
         ws = await h.connect()
 
-        blob = "A" * (1024 * 1024)
-        reply = await ask(ws, {"action": blob})
-        assert reply["event"] == "error"
-        assert reply["data"]["message"] == (
-            f"Message too large (max {MAX_MESSAGE_LENGTH} characters)"
-        )
-
-        # A frame that fits, but whose echoed action is still large: the reply
-        # is truncated rather than mirrored.
         big_action = "B" * (MAX_MESSAGE_LENGTH // 2)
         reply = await ask(ws, {"action": big_action})
         message = reply["data"]["message"]
@@ -507,10 +517,17 @@ class TestHostileFrames:
         assert reply["event"] == "subscribed"
         assert list(h.server.subscriptions) == [at_limit]
 
-        huge = "D" * (1024 * 1024)
-        reply = await ask(ws, {"action": "subscribe", "channels": [huge]})
-        assert reply["data"]["message"].startswith("Message too large")
-        assert list(h.server.subscriptions) == [at_limit]
+        # A name big enough to push its frame over MAX_MESSAGE_LENGTH cannot
+        # even arrive: aiohttp refuses the frame while framing it and closes
+        # with 1009, rather than handing the server the name to look at.
+        huge = "D" * MAX_MESSAGE_LENGTH
+        await ws.send_json({"action": "subscribe", "channels": [huge]})
+        closing = await asyncio.wait_for(ws.receive(), 5.0)
+        assert closing.type is aiohttp.WSMsgType.CLOSE
+        assert closing.data == aiohttp.WSCloseCode.MESSAGE_TOO_BIG
+        # Whatever the reaping of the closed connection has got to by now,
+        # the name itself was never recorded.
+        assert huge not in h.server.subscriptions
 
     @pytest.mark.asyncio
     async def test_float_job_id_is_rejected_not_truncated(
@@ -551,10 +568,24 @@ class TestHostileFrames:
         )
         assert h.server.stats["errors"] == 0
 
-        # A frame that raises inside handle_message does count.
-        await ask(ws, "123")
+        # Nor is a well-formed-JSON non-message: the shape check answers it,
+        # so nothing raises and nothing is counted against the server.
+        assert (await ask(ws, "123"))["data"]["message"] == (
+            "Message must be a JSON object"
+        )
+        assert h.server.stats["errors"] == 0
+
+        # A frame that raises inside handle_message DOES count -- and no
+        # hostile frame can still produce one, so it has to be arranged.
+        async def explode(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("handler blew up")
+
+        h.server.handle_get_stats = explode  # type: ignore[method-assign]
+        assert (await ask(ws, {"action": "get_stats"}))["data"]["message"] == (
+            INTERNAL_ERROR_MESSAGE
+        )
         assert h.server.stats["errors"] == 1
-        assert h.server.stats["messages_received"] == 3
+        assert h.server.stats["messages_received"] == 4
 
 
 # =============================================================================
@@ -1278,3 +1309,172 @@ class TestNotificationTaskBounding:
             what="notification task set drains",
         )
         assert server.stats["events_received"] == 1
+
+
+# =============================================================================
+# 6. Server-wide resource bounds
+#
+# The rate limiter above bounds what ONE connection can cost. These bound what
+# the SERVER can be made to hold: the size of a single frame before anything
+# looks at it, and the number of connections at all.
+# =============================================================================
+
+
+def _frame_of_exactly(size: int) -> str:
+    """A one-key JSON object whose serialization is exactly `size` bytes."""
+    frame = json.dumps({"action": "A" * size})
+    return json.dumps({"action": "A" * (2 * size - len(frame))})
+
+
+class TestFrameSizeIsBoundedAtTheFramingLayer:
+    """MAX_MESSAGE_LENGTH is enforced by aiohttp's ``max_msg_size``, not only
+    by the application check after the frame has been read.
+
+    Without it aiohttp buffers up to its own 4 MiB default per connection and
+    only then hands the frame over to be rejected: the memory an unauthenticated
+    client can make the server hold is spent before the bound is consulted.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_oversized_frame_never_reaches_the_application(self, ws_factory):
+        h = await ws_factory(pool=False)
+        ws = await h.connect()
+
+        await ws.send_str(_frame_of_exactly(MAX_MESSAGE_LENGTH + 1))
+        closing = await asyncio.wait_for(ws.receive(), 5.0)
+
+        assert closing.type is aiohttp.WSMsgType.CLOSE
+        assert closing.data == aiohttp.WSCloseCode.MESSAGE_TOO_BIG
+        # Never parsed, never metered, never counted: the frame was refused
+        # while it was being framed.
+        assert h.server.stats["messages_received"] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_frame_at_exactly_the_limit_is_accepted(self, ws_factory):
+        """The bound is not off by one: MAX_MESSAGE_LENGTH bytes is legal, and
+        the frame is answered normally."""
+        h = await ws_factory(pool=False)
+        ws = await h.connect()
+
+        frame = _frame_of_exactly(MAX_MESSAGE_LENGTH)
+        assert len(frame.encode()) == MAX_MESSAGE_LENGTH
+        await ws.send_str(frame)
+
+        reply = await recv(ws)
+        assert reply["event"] == "error"
+        assert reply["data"]["message"].startswith("Unknown action: AAA")
+        assert not ws.closed
+        assert h.server.stats["messages_received"] == 1
+
+
+class TestConnectionCountIsBounded:
+    """MAX_CLIENTS: the per-client rate limit says nothing about N clients.
+
+    Every accepted connection is a task, a read buffer, a write buffer and a
+    row in ``clients``; nothing above this line stops an anonymous caller
+    from opening as many as the process has file descriptors for.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_connection_beyond_the_cap_is_refused_at_the_handshake(
+        self, ws_factory
+    ):
+        h = await ws_factory(max_clients=2, pool=False)
+        await h.connect()
+        await h.connect()
+
+        with pytest.raises(aiohttp.WSServerHandshakeError) as refused:
+            await h.client.ws_connect("/ws")
+        assert refused.value.status == 503
+
+        # The two accepted connections are untouched by the refusal.
+        assert h.server.stats["current_connections"] == 2
+        assert (await ask(h.sockets[0], PING))["event"] == "subscribed"
+
+    @pytest.mark.asyncio
+    async def test_a_disconnect_releases_its_slot(self, ws_factory):
+        """The cap counts LIVE connections, so a client that leaves makes room
+        for the next one -- otherwise the server refuses everyone forever after
+        its first MAX_CLIENTS visitors."""
+        h = await ws_factory(max_clients=1, pool=False)
+        first = await h.connect()
+
+        with pytest.raises(aiohttp.WSServerHandshakeError):
+            await h.client.ws_connect("/ws")
+
+        await first.close()
+        await wait_until(
+            lambda: asyncio.sleep(0, result=not h.server.clients),
+            timeout=5.0,
+            what="the disconnected client is reaped",
+        )
+
+        second = await h.connect()
+        assert (await ask(second, PING))["event"] == "subscribed"
+
+    @pytest.mark.asyncio
+    async def test_the_default_cap_is_the_documented_one(self, ws_factory):
+        h = await ws_factory(pool=False)
+        assert h.server.max_clients == MAX_CLIENTS == 100
+
+
+class TestInternalErrorsAreOpaqueToClients:
+    """/ws has no authentication, so a failing handler must not read the
+    schema out to whoever asked.
+
+    asyncpg's messages quote the SQL, the relation and the column that failed.
+    Those go to the LOG; the client is told that it failed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_failing_query_does_not_echo_the_database_error(
+        self, ws_factory, db_pool, unique_queue, monkeypatch, caplog
+    ):
+        h = await ws_factory()
+        ws = await h.connect()
+        job_id = await make_job(db_pool, unique_queue, "queued")
+
+        # A real asyncpg failure, from a real query, naming a real column.
+        monkeypatch.setattr(
+            websocket_server,
+            "WATCH_JOB_SQL",
+            "SELECT jorb.no_such_column FROM jorb WHERE id = $1",
+        )
+
+        with caplog.at_level("ERROR", logger="pyjobby.websocket_server"):
+            reply = await ask(ws, {"action": "watch_job", "job_id": job_id})
+
+        assert reply["event"] == "error"
+        assert reply["data"]["message"] == (
+            f"Failed to watch job. {INTERNAL_ERROR_MESSAGE}"
+        )
+        assert "no_such_column" not in reply["data"]["message"]
+        # The operator still gets the detail, on the server side.
+        assert "no_such_column" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_an_unhandled_handler_error_does_not_echo_its_exception(
+        self, ws_factory, caplog
+    ):
+        """The catch-all in handle_text_frame used to send `Error: {e}`, which
+        is whatever the deepest frame happened to say."""
+        h = await ws_factory(pool=False)
+        ws = await h.connect()
+
+        async def explode(*args: Any, **kwargs: Any) -> None:
+            raise asyncpg.UndefinedColumnError(
+                "column jorb.secret_column does not exist"
+            )
+
+        monkeypatch_target = h.server
+        monkeypatch_target.handle_get_stats = explode  # type: ignore[method-assign]
+
+        with caplog.at_level("ERROR", logger="pyjobby.websocket_server"):
+            reply = await ask(ws, {"action": "get_stats"})
+
+        assert reply["event"] == "error"
+        assert reply["data"]["message"] == INTERNAL_ERROR_MESSAGE
+        assert "secret_column" not in reply["data"]["message"]
+        assert "secret_column" in caplog.text
+        # The connection survives its own internal error.
+        assert (await ask(ws, PING))["event"] == "subscribed"

@@ -118,6 +118,28 @@ ENQUEUE_SQL = """
     RETURNING id
 """
 
+# The multi-row form of ENQUEUE_SQL: the same columns, filled from one array
+# per column, so a batch is ONE statement — and therefore all-or-nothing
+# without a transaction of its own. Every multi-row writer (enqueue_batch,
+# create_fan_out) goes through this, so "a batch job loses nothing by being
+# batched" stays true of the SQL as well as of the row construction.
+ENQUEUE_BATCH_SQL = """
+    INSERT INTO jorb (
+        job_class, kwargs, queue, prio, run_after,
+        capability, uid, run_group,
+        waitfor_job, waitfor_group,
+        deadline_key, admin_data, tags, state, schedule_id
+    )
+    SELECT * FROM UNNEST(
+        $1::text[], $2::jsonb[], $3::text[], $4::int[],
+        $5::timestamptz[], $6::text[], $7::bigint[],
+        $8::bigint[], $9::bigint[], $10::bigint[],
+        $11::text[], $12::jsonb[], $13::jsonb[],
+        $14::jorbstate[], $15::bigint[]
+    )
+    RETURNING id
+"""
+
 # What a tag value may be. Tags exist to be FILTERED on, and filtering goes
 # through `tags @> '{"key": value}'` against a GIN index, so a value has to be
 # something a caller can write down in a query -- and, one layer out, in a
@@ -904,18 +926,23 @@ class JobClient:
                     **kwargs,
                 )
             except asyncpg.UndefinedTableError as e:
-                # The first thing an application does against a database
-                # nobody migrated is enqueue, and asyncpg answers `relation
-                # "jorb" does not exist` from inside the driver: true, and
-                # useless -- it names no database and no fix. Say both, and
-                # chain the original so the traceback keeps the SQL detail.
-                from . import migrations
-                from .configloader import describe_db_target
+                raise self._unmigrated_database_error() from e
 
-                raise RuntimeError(
-                    f"Cannot enqueue into {describe_db_target(self._db_params)}: "
-                    f"{migrations.SCHEMA_REMEDY}"
-                ) from e
+    def _unmigrated_database_error(self) -> RuntimeError:
+        """Turn asyncpg's `relation "jorb" does not exist` into an answer.
+
+        The first thing an application does against a database nobody
+        migrated is enqueue, and the driver's message is true and useless --
+        it names no database and no fix. Say both; the caller chains the
+        original so the traceback keeps the SQL detail.
+        """
+        from . import migrations
+        from .configloader import describe_db_target
+
+        return RuntimeError(
+            f"Cannot enqueue into {describe_db_target(self._db_params)}: "
+            f"{migrations.SCHEMA_REMEDY}"
+        )
 
     async def enqueue_handle(self, job_class: str, **options: Any) -> JobHandle:
         """Enqueue a job (same keyword arguments as enqueue()) and return a
@@ -1246,9 +1273,22 @@ class JobClient:
         if not jobs:
             return []
 
-        # These three are supplied by enqueue_batch itself — job_class and
-        # kwargs from each tuple, prio_ceiling from the call. Naming any of
-        # them again in the shared options or a per-job dict would reach
+        rows = self._build_batch_rows(jobs, prio_ceiling, **options)
+        async with self.pool.acquire() as conn:
+            return await self._insert_batch_rows(conn, rows)
+
+    def _build_batch_rows(
+        self, jobs: list[tuple[Any, ...]], prio_ceiling: int | None, **options: Any
+    ) -> list[list[Any]]:
+        """Validate a batch and build one ENQUEUE_BATCH_SQL row per job.
+
+        Split out from enqueue_batch so every multi-row writer (the batch
+        itself, create_fan_out) validates and constructs identically and
+        only differs in the connection the INSERT runs on.
+        """
+        # These three are supplied by the batch builder itself — job_class
+        # and kwargs from each tuple, prio_ceiling from the call. Naming any
+        # of them again in the shared options or a per-job dict would reach
         # build_enqueue_row as a duplicate argument and raise a bare
         # "multiple values for keyword argument" TypeError from deep in the
         # call; caught here it becomes a message that says which key and where.
@@ -1282,30 +1322,17 @@ class JobClient:
                     **{**options, **per_job},
                 )
             )
+        return rows
 
+    @staticmethod
+    async def _insert_batch_rows(
+        conn: asyncpg.Connection, rows: list[list[Any]]
+    ) -> list[int]:
+        """Write pre-built rows with ENQUEUE_BATCH_SQL on the given
+        connection, returning the ids in order."""
         columns = list(zip(*rows, strict=True))
-        async with self.pool.acquire() as conn:
-            job_ids = await conn.fetch(
-                """
-                INSERT INTO jorb (
-                    job_class, kwargs, queue, prio, run_after,
-                    capability, uid, run_group,
-                    waitfor_job, waitfor_group,
-                    deadline_key, admin_data, tags, state, schedule_id
-                )
-                SELECT * FROM UNNEST(
-                    $1::text[], $2::jsonb[], $3::text[], $4::int[],
-                    $5::timestamptz[], $6::text[], $7::bigint[],
-                    $8::bigint[], $9::bigint[], $10::bigint[],
-                    $11::text[], $12::jsonb[], $13::jsonb[],
-                    $14::jorbstate[], $15::bigint[]
-                )
-                RETURNING id
-            """,
-                *columns,
-            )
-
-        return [row["id"] for row in job_ids]
+        inserted = await conn.fetch(ENQUEUE_BATCH_SQL, *columns)
+        return [row["id"] for row in inserted]
 
     # =========================================================================
     # Job Inspection & Management
@@ -2640,36 +2667,63 @@ class JobClient:
         into jobs that never asked for it would be a TypeError in their
         task() -- while create_pipeline_with_results threads results through.
         Different verbs, one chain construction.
+
+        The whole chain is written in ONE transaction, for the reason
+        DAGBuilder.execute gives at length: stage 0 is immediately runnable
+        the instant it commits, and the wake-up of a waiting stage is
+        performed by the worker that FINISHES its predecessor -- so a stage 0
+        that committed, ran and finished while stage 1 was still being
+        written would leave stage 1 waiting on a job nobody will report again
+        (until `monitor.sweep_stranded_waiters` notices). A failure partway
+        down the chain must leave no jobs at all, not a committed head whose
+        tail does not exist.
         """
+        if not stages:
+            return []
+
         job_ids: list[int] = []
         previous_job: int | None = None
         previous_saved = False
 
-        for job_class, kwargs, save_result in stages:
-            # The result options are supplied ONLY by the verb that owns them.
-            # create_pipeline never named them, so a stage whose kwargs carry
-            # `save_result` passes it through to enqueue as it always did;
-            # naming them unconditionally here turned that into a "multiple
-            # values for keyword argument" TypeError.
-            result_options: dict[str, Any] = {}
-            if pass_results:
-                result_options["save_result"] = save_result
-                result_options["use_result_from"] = (
-                    previous_job if previous_saved else None
-                )
+        async with self.pool.acquire() as conn, conn.transaction():
+            try:
+                for job_class, kwargs, save_result in stages:
+                    # The result options are supplied ONLY by the verb that
+                    # owns them. create_pipeline never named them, so a stage
+                    # whose kwargs carry `save_result` passes it through to
+                    # the enqueue path as it always did; naming them
+                    # unconditionally here turned that into a "multiple values
+                    # for keyword argument" TypeError.
+                    result_options: dict[str, Any] = {}
+                    if pass_results:
+                        result_options["save_result"] = save_result
+                        result_options["use_result_from"] = (
+                            previous_job if previous_saved else None
+                        )
 
-            job_id = await self.enqueue(
-                job_class,
-                **kwargs,
-                queue=queue,
-                priority=priority,
-                waitfor_job=previous_job,
-                **result_options,
-                **common_options,
-            )
-            job_ids.append(job_id)
-            previous_job = job_id
-            previous_saved = save_result
+                    # enqueue_in_transaction is static and so has no client to
+                    # read the fleet's ceiling from; pass ours, and let an
+                    # explicit common_options ceiling still win.
+                    options: dict[str, Any] = {
+                        "queue": queue,
+                        "priority": priority,
+                        "prio_ceiling": self.prio_ceiling,
+                        **result_options,
+                        **common_options,
+                    }
+
+                    job_id = await self.enqueue_in_transaction(
+                        conn,
+                        job_class,
+                        **kwargs,
+                        waitfor_job=previous_job,
+                        **options,
+                    )
+                    job_ids.append(job_id)
+                    previous_job = job_id
+                    previous_saved = save_result
+            except asyncpg.UndefinedTableError as e:
+                raise self._unmigrated_database_error() from e
 
         return job_ids
 
@@ -2709,15 +2763,28 @@ class JobClient:
                 waitfor_group=group_id
             )
         """
-        if run_group is None:
-            # Auto-generate group ID
-            async with self.pool.acquire() as conn:
+        # A group is only meaningful whole: a waiter on a half-written group
+        # is satisfied by the members that exist and never sees the rest, so
+        # the group id and every member are written on ONE connection in ONE
+        # transaction. The members are a single ENQUEUE_BATCH_SQL statement
+        # (all-or-nothing by itself); the transaction is what also ties the
+        # id allocation to them.
+        jobs: list[tuple[Any, ...]] = [(job_class, kwargs) for kwargs in items]
+        async with self.pool.acquire() as conn, conn.transaction():
+            if run_group is None:
                 run_group = await conn.fetchval("SELECT nextval('jorb_id_seq')")
 
-        jobs = [(job_class, kwargs) for kwargs in items]
-        job_ids = await self.enqueue_batch(
-            jobs, queue=queue, priority=priority, run_group=run_group
-        )
+            if not jobs:
+                return [], run_group
+
+            rows = self._build_batch_rows(
+                jobs,
+                None,
+                queue=queue,
+                priority=priority,
+                run_group=run_group,
+            )
+            job_ids = await self._insert_batch_rows(conn, rows)
 
         return job_ids, run_group
 
@@ -3205,19 +3272,47 @@ class SyncJobClient:
         return updated
 
     def create_pipeline(
-        self, jobs: list[tuple[str, dict[str, Any]]], **options: Any
+        self,
+        steps: list[tuple[str, dict[str, Any]]],
+        queue: str = "default",
+        priority: int = 100,
     ) -> list[int]:
         """Synchronous JobClient.create_pipeline()."""
-        ids: list[int] = self._run(self._client.create_pipeline(jobs, **options))
+        ids: list[int] = self._run(
+            self._client.create_pipeline(steps, queue=queue, priority=priority)
+        )
         return ids
 
-    def create_fan_out(self, *args: Any, **options: Any) -> Any:
+    def create_fan_out(
+        self,
+        job_class: str,
+        items: list[dict[str, Any]],
+        queue: str = "default",
+        priority: int = 100,
+        run_group: int | None = None,
+    ) -> tuple[list[int], int]:
         """Synchronous JobClient.create_fan_out()."""
-        return self._run(self._client.create_fan_out(*args, **options))
+        fanned: tuple[list[int], int] = self._run(
+            self._client.create_fan_out(
+                job_class, items, queue=queue, priority=priority, run_group=run_group
+            )
+        )
+        return fanned
 
-    def create_pipeline_with_results(self, *args: Any, **options: Any) -> Any:
+    def create_pipeline_with_results(
+        self,
+        stages: list[tuple[str, dict, bool]],
+        queue: str = "default",
+        priority: int = 100,
+        **common_options: Any,
+    ) -> list[int]:
         """Synchronous JobClient.create_pipeline_with_results()."""
-        return self._run(self._client.create_pipeline_with_results(*args, **options))
+        ids: list[int] = self._run(
+            self._client.create_pipeline_with_results(
+                stages, queue=queue, priority=priority, **common_options
+            )
+        )
+        return ids
 
     def health_check(self) -> bool:
         """Synchronous JobClient.health_check()."""

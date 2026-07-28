@@ -239,7 +239,13 @@ class TestScheduleManagerIntegration:
 
     @pytest.mark.asyncio
     async def test_create_schedule(self, db_pool):
-        """Test schedule creation - covers lines 246-320."""
+        """Test schedule creation - covers lines 246-320.
+
+        ``priority=`` is asserted against the stored row, not merely passed:
+        the manager used to read ``kwargs.get("prio")``, so every caller
+        speaking the API's own vocabulary got the 100 default with no error
+        and no way to notice.
+        """
         async with db_pool.acquire() as conn:
             manager = ScheduleManager(conn)
             try:
@@ -254,6 +260,12 @@ class TestScheduleManagerIntegration:
                 assert schedule_id is not None
             except ImportError:
                 pytest.skip("croniter not installed")
+
+            row = await conn.fetchrow(
+                "SELECT queue, prio FROM jorb_schedule WHERE id = $1", schedule_id
+            )
+            assert row["queue"] == "test_queue"
+            assert row["prio"] == 50
 
     @pytest.mark.asyncio
     async def test_set_next_run(self, db_pool):
