@@ -575,7 +575,7 @@ class TestDeadlockPrevention:
                     epoch = claimed["run_epoch"]
 
                     # Run
-                    await conn.execute(STMTS["run"], job_id, epoch)
+                    await conn.execute(STMTS["run"], job_id, epoch, None)
 
                     # Small processing delay
                     await asyncio.sleep(0.001)
@@ -634,7 +634,7 @@ class TestStressScenarios:
                         break
 
                     epoch = claimed["run_epoch"]
-                    await conn.execute(STMTS["run"], claimed["id"], epoch)
+                    await conn.execute(STMTS["run"], claimed["id"], epoch, None)
                     await asyncio.sleep(0.0001)  # Tiny processing time
                     await conn.fetchrow(
                         STMTS["finished"], claimed["id"], {"worker": worker_id}, epoch
@@ -683,7 +683,7 @@ class TestConcurrencyIntegration:
         # Process parent
         claimed = await claim(conn, unique_queue)
         epoch = claimed["run_epoch"]
-        await conn.execute(STMTS["run"], claimed["id"], epoch)
+        await conn.execute(STMTS["run"], claimed["id"], epoch, None)
         await conn.fetchrow(STMTS["finished"], claimed["id"], {}, epoch)
 
         # Trigger dependency resolution
@@ -700,7 +700,7 @@ class TestConcurrencyIntegration:
                 )
                 if claimed:
                     epoch = claimed["run_epoch"]
-                    await conn.execute(STMTS["run"], claimed["id"], epoch)
+                    await conn.execute(STMTS["run"], claimed["id"], epoch, None)
                     await conn.fetchrow(STMTS["finished"], claimed["id"], {}, epoch)
                     return claimed["id"]
                 return None

@@ -534,7 +534,7 @@ async def test_unregistered_claim_is_reclaimed_only_after_the_grace_period(
 #: Statements a running attempt uses to change its job's row. Every one of
 #: them carries ``AND run_epoch = $n``; this list is what makes that claim
 #: testable rather than aspirational.
-EPOCH_FENCED = ("run", "set-timeout", "finished", "retry", "crashed", "cancelled")
+EPOCH_FENCED = ("run", "finished", "retry", "crashed", "cancelled")
 
 STALE_WRITE_CASES = (*EPOCH_FENCED, "record-step", "set-event", "send", "recv")
 
@@ -542,7 +542,12 @@ STALE_WRITE_CASES = (*EPOCH_FENCED, "record-step", "set-event", "send", "recv")
 async def apply_fenced_statement(pool, name: str, job_id: int, epoch: int) -> int:
     """Run one epoch-fenced statement; return how many rows it wrote."""
     if name == "run":
-        rows = await pool.fetch(STMTS[name], job_id, epoch)
+        # the deadline rides in the same statement (there is no separate
+        # set-timeout write any more), so the stale case also proves a
+        # zombie cannot move a deadline
+        rows = await pool.fetch(
+            STMTS[name], job_id, epoch, datetime.timedelta(seconds=60)
+        )
         return len(rows)
     if name == "finished":
         rows = await pool.fetch(STMTS[name], job_id, {"wrote": name}, epoch)
@@ -565,11 +570,6 @@ async def apply_fenced_statement(pool, name: str, job_id: int, epoch: int) -> in
     if name == "cancelled":
         rows = await pool.fetch(STMTS[name], job_id, epoch)
         return len(rows)
-    if name == "set-timeout":
-        status = await pool.execute(
-            STMTS[name], job_id, datetime.timedelta(seconds=60), epoch
-        )
-        return int(status.split()[-1])
     if name == "record-step":
         rows = await pool.fetch(
             STMTS[name], job_id, 1, "stale-step", {"v": 1}, None, epoch, db.utcnow()
@@ -809,8 +809,8 @@ async def test_stale_reschedule_cannot_requeue_the_live_attempt(db_pool, unique_
     not apply.
     """
     job_id, stale, current = await superseded_job(db_pool, unique_queue)
-    started = await db_pool.fetch(STMTS["run"], job_id, current)
-    assert [r["state"] for r in started] == ["running"]
+    started = await db_pool.fetch(STMTS["run"], job_id, current, None)
+    assert [r["id"] for r in started] == [job_id]
 
     # the zombie from the superseded attempt tries to reschedule itself
     applied = await db_pool.fetch(
@@ -832,13 +832,13 @@ async def test_live_completion_survives_a_stale_reschedule(db_pool, unique_queue
     no-op, so the live attempt still finishes normally.
     """
     job_id, stale, current = await superseded_job(db_pool, unique_queue)
-    await db_pool.fetch(STMTS["run"], job_id, current)
+    await db_pool.fetch(STMTS["run"], job_id, current, None)
     await db_pool.fetch(
         STMTS["reschedule"], job_id, datetime.timedelta(seconds=60), stale
     )
 
     completion = await db_pool.fetch(STMTS["finished"], job_id, {"real": True}, current)
-    assert [r["state"] for r in completion] == ["finished"]
+    assert [r["id"] for r in completion] == [job_id]
 
     row = await db_pool.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
     assert row["state"] == "finished"
@@ -848,7 +848,7 @@ async def test_live_completion_survives_a_stale_reschedule(db_pool, unique_queue
 async def test_live_attempt_can_still_reschedule_itself(db_pool, unique_queue):
     """The fence blocks stale attempts only -- the current one still works."""
     job_id, _stale, current = await superseded_job(db_pool, unique_queue)
-    await db_pool.fetch(STMTS["run"], job_id, current)
+    await db_pool.fetch(STMTS["run"], job_id, current, None)
 
     applied = await db_pool.fetch(
         STMTS["reschedule"], job_id, datetime.timedelta(seconds=60), current
@@ -987,8 +987,8 @@ async def test_dead_lettering_fences_the_execution_it_abandons(db_pool, unique_q
     job_id = await enqueue(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {"x": 1})
     claimed = await claim_once(db_pool, unique_queue)
     epoch = claimed["run_epoch"]
-    started = await db_pool.fetch(STMTS["run"], job_id, epoch)
-    assert [r["state"] for r in started] == ["running"]
+    started = await db_pool.fetch(STMTS["run"], job_id, epoch, None)
+    assert [r["id"] for r in started] == [job_id]
 
     await handle_timed_out_job(
         db_pool, job_id, "tests.dxe_jobs.OkJob", {"on_timeout": "fail"}, 0

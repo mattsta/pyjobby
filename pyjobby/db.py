@@ -56,7 +56,9 @@ def utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC)
 
 
-def build_requeue_sql(allowed_states: tuple[str, ...] = ("crashed",)) -> str:
+def build_requeue_sql(
+    allowed_states: tuple[str, ...] = ("crashed",), *, many: bool = False
+) -> str:
     """SQL that puts a terminal/in-flight job back in the queue.
 
     Jobs keep ONE row for life: a retry (automatic or operator-driven)
@@ -76,6 +78,7 @@ def build_requeue_sql(allowed_states: tuple[str, ...] = ("crashed",)) -> str:
     Parameters: $1 job_id, $2 delay (interval), $3 reset_errors (bool).
     """
     states = ", ".join(f"'{s}'" for s in allowed_states)
+    target = "id = ANY($1::bigint[])" if many else "id = $1::bigint"
     return f"""UPDATE jorb
             SET state = 'queued',
                 run_epoch = run_epoch + 1,
@@ -88,7 +91,7 @@ def build_requeue_sql(allowed_states: tuple[str, ...] = ("crashed",)) -> str:
                 timeout_at = NULL,
                 cancel_requested = FALSE,
                 updated = now()
-            WHERE id = $1::bigint
+            WHERE {target}
               AND state IN ({states})
             RETURNING id"""
 
@@ -124,6 +127,31 @@ async def retry_job(
         reset_errors=reset_errors,
         allowed_states=RETRYABLE_STATES,
     )
+
+
+async def retry_jobs(
+    conn: asyncpg.Connection | asyncpg.Pool,
+    job_ids: list[int],
+    *,
+    delay: datetime.timedelta | None = None,
+    reset_errors: bool = True,
+) -> list[int]:
+    """retry_job() over a list, as ONE statement.
+
+    Same guard, same semantics, same bumped fence — the only difference is
+    `id = ANY($1)` instead of a round trip per id, which is what makes a
+    thousand-job DLQ retry one statement instead of a thousand. Returns the
+    ids actually requeued (jobs keep their id across retries), omitting any
+    that were not in a retryable state.
+    """
+    if not job_ids:
+        return []
+    if delay is None:
+        delay = datetime.timedelta(0)
+    rows = await conn.fetch(
+        build_requeue_sql(RETRYABLE_STATES, many=True), job_ids, delay, reset_errors
+    )
+    return [r["id"] for r in rows]
 
 
 async def rerun_job(
@@ -180,6 +208,9 @@ CANCEL_SQL = """UPDATE jorb
           AND state IN ('queued', 'waiting', 'claimed', 'running')
         RETURNING state, cancel_requested"""
 
+#: cancel over a list, one statement — identical CASE logic to CANCEL_SQL.
+CANCEL_MANY_SQL = CANCEL_SQL.replace("WHERE id = $1", "WHERE id = ANY($1::bigint[])")
+
 
 async def cancel_job(
     conn: asyncpg.Connection | asyncpg.Pool, job_id: int
@@ -199,6 +230,21 @@ async def cancel_job(
     if row["state"] == "cancelled":
         return "cancelled"
     return "cancel_requested"
+
+
+async def cancel_jobs(
+    conn: asyncpg.Connection | asyncpg.Pool, job_ids: list[int]
+) -> int:
+    """cancel_job() over a list, as ONE statement.
+
+    Returns how many jobs the cancel reached (cancelled outright or
+    cancel-requested); ids not in a cancellable state are simply not
+    counted, matching the single verb returning None for them.
+    """
+    if not job_ids:
+        return 0
+    rows = await conn.fetch(CANCEL_MANY_SQL, job_ids)
+    return len(rows)
 
 
 async def connect(*args: Any, **kwargs: Any) -> asyncpg.Connection:

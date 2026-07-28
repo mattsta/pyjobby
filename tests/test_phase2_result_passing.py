@@ -167,11 +167,14 @@ class TestResultPassing:
         assert downstream["result"] == {"upstream": {"doubled": 42}}
 
     @pytest.mark.asyncio
-    async def test_no_injection_when_upstream_unfinished(
+    async def test_an_unfinished_upstream_is_a_failure_not_a_silent_none(
         self, live_worker, unique_queue, db_pool
     ):
-        """No upstream_result is injected if the referenced job is not
-        finished (the task just sees its plain kwargs)."""
+        """Running without the declared input would produce a result computed
+        WITHOUT it — the exact wrong answer the missing-upstream refusal
+        exists to prevent, so not-yet must not be quieter than never. The
+        reader takes the ordinary retry path (so it retries with backoff
+        until the upstream finishes) rather than finishing with None."""
         await live_worker()
 
         # an upstream that never runs (parked on an unrelated queue)
@@ -188,11 +191,15 @@ class TestResultPassing:
             "tests.test_phase2_result_passing.EchoUpstreamJob",
             {},
             unique_queue,
-            {"use_result_from": upstream_id},
+            {"use_result_from": upstream_id, "max_retries": 1},
         )
 
-        downstream = await wait_for_job_state(db_pool, downstream_id, ("finished",))
-        assert downstream["result"] == {"upstream": None}
+        downstream = await wait_for_job_state(
+            db_pool, downstream_id, ("crashed",), timeout=20
+        )
+        assert "not finished" in downstream["error_message"]
+        assert f"waitfor_job={upstream_id}" in downstream["error_message"]
+        assert downstream["result"] is None
 
     @pytest.mark.asyncio
     async def test_result_passing_in_chain(self, db_connection):

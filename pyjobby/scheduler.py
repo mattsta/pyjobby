@@ -48,6 +48,22 @@ CONCURRENCY_COUNT_SQL = """
        AND state IN ('queued', 'claimed', 'running', 'waiting')
 """
 
+#: The backpressure depth count, split into one arm per partial index.
+#: A single predicate spanning queued AND claimed/running matches neither
+#: ``jorb_claim_idx`` (partial on queued) nor ``jorb_inflight_idx`` (partial
+#: on claimed/running) and collapses into a sequential scan — the identical
+#: defect diagnosed and fixed at CONCURRENCY_COUNT_SQL above, in the
+#: monitor's terminal-states predicate, and in the websocket snapshot. The
+#: queued arm walks the queue's own backlog (the number being measured);
+#: the in-flight arm walks fleet-wide in-flight work and discards other
+#: queues', bounded by workers, never by the table.
+BACKPRESSURE_COUNT_SQL = """
+    SELECT (SELECT count(*) FROM jorb
+             WHERE queue = $1 AND state = 'queued')
+         + (SELECT count(*) FROM jorb
+             WHERE state IN ('claimed', 'running') AND queue = $1)
+"""
+
 
 @dataclass
 class ScheduleExecutionResult:
@@ -125,15 +141,9 @@ class ScheduleSafetyManager:
         if threshold is None:
             return True, 0
 
-        # Count jobs in queue that are not finished
-        depth = await self.conn.fetchval(
-            """
-            SELECT COUNT(*) FROM jorb
-            WHERE queue = $1
-              AND state IN ('queued', 'claimed', 'running')
-        """,
-            queue,
-        )
+        # Count jobs in queue that are not finished (see the constant for
+        # why this is two index-backed arms rather than one predicate)
+        depth = await self.conn.fetchval(BACKPRESSURE_COUNT_SQL, queue)
 
         is_safe = depth < threshold
 

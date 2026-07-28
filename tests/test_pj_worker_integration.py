@@ -325,14 +325,15 @@ class TestJobTimeoutHandling:
             )
             claimed = await claim(conn, unique_queue)
 
-            # Arm the (epoch-fenced) timeout deadline like the worker does
+            # Arm the (epoch-fenced) timeout deadline like the worker does:
+            # it rides in the claimed -> running write itself
             from datetime import timedelta
 
             await conn.execute(
-                STMTS["set-timeout"],
+                STMTS["run"],
                 job_id,
-                timedelta(seconds=1),
                 claimed["run_epoch"],
+                timedelta(seconds=1),
             )
             timeout_at = await conn.fetchval(
                 "SELECT timeout_at FROM jorb WHERE id = $1", job_id
@@ -369,7 +370,7 @@ class TestCrashRecovery:
                 unique_queue,
             )
             claimed = await claim(conn, unique_queue, pid=99999, host="dead-node")
-            await conn.execute(STMTS["run"], job_id, claimed["run_epoch"])
+            await conn.execute(STMTS["run"], job_id, claimed["run_epoch"], None)
 
             # dead-worker recovery is the shared requeue primitive in
             # pyjobby.db (driven by pyjobby.monitor via the worker registry)

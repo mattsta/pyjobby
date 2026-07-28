@@ -764,12 +764,12 @@ async def test_rate_limit_refuses_a_claim_once_a_start_is_recorded(
     conn = await db.connect(**db_params)
     try:
         first = await claim_once(conn, unique_queue)
-        started = await conn.fetch(STMTS["run"], first["id"], first["run_epoch"])
+        started = await conn.fetch(STMTS["run"], first["id"], first["run_epoch"], None)
         second = await claim_once(conn, unique_queue)
     finally:
         await conn.close()
 
-    assert [r["state"] for r in started] == ["running"]
+    assert [r["id"] for r in started] == [first["id"]]
     assert second is None
 
 
@@ -826,7 +826,7 @@ async def test_four_concurrent_timeout_sweeps_handle_a_job_exactly_once(
     )
     claimed = await claim_once(db_pool, unique_queue)
     assert claimed["id"] == job_id
-    await db_pool.execute(STMTS["run"], job_id, claimed["run_epoch"])
+    await db_pool.execute(STMTS["run"], job_id, claimed["run_epoch"], None)
     await db_pool.execute(
         "UPDATE jorb SET timeout_at = now() - interval '5 seconds' WHERE id = $1",
         job_id,
@@ -858,7 +858,7 @@ async def test_four_concurrent_dead_worker_sweeps_requeue_a_job_exactly_once(
     job_id = await enqueue(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {"x": 2})
     claimed = await claim_once(db_pool, unique_queue, worker_id=worker_id)
     assert claimed["id"] == job_id
-    await db_pool.execute(STMTS["run"], job_id, claimed["run_epoch"])
+    await db_pool.execute(STMTS["run"], job_id, claimed["run_epoch"], None)
 
     requeued = await asyncio.gather(
         *[sweep_dead_workers(db_pool, liveness_grace_seconds=60) for _ in range(4)]

@@ -93,7 +93,7 @@ async def claim_and_finish_job(conn, queue="default"):
     )
     if claimed:
         epoch = claimed["run_epoch"]
-        await conn.execute(STMTS["run"], claimed["id"], epoch)
+        await conn.execute(STMTS["run"], claimed["id"], epoch, None)
         await conn.execute(
             STMTS["finished"], claimed["id"], {"result": "success"}, epoch
         )
@@ -352,7 +352,7 @@ class TestDependencyProperties:
 
                 # Finish job to release next in chain
                 epoch = claimed["run_epoch"]
-                await conn.execute(STMTS["run"], claimed["id"], epoch)
+                await conn.execute(STMTS["run"], claimed["id"], epoch, None)
                 await conn.execute(
                     STMTS["finished"],
                     claimed["id"],
@@ -591,7 +591,7 @@ class TestStateTransitionProperties:
             epoch = job["run_epoch"]
 
             # Mark running: claimed -> running
-            await conn.execute(STMTS["run"], job_id, epoch)
+            await conn.execute(STMTS["run"], job_id, epoch, None)
             job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
             assert job["state"] == "running"
             assert job["started"] is not None

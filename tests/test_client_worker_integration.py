@@ -126,15 +126,11 @@ async def _run_epoch(conn, job_id) -> int:
 
 
 async def mark_running(conn, job_id, timeout_seconds=None):
-    """Mark job as running using actual worker STMTS (epoch-fenced)."""
+    """Mark job as running using the actual worker statement (epoch-fenced);
+    the deadline rides in the same write, exactly as the worker issues it."""
     epoch = await _run_epoch(conn, job_id)
-    await conn.execute(STMTS["run"], job_id, epoch)
-
-    # Set timeout if specified
-    if timeout_seconds:
-        await conn.execute(
-            STMTS["set-timeout"], job_id, timedelta(seconds=timeout_seconds), epoch
-        )
+    interval = timedelta(seconds=timeout_seconds) if timeout_seconds else None
+    await conn.execute(STMTS["run"], job_id, epoch, interval)
 
 
 async def mark_finished(conn, job_id, result: dict):

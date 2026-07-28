@@ -115,29 +115,31 @@ STMTS["above-ceiling"] = """SELECT count(*) AS above, min(prio) AS lowest
                                AND prio > $2
                                AND run_after <= now()"""
 
-STMTS["get"] = """SELECT * FROM jorb
-                     WHERE id = $1
-                        AND state = 'claimed'"""
-
 # Fetch an upstream job's stored result for run-time result passing
 # (admin_data.use_result_from).
 STMTS["get-result"] = """SELECT state, result FROM jorb WHERE id = $1"""
 
 # claimed -> running (records `started`; timeout enforcement, duration
-# metrics, and rate limiting all key off this transition)
+# metrics, and rate limiting all key off this transition). The deadline is
+# stamped HERE rather than by a separate statement: the two writes were
+# microseconds apart on the hottest table in the system, and a job's
+# deadline measured from `started` is the deadline the operator configured.
+# $3 is NULL for a job with no timeout.
+#
+# RETURNING id, and the caller MUST check it: zero rows means the row was
+# requeued or cancelled between claim and here, and executing the job
+# anyway runs its side effects concurrently with the attempt that replaced
+# it — a non-DXE job would never find out.
 STMTS["run"] = """UPDATE jorb
               SET state = 'running',
                   started = now(),
+                  timeout_at = CASE WHEN $3::interval IS NULL THEN NULL
+                                    ELSE now() + $3::interval END,
                   updated = now()
               WHERE id = $1
                 AND state = 'claimed'
                 AND run_epoch = $2
-          RETURNING *"""
-
-STMTS["set-timeout"] = """UPDATE jorb
-              SET timeout_at = now() + $2::interval
-              WHERE id = $1
-                AND run_epoch = $3"""
+          RETURNING id"""
 
 # Terminal success. Epoch-fenced: if the reaper or an operator requeued this
 # job while we ran, our (stale) completion is a no-op.
@@ -159,7 +161,7 @@ STMTS["finished"] = """UPDATE jorb
               WHERE id = $1
                 AND state IN ('claimed', 'running')
                 AND run_epoch = $3
-          RETURNING *"""
+          RETURNING id"""
 
 # Same-row retry: back into the queue with backoff; jorb_history holds the
 # per-attempt audit trail (recorded by trigger on the state change).
@@ -178,7 +180,7 @@ STMTS["retry"] = """UPDATE jorb
               WHERE id = $1
                 AND state IN ('claimed', 'running')
                 AND run_epoch = $5
-          RETURNING *"""
+          RETURNING id"""
 
 # Terminal failure: retries exhausted (or on_timeout='fail'). state='crashed'
 # IS the dead letter queue. Bumps run_epoch (see STMTS["finished"]): the
@@ -195,7 +197,7 @@ STMTS["crashed"] = """UPDATE jorb
               WHERE id = $1
                 AND state IN ('claimed', 'running')
                 AND run_epoch = $4
-          RETURNING *"""
+          RETURNING id"""
 
 # A running job whose cancellation was requested and honored. Bumps
 # run_epoch (see STMTS["finished"]): "honored" is the worker's view — a
@@ -210,7 +212,7 @@ STMTS["cancelled"] = """UPDATE jorb
               WHERE id = $1
                 AND state IN ('claimed', 'running')
                 AND run_epoch = $2
-          RETURNING *"""
+          RETURNING id"""
 
 # Job.reschedule() and durable sleep: the task asked to run again later, so
 # the requeue wins over normal completion. Fenced like every other
@@ -404,6 +406,16 @@ class JobSystem:
                 return await self.stmts[op].fetch(*args)  # type: ignore[no-any-return]
             except (asyncpg.InterfaceError, asyncpg.PostgresConnectionError) as e:
                 if self.stop:
+                    raise
+                if (
+                    isinstance(e, asyncpg.InterfaceError)
+                    and self.cxn is not None
+                    and not self.cxn.is_closed()
+                ):
+                    # InterfaceError over a LIVE connection is client-side
+                    # misuse (wrong argument count, bad parameter type), not
+                    # a lost connection: reconnecting cannot fix it, so
+                    # retrying spins forever on a bug that should be loud.
                     raise
                 logger.warning(
                     f"Database connection lost during '{op}' ({e}); reconnecting..."
@@ -995,17 +1007,37 @@ class JobSystem:
                         f"job {jid} reads its input from job {upstream_id}, "
                         f"which no longer exists"
                     )
-                if upstream[0]["state"] == "finished":
-                    job["kwargs"] = {
-                        **(job.get("kwargs") or {}),
-                        "upstream_result": upstream[0]["result"],
-                    }
+                if upstream[0]["state"] != "finished":
+                    # Running without the input would silently produce a
+                    # result computed WITHOUT it — the same wrong answer the
+                    # missing-upstream raise above exists to prevent, so the
+                    # not-yet case must not be quieter than the never case.
+                    # The raise takes the ordinary retry path, so the reader
+                    # retries with backoff until the upstream finishes (or
+                    # the reader's budget runs out).
+                    raise LookupError(
+                        f"job {jid} reads its input from job {upstream_id}, "
+                        f"which is {upstream[0]['state']!r}, not finished — "
+                        f"enqueue the reader with waitfor_job={upstream_id} "
+                        f"so it cannot start early"
+                    )
+                job["kwargs"] = {
+                    **(job.get("kwargs") or {}),
+                    "upstream_result": upstream[0]["result"],
+                }
 
             klass = self.classForKlassFromName(job["job_class"], job=job)
 
             # DXE: bind previously recorded checkpoints so completed steps
-            # fast-forward instead of re-executing on this attempt
-            checkpoints = await self.ex("load-steps", jid)
+            # fast-forward instead of re-executing on this attempt. A first
+            # attempt provably has none — claim_jorb increments run_count,
+            # so run_count == 1 means no execution ever preceded this one —
+            # and skipping the load saves a round trip on the overwhelmingly
+            # common path.
+            if job.get("run_count", 0) > 1:
+                checkpoints = await self.ex("load-steps", jid)
+            else:
+                checkpoints = []
             klass._dxe_bind(checkpoints, epoch)
 
             # timeout: admin_data override > class attribute > worker default
@@ -1017,16 +1049,23 @@ class JobSystem:
                     self.default_timeout if klass.timeout is None else klass.timeout
                 )
 
-            if job_timeout:
-                await self.ex(
-                    "set-timeout",
-                    jid,
-                    datetime.timedelta(seconds=job_timeout),
-                    epoch,
+            # claimed -> running: records `started` and stamps the deadline
+            # in the same write. Zero rows back means the row was requeued or
+            # cancelled between claim and here — executing anyway would run
+            # the job's side effects concurrently with the attempt that
+            # replaced it, and a non-DXE job would never find out.
+            started_rows = await self.ex(
+                "run",
+                jid,
+                epoch,
+                datetime.timedelta(seconds=job_timeout) if job_timeout else None,
+            )
+            if not started_rows:
+                logger.warning(
+                    f"[job {jid}] Superseded between claim and run; "
+                    f"abandoning without executing"
                 )
-
-            # claimed -> running (records `started`)
-            await self.ex("run", jid, epoch)
+                return
 
             start_counter = time.perf_counter()
             # DXE: ONE deadline for this job. It is what _execute enforces and
@@ -1043,8 +1082,21 @@ class JobSystem:
 
             if admin_data.get("save_result") is False:
                 result = None
-            await self.ex("finished", jid, result, epoch)
-            await self._wake_dependents(job)
+            completed = await self.ex("finished", jid, result, epoch)
+            if completed:
+                await self._wake_dependents(job)
+            elif klass._dxe_rescheduled:
+                # the task called reschedule(): the requeue won over normal
+                # completion, by design — the row is already back in 'queued'
+                logger.info(f"[job {jid}] Rescheduled itself; result discarded")
+            else:
+                # requeued/cancelled while we ran: the result was fenced out.
+                # Said out loud because the work WAS done and its answer
+                # dropped — silence here is how a lost result stays a mystery.
+                logger.warning(
+                    f"[job {jid}] Superseded before completion could be "
+                    f"recorded; result discarded"
+                )
 
         except dxe.DurableSleep as sleep:
             # the job checkpointed a sleep and rescheduled itself; nothing
@@ -1073,7 +1125,13 @@ class JobSystem:
             if not self._cancel_current:
                 raise  # the WORKER is being cancelled, not the job
             logger.warning(f"[job {jid}] Cancelled while running (operator request)")
-            await self.ex("cancelled", jid, epoch)
+            recorded = await self.ex("cancelled", jid, epoch)
+            if not recorded:
+                # a monitor requeue or dead-letter beat us to the row; the
+                # cancel outcome belongs to whoever owns it now
+                logger.warning(
+                    f"[job {jid}] Cancel not recorded — row already moved on"
+                )
             self.errors += 1
 
         except Exception as e:
@@ -1326,6 +1384,12 @@ class Job:
     #: has no deadline. Set by the worker; a Job built outside one has no
     #: ceiling and its declared step budgets apply as declared.
     _dxe_deadline: float | None = None
+    #: True once this execution successfully requeued its own row
+    #: (reschedule() / durable sleep). The worker reads it to tell "my
+    #: completion no-oped because the reschedule won, by design" apart from
+    #: "my completion no-oped because I was superseded" — the first is
+    #: routine, the second deserves a warning.
+    _dxe_rescheduled: bool = False
 
     def __post_init__(self) -> None:
         # a Job constructed outside the worker (tests, direct use) still has
@@ -1800,6 +1864,7 @@ class Job:
             raise dxe.StaleExecutionError(
                 f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
             )
+        self._dxe_rescheduled = True
 
     async def set_event(self, key: str, value: Any) -> None:
         """Publish a key/value event on this job (idempotent upsert).

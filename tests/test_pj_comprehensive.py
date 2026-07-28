@@ -64,10 +64,8 @@ class TestJobSystemInitialization:
         async with prepared_system(db_params, worker_params) as system:
             for name in (
                 "claim",
-                "get",
                 "get-result",
                 "run",
-                "set-timeout",
                 "finished",
                 "retry",
                 "crashed",
@@ -83,8 +81,17 @@ class TestJobSystemInitialization:
             ):
                 assert name in system.stmts
 
-            # machinery removed in schema v1 must stay gone
-            for gone in ("create-retry", "recover-abandoned", "cancel", "crash"):
+            # machinery removed must stay gone: schema v1's verbs, the dead
+            # "get" probe nothing executed, and "set-timeout" (the deadline
+            # rides in the "run" statement itself now)
+            for gone in (
+                "create-retry",
+                "recover-abandoned",
+                "cancel",
+                "crash",
+                "get",
+                "set-timeout",
+            ):
                 assert gone not in system.stmts
 
 
@@ -240,7 +247,7 @@ class TestJobExecution:
 
         async with prepared_system(db_params, worker_params) as system:
             # 'run' is epoch-fenced: this directly inserted row is at epoch 0
-            await system.ex("run", job_id, 0)
+            await system.ex("run", job_id, 0, None)
 
             job = await system.cxn.fetchrow(
                 "SELECT state, started FROM jorb WHERE id = $1", job_id
@@ -327,9 +334,9 @@ class TestTimeoutHandling:
         )
 
         async with prepared_system(db_params, worker_params) as system:
-            await system.ex("run", job_id, 0)
+            # the deadline rides in the claimed -> running write itself
             await system.ex(
-                "set-timeout", job_id, timedelta(seconds=system.default_timeout), 0
+                "run", job_id, 0, timedelta(seconds=system.default_timeout)
             )
 
             job = await system.cxn.fetchrow(
@@ -338,8 +345,9 @@ class TestTimeoutHandling:
             assert job["timeout_at"] is not None
             assert job["timeout_at"] > job["started"]
 
-            # a stale epoch cannot move the deadline
-            await system.ex("set-timeout", job_id, timedelta(hours=99), 42)
+            # a stale epoch cannot start the job again or move the deadline
+            stale = await system.ex("run", job_id, 42, timedelta(hours=99))
+            assert stale == []
             unchanged = await system.cxn.fetchrow(
                 "SELECT timeout_at FROM jorb WHERE id = $1", job_id
             )
@@ -395,10 +403,17 @@ class TestRetryLogic:
             retried = await system.ex(
                 "retry", job_id, timedelta(seconds=30), "flaky", "Traceback...", 0
             )
-            assert retried[0]["id"] == job_id
-            assert retried[0]["state"] == "queued"
-            assert retried[0]["error_count"] == 1
-            assert retried[0]["run_after"] > datetime.now(UTC)
+            assert [r["id"] for r in retried] == [job_id]
+            # the statement returns only the id (a retry's full row — result,
+            # backtrace — was round-tripped and discarded); read the state
+            # it produced from the row itself
+            row = await system.cxn.fetchrow(
+                "SELECT state, error_count, run_after FROM jorb WHERE id = $1",
+                job_id,
+            )
+            assert row["state"] == "queued"
+            assert row["error_count"] == 1
+            assert row["run_after"] > datetime.now(UTC)
 
             # no copy rows were created
             rows = await system.cxn.fetchval(
@@ -636,31 +651,50 @@ class TestJobSystemErrorHandling:
             100,
         )
 
-        # Mock statement fetch to raise InterfaceError; ex() must then
-        # RECONNECT (fresh connection, statements re-prepared from STMTS)
-        # and retry the operation against the real database.
+        # Mock statement fetch to raise InterfaceError with the connection
+        # REALLY gone — that pairing is what "lost connection" means, and it
+        # is what ex() keys its reconnect on (an InterfaceError over a live
+        # connection is caller misuse and raises instead). ex() must then
+        # rebuild the connection, re-prepare every statement from STMTS, and
+        # retry the operation against the real database.
         call_count = 0
 
         class MockPreparedStatement:
             async def fetch(self, *args):
                 nonlocal call_count
                 call_count += 1
-                raise asyncpg.InterfaceError("Connection lost")
+                await system.cxn.close()
+                raise asyncpg.InterfaceError("connection is closed")
 
-        system.stmts["get"] = MockPreparedStatement()
+        system.stmts["get-result"] = MockPreparedStatement()
 
         try:
-            result = await system.ex("get", job_id)
+            result = await system.ex("get-result", job_id)
 
             # The broken statement was tried exactly once, then replaced by a
-            # freshly prepared statement during reconnect (job is 'queued' so
-            # the 'get' statement, which filters on state='claimed', returns
-            # no rows — the point is that ex() recovered and completed).
+            # freshly prepared statement during reconnect — the point is that
+            # ex() recovered and completed against the real database.
             assert call_count == 1
-            assert result == []
-            assert not isinstance(system.stmts["get"], MockPreparedStatement)
+            assert [r["state"] for r in result] == ["queued"]
+            assert not isinstance(
+                system.stmts["get-result"], MockPreparedStatement
+            )
         finally:
             await system.cxn.close()
+
+    async def test_ex_raises_on_client_side_misuse_instead_of_spinning(
+        self, db_params, worker_params
+    ):
+        """asyncpg reports wrong-arity calls as InterfaceError — the same
+        type a lost connection raises. Over a LIVE connection that is a bug
+        in the caller, and reconnecting cannot fix a bug: ex() must raise
+        it loudly rather than reconnect-and-retry the same mistake forever
+        (which is exactly what it did when the 'run' statement grew a third
+        parameter and one caller kept passing two)."""
+        async with prepared_system(db_params, worker_params) as system:
+            with pytest.raises(asyncpg.exceptions.InterfaceError):
+                await system.ex("run", 1, 0)  # missing the deadline argument
+            assert not system.cxn.is_closed()
 
 
 class TestJobClassResolution:

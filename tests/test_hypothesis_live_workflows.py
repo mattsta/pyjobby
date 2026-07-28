@@ -154,8 +154,8 @@ def run_worker_process(
                 job = jobs[0]
                 epoch = job["run_epoch"]
                 try:
-                    # Mark as running
-                    await worker.ex("run", job["id"], epoch)
+                    # Mark as running (no deadline for these driver loops)
+                    await worker.ex("run", job["id"], epoch, None)
 
                     # Execute job (simplified - no class loading for speed)
                     if job_sleep_seconds:

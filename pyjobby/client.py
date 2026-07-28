@@ -2152,10 +2152,9 @@ class JobClient:
         if not job_ids:
             return 0
 
-        async with self.pool.acquire() as conn:
-            outcomes = [await db.cancel_job(conn, job_id) for job_id in job_ids]
-
-        return sum(outcome is not None for outcome in outcomes)
+        # one statement, not one round trip per id (db.cancel_jobs shares
+        # CANCEL_SQL's guard and CASE logic verbatim)
+        return await db.cancel_jobs(self.pool, job_ids)
 
     async def bulk_retry(self, job_ids: list[int]) -> list[int]:
         """
@@ -2175,16 +2174,9 @@ class JobClient:
         if not job_ids:
             return []
 
-        # one shared requeue statement per job (see db.build_requeue_sql):
-        # jobs keep their ids across retries
-        requeued_ids = []
-        async with self.pool.acquire() as conn:
-            for job_id in job_ids:
-                requeued = await db.retry_job(conn, job_id)
-                if requeued is not None:
-                    requeued_ids.append(requeued)
-
-        return requeued_ids
+        # one statement, not one round trip per id (db.retry_jobs is the
+        # same guarded requeue with `id = ANY(...)`)
+        return await db.retry_jobs(self.pool, job_ids)
 
     async def bulk_delete(self, job_ids: list[int]) -> int:
         """

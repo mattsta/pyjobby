@@ -224,11 +224,15 @@ class TestClaimStatement:
         requeued = await db_connection.fetchrow(
             STMTS["retry"], job_id, timedelta(seconds=-1), "boom", "trace", 1
         )
-        assert requeued["run_epoch"] > first["run_epoch"]
+        assert requeued["id"] == job_id
+        requeued_epoch = await db_connection.fetchval(
+            "SELECT run_epoch FROM jorb WHERE id = $1", job_id
+        )
+        assert requeued_epoch > first["run_epoch"]
 
         second = await claim(db_connection, unique_queue)
         assert second["id"] == job_id
-        assert second["run_epoch"] > requeued["run_epoch"]
+        assert second["run_epoch"] > requeued_epoch
         assert second["run_count"] == 2
 
 
@@ -243,7 +247,7 @@ class TestRunStatement:
         claimed = await claim(db_connection, unique_queue)
         job_id, epoch = claimed["id"], claimed["run_epoch"]
 
-        await db_connection.execute(STMTS["run"], job_id, epoch)
+        await db_connection.execute(STMTS["run"], job_id, epoch, None)
 
         job = await get_job(db_connection, job_id)
         assert job["state"] == "running"
@@ -257,7 +261,7 @@ class TestRunStatement:
         claimed = await claim(db_connection, unique_queue)
 
         stale = await db_connection.fetch(
-            STMTS["run"], claimed["id"], claimed["run_epoch"] - 1
+            STMTS["run"], claimed["id"], claimed["run_epoch"] - 1, None
         )
         assert stale == []
         job = await get_job(db_connection, claimed["id"])
@@ -280,9 +284,10 @@ class TestFinishedStatement:
         )
 
         assert result["id"] == job_id
-        assert result["state"] == "finished"
-        assert result["result"]["status"] == "success"
-        assert result["finished"] is not None
+        job = await get_job(db_connection, job_id)
+        assert job["state"] == "finished"
+        assert job["result"]["status"] == "success"
+        assert job["finished"] is not None
 
     async def test_finished_updates_timestamp(self, db_connection, unique_queue):
         """Test that finished updates the updated timestamp."""
@@ -297,7 +302,11 @@ class TestFinishedStatement:
         result = await db_connection.fetchrow(
             STMTS["finished"], claimed["id"], {}, claimed["run_epoch"]
         )
-        assert result["updated"] >= claimed["updated"]
+        assert result["id"] == claimed["id"]
+        updated = await db_connection.fetchval(
+            "SELECT updated FROM jorb WHERE id = $1", claimed["id"]
+        )
+        assert updated >= claimed["updated"]
 
     async def test_finished_is_epoch_fenced(self, db_connection, unique_queue):
         """A superseded execution's completion is a no-op."""
@@ -325,7 +334,7 @@ class TestCrashedStatement:
         )
         claimed = await claim(db_connection, unique_queue)
         job_id, epoch = claimed["id"], claimed["run_epoch"]
-        await db_connection.execute(STMTS["run"], job_id, epoch)
+        await db_connection.execute(STMTS["run"], job_id, epoch, None)
 
         await db_connection.execute(
             STMTS["crashed"],
@@ -400,10 +409,11 @@ class TestRetryStatement:
 
         # SAME row, no retry-copy rows anywhere
         assert result["id"] == job_id
-        assert result["state"] == "queued"
-        assert result["error_count"] == 1
-        assert result["error_message"] == "transient failure"
-        assert result["run_after"] > datetime.now(UTC) - timedelta(seconds=1)
+        job = await get_job(db_connection, job_id)
+        assert job["state"] == "queued"
+        assert job["error_count"] == 1
+        assert job["error_message"] == "transient failure"
+        assert job["run_after"] > datetime.now(UTC) - timedelta(seconds=1)
         total_rows = await db_connection.fetchval(
             "SELECT count(*) FROM jorb WHERE queue = $1", unique_queue
         )
@@ -467,7 +477,7 @@ class TestRescheduleStatement:
         )
         claimed = await claim(db_connection, unique_queue)
         job_id = claimed["id"]
-        await db_connection.execute(STMTS["run"], job_id, claimed["run_epoch"])
+        await db_connection.execute(STMTS["run"], job_id, claimed["run_epoch"], None)
 
         # Reschedule to run in 1 hour (fenced to this attempt, like every
         # other state-changing statement)
@@ -489,7 +499,7 @@ class TestRescheduleStatement:
         )
         claimed = await claim(db_connection, unique_queue)
         job_id = claimed["id"]
-        await db_connection.execute(STMTS["run"], job_id, claimed["run_epoch"])
+        await db_connection.execute(STMTS["run"], job_id, claimed["run_epoch"], None)
 
         applied = await db_connection.fetch(
             STMTS["reschedule"], job_id, timedelta(hours=1), claimed["run_epoch"] - 1
@@ -498,32 +508,41 @@ class TestRescheduleStatement:
         assert (await get_job(db_connection, job_id))["state"] == "running"
 
 
-class TestSetTimeoutStatement:
-    """Test the 'set-timeout' SQL statement."""
+class TestRunStampsTheDeadline:
+    """The deadline is written by 'run' itself, in the same statement as
+    the claimed -> running transition — there is no separate set-timeout
+    write to forget, misorder, or pay a second row version for."""
 
-    async def test_set_timeout(self, db_connection, unique_queue):
+    async def test_run_with_a_timeout_stamps_timeout_at(
+        self, db_connection, unique_queue
+    ):
         await create_job(
             db_connection, queue=unique_queue, state="queued", run_after=past()
         )
         claimed = await claim(db_connection, unique_queue)
 
         await db_connection.execute(
-            STMTS["set-timeout"],
-            claimed["id"],
-            timedelta(seconds=30),
-            claimed["run_epoch"],
+            STMTS["run"], claimed["id"], claimed["run_epoch"], timedelta(seconds=30)
         )
         job = await get_job(db_connection, claimed["id"])
+        assert job["state"] == "running"
         assert job["timeout_at"] is not None
+        assert job["timeout_at"] > job["started"]
 
-        # a stale epoch cannot move the deadline
-        stale = await db_connection.execute(
-            STMTS["set-timeout"],
-            claimed["id"],
-            timedelta(hours=9),
-            claimed["run_epoch"] - 1,
+    async def test_run_without_a_timeout_leaves_no_deadline(
+        self, db_connection, unique_queue
+    ):
+        await create_job(
+            db_connection, queue=unique_queue, state="queued", run_after=past()
         )
-        assert stale == "UPDATE 0"
+        claimed = await claim(db_connection, unique_queue)
+
+        await db_connection.execute(
+            STMTS["run"], claimed["id"], claimed["run_epoch"], None
+        )
+        job = await get_job(db_connection, claimed["id"])
+        assert job["state"] == "running"
+        assert job["timeout_at"] is None
 
 
 class TestEnqueueStatements:
@@ -627,7 +646,7 @@ class TestHistoryTrigger:
         )
         claimed = await claim(db_connection, unique_queue)
         job_id, epoch = claimed["id"], claimed["run_epoch"]
-        await db_connection.execute(STMTS["run"], job_id, epoch)
+        await db_connection.execute(STMTS["run"], job_id, epoch, None)
         await db_connection.execute(STMTS["finished"], job_id, {"ok": True}, epoch)
 
         events = [
@@ -721,7 +740,7 @@ class TestSQLStatementIntegration:
         epoch = claimed["run_epoch"]
 
         # 3. Mark as running
-        await db_connection.execute(STMTS["run"], job_id, epoch)
+        await db_connection.execute(STMTS["run"], job_id, epoch, None)
         job = await get_job(db_connection, job_id)
         assert job["state"] == "running"
 
@@ -729,7 +748,9 @@ class TestSQLStatementIntegration:
         finished = await db_connection.fetchrow(
             STMTS["finished"], job_id, {"result": "success"}, epoch
         )
-        assert finished["state"] == "finished"
+        assert finished["id"] == job_id
+        job = await get_job(db_connection, job_id)
+        assert job["state"] == "finished"
 
     async def test_repeated_attempts_share_one_row(self, db_connection, unique_queue):
         """Three failing attempts stay on ONE row; history holds the trail."""

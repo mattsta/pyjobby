@@ -34,7 +34,7 @@ from pyjobby.monitor import (
     SWEEP_SCHEDULE_LOG_SQL,
 )
 from pyjobby.pj import STMTS
-from pyjobby.scheduler import CONCURRENCY_COUNT_SQL
+from pyjobby.scheduler import BACKPRESSURE_COUNT_SQL, CONCURRENCY_COUNT_SQL
 from tests.utils.plans import (
     assert_no_seq_scan,
     assert_reads_far_less_than_a_scan,
@@ -701,6 +701,49 @@ class TestRetiredWorkerSweepPlan:
         assert "jorb_inflight_idx" in plan, plan
         assert_no_seq_scan(plan, "jorb")
         assert rows_scanned_by(plan, "jorb_inflight_idx") == in_flight, plan
+
+
+class TestBackpressureCountPlan:
+    """The scheduler's backpressure depth count, once per firing whenever a
+    threshold is configured.
+
+    One predicate spanning queued AND claimed/running matches neither
+    ``jorb_claim_idx`` (partial on queued) nor ``jorb_inflight_idx``
+    (partial on claimed/running) and collapses into a sequential scan of
+    jorb — the identical defect the tree has diagnosed and fixed three
+    times already. The two-arm split reads each partial index for exactly
+    the rows it counts, so nothing is read-and-discarded and nothing is
+    scanned. The queued arm's cost is the backlog being measured, which is
+    the number the caller asked for.
+
+    EXPLAINs the scheduler's own ``BACKPRESSURE_COUNT_SQL``, never a copy.
+    """
+
+    async def test_the_count_is_two_index_arms_not_a_scan(
+        self, db_pool, unique_queue
+    ):
+        await seed_terminal_jobs(db_pool, unique_queue)
+        # a slice of in-flight work on ANOTHER queue: the in-flight arm walks
+        # the fleet-wide index and must filter these few out, and that
+        # bounded discard must not grow into a table-shaped one
+        await db_pool.execute(
+            """
+            UPDATE jorb SET state = 'running', claimed_at = now(), started = now()
+            WHERE id IN (SELECT id FROM jorb
+                          WHERE queue = $1 AND state = 'queued'
+                          ORDER BY id LIMIT 20)
+            """,
+            unique_queue,
+        )
+        await settle(db_pool)
+
+        plan = await plan_for(
+            db_pool, BACKPRESSURE_COUNT_SQL, unique_queue + "_other"
+        )
+
+        assert_no_seq_scan(plan)
+        # nothing read-and-discarded beyond the bounded in-flight slice
+        assert rows_removed_by_filter(plan) <= 20, plan
 
 
 class TestScheduleConcurrencyPlan:

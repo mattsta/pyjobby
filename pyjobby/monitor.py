@@ -608,11 +608,11 @@ async def handle_timed_out_job(
     if on_timeout == "retry" and attempt < max_retries:
         from .retry_strategies import calculate_retry_from_job
 
-        job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
-        if not job:
-            return
-
-        retry_delay = calculate_retry_from_job(dict(job), attempt)
+        # The sweep's own SELECT already carried admin_data — the one column
+        # the backoff calculation reads — so re-fetching the full row here
+        # (kwargs, result, backtrace) was a wholly redundant round trip made
+        # N times inside the transaction holding the batch's row locks.
+        retry_delay = calculate_retry_from_job({"admin_data": admin}, attempt)
 
         await conn.execute(
             RETRY_TIMED_OUT_SQL,

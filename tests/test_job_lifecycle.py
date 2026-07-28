@@ -199,7 +199,7 @@ class TestJobExecution:
         epoch = claimed["run_epoch"]
 
         # 3. Mark as running
-        await db_connection.execute(STMTS["run"], job_id, epoch)
+        await db_connection.execute(STMTS["run"], job_id, epoch, None)
         job = await get_job(db_connection, job_id)
         assert job["state"] == "running"
         assert job["started"] is not None
@@ -225,7 +225,7 @@ class TestJobExecution:
         epoch = claimed["run_epoch"]
 
         # Mark as running
-        await db_connection.execute(STMTS["run"], job_id, epoch)
+        await db_connection.execute(STMTS["run"], job_id, epoch, None)
 
         # Dead-letter the job
         await db_connection.execute(
@@ -268,10 +268,13 @@ class TestRetryMechanism:
 
         # same id, back in the queue with backoff — no retry-copy rows
         assert retried["id"] == job_id
-        assert retried["state"] == "queued"
-        assert retried["job_class"] == "test.RetryableJob"
-        assert retried["error_count"] == 1
-        assert "parent_job_id" not in retried["admin_data"]
+        job = await db_connection.fetchrow(
+            "SELECT * FROM jorb WHERE id = $1", job_id
+        )
+        assert job["state"] == "queued"
+        assert job["job_class"] == "test.RetryableJob"
+        assert job["error_count"] == 1
+        assert "parent_job_id" not in job["admin_data"]
         assert (
             await db_connection.fetchval(
                 "SELECT count(*) FROM jorb WHERE queue = $1", unique_queue
@@ -430,7 +433,7 @@ class TestJobScheduling:
             db_connection, queue=unique_queue, state="queued", run_after=past()
         )
         claimed = await claim(db_connection, unique_queue)
-        await db_connection.execute(STMTS["run"], job_id, claimed["run_epoch"])
+        await db_connection.execute(STMTS["run"], job_id, claimed["run_epoch"], None)
 
         before = datetime.now(UTC)
 
@@ -528,7 +531,7 @@ class TestCompleteJobFlows:
         epoch = claimed["run_epoch"]
 
         # Worker starts execution
-        await db_connection.execute(STMTS["run"], job_id, epoch)
+        await db_connection.execute(STMTS["run"], job_id, epoch, None)
 
         # Job completes successfully
         await db_connection.fetchrow(
@@ -554,7 +557,7 @@ class TestCompleteJobFlows:
 
         # First attempt - claim, run, fail into retry
         first = await claim(db_connection, unique_queue)
-        await db_connection.execute(STMTS["run"], job_id, first["run_epoch"])
+        await db_connection.execute(STMTS["run"], job_id, first["run_epoch"], None)
         await db_connection.execute(
             STMTS["retry"],
             job_id,
@@ -568,7 +571,7 @@ class TestCompleteJobFlows:
         second = await claim(db_connection, unique_queue, pid=12346, host="worker-2")
         assert second["id"] == job_id
         assert second["run_epoch"] > first["run_epoch"]
-        await db_connection.execute(STMTS["run"], job_id, second["run_epoch"])
+        await db_connection.execute(STMTS["run"], job_id, second["run_epoch"], None)
         await db_connection.fetchrow(
             STMTS["finished"], job_id, {"status": "success"}, second["run_epoch"]
         )
@@ -619,7 +622,7 @@ class TestCompleteJobFlows:
         # Execute parent job
         parent_claim = await claim(db_connection, unique_queue)
         assert parent_claim["id"] == parent_id
-        await db_connection.execute(STMTS["run"], parent_id, parent_claim["run_epoch"])
+        await db_connection.execute(STMTS["run"], parent_id, parent_claim["run_epoch"], None)
         await db_connection.fetchrow(
             STMTS["finished"],
             parent_id,
@@ -637,7 +640,7 @@ class TestCompleteJobFlows:
         # Execute child job
         child_claim = await claim(db_connection, unique_queue, pid=12346)
         assert child_claim["id"] == child_id
-        await db_connection.execute(STMTS["run"], child_id, child_claim["run_epoch"])
+        await db_connection.execute(STMTS["run"], child_id, child_claim["run_epoch"], None)
         await db_connection.fetchrow(
             STMTS["finished"],
             child_id,
