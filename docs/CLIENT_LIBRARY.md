@@ -409,6 +409,36 @@ else:
     print("Database connection failed")
 ```
 
+### More methods
+
+The rest of the public surface, one line each. Every async method has a
+synchronous twin on `SyncJobClient` with the same signature.
+
+**Inspection**
+- `get_job_full(job_id)` — complete row: kwargs, result, error, timestamps.
+- `get_job_result(job_id)` — a finished job's stored result, without waiting.
+- `get_steps(job_id)` — a job's recorded DXE checkpoints, oldest first.
+- `get_jobs(queue=None, state=None, limit=100, offset=0, order_by='created', ascending=False)` — list jobs, filtered and paginated.
+- `get_failed_jobs(queue=None, limit=100)` / `get_waiting_jobs(limit=100)` — filtered views of `get_jobs`.
+- `list_queues(window=timedelta(hours=1))` — every queue with per-state counts (same contract as `queue_stats`).
+
+**Events & mail** (see also State Machines below)
+- `send_message(dest_job_id, message, topic=None)` — put a durable message in a job's mailbox.
+- `get_event(job_id, key, timeout=None)` — wait for a job's published event value.
+- `wait_for_event(job_id, key, accept=None, timeout=None)` — wait until the event exists *and* satisfies `accept`.
+
+**Bulk operations** (the single-job verbs over a list of ids)
+- `bulk_retry(job_ids)`, `bulk_cancel(job_ids)`, `bulk_delete(job_ids)`, `bulk_update_priority(job_ids, new_priority)`.
+- `delete_job(job_id)`, `purge_queue(queue, states=None)` — delete one job, or a queue's jobs by state.
+
+**Advanced enqueue**
+- `enqueue_handle(...)` — enqueue and get a `JobHandle` (`.result()`, `.wait_for_result()`, `.cancel()`, `.event()`).
+- `enqueue_in_transaction(conn, ...)` — enqueue on the CALLER's asyncpg connection, inside their transaction (async only; no sync twin).
+- `create_pipeline_with_results(stages, ...)` — a pipeline where each stage receives the previous stage's result.
+
+**Property**
+- `listening` — True when this client can ride LISTEN/NOTIFY for its waits (constructed with `db_params`) rather than polling only.
+
 ---
 
 ## Common Patterns
@@ -520,6 +550,33 @@ async def process_user_uploads(client, user_id, image_urls):
         "group_id": group_id,
     }
 ```
+
+### 2b. DAG Workflows (Arbitrary Dependencies)
+
+When the dependency graph is neither a straight pipeline nor a single
+fan-out, build it explicitly. `client.dag()` returns a builder; `dag.add()`
+returns a node you pass to a later job's `depends_on`; `execute_dag()` writes
+every job at once and returns a node → job_id map.
+
+```python
+dag = client.dag("nightly-report", queue="reports")
+
+extract = dag.add("etl.Extract", {"source": "sales"})
+transform = dag.add("etl.Transform", depends_on=[extract])
+load = dag.add("etl.Load", depends_on=[transform])
+notify = dag.add("etl.Notify", depends_on=[load])
+
+nodes = await client.execute_dag(dag)      # {node: job_id}
+dag_id = nodes[extract]                     # any node's job id identifies the DAG
+
+# Wait for the whole graph, or inspect it without waiting.
+ok = await client.wait_for_dag(dag_id, timeout=3600)
+status = await client.get_dag_status(dag_id)
+```
+
+A job runs only once every job in its `depends_on` has finished; a member
+that crashes or is cancelled means the jobs downstream of it never become
+runnable (surfaced by `pj-admin doctor`).
 
 ### 3. Scheduled Jobs
 

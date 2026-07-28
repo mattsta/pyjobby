@@ -342,6 +342,29 @@ whose jobs had aged out reported `total_jobs = 0` **permanently**. That is a
 wrong answer served to an operator, and unlike a slow query it does not
 announce itself.
 
+### Durable machines have a different cost model
+
+A state machine (`start_machine`) is a job that parks on `recv()` waiting for
+the next event, so its cost scales with **how many machines are alive at
+once**, not with job throughput:
+
+* **A parked machine holds a worker.** A worker running a machine that is
+  waiting for an event is not claiming other jobs. N machines that must be
+  able to make progress concurrently need N worker slots — which is why
+  machines default to their own `machines` queue, so they cannot starve the
+  workers serving latency-sensitive job queues. Size that queue's `--workers`
+  to the concurrent-machine count, not to the job rate.
+* **A long-lived machine accumulates `jorb_history` and consumed mail.** The
+  job-scoped `ON DELETE CASCADE` never fires for a machine that never
+  terminates, so its wake/sleep history and read messages are bounded only by
+  the history and mailbox sweeps (`--retention-days`), not by job completion.
+  Those two sweeps, not job retention, are what keep a fleet of durable
+  machines from growing without limit.
+
+The per-machine `recv` and event-wait rates depend on how chatty your
+machines are; measure yours with `pj-bench` rather than assuming, the same
+way the job-cost numbers above were measured.
+
 ---
 
 ## Checklist before running at this rate

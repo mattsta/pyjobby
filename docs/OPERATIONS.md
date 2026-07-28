@@ -38,6 +38,26 @@ pj-admin db status
 Neither web surface has authentication: keep them on localhost or behind an
 authenticating proxy.
 
+## Shutdown (SIGTERM / SIGINT)
+
+Every process handles `SIGTERM` and `SIGINT` (Ctrl-C) as a graceful stop, so
+`systemctl stop`, `docker stop` and Kubernetes rollout all end cleanly rather
+than killing work mid-flight. No process needs `SIGKILL` under normal
+operation.
+
+| Process | On SIGTERM |
+|---|---|
+| Worker (`pj`) | Stops claiming new jobs and finishes the one it is running, then exits. In-flight work is not abandoned; give the container a stop grace period at least as long as your longest job (or its timeout). |
+| Monitor (`pj-monitor`) | Ends at the next clean point: it stops between sweeps, and a sweep that is mid-drain yields after the current batch rather than mid-statement. |
+| Scheduler (`pj-scheduler`) | Cuts its poll sleep short and exits before the next firing; a schedule already firing completes. |
+| Websocket (`pj-ws`) | Stops accepting connections, drains the aiohttp runner, then closes its pool. |
+| Web admin (`pj-web`) | Stops serving and exits. |
+
+A worker that is killed with `SIGKILL` (or whose host dies) does not corrupt
+anything: its in-flight jobs are reclaimed by the monitor's dead-worker sweep
+once the worker's registry row goes stale, and run-epoch fencing prevents the
+killed attempt from writing anything after it is reclaimed.
+
 ## Health: `pj-admin doctor`
 
 ```bash

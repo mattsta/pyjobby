@@ -238,6 +238,7 @@ Commands:
   requeue        Requeue a terminal job for another run (also: RESUME an interrupted job)
   retry          Retry one or more crashed jobs
   retry-stats    Show retry statistics from the jorb_history audit trail
+  set-priority   Change a queued or waiting job's priority.
   steps          Show a job's DXE step checkpoints
   timeout-stats  Show timeout statistics (from jorb.timeout_at/state)
 ```
@@ -346,6 +347,10 @@ Options:
   a claimed or running job gets a cancellation *request* delivered to its
   worker, reported distinctly, because a job whose worker has died stays
   running with only the request recorded.
+* `jobs set-priority ID PRIORITY` — re-prioritise a **queued or waiting**
+  job (lower numbers are claimed first). Once a job is claimed its priority
+  no longer decides anything, so those are refused; a priority above the
+  deployment's worker ceiling is refused too, since no worker would claim it.
 * `jobs delete ID` — permanent, prompts unless `-f/--force`.
 
 The retry-versus-rerun distinction is expanded in
@@ -715,7 +720,7 @@ Method groups, all `async`:
 
 * **Jobs** — `list_jobs`, `get_job`, `get_job_history`, `get_job_steps`,
   `retry_job`, `retry_jobs`, `requeue_job`, `cancel_job`, `cancel_jobs`,
-  `delete_job`, `delete_jobs`.
+  `update_job_priority`, `delete_job`, `delete_jobs`.
 * **Queues** — `list_queues`, `queue_stats`, `clear_queue`,
   `list_queue_controls`, `get_queue_control`, `set_queue_control`,
   `pause_queue`, `resume_queue`.
