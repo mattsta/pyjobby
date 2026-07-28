@@ -642,7 +642,7 @@ class JobClient:
         config_path: str,
         min_size: int = 5,
         max_size: int = 20,
-        prio_ceiling: int = DEFAULT_PRIO_CEILING,
+        prio_ceiling: int | None = None,
     ) -> JobClient:
         """
         Create client from pyjobby config file.
@@ -652,8 +652,17 @@ class JobClient:
             min_size: Minimum pool size (default: 5)
             max_size: Maximum pool size (default: 20)
             prio_ceiling: this fleet's worker priority ceiling
-                (`pj --max-prio`, default 1000); enqueueing above it is
-                refused. See JobClient.__init__.
+                (`pj --max-prio`); enqueueing above it is refused. See
+                JobClient.__init__. Left unset (the default), the config
+                file's own ``prio_ceiling`` is used, and 1000 if the file
+                does not declare one — the ceiling is a deployment fact,
+                declared once in the file every daemon already reads.
+
+        Raises:
+            ConfigError: the file declares no db_params. Falling back to
+                asyncpg's environment defaults would connect to whatever
+                PGHOST/PGDATABASE happen to say — a DIFFERENT database
+                than the one the operator wrote down, discovered later.
 
         Returns:
             JobClient instance
@@ -661,10 +670,20 @@ class JobClient:
         Example:
             client = await JobClient.from_config('./pyjobby.toml')
         """
-        from .configloader import load_config_from_file
+        from .configloader import ConfigError, load_config_from_file
 
-        config = load_config_from_file(config_path, keys=["db_params"])
-        db_params = config.get("db_params", {})
+        config = load_config_from_file(config_path, keys=["db_params", "prio_ceiling"])
+        db_params = config.get("db_params")
+        if not db_params:
+            raise ConfigError(f"No db_params found in config file: {config_path}")
+
+        # `is not None`, not `or`: an explicit prio_ceiling of 0 (a ceiling
+        # admitting only prio-0 work) is a real value, not "unset".
+        if prio_ceiling is None:
+            configured = config.get("prio_ceiling")
+            prio_ceiling = (
+                DEFAULT_PRIO_CEILING if configured is None else int(configured)
+            )
 
         pool = await db.create_pool(min_size=min_size, max_size=max_size, **db_params)
         client = cls(pool, db_params=db_params, prio_ceiling=prio_ceiling)
@@ -843,33 +862,47 @@ class JobClient:
             )
         """
         async with self.pool.acquire() as conn:
-            return await self.enqueue_in_transaction(
-                conn,
-                job_class,
-                queue=queue,
-                priority=priority,
-                run_after=run_after,
-                capability=capability,
-                uid=uid,
-                run_group=run_group,
-                waitfor_job=waitfor_job,
-                waitfor_group=waitfor_group,
-                deadline_key=deadline_key,
-                admin_data=admin_data,
-                tags=tags,
-                save_result=save_result,
-                use_result_from=use_result_from,
-                retry_strategy=retry_strategy,
-                max_retries=max_retries,
-                initial_retry_delay=initial_retry_delay,
-                max_retry_delay=max_retry_delay,
-                timeout_seconds=timeout_seconds,
-                on_timeout=on_timeout,
-                prio_ceiling=(
-                    self.prio_ceiling if prio_ceiling is None else prio_ceiling
-                ),
-                **kwargs,
-            )
+            try:
+                return await self.enqueue_in_transaction(
+                    conn,
+                    job_class,
+                    queue=queue,
+                    priority=priority,
+                    run_after=run_after,
+                    capability=capability,
+                    uid=uid,
+                    run_group=run_group,
+                    waitfor_job=waitfor_job,
+                    waitfor_group=waitfor_group,
+                    deadline_key=deadline_key,
+                    admin_data=admin_data,
+                    tags=tags,
+                    save_result=save_result,
+                    use_result_from=use_result_from,
+                    retry_strategy=retry_strategy,
+                    max_retries=max_retries,
+                    initial_retry_delay=initial_retry_delay,
+                    max_retry_delay=max_retry_delay,
+                    timeout_seconds=timeout_seconds,
+                    on_timeout=on_timeout,
+                    prio_ceiling=(
+                        self.prio_ceiling if prio_ceiling is None else prio_ceiling
+                    ),
+                    **kwargs,
+                )
+            except asyncpg.UndefinedTableError as e:
+                # The first thing an application does against a database
+                # nobody migrated is enqueue, and asyncpg answers `relation
+                # "jorb" does not exist` from inside the driver: true, and
+                # useless -- it names no database and no fix. Say both, and
+                # chain the original so the traceback keeps the SQL detail.
+                from . import migrations
+                from .configloader import describe_db_target
+
+                raise RuntimeError(
+                    f"Cannot enqueue into {describe_db_target(self._db_params)}: "
+                    f"{migrations.SCHEMA_REMEDY}"
+                ) from e
 
     async def enqueue_handle(self, job_class: str, **options: Any) -> JobHandle:
         """Enqueue a job (same keyword arguments as enqueue()) and return a
@@ -2894,14 +2927,29 @@ class SyncJobClient:
         *,
         min_size: int = 1,
         max_size: int = 4,
-        prio_ceiling: int = DEFAULT_PRIO_CEILING,
+        prio_ceiling: int | None = None,
     ) -> SyncJobClient:
         """Build from a pyjobby.toml, like JobClient.from_config() —
-        scripts and cron jobs are exactly where a config file lives."""
-        from .configloader import load_config_from_file
+        scripts and cron jobs are exactly where a config file lives.
 
-        config = load_config_from_file(config_path, keys=["db_params"])
-        db_params = config.get("db_params", {})
+        ``prio_ceiling`` left unset takes the file's ``prio_ceiling`` (else
+        1000), and a file with no db_params is a ConfigError rather than a
+        silent fallback to asyncpg's environment defaults — both exactly as
+        in JobClient.from_config(), which documents why.
+        """
+        from .configloader import ConfigError, load_config_from_file
+
+        config = load_config_from_file(config_path, keys=["db_params", "prio_ceiling"])
+        db_params = config.get("db_params")
+        if not db_params:
+            raise ConfigError(f"No db_params found in config file: {config_path}")
+
+        if prio_ceiling is None:
+            configured = config.get("prio_ceiling")
+            prio_ceiling = (
+                DEFAULT_PRIO_CEILING if configured is None else int(configured)
+            )
+
         return cls(
             min_size=min_size,
             max_size=max_size,

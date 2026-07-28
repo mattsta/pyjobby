@@ -167,7 +167,9 @@ class TestConfigFile:
 
     async def test_config_without_db_params_exits_one(self, tmp_path):
         conf = tmp_path / "nodb.toml"
-        conf.write_text("workers = 4\n")
+        # a KNOWN key, so this is the no-db_params failure and not the
+        # unknown-key one (which the loader refuses first, by name)
+        conf.write_text("prio_ceiling = 900\n")
 
         result = await run_cli("--config", str(conf), "jobs", "list")
 

@@ -14,16 +14,17 @@ import sys
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 from click.testing import CliRunner
 
-from pyjobby import db
+from pyjobby import db, migrations
 from pyjobby.pj import STMTS, JobSystem, workit
+from pyjobby.procs import write_config_toml
 
 from .conftest import wait_for_job_state
+from .schema_fixtures import ScratchDatabases
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-# stays a str: it is passed straight into argv lists
-CONFIG_PATH = str(REPO_ROOT / "pyjobby.toml")
 
 
 def run_workit_briefly(args: list[str], cwd: Path, timeout: float = 2) -> bool:
@@ -55,6 +56,124 @@ def run_workit_briefly(args: list[str], cwd: Path, timeout: float = 2) -> bool:
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=5)
     return alive_at_kill
+
+
+def run_workit(args: list[str], timeout: float = 60) -> subprocess.CompletedProcess:
+    """Run `python -m pyjobby.pj <args>` TO COMPLETION and return it.
+
+    For the launches that are supposed to END on their own — a preflight
+    refusal, a fleet that died. Its own process group is killed if it does
+    not, so a launcher that hangs fails the test instead of leaking workers
+    into the next one.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "pyjobby.pj", *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=REPO_ROOT,
+        start_new_session=True,
+    )
+    try:
+        output, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        output, _ = proc.communicate(timeout=10)
+        raise
+    return subprocess.CompletedProcess(proc.args, proc.returncode, output, "")
+
+
+@pytest.fixture
+def live_config(db_params, tmp_path) -> str:
+    """A config file pointing at THIS session's database.
+
+    Every launch that has to get PAST the startup preflight needs one: the
+    repo's own pyjobby.toml is the sample operators copy, not a live
+    deployment (and under xdist each worker owns a different database).
+    """
+    return str(write_config_toml(tmp_path / "pyjobby.toml", db_params))
+
+
+@pytest_asyncio.fixture
+async def scratch(db_params):
+    """Throwaway databases, all dropped when the test ends."""
+    factory = ScratchDatabases(db_params)
+    try:
+        yield factory
+    finally:
+        await factory.close()
+
+
+# ============================================================================
+# Test the startup preflight
+# ============================================================================
+
+
+class TestWorkitPreflight:
+    """`pj` answers "can I use this database?" ONCE, itself, before forking.
+
+    Without it, an unreachable database or a missing schema became N child
+    processes logging from inside a retry loop while the launcher sat there
+    looking healthy and — when the workers died outright — exited 0.
+    """
+
+    def test_an_unreachable_database_exits_2_naming_the_target(self, tmp_path):
+        config = write_config_toml(
+            tmp_path / "pyjobby.toml",
+            {
+                "host": "127.0.0.1",
+                # port 1 is privileged and unbound: connection refused, now
+                "port": 1,
+                "database": "pyjobby",
+                "user": "nobody",
+                "password": "hunter2-must-not-be-logged",
+            },
+        )
+
+        result = run_workit(["--config", str(config), "--workers", "1"])
+
+        assert result.returncode == 2, result.stdout
+        assert "127.0.0.1:1/pyjobby" in result.stdout
+        assert "hunter2" not in result.stdout, "the password reached the log"
+
+    @pytest.mark.asyncio
+    async def test_a_database_without_the_schema_exits_2_naming_the_remedy(
+        self, scratch, tmp_path
+    ):
+        """Reachable, empty, and therefore useless: every worker would have
+        died on its first prepared statement."""
+        params = await scratch.create(install=None)
+        config = write_config_toml(tmp_path / "pyjobby.toml", params)
+
+        result = run_workit(["--config", str(config), "--workers", "1"])
+
+        assert result.returncode == 2, result.stdout
+        assert params["database"] in result.stdout
+        assert migrations.MIGRATE_REMEDY in result.stdout
+
+    def test_a_fleet_that_all_died_exits_non_zero(self, db_params, tmp_path):
+        """The database is fine; the workers are not.
+
+        `pj` used to swallow every worker exception ("what went wrong now?")
+        and then exit 0 unconditionally, so a fleet in which every process
+        died at startup was reported as a success — to systemd, to the deploy
+        script, to everything that reads an exit code. The crash here is a
+        real misconfiguration: a web_listen socket in a directory that does
+        not exist."""
+        config = write_config_toml(tmp_path / "pyjobby.toml", db_params)
+        missing_dir = tmp_path / "no-such-directory"
+        with config.open("a") as fh:
+            fh.write(
+                "\n[web_listen]\n"
+                f'sites = [{{ path = "{missing_dir / "pj.sock"}" }}]\n'
+            )
+
+        result = run_workit(["--config", str(config), "--workers", "2"])
+
+        assert result.returncode == 1, result.stdout
+        assert "crashed during startup/run" in result.stdout
+        assert "exited non-zero" in result.stdout
 
 
 # ============================================================================
@@ -285,21 +404,29 @@ class TestJobProcessingCounters:
 
 
 class TestWorkitCLIWithConfig:
-    """Test workit CLI with valid configuration."""
+    """Test workit CLI with valid configuration.
 
-    def test_workit_loads_config_and_exits_quickly(self):
+    The config is written from THIS session's connection parameters rather
+    than read from the repo's `pyjobby.toml`: that file is the sample an
+    operator copies (its password is a `${ENV_VAR}` reference to a database
+    that need not exist here), and a launch test pointed at it proves
+    nothing about the flags it is passing — the launcher now refuses at the
+    preflight before it ever parses them.
+    """
+
+    def test_workit_loads_config_and_exits_quickly(self, live_config):
         """Test workit loads config and launches successfully."""
         # Run workit with a very short timeout to just test startup
         # Use --workers=1 for minimal spawning
         assert run_workit_briefly(
-            ["--config", CONFIG_PATH, "--workers", "1"],
+            ["--config", live_config, "--workers", "1"],
             cwd=REPO_ROOT,
         )
 
         # Process group is killed by the helper, which is expected
         # We just want to verify it starts correctly
 
-    def test_workit_with_multiple_queues(self):
+    def test_workit_with_multiple_queues(self, live_config):
         """Two queues at --workers 3 is six workers, three per queue —
         the flag is PER QUEUE (behavior proven with registry assertions in
         test_entry_points; this only checks the launcher survives the
@@ -307,7 +434,7 @@ class TestWorkitCLIWithConfig:
         assert run_workit_briefly(
             [
                 "--config",
-                CONFIG_PATH,
+                live_config,
                 "--queue",
                 "high",
                 "--queue",
@@ -318,12 +445,12 @@ class TestWorkitCLIWithConfig:
             cwd=REPO_ROOT,
         )
 
-    def test_workit_with_capabilities(self):
+    def test_workit_with_capabilities(self, live_config):
         """Test workit with capability options."""
         assert run_workit_briefly(
             [
                 "--config",
-                CONFIG_PATH,
+                live_config,
                 "--cap",
                 "gpu",
                 "--cap",
@@ -334,12 +461,12 @@ class TestWorkitCLIWithConfig:
             cwd=REPO_ROOT,
         )
 
-    def test_workit_with_path_option(self):
+    def test_workit_with_path_option(self, live_config):
         """Test workit with extra job-class path options."""
         assert run_workit_briefly(
             [
                 "--config",
-                CONFIG_PATH,
+                live_config,
                 "--path",
                 "/tmp",
                 "--path",
@@ -359,11 +486,17 @@ class TestWorkitCLIWithConfig:
 class TestConfigloaderIntegration:
     """Test configloader integration with workit."""
 
-    def test_load_config_from_file(self):
-        """Test that load_config_from_file works correctly."""
+    def test_load_config_from_file(self, live_config):
+        """workit's two keys come back from a file that declares both."""
         from pyjobby.configloader import load_config_from_file
 
-        config = load_config_from_file(CONFIG_PATH, {"db_params", "web_listen"})
+        with Path(live_config).open("a") as fh:
+            fh.write(
+                "\n[web_listen]\n"
+                'sites = [{ host = "127.0.0.1", port = 8080 }]\npaths = []\n'
+            )
+
+        config = load_config_from_file(live_config, {"db_params", "web_listen"})
 
         assert "db_params" in config
         assert "database" in config["db_params"]

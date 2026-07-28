@@ -53,9 +53,9 @@ import click
 from aiohttp import web
 from loguru import logger
 
-from . import db, dxe
+from . import db, dxe, migrations
 from .client import DEFAULT_PRIO_CEILING
-from .configloader import load_config_from_file
+from .configloader import describe_db_target, load_config_from_file
 from .retry_strategies import DEFAULT_MAX_RETRIES
 
 fmt = (
@@ -518,7 +518,15 @@ class JobSystem:
                 logger.info("Database connection re-established")
                 return
             except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as e:
-                logger.warning(f"Reconnect attempt failed ({e}); retrying...")
+                # A reachable database with no schema fails here forever, once
+                # a second, on a line that reads like a network blip. Naming
+                # the remedy is the difference between an operator watching a
+                # retry loop and an operator fixing it.
+                hint = migrations.schema_error_hint(e)
+                logger.warning(
+                    f"Reconnect attempt failed ({e}); retrying..."
+                    + (f" {hint}" if hint else "")
+                )
                 await asyncio.sleep(1.0)
 
     # ------------------------------------------------------------------
@@ -2190,6 +2198,43 @@ class Job:
         return interval
 
 
+async def _preflight_problem(db_params: dict[str, Any]) -> str | None:
+    """Connect once and check the schema is there. Returns the operator-facing
+    problem, or None when the database is usable.
+
+    Run BEFORE any worker is forked. A worker that cannot reach the database
+    or finds no schema is a worker that logs from inside a retry loop in one
+    of N child processes, N times a second, while the launcher sits there
+    looking healthy — so the launcher asks the question once, itself, and can
+    then answer it as an exit code.
+    """
+    target = describe_db_target(db_params)
+    try:
+        conn = await db.connect(**db_params)
+    except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as e:
+        hint = migrations.schema_error_hint(e)
+        return (
+            f"Cannot connect to the database at {target}: {e}"
+            + (f" {hint}" if hint else "")
+        )
+    try:
+        if not await conn.fetchval("SELECT to_regclass('public.jorb')"):
+            return (
+                f"No pyjobby schema in the database at {target}: "
+                f"{migrations.SCHEMA_REMEDY}"
+            )
+    except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as e:
+        hint = migrations.schema_error_hint(e)
+        return (
+            f"Cannot query the database at {target}: {e}"
+            + (f" {hint}" if hint else "")
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await conn.close()
+    return None
+
+
 def runAndDone(
     qname: str,
     caps: tuple[str],
@@ -2231,9 +2276,18 @@ def runAndDone(
     try:
         asyncio.run(runner.run())
     except KeyboardInterrupt:
+        # Ctrl-C reaches every process in the group; a worker stopping on it
+        # is a clean stop, not a failure.
         return
     except Exception:
-        logger.exception("what went wrong now?")
+        # Swallowing this exited the child 0, and the launcher then reported
+        # success for a fleet in which every worker had died on the first
+        # statement. Log it WITH the worker it belongs to, then re-raise so
+        # the child's exit code says failed and workit() can too.
+        logger.exception(
+            f"[worker {n} on queue {qname}] crashed during startup/run"
+        )
+        raise
 
 
 @click.command()
@@ -2377,6 +2431,14 @@ def workit(
         logger.error("No db_params found in config: {}", config)
         sys.exit(1)
 
+    # Ask the one question every worker is about to ask, before forking any of
+    # them: exit code 2 (a startup precondition) rather than N children in
+    # retry loops behind a launcher that reports success.
+    problem = asyncio.run(_preflight_problem(loadedConfig["db_params"]))
+    if problem is not None:
+        logger.error(problem)
+        sys.exit(2)
+
     # One full set of workers per DISTINCT named queue. Duplicates collapse
     # (asking for the same queue twice asks for the same set twice), which
     # also means `--queue Q --queue Q --workers 2` is two workers on Q
@@ -2450,9 +2512,26 @@ def workit(
                 os.kill(p.pid, signum)
 
     signal.signal(signal.SIGTERM, signalBroadcast)
+    failed: list[tuple[int | None, int]] = []
     for l in launched:
         with contextlib.suppress(KeyboardInterrupt):
             l.join()
+        # None = the join was interrupted (Ctrl-C, suppressed above) and this
+        # child's fate is unknown; 0 = a clean stop, which is what SIGTERM and
+        # Ctrl-C produce, so a graceful shutdown still exits 0. Everything
+        # else — a crash (1) or a signal death (negative) — is a failure the
+        # launcher must not report as success.
+        if l.exitcode:
+            failed.append((l.pid, l.exitcode))
+
+    if failed:
+        logger.error(
+            "{} of {} worker process(es) exited non-zero: {}",
+            len(failed),
+            len(launched),
+            ", ".join(f"pid {pid} exit {code}" for pid, code in failed),
+        )
+        sys.exit(1)
 
     # success!
     sys.exit(0)

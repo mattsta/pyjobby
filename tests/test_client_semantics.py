@@ -839,3 +839,154 @@ class TestPriorityCeiling:
             )
         finally:
             await conn.close()
+
+
+class TestFromConfig:
+    """What `from_config` takes from the file, and what it refuses.
+
+    The config file is the deployment's single declaration — every daemon
+    reads the same one — so a client built from it must not quietly connect
+    somewhere else, and must not run at a different ceiling than the fleet
+    the same file configures.
+    """
+
+    def write(self, tmp_path, db_params, **extra):
+        from pyjobby.procs import write_config_toml
+
+        return str(write_config_toml(tmp_path / "pyjobby.toml", db_params, **extra))
+
+    async def test_missing_db_params_is_refused_not_guessed(self, tmp_path):
+        """Without db_params, asyncpg falls back to PGHOST/PGDATABASE/the
+        unix user — a DIFFERENT database than the one the operator wrote
+        down, discovered much later and never named in the failure."""
+        from pyjobby.client import SyncJobClient
+        from pyjobby.configloader import ConfigError
+
+        path = tmp_path / "pyjobby.toml"
+        path.write_text("prio_ceiling = 900\n")
+
+        with pytest.raises(ConfigError, match="No db_params found"):
+            await JobClient.from_config(str(path))
+
+        with pytest.raises(ConfigError, match="No db_params found"):
+            await asyncio.to_thread(SyncJobClient.from_config, str(path))
+
+        # and it names the file the operator has to go and edit
+        with pytest.raises(ConfigError, match=r"pyjobby\.toml"):
+            await JobClient.from_config(str(path))
+
+    async def test_the_files_prio_ceiling_is_the_clients_ceiling(
+        self, db_params, unique_queue, tmp_path
+    ):
+        """One declaration: `prio_ceiling` in the file is what `pj` runs its
+        workers at, so a client reading that file must refuse what those
+        workers would never claim."""
+        config = self.write(tmp_path, db_params, prio_ceiling=500)
+
+        client = await JobClient.from_config(config)
+        try:
+            assert client.prio_ceiling == 500
+
+            with pytest.raises(ValueError) as refused:
+                await client.enqueue(
+                    "tests.test_client_semantics.CountJob",
+                    queue=unique_queue,
+                    priority=501,
+                    n=1,
+                )
+            assert "above the worker priority ceiling (500)" in str(refused.value)
+
+            # the declared ceiling itself is still claimable
+            job_id = await client.enqueue(
+                "tests.test_client_semantics.CountJob",
+                queue=unique_queue,
+                priority=500,
+                n=1,
+            )
+            assert (
+                await client.pool.fetchval(
+                    "SELECT prio FROM jorb WHERE id = $1", job_id
+                )
+            ) == 500
+        finally:
+            await client.close()
+
+    async def test_an_explicit_ceiling_still_wins_over_the_file(
+        self, db_params, unique_queue, tmp_path
+    ):
+        """The argument is the caller saying they know better about THIS
+        client; the file is the default, not an override."""
+        config = self.write(tmp_path, db_params, prio_ceiling=500)
+
+        client = await JobClient.from_config(config, prio_ceiling=5000)
+        try:
+            assert client.prio_ceiling == 5000
+            job_id = await client.enqueue(
+                "tests.test_client_semantics.CountJob",
+                queue=unique_queue,
+                priority=5000,
+                n=1,
+            )
+            assert (
+                await client.pool.fetchval(
+                    "SELECT prio FROM jorb WHERE id = $1", job_id
+                )
+            ) == 5000
+        finally:
+            await client.close()
+
+    async def test_a_file_without_a_ceiling_gets_the_platform_default(
+        self, db_params, tmp_path
+    ):
+        from pyjobby.client import DEFAULT_PRIO_CEILING
+
+        client = await JobClient.from_config(self.write(tmp_path, db_params))
+        try:
+            assert client.prio_ceiling == DEFAULT_PRIO_CEILING
+        finally:
+            await client.close()
+
+    async def test_the_sync_facade_reads_the_ceiling_too(self, db_params, tmp_path):
+        """Scripts and cron jobs are exactly where a config file lives."""
+        from pyjobby.client import SyncJobClient
+
+        config = self.write(tmp_path, db_params, prio_ceiling=500)
+
+        def _drive() -> int:
+            with SyncJobClient.from_config(config) as client:
+                return client._client.prio_ceiling
+
+        assert await asyncio.to_thread(_drive) == 500
+
+    async def test_enqueue_against_an_unmigrated_database_says_so(
+        self, db_params, unique_queue, tmp_path
+    ):
+        """Enqueue is the first thing an application does against a database
+        nobody migrated, and asyncpg answers `relation "jorb" does not exist`
+        from inside the driver: true, and useless — it names neither the
+        database nor the fix."""
+        from pyjobby import migrations
+        from tests.schema_fixtures import ScratchDatabases
+
+        factory = ScratchDatabases(db_params)
+        try:
+            params = await factory.create(install=None)  # empty: no schema
+            client = await JobClient.from_config(self.write(tmp_path, params))
+            try:
+                with pytest.raises(RuntimeError) as boom:
+                    await client.enqueue(
+                        "tests.test_client_semantics.CountJob",
+                        queue=unique_queue,
+                        n=1,
+                    )
+            finally:
+                await client.close()
+        finally:
+            await factory.close()
+
+        message = str(boom.value)
+        # the database, by name, without the password that got us there
+        assert f"{params['host']}:{params['port']}/{params['database']}" in message
+        assert migrations.MIGRATE_REMEDY in message
+        # and the driver's own detail is still one traceback frame away
+        assert isinstance(boom.value.__cause__, asyncpg.UndefinedTableError)

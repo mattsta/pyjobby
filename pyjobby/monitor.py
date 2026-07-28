@@ -96,6 +96,7 @@ import contextlib
 import datetime
 import signal
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 import asyncpg  # type: ignore[import-untyped]
 from loguru import logger
@@ -1224,7 +1225,7 @@ async def _run_retention(
 
 
 async def monitor(
-    dsn: str,
+    target: str | dict[str, Any],
     check_interval: float = 10,
     batch_size: int = 100,
     liveness_grace_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS,
@@ -1235,6 +1236,14 @@ async def monitor(
     retention_max_seconds: float = 5.0,
 ) -> None:
     """Run all sweeps every ``check_interval`` seconds, forever.
+
+    ``target`` is either a DSN string or a dict of asyncpg.connect keyword
+    arguments — the ``db_params`` table of a pyjobby.toml, passed through
+    whole. The config path used to be flattened into a DSN string built by
+    interpolation, which dropped every key beyond host/port/database/user/
+    password (ssl, server_settings, statement_cache_size, ...) and produced
+    an unusable URL for a unix-socket host, so the one process an operator
+    configures by file was the one that could not use the file's settings.
 
     Retention is on by default and the two windows are independent:
     ``retention_days`` deletes whole terminal jobs — and the emptied DAGs,
@@ -1252,7 +1261,10 @@ async def monitor(
     Each retention sweep drains its backlog within a ``retention_max_seconds``
     budget per cycle, so it can catch up on a busy install without ever
     delaying the latency-critical sweeps above it."""
-    pool = await db.create_pool(dsn, min_size=1, max_size=2)
+    if isinstance(target, str):
+        pool = await db.create_pool(target, min_size=1, max_size=2)
+    else:
+        pool = await db.create_pool(min_size=1, max_size=2, **target)
 
     # SIGTERM/SIGINT set the stop event so shutdown is a clean end-of-cycle
     # rather than a kill mid-sweep: the default SIGTERM disposition never
@@ -1454,27 +1466,26 @@ def cli() -> None:
         retention (on by default; --retention-days 0 keeps everything)."""
         import asyncio
 
-        if not dsn:
-            if config:
-                from urllib.parse import quote
+        from .configloader import describe_db_target, load_config_from_file
 
-                from .configloader import load_config_from_file
-
-                cfg = load_config_from_file(config, keys=["db_params"])
-                db_params = cfg.get("db_params", {})
-                user = quote(str(db_params.get("user", "")), safe="")
-                password = quote(str(db_params.get("password", "")), safe="")
-                dsn = (
-                    f"postgresql://{user}:{password}"
-                    f"@{db_params.get('host')}:{db_params.get('port', 5432)}"
-                    f"/{db_params.get('database')}"
-                )
-            else:
-                click.echo("Error: Must provide --dsn or --config", err=True)
-                sys.exit(1)
+        target: str | dict[str, Any]
+        if dsn:
+            target = dsn
+        elif config:
+            # The config's db_params are handed to asyncpg WHOLE. Rebuilding
+            # a URL from five of its keys silently dropped the rest and could
+            # not express a unix-socket host at all.
+            cfg = load_config_from_file(config, keys=["db_params"])
+            db_params = cfg.get("db_params")
+            if not db_params:
+                raise click.ClickException(f"No db_params found in config: {config}")
+            target = db_params
+        else:
+            click.echo("Error: Must provide --dsn or --config", err=True)
+            sys.exit(1)
 
         click.echo(f"Starting monitor (check every {check_interval}s)...")
-        click.echo(f"DSN: {dsn.split('@')[1] if '@' in dsn else dsn}")
+        click.echo(f"Database: {describe_db_target(target)}")
         click.echo(
             "Retention: jobs "
             + (f"older than {retention_days}d" if retention_days else "kept forever")
@@ -1488,7 +1499,7 @@ def cli() -> None:
 
         asyncio.run(
             monitor(
-                dsn,
+                target,
                 check_interval=check_interval,
                 liveness_grace_seconds=liveness_grace,
                 claimed_grace_seconds=claimed_grace,

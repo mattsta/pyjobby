@@ -40,7 +40,7 @@ from __future__ import annotations
 import os
 import re
 import tomllib
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +63,33 @@ _ENV_REF = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}\Z")
 #: kilobytes; a megabytes-large one is a mistake or a resource-exhaustion
 #: attempt, and reading it into memory to then reject it is the exhaustion.
 _MAX_CONFIG_BYTES = 1024 * 1024
+
+#: Every top-level key a pyjobby config may define. A key outside this set is
+#: refused rather than skipped: each daemon asks for the SUBSET of keys it
+#: cares about, so an unknown key looks exactly like a key this particular
+#: process did not want -- and `prio_ceilng = 100` would then silently leave
+#: the setting at its default in every process, forever, with the file
+#: sitting there looking like it said otherwise.
+KNOWN_TOP_LEVEL_KEYS = frozenset({"db_params", "prio_ceiling", "web_listen"})
+
+
+def describe_db_target(target: Mapping[str, Any] | str | None) -> str:
+    """Name a connection target for an operator-facing message.
+
+    Host, port and database only. A failure message has to say WHICH database
+    could not be reached -- an operator running four deployments cannot act on
+    "connection refused" -- and it must do that without printing the password
+    that both a db_params table and a DSN string carry.
+    """
+    if target is None:
+        return "the connected database"
+    if isinstance(target, str):
+        # everything before the last '@' in a DSN is userinfo, i.e. secret
+        return target.rsplit("@", 1)[-1]
+    host = target.get("host", "localhost")
+    port = target.get("port", 5432)
+    database = target.get("database", "?")
+    return f"{host}:{port}/{database}"
 
 
 def _substitute_env(value: Any, *, source: str) -> Any:
@@ -95,6 +122,9 @@ def load_config_from_file(filename: str, keys: Iterable[str]) -> dict[str, Any]:
     ``.get``), so optional settings need no null spelling. A ``.py`` config
     is refused by name with the reason: the executable-config format it
     implies is exactly what this loader exists not to be.
+
+    A top-level key outside ``KNOWN_TOP_LEVEL_KEYS`` is a ConfigError naming
+    it, whether or not this caller asked for it -- see that constant.
     """
     path = Path(filename)
     if path.suffix == ".py":
@@ -127,6 +157,15 @@ def load_config_from_file(filename: str, keys: Iterable[str]) -> dict[str, Any]:
         # `except RuntimeError` guard in every CLI entry point catches them
         # instead of a raw traceback escaping.
         raise ConfigError(f"Failed to read config file: {filename}: {e}") from e
+
+    unknown = sorted(k for k in raw if k.lower() not in KNOWN_TOP_LEVEL_KEYS)
+    if unknown:
+        known = ", ".join(sorted(KNOWN_TOP_LEVEL_KEYS))
+        raise ConfigError(
+            f"unknown key {unknown[0]!r} in {filename}; known keys are "
+            f"{known}. A typo here silently disables the setting, so it is "
+            f"refused rather than skipped."
+        )
 
     wanted = {k.lower() for k in keys}
     try:

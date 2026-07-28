@@ -112,19 +112,6 @@ def fail(
     raise problem(code)
 
 
-#: The errors PostgreSQL raises when the code addresses an object the database
-#: does not have. Every one of them means the same thing here -- this database
-#: was installed from a different revision of schema.sql, or from none at all
-#: -- and none of them means the operator typed something wrong.
-SCHEMA_ERRORS = (
-    asyncpg.UndefinedTableError,
-    asyncpg.UndefinedColumnError,
-    asyncpg.UndefinedFunctionError,
-    asyncpg.UndefinedObjectError,
-    asyncpg.InvalidSchemaNameError,
-)
-
-
 class PyjobbyCLI(click.Group):
     """The root group, with one job beyond click's: turning a missing or stale
     schema into an answer instead of a stack trace.
@@ -148,7 +135,7 @@ class PyjobbyCLI(click.Group):
     def invoke(self, ctx: click.Context) -> Any:
         try:
             return super().invoke(ctx)
-        except SCHEMA_ERRORS as e:
+        except migrations.SCHEMA_ERRORS as e:
             fail(
                 f"The database schema is missing or out of date: {e}",
                 "Install or upgrade it with `pj-admin db migrate`, then "

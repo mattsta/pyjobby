@@ -12,7 +12,12 @@ from __future__ import annotations
 
 import pytest
 
-from pyjobby.configloader import ConfigError, load_config_from_file
+from pyjobby.configloader import (
+    KNOWN_TOP_LEVEL_KEYS,
+    ConfigError,
+    describe_db_target,
+    load_config_from_file,
+)
 
 
 def write(tmp_path, text: str, name: str = "pyjobby.toml"):
@@ -27,7 +32,6 @@ class TestLoading:
             tmp_path,
             """
 prio_ceiling = 900
-unrelated = "ignored"
 
 [db_params]
 host = "localhost"
@@ -45,8 +49,7 @@ paths = []
             "prio_ceiling": 900,
             "db_params": {"host": "localhost", "port": 5432},
         }
-        assert "unrelated" not in cfg
-        assert "web_listen" not in cfg  # not requested
+        assert "web_listen" not in cfg  # known, but not requested
 
     def test_keys_are_matched_case_insensitively(self, tmp_path):
         path = write(tmp_path, 'DB_PARAMS = { host = "h" }\n')
@@ -63,6 +66,84 @@ paths = []
         cfg = load_config_from_file(path, ["db_params", "web_listen"])
 
         assert cfg.get("web_listen") is None
+
+
+class TestUnknownKeys:
+    """A key outside KNOWN_TOP_LEVEL_KEYS is refused, not skipped.
+
+    Every daemon asks for the SUBSET of keys it cares about, so a dropped
+    unknown key is indistinguishable from a key this process did not want:
+    `prio_ceilng = 100` would leave the ceiling at its default in every
+    process, forever, with the file sitting there saying otherwise.
+    """
+
+    def test_an_unknown_key_is_refused_naming_it_and_the_file(self, tmp_path):
+        path = write(tmp_path, '[db_params]\nhost = "h"\n\n[web_lissten]\nx = 1\n')
+
+        with pytest.raises(ConfigError) as excinfo:
+            load_config_from_file(path, ["db_params"])
+
+        message = str(excinfo.value)
+        assert "web_lissten" in message, "the message must name the typo"
+        assert path in message, "the message must name the file"
+        for known in KNOWN_TOP_LEVEL_KEYS:
+            assert known in message, "the message must list the known keys"
+
+    def test_it_is_refused_even_when_the_caller_did_not_ask_for_it(self, tmp_path):
+        """The check is the FILE's, not the request's: pj asks for three keys
+        and the scheduler for two, so a typo caught only by whoever happened
+        to request that key is a typo caught by nobody."""
+        path = write(tmp_path, 'prio_ceilng = 100\n[db_params]\nhost = "h"\n')
+
+        with pytest.raises(ConfigError, match="prio_ceilng"):
+            load_config_from_file(path, ["db_params"])
+
+    def test_known_keys_load_in_any_case(self, tmp_path):
+        """Key matching is case-insensitive, so the unknown-key check has to
+        be too, or DB_PARAMS becomes an error."""
+        path = write(tmp_path, 'DB_PARAMS = { host = "h" }\nPRIO_CEILING = 7\n')
+
+        cfg = load_config_from_file(path, ["db_params", "prio_ceiling"])
+
+        assert cfg == {"db_params": {"host": "h"}, "prio_ceiling": 7}
+
+    def test_the_shipped_config_uses_only_known_keys(self):
+        """The repo's own pyjobby.toml is the file operators copy."""
+        import tomllib
+        from pathlib import Path
+
+        shipped = Path(__file__).resolve().parent.parent / "pyjobby.toml"
+        with shipped.open("rb") as fh:
+            raw = tomllib.load(fh)
+
+        assert set(raw) <= KNOWN_TOP_LEVEL_KEYS
+
+
+class TestDescribeDbTarget:
+    """Operator-facing messages name the database and never the password."""
+
+    def test_db_params_become_host_port_database(self):
+        assert (
+            describe_db_target(
+                {
+                    "host": "db.internal",
+                    "port": 6432,
+                    "database": "pyjobby",
+                    "user": "pj",
+                    "password": "hunter2",
+                }
+            )
+            == "db.internal:6432/pyjobby"
+        )
+
+    def test_a_dsn_keeps_only_what_follows_the_credentials(self):
+        described = describe_db_target("postgresql://pj:hunter2@db.internal:5432/pj")
+
+        assert described == "db.internal:5432/pj"
+        assert "hunter2" not in described
+
+    def test_no_params_still_describes_something(self):
+        assert describe_db_target(None) == "the connected database"
 
 
 class TestEnvSubstitution:

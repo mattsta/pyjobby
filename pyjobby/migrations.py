@@ -206,6 +206,42 @@ REQUIRED_ENUM_LABELS: dict[str, tuple[str, ...]] = {
 #: every stale-schema message in the platform should name the same command.
 MIGRATE_REMEDY = "run: pj-admin db migrate"
 
+#: The errors PostgreSQL raises when the code addresses an object the database
+#: does not have. Every one of them means the same thing anywhere in the
+#: platform -- this database was installed from a different revision of the
+#: base schema, or from none at all -- and none of them means the operator
+#: typed something wrong.
+#:
+#: It lives HERE, next to the remedy and the required-shape manifest, because
+#: the daemons need it too: pj's startup preflight and JobClient.enqueue both
+#: have to recognise a missing schema, and a copy of this tuple inside the
+#: admin CLI is a copy the daemons cannot import.
+SCHEMA_ERRORS = (
+    asyncpg.UndefinedTableError,
+    asyncpg.UndefinedColumnError,
+    asyncpg.UndefinedFunctionError,
+    asyncpg.UndefinedObjectError,
+    asyncpg.InvalidSchemaNameError,
+)
+
+#: The whole sentence a daemon or client prints when it meets one of them.
+#: Built from MIGRATE_REMEDY so the command is still written once.
+SCHEMA_REMEDY = (
+    f"The database schema is missing or out of date: {MIGRATE_REMEDY}, "
+    f"then confirm with: pj-admin doctor"
+)
+
+
+def schema_error_hint(e: BaseException) -> str | None:
+    """``SCHEMA_REMEDY`` when ``e`` is a missing-object error, else None.
+
+    So a caller can append the remedy to its own message without importing
+    the error tuple and reimplementing the isinstance check -- the retry
+    loops in particular log the same line for a network blip and for a
+    database that has no schema, and only the second one has an answer.
+    """
+    return SCHEMA_REMEDY if isinstance(e, SCHEMA_ERRORS) else None
+
 
 @dataclass
 class Migration:

@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import datetime
 import inspect
+import uuid
 
 import pytest
 from loguru import logger
@@ -1949,6 +1950,44 @@ class TestMonitorLoop:
             "SELECT * FROM jorb_worker WHERE id = $1", dead_worker
         )
         assert worker["shutdown_at"] is not None
+
+    async def test_db_params_reach_asyncpg_whole(
+        self, db_pool, unique_queue, db_params
+    ):
+        """--config mode hands asyncpg the db_params table itself.
+
+        It used to rebuild a five-key URL from it by string interpolation,
+        which dropped every other key (ssl, server_settings,
+        statement_cache_size, ...) and could not express a unix-socket host
+        at all — so the one daemon an operator configures by file was the one
+        that could not use the file's settings. The proof here is a key no
+        such rebuild ever carried: server_settings.application_name, read
+        back out of pg_stat_activity."""
+        marker = f"pj-monitor-{uuid.uuid4().hex[:8]}"
+        timed_out = await insert_job(
+            db_pool, unique_queue, state="running", timeout_at_offset_seconds=-5
+        )
+
+        task = asyncio.create_task(
+            monitor(
+                {**db_params, "server_settings": {"application_name": marker}},
+                check_interval=0.1,
+                liveness_grace_seconds=60,
+            )
+        )
+        try:
+            # it really is the monitor: the sweep it exists for happened
+            await wait_for_job_state(db_pool, timed_out, ("queued",), timeout=10)
+            connections = await db_pool.fetchval(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1",
+                marker,
+            )
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert connections >= 1, "the monitor's pool dropped the extra db_params"
 
     async def test_one_failing_sweep_does_not_starve_the_others(
         self, db_pool, unique_queue, db_params, monkeypatch

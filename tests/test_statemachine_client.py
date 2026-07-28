@@ -276,7 +276,8 @@ def test_sync_machine_drives_a_machine_from_plain_code(db_params, unique_queue):
         assert order.history() == []
 
         assert client.machine(order.id, OrderMachine).id == order.id
-        assert order.cancel() == "cancelled"
+        # cancel answers in the unified verb shape, like every surface
+        assert order.cancel() == {"job_id": order.id, "status": "cancelled"}
 
 
 def test_the_sync_facade_mirrors_every_async_method():
