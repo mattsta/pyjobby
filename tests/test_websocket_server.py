@@ -4,13 +4,18 @@ Using LIVE database operations with NO MOCKS for maximum correctness guarantees!
 """
 
 import asyncio
+import inspect
 import json
-from datetime import UTC, datetime
+import re
 
 import pytest
-from aiohttp import web
 
-from pyjobby.websocket_server import ClientConnection, WebSocketServer
+from pyjobby.websocket_server import (
+    ACTIONS,
+    DASHBOARD_HTML,
+    ClientConnection,
+    WebSocketServer,
+)
 from tests.conftest import unique_name
 
 # db_params comes from conftest.py (honors PYJOBBY_TEST_DSN)
@@ -243,7 +248,13 @@ class TestQueueStatsQuery:
 
 
 class TestServerStart:
-    """Test server start functionality - covers lines 586-630."""
+    """The HTTP surface `pj-ws` serves: the dashboard page, /ws and /health.
+
+    Every test here mounts `server.create_app()` -- the SAME routing table
+    `start()` installs -- rather than re-declaring a handler in the test. A
+    test that rebuilds the handler it is checking passes whatever the server
+    does, including nothing.
+    """
 
     @pytest.mark.asyncio
     async def test_health_check_endpoint(self, db_params, aiohttp_client):
@@ -252,27 +263,8 @@ class TestServerStart:
         await server.init_db_pool()
         await server.init_notify_connection()
 
-        # Create app with health check
-        app = web.Application()
+        client = await aiohttp_client(server.create_app())
 
-        async def health_check(request):
-            return web.json_response(
-                {
-                    "status": "healthy",
-                    "stats": server.stats,
-                    "notify_connection": not server.notify_conn.is_closed()
-                    if server.notify_conn
-                    else False,
-                    "timestamp": datetime.now(UTC).isoformat(),
-                }
-            )
-
-        app.router.add_get("/health", health_check)
-
-        # Create test client
-        client = await aiohttp_client(app)
-
-        # Test health check
         resp = await client.get("/health")
         assert resp.status == 200
 
@@ -284,6 +276,95 @@ class TestServerStart:
         # Cleanup
         await server.notify_conn.close()
         await server.db_pool.close()
+
+    @pytest.mark.asyncio
+    async def test_websocket_endpoint_still_accepts_clients(
+        self, db_params, aiohttp_client
+    ):
+        """Adding routes must not have moved the one that matters."""
+        server = WebSocketServer(db_params)
+        await server.init_db_pool()
+
+        client = await aiohttp_client(server.create_app())
+
+        async with client.ws_connect("/ws") as ws:
+            welcome = await asyncio.wait_for(ws.receive_json(), timeout=5)
+            assert welcome["event"] == "connected"
+            assert welcome["data"]["server"] == "pyjobby-websocket"
+
+        await server.db_pool.close()
+
+    @pytest.mark.asyncio
+    async def test_dashboard_is_served_at_root(self, db_params, aiohttp_client):
+        """The page ships in the wheel and is served from it.
+
+        It used to live in a top-level `frontend/` directory: outside the
+        package, so no install ever had it, and the docs told operators to
+        clone the repository and open a file:// URL instead.
+        """
+        server = WebSocketServer(db_params)
+        client = await aiohttp_client(server.create_app())
+
+        resp = await client.get("/")
+        assert resp.status == 200
+        assert resp.content_type == "text/html"
+
+        body = await resp.text()
+        assert "<title>Pyjobby Live Dashboard</title>" in body
+        assert "Real-time job monitoring and management" in body
+
+    @pytest.mark.asyncio
+    async def test_dashboard_derives_its_websocket_url(self, db_params, aiohttp_client):
+        """The served page must reach the websocket it was served BY.
+
+        The URL is derived from the page's own origin, so the dashboard works
+        on any host and port and behind a TLS proxy (wss:// follows
+        https://). The literal `ws://localhost:8082/ws` survives ONLY as the
+        commented file:// fallback; if it is ever the active value again, an
+        operator on any other host gets a page that cannot connect and says
+        nothing about why.
+        """
+        server = WebSocketServer(db_params)
+        client = await aiohttp_client(server.create_app())
+
+        body = await (await client.get("/")).text()
+
+        assert (
+            "(location.protocol === 'https:' ? 'wss://' : 'ws://') "
+            "+ location.host + '/ws'" in body
+        )
+        # The one surviving mention is the named fallback constant, nothing else.
+        assert body.count("ws://localhost:8082/ws") == 1
+        assert "const WS_URL_FILE_FALLBACK = 'ws://localhost:8082/ws';" in body
+
+    def test_dashboard_only_sends_actions_the_server_accepts(self):
+        """Every `action:` the page sends is a verb the dispatcher answers.
+
+        This is the drift that shipped once already: the server's `retry_job`
+        was renamed to `rerun_job` and the page kept sending the dead name, so
+        the button did nothing but log an error into a panel nobody reads.
+        Both sides are checked against ACTIONS -- the table `handle_message`
+        itself dispatches on -- so neither can be renamed alone.
+        """
+        html = DASHBOARD_HTML.read_text(encoding="utf-8")
+        sent = set(re.findall(r"action:\s*'([a-z_]+)'", html))
+
+        assert sent, "no `action:` strings found in the dashboard -- bad regex?"
+        assert sent <= set(ACTIONS), (
+            f"the dashboard sends actions the server does not accept: "
+            f"{sorted(sent - set(ACTIONS))}"
+        )
+
+    def test_every_dispatched_action_names_a_real_handler(self):
+        """ACTIONS holds METHOD NAMES, resolved at dispatch time, so a typo
+        or a renamed handler would surface as an internal error on a live
+        socket instead of here."""
+        for action, handler_name in ACTIONS.items():
+            handler = getattr(WebSocketServer, handler_name, None)
+            assert handler is not None, f"{action} -> missing {handler_name}()"
+            assert inspect.iscoroutinefunction(handler), (
+                f"{action} -> {handler_name}() is not awaitable"
+            )
 
 
 class TestHandleNotification:

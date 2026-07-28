@@ -94,28 +94,40 @@ jobs:
       - name: Build wheel and sdist
         run: uv build
 
-      - name: Verify the wheel ships the whole base schema
+      - name: Verify the wheel ships every runtime asset
         run: |
           python - <<'PY'
           import glob, zipfile
           from pathlib import Path
 
+          wheel = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+
+          def packaged(prefix: str, suffix: str) -> set[str]:
+              return {
+                  n.split("/")[-1]
+                  for n in names
+                  if n.startswith(prefix) and n.endswith(suffix)
+              }
+
           # Compare against the source tree rather than a hardcoded name: the
           # schema is a DIRECTORY of ordered files, and an assertion naming
           # one file silently stopped protecting anything when it was split.
-          want = {p.name for p in Path("pyjobby/sql/schema").glob("*.sql")}
-          assert want, "no base-schema files in the source tree"
-
-          wheel = glob.glob("dist/*.whl")[0]
-          names = zipfile.ZipFile(wheel).namelist()
-          got = {
-              n.split("/")[-1]
-              for n in names
-              if n.startswith("pyjobby/sql/schema/") and n.endswith(".sql")
-          }
-          missing = sorted(want - got)
-          assert not missing, f"{wheel} is missing base-schema files: {missing}"
-          print(f"{wheel}: all {len(got)} base-schema file(s) packaged")
+          #
+          # Every asset the installed code reads at RUNTIME belongs here. The
+          # dashboard did not: it lived outside the package, so no install
+          # ever had it and the docs told operators to clone the repository
+          # instead. "The wheel is missing a runtime asset" is a CI failure,
+          # not a bug report.
+          for label, source, prefix, suffix in (
+              ("base-schema", "pyjobby/sql/schema", "pyjobby/sql/schema/", ".sql"),
+              ("dashboard", "pyjobby/static", "pyjobby/static/", ".html"),
+          ):
+              want = {p.name for p in Path(source).glob(f"*{suffix}")}
+              assert want, f"no {label} files in the source tree ({source})"
+              missing = sorted(want - packaged(prefix, suffix))
+              assert not missing, f"{wheel} is missing {label} files: {missing}"
+              print(f"{wheel}: all {len(want)} {label} file(s) packaged")
           PY
 
       - uses: actions/upload-artifact@v4

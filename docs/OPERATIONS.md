@@ -404,7 +404,7 @@ automatically and re-prepare their statements; nothing needs a restart.
 | Queue depths/ages | `pj-admin queues list`, `/metrics` gauges |
 | What happened to job N | `pj-admin jobs history N`, `jobs steps N` |
 | Throughput/error rates | `/metrics` counters + duration quantiles |
-| Live event stream | `pj-ws` + `frontend/live-dashboard.html` |
+| Live event stream | `pj-ws`, then the dashboard it serves at `http://127.0.0.1:8082/` |
 | Progress of a running job | `client.get_event(job_id, "progress")` (if the job publishes) |
 
 ## Queue controls: what the limits actually promise

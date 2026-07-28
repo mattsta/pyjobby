@@ -373,8 +373,21 @@
         const queues = new Map();
         let workersLive = 0;
 
-        // Configuration
-        const WS_URL = 'ws://localhost:8082/ws';
+        // Where the websocket lives.
+        //
+        // Derived from the page's OWN location, because pj-ws serves this
+        // page at `/` and its websocket at `/ws` on the same origin: there
+        // is nothing to configure, and a TLS proxy on a different host or
+        // port works untouched (wss:// follows https:// automatically).
+        //
+        // FALLBACK, used only when there is no origin to derive from -- i.e.
+        // someone opened this file directly with file://, where
+        // location.host is empty. Edit it for that case only; when the page
+        // is served, the derived value above always wins.
+        const WS_URL_FILE_FALLBACK = 'ws://localhost:8082/ws';
+        const WS_URL = location.host
+            ? (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws'
+            : WS_URL_FILE_FALLBACK;
 
         // Initialize dashboard
         function init() {
@@ -438,8 +451,13 @@
                     log(`Schedule "${message.data.schedule_name}" executed: ${message.data.result}`);
                     break;
 
-                case 'job_retried':
-                    log(`Job ${message.data.job_id} retry: ${message.data.status}`);
+                // The server's re-run reply. `fresh` is echoed because
+                // "restart from step 1" and "resume from checkpoints" are
+                // opposite answers to the same button, so the log has to say
+                // which one happened.
+                case 'job_rerun':
+                    log(`Job ${message.data.job_id} rerun: ${message.data.status}` +
+                        ` (fresh: ${message.data.fresh})`);
                     break;
 
                 case 'job_cancelled':

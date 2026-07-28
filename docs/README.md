@@ -67,9 +67,9 @@ below is a file you can open.
     `AdminAPI` Python interface.
 12. **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — the symptom index. Start
     at `pj-admin doctor`, then jump to the entry for what you are seeing.
-13. **[WEBSOCKET_DASHBOARD.md](WEBSOCKET_DASHBOARD.md)** — `pj-ws` and
-    `frontend/live-dashboard.html`: live aggregates, per-job watches, and
-    the demand-gated channels behind them.
+13. **[WEBSOCKET_DASHBOARD.md](WEBSOCKET_DASHBOARD.md)** — `pj-ws` and the
+    dashboard it serves at `/`: live aggregates, per-job watches, and the
+    demand-gated channels behind them.
 
 ### Changing it
 

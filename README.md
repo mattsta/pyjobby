@@ -225,8 +225,11 @@ pj-ws --config ./pyjobby.toml --host 127.0.0.1 --port 8082
 ```
 
 Defaults to `127.0.0.1:8082`; the websocket API is unauthenticated, so front
-it with a proxy before exposing it. The standalone client page lives at
-[`frontend/live-dashboard.html`](frontend/live-dashboard.html).
+it with a proxy before exposing it. The same server serves the dashboard page
+itself at <http://127.0.0.1:8082/> — it ships in the package
+([`pyjobby/static/live-dashboard.html`](pyjobby/static/live-dashboard.html))
+and finds its websocket from its own address, so there is nothing to
+configure.
 
 See [docs/WEBSOCKET_DASHBOARD.md](docs/WEBSOCKET_DASHBOARD.md) for details.
 

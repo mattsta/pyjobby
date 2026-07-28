@@ -37,6 +37,7 @@ from pyjobby import websocket_server
 from pyjobby.client import DEFAULT_PRIO_CEILING
 from pyjobby.procs import wait_until
 from pyjobby.websocket_server import (
+    ACTIONS,
     INTERNAL_ERROR_MESSAGE,
     MAX_CHANNEL_NAME_LENGTH,
     MAX_CLIENTS,
@@ -1187,17 +1188,9 @@ class TestUnauthenticatedMutationBoundary:
             assert await conn.fetchval("SELECT COUNT(*) FROM jorb") == before
 
     def test_dispatcher_action_set_is_exactly_documented(self):
-        """Guard the spec above against silent growth: the source of
-        handle_message must dispatch exactly these actions."""
-        import inspect
-
-        source = inspect.getsource(WebSocketServer.handle_message)
-        dispatched = {
-            line.split('== "', 1)[1].split('"', 1)[0]
-            for line in source.splitlines()
-            if 'action == "' in line
-        }
-        assert dispatched == {
+        """Guard the spec above against silent growth: handle_message
+        dispatches out of ACTIONS, and ACTIONS is exactly these verbs."""
+        assert set(ACTIONS) == {
             "subscribe",
             "unsubscribe",
             "watch_job",

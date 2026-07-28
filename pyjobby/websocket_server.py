@@ -45,9 +45,10 @@ Features:
 - Aggregate dashboard snapshots on an interval, one query for all clients
 - Per-job watches over the demand-gated ``jorb_done`` channel
 - Channel-based subscriptions
-- Interactive job management (cancel, retry, priority adjust)
+- Interactive job management (cancel, rerun, priority adjust)
 - Connection pooling and rate limiting
 - Multiple WebSocket servers can run independently
+- Serves the dashboard page itself at ``/`` (see DASHBOARD_HTML)
 """
 
 from __future__ import annotations
@@ -59,8 +60,10 @@ import logging
 import signal
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from importlib.resources import files
 from typing import Any, Final
 
 import aiohttp
@@ -125,6 +128,18 @@ INTERNAL_ERROR_MESSAGE = "Internal server error — see the server log"
 MAX_BIGINT = 2**63 - 1
 MIN_INT32 = -(2**31)
 MAX_INT32 = 2**31 - 1
+
+#: The dashboard page this server serves at ``/``.
+#:
+#: It lives INSIDE the package, addressed the way migrations.py addresses its
+#: SQL, because a page that ships next to the repository is a page a `pip
+#: install pyjobby` never gets: the old copy sat in a top-level `frontend/`
+#: directory the wheel could not carry, so every install had to be told to
+#: clone the repository and open a file:// URL. Serving it from here means
+#: the dashboard is present wherever pj-ws is, and reaches the websocket by
+#: deriving the URL from its own origin rather than from a constant somebody
+#: has to edit.
+DASHBOARD_HTML = files("pyjobby") / "static" / "live-dashboard.html"
 
 # =============================================================================
 # The aggregate snapshot: what replaced the per-transition firehose
@@ -335,6 +350,11 @@ class WebSocketServer:
         self.db_pool: asyncpg.Pool | None = None  # For queries
         self.notify_conn: asyncpg.Connection | None = None  # For LISTEN
 
+        # The dashboard page, read from the package once and held. A static
+        # asset re-read per request is disk I/O on the event loop for a
+        # result that cannot have changed.
+        self._dashboard_html: str | None = None
+
         # In-flight notification broadcast tasks (kept to avoid GC of
         # fire-and-forget tasks; bounded so a flood cannot grow unbounded)
         self._notification_tasks: set[asyncio.Task] = set()
@@ -446,6 +466,55 @@ class WebSocketServer:
             return "schedules"
 
         return "jobs"
+
+    def dashboard_html(self) -> str:
+        """The dashboard page, read from the package on first use and cached.
+
+        Read through :data:`DASHBOARD_HTML` so it works from a wheel, a
+        zipimport or a source checkout alike -- the same mechanism
+        migrations.py uses for its SQL.
+        """
+        if self._dashboard_html is None:
+            self._dashboard_html = DASHBOARD_HTML.read_text(encoding="utf-8")
+        return self._dashboard_html
+
+    async def handle_dashboard(self, request: web.Request) -> web.Response:
+        """Serve the live dashboard at ``/``.
+
+        The page derives its websocket URL from its own location, so being
+        served from here is the whole configuration: no constant to edit, and
+        a TLS proxy on another host or port works without a rebuild.
+        """
+        return web.Response(text=self.dashboard_html(), content_type="text/html")
+
+    async def handle_health(self, request: web.Request) -> web.Response:
+        """Liveness/readiness probe: counters plus the LISTEN connection.
+
+        ``notify_connection`` is reported because a server whose LISTEN
+        connection died still accepts websockets on the port while every
+        watch_job waits forever for a jorb_done that cannot arrive.
+        """
+        return web.json_response(
+            {
+                "status": "healthy",
+                "stats": self.stats,
+                "notify_connection": not self.notify_conn.is_closed()
+                if self.notify_conn
+                else False,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+        )
+
+    def create_app(self) -> web.Application:
+        """Build the aiohttp application: every route this server answers.
+
+        One place, so the routes a test mounts are the routes `pj-ws` serves.
+        """
+        app = web.Application()
+        app.router.add_get("/", self.handle_dashboard)
+        app.router.add_get("/ws", self.handle_websocket)
+        app.router.add_get("/health", self.handle_health)
+        return app
 
     async def handle_websocket(self, request: web.Request) -> web.StreamResponse:
         """Handle WebSocket connection.
@@ -720,33 +789,21 @@ class WebSocketServer:
             await self.send_error(ws, str(e))
             return
 
-        # Handle different actions
-        if action == "subscribe":
-            await self.handle_subscribe(ws, client, data)
-
-        elif action == "unsubscribe":
-            await self.handle_unsubscribe(ws, client, data)
-
-        elif action == "watch_job":
-            await self.handle_watch_job(ws, client, data)
-
-        elif action == "unwatch_job":
-            await self.handle_unwatch_job(ws, client, data)
-
-        elif action == "cancel_job":
-            await self.handle_cancel_job(ws, client, data)
-
-        elif action == "rerun_job":
-            await self.handle_rerun_job(ws, client, data)
-
-        elif action == "adjust_priority":
-            await self.handle_adjust_priority(ws, client, data)
-
-        elif action == "get_stats":
-            await self.handle_get_stats(ws, client, data)
-
-        else:
+        # `isinstance` before the lookup, not for tidiness: `action` is
+        # whatever the client's JSON said, and an unhashable one (a list, an
+        # object) would raise TypeError out of the dict lookup and be
+        # reported as an internal error. Anything that is not a string is
+        # simply not an action name.
+        handler_name = ACTIONS.get(action) if isinstance(action, str) else None
+        if handler_name is None:
             await self.send_error(ws, f"Unknown action: {action}")
+            return
+
+        # Looked up on `self`, so a subclass override (or a test's) is what
+        # runs — binding the function objects in ACTIONS itself would pin
+        # dispatch to this class forever.
+        handler: ActionHandler = getattr(self, handler_name)
+        await handler(ws, client, data)
 
     async def handle_subscribe(
         self, ws: web.WebSocketResponse, client: ClientConnection, data: dict[str, Any]
@@ -1374,24 +1431,8 @@ class WebSocketServer:
         await self.init_db_pool()
         await self.init_notify_connection()
 
-        # Create web application
-        app = web.Application()
-        app.router.add_get("/ws", self.handle_websocket)
-
-        # Health check endpoint
-        async def health_check(request: web.Request) -> web.Response:
-            return web.json_response(
-                {
-                    "status": "healthy",
-                    "stats": self.stats,
-                    "notify_connection": not self.notify_conn.is_closed()
-                    if self.notify_conn
-                    else False,
-                    "timestamp": datetime.now(UTC).isoformat(),
-                }
-            )
-
-        app.router.add_get("/health", health_check)
+        # Create web application (dashboard page, websocket, health probe)
+        app = self.create_app()
 
         # Start the aggregate snapshot feed (idle until somebody subscribes)
         stats_task = asyncio.create_task(self.snapshot_broadcast())
@@ -1403,6 +1444,7 @@ class WebSocketServer:
         await site.start()
 
         logger.info(f"WebSocket server running on ws://{host}:{port}/ws")
+        logger.info(f"Live dashboard available at http://{host}:{port}/")
         logger.info(f"Health check available at http://{host}:{port}/health")
         logger.info("Using PostgreSQL LISTEN/NOTIFY (no Redis needed!)")
 
@@ -1441,6 +1483,36 @@ class WebSocketServer:
                 await self.notify_conn.close()
             if self.db_pool:
                 await self.db_pool.close()
+
+
+#: The shape every ``/ws`` action handler has, once bound to a server.
+ActionHandler = Callable[
+    [web.WebSocketResponse, ClientConnection, dict[str, Any]], Awaitable[None]
+]
+
+#: EVERY action ``/ws`` accepts, mapped to the method that serves it.
+#:
+#: :meth:`WebSocketServer.handle_message` dispatches out of this table, so it
+#: IS the protocol rather than a list beside it that can rot. That matters
+#: now that the dashboard ships with the server and is served by it:
+#: ``pyjobby/static/live-dashboard.html`` sends these names, and a rename
+#: here without a rename there is a button that silently does nothing. It was
+#: exactly that once — ``retry_job`` outlived the rename to ``rerun_job`` —
+#: which is why tests/test_websocket_server.py checks every ``action:`` in
+#: the page against these keys.
+#:
+#: Method NAMES, resolved on the instance at dispatch time, so overriding a
+#: handler on a subclass or a test double actually takes effect.
+ACTIONS: Final[dict[str, str]] = {
+    "subscribe": "handle_subscribe",
+    "unsubscribe": "handle_unsubscribe",
+    "watch_job": "handle_watch_job",
+    "unwatch_job": "handle_unwatch_job",
+    "cancel_job": "handle_cancel_job",
+    "rerun_job": "handle_rerun_job",
+    "adjust_priority": "handle_adjust_priority",
+    "get_stats": "handle_get_stats",
+}
 
 
 async def serve(

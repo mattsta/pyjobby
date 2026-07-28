@@ -108,25 +108,28 @@ pj-ws --config ./pyjobby.toml --host 0.0.0.0 --port 8082
 The websocket API is unauthenticated, so put a proxy in front of it before
 binding `0.0.0.0`.
 
-### 3. Live Dashboard (`frontend/live-dashboard.html`)
+### 3. Live Dashboard (served at `/`)
 
-Single-page HTML dashboard with:
+A single-page HTML dashboard that ships **inside the package**
+(`pyjobby/static/live-dashboard.html`) and is served by `pj-ws` itself at
+`/` — so it is present in any `pip install pyjobby`, and there is nothing to
+copy, clone or configure.
 
-- Live job list with state badges
+- Live queue list with state badges
 - Real-time queue statistics
 - Event log
 - Connection status indicator
-- Cancel/retry buttons
+- Cancel/re-run actions
 - Auto-reconnect on disconnect
+
+The page derives its websocket URL from its own address (`wss://` when it was
+served over HTTPS), so it works unchanged on any host or port and behind a
+TLS-terminating proxy.
 
 **Open**:
 
-```bash
-# Edit WS_URL in HTML to point to your WebSocket server
-# Default: ws://localhost:8082/ws
-
-# Then open in browser
-open frontend/live-dashboard.html
+```
+http://127.0.0.1:8082/
 ```
 
 ---
@@ -154,6 +157,7 @@ You should see:
 ... - pyjobby.websocket_server - INFO - Database connection pool initialized
 ... - pyjobby.websocket_server - INFO - PostgreSQL LISTEN connections established
 ... - pyjobby.websocket_server - INFO - WebSocket server running on ws://127.0.0.1:8082/ws
+... - pyjobby.websocket_server - INFO - Live dashboard available at http://127.0.0.1:8082/
 ... - pyjobby.websocket_server - INFO - Health check available at http://127.0.0.1:8082/health
 ... - pyjobby.websocket_server - INFO - Using PostgreSQL LISTEN/NOTIFY (no Redis needed!)
 ```
@@ -163,7 +167,8 @@ proxy) if the dashboard runs on another machine.
 
 ### Step 3: Open Dashboard
 
-Open `frontend/live-dashboard.html` in your browser.
+Browse to `http://127.0.0.1:8082/` — the same server serves the page and the
+websocket it talks to.
 
 ### Step 4: Enqueue Some Jobs
 
@@ -643,14 +648,20 @@ Response:
 
 ## 🎨 Frontend Customization
 
-The dashboard HTML can be customized:
+The dashboard is `pyjobby/static/live-dashboard.html` inside the installed
+package; edit it there (or edit a copy and serve it yourself).
 
-### Change WebSocket URL
+### The WebSocket URL is derived, not configured
 
 ```javascript
-// In live-dashboard.html, line ~240
-const WS_URL = "ws://your-server:8082/ws";
+const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://')
+    + location.host + '/ws';
 ```
+
+The page connects back to the server that served it, so a different host,
+port, or a TLS-terminating proxy all work with no edit. The
+`WS_URL_FILE_FALLBACK` constant beside it applies only when the file is
+opened directly over `file://`, where there is no origin to derive from.
 
 ### Change Colors
 
@@ -726,17 +737,19 @@ location /ws {
 location /health {
     proxy_pass http://localhost:8082/health;
 }
+
+# The dashboard page itself
+location = / {
+    proxy_pass http://localhost:8082/;
+}
 ```
 
 ### SSL/TLS
 
-Use `wss://` (WebSocket Secure) in production:
-
-```javascript
-const WS_URL = "wss://your-domain.com/ws";
-```
-
-NGINX handles SSL termination, forwards to local WebSocket server.
+NGINX terminates TLS and forwards to the local server. Nothing in the page
+needs changing: it derives its websocket URL from its own address, so a page
+served over `https://your-domain.com/` connects to
+`wss://your-domain.com/ws` on its own.
 
 ---
 
