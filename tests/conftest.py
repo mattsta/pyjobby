@@ -22,6 +22,24 @@ from pathlib import Path
 import asyncpg
 import pytest
 import pytest_asyncio
+from hypothesis import settings as hypothesis_settings
+
+# Hypothesis's per-example deadline (200ms by default) measures WALL CLOCK,
+# and under pytest-xdist the wall clock measures the machine's load rather
+# than the code: a pure-arithmetic example that takes microseconds alone
+# blows 200ms while four workers saturate the box. That was this suite's
+# recurring "one failure per full -n 4 run, always passes in isolation"
+# family — every recent instance was a no-database hypothesis test.
+# Per-example slowness is still bounded by the per-test timeout, so the
+# deadline bought nothing here but noise. The "deadline-proof" profile
+# exists to DEMONSTRATE the mechanism on demand:
+# HYPOTHESIS_PROFILE=deadline-proof makes the same tests fail
+# deterministically with DeadlineExceeded.
+hypothesis_settings.register_profile("pyjobby", deadline=None)
+hypothesis_settings.register_profile(
+    "deadline-proof", deadline=0.001, max_examples=20
+)
+hypothesis_settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "pyjobby"))
 
 # Path to schema file
 SCHEMA_PATH = Path(__file__).parent.parent / "pyjobby" / "sql" / "schema.sql"
