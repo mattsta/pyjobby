@@ -9,11 +9,7 @@ import pytest
 import pytest_asyncio
 
 from pyjobby.web_admin import WebAdminServer
-
-
-def unique_name(base: str) -> str:
-    """Generate unique name for test isolation."""
-    return f"{base}_{uuid.uuid4().hex[:8]}"
+from tests.conftest import unique_name
 
 
 class TestWebAdminServerInit:

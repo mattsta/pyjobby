@@ -32,7 +32,6 @@ import re
 from datetime import timedelta
 
 import pytest
-import pytest_asyncio
 
 from pyjobby.web_admin import (
     PROM_RATE_WINDOW_SECONDS,
@@ -41,18 +40,12 @@ from pyjobby.web_admin import (
     PROM_SQL_LIVE_STATES,
     PROM_SQL_STARTED_RECENT,
     PROM_SQL_TERMINAL_RECENT,
-    WebAdminServer,
 )
 from tests.utils.plans import plan_for, seed_for_plans
 
 pytestmark = pytest.mark.asyncio
 
 
-@pytest_asyncio.fixture
-async def web_admin_client(db_params, aiohttp_client):
-    """A test client for the web admin server on the session's database."""
-    server = WebAdminServer(db_params)
-    return await aiohttp_client(server.app)
 
 
 # =============================================================================

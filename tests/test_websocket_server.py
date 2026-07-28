@@ -5,19 +5,13 @@ Using LIVE database operations with NO MOCKS for maximum correctness guarantees!
 
 import asyncio
 import json
-import uuid
 from datetime import UTC, datetime
 
 import pytest
 from aiohttp import web
 
 from pyjobby.websocket_server import ClientConnection, WebSocketServer
-
-
-def unique_name(base: str) -> str:
-    """Generate unique name for test isolation."""
-    return f"{base}_{uuid.uuid4().hex[:8]}"
-
+from tests.conftest import unique_name
 
 # db_params comes from conftest.py (honors PYJOBBY_TEST_DSN)
 

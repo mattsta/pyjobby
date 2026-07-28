@@ -17,8 +17,6 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from pyjobby.client import JobClient
-
 # =============================================================================
 # State helpers
 # =============================================================================
@@ -63,12 +61,6 @@ async def force_crash(conn, job_id: int, error: str, backtrace: str = "") -> Non
 # =============================================================================
 
 
-@pytest.fixture
-async def job_client(db_pool):
-    """Create a JobClient using the test database pool."""
-    client = JobClient(pool=db_pool)
-    yield client
-    await client.close()
 
 
 @pytest.fixture

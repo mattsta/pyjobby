@@ -3,7 +3,6 @@ Comprehensive tests for admin_api.py - Administrative API.
 Using LIVE database operations with NO MOCKS for maximum correctness guarantees!
 """
 
-import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -13,11 +12,7 @@ from pyjobby.admin_api import (
     JobInfo,
     QueueStats,
 )
-
-
-def unique_name(base: str) -> str:
-    """Generate unique name for test isolation."""
-    return f"{base}_{uuid.uuid4().hex[:8]}"
+from tests.conftest import unique_name
 
 
 class TestJobInfoDataclass:

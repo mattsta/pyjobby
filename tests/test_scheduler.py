@@ -4,7 +4,6 @@ Using LIVE database operations with NO MOCKS for maximum correctness guarantees!
 """
 
 import asyncio
-import uuid
 from datetime import UTC, datetime
 
 import pytest
@@ -15,11 +14,7 @@ from pyjobby.scheduler import (
     SchedulerWorker,
     ScheduleSafetyManager,
 )
-
-
-def unique_name(base: str) -> str:
-    """Generate unique name for test isolation."""
-    return f"{base}_{uuid.uuid4().hex[:8]}"
+from tests.conftest import unique_name
 
 
 class TestScheduleExecutionResult:

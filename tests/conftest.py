@@ -387,6 +387,32 @@ def worker_params(unique_queue: str) -> dict:
 
 
 @pytest_asyncio.fixture
+async def job_client(db_pool: asyncpg.Pool):
+    """A pool-backed JobClient, closed at teardown.
+
+    In conftest because four files carried byte-identical private copies of
+    it. (The pool is the fixture's, not the client's, so close() leaves it
+    open by the ownership contract — teardown here is about the listener.)
+    """
+    from pyjobby.client import JobClient
+
+    client = JobClient(pool=db_pool)
+    yield client
+    await client.close()
+
+
+@pytest_asyncio.fixture
+async def web_admin_client(db_params: dict, aiohttp_client):
+    """A test client for the web admin server on the session's database.
+
+    In conftest because three files carried identical private copies."""
+    from pyjobby.web_admin import WebAdminServer
+
+    server = WebAdminServer(db_params)
+    return await aiohttp_client(server.app)
+
+
+@pytest_asyncio.fixture
 async def client(db_pool: asyncpg.Pool):
     """
     Create a JobClient instance for testing.

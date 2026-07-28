@@ -26,12 +26,10 @@ import time
 from typing import Any
 
 import pytest
-import pytest_asyncio
 
 from pyjobby.admin_api import AdminAPI
 from pyjobby.cli import DOCTOR_THREADS_REMEDY
 from pyjobby.pj import WORKER_HEARTBEAT_SQL, JobSystem
-from pyjobby.web_admin import WebAdminServer
 
 from .conftest import wait_for_job_state
 from .test_cli_doctor import dsn_for, parse_checks, run_doctor
@@ -56,11 +54,6 @@ BLOCK_SECONDS = 12.0
 FAST_HEARTBEAT = 0.25
 
 
-@pytest_asyncio.fixture
-async def web_admin_client(db_params, aiohttp_client):
-    """A test client for the web admin server on the session's database."""
-    server = WebAdminServer(db_params)
-    return await aiohttp_client(server.app)
 
 
 async def fill_the_pool(
