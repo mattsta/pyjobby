@@ -723,7 +723,9 @@ class TestSchedulePriorityCeiling:
         )
 
         with pytest.raises(ValueError) as exc:
-            await admin_api.update_schedule(sched["id"], priority=DEFAULT_PRIO_CEILING + 1)
+            await admin_api.update_schedule(
+                sched["id"], priority=DEFAULT_PRIO_CEILING + 1
+            )
         assert (
             f"priority {DEFAULT_PRIO_CEILING + 1} is above the worker "
             f"priority ceiling ({DEFAULT_PRIO_CEILING})" in str(exc.value)

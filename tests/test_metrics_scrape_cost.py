@@ -46,8 +46,6 @@ from tests.utils.plans import plan_for, seed_for_plans
 pytestmark = pytest.mark.asyncio
 
 
-
-
 # =============================================================================
 # Helpers
 # =============================================================================
@@ -56,8 +54,6 @@ pytestmark = pytest.mark.asyncio
 # table genuinely IS cheaper than an index, so below this the test proves
 # nothing.
 PLAN_ROWS = 20_000
-
-
 
 
 _BUFFERS_RE = re.compile(r"shared hit=(\d+)(?: read=(\d+))?")
@@ -212,9 +208,7 @@ class TestScrapeQueryPlans:
 
         assert "jorb_started_idx" in plan, plan
 
-    async def test_duration_quantiles_ride_the_finished_retention_index(
-        self, db_pool
-    ):
+    async def test_duration_quantiles_ride_the_finished_retention_index(self, db_pool):
         """Quantiles filter on `state = 'finished'` over the window, which
         the FINISHED-only partial index covers exactly (and more tightly than
         the all-terminal jorb_retention_idx the planner used before that index

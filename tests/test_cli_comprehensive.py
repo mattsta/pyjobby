@@ -648,8 +648,7 @@ class TestJobsCommands:
             assert result.exit_code == 1
             assert (
                 "Job 1 cannot be rerun "
-                "(not found, or not crashed, cancelled, or finished)"
-                in result.stderr
+                "(not found, or not crashed, cancelled, or finished)" in result.stderr
             )
 
     def test_jobs_rerun(self, cli_runner, mock_admin_api, mock_db_params):
@@ -943,8 +942,7 @@ class TestDLQCommands:
 
             assert result.exit_code == 1
             assert (
-                "Job 10 is not in the DLQ (not found, or not crashed)"
-                in result.stderr
+                "Job 10 is not in the DLQ (not found, or not crashed)" in result.stderr
             )
 
 

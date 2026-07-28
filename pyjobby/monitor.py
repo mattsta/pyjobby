@@ -786,9 +786,7 @@ async def sweep_stranded_waiters(pool: asyncpg.Pool, batch_size: int = 500) -> i
                 # found: the wake re-verifies the dependency under the lock,
                 # so a probe hit whose upstream was re-run in the gap is
                 # correctly refused -- and must not be logged as woken.
-                woken = await conn.fetch(
-                    WAKE_WAITERS_SQL + " RETURNING w.id", ids
-                )
+                woken = await conn.fetch(WAKE_WAITERS_SQL + " RETURNING w.id", ids)
                 if woken:
                     woken_ids = [r["id"] for r in woken]
                     logger.warning(
@@ -1395,9 +1393,7 @@ def cli() -> None:
         required=False,
         help="PostgreSQL DSN (or use PYJOBBY_DSN env var)",
     )
-    @click.option(
-        "--config", type=click.Path(exists=True), help="Path to pyjobby.toml"
-    )
+    @click.option("--config", type=click.Path(exists=True), help="Path to pyjobby.toml")
     @click.option(
         "--check-interval", default=10.0, show_default=True, help="Sweep interval (s)"
     )

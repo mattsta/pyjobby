@@ -36,9 +36,7 @@ from hypothesis import settings as hypothesis_settings
 # HYPOTHESIS_PROFILE=deadline-proof makes the same tests fail
 # deterministically with DeadlineExceeded.
 hypothesis_settings.register_profile("pyjobby", deadline=None)
-hypothesis_settings.register_profile(
-    "deadline-proof", deadline=0.001, max_examples=20
-)
+hypothesis_settings.register_profile("deadline-proof", deadline=0.001, max_examples=20)
 hypothesis_settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "pyjobby"))
 
 # The base-schema directory: ordered purpose files whose lexical-order

@@ -398,9 +398,9 @@ class TestSubcommandsEmitDocumentedJson:
         # recv is the hottest DXE statement; its mailbox probe must ride the
         # partial pending index (dest_job_id, topic, id) WHERE consumed_at IS
         # NULL — a scan there would grow with the whole mailbox.
-        assert (
-            "jorb_mailbox_pending_idx" in payload["queries"]["recv"]["indexes"]
-        ), payload["queries"]["recv"]
+        assert "jorb_mailbox_pending_idx" in payload["queries"]["recv"]["indexes"], (
+            payload["queries"]["recv"]
+        )
         # Each sweep must reach the index its own table was given for it --
         # "no seq scan" alone would be satisfied by the wrong index.
         for key, index in (

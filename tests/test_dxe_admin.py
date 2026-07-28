@@ -321,9 +321,7 @@ async def test_rerun_job_wipes_checkpoints_by_default_but_fresh_false_keeps(
     them would fast-forward over the work and repeat nothing. Default wipes;
     fresh=False is the explicit RESUME opt-out that keeps them."""
     for keep in (False, True):
-        job_id = await _insert_job(
-            db_pool, unique_queue, "tests.dxe_jobs.OkJob", {}
-        )
+        job_id = await _insert_job(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {})
         await db_pool.execute(
             "UPDATE jorb SET state = 'finished', finished = now() WHERE id = $1",
             job_id,

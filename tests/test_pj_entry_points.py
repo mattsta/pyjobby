@@ -165,8 +165,7 @@ class TestWorkitPreflight:
         missing_dir = tmp_path / "no-such-directory"
         with config.open("a") as fh:
             fh.write(
-                "\n[web_listen]\n"
-                f'sites = [{{ path = "{missing_dir / "pj.sock"}" }}]\n'
+                f'\n[web_listen]\nsites = [{{ path = "{missing_dir / "pj.sock"}" }}]\n'
             )
 
         result = run_workit(["--config", str(config), "--workers", "2"])

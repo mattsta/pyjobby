@@ -104,8 +104,7 @@ def _substitute_env(value: Any, *, source: str) -> Any:
         name = match.group(1)
         if name not in os.environ:
             raise ConfigError(
-                f"{source}: references environment variable {name!r}, "
-                f"which is not set"
+                f"{source}: references environment variable {name!r}, which is not set"
             )
         return os.environ[name]
     if isinstance(value, dict):
@@ -176,6 +175,5 @@ def load_config_from_file(filename: str, keys: Iterable[str]) -> dict[str, Any]:
         }
     except RecursionError as e:
         raise ConfigError(
-            f"Failed to read config file: {filename}: structure too deeply "
-            f"nested ({e})"
+            f"Failed to read config file: {filename}: structure too deeply nested ({e})"
         ) from e

@@ -854,7 +854,13 @@ async def test_an_error_record_never_clobbers_a_committed_success(
 
     # the committed success (as transaction() writes it)
     ok = await db_pool.fetch(
-        STMTS["record-step"], job_id, 1, "send", {"delivered": 1}, None, epoch,
+        STMTS["record-step"],
+        job_id,
+        1,
+        "send",
+        {"delivered": 1},
+        None,
+        epoch,
         db.utcnow(),
     )
     assert [r["step_seq"] for r in ok] == [1]
@@ -863,8 +869,14 @@ async def test_an_error_record_never_clobbers_a_committed_success(
     # It writes a row (so _dxe_record does NOT misread it as a stale epoch),
     # but the CASE preserves the committed success unchanged.
     clobber = await db_pool.fetch(
-        STMTS["record-step"], job_id, 1, "send", None, "ConnectionError: gone",
-        epoch, db.utcnow(),
+        STMTS["record-step"],
+        job_id,
+        1,
+        "send",
+        None,
+        "ConnectionError: gone",
+        epoch,
+        db.utcnow(),
     )
     assert [r["step_seq"] for r in clobber] == [1]
 
@@ -879,16 +891,35 @@ async def test_an_error_record_never_clobbers_a_committed_success(
     # an existing error (the retry that finally succeeded)
     await db_pool.execute("DELETE FROM jorb_step WHERE job_id=$1", job_id)
     await db_pool.fetch(
-        STMTS["record-step"], job_id, 1, "s", None, "first failure", epoch,
+        STMTS["record-step"],
+        job_id,
+        1,
+        "s",
+        None,
+        "first failure",
+        epoch,
         db.utcnow(),
     )
     reerr = await db_pool.fetch(
-        STMTS["record-step"], job_id, 1, "s", None, "second failure", epoch,
+        STMTS["record-step"],
+        job_id,
+        1,
+        "s",
+        None,
+        "second failure",
+        epoch,
         db.utcnow(),
     )
     assert [r["step_seq"] for r in reerr] == [1]  # error -> error updates
     win = await db_pool.fetch(
-        STMTS["record-step"], job_id, 1, "s", {"ok": 1}, None, epoch, db.utcnow(),
+        STMTS["record-step"],
+        job_id,
+        1,
+        "s",
+        {"ok": 1},
+        None,
+        epoch,
+        db.utcnow(),
     )
     assert [r["step_seq"] for r in win] == [1]  # error -> success updates
     final = await db_pool.fetchrow(
@@ -968,9 +999,7 @@ async def test_compaction_drops_the_notification_latch(db_pool, unique_queue):
     """
     job_id = await enqueue(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {"x": 1})
     claimed = await claim_once(db_pool, unique_queue)
-    await db_pool.execute(
-        "UPDATE jorb SET awaited = TRUE WHERE id = $1", job_id
-    )
+    await db_pool.execute("UPDATE jorb SET awaited = TRUE WHERE id = $1", job_id)
 
     job = await bound_job(db_pool, claimed)
     assert await job.compact() is True
@@ -986,8 +1015,7 @@ async def test_compaction_drops_the_notification_latch(db_pool, unique_queue):
     with pytest.raises(dxe.StaleExecutionError):
         await zombie.compact()
     assert (
-        await db_pool.fetchval("SELECT awaited FROM jorb WHERE id = $1", job_id)
-        is True
+        await db_pool.fetchval("SELECT awaited FROM jorb WHERE id = $1", job_id) is True
     )
 
 
@@ -1131,10 +1159,7 @@ async def test_dead_lettering_fences_the_execution_it_abandons(db_pool, unique_q
 
     # the abandoned execution's epoch-only-guarded writes are all refused
     assert (
-        await db_pool.fetch(
-            STMTS["set-event"], job_id, "zombie", {"v": 1}, epoch
-        )
-        == []
+        await db_pool.fetch(STMTS["set-event"], job_id, "zombie", {"v": 1}, epoch) == []
     )
     assert (
         await db_pool.fetch(

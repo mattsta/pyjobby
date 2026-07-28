@@ -63,8 +63,6 @@ async def force_crash(conn, job_id: int, error: str, backtrace: str = "") -> Non
 # =============================================================================
 
 
-
-
 @pytest.fixture
 async def setup_test_jobs(db_pool, job_client):
     """Create various test jobs for management tests."""
@@ -583,9 +581,7 @@ class TestCancelAndWait:
 
 @pytest.mark.asyncio
 class TestRunTimeout:
-    async def test_run_cancels_the_job_it_gave_up_waiting_on(
-        self, db_pool, job_client
-    ):
+    async def test_run_cancels_the_job_it_gave_up_waiting_on(self, db_pool, job_client):
         """No worker runs the job, so run()'s wait times out. The abandoned
         job must be cancelled, not left queued and orphaned, and the caller
         still sees the TimeoutError."""

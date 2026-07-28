@@ -794,9 +794,7 @@ class TestBackpressureCountPlan:
     EXPLAINs the scheduler's own ``BACKPRESSURE_COUNT_SQL``, never a copy.
     """
 
-    async def test_the_count_is_two_index_arms_not_a_scan(
-        self, db_pool, unique_queue
-    ):
+    async def test_the_count_is_two_index_arms_not_a_scan(self, db_pool, unique_queue):
         await seed_terminal_jobs(db_pool, unique_queue)
         # a slice of in-flight work on ANOTHER queue: the in-flight arm walks
         # the fleet-wide index and must filter these few out, and that
@@ -812,9 +810,7 @@ class TestBackpressureCountPlan:
         )
         await settle(db_pool)
 
-        plan = await plan_for(
-            db_pool, BACKPRESSURE_COUNT_SQL, unique_queue + "_other"
-        )
+        plan = await plan_for(db_pool, BACKPRESSURE_COUNT_SQL, unique_queue + "_other")
 
         assert_no_seq_scan(plan)
         # nothing read-and-discarded beyond the bounded in-flight slice

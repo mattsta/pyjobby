@@ -63,7 +63,9 @@ def synthetic_migrations(monkeypatch, *files: tuple[int, str, str]) -> None:
     """
     fixed = [Migration(version=v, name=n, sql=s) for v, n, s in files]
     monkeypatch.setattr(
-        migrations, "available_migrations", lambda: sorted(fixed, key=lambda m: m.version)
+        migrations,
+        "available_migrations",
+        lambda: sorted(fixed, key=lambda m: m.version),
     )
 
 

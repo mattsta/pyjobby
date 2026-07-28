@@ -54,8 +54,6 @@ BLOCK_SECONDS = 12.0
 FAST_HEARTBEAT = 0.25
 
 
-
-
 async def fill_the_pool(
     live_worker: Any, db_pool: Any, queue: str, *, job_threads: int
 ) -> JobSystem:

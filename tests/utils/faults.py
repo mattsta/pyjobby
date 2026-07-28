@@ -211,10 +211,7 @@ def write_worker_config(tmp_path: Path, db_params: dict[str, Any]) -> Path:
 
     config = write_config_toml(
         tmp_path / "pyjobby.toml",
-        {
-            k: db_params[k]
-            for k in ("host", "port", "user", "password", "database")
-        },
+        {k: db_params[k] for k in ("host", "port", "user", "password", "database")},
     )
     return config
 

@@ -825,7 +825,9 @@ class AdminAPI:
             workers.append(data)
         return workers
 
-    async def worker_stats(self, stale_after_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS) -> dict[str, Any]:
+    async def worker_stats(
+        self, stale_after_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS
+    ) -> dict[str, Any]:
         """
         Aggregate worker registry statistics.
 

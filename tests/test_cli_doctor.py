@@ -213,9 +213,7 @@ class TestDoctorSchema:
         # the command returns immediately: nothing else can be checked
         assert set(checks) == {"database", "schema"}
 
-    async def test_fresh_install_passes_at_baseline(
-        self, scratch_db: ScratchFactory
-    ):
+    async def test_fresh_install_passes_at_baseline(self, scratch_db: ScratchFactory):
         """Pre-live no migration files ship, so a fresh install has recorded
         nothing and reports the baseline."""
         fresh = await scratch_db()
@@ -671,9 +669,7 @@ class TestDoctorBlockedWaiters:
                VALUES ('tests.dxe_jobs.OkJob', $1, 'crashed') RETURNING id""",
             unique_queue,
         )
-        await db_pool.execute(
-            "UPDATE jorb SET run_group = $1 WHERE id = $1", leader
-        )
+        await db_pool.execute("UPDATE jorb SET run_group = $1 WHERE id = $1", leader)
         await db_pool.execute(
             """INSERT INTO jorb (job_class, queue, state, waitfor_group)
                VALUES ('tests.dxe_jobs.OkJob', $1, 'waiting', $2)""",
@@ -984,9 +980,7 @@ class TestDoctorJson:
 
     async def test_an_unreachable_database_still_reports_json(self, db_params):
         port = await unused_port()
-        result = await run_doctor(
-            dsn_for({**db_params, "port": port}), "--json"
-        )
+        result = await run_doctor(dsn_for({**db_params, "port": port}), "--json")
 
         assert result.exit_code == 1
         assert json.loads(result.stdout) == [

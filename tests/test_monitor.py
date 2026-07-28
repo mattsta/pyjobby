@@ -655,12 +655,8 @@ class TestSweepStrandedWaiters:
         self, db_pool, unique_queue
     ):
         leader = await insert_job(db_pool, unique_queue, state="finished")
-        await db_pool.execute(
-            "UPDATE jorb SET run_group = $1 WHERE id = $1", leader
-        )
-        await insert_job(
-            db_pool, unique_queue, state="finished", run_group=leader
-        )
+        await db_pool.execute("UPDATE jorb SET run_group = $1 WHERE id = $1", leader)
+        await insert_job(db_pool, unique_queue, state="finished", run_group=leader)
         waiter = await insert_job(
             db_pool, unique_queue, state="waiting", waitfor_group=leader
         )
@@ -673,12 +669,8 @@ class TestSweepStrandedWaiters:
         self, db_pool, unique_queue
     ):
         leader = await insert_job(db_pool, unique_queue, state="finished")
-        await db_pool.execute(
-            "UPDATE jorb SET run_group = $1 WHERE id = $1", leader
-        )
-        await insert_job(
-            db_pool, unique_queue, state="running", run_group=leader
-        )
+        await db_pool.execute("UPDATE jorb SET run_group = $1 WHERE id = $1", leader)
+        await insert_job(db_pool, unique_queue, state="running", run_group=leader)
         waiter = await insert_job(
             db_pool, unique_queue, state="waiting", waitfor_group=leader
         )
@@ -730,9 +722,7 @@ class TestSweepStrandedWaiters:
         it must NOT cancel a waiter whose group now exists — closing the
         window where incrementally-built groups get their waiter cancelled."""
         group = await insert_job(db_pool, unique_queue, state="running")
-        await db_pool.execute(
-            "UPDATE jorb SET run_group = $1 WHERE id = $1", group
-        )
+        await db_pool.execute("UPDATE jorb SET run_group = $1 WHERE id = $1", group)
         waiter = await insert_job(
             db_pool, unique_queue, state="waiting", waitfor_group=group
         )

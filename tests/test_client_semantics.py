@@ -301,9 +301,7 @@ class TestClientLifecycle:
         assert after <= before
         await pool.close()
 
-    async def test_close_leaves_a_caller_provided_pool_open(
-        self, db_pool, db_params
-    ):
+    async def test_close_leaves_a_caller_provided_pool_open(self, db_pool, db_params):
         """A pool handed to the constructor is the CALLER's — an application
         routinely shares one pool between its ORM and this client, and
         close() closing it would take the whole process's database access
@@ -335,9 +333,7 @@ class TestEventReads:
     blocks a caller forever with no exception and no log line.
     """
 
-    async def test_get_event_on_a_nonexistent_job_fails_fast(
-        self, db_pool, client
-    ):
+    async def test_get_event_on_a_nonexistent_job_fails_fast(self, db_pool, client):
         ghost = await db_pool.fetchval(
             """INSERT INTO jorb (job_class, kwargs, queue, state)
                VALUES ('x.Gone', '{}', 'q', 'finished') RETURNING id"""
@@ -505,9 +501,7 @@ class TestOneCallWorkflows:
     ):
         await live_worker()
         leader = await client.enqueue(f"{__name__}.CountJob", queue=unique_queue, n=1)
-        await db_pool.execute(
-            "UPDATE jorb SET run_group = $1 WHERE id = $1", leader
-        )
+        await db_pool.execute("UPDATE jorb SET run_group = $1 WHERE id = $1", leader)
         await client.enqueue(
             f"{__name__}.CountJob", queue=unique_queue, run_group=leader, n=2
         )
@@ -522,9 +516,7 @@ class TestOneCallWorkflows:
                VALUES ('x.Gone', '{}', $1, 'crashed') RETURNING id""",
             unique_queue,
         )
-        await db_pool.execute(
-            "UPDATE jorb SET run_group = $1 WHERE id = $1", leader
-        )
+        await db_pool.execute("UPDATE jorb SET run_group = $1 WHERE id = $1", leader)
 
         with pytest.raises(Exception, match="cannot finish"):
             await client.wait_for_group(leader, timeout=5)
@@ -646,9 +638,7 @@ class TestSyncFacadeParity:
             f"SyncJobClient wrappers dropping async parameters: {offenders}"
         )
 
-    async def test_from_config_builds_a_working_sync_client(
-        self, db_params, tmp_path
-    ):
+    async def test_from_config_builds_a_working_sync_client(self, db_params, tmp_path):
         """Scripts and cron jobs are exactly where a config file lives, and
         the sync facade is the class built for them."""
         from pyjobby.client import SyncJobClient

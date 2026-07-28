@@ -7,25 +7,30 @@ license = "MIT"
 authors = [{ name = "Matt Stancliff", email = "matt@genges.com" }]
 requires-python = ">=3.14"
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
+    "Framework :: AsyncIO",
     "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.14",
     "Topic :: System :: Distributed Computing",
-    "Framework :: AsyncIO",
+    "Typing :: Typed",
 ]
 dependencies = [
     "orjson>=3.9",
     "click>=8.1",
     "asyncpg>=0.30",
     "loguru>=0.7",
-    "aiohttp>=3.9",
+    "aiohttp>=3.12",
     "croniter>=6.2.4",
     "tzdata>=2025.2",
 ]
 
 [project.urls]
+Homepage = "https://github.com/mattsta/pyjobby"
 Repository = "https://github.com/mattsta/pyjobby"
+Documentation = "https://github.com/mattsta/pyjobby/tree/main/docs"
+Issues = "https://github.com/mattsta/pyjobby/issues"
 
 [project.scripts]
 pj = "pyjobby.pj:workit"

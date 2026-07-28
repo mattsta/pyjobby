@@ -268,9 +268,7 @@ class TestRetryMechanism:
 
         # same id, back in the queue with backoff — no retry-copy rows
         assert retried["id"] == job_id
-        job = await db_connection.fetchrow(
-            "SELECT * FROM jorb WHERE id = $1", job_id
-        )
+        job = await db_connection.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
         assert job["state"] == "queued"
         assert job["job_class"] == "test.RetryableJob"
         assert job["error_count"] == 1
@@ -622,7 +620,9 @@ class TestCompleteJobFlows:
         # Execute parent job
         parent_claim = await claim(db_connection, unique_queue)
         assert parent_claim["id"] == parent_id
-        await db_connection.execute(STMTS["run"], parent_id, parent_claim["run_epoch"], None)
+        await db_connection.execute(
+            STMTS["run"], parent_id, parent_claim["run_epoch"], None
+        )
         await db_connection.fetchrow(
             STMTS["finished"],
             parent_id,
@@ -640,7 +640,9 @@ class TestCompleteJobFlows:
         # Execute child job
         child_claim = await claim(db_connection, unique_queue, pid=12346)
         assert child_claim["id"] == child_id
-        await db_connection.execute(STMTS["run"], child_id, child_claim["run_epoch"], None)
+        await db_connection.execute(
+            STMTS["run"], child_id, child_claim["run_epoch"], None
+        )
         await db_connection.fetchrow(
             STMTS["finished"],
             child_id,

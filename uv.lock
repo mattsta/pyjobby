@@ -611,7 +611,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiohttp", specifier = ">=3.9" },
+    { name = "aiohttp", specifier = ">=3.12" },
     { name = "asyncpg", specifier = ">=0.30" },
     { name = "click", specifier = ">=8.1" },
     { name = "croniter", specifier = ">=6.2.4" },

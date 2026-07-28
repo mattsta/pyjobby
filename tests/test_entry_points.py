@@ -460,8 +460,6 @@ class TestDaemonsShutDownCleanly:
         assert proc.returncode == 0
 
 
-
-
 class TestMonitorEntryPoint:
     async def test_pj_monitor_reclaims_a_dead_workers_job(
         self, db_pool, unique_queue, dsn

@@ -2213,9 +2213,8 @@ async def _preflight_problem(db_params: dict[str, Any]) -> str | None:
         conn = await db.connect(**db_params)
     except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as e:
         hint = migrations.schema_error_hint(e)
-        return (
-            f"Cannot connect to the database at {target}: {e}"
-            + (f" {hint}" if hint else "")
+        return f"Cannot connect to the database at {target}: {e}" + (
+            f" {hint}" if hint else ""
         )
     try:
         if not await conn.fetchval("SELECT to_regclass('public.jorb')"):
@@ -2225,9 +2224,8 @@ async def _preflight_problem(db_params: dict[str, Any]) -> str | None:
             )
     except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as e:
         hint = migrations.schema_error_hint(e)
-        return (
-            f"Cannot query the database at {target}: {e}"
-            + (f" {hint}" if hint else "")
+        return f"Cannot query the database at {target}: {e}" + (
+            f" {hint}" if hint else ""
         )
     finally:
         with contextlib.suppress(Exception):
@@ -2284,9 +2282,7 @@ def runAndDone(
         # success for a fleet in which every worker had died on the first
         # statement. Log it WITH the worker it belongs to, then re-raise so
         # the child's exit code says failed and workit() can too.
-        logger.exception(
-            f"[worker {n} on queue {qname}] crashed during startup/run"
-        )
+        logger.exception(f"[worker {n} on queue {qname}] crashed during startup/run")
         raise
 
 

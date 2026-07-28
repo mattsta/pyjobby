@@ -252,9 +252,7 @@ class TestConnectionRecovery:
         assert await worker.conn.fetchval("SELECT 1") == 1
         await worker.conn.close()
 
-    async def test_the_loop_survives_a_killed_connection(
-        self, db_params, db_pool
-    ):
+    async def test_the_loop_survives_a_killed_connection(self, db_params, db_pool):
         """End to end: the run loop hits a dead connection, reconnects, and
         keeps polling instead of dying or spinning."""
         conn = await db.connect(**db_params)

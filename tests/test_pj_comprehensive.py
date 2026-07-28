@@ -335,9 +335,7 @@ class TestTimeoutHandling:
 
         async with prepared_system(db_params, worker_params) as system:
             # the deadline rides in the claimed -> running write itself
-            await system.ex(
-                "run", job_id, 0, timedelta(seconds=system.default_timeout)
-            )
+            await system.ex("run", job_id, 0, timedelta(seconds=system.default_timeout))
 
             job = await system.cxn.fetchrow(
                 "SELECT timeout_at, started FROM jorb WHERE id = $1", job_id
@@ -676,9 +674,7 @@ class TestJobSystemErrorHandling:
             # ex() recovered and completed against the real database.
             assert call_count == 1
             assert [r["state"] for r in result] == ["queued"]
-            assert not isinstance(
-                system.stmts["get-result"], MockPreparedStatement
-            )
+            assert not isinstance(system.stmts["get-result"], MockPreparedStatement)
         finally:
             await system.cxn.close()
 

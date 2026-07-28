@@ -159,9 +159,7 @@ class TestEnvSubstitution:
         assert cfg["db_params"]["password"] == "s3cr3t"
         assert cfg["db_params"]["host"] == "h"
 
-    def test_substitution_reaches_into_arrays_and_tables(
-        self, tmp_path, monkeypatch
-    ):
+    def test_substitution_reaches_into_arrays_and_tables(self, tmp_path, monkeypatch):
         monkeypatch.setenv("PYJOBBY_TEST_HOST", "10.0.0.9")
         path = write(
             tmp_path,
@@ -172,15 +170,11 @@ class TestEnvSubstitution:
 
         assert cfg["web_listen"]["sites"][0]["host"] == "10.0.0.9"
 
-    def test_an_unset_variable_is_a_loud_error_naming_it(
-        self, tmp_path, monkeypatch
-    ):
+    def test_an_unset_variable_is_a_loud_error_naming_it(self, tmp_path, monkeypatch):
         """A config that silently loads with a missing secret fails later,
         further from the cause."""
         monkeypatch.delenv("PYJOBBY_TEST_UNSET", raising=False)
-        path = write(
-            tmp_path, '[db_params]\npassword = "${PYJOBBY_TEST_UNSET}"\n'
-        )
+        path = write(tmp_path, '[db_params]\npassword = "${PYJOBBY_TEST_UNSET}"\n')
 
         with pytest.raises(ConfigError, match="PYJOBBY_TEST_UNSET"):
             load_config_from_file(path, ["db_params"])
@@ -198,9 +192,7 @@ class TestEnvSubstitution:
         """The anchor is \\Z, not $ -- $ also matches before a trailing
         newline, which would substitute "${VAR}\\n" and drop the newline."""
         monkeypatch.setenv("PYJOBBY_TEST_NL", "secret")
-        path = write(
-            tmp_path, '[db_params]\nhost = """${PYJOBBY_TEST_NL}\n"""\n'
-        )
+        path = write(tmp_path, '[db_params]\nhost = """${PYJOBBY_TEST_NL}\n"""\n')
 
         cfg = load_config_from_file(path, ["db_params"])
 
@@ -247,9 +239,7 @@ class TestFailureModes:
         with pytest.raises(RuntimeError):
             load_config_from_file(str(tmp_path / "absent.toml"), ["db_params"])
 
-    def test_a_non_utf8_file_is_a_config_error_not_a_raw_traceback(
-        self, tmp_path
-    ):
+    def test_a_non_utf8_file_is_a_config_error_not_a_raw_traceback(self, tmp_path):
         """UnicodeDecodeError must arrive as ConfigError (RuntimeError) so the
         `except RuntimeError` guard in every CLI entry point catches it."""
         path = tmp_path / "bad.toml"
