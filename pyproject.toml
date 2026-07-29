@@ -84,6 +84,7 @@ markers = [
     "concurrency: marks tests as concurrency tests",
     "stress: marks tests as stress tests (high load scenarios)",
     "hypothesis: marks tests as property-based tests using Hypothesis",
+    "ops: process-level operational validation -- spawns real pj*/pj-admin processes and holds OPERATIONS.md / TROUBLESHOOTING.md to their word",
     # Comparisons between configurations only. A test marked here never runs
     # in CI, so an invariant asserted only inside one is never checked against
     # any commit -- see docs/TESTING.md, "The performance marker".
