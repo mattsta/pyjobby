@@ -43,7 +43,7 @@ class TestEmptyDatabase:
         # only thing that does.
         assert report.returncode == 0
         assert "PASS schema: installed, migrations current (baseline)" in report.stdout
-        assert "PASS triggers: all schema triggers present (7)" in report.stdout
+        assert "PASS triggers: all schema triggers present (8)" in report.stdout
         assert "WARN workers: no live workers seen in last 60s" in report.stdout
 
 

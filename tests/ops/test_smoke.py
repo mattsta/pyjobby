@@ -39,7 +39,7 @@ class TestFleetSmoke:
         out = report.stdout
         assert "PASS database: connected" in out
         assert "PASS schema: installed" in out
-        assert "PASS triggers: all schema triggers present (7)" in out
+        assert "PASS triggers: all schema triggers present (8)" in out
         assert "PASS notify-queue:" in out
         assert "PASS workers:" in out and "live worker" in out
         assert "PASS dlq: empty" in out

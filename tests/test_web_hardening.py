@@ -675,7 +675,12 @@ class TestPrometheusExposition:
         # Footprint gauges are labelled by table name, which is ours.
         assert sorted(
             labels for name, labels in samples if name == "pyjobby_table_total_bytes"
-        ) == ['table="jorb"', 'table="jorb_history"', 'table="jorb_step"']
+        ) == [
+            'table="jorb"',
+            'table="jorb_history"',
+            'table="jorb_step"',
+            'table="jorb_stream"',
+        ]
 
     @pytest.mark.asyncio
     async def test_cardinality_fifty_queues_all_reported(
