@@ -107,6 +107,7 @@ def mock_admin_api():
         "waitfor_job": None,
         "waitfor_group": None,
         "deadline_key": None,
+        "identity_key": None,
         "worker_pid": None,
         "worker_host": None,
         "result": None,

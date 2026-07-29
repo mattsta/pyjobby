@@ -567,7 +567,19 @@ and a monitor startup WARNING naming the two flags. Raise the grace
   [DXE.md](DXE.md).
 - **`deadline_key`** — a partial unique index makes one _queued_ row per
   `(deadline_key, queue)`, so duplicate submissions collapse into one job.
-  This is the enqueue-side guard, not the execution-side one.
+  This is the enqueue-side guard, not the execution-side one. Note that it
+  **re-arms**: the key is released the moment a worker claims the job, so it
+  stops a duplicate that has not started and nothing after that.
+- **`identity_key`** — the enqueue-side guard for work that must happen once
+  and only once. Its unique index has no state predicate, so the row holds
+  the key while it runs and after it terminates, and a second enqueue
+  returns the existing job's id instead of raising. **Bounded by retention:**
+  when the sweep reaps the terminal row the key is free again and the same
+  identity creates a new job — so if you are seeing a second run days or
+  weeks later, check `--retention-days` before suspecting the index, and
+  scope keys to a time you can name (`nightly-rebuild:2026-07-29`, not
+  `nightly-rebuild`). See
+  [CLIENT_LIBRARY.md](CLIENT_LIBRARY.md#4b-at-most-once-work-identity-keys).
 - **Idempotent side effects** — the fallback when neither applies.
 
 Note that a re-run you asked for is a separate verb precisely because it

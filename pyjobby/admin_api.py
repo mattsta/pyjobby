@@ -280,6 +280,9 @@ class JobInfo:
     waitfor_job: int | None = None
     waitfor_group: int | None = None
     deadline_key: str | None = None
+    # the caller's at-most-once name for this work, unique across every state
+    # for as long as the row survives retention (see sql/schema/10_jobs.sql)
+    identity_key: str | None = None
     worker_pid: int | None = None
     worker_host: str | None = None
     result: dict | None = None
@@ -412,6 +415,7 @@ class AdminAPI:
         state: str | None = None,
         job_class: str | None = None,
         uid: int | None = None,
+        identity_key: str | None = None,
         tags: dict[str, Any] | None = None,
         limit: int = 50,
         offset: int = 0,
@@ -426,6 +430,14 @@ class AdminAPI:
             state: Filter by job state (queued, claimed, running, etc.)
             job_class: Filter by job class name (supports LIKE patterns)
             uid: Filter by user ID
+            identity_key: The caller's at-most-once key, matched exactly.
+                Returns at most one job, in whatever state it reached, since
+                a unique index holds the key for the row's whole life; an
+                empty result means the identity was never enqueued or its
+                job has aged out of retention. Answered by
+                `jorb_identity_idx` — equality is strict, so the clause
+                implies the index's `identity_key IS NOT NULL` predicate
+                without restating it (unlike the tag filter below).
             tags: Match jobs whose tags CONTAIN every pair given. Extra tags
                 on the job do not disqualify it, so `{'region': 'eu'}` finds
                 a job tagged region+customer+batch. Answered by the partial
@@ -461,6 +473,11 @@ class AdminAPI:
         if uid is not None:
             where_clauses.append(f"uid = ${param_idx}")
             params.append(uid)
+            param_idx += 1
+
+        if identity_key is not None:
+            where_clauses.append(f"identity_key = ${param_idx}")
+            params.append(identity_key)
             param_idx += 1
 
         if tags:
@@ -561,8 +578,9 @@ class AdminAPI:
                 counted as live (default: 60), matching `list_workers`
 
         Returns:
-            ``{job_id, state, queue, job_class, prio, capability, run_after,
-            created, updated, reason, summary, details}``, or None when no
+            ``{job_id, state, queue, job_class, prio, capability,
+            identity_key, run_after, created, updated, reason, summary,
+            details}``, or None when no
             such job exists -- absence is the caller's to report, exactly as
             `get_job` leaves it.
         """
@@ -577,6 +595,7 @@ class AdminAPI:
                    j.claimed_by, j.worker_host, j.worker_pid,
                    j.run_count, j.error_count, j.error_message,
                    j.cancel_requested, j.waitfor_job, j.waitfor_group,
+                   j.identity_key,
                    EXTRACT(EPOCH FROM (j.run_after - now()))::float8
                        AS run_after_in_seconds,
                    EXTRACT(EPOCH FROM (now() - j.updated))::float8
@@ -612,6 +631,12 @@ class AdminAPI:
             "job_class": row["job_class"],
             "prio": row["prio"],
             "capability": row["capability"],
+            # Reported because it changes what the operator should DO about
+            # the answer: a job holding an identity_key cannot be replaced by
+            # enqueueing the same work again -- that call returns this very
+            # job -- so "just re-submit it" is not available until this row
+            # is gone. NULL for every job that was enqueued without one.
+            "identity_key": row["identity_key"],
             "run_after": _iso(row["run_after"]),
             "created": _iso(row["created"]),
             "updated": _iso(row["updated"]),

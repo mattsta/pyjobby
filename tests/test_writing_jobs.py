@@ -715,3 +715,76 @@ async def test_job_tags_are_filterable(client, live_worker, unique_queue):
 
     found = await client.search_jobs(tags={"customer": "acme", "batch": 42})
     assert job_id in [j["id"] for j in found]
+
+
+# ===========================================================================
+# Choosing your dedupe primitive
+# ===========================================================================
+
+
+class CartReminder(Job):
+    """The guide's deadline_key example: one PENDING reminder per cart."""
+
+    async def task(self, cart_id: int) -> dict[str, Any]:
+        return {"reminded": cart_id}
+
+
+class ShipOrder(Job):
+    """The guide's identity_key example: one shipment per order, ever."""
+
+    async def task(self, order_id: int) -> dict[str, Any]:
+        return {"shipped": order_id}
+
+
+async def test_a_deadline_key_collapses_the_pending_duplicate(client, unique_queue):
+    """First half of the contrast: while the job is queued, the duplicate
+    submission raises and the caller treats that as "already scheduled"."""
+    import asyncpg
+
+    await client.enqueue(
+        "tests.test_writing_jobs.CartReminder",
+        queue=unique_queue,
+        deadline_key=f"cart_reminder:{unique_queue}",
+        cart_id=7,
+    )
+
+    with pytest.raises(asyncpg.UniqueViolationError):
+        await client.enqueue(
+            "tests.test_writing_jobs.CartReminder",
+            queue=unique_queue,
+            deadline_key=f"cart_reminder:{unique_queue}",
+            cart_id=7,
+        )
+
+
+async def test_an_identity_key_returns_the_job_that_already_ran(
+    client, live_worker, unique_queue
+):
+    """Second half: the identity survives the job running to completion, so
+    the later caller waits on the result instead of shipping twice."""
+    await live_worker()
+    key = f"order:{unique_queue}:ship"
+
+    job_id = await client.enqueue(
+        "tests.test_writing_jobs.ShipOrder",
+        queue=unique_queue,
+        identity_key=key,
+        order_id=4711,
+    )
+    await wait_for_job_state(client.pool, job_id, ("finished",))
+
+    again = await client.enqueue(
+        "tests.test_writing_jobs.ShipOrder",
+        queue=unique_queue,
+        identity_key=key,
+        order_id=4711,
+    )
+
+    assert again == job_id
+    assert await client.wait_for_result(again) == {"shipped": 4711}
+    assert (
+        await client.pool.fetchval(
+            "SELECT count(*) FROM jorb WHERE queue = $1", unique_queue
+        )
+        == 1
+    )

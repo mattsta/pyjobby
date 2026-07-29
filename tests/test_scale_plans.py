@@ -118,6 +118,28 @@ async def seed_terminal_jobs(pool, queue: str, rows: int = ROWS) -> None:
     await settle(pool)
 
 
+async def seed_identified_jobs(pool, queue: str, identified: int = 2_000) -> None:
+    """A realistic install for the identity index: mostly jobs without one.
+
+    The proportion is the point. An EMPTY partial index is trivially the
+    cheapest plan and would prove nothing, and an index over every row would
+    not be the index that ships — so a minority of the seeded jobs carry a
+    key, which is the shape the partial predicate exists for.
+    """
+    await seed_terminal_jobs(pool, queue)
+    await pool.execute(
+        """UPDATE jorb SET identity_key = 'identity:scale:' || id
+            WHERE id IN (SELECT id FROM jorb ORDER BY id LIMIT $1)""",
+        identified,
+    )
+    # a key that really exists, so the positive lookup below is a hit
+    await pool.execute(
+        "UPDATE jorb SET identity_key = 'identity:scale:1' "
+        " WHERE id = (SELECT min(id) FROM jorb)"
+    )
+    await settle(pool)
+
+
 class TestRetentionScanPlan:
     """The sweep must find expired jobs by index, not by reading the table."""
 
@@ -981,6 +1003,58 @@ class TestScheduleConcurrencyPlan:
             await db_pool.fetchval("SELECT pg_relation_size('jorb_schedule_id_idx')")
             == before
         ), f"{ROWS} client-enqueued jobs grew a schedule-only index"
+
+
+class TestIdentityLookupPlan:
+    """Both readers of jorb_identity_idx, at a size where a scan could win.
+
+    The index is PARTIAL (`WHERE identity_key IS NOT NULL`, because almost no
+    job has one), and the cost of partial is the same one jorb_tags_idx
+    documents: the planner uses it only when the query's clauses IMPLY the
+    predicate. Here the implication is true rather than arranged — equality
+    is strict, so `identity_key = $1` already implies `identity_key IS NOT
+    NULL` — and these assert the planner agrees.
+    """
+
+    async def test_the_client_lookup_is_an_index_probe(self, db_pool, unique_queue):
+        """`get_job_by_identity` — the equality read, on a populated index."""
+        await seed_identified_jobs(db_pool, unique_queue)
+
+        plan = await plan_for(
+            db_pool,
+            "SELECT id, job_class, queue, prio, state, created FROM jorb "
+            "WHERE identity_key = $1",
+            "identity:scale:1",
+        )
+
+        assert "jorb_identity_idx" in plan, plan
+        assert_no_seq_scan(plan, "jorb")
+
+    async def test_the_admin_filter_does_not_walk_the_table_to_find_nothing(
+        self, db_pool, unique_queue
+    ):
+        """`pj-admin jobs list --identity KEY`, which is `list_jobs`' filter
+        under an ORDER BY on a DIFFERENT column.
+
+        That ordering is the trap: with no matching row the planner can walk
+        jorb_created_idx backwards and discard the whole table rather than
+        probe the identity index and stop. Asserted against a key nothing
+        holds, which is the answer an operator gets most often — "no, that
+        work never ran" — and the only shape where the wrong plan is free to
+        be arbitrarily expensive.
+        """
+        await seed_identified_jobs(db_pool, unique_queue)
+
+        plan = await plan_for(
+            db_pool,
+            "SELECT * FROM jorb WHERE identity_key = $1 "
+            "ORDER BY created DESC LIMIT 50 OFFSET 0",
+            "identity:scale:nothing-holds-this",
+        )
+
+        assert "jorb_identity_idx" in plan, plan
+        assert_no_seq_scan(plan, "jorb")
+        assert rows_removed_by_filter(plan) < BATCH, plan
 
 
 class TestCascadeIndexes:

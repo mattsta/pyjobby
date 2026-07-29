@@ -23,6 +23,10 @@ CREATE TABLE jorb (
     -- idempotent enqueue: one queued row per (deadline_key, queue)
     deadline_key    TEXT,
 
+    -- at-most-once identity: one row per identity_key IN ANY STATE, for as
+    -- long as the row exists (see the COMMENT -- retention is the bound)
+    identity_key    TEXT,
+
     -- provenance: the recurring schedule that fired this job into existence
     schedule_id     BIGINT,
 
@@ -64,6 +68,7 @@ COMMENT ON COLUMN jorb.tags IS 'The CALLER''s labels (customer, region, batch), 
 COMMENT ON COLUMN jorb.waitfor_group IS 'Becomes queued only when ALL jobs with run_group = this value are finished.';
 COMMENT ON COLUMN jorb.waitfor_job IS 'Becomes queued only when the job with this id is finished.';
 COMMENT ON COLUMN jorb.forked_from IS 'The job this one was forked from: a fork is a NEW row that re-executes an existing job''s work from step N, with steps 1..N-1 copied in as checkpoints (jorb.admin_data->''fork'' records which N, and how many rows were copied). Retry and re-run keep ONE row; a fork does not, which is the whole point -- the source is never touched, so a fork of a running job is safe and a fork of a finished one does not disturb its result. ON DELETE SET NULL because LINEAGE IS BEST-EFFORT AUDIT, NOT A DEPENDENCY: retention reaps terminal jobs on its own schedule and the source is usually older than the fork, so a fork must outlive the row it came from rather than be deleted with it (ON DELETE CASCADE) or pin it forever (RESTRICT). A NULL here therefore means "no source, or the source has aged out", and the fork''s own history row -- written at insert, before anything could be reaped -- keeps the source id and step regardless.';
+COMMENT ON COLUMN jorb.identity_key IS 'The CALLER''s name for a piece of work, unique across this table IN ANY STATE: enqueueing an identity that already exists returns the existing job instead of writing a second row. THE CONTRAST WITH deadline_key IS THE WHOLE POINT, and the two indexes say it: jorb_deadline_idx is unique only among QUEUED rows and per QUEUE, so a deadline_key collapses duplicate submissions of work that has not started and then RE-ARMS the moment the job is claimed -- tomorrow''s "send the 09:00 digest" is a legitimate second job. jorb_identity_idx has no state predicate and no queue column, so an identity_key is claimed by the row for its entire life, running and finished and crashed alike, and never re-arms. RETENTION IS THE HORIZON, and it is the honest bound on "at most once": when the sweep reaps the terminal row (--retention-days) the key goes with it and the same identity enqueued afterwards creates a new job. A caller who needs uniqueness beyond the horizon scopes the key to a time it can name -- an order id, a date stamp, a ULID -- rather than expecting the platform to remember further back than it remembers anything else. NOT inherited by a fork (FORK_JOB_SQL lists its columns and this is not one: two live rows sharing an identity would make it mean nothing), and untouched by retry, rerun and dlq retry, which requeue the SAME row and so keep the identity they already had.';
 COMMENT ON COLUMN jorb.schedule_id IS 'The jorb_schedule row that fired this job, NULL for every job enqueued directly. This is the SOLE source of that fact -- it used to live in admin_data->>''schedule_id'', which no index could serve, so the scheduler''s max_concurrent_jobs check scanned the whole job table on every firing. Deliberately NOT a foreign key: jobs outlive the schedules that made them (deleting a schedule must not delete or rewrite its history), and a REFERENCES here would need an index over EVERY schedule-created job to serve the cascade, undoing the point of the partial index below.';
 
 -- the poll/claim path
@@ -206,6 +211,34 @@ CREATE INDEX jorb_schedule_id_idx ON jorb (schedule_id)
 -- idempotent enqueue
 CREATE UNIQUE INDEX jorb_deadline_idx ON jorb (deadline_key, queue)
     WHERE state = 'queued' AND deadline_key IS NOT NULL;
+-- at-most-once identity. Read this one directly against the line above: the
+-- two differ in exactly the places that decide what each key PROMISES.
+--
+--   No `state = 'queued'`. The deadline index holds only queued rows, so a
+--   deadline_key is released the instant a worker claims the job and the
+--   next enqueue of it is a new job -- collapse-then-re-arm, which is what
+--   "one pending digest at a time" wants. This index holds EVERY row with a
+--   key, so the identity is held by running, finished and crashed jobs too
+--   and no second row can ever exist while the first one does.
+--
+--   No `queue`. A deadline_key is scoped per queue because it is about the
+--   pending work in that queue; an identity names the WORK, and the same
+--   work routed to another queue is still the same work.
+--
+-- Partial for the reason every partial index here is: identity_key is NULL
+-- on the overwhelming majority of jobs, and an unconditional unique index
+-- would write an entry for each of them -- write amplification on the
+-- hottest table in the system, on the enqueue path, for rows it could never
+-- answer a question about. Unique partial indexes are also what ON CONFLICT
+-- infers against, and inference requires the predicate to be RESTATED in the
+-- statement (`ON CONFLICT (identity_key) WHERE identity_key IS NOT NULL`);
+-- pyjobby/client.py ENQUEUE_IDENTIFIED_SQL is the one place that does.
+--
+-- THE LIFETIME OF AN ENTRY IS THE LIFETIME OF THE ROW, so retention bounds
+-- the guarantee (see the COMMENT on the column). Nothing else frees a key:
+-- retry, rerun and dlq retry all requeue the same row.
+CREATE UNIQUE INDEX jorb_identity_idx ON jorb (identity_key)
+    WHERE identity_key IS NOT NULL;
 
 -- ----------------------------------------------------------------------------
 -- Autovacuum, tuned for this table's write pattern rather than left at the

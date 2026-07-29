@@ -673,7 +673,7 @@ copied and everything re-runs.
 
 | Copied | Not copied |
 | --- | --- |
-| `job_class`, `kwargs` (or an override) | `uid`, `deadline_key` |
+| `job_class`, `kwargs` (or an override) | `uid`, `deadline_key`, `identity_key` |
 | `queue`, `prio` (or overrides) | `schedule_id` |
 | `capability`, `tags` | `dag_id`, `run_group`, `waitfor_*` |
 | `admin_data` (retry/timeout policy) | `result`, error fields, `run_count`, `error_count` |
@@ -681,7 +681,9 @@ copied and everything re-runs.
 The split is identity: everything that describes the **work** comes across,
 and nothing that names **this job** or wires it into somebody else's
 structure does. Two live rows sharing a `deadline_key` would make idempotent
-enqueue meaningless, and a fork is nobody's DAG member.
+enqueue meaningless, an `identity_key` promises there is exactly one row
+holding it (its unique index would refuse the second), and a fork is
+nobody's DAG member.
 
 Lineage lives in `jorb.forked_from` (`ON DELETE SET NULL`, so a fork
 outlives the retention sweep that reaps its source) and, permanently, in the

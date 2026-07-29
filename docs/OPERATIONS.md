@@ -361,6 +361,14 @@ knowing. Job retention already keeps a terminal job that a `waiting` job
 depends on; these keep a populated DAG, a schedule's last execution, and a
 worker with jobs in flight.
 
+One thing the job window deletes is not a row but a **promise**: reaping a
+terminal job frees its `identity_key`, so the retention horizon _is_ the
+bound on the platform's at-most-once guarantee — the same identity enqueued
+after the window creates a new job
+([CLIENT_LIBRARY.md](CLIENT_LIBRARY.md#4b-at-most-once-work-identity-keys)).
+Lengthening `--retention-days` lengthens that guarantee; shortening it
+shortens it.
+
 Nothing here is an operator action. Watch that the monitor logs
 `caught up` rather than `stopped on its ... budget`
 ([TROUBLESHOOTING](TROUBLESHOOTING.md#retention-is-falling-behind)), and set
@@ -486,10 +494,11 @@ Reach for **fork** when the re-run must not be the same job:
 What a fork inherits: job class, arguments, queue, priority, capability,
 `uid`, tags, and the retry/timeout policy — everything that describes or
 labels the WORK (`uid` is a tenant tag, so a tenant's fork stays theirs).
-What it does not: `deadline_key`, `schedule_id`, DAG membership,
-dependency edges, and every execution counter. A fork is a new identity, so
-it cannot inherit one: two live rows sharing an idempotency key would make
-that key mean nothing.
+What it does not: `deadline_key`, `identity_key`, `schedule_id`, DAG
+membership, dependency edges, and every execution counter. A fork is a new
+identity, so it cannot inherit one: two live rows sharing an idempotency key
+would make that key mean nothing, and an `identity_key` promises there is
+only one row holding it.
 
 Streams, events and mailbox messages are **not** copied either — they are
 the source's output, and the fork produces its own

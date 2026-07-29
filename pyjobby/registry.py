@@ -30,7 +30,8 @@ require a Job subclass. The original function stays reachable as ``.fn``.
 
 Enqueue-time options are explicit keyword-only parameters on the attached
 ``enqueue`` (queue, priority, run_after, timeout_seconds, max_retries,
-retry_strategy, deadline_key, waitfor_job, use_result_from, admin_data);
+retry_strategy, deadline_key, identity_key, waitfor_job, use_result_from,
+admin_data);
 everything else in ``**task_kwargs`` is validated against the task
 signature (``self`` and the worker-injected ``upstream_result`` are
 ignored). An option name therefore shadows any task parameter of the same
@@ -175,6 +176,7 @@ def _attach_typed_enqueue(
         max_retries: int = 10,
         retry_strategy: str = "exponential",
         deadline_key: str | None = None,
+        identity_key: str | None = None,
         waitfor_job: int | None = None,
         use_result_from: int | None = None,
         admin_data: dict[str, Any] | None = None,
@@ -197,6 +199,7 @@ def _attach_typed_enqueue(
             max_retries=max_retries,
             retry_strategy=retry_strategy,
             deadline_key=deadline_key,
+            identity_key=identity_key,
             waitfor_job=waitfor_job,
             use_result_from=use_result_from,
             admin_data=admin_data,

@@ -155,6 +155,70 @@ workers for less-urgent work, say so on both sides —
 `pj --max-prio 5000` and `JobClient(pool, prio_ceiling=5000)`; see
 [OPERATIONS.md](OPERATIONS.md#priority-and-the-ceiling-a-worker-claims-under).
 
+### Choosing your dedupe primitive
+
+Two of those options stop the same job being enqueued twice, and they mean
+different things. Pick by what you want to be true, not by which name reads
+better.
+
+| Option         | Unique among            | What it promises                                                       |
+| -------------- | ----------------------- | ---------------------------------------------------------------------- |
+| `deadline_key` | `queued` rows, per queue | at most one job of this key is **pending**; the key re-arms once claimed |
+| `identity_key` | all rows, table-wide     | this exact work happens **at most once**, until retention reaps the row |
+
+**`deadline_key` collapses, then re-arms.** The unique index covers queued
+rows only, so while a job sits in the queue a duplicate submission raises
+`asyncpg.UniqueViolationError` and you treat that as "already scheduled" —
+but the instant a worker claims it, the key is free again. That is exactly
+right for work that recurs: a nightly digest, a debounced re-index, a "the
+cart changed, schedule a reminder" job. Tomorrow's is a legitimately new
+job, and the key must not stop it.
+
+```python
+# one pending reminder per cart; tomorrow's is a different job
+try:
+    await client.enqueue(
+        "myapp.jobs.CartReminder",
+        deadline_key=f"cart_reminder:{cart_id}",
+        cart_id=cart_id,
+    )
+except asyncpg.UniqueViolationError:
+    pass  # a reminder is already queued for this cart
+```
+
+**`identity_key` holds, and does not re-arm.** The unique index has no state
+predicate, so the row holds the key for its whole life — queued, running,
+finished, crashed alike — and a second enqueue does not raise: it returns
+the existing job's id, which you observe or wait on exactly as if you had
+just created it. That is right for work that must happen once and only
+once: ship this order, charge this invoice, provision this account.
+
+```python
+# whoever calls this, however often, one shipment happens
+job_id = await client.enqueue(
+    "myapp.jobs.ShipOrder",
+    identity_key=f"order:{order_id}:ship",
+    order_id=order_id,
+)
+await client.wait_for_result(job_id)
+```
+
+**The horizon.** "At most once" lasts as long as the row does. When
+retention reaps the terminal job (`--retention-days`, 30 by default) the key
+is released, and the same identity enqueued afterwards is a new job. So
+scope the key to a time the platform cannot outlive: `order:4711:ship` is
+safe because order ids are never reused, `nightly-rebuild` is not, and
+`nightly-rebuild:2026-07-29` is. If your key would be re-used inside the
+retention window on purpose — because the work genuinely recurs — you wanted
+`deadline_key`.
+
+Neither is an execution-side guarantee. Both stop a duplicate **row**; they
+do nothing about a job whose own `task()` runs twice after a retry. That is
+what [`step()`](#step--do-not-do-that-twice) and
+[`transaction()`](#transaction--exactly-once-for-writes-to-this-database)
+are for, and the two layers compose: an `identity_key` makes the work exist
+once, `step()` makes each part of it execute once.
+
 ---
 
 ## Which primitive, and when

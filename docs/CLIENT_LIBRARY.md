@@ -207,7 +207,17 @@ Enqueue a single job.
 - `run_group` (int): Group ID for tracking related jobs (default: None)
 - `waitfor_job` (int): Wait for this job ID to complete (default: None)
 - `waitfor_group` (int): Wait for all jobs in this group (default: None)
-- `deadline_key` (str): Idempotency key to prevent duplicates (default: None)
+- `deadline_key` (str): Idempotency key that collapses duplicate submissions
+  of work that has **not started** — one _queued_ row per
+  `(deadline_key, queue)`, so a second enqueue while the first is still
+  queued raises `asyncpg.UniqueViolationError`, and the key re-arms once a
+  worker claims the job (default: None). See
+  [Idempotent jobs](#4-idempotent-jobs-deadline-keys).
+- `identity_key` (str): This exact work happens **at most once**. Unique
+  across _every_ state, so if a job with this key already exists — queued,
+  running, finished, crashed — the enqueue returns **that job's id** instead
+  of writing a second row, and never raises (default: None). Bounded by
+  retention; see [At-most-once work](#4b-at-most-once-work-identity-keys).
 - `admin_data` (dict): Metadata for tracking (default: None)
 - `tags` (dict): Your own labels — customer, region, batch — that you can
   filter jobs by later (default: None). See [Job Tags](#8-job-tags).
@@ -230,7 +240,8 @@ Enqueue a single job.
   `ValueError`.
 - `**kwargs`: Job arguments passed to job class
 
-**Returns:** Job ID (int)
+**Returns:** Job ID (int) — of the job this call created, or, when
+`identity_key` names a job that already exists, of that one.
 
 **Examples:**
 
@@ -265,6 +276,13 @@ job_id = await client.enqueue(
     deadline_key=f"payment:{payment_id}",
     payment_id=payment_id,
     amount=99.99,
+)
+
+# At-most-once job — every call returns the SAME id while the row lives
+job_id = await client.enqueue(
+    "myapp.jobs.ShipOrder",
+    identity_key=f"order:{order_id}:ship",
+    order_id=order_id,
 )
 
 # Multi-tenant job
@@ -313,6 +331,11 @@ single enqueue means.
 
 Payload and options never collide: the `kwargs` dict is delivered to the
 job verbatim, even if it contains keys named like options.
+
+`identity_key` is the one `enqueue()` option a batch refuses, shared or
+per-job: a batch is one INSERT returning one id per row **in order**, and an
+identity that already exists has no row in it to return. Enqueue identified
+jobs one at a time with `enqueue_identified()`.
 
 **Returns:** List of job IDs, in the order given
 
@@ -418,9 +441,11 @@ result = await client.wait_for_result(fork["job_id"])
 
 The fork inherits the job class, arguments, queue, priority, capability,
 tags and retry/timeout policy. It does **not** inherit identity or
-structure: `uid`, `deadline_key`, `schedule_id`, DAG membership and
-dependency edges are left unset, because two live rows sharing an
-idempotency key would make that key mean nothing. Streams, events and
+structure: `uid`, `deadline_key`, `identity_key`, `schedule_id`, DAG
+membership and dependency edges are left unset, because two live rows
+sharing an idempotency key would make that key mean nothing — and an
+`identity_key` most of all, since its whole promise is that the row holding
+it is the only one. Streams, events and
 mailbox messages are the source's output and are not copied either — see
 [DXE.md](DXE.md#forking-a-job-a-new-row-from-a-checkpoint-prefix).
 
@@ -558,6 +583,7 @@ marked "async only" below.
 **Inspection**
 
 - `get_job_full(job_id)` — complete row: kwargs, result, error, timestamps.
+- `get_job_by_identity(identity_key)` — the job holding that at-most-once key, or None (never enqueued, or already reaped by retention — the two are deliberately the same answer).
 - `get_job_result(job_id)` — a finished job's stored result, without waiting.
 - `wait_for_result(job_id, timeout=None)` — block until the job is terminal and return its result; raises `JobFailedError` / `JobCancelledError` / `TimeoutError`. The by-id form of `run()`, for a job enqueued earlier.
 - `get_steps(job_id)` — a job's recorded DXE checkpoints, oldest first.
@@ -580,6 +606,7 @@ marked "async only" below.
 
 **Advanced enqueue**
 
+- `enqueue_identified(job_class, *, identity_key, ...)` — the at-most-once enqueue, returning `(job_id, created)` so a caller can tell "I started this" from "this was already under way". Plain `enqueue(..., identity_key=...)` does the same write and returns the bare id.
 - `enqueue_handle(...)` — enqueue and get a `JobHandle` (`.wait()` — alias `.result()` —, `.status()`, `.cancel()`, `.event()`) (async only; a handle's own methods are coroutines bound to the async client, so `run()` / `wait_for_result()` are the sync shapes of this workflow).
 - `enqueue_in_transaction(conn, ...)` — enqueue on the CALLER's asyncpg connection, inside their transaction (async only; no sync twin).
 - `create_pipeline_with_results(stages, ...)` — a pipeline where each stage receives the previous stage's result.
@@ -783,6 +810,71 @@ try:
 except asyncpg.UniqueViolationError:
     print(f"Report for {date} already scheduled")
 ```
+
+A `deadline_key` is about work that has **not started**: the unique index
+covers only `queued` rows, so the key is released the moment a worker claims
+the job and the next enqueue is a legitimately new one. That is what you
+want for "one pending digest at a time"; it is not what you want for "this
+shipment happens once".
+
+### 4b. At-most-once work (Identity Keys)
+
+An `identity_key` is your own name for a piece of work, and only one job can
+carry it — **in any state**. A second enqueue does not raise: it returns the
+id of the job that already exists.
+
+```python
+# Every call returns the same id: the queued one, then the running one,
+# then the finished one. The work is done once.
+job_id = await client.enqueue(
+    "myapp.jobs.ShipOrder",
+    identity_key=f"order:{order_id}:ship",
+    order_id=order_id,
+)
+result = await client.wait_for_result(job_id)
+```
+
+Use `enqueue_identified()` when you need to know which call created it:
+
+```python
+job_id, created = await client.enqueue_identified(
+    "myapp.jobs.ShipOrder",
+    identity_key=f"order:{order_id}:ship",
+    order_id=order_id,
+)
+if not created:
+    log.info("order %s was already being shipped as job %s", order_id, job_id)
+```
+
+And `get_job_by_identity()` answers "did this ever run, and what became of
+it" without an id you would have had to store:
+
+```python
+job = await client.get_job_by_identity(f"order:{order_id}:ship")
+print("not shipped" if job is None else f"shipment {job.state}")
+```
+
+Two rules come with it:
+
+- **The job class must match.** If the identity already names a job of a
+  _different_ class, the enqueue raises `ValueError` naming both classes and
+  the key. One identity means one piece of work; the platform will not hand
+  back a job of the other class as if it were what you asked for.
+- **Retention is the horizon.** The key is held by the _row_, so when the
+  retention sweep reaps the terminal job (`--retention-days`, 30 by default)
+  the key is free and the same identity enqueued afterwards creates a **new**
+  job. This is the honest version of at-most-once: bounded by exactly the
+  same window as everything else the platform remembers. If you need
+  uniqueness beyond that window, put the time in the key —
+  `order:4711:ship` is safe because order ids are not reused;
+  `nightly-rebuild` is not, and `nightly-rebuild:2026-07-29` is.
+
+`identity_key` and `deadline_key` may coexist on one row and keep their
+separate meanings, but you usually want one or the other — see
+[writing-jobs.md § Choosing your dedupe primitive](writing-jobs.md#choosing-your-dedupe-primitive).
+Identity is **not** a batch option: `enqueue_batch()` returns one id per row
+in order, and an identity that already exists has no row in that INSERT to
+return, so it is refused rather than silently dropped.
 
 ### 5. Priority, and the ceiling
 

@@ -313,9 +313,16 @@ Showing 5 job(s). Use --limit and --offset for pagination.
 ```
 
 Filters: `-q/--queue`, `-s/--state`, `--job-class` (patterns), `--uid`,
-`--tag KEY=VALUE` (repeat for AND), `-l/--limit`, `-o/--offset`, `--json`.
-The table truncates long values for width — use `--json` when you need the
-full queue name or class path.
+`--identity KEY`, `--tag KEY=VALUE` (repeat for AND), `-l/--limit`,
+`-o/--offset`, `--json`. The table truncates long values for width — use
+`--json` when you need the full queue name or class path.
+
+`--identity` matches the caller's at-most-once key exactly and returns at
+most one job, in whatever state it reached — the way to answer "did this
+piece of work ever run?" from the name the application already has, with no
+job id to look up. An empty result means the identity was never enqueued
+**or** its job has aged out of retention; the two are the same answer,
+because both mean the next enqueue of it creates a new job.
 
 `--tag` matches jobs _containing_ the pair, so extra tags on the job are
 fine, and values are read as JSON when they look like it: `batch=7` matches
@@ -348,6 +355,19 @@ Result:
 {
   "n": 17748
 }
+```
+
+Optional fields appear only when the job has them. `Identity:` is one of
+them, and it is the one that changes what you can do next: a job holding an
+`identity_key` cannot be replaced by re-submitting the same work, because
+that enqueue returns this very job. `Forked From:` / `Forked Into:`,
+`Capability:`, `User ID:` and `Tags:` behave the same way.
+
+```console
+$ pj-admin jobs inspect 48210
+...
+Error Count:     0
+Identity:        order:4711:ship
 ```
 
 ```console
@@ -637,7 +657,7 @@ which is the second reason to fork (a retry cannot change either). A
 `--max-prio N` raises the ceiling for one command. The fork
 inherits the job's class, arguments, capability, tags and retry/timeout
 policy, and inherits **no identity** — no `uid`, no `deadline_key`, no
-schedule, no DAG or dependency edges. Streams, events and mail are the
+`identity_key`, no schedule, no DAG or dependency edges. Streams, events and mail are the
 source's output and are not copied
 ([DXE.md](DXE.md#forking-a-job-a-new-row-from-a-checkpoint-prefix)).
 

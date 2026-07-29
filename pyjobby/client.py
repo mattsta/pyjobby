@@ -112,10 +112,68 @@ ENQUEUE_SQL = """
         job_class, kwargs, queue, prio, run_after,
         capability, uid, run_group,
         waitfor_job, waitfor_group,
-        deadline_key, admin_data, tags, state, schedule_id
+        deadline_key, admin_data, tags, state, schedule_id,
+        identity_key
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+            $16)
     RETURNING id
+"""
+
+# The identified form of ENQUEUE_SQL: same columns, same row, but the write
+# is "claim this identity or tell me who holds it". ONE statement, because
+# read-then-insert has a race with exactly the shape the feature exists to
+# rule out -- two callers both read "no such identity" and both insert, and
+# only the unique index stops the second, as an error the caller did not ask
+# for. Here the loser of the race takes the second branch and gets the
+# winner's id, so both callers are told the same thing.
+#
+# ON CONFLICT infers jorb_identity_idx, and inference against a PARTIAL
+# unique index requires its predicate restated (`WHERE identity_key IS NOT
+# NULL`) -- without it PostgreSQL refuses the statement rather than guessing.
+#
+# DO NOTHING, deliberately not DO UPDATE. DO UPDATE would return the
+# existing row directly, but it takes a ROW LOCK on it and writes a new
+# version of it: a duplicate enqueue would then contend with the worker
+# running that very job, and leave a dead tuple behind for every duplicate.
+# An identity collision must cost the holder nothing.
+#
+# THIS STATEMENT CAN RETURN NO ROWS AT ALL, and that is not an error. The
+# sequence, measured (tests/test_job_identity.py pins each step):
+#
+#   1. another transaction has inserted this identity and not committed;
+#   2. the speculative insert here finds the conflicting tuple and WAITS for
+#      that transaction -- ON CONFLICT does not skip an in-progress
+#      conflict, it blocks on it, so this never answers early or twice;
+#   3. that transaction commits, so DO NOTHING correctly inserts nothing;
+#   4. the second branch runs under THIS statement's snapshot, which was
+#      taken back at step 1 and therefore cannot see the row that committed
+#      at step 3.
+#
+# Nothing was written and nothing can be reported: the answer is "ask
+# again", with a new snapshot. _enqueue_identity is the loop that does.
+#
+# Params: ENQUEUE_SQL's, with $16 the identity_key (never NULL here).
+ENQUEUE_IDENTIFIED_SQL = """
+    WITH claimed AS (
+        INSERT INTO jorb (
+            job_class, kwargs, queue, prio, run_after,
+            capability, uid, run_group,
+            waitfor_job, waitfor_group,
+            deadline_key, admin_data, tags, state, schedule_id,
+            identity_key
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                $15, $16)
+        ON CONFLICT (identity_key) WHERE identity_key IS NOT NULL DO NOTHING
+        RETURNING id, job_class
+    )
+    SELECT id, job_class, TRUE AS created FROM claimed
+    UNION ALL
+    SELECT held.id, held.job_class, FALSE
+      FROM jorb held
+     WHERE held.identity_key = $16
+       AND NOT EXISTS (SELECT 1 FROM claimed)
 """
 
 # The multi-row form of ENQUEUE_SQL: the same columns, filled from one array
@@ -128,14 +186,15 @@ ENQUEUE_BATCH_SQL = """
         job_class, kwargs, queue, prio, run_after,
         capability, uid, run_group,
         waitfor_job, waitfor_group,
-        deadline_key, admin_data, tags, state, schedule_id
+        deadline_key, admin_data, tags, state, schedule_id,
+        identity_key
     )
     SELECT * FROM UNNEST(
         $1::text[], $2::jsonb[], $3::text[], $4::int[],
         $5::timestamptz[], $6::text[], $7::bigint[],
         $8::bigint[], $9::bigint[], $10::bigint[],
         $11::text[], $12::jsonb[], $13::jsonb[],
-        $14::jorbstate[], $15::bigint[]
+        $14::jorbstate[], $15::bigint[], $16::text[]
     )
     RETURNING id
 """
@@ -183,6 +242,40 @@ DEFAULT_MACHINE_QUEUE: Final = "machines"
 #: catch never arrived and the call hung on the tidying instead of the work.
 #: Short on purpose — the cancel is best effort, the exception is not.
 _RUN_CANCEL_TIMEOUT: Final = 5.0
+
+#: How many times an identified enqueue re-runs ENQUEUE_IDENTIFIED_SQL when
+#: it comes back empty. Empty means the identity was committed by another
+#: transaction AFTER this statement's snapshot was taken, so the statement
+#: could neither insert over the row nor see it (that statement's comment
+#: walks through the four steps). Re-running takes a FRESH SNAPSHOT, which is
+#: why this is a loop and not a longer statement, and one retry is normally
+#: the whole of it: the writer we waited for has already committed.
+#:
+#: More than one is only needed if ANOTHER writer claims the identity in the
+#: gap, so the budget is a backstop against a pathological stream of them and
+#: not a wait for anything. It is deliberately NOT the answer to a
+#: transaction that never commits -- that case blocks inside PostgreSQL at
+#: step 2 and never reaches this loop at all.
+_IDENTITY_ATTEMPTS: Final = 5
+
+#: Pause between those attempts, growing linearly. Nonzero so a pile-up of
+#: writers is not spun on, and tiny because there is nothing to wait for:
+#: the commit we lost to has already happened.
+_IDENTITY_BACKOFF: Final = 0.01
+
+#: Why a batch cannot carry identity keys. A batch is ONE multi-row INSERT
+#: whose contract is "the ids, in the order given" -- and the identified
+#: write resolves each conflict into an id to hand back, which a single
+#: RETURNING cannot do for the rows it did not insert. Accepting the option
+#: and silently dropping collided rows would break that contract in the way
+#: hardest to notice: a shorter list, misaligned with the input. So it is
+#: refused at the door, and the caller loops enqueue_identified().
+_NO_BATCH_IDENTITY: Final = (
+    "identity_key is not a batch option: a batch is one INSERT returning one "
+    "id per row IN ORDER, and an identity that already exists has no row in "
+    "it to return. Enqueue identified jobs one at a time with "
+    "enqueue_identified(), which tells you which ones were already there."
+)
 
 
 def validate_priority(priority: int, ceiling: int = DEFAULT_PRIO_CEILING) -> int:
@@ -779,6 +872,7 @@ class JobClient:
         waitfor_job: int | None = None,
         waitfor_group: int | None = None,
         deadline_key: str | None = None,
+        identity_key: str | None = None,
         admin_data: dict[str, Any] | None = None,
         tags: dict[str, Any] | None = None,
         # result storage & passing
@@ -814,7 +908,20 @@ class JobClient:
             run_group: Group ID for pipeline tracking (default: None)
             waitfor_job: Wait for this job ID to complete (default: None)
             waitfor_group: Wait for all jobs in this group (default: None)
-            deadline_key: Idempotency key (default: None)
+            deadline_key: Idempotency key that collapses duplicate
+                submissions of work that has not started: one QUEUED row per
+                (deadline_key, queue), so a second enqueue while the first is
+                still queued raises UniqueViolationError — and the key
+                RE-ARMS once the job is claimed (default: None)
+            identity_key: This exact work happens AT MOST ONCE. Unique across
+                every state, so if a job with this key already exists — queued,
+                running, finished, crashed — the enqueue returns THAT job's id
+                instead of writing a second row, and never raises. Bounded by
+                retention: reaping the terminal row frees the key, so scope
+                keys to a time you can name (an order id, a date stamp) if you
+                need uniqueness beyond `--retention-days`. Use
+                enqueue_identified() when you must know which of the two
+                happened (default: None)
             admin_data: Metadata dict (default: None)
             tags: The caller's OWN labels — customer, tenant, region, batch —
                 as a flat dict of string keys to scalar values, filterable
@@ -844,14 +951,16 @@ class JobClient:
             **kwargs: Job arguments (passed to job class)
 
         Returns:
-            Job ID
+            Job ID — of the job this call created, or, when identity_key
+            names a job that already exists, of that one.
 
         Raises:
             asyncpg.UniqueViolationError: If deadline_key already exists
             ValueError: If both waitfor_job and waitfor_group specified, if
                 on_timeout is neither 'retry' nor 'fail', if priority is
-                above this client's worker priority ceiling, or if tags are
-                not a flat dict of string keys to scalar values
+                above this client's worker priority ceiling, if tags are
+                not a flat dict of string keys to scalar values, or if
+                identity_key names an existing job of a DIFFERENT job_class
 
         Examples:
             # Simple job
@@ -885,6 +994,14 @@ class JobClient:
                 payment_id=payment_id
             )
 
+            # At-most-once work: every call returns the SAME job id for as
+            # long as retention keeps the row, whatever state it is in
+            job_id = await client.enqueue(
+                'myapp.jobs.ShipOrder',
+                identity_key=f'order:{order_id}:ship',
+                order_id=order_id
+            )
+
             # Pipeline with result passing
             job1 = await client.enqueue('FetchData', url='...', save_result=True)
             job2 = await client.enqueue('ProcessData', waitfor_job=job1, use_result_from=job1)
@@ -912,6 +1029,7 @@ class JobClient:
                     waitfor_job=waitfor_job,
                     waitfor_group=waitfor_group,
                     deadline_key=deadline_key,
+                    identity_key=identity_key,
                     admin_data=admin_data,
                     tags=tags,
                     save_result=save_result,
@@ -945,6 +1063,47 @@ class JobClient:
             f"Cannot enqueue into {describe_db_target(self._db_params)}: "
             f"{migrations.SCHEMA_REMEDY}"
         )
+
+    async def enqueue_identified(
+        self, job_class: str, *, identity_key: str, **options: Any
+    ) -> tuple[int, bool]:
+        """Enqueue at-most-once work and say whether THIS call created it.
+
+        Same job, same keyword arguments and same outcome as
+        ``enqueue(..., identity_key=...)`` — the only difference is the
+        return shape: ``(job_id, created)``, where ``created`` is False when
+        the id belongs to a job that already existed. Plain enqueue stays a
+        bare int because most callers do not care which of the two happened;
+        this exists for the ones that genuinely cannot tell otherwise, since
+        the id alone never says (both calls return the same one).
+
+        `created` is a fact about this call, not about the job: exactly one
+        of two racing callers gets True, and the other's False is the
+        truthful answer even though its INSERT and the winner's were in
+        flight at the same time.
+
+        Example:
+            job_id, created = await client.enqueue_identified(
+                'myapp.jobs.ShipOrder',
+                identity_key=f'order:{order_id}:ship',
+                order_id=order_id,
+            )
+            if not created:
+                log.info("shipment %s was already under way as job %s",
+                         order_id, job_id)
+            result = await client.wait_for_result(job_id)
+        """
+        # enqueue()'s ceiling rule, applied here too: this client's declared
+        # worker ceiling unless the call overrides it for itself.
+        ceiling = options.pop("prio_ceiling", None)
+        options["prio_ceiling"] = self.prio_ceiling if ceiling is None else ceiling
+        async with self.pool.acquire() as conn:
+            try:
+                return await self._enqueue_row(
+                    conn, job_class, identity_key=identity_key, **options
+                )
+            except asyncpg.UndefinedTableError as e:
+                raise self._unmigrated_database_error() from e
 
     async def enqueue_handle(self, job_class: str, **options: Any) -> JobHandle:
         """Enqueue a job (same keyword arguments as enqueue()) and return a
@@ -1072,9 +1231,87 @@ class JobClient:
                     conn, 'myapp.jobs.FulfillOrder', order_id=42
                 )
         """
-        args = JobClient.build_enqueue_row(job_class, **options)
-        job_id: int = await conn.fetchval(ENQUEUE_SQL, *args)
+        job_id, _ = await JobClient._enqueue_row(conn, job_class, **options)
         return job_id
+
+    @staticmethod
+    async def _enqueue_row(
+        conn: asyncpg.Connection, job_class: str, **options: Any
+    ) -> tuple[int, bool]:
+        """THE single-row write behind every enqueue path, and the one place
+        that knows an identified enqueue is a different statement.
+
+        Returns ``(job_id, created)``. Without an identity_key `created` is
+        always True — an ordinary enqueue writes a row or raises — and every
+        caller but enqueue_identified() throws it away.
+
+        The unidentified path is left EXACTLY as it was, a bare INSERT ...
+        RETURNING id, because it is the hot one: identity costs a CTE, a
+        conflict-inferring index probe and a second branch, and no job that
+        does not ask for identity should pay any of it.
+        """
+        identity_key = options.get("identity_key")
+        args = JobClient.build_enqueue_row(job_class, **options)
+        if identity_key is None:
+            job_id: int = await conn.fetchval(ENQUEUE_SQL, *args)
+            return job_id, True
+        return await JobClient._enqueue_identity(conn, args, job_class, identity_key)
+
+    @staticmethod
+    async def _enqueue_identity(
+        conn: asyncpg.Connection,
+        args: list[Any],
+        job_class: str,
+        identity_key: str,
+    ) -> tuple[int, bool]:
+        """Claim ``identity_key`` for this row, or return the job that holds it.
+
+        The loop is the whole reason this is a method and not a fetchrow.
+        ENQUEUE_IDENTIFIED_SQL answers in one statement EXCEPT when it loses
+        a race it had to wait out: it blocks on the conflicting transaction,
+        that transaction commits, and the row is then newer than this
+        statement's snapshot -- so it returns nothing at all rather than a
+        wrong answer. Each attempt is a new statement and therefore a new
+        snapshot (READ COMMITTED, the default and what every pyjobby
+        connection runs at), which is why the retry sees what the first
+        attempt could not.
+
+        A caller running at REPEATABLE READ would loop without converging,
+        because the snapshot is the transaction's rather than the
+        statement's. That is the same isolation level at which a plain
+        enqueue's UniqueViolationError could not be retried either, and the
+        bounded budget turns it into an error rather than a hang.
+
+        THE CLASS CHECK IS AFTER THE RACE, not before it: it reads the
+        job_class the winning row actually has, so two callers disagreeing
+        about what an identity means are BOTH told, whichever of them
+        inserted. Checking a row read beforehand would let the loser insert
+        against a row that no longer says what it read.
+        """
+        for attempt in range(_IDENTITY_ATTEMPTS):
+            row = await conn.fetchrow(ENQUEUE_IDENTIFIED_SQL, *args)
+            if row is not None:
+                held: str = row["job_class"]
+                if held != job_class:
+                    raise ValueError(
+                        f"identity_key {identity_key!r} already names job "
+                        f"{row['id']}, which is a {held} — not the requested "
+                        f"{job_class}. An identity names ONE piece of work, so "
+                        f"this is either the wrong key for this job or the "
+                        f"wrong job for this key; the platform will not "
+                        f"silently hand back a job of the other class."
+                    )
+                return row["id"], row["created"]
+            await asyncio.sleep(_IDENTITY_BACKOFF * (attempt + 1))
+        raise RuntimeError(
+            f"identity_key {identity_key!r} was claimed by another "
+            f"transaction after each of {_IDENTITY_ATTEMPTS} attempts' "
+            f"snapshots, so this call can neither create the job nor name the "
+            f"one that holds it. Nothing was written. Either an unbroken "
+            f"stream of writers is claiming this one identity, or this "
+            f"enqueue is running at REPEATABLE READ or higher, where a retry "
+            f"reuses the transaction's snapshot and can never see the row."
+        )
 
     @staticmethod
     def build_enqueue_row(
@@ -1089,6 +1326,7 @@ class JobClient:
         waitfor_job: int | None = None,
         waitfor_group: int | None = None,
         deadline_key: str | None = None,
+        identity_key: str | None = None,
         admin_data: dict[str, Any] | None = None,
         tags: dict[str, Any] | None = None,
         save_result: bool = True,
@@ -1222,6 +1460,7 @@ class JobClient:
             job_tags,  # Dict - custom codec handles conversion
             state,
             schedule_id,
+            identity_key,
         ]
 
     async def enqueue_batch(
@@ -1302,6 +1541,8 @@ class JobClient:
                 f"job_class and kwargs come from each job tuple, and "
                 f"prio_ceiling is enqueue_batch's own argument"
             )
+        if "identity_key" in options:
+            raise ValueError(_NO_BATCH_IDENTITY)
 
         ceiling = self.prio_ceiling if prio_ceiling is None else prio_ceiling
         rows = []
@@ -1316,6 +1557,8 @@ class JobClient:
                     f"tuple's first two elements, and prio_ceiling is a "
                     f"batch-level argument"
                 )
+            if "identity_key" in per_job:
+                raise ValueError(f"job {index}: {_NO_BATCH_IDENTITY}")
             rows.append(
                 self.build_enqueue_row(
                     job_class,
@@ -1363,6 +1606,38 @@ class JobClient:
                 WHERE id = $1
             """,
                 job_id,
+            )
+
+        if not row:
+            return None
+
+        return JobInfo(**dict(row))
+
+    async def get_job_by_identity(self, identity_key: str) -> JobInfo | None:
+        """The job holding ``identity_key``, or None if nothing holds it.
+
+        The same view get_job() returns, found by the caller's own name for
+        the work instead of by an id it would have had to keep. There is at
+        most one, in any state, because jorb_identity_idx says so.
+
+        None is the honest answer to two different questions and does not
+        distinguish them: this identity was never enqueued, or its job was
+        enqueued, finished, and has since been reaped by retention. Both mean
+        the same thing for what happens next — enqueueing it now creates a
+        new job — which is exactly the horizon the key is bounded by.
+
+        Example:
+            job = await client.get_job_by_identity(f"order:{order_id}:ship")
+            print("not shipped yet" if job is None else f"shipment {job.state}")
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, job_class, queue, prio as priority, state, created
+                FROM jorb
+                WHERE identity_key = $1
+            """,
+                identity_key,
             )
 
         if not row:
@@ -1521,9 +1796,11 @@ class JobClient:
         The fork inherits job_class, kwargs (or `kwargs_override`), queue and
         priority (or the overrides), capability, tags and the retry/timeout
         policy in admin_data. It does NOT inherit identity or structure: uid,
-        deadline_key, schedule_id, dag_id, run_group and the waitfor edges
-        are all left unset, because two live rows sharing an idempotency key
-        (or a DAG slot) would make that key mean nothing.
+        deadline_key, identity_key, schedule_id, dag_id, run_group and the
+        waitfor edges are all left unset, because two live rows sharing an
+        idempotency key (or a DAG slot) would make that key mean nothing —
+        and an identity_key most of all, since ITS whole promise is that the
+        row holding it is the only one.
 
         Streams, events and mailbox messages are NOT copied — they are the
         SOURCE's output. A fast-forwarded `stream_write` checkpoint therefore
@@ -3385,9 +3662,25 @@ class SyncJobClient:
         job_id: int = self._run(self._client.enqueue(job_class, **options))
         return job_id
 
+    def enqueue_identified(
+        self, job_class: str, *, identity_key: str, **options: Any
+    ) -> tuple[int, bool]:
+        """Synchronous JobClient.enqueue_identified()."""
+        outcome: tuple[int, bool] = self._run(
+            self._client.enqueue_identified(
+                job_class, identity_key=identity_key, **options
+            )
+        )
+        return outcome
+
     def get_job(self, job_id: int) -> JobInfo | None:
         """Synchronous JobClient.get_job()."""
         info: JobInfo | None = self._run(self._client.get_job(job_id))
+        return info
+
+    def get_job_by_identity(self, identity_key: str) -> JobInfo | None:
+        """Synchronous JobClient.get_job_by_identity()."""
+        info: JobInfo | None = self._run(self._client.get_job_by_identity(identity_key))
         return info
 
     def wait_for_result(self, job_id: int, timeout: float | None = None) -> Any:

@@ -303,6 +303,14 @@ def jobs() -> None:
 @click.option("--job-class", help="Filter by job class (supports patterns)")
 @click.option("--uid", type=int, help="Filter by user ID")
 @click.option(
+    "--identity",
+    "identity_key",
+    metavar="KEY",
+    help="Filter by at-most-once identity key (exact match). At most one job "
+    "can hold a key, in any state, so this answers 'did this work ever run, "
+    "and what became of it' — until retention reaps the row.",
+)
+@click.option(
     "--tag",
     "tag_pairs",
     multiple=True,
@@ -322,6 +330,7 @@ def jobs_list(
     state: str | None,
     job_class: str | None,
     uid: int | None,
+    identity_key: str | None,
     tag_pairs: tuple[str, ...],
     limit: int,
     offset: int,
@@ -342,6 +351,7 @@ def jobs_list(
                 state=state,
                 job_class=job_class,
                 uid=uid,
+                identity_key=identity_key,
                 tags=tags,
                 limit=limit,
                 offset=offset,
@@ -433,6 +443,12 @@ def jobs_inspect(ctx: click.Context, job_id: int, output_json: bool) -> None:
                 if forks:
                     click.echo(f"Forked Into:     {', '.join(str(f) for f in forks)}")
 
+                # Printed only when set, like every optional field here --
+                # and worth a line of its own when it is, because it is the
+                # reason a re-enqueue of this work would come straight back
+                # to this job instead of creating another.
+                if job["identity_key"]:
+                    click.echo(f"Identity:        {job['identity_key']}")
                 if job["capability"]:
                     click.echo(f"Capability:      {job['capability']}")
                 if job["uid"]:
@@ -501,6 +517,11 @@ def jobs_why(ctx: click.Context, job_id: int, output_json: bool) -> None:
                 f"{answer['state']}  {answer['queue']}  "
                 f"{answer['job_class']}  prio {answer['prio']}"
                 + (f"  cap {answer['capability']}" if answer["capability"] else "")
+                + (
+                    f"  identity {answer['identity_key']}"
+                    if answer["identity_key"]
+                    else ""
+                )
             )
             click.echo("-" * 50)
             click.echo(answer["summary"])
@@ -896,8 +917,9 @@ def jobs_fork(
 
     The fork inherits the job's class, arguments, queue, priority,
     capability, tags and retry/timeout policy. It does NOT inherit identity:
-    no uid, no deadline_key, no schedule, no DAG or dependency edges -- two
-    live rows sharing an idempotency key would make that key mean nothing.
+    no uid, no deadline_key, no identity_key, no schedule, no DAG or
+    dependency edges -- two live rows sharing an idempotency key would make
+    that key mean nothing, and an identity_key promises there is only one.
 
     --priority is refused above the deployment's worker ceiling, exactly as
     `jobs set-priority` refuses it: no worker would claim the fork. The

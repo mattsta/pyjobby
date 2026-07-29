@@ -215,7 +215,8 @@ jorb_history; pj-monitor reaps timeouts and jobs of dead workers
 | `waitfor_job`     | Dependency on specific job                                                                                                                                        |
 | `waitfor_group`   | Dependency on job group                                                                                                                                           |
 | `run_group`       | Group identifier for this job                                                                                                                                     |
-| `deadline_key`    | Unique key for singleton scheduling                                                                                                                               |
+| `deadline_key`    | Unique key for singleton scheduling — among `queued` rows only, so it re-arms once the job is claimed                                                              |
+| `identity_key`    | Caller-chosen at-most-once identity — unique in every state, for as long as retention keeps the row                                                                |
 
 ## Example Workflows
 

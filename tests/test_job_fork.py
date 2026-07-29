@@ -239,7 +239,8 @@ class TestTheForkedRow:
         capability, tags, retry/timeout policy). What identifies the job, or
         wires it into somebody else's structure, does not — two live rows
         sharing a deadline_key would make idempotent enqueue mean nothing,
-        and a fork is nobody's DAG member.
+        an identity_key promises there is only one row holding it, and a
+        fork is nobody's DAG member.
         """
         upstream = await make_source(db_pool, unique_queue)
         dag_id = await db_pool.fetchval(
@@ -257,6 +258,7 @@ class TestTheForkedRow:
             admin_data={"max_retries": 2, "timeout_seconds": 30},
             uid=99,
             deadline_key="payment:1",
+            identity_key=f"identity:{unique_queue}",
             schedule_id=1234,
             run_group=5,
             waitfor_job=upstream,
@@ -276,9 +278,17 @@ class TestTheForkedRow:
         assert row["admin_data"]["timeout_seconds"] == 30
         assert row["state"] == "queued"
         # uid is a tenant LABEL like tags, so a fork stays attributed to its
-        # tenant; deadline_key and schedule_id are identity, never inherited.
+        # tenant; deadline_key, identity_key and schedule_id are identity,
+        # never inherited. identity_key is the load-bearing one: its index is
+        # unique across EVERY state, so a fork that inherited it could not
+        # have been inserted at all -- FORK_JOB_SQL lists its columns, and
+        # this asserts identity_key is still not among them.
         assert row["uid"] == 99
-        assert (row["deadline_key"], row["schedule_id"]) == (None, None)
+        assert (row["deadline_key"], row["identity_key"], row["schedule_id"]) == (
+            None,
+            None,
+            None,
+        )
         assert (row["dag_id"], row["run_group"], row["waitfor_job"]) == (
             None,
             None,
