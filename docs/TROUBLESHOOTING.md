@@ -513,6 +513,15 @@ fresh attempt budget. A DXE job resumes from its last completed
 checkpoint; `pj-admin jobs rerun ID` wipes the checkpoints and
 restarts from step 1 (`--resume` keeps them).
 
+`pj-admin jobs fork ID --from-failure` is the same recovery under a **new
+id**: it creates a second job that starts at the step that failed, with the
+completed prefix copied in as checkpoints, and leaves the crashed original
+untouched as the record of the incident. Take it instead of `dlq retry`
+when the evidence must survive the recovery, when the fork needs a
+different queue or priority (`--queue`, `--priority`), or when the job has
+already been retried as far as it can be. See
+[OPERATIONS.md § Retry, re-run, fork](OPERATIONS.md#retry-re-run-fork).
+
 Watch `DLQ Growth` in `pj-admin metrics` and `Retry Pressure` next to it —
 retries that eventually succeed cost throughput without ever reaching the
 DLQ, so a flat DLQ with rising retry pressure is still a problem.
@@ -564,7 +573,7 @@ and a monitor startup WARNING naming the two flags. Raise the grace
 Note that a re-run you asked for is a separate verb precisely because it
 repeats side effects: `jobs retry` refuses a finished job, `jobs rerun`
 accepts one. See
-[OPERATIONS.md § Retry vs. re-run](OPERATIONS.md#retry-vs-re-run).
+[OPERATIONS.md § Retry, re-run, fork](OPERATIONS.md#retry-re-run-fork).
 
 ---
 

@@ -26,6 +26,9 @@ CREATE TABLE jorb (
     -- provenance: the recurring schedule that fired this job into existence
     schedule_id     BIGINT,
 
+    -- lineage: the job this one was FORKED from (see the COMMENT)
+    forked_from     BIGINT REFERENCES jorb (id) ON DELETE SET NULL,
+
     -- execution bookkeeping
     run_count       INTEGER     NOT NULL DEFAULT 0,
     error_count     INTEGER     NOT NULL DEFAULT 0,
@@ -60,6 +63,7 @@ COMMENT ON COLUMN jorb.awaited IS 'Someone has waited on this job (wait_for_resu
 COMMENT ON COLUMN jorb.tags IS 'The CALLER''s labels (customer, region, batch), flat key -> scalar, for filtering jobs by something the application means. Deliberately NOT admin_data: that column is the platform''s own execution config (max_retries, timeout_seconds, save_result, schedule metadata), which nobody filters on, so indexing it would tax every enqueue to make no query faster. The one thing anybody DID filter admin_data by is now jorb.schedule_id: a fact worth querying by is worth a column, because the alternative is an expression index over a jsonb blob written by every job to answer a question asked about a handful of them.';
 COMMENT ON COLUMN jorb.waitfor_group IS 'Becomes queued only when ALL jobs with run_group = this value are finished.';
 COMMENT ON COLUMN jorb.waitfor_job IS 'Becomes queued only when the job with this id is finished.';
+COMMENT ON COLUMN jorb.forked_from IS 'The job this one was forked from: a fork is a NEW row that re-executes an existing job''s work from step N, with steps 1..N-1 copied in as checkpoints (jorb.admin_data->''fork'' records which N, and how many rows were copied). Retry and re-run keep ONE row; a fork does not, which is the whole point -- the source is never touched, so a fork of a running job is safe and a fork of a finished one does not disturb its result. ON DELETE SET NULL because LINEAGE IS BEST-EFFORT AUDIT, NOT A DEPENDENCY: retention reaps terminal jobs on its own schedule and the source is usually older than the fork, so a fork must outlive the row it came from rather than be deleted with it (ON DELETE CASCADE) or pin it forever (RESTRICT). A NULL here therefore means "no source, or the source has aged out", and the fork''s own history row -- written at insert, before anything could be reaped -- keeps the source id and step regardless.';
 COMMENT ON COLUMN jorb.schedule_id IS 'The jorb_schedule row that fired this job, NULL for every job enqueued directly. This is the SOLE source of that fact -- it used to live in admin_data->>''schedule_id'', which no index could serve, so the scheduler''s max_concurrent_jobs check scanned the whole job table on every firing. Deliberately NOT a foreign key: jobs outlive the schedules that made them (deleting a schedule must not delete or rewrite its history), and a REFERENCES here would need an index over EVERY schedule-created job to serve the cascade, undoing the point of the partial index below.';
 
 -- the poll/claim path
@@ -118,6 +122,24 @@ CREATE INDEX jorb_run_group_idx ON jorb (run_group) WHERE run_group IS NOT NULL;
 CREATE INDEX jorb_group_unfinished_idx ON jorb (run_group)
     WHERE run_group IS NOT NULL AND state != 'finished';
 CREATE INDEX jorb_uid_idx       ON jorb (uid)       WHERE uid IS NOT NULL;
+-- Fork lineage, partial for the same reason as the two above: almost no job
+-- is a fork, so the predicate keeps every ordinary enqueue out of the index.
+--
+-- The reader that MAKES this index mandatory is not a query anybody writes.
+-- `forked_from REFERENCES jorb ON DELETE SET NULL` means PostgreSQL runs
+-- `UPDATE jorb SET forked_from = NULL WHERE forked_from = <id>` for EVERY row
+-- deleted from this table -- and retention deletes in batches of thousands,
+-- forever. Unindexed that is a sequential scan of the largest table in the
+-- system per reaped job, i.e. the retention sweep silently becoming O(rows
+-- deleted x table size). The referential-integrity query is `forked_from =
+-- $1`, a strict clause, which implies `forked_from IS NOT NULL` and so may
+-- use this partial index (THE COST OF PARTIAL, spelled out on jorb_tags_idx
+-- below, is a real cost here and it is paid: tests/test_scale_plans.py
+-- asserts the delete path is an index scan at scale, not a seq scan).
+--
+-- It also answers the lineage question in the other direction -- "what was
+-- forked from this job?", which `pj-admin jobs inspect` asks about the source.
+CREATE INDEX jorb_forked_from_idx ON jorb (forked_from) WHERE forked_from IS NOT NULL;
 CREATE INDEX jorb_dag_idx           ON jorb (dag_id) WHERE dag_id IS NOT NULL;
 -- Caller-supplied labels, and partial for exactly the reason the three above
 -- are: almost every job sets no tags at all, and a plain GIN index would

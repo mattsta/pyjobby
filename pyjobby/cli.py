@@ -397,6 +397,7 @@ def jobs_inspect(ctx: click.Context, job_id: int, output_json: bool) -> None:
             if output_json:
                 click.echo(json.dumps(job, indent=2))
             else:
+                forks = await api.list_forks(job_id)
                 click.echo(f"\n{Colors.BOLD}Job {job_id} Details{Colors.ENDC}")
                 click.echo("-" * 50)
                 click.echo(f"State:           {job['state']}")
@@ -408,6 +409,29 @@ def jobs_inspect(ctx: click.Context, job_id: int, output_json: bool) -> None:
                 click.echo(f"Run After:       {job['run_after']}")
                 click.echo(f"Run Count:       {job['run_count']}")
                 click.echo(f"Error Count:     {job['error_count']}")
+
+                # Lineage, both directions. `forked_from` alone under-reports
+                # it: the reference is ON DELETE SET NULL, so a fork whose
+                # source has been reaped keeps only the fork block recorded
+                # on its own row -- and saying "step 4, source gone" is a
+                # better answer than saying nothing.
+                fork = (job["admin_data"] or {}).get("fork")
+                fork = fork if isinstance(fork, dict) else None
+                if job["forked_from"] or fork:
+                    source = (
+                        f"job {job['forked_from']}"
+                        if job["forked_from"]
+                        else "a job since deleted"
+                    )
+                    detail = (
+                        f" at step {fork.get('from_step')} "
+                        f"({fork.get('steps_copied')} checkpoint(s) copied)"
+                        if fork
+                        else ""
+                    )
+                    click.echo(f"Forked From:     {source}{detail}")
+                if forks:
+                    click.echo(f"Forked Into:     {', '.join(str(f) for f in forks)}")
 
                 if job["capability"]:
                     click.echo(f"Capability:      {job['capability']}")
@@ -715,6 +739,17 @@ def jobs_history(ctx: click.Context, job_id: int, output_json: bool) -> None:
             print_table(headers, rows, max_width=140)
             click.echo(f"\nTotal: {len(history)} transition(s)")
 
+            # A fork has no event of its own -- this table records STATE
+            # transitions and a fork transitions nothing -- so its origin
+            # rides on the row that IS its creation: the 'enqueued' one.
+            origin = history[0]["detail"] or {}
+            if "forked_from" in origin:
+                click.echo(
+                    f"Forked from job {origin['forked_from']} at step "
+                    f"{origin.get('from_step')} "
+                    f"({origin.get('steps_copied')} checkpoint(s) copied)"
+                )
+
         finally:
             await conn.close()
 
@@ -814,6 +849,106 @@ def jobs_rerun(ctx: click.Context, job_id: int, resume: bool) -> None:
             await conn.close()
 
     asyncio.run(_rerun())
+
+
+@jobs.command("fork")
+@click.argument("job_id", type=int)
+@click.option(
+    "--from-step",
+    type=int,
+    default=None,
+    metavar="N",
+    help="1-based step the fork EXECUTES first; steps before it are copied "
+    "as checkpoints and fast-forward (default: 1, copy nothing)",
+)
+@click.option(
+    "--from-failure",
+    is_flag=True,
+    help="Start at the first step whose checkpoint recorded an error",
+)
+@click.option("--queue", "-q", default=None, help="Run the fork on another queue")
+@click.option(
+    "--priority", "-p", type=int, default=None, help="Run the fork at another priority"
+)
+@max_prio_option
+@click.pass_context
+def jobs_fork(
+    ctx: click.Context,
+    job_id: int,
+    from_step: int | None,
+    from_failure: bool,
+    queue: str | None,
+    priority: int | None,
+    max_prio: int | None,
+) -> None:
+    """FORK a job into a NEW job that starts at a given step
+
+    `retry` and `rerun` requeue the SAME row -- same id, same history. A
+    fork creates a NEW job that re-executes this one's work from --from-step,
+    with the steps before it copied in as checkpoints so they fast-forward
+    instead of running again.
+
+    The source is never touched: it may be in ANY state, running included,
+    and its state, checkpoints and result are exactly as they were
+    afterwards. That is what makes fork the incident verb -- deploy the fix,
+    fork the crashed job from the step that broke (--from-failure), and the
+    completed prefix is not paid for twice.
+
+    The fork inherits the job's class, arguments, queue, priority,
+    capability, tags and retry/timeout policy. It does NOT inherit identity:
+    no uid, no deadline_key, no schedule, no DAG or dependency edges -- two
+    live rows sharing an idempotency key would make that key mean nothing.
+
+    --priority is refused above the deployment's worker ceiling, exactly as
+    `jobs set-priority` refuses it: no worker would claim the fork. The
+    ceiling comes from the config file's `prio_ceiling`, and --max-prio
+    overrides it for one command.
+
+    Streams, events and mail are the SOURCE's output and are not copied.
+    """
+
+    async def _fork() -> None:
+        if from_failure and from_step is not None:
+            fail(
+                "--from-step and --from-failure both name where to start; pass one",
+                code=2,
+            )
+        conn, api = await get_api(ctx, prio_ceiling=max_prio)
+        try:
+            try:
+                if from_failure:
+                    result = await api.fork_job_from_failure(
+                        job_id, queue=queue, priority=priority
+                    )
+                else:
+                    result = await api.fork_job(
+                        job_id,
+                        from_step=1 if from_step is None else from_step,
+                        queue=queue,
+                        priority=priority,
+                    )
+            except db.ForkRefused as refusal:
+                fail(str(refusal))
+            except ValueError as unclaimable:  # a priority above the ceiling
+                fail(str(unclaimable), code=2)
+
+            print_success(
+                f"Job {result['job_id']} forked from job {result['source_job_id']}"
+            )
+            copied = result["steps_copied"]
+            click.echo(
+                f"  starts at step {result['from_step']}"
+                + (
+                    f" ({copied} checkpoint(s) copied, fast-forwarded)"
+                    if copied
+                    else " (no checkpoints copied: re-runs from the start)"
+                )
+            )
+            click.echo(f"  queue {result['queue']}  priority {result['priority']}")
+        finally:
+            await conn.close()
+
+    asyncio.run(_fork())
 
 
 # =========================================================================

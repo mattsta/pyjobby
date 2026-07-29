@@ -370,6 +370,7 @@ TRIGGER_TABLES = {
     "jorb_history_record": "jorb",
     "jorb_dag_complete": "jorb",
     "jorb_event_notify": "jorb_event",
+    "jorb_stream_notify": "jorb_stream",
     "schedule_executed_notify": "jorb_schedule_log",
 }
 

@@ -282,6 +282,225 @@ async def requeue_job(
     return requeued
 
 
+# =========================================================================
+# Fork: a NEW job from an existing job's checkpoint prefix
+# =========================================================================
+# Retry and re-run keep ONE row (see build_requeue_sql). A FORK does not: it
+# inserts a second row that re-executes the source's work from step N, with
+# steps 1..N-1 copied in as its own checkpoints so they fast-forward. The
+# source is never touched -- not its state, not its epoch, not its steps --
+# which is what makes forking a RUNNING job safe and forking a FINISHED one
+# non-destructive.
+#
+# ONE STATEMENT, so the row and its checkpoint prefix commit together and no
+# claim can land in between: a fork whose row existed before its checkpoints
+# would be claimable by a worker that then re-executed the very steps the
+# fork was asked to skip. It also means every read here -- the source row,
+# the step count, the prefix itself -- comes from ONE snapshot, which is the
+# whole of what "as of the fork" means when the source is still running.
+#
+# THE GUARD IS IN THE SQL, not in a preceding SELECT: `from_step` is checked
+# against the same snapshot that copies, so a source that gains a step
+# between two round trips cannot make the refusal (or the acceptance) a lie.
+# When the guard refuses, `forked` inserts nothing, `copied` copies nothing,
+# and the outer SELECT still reports the recorded step count -- so the
+# caller can name it in the error.
+#
+# COPIED CHECKPOINTS GET run_epoch 0, not the epoch that produced them. A
+# jorb_step row's run_epoch says which attempt of ITS job wrote it, and no
+# attempt of the fork wrote these -- 0 is below every epoch the fork will
+# ever run at (the first claim bumps it to 1), so the prefix reads as
+# "predates this job's first attempt", which is exactly what it is. Carrying
+# the source's epochs over would have the fork's step table claim attempts
+# that never happened. Nothing depends on the value: LOAD_STEPS_SQL replays
+# checkpoints with no epoch filter, the same property `rerun --resume`
+# relies on. Provenance lives in jorb.forked_from and in the fork's own
+# history row.
+#
+# NOTHING ELSE IS COPIED. Streams, events and mailbox messages are the
+# SOURCE's output and stay with it (docs/DXE.md spells out what that means
+# for a fast-forwarded stream write).
+#
+# Params: $1 source job id, $2 from_step (1-based), $3 queue override or
+# NULL, $4 priority override or NULL, $5 kwargs override or NULL.
+FORK_JOB_SQL = """
+    WITH src AS (
+        SELECT * FROM jorb WHERE id = $1
+    ), recorded AS (
+        SELECT COALESCE(max(step_seq), 0)::int AS steps,
+               (count(*) FILTER (WHERE step_seq < $2::int))::int AS prefix
+          FROM jorb_step WHERE job_id = $1
+    ), forked AS (
+        INSERT INTO jorb (
+            job_class, kwargs, queue, prio, capability, uid, tags, admin_data,
+            state, forked_from
+        )
+        SELECT src.job_class,
+               COALESCE($5::jsonb, src.kwargs),
+               COALESCE($3::text, src.queue),
+               COALESCE($4::int, src.prio),
+               src.capability,
+               src.uid,
+               src.tags,
+               (src.admin_data - 'fork') || jsonb_build_object(
+                   'fork', jsonb_build_object(
+                       'from_step', $2::int, 'steps_copied', recorded.prefix)),
+               'queued'::jorbstate,
+               src.id
+          FROM src, recorded
+         WHERE $2::int <= recorded.steps + 1
+        RETURNING id, queue, prio
+    ), copied AS (
+        INSERT INTO jorb_step (job_id, step_seq, name, output, error,
+                               run_epoch, started, finished)
+        SELECT forked.id, s.step_seq, s.name, s.output, s.error,
+               0, s.started, s.finished
+          FROM jorb_step s, forked
+         WHERE s.job_id = $1 AND s.step_seq < $2::int
+        RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM src)::int      AS source_exists,
+           (SELECT steps FROM recorded)         AS recorded_steps,
+           (SELECT id FROM forked)              AS job_id,
+           (SELECT queue FROM forked)           AS queue,
+           (SELECT prio FROM forked)            AS prio,
+           (SELECT count(*) FROM copied)::int   AS steps_copied
+"""
+
+#: The first step whose checkpoint recorded a FAILURE — where "fork from the
+#: failure" starts. A step that failed and then succeeded on a later attempt
+#: has no error recorded (RECORD_STEP_SQL never lets an error overwrite a
+#: committed success), so this finds the step whose recorded OUTCOME is a
+#: failure and not merely one that ever raised.
+#:
+#: Asked together with "does this job exist at all?", because a job with no
+#: steps and a job with no such id both answer NULL here and they need
+#: different messages.
+FIRST_FAILED_STEP_SQL = """
+    SELECT (SELECT count(*) FROM jorb WHERE id = $1)::int AS source_exists,
+           (SELECT min(step_seq)::int FROM jorb_step
+             WHERE job_id = $1 AND error IS NOT NULL) AS failed_step
+"""
+
+
+class ForkRefused(ValueError):
+    """A fork was asked for that the platform will not create.
+
+    A ValueError because every case is the caller's argument being wrong
+    about a fact the database holds — no such job, a step the source never
+    recorded, a failure to fork from that never happened — and each carries
+    the number that makes it actionable.
+    """
+
+
+def _no_such_job(job_id: int) -> ForkRefused:
+    """The refusal both fork verbs make about an id that is not there."""
+    return ForkRefused(f"job {job_id} not found, so there is nothing to fork")
+
+
+async def fork_job(
+    conn: asyncpg.Connection | asyncpg.Pool,
+    job_id: int,
+    *,
+    from_step: int = 1,
+    queue: str | None = None,
+    priority: int | None = None,
+    kwargs_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fork ``job_id`` into a NEW job that starts at ``from_step``.
+
+    THE fork verb for every surface (client, admin API, `pj-admin jobs
+    fork`), so no surface can fork on terms another one would refuse.
+
+    ``from_step`` is 1-based and names the step the fork EXECUTES first:
+    ``1`` (the default) copies no checkpoints and re-runs the whole job under
+    a new id, ``4`` copies steps 1-3 and fast-forwards them.
+
+    The source may be in any state; a fork never touches it. Forking a job
+    that is still running is allowed and takes the prefix as of this
+    statement's snapshot — the source's step log may keep growing afterwards,
+    and the fork will not see the later rows.
+
+    What the new row inherits: job_class, kwargs (or ``kwargs_override``),
+    queue and prio (or the overrides), capability, tags, and admin_data —
+    the retry/timeout policy describes the WORK, so the fork runs under the
+    same rules. What it does not: uid and deadline_key (identity and dedupe;
+    two live rows sharing an idempotency key would make it mean nothing),
+    schedule_id (no schedule fired this), dag_id / waitfor_* / run_group (a
+    fork belongs to no DAG, group or dependency edge of the original's), and
+    every execution counter — it starts queued at run_epoch 0 with no errors
+    and no result.
+
+    Returns ``{"job_id", "source_job_id", "from_step", "steps_copied",
+    "queue", "priority"}``.
+
+    Raises ForkRefused when there is no such job, when ``from_step`` is below
+    1, or when it exceeds the source's recorded step count + 1 (there is no
+    prefix to copy that far, so the request is a typo rather than a fork).
+    """
+    if from_step < 1:
+        raise ForkRefused(
+            f"from_step must be at least 1 (steps are numbered from 1); got {from_step}"
+        )
+    row = await conn.fetchrow(
+        FORK_JOB_SQL, job_id, from_step, queue, priority, kwargs_override
+    )
+    if not row["source_exists"]:
+        raise _no_such_job(job_id)
+    if row["job_id"] is None:
+        recorded = row["recorded_steps"]
+        raise ForkRefused(
+            f"job {job_id} recorded {recorded} step(s), so a fork may start at "
+            f"step {recorded + 1} at the latest; got {from_step}"
+        )
+    return {
+        "job_id": row["job_id"],
+        "source_job_id": job_id,
+        "from_step": from_step,
+        "steps_copied": row["steps_copied"],
+        "queue": row["queue"],
+        "priority": row["prio"],
+    }
+
+
+async def fork_job_from_failure(
+    conn: asyncpg.Connection | asyncpg.Pool,
+    job_id: int,
+    *,
+    queue: str | None = None,
+    priority: int | None = None,
+    kwargs_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """:func:`fork_job` from the first step that FAILED.
+
+    The incident verb: fix the code, fork the job from the step that broke,
+    and every step before it fast-forwards from its recorded output instead
+    of running again.
+
+    Raises ForkRefused when no step of ``job_id`` has a recorded error —
+    including when the job crashed OUTSIDE any step, which is a real
+    condition with a different answer (`jobs steps` shows what ran; name the
+    step with ``from_step``).
+    """
+    row = await conn.fetchrow(FIRST_FAILED_STEP_SQL, job_id)
+    if not row["source_exists"]:
+        raise _no_such_job(job_id)
+    failed: int | None = row["failed_step"]
+    if failed is None:
+        raise ForkRefused(
+            f"job {job_id} has no failed step recorded, so there is no failure "
+            f"to fork from — `pj-admin jobs steps {job_id}` shows what ran"
+        )
+    return await fork_job(
+        conn,
+        job_id,
+        from_step=failed,
+        queue=queue,
+        priority=priority,
+        kwargs_override=kwargs_override,
+    )
+
+
 #: THE queue-statistics query. Every surface that reports per-queue,
 #: per-state counts reads it from here (client ``queue_stats``/``list_queues``,
 #: ``AdminAPI.queue_stats``) so no two surfaces can disagree about what a

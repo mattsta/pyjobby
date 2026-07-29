@@ -1494,6 +1494,105 @@ class JobClient:
             "status": "requeued" if requeued else "not_retriable",
         }
 
+    async def fork_job(
+        self,
+        job_id: int,
+        *,
+        from_step: int = 1,
+        queue: str | None = None,
+        priority: int | None = None,
+        kwargs_override: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        FORK a job into a NEW one that starts at `from_step`.
+
+        The third verb, and the only one that does not reuse the row.
+        `retry_job` and `rerun_job` requeue the SAME job — same id, same
+        history, same identity. A fork inserts a second row that re-executes
+        the source's work from step `from_step`, with steps 1..from_step-1
+        copied in as its own checkpoints so they fast-forward rather than
+        run again, and leaves the source completely alone (any state,
+        including running).
+
+        `from_step` is 1-based and names the step the fork EXECUTES first:
+        1 (the default) copies nothing and re-runs everything under a new
+        id; 4 copies steps 1-3.
+
+        The fork inherits job_class, kwargs (or `kwargs_override`), queue and
+        priority (or the overrides), capability, tags and the retry/timeout
+        policy in admin_data. It does NOT inherit identity or structure: uid,
+        deadline_key, schedule_id, dag_id, run_group and the waitfor edges
+        are all left unset, because two live rows sharing an idempotency key
+        (or a DAG slot) would make that key mean nothing.
+
+        Streams, events and mailbox messages are NOT copied — they are the
+        SOURCE's output. A fast-forwarded `stream_write` checkpoint therefore
+        appends nothing to the fork's stream: the fork's stream holds only
+        what the steps it really ran produced (docs/DXE.md).
+
+        Args:
+            job_id: the job to fork FROM
+            from_step: 1-based step the fork executes first (default: 1)
+            queue: run the fork elsewhere (default: the source's queue)
+            priority: run the fork at another priority (default: the source's)
+            kwargs_override: replace the arguments wholesale (default: the
+                source's kwargs)
+
+        Returns:
+            {"job_id", "source_job_id", "from_step", "steps_copied",
+             "queue", "priority"} — `job_id` is the NEW job
+
+        Raises:
+            db.ForkRefused: no such job, `from_step` below 1, or `from_step`
+                past the source's recorded step count + 1
+            ValueError: `priority` above this client's worker ceiling —
+                the same refusal enqueue makes, for the same reason (a job
+                no worker will claim is a silent black hole)
+
+        Example:
+            fork = await client.fork_job(12345, from_step=4)
+            result = await client.wait_for_result(fork["job_id"])
+        """
+        if priority is not None:
+            validate_priority(priority, self.prio_ceiling)
+        async with self.pool.acquire() as conn:
+            return await db.fork_job(
+                conn,
+                job_id,
+                from_step=from_step,
+                queue=queue,
+                priority=priority,
+                kwargs_override=kwargs_override,
+            )
+
+    async def fork_job_from_failure(
+        self,
+        job_id: int,
+        *,
+        queue: str | None = None,
+        priority: int | None = None,
+        kwargs_override: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        fork_job() from the first step whose checkpoint recorded an error.
+
+        The incident shape of the verb: deploy the fix, fork the crashed job
+        from the step that broke, and the completed prefix is not paid for
+        twice. Raises db.ForkRefused when no step recorded a failure — a job
+        that crashed outside its steps has no failing step to start from, and
+        guessing one would fast-forward work that never ran.
+        """
+        if priority is not None:
+            validate_priority(priority, self.prio_ceiling)
+        async with self.pool.acquire() as conn:
+            return await db.fork_job_from_failure(
+                conn,
+                job_id,
+                queue=queue,
+                priority=priority,
+                kwargs_override=kwargs_override,
+            )
+
     # =========================================================================
     # Waiting on jobs (LISTEN/NOTIFY with polling fallback)
     # =========================================================================
@@ -3308,6 +3407,43 @@ class SyncJobClient:
     def rerun_job(self, job_id: int, *, fresh: bool = True) -> dict[str, Any]:
         """Synchronous JobClient.rerun_job()."""
         result: dict[str, Any] = self._run(self._client.rerun_job(job_id, fresh=fresh))
+        return result
+
+    def fork_job(
+        self,
+        job_id: int,
+        *,
+        from_step: int = 1,
+        queue: str | None = None,
+        priority: int | None = None,
+        kwargs_override: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Synchronous JobClient.fork_job()."""
+        result: dict[str, Any] = self._run(
+            self._client.fork_job(
+                job_id,
+                from_step=from_step,
+                queue=queue,
+                priority=priority,
+                kwargs_override=kwargs_override,
+            )
+        )
+        return result
+
+    def fork_job_from_failure(
+        self,
+        job_id: int,
+        *,
+        queue: str | None = None,
+        priority: int | None = None,
+        kwargs_override: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Synchronous JobClient.fork_job_from_failure()."""
+        result: dict[str, Any] = self._run(
+            self._client.fork_job_from_failure(
+                job_id, queue=queue, priority=priority, kwargs_override=kwargs_override
+            )
+        )
         return result
 
     def get_event(self, job_id: int, key: str, timeout: float | None = None) -> Any:

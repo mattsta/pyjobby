@@ -284,6 +284,7 @@ $ pj-admin jobs --help
 Commands:
   cancel         Cancel one or more jobs.
   delete         Delete one or more jobs (permanent!)
+  fork           FORK a job into a NEW job that starts at a given step
   history        Show a job's full transition trail (including per-attempt errors)
   inspect        Show detailed information about a job
   list           List jobs with optional filtering
@@ -536,6 +537,8 @@ Options:
   `cancelled`). Refuses anything else.
 - `jobs rerun ID` — also accepts a **finished** job. Running successful
   work again repeats its side effects, which is why it is a separate verb.
+- `jobs fork ID` — creates a **new** job from this one's checkpoint prefix
+  and leaves this one alone (see below).
 - `jobs cancel ID...` — queued and waiting jobs are cancelled immediately;
   a claimed or running job gets a cancellation _request_ delivered to its
   worker, reported distinctly, because a job whose worker has died stays
@@ -549,8 +552,101 @@ Options:
 - `jobs delete ID...` — permanent, one line per id, prompts once for the
   whole list unless `-f/--force`.
 
-The retry-versus-rerun distinction is expanded in
-[OPERATIONS.md § Retry vs. re-run](OPERATIONS.md#retry-vs-re-run).
+The retry-versus-rerun-versus-fork distinction is expanded in
+[OPERATIONS.md § Retry, re-run, fork](OPERATIONS.md#retry-re-run-fork).
+
+### Forking a job
+
+`retry` and `rerun` requeue the **same row**. `jobs fork` makes a **new
+job** that re-executes this one's work from a given step, with the steps
+before it copied in as checkpoints so they fast-forward — and does not
+touch the source at all.
+
+The incident shape: a durable job crashed part way through, the cause is
+fixed, and the expensive prefix must not be paid for twice.
+
+```console
+$ pj-admin jobs steps 48821
+
+Job 48821 Steps
+Seq  Name     Epoch  Status  Duration  Error
+-----------------------------------------------------------
+1    extract  2      ok      0.000s
+2    enrich   2      ok      0.000s
+3    publish  2      error   0.000s    RuntimeError: upstre
+
+Total: 3 step(s)
+
+$ pj-admin jobs fork 48821 --from-failure
+Job 48822 forked from job 48821
+  starts at step 3 (2 checkpoint(s) copied, fast-forwarded)
+  queue reports  priority 100
+```
+
+`--from-failure` reads the first step whose checkpoint recorded an error and
+starts there; `--from-step N` names it directly. **N is 1-based and names the
+step the fork EXECUTES first**, so `--from-step 3` copies two checkpoints.
+The two flags answer the same question, so passing both is a usage error.
+
+The new job carries the prefix at epoch `0` — no attempt of the fork
+recorded those rows, and its first claim moves the row to epoch 1:
+
+```console
+$ pj-admin jobs steps 48822
+
+Job 48822 Steps
+Seq  Name     Epoch  Status  Duration  Error
+--------------------------------------------
+1    extract  0      ok      0.000s
+2    enrich   0      ok      0.000s
+
+Total: 2 step(s)
+```
+
+Lineage reads in both directions, and `jobs history` keeps it even after
+retention reaps the source (the column is `ON DELETE SET NULL`, the history
+row is not):
+
+```console
+$ pj-admin jobs inspect 48822 | grep Forked
+Forked From:     job 48821 at step 3 (2 checkpoint(s) copied)
+
+$ pj-admin jobs inspect 48821 | grep Forked
+Forked Into:     48822
+
+$ pj-admin jobs history 48822
+
+Job 48822 History
+At                   Event     From  Epoch  Errors  Worker  Error
+-----------------------------------------------------------------
+2026-07-29T17:07:14  enqueued  -     -      -       -
+
+Total: 1 transition(s)
+Forked from job 48821 at step 3 (2 checkpoint(s) copied)
+```
+
+There is no `forked` history **event**: `jorb_history` records state
+transitions, and a fork transitions nothing — it inserts a row. So the
+origin rides on the row that IS the fork's creation, and the source's trail
+is untouched.
+
+Other options: `--queue` and `--priority` move the fork somewhere else,
+which is the second reason to fork (a retry cannot change either). A
+`--priority` above the deployment's worker ceiling is refused exactly as
+`set-priority` refuses it — no worker would claim the fork — and
+`--max-prio N` raises the ceiling for one command. The fork
+inherits the job's class, arguments, capability, tags and retry/timeout
+policy, and inherits **no identity** — no `uid`, no `deadline_key`, no
+schedule, no DAG or dependency edges. Streams, events and mail are the
+source's output and are not copied
+([DXE.md](DXE.md#forking-a-job-a-new-row-from-a-checkpoint-prefix)).
+
+Refusals name the number you needed:
+
+```console
+$ pj-admin jobs fork 48821 --from-step 9
+Error: job 48821 recorded 3 step(s), so a fork may start at step 4 at the latest; got 9
+```
 
 ### Aggregates
 

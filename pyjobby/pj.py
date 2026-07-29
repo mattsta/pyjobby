@@ -1142,11 +1142,23 @@ class JobSystem:
 
             # DXE: bind previously recorded checkpoints so completed steps
             # fast-forward instead of re-executing on this attempt. A first
-            # attempt provably has none — claim_jorb increments run_count,
-            # so run_count == 1 means no execution ever preceded this one —
-            # and skipping the load saves a round trip on the overwhelmingly
-            # common path.
-            if job.get("run_count", 0) > 1:
+            # attempt of a job that was ENQUEUED provably has none —
+            # claim_jorb increments run_count, so run_count == 1 means no
+            # execution ever preceded this one — and skipping the load saves
+            # a round trip on the overwhelmingly common path.
+            #
+            # A FORK is the one row born with checkpoints it never executed:
+            # it starts at run_count 0 with its source's prefix already
+            # copied in, so "first attempt" and "no checkpoints" come apart
+            # for exactly this case. The fork block records that at insert
+            # and is never rewritten, which is why the test is made against
+            # it and not against jorb.forked_from — retention may null the
+            # lineage column out from under a fork that has not run yet.
+            fork_block = admin_data.get("fork")
+            born_with_checkpoints = isinstance(fork_block, dict) and fork_block.get(
+                "steps_copied"
+            )
+            if job.get("run_count", 0) > 1 or born_with_checkpoints:
                 checkpoints = await self.ex("load-steps", jid)
             else:
                 checkpoints = []

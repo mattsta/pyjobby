@@ -1040,8 +1040,12 @@ class TestRetentionCascade:
             "jorb_dependencies",
             "jorb_history",
         }
-        # every foreign key to jorb cascades; none of them is history's
-        assert {c["child"] for c in constraints} == cascading
+        # Every CHILD table cascades. The one reference that does not is
+        # jorb's to itself: `forked_from` is lineage, not ownership, so it is
+        # ON DELETE SET NULL ('n') -- a fork must outlive the source
+        # retention reaps, which cascading would delete along with it.
+        assert {c["child"] for c in constraints} == cascading | {"jorb"}
+        assert [c["on_delete"] for c in constraints if c["child"] == "jorb"] == ["n"]
 
 
 class TestSweepExpiredJobs:

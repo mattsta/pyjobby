@@ -446,21 +446,59 @@ script, anything that admits a job. Two consequences worth knowing:
 window — jobs picked up by a worker, not jobs that reached `running`. The two
 differ by one statement, and counting the latter let a burst slip through.
 
-## Retry vs. re-run
+## Retry, re-run, fork
 
-Two different verbs, because they carry different risk:
+Three verbs for "run this again", because they carry different risk. The
+first two reuse the job's row; the third does not.
 
-- **Retry** — `pj-admin jobs retry ID`, `pj-admin dlq retry ID`. For a job
-  that did _not_ succeed (`crashed` or `cancelled`).
-- **Re-run** — `pj-admin jobs rerun ID`. Also accepts a **finished** job.
-  Running successful work again repeats its side effects, so it is a
-  separate verb rather than a permissive retry.
+| Verb | Row | Starts from | For |
+| --- | --- | --- | --- |
+| `jobs retry ID` | **same** id | its checkpoints (resume) | a job that did _not_ succeed (`crashed`, `cancelled`) |
+| `jobs rerun ID` | **same** id | step 1 (or `--resume`) | any terminal job, **including a finished one** |
+| `jobs fork ID` | **NEW** id | `--from-step N` | any job in any state, when the re-run must not be the same job |
 
-A re-run is FRESH by default: the DXE step checkpoints are dropped and the
-job re-executes from step 1 — that is what "run it again" means. Add
-`--resume` to keep the checkpoints instead; completed steps fast-forward
-and the job continues where it stopped, which is how an interrupted
-durable job is resumed.
+- **Retry** — `pj-admin jobs retry ID`, `pj-admin dlq retry ID`. Refuses a
+  finished job: re-running successful work repeats its side effects, and
+  that has to be asked for by name.
+- **Re-run** — `pj-admin jobs rerun ID`. Accepts a finished job. FRESH by
+  default: the DXE step checkpoints are dropped and the job re-executes
+  from step 1 — that is what "run it again" means. Add `--resume` to keep
+  the checkpoints instead; completed steps fast-forward and the job
+  continues where it stopped, which is how an interrupted durable job is
+  resumed.
+- **Fork** — `pj-admin jobs fork ID --from-step N` (or `--from-failure`).
+  Creates a **second job** that re-executes this one's work from step N,
+  with steps 1..N-1 copied in as checkpoints so they fast-forward. The
+  source is not touched at all — not its state, not its result, not its
+  checkpoints — so it can be in _any_ state, running included.
+
+Reach for **fork** when the re-run must not be the same job:
+
+- **replay an incident from just before the failing step.** Deploy the fix,
+  `jobs fork ID --from-failure`, and the expensive prefix is not paid for a
+  second time. The crashed original stays crashed as the record of what
+  happened.
+- **re-run an expensive pipeline's tail** under different behaviour, without
+  destroying the run you already have.
+- **change a row-level knob a retry cannot touch**: `--queue`, `--priority`,
+  or different arguments.
+
+What a fork inherits: job class, arguments, queue, priority, capability,
+`uid`, tags, and the retry/timeout policy — everything that describes or
+labels the WORK (`uid` is a tenant tag, so a tenant's fork stays theirs).
+What it does not: `deadline_key`, `schedule_id`, DAG membership,
+dependency edges, and every execution counter. A fork is a new identity, so
+it cannot inherit one: two live rows sharing an idempotency key would make
+that key mean nothing.
+
+Streams, events and mailbox messages are **not** copied either — they are
+the source's output, and the fork produces its own
+([DXE.md](DXE.md#forking-a-job-a-new-row-from-a-checkpoint-prefix)).
+
+Lineage is best-effort audit, not a dependency: `jobs inspect` shows
+`Forked From` on the fork and `Forked Into` on the source, and retention may
+reap the source at any time (the fork survives, and its own history row
+keeps the id).
 
 ## Reading the latency numbers
 

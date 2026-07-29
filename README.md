@@ -166,6 +166,7 @@ pj-admin jobs list --queue default --state queued
 pj-admin jobs inspect 12345
 pj-admin jobs cancel 12345
 pj-admin jobs retry 12345
+pj-admin jobs fork 12345 --from-failure   # a NEW job from the failing step on
 
 # Queue monitoring
 pj-admin queues list

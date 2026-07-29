@@ -556,7 +556,10 @@ step the old attempts completed.
    handed.
 
 2. **A job keeps one row for its entire life.** Retries requeue it;
-   `jorb_history` is the per-attempt audit trail.
+   `jorb_history` is the per-attempt audit trail. A
+   [fork](#forking-a-job-a-new-row-from-a-checkpoint-prefix) does not break
+   this — it is a second **job**, with its own row, its own history and its
+   own copy of the prefix, not a second row for this one.
 3. **`run_epoch` only increases**, and a write at a stale epoch is a no-op.
 4. **A superseded execution cannot write** — a result, a checkpoint, a timeout,
    a reschedule, a published event, a mailbox message, or a stream row. The list is every
@@ -580,8 +583,8 @@ These are enforced by tests, not just asserted here: see
 `tests/test_dxe_primitives.py`, `tests/test_dxe_transactions.py`,
 `tests/test_dxe_streams.py`,
 `tests/test_dxe_step_timeouts.py`, `tests/test_job_timeout_ceiling.py`,
-`tests/test_dxe_faults.py`, `tests/test_dxe_concurrency.py`, and
-`tests/test_invariants.py`.
+`tests/test_dxe_faults.py`, `tests/test_dxe_concurrency.py`,
+`tests/test_job_fork.py`, and `tests/test_invariants.py`.
 
 The at-least-once/exactly-once distinction in particular is proved by fault
 injection rather than argued: `test_kill_between_the_write_and_the_checkpoint`
@@ -605,6 +608,87 @@ Fresh is the default — a plain `rerun` (no flag; there is no `--fresh`,
 it when the recorded results are _wrong_ rather than merely incomplete —
 after fixing a bug in a step, for instance. It is the operator's way to
 discard checkpoints for a job that is going to run again.
+
+---
+
+## Forking a job: a NEW row from a checkpoint prefix
+
+A resume and a re-run both reuse the job's row. A **fork** does not: it
+creates a second job that re-executes the source's work from step N, with
+steps 1..N-1 copied into the new job as its own checkpoints, so they
+fast-forward exactly as a resume's would.
+
+```
+pj-admin jobs fork <id> --from-step 4    # copies steps 1-3, executes from 4
+pj-admin jobs fork <id> --from-failure   # starts at the first recorded error
+pj-admin jobs fork <id>                  # copies nothing: a fresh run, new id
+```
+
+```python
+fork = await client.fork_job(job_id, from_step=4)
+result = await client.wait_for_result(fork["job_id"])
+```
+
+`from_step` is **1-based and names the step the fork EXECUTES first**, so
+`--from-step 4` copies three checkpoints. The refusal boundary is one past
+the last recorded step (that is "run the next one"); anything beyond it is
+refused with the number the source actually recorded.
+
+**The source is not touched.** Not its state, not its `run_epoch`, not its
+checkpoints, not its result — a fork writes one new job row and its copied
+steps, in one statement, and nothing else. That is why the source may be in
+_any_ state, including `running`: the prefix is copied as of the fork
+statement's snapshot, and a source that goes on recording steps afterwards
+simply has steps the fork never saw.
+
+**Copied checkpoints carry `run_epoch` 0.** A `jorb_step` row's epoch says
+which attempt of _its own job_ recorded it, and no attempt of the fork
+recorded these; 0 is below every epoch the fork will run at (its first claim
+makes it 1), so the copied prefix reads as "predates this job's first
+attempt". Nothing depends on the value — replay loads checkpoints with no
+epoch filter, the same property `rerun --resume` relies on — so
+`pj-admin jobs steps` on a fork shows the fast-forwarded prefix at epoch 0
+and the steps it really ran at 1 or more.
+
+### Streams, events and mail are NOT copied
+
+They are the **source's** output. A fork produces its own, from the steps it
+actually runs — and readers of the fork see a fresh stream that starts at
+position 0.
+
+The consequence is worth stating rather than discovering: `stream_write` is
+a checkpointed step, so a **copied** `dxe.stream:<key>` checkpoint
+fast-forwards, which by definition appends nothing. A job that streams five
+rows and then fails, forked from step 6, produces a stream containing only
+what steps 6 onward write. The fast-forwarded calls still return their
+recorded positions to the job code, and the fork's own first append is
+position 0 of the fork's own dense sequence — positions are per `(job, key)`,
+so a reader of the fork sees an ordinary stream and a reader of the source
+sees the untouched original.
+
+If a fork must reproduce the whole stream, fork from step 1: nothing is
+copied and everything re-runs.
+
+### What the new row inherits
+
+| Copied | Not copied |
+| --- | --- |
+| `job_class`, `kwargs` (or an override) | `uid`, `deadline_key` |
+| `queue`, `prio` (or overrides) | `schedule_id` |
+| `capability`, `tags` | `dag_id`, `run_group`, `waitfor_*` |
+| `admin_data` (retry/timeout policy) | `result`, error fields, `run_count`, `error_count` |
+
+The split is identity: everything that describes the **work** comes across,
+and nothing that names **this job** or wires it into somebody else's
+structure does. Two live rows sharing a `deadline_key` would make idempotent
+enqueue meaningless, and a fork is nobody's DAG member.
+
+Lineage lives in `jorb.forked_from` (`ON DELETE SET NULL`, so a fork
+outlives the retention sweep that reaps its source) and, permanently, in the
+fork's own `enqueued` history row, which records the source id, the step and
+how many checkpoints were copied. There is no `forked` history event and no
+row on the source's trail: `jorb_history` records state transitions, and a
+fork transitions nothing.
 
 ---
 

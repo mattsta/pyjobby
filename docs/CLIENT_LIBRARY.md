@@ -397,6 +397,51 @@ side effects). Returns `{"job_id", "status", "fresh"}` with status
 `True` wipes DXE checkpoints and restarts from step 1, `False` resumes from
 them.
 
+#### `fork_job(job_id, *, from_step=1, queue=None, priority=None, kwargs_override=None)`
+
+Create a **NEW** job that re-executes this one's work from `from_step`, with
+steps `1..from_step-1` copied in as checkpoints so they fast-forward. The
+third verb, and the only one that does not reuse the row: `retry_job` and
+`rerun_job` requeue the same id, a fork leaves the source completely alone —
+any state, including `running`.
+
+`from_step` is 1-based and names the step the fork **executes first**, so
+`from_step=4` copies three checkpoints and `from_step=1` (the default)
+copies none. Returns `{"job_id", "source_job_id", "from_step",
+"steps_copied", "queue", "priority"}`, where `job_id` is the new job.
+
+```python
+fork = await client.fork_job(12345, from_step=4, priority=10)
+print(f"job {fork['job_id']} skips {fork['steps_copied']} step(s)")
+result = await client.wait_for_result(fork["job_id"])
+```
+
+The fork inherits the job class, arguments, queue, priority, capability,
+tags and retry/timeout policy. It does **not** inherit identity or
+structure: `uid`, `deadline_key`, `schedule_id`, DAG membership and
+dependency edges are left unset, because two live rows sharing an
+idempotency key would make that key mean nothing. Streams, events and
+mailbox messages are the source's output and are not copied either — see
+[DXE.md](DXE.md#forking-a-job-a-new-row-from-a-checkpoint-prefix).
+
+Raises `ForkRefused` (`from pyjobby import ForkRefused`, a `ValueError`)
+when there is no such job, when `from_step`
+is below 1, or when it is past the source's recorded step count + 1 — and
+`ValueError` for a `priority` above this client's worker ceiling, the same
+refusal `enqueue` makes.
+
+#### `fork_job_from_failure(job_id, *, queue=None, priority=None, kwargs_override=None)`
+
+`fork_job` from the first step whose checkpoint recorded an error — the
+incident shape: deploy the fix, fork the crashed job from the step that
+broke, and the completed prefix is not paid for twice. Raises `ForkRefused`
+when no step recorded a failure (a job that crashed outside its steps has no
+failing step to start from).
+
+```python
+fork = await client.fork_job_from_failure(12345)
+```
+
 ### Queue Operations
 
 #### `queue_depth(queue=None)`

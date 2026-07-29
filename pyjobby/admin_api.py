@@ -300,6 +300,10 @@ class JobInfo:
     # the recurring schedule that fired this job, NULL for a job anyone
     # enqueued directly (see sql/schema/10_jobs.sql)
     schedule_id: int | None = None
+    # the job this one was forked from, NULL for every job that is not a
+    # fork AND for a fork whose source has since been reaped (the reference
+    # is ON DELETE SET NULL — see sql/schema/10_jobs.sql)
+    forked_from: int | None = None
 
     @classmethod
     def from_record(cls, record: asyncpg.Record) -> JobInfo:
@@ -2409,6 +2413,113 @@ class AdminAPI:
             "status": "requeued" if requeued else "not_rerunnable",
             "fresh": fresh,
         }
+
+    async def fork_job(
+        self,
+        job_id: int,
+        *,
+        from_step: int = 1,
+        queue: str | None = None,
+        priority: int | None = None,
+        kwargs_override: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        FORK a job: create a NEW job that re-executes this one's work from
+        `from_step`, with steps 1..from_step-1 copied in as checkpoints so
+        they fast-forward instead of running again.
+
+        The third verb, and the only one that does not reuse the row:
+        `retry` and `rerun` requeue the SAME job (same id, same history),
+        while a fork leaves the source completely alone — any state, running
+        included — and gives the work a new identity. That is what makes it
+        the incident verb: fix the code, fork the crashed job from the step
+        that broke, and the expensive prefix is not paid twice.
+
+        Args:
+            job_id: the job to fork FROM
+            from_step: 1-based step the fork EXECUTES first; 1 (the default)
+                copies nothing and re-runs everything under a new id
+            queue: run the fork on another queue (default: the source's)
+            priority: run the fork at another priority (default: the source's)
+            kwargs_override: replace the job's arguments wholesale (default:
+                the source's kwargs)
+
+        Returns:
+            {"job_id", "source_job_id", "from_step", "steps_copied",
+             "queue", "priority"} — job_id is the NEW job
+
+        Raises:
+            db.ForkRefused: no such job, from_step below 1, or from_step past
+                the source's recorded step count + 1
+            ValueError: a priority above this deployment's worker ceiling
+        """
+        if priority is not None:
+            # Same guard as enqueue and set-priority, for the same reason: a
+            # job above every live worker's ceiling is never claimed, never
+            # fails and never shows up anywhere. A fork is enqueued work.
+            validate_priority(priority, self.prio_ceiling)
+        return await db.fork_job(
+            self.conn,
+            job_id,
+            from_step=from_step,
+            queue=queue,
+            priority=priority,
+            kwargs_override=kwargs_override,
+        )
+
+    async def fork_job_from_failure(
+        self,
+        job_id: int,
+        *,
+        queue: str | None = None,
+        priority: int | None = None,
+        kwargs_override: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        fork_job() from the first step whose checkpoint recorded an error.
+
+        The common case of the incident verb, so the operator does not have
+        to read `jobs steps` and count. Refuses (db.ForkRefused) when no step
+        recorded a failure — a job that crashed outside its steps has no
+        failing step to start from, and guessing one would fast-forward work
+        that never ran.
+        """
+        if priority is not None:
+            validate_priority(priority, self.prio_ceiling)
+        return await db.fork_job_from_failure(
+            self.conn,
+            job_id,
+            queue=queue,
+            priority=priority,
+            kwargs_override=kwargs_override,
+        )
+
+    async def list_forks(
+        self, job_id: int, limit: int = DEFAULT_HISTORY_LIMIT
+    ) -> list[int]:
+        """
+        The ids forked FROM this job, oldest first.
+
+        The other direction of `jorb.forked_from`, which is the direction an
+        operator asks in ("did anyone already fork this incident?"). Bounded
+        like every other per-job listing, and served by the partial
+        `jorb_forked_from_idx` without spelling its predicate out: equality
+        is strict, so `forked_from = $1` already implies
+        `forked_from IS NOT NULL` (unlike the containment operator that
+        forces `tags_filter_sql` to emit both clauses).
+
+        Best-effort, exactly like the column: a fork whose source was reaped
+        by retention has its `forked_from` set to NULL and stops being
+        listed here, while its own history row keeps the source id.
+        """
+        return [
+            r["id"]
+            for r in await self.conn.fetch(
+                "SELECT id FROM jorb WHERE forked_from = $1 ORDER BY id LIMIT $2",
+                job_id,
+                limit,
+            )
+        ]
 
     # =========================================================================
     # Schedule Management

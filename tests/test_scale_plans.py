@@ -1016,6 +1016,47 @@ class TestCascadeIndexes:
             "— add an index on the referencing column"
         )
 
+    async def test_the_fork_lineage_reference_is_served_by_its_partial_index(
+        self, db_pool, unique_queue
+    ):
+        """jorb references ITSELF through forked_from, ON DELETE SET NULL.
+
+        So every row retention deletes makes PostgreSQL run
+        `UPDATE jorb SET forked_from = NULL WHERE forked_from = <id>` against
+        the largest table in the system — the sweep would become O(deleted x
+        table) on a seq scan.
+
+        The index that serves it is PARTIAL (`WHERE forked_from IS NOT NULL`,
+        because almost no job is a fork), and a partial index is usable only
+        when the query's own clauses IMPLY its predicate. Nothing in this
+        codebase writes that query — PostgreSQL's referential-integrity
+        trigger does — so the implication cannot be arranged by adding a
+        clause the way `tags_filter_sql` does. It has to be TRUE: equality is
+        strict, so `forked_from = $1` implies `forked_from IS NOT NULL`. This
+        asserts the planner agrees, at a size where a scan would otherwise
+        win.
+        """
+        await seed_terminal_jobs(db_pool, unique_queue)
+        source = await db_pool.fetchval("SELECT min(id) FROM jorb")
+        # a populated index, not an empty one: an index with no entries is
+        # trivially the cheapest plan and would prove nothing about the shape
+        # of a real install's lineage.
+        await db_pool.execute(
+            """UPDATE jorb SET forked_from = $1
+                WHERE id IN (SELECT id FROM jorb ORDER BY id OFFSET 1 LIMIT 500)""",
+            source,
+        )
+        await settle(db_pool)
+
+        plan = await explain_rolled_back(
+            db_pool,
+            "UPDATE jorb SET forked_from = NULL WHERE forked_from = $1",
+            source,
+        )
+
+        assert "jorb_forked_from_idx" in plan, plan
+        assert_no_seq_scan(plan, "jorb")
+
 
 class TestGroupWakePlan:
     """The group wake runs on the completion path of EVERY grouped job.

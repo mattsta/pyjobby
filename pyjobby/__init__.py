@@ -42,7 +42,7 @@ from .client import (
     UnhandledEventError,
 )
 from .dag import DAGBuilder
-from .db import JobState
+from .db import ForkRefused, JobState
 from .dxe import DXEError, NondeterminismError, StaleExecutionError, StepTimeoutError
 
 # MachineDefinitionError comes from .fsm, not .statemachine: the declaration
@@ -79,6 +79,7 @@ def __getattr__(name: str) -> object:
 __all__ = [
     "DAGBuilder",
     "DXEError",
+    "ForkRefused",
     "Job",
     "JobCancelledError",
     "JobClient",

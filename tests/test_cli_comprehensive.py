@@ -120,7 +120,10 @@ def mock_admin_api():
         "run_epoch": 0,
         "cancel_requested": False,
         "claimed_by": None,
+        "forked_from": None,
     }
+    # the lineage lookup `jobs inspect` makes alongside get_job
+    mock_api.list_forks.return_value = []
 
     mock_api.retry_job.return_value = {"job_id": 1, "status": "requeued"}
     mock_api.retry_jobs.return_value = [

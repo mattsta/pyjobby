@@ -6,10 +6,23 @@
 CREATE FUNCTION record_jorb_history() RETURNS trigger AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
+        -- A FORK's origin row names where it came from. There is no 'forked'
+        -- EVENT and there is no row on the source's trail: this table records
+        -- STATE TRANSITIONS (its domain is 'enqueued' plus the jorbstate
+        -- labels, and pyjobby.lifecycle declares the walk between them), while
+        -- a fork transitions nothing -- it inserts one row and leaves the
+        -- source untouched. So the fact is recorded where it IS a fact: on the
+        -- insert of the row it is true of. Copied out of the row rather than
+        -- left to a reader's join because the source may be reaped later,
+        -- which sets jorb.forked_from back to NULL (see its COMMENT).
         INSERT INTO jorb_history (job_id, event, detail)
         VALUES (NEW.id, 'enqueued', jsonb_build_object(
             'queue', NEW.queue, 'job_class', NEW.job_class,
-            'state', NEW.state, 'prio', NEW.prio));
+            'state', NEW.state, 'prio', NEW.prio)
+            || CASE WHEN NEW.forked_from IS NULL THEN '{}'::jsonb
+                    ELSE jsonb_build_object('forked_from', NEW.forked_from)
+                         || COALESCE(NEW.admin_data -> 'fork', '{}'::jsonb)
+               END);
     ELSIF OLD.state IS DISTINCT FROM NEW.state THEN
         INSERT INTO jorb_history (job_id, event, detail)
         VALUES (NEW.id, NEW.state::text, jsonb_build_object(

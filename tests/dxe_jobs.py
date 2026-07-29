@@ -14,6 +14,8 @@ from typing import Any
 
 from pyjobby.pj import Job
 
+from .utils.faults import record_effect
+
 
 class OkJob(Job):
     """Succeeds immediately; doubles its input."""
@@ -169,6 +171,40 @@ class StreamRetryJob(Job):
         if self.job["error_count"] == 0:
             raise RuntimeError("after the stream writes")
         return {"ok": True}
+
+
+class GatedStepJob(Job):
+    """Two checkpointed steps; the second one fails until a fix is "deployed".
+
+    The fork shape, without asking a job to change its own code: 'gate'
+    raises unless a ``jorb_test_effect`` row labelled 'fixed' exists for
+    this tag, so a test can let the original crash, insert that row, and
+    fork from the failure — the fork fast-forwards 'prepare' and gets
+    through 'gate'.
+
+    Every REAL execution of either step appends its own ledger row (labelled
+    with the step name, against the executing job's id), so a test counts
+    what actually ran per job rather than what the checkpoint table claims.
+    """
+
+    async def task(self, tag: str) -> dict[str, Any]:
+        prepared = await self.step("prepare", self._prepare, tag)
+        passed = await self.step("gate", self._gate, tag)
+        return {"prepare": prepared, "gate": passed}
+
+    async def _prepare(self, tag: str) -> dict[str, Any]:
+        await record_effect(self.s.cxn, tag, self.job["id"], "prepare")
+        return {"by": self.job["id"]}
+
+    async def _gate(self, tag: str) -> dict[str, Any]:
+        await record_effect(self.s.cxn, tag, self.job["id"], "gate")
+        fixed = await self.s.cxn.fetchval(
+            "SELECT count(*) FROM jorb_test_effect WHERE tag = $1 AND label = 'fixed'",
+            tag,
+        )
+        if not fixed:
+            raise RuntimeError("gate closed: the fix is not deployed")
+        return {"by": self.job["id"]}
 
 
 class PingJob(Job):

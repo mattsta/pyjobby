@@ -359,6 +359,28 @@ class TestJobsUnknownId:
             "(not found, or not crashed, cancelled, or finished)" in result.stderr
         )
 
+    async def test_fork_exits_one(self, dsn):
+        """A fork of a job that is not there is a refusal like any other —
+        and it names the id rather than the SQL that could not find it."""
+        result = await run_cli("--dsn", dsn, "jobs", "fork", str(MISSING_ID))
+
+        assert result.exit_code == 1
+        assert (
+            f"Error: job {MISSING_ID} not found, so there is nothing to fork"
+            in result.stderr
+        )
+
+    async def test_fork_from_failure_exits_one(self, dsn):
+        result = await run_cli(
+            "--dsn", dsn, "jobs", "fork", str(MISSING_ID), "--from-failure"
+        )
+
+        assert result.exit_code == 1
+        assert (
+            f"Error: job {MISSING_ID} not found, so there is nothing to fork"
+            in result.stderr
+        )
+
     async def test_rerun_resume_exits_one(self, dsn):
         result = await run_cli(
             "--dsn", dsn, "jobs", "rerun", str(MISSING_ID), "--resume"
@@ -619,6 +641,45 @@ class TestJobsInvalidFilters:
         assert f"Error: Valid states: {self.VALID_STATES}" in result.stderr
         assert not isinstance(result.exception, asyncpg.InvalidTextRepresentationError)
         assert "jorbstate" not in result.stderr
+
+    async def test_fork_refuses_two_ways_of_naming_the_same_thing(
+        self, dsn, db_pool, unique_queue
+    ):
+        """--from-step and --from-failure both answer "where does the fork
+        start", so passing both is a question with two answers. 2, not 1:
+        nothing was attempted."""
+        job_id = await make_job(db_pool, unique_queue, "crashed")
+
+        result = await run_cli(
+            "--dsn",
+            dsn,
+            "jobs",
+            "fork",
+            str(job_id),
+            "--from-step",
+            "2",
+            "--from-failure",
+        )
+
+        assert result.exit_code == 2
+        assert "both name where to start; pass one" in result.stderr
+
+    async def test_fork_past_the_recorded_steps_names_the_count(
+        self, dsn, db_pool, unique_queue
+    ):
+        """The refusal an operator hits when they guess: it answers with the
+        number they needed."""
+        job_id = await make_job(db_pool, unique_queue, "crashed")
+
+        result = await run_cli(
+            "--dsn", dsn, "jobs", "fork", str(job_id), "--from-step", "4"
+        )
+
+        assert result.exit_code == 1
+        assert (
+            f"Error: job {job_id} recorded 0 step(s), so a fork may start at "
+            f"step 1 at the latest; got 4" in result.stderr
+        )
 
     async def test_unknown_state_in_queues_clear_is_rejected_too(
         self, dsn, unique_queue, db_pool
