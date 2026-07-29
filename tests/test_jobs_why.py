@@ -27,7 +27,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from pyjobby.admin_api import EXPLAIN_REASONS, AdminAPI
+from pyjobby.admin_api import EXPLAIN_REASONS, UNCLAIMABLE_REASONS, AdminAPI
 from pyjobby.client import DEFAULT_PRIO_CEILING
 from pyjobby.lifecycle import JOB_STATES
 
@@ -476,6 +476,236 @@ class TestClaimable:
 
         assert answer["reason"] == "claimable"
         assert answer["details"]["queue_serialised"] is True
+
+
+# ============================================================================
+# The fleet-wide sweep: `unclaimable_jobs`
+# ============================================================================
+# The proactive counterpart to the two reason codes above. `explain_job`
+# answers for ONE job somebody already suspects; this one FINDS them, so it
+# belongs to the same subject and is tested against the same fixtures and the
+# same reason vocabulary. What it must never do is disagree with `explain_job`
+# about which cause a job has -- the two send the operator to different
+# remedies -- so several of these assert both verbs on the same row.
+
+
+class TestUnclaimableSweep:
+    async def test_a_job_above_every_live_ceiling_is_found(
+        self, admin_api, db_connection, unique_queue
+    ):
+        await make_worker(db_connection, unique_queue, max_prio=50)
+        await make_worker(db_connection, unique_queue, max_prio=200, pid=4243)
+        low = await make_job(db_connection, unique_queue, prio=300)
+        high = await make_job(db_connection, unique_queue, prio=900)
+
+        report = await admin_api.unclaimable_jobs()
+
+        assert len(report) == 1
+        (entry,) = report
+        assert entry["queue"] == unique_queue
+        assert entry["reason"] == "above_worker_ceiling"
+        assert entry["count"] == 2
+        assert entry["count_capped"] is False
+        assert entry["live_workers"] == 2
+        assert entry["sample_job_ids"] == [low, high]  # claim order: prio, id
+        assert entry["details"] == {
+            "max_live_ceiling": 200,
+            "lowest_blocked_prio": 300,
+            "highest_blocked_prio": 900,
+        }
+        # and the per-job verb agrees about the cause
+        assert (await admin_api.explain_job(high))["reason"] == entry["reason"]
+
+    async def test_a_capability_nobody_advertises_is_found(
+        self, admin_api, db_connection, unique_queue
+    ):
+        await make_worker(db_connection, unique_queue, capabilities=("cpu", "test"))
+        job = await make_job(db_connection, unique_queue, capability="gpu")
+
+        report = await admin_api.unclaimable_jobs()
+
+        (entry,) = report
+        assert entry["queue"] == unique_queue
+        assert entry["reason"] == "capability_unmet"
+        assert entry["count"] == 1
+        assert entry["sample_job_ids"] == [job]
+        assert entry["details"] == {
+            "missing_capabilities": ["gpu"],
+            "advertised_capabilities": ["cpu", "test"],
+        }
+        assert (await admin_api.explain_job(job))["reason"] == entry["reason"]
+
+    async def test_claimable_work_is_not_reported(
+        self, admin_api, db_connection, unique_queue
+    ):
+        await make_worker(
+            db_connection, unique_queue, capabilities=("gpu",), max_prio=100
+        )
+        await make_job(db_connection, unique_queue, prio=100, capability="gpu")
+        await make_job(db_connection, unique_queue, prio=1)
+
+        assert await admin_api.unclaimable_jobs() == []
+
+    async def test_prio_equal_to_the_ceiling_is_claimable(
+        self, admin_api, db_connection, unique_queue
+    ):
+        """claim_jorb admits prio <= ceiling, so the boundary is not blocked."""
+        await make_worker(db_connection, unique_queue, max_prio=100)
+        await make_job(db_connection, unique_queue, prio=100)
+
+        assert await admin_api.unclaimable_jobs() == []
+
+    async def test_an_idle_database_is_empty(self, admin_api):
+        assert await admin_api.unclaimable_jobs() == []
+
+    async def test_a_queue_with_no_live_workers_is_not_this_checks_business(
+        self, admin_api, db_connection, unique_queue
+    ):
+        """The deliberate exclusion (see AdminAPI.unclaimable_jobs).
+
+        Every job on a workerless queue is trivially unclaimable, so including
+        them would restate the worker check for every idle queue in the
+        install and bury the condition this verb exists to find. The remedies
+        differ too: start a worker vs. change what the running ones accept.
+        `explain_job` still answers for the individual job.
+        """
+        job = await make_job(db_connection, unique_queue, prio=900, capability="gpu")
+
+        assert await admin_api.unclaimable_jobs() == []
+        assert (await admin_api.explain_job(job))["reason"] == "no_live_workers"
+
+    async def test_a_stale_heartbeat_is_not_a_live_worker(
+        self, admin_api, db_connection, unique_queue
+    ):
+        """Same liveness grace as the rest of the platform: a queue whose only
+        worker stopped heartbeating has no live fleet, so it drops out by the
+        rule above rather than reporting every job on it."""
+        await db_connection.execute(
+            """INSERT INTO jorb_worker (host, pid, queue, max_prio, last_seen)
+               VALUES ('stale', 1, $1, 10, now() - interval '1 hour')""",
+            unique_queue,
+        )
+        await make_job(db_connection, unique_queue, prio=900)
+
+        assert await admin_api.unclaimable_jobs() == []
+
+    async def test_deferred_work_is_not_unclaimable_yet(
+        self, admin_api, db_connection, unique_queue
+    ):
+        """CLAIMABLE-NOW only: a job on retry backoff or a scheduled batch is
+        invisible on purpose, and its ceiling stops mattering until it is
+        due."""
+        await make_worker(db_connection, unique_queue, max_prio=10)
+        await make_job(
+            db_connection,
+            unique_queue,
+            prio=900,
+            run_after=datetime.now(UTC) + timedelta(hours=1),
+        )
+
+        assert await admin_api.unclaimable_jobs() == []
+
+    async def test_only_queued_rows_count(self, admin_api, db_connection, unique_queue):
+        """A crashed row above the ceiling is in the DLQ, not silent."""
+        await make_worker(db_connection, unique_queue, max_prio=10)
+        for state in ("crashed", "cancelled", "finished", "running", "waiting"):
+            await make_job(db_connection, unique_queue, state=state, prio=900)
+
+        assert await admin_api.unclaimable_jobs() == []
+
+    async def test_the_two_causes_are_disjoint_and_ordered_like_jobs_why(
+        self, admin_api, db_connection, unique_queue
+    ):
+        """A job that is BOTH is counted once, under the cause `explain_job`
+        headlines -- otherwise the two verbs disagree and the operator is
+        pointed at the wrong fix."""
+        await make_worker(
+            db_connection, unique_queue, max_prio=100, capabilities=("cpu",)
+        )
+        both = await make_job(db_connection, unique_queue, prio=900, capability="gpu")
+
+        report = await admin_api.unclaimable_jobs()
+
+        assert [(e["reason"], e["count"]) for e in report] == [
+            ("above_worker_ceiling", 1)
+        ]
+        assert report[0]["sample_job_ids"] == [both]
+        assert (await admin_api.explain_job(both))["reason"] == "above_worker_ceiling"
+
+    async def test_each_queue_and_cause_is_its_own_record(
+        self, admin_api, db_connection, unique_queue
+    ):
+        other = f"{unique_queue}_b"
+        await make_worker(
+            db_connection, unique_queue, max_prio=100, capabilities=("cpu",)
+        )
+        await make_worker(db_connection, other, max_prio=100, pid=4243)
+        await make_job(db_connection, unique_queue, prio=900)
+        await make_job(db_connection, unique_queue, capability="gpu")
+        await make_job(db_connection, other, prio=900)
+
+        report = await admin_api.unclaimable_jobs()
+
+        assert [(e["queue"], e["reason"], e["count"]) for e in report] == [
+            (unique_queue, "above_worker_ceiling", 1),
+            (unique_queue, "capability_unmet", 1),
+            (other, "above_worker_ceiling", 1),
+        ]
+
+    async def test_a_worker_on_another_queue_is_not_capacity_here(
+        self, admin_api, db_connection, unique_queue
+    ):
+        """The fleet is read per queue: a generous ceiling elsewhere must not
+        make this queue's work look claimable."""
+        await make_worker(db_connection, unique_queue, max_prio=10)
+        await make_worker(db_connection, f"{unique_queue}_other", max_prio=9999)
+        await make_job(db_connection, unique_queue, prio=900)
+
+        report = await admin_api.unclaimable_jobs()
+
+        assert len(report) == 1
+        assert report[0]["details"]["max_live_ceiling"] == 10
+
+    async def test_the_count_and_the_sample_are_both_bounded(
+        self, admin_api, db_connection, unique_queue
+    ):
+        """The operator needs examples and a magnitude, not a dump: past the
+        scan limit the count is reported as capped."""
+        await make_worker(db_connection, unique_queue, max_prio=10)
+        for _ in range(6):
+            await make_job(db_connection, unique_queue, prio=900)
+
+        report = await admin_api.unclaimable_jobs(scan_limit=4, sample_limit=2)
+
+        (entry,) = report
+        assert entry["count"] == 4
+        assert entry["count_capped"] is True
+        assert len(entry["sample_job_ids"]) == 2
+
+    async def test_every_reason_it_emits_is_in_the_reason_table(
+        self, admin_api, db_connection, unique_queue
+    ):
+        """The vocabulary is shared with `jobs why`, not parallel to it."""
+        await make_worker(
+            db_connection, unique_queue, max_prio=100, capabilities=("cpu",)
+        )
+        await make_job(db_connection, unique_queue, prio=900)
+        await make_job(db_connection, unique_queue, capability="gpu")
+
+        report = await admin_api.unclaimable_jobs()
+
+        assert [e["reason"] for e in report] == list(UNCLAIMABLE_REASONS)
+        assert all(e["reason"] in EXPLAIN_REASONS for e in report)
+
+    async def test_the_report_is_json_serialisable(
+        self, admin_api, db_connection, unique_queue
+    ):
+        await make_worker(db_connection, unique_queue, capabilities=("cpu",))
+        await make_job(db_connection, unique_queue, capability="gpu")
+
+        report = await admin_api.unclaimable_jobs()
+
+        assert json.loads(json.dumps(report)) == report
 
 
 # ============================================================================

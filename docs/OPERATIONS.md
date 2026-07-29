@@ -68,7 +68,8 @@ Checks (FAIL exits nonzero; WARN does not): database reachable, the schema's
 **shape** against the manifest of objects this release addresses, all seven
 schema triggers present by name, NOTIFY queue saturation, live workers seen
 in the last 60s, workers that are alive but claiming nothing, per-queue
-depth and oldest-runnable age, waiters blocked on a crashed or cancelled
+depth and oldest-runnable age, jobs no live worker on their queue could ever
+claim, waiters blocked on a crashed or cancelled
 upstream, unread durable mail older than a day, DLQ size, overdue
 schedules. Run it from cron/CI
 as a platform health probe; scrape `GET /metrics` on the web admin for
@@ -83,6 +84,7 @@ PASS notify-queue: 0.0% full
 WARN workers: no live workers seen in last 60s
 PASS job-threads: 0 live worker(s) claiming
 PASS queues: no queued jobs
+PASS unclaimable: no queued job is invisible to its queue's live workers
 PASS blocked-waiters: no waiting jobs blocked on failed upstreams
 PASS mailbox: no unread mail older than a day
 PASS dlq: empty
@@ -266,8 +268,14 @@ jumps the queue, 900 is background work. Every worker also has a **ceiling**
 A priority above every live worker's ceiling is therefore not "very low
 priority", it is **unclaimable**: the job is never claimed, never runs, never
 fails, never retries, never reaches the DLQ, and no age-based check sees it,
-because none of them look at `queued`. It simply sits there. Two things stop
-that happening quietly:
+because none of them look at `queued`. It simply sits there. Three things
+stop that happening quietly:
+
+- **`doctor` sweeps for it.** `WARN unclaimable` counts, per queue, the
+  jobs that are runnable now and above the ceiling of every live worker on
+  that queue — naming the highest `--max-prio` in the fleet, the priorities
+  blocked behind it, and example ids for `pj-admin jobs why ID`. It is the
+  only check that finds these without being handed a job id.
 
 - **The client refuses the enqueue.** `client.enqueue(..., priority=5000)`
   raises `ValueError` naming the ceiling — at the caller, where it can still
@@ -300,8 +308,9 @@ that happening quietly:
   ```
 
 To fix jobs already in that state: lower their priority
-(`client.update_job_priority(id, 900)`, which is refused above the ceiling
-for the same reason), or start a worker whose `--max-prio` covers them.
+(`pj-admin jobs set-priority ID 900`, or `client.update_job_priority(id,
+900)`, both refused above the ceiling for the same reason), or start a
+worker whose `--max-prio` covers them.
 
 ## Retention: what it deletes, and what it refuses to
 
@@ -380,7 +389,8 @@ For chronic pressure set `--max-concurrency` / `--rate-limit` instead.
 code fix, `pj-admin dlq retry ID` (fresh attempt budget).
 
 **Nothing is being claimed.** In order: `pj-admin doctor` (a `WARN
-job-threads` names any worker that is alive and claiming nothing);
+job-threads` names any worker that is alive and claiming nothing; a `WARN
+unclaimable` names work no live worker on that queue could ever claim);
 `pj-admin queues show NAME` (paused? limits hit?); `pj-admin workers list`
 (any live workers on that queue, and is any of them `not claiming`?); the
 workers' own logs for `NOT CLAIMING` (abandoned job threads — see above) and
@@ -402,6 +412,7 @@ automatically and re-prepare their statements; nothing needs a restart.
 | ----------------------------------- | ----------------------------------------------------------------- |
 | Fleet health                        | `pj-admin doctor`, `pj-admin workers list`                        |
 | A worker is alive but doing nothing | `pyjobby_workers_not_claiming`, `doctor`'s `job-threads` check    |
+| Queued work nothing can ever claim  | `doctor`'s `unclaimable` check, then `pj-admin jobs why ID`      |
 | Queue depths/ages                   | `pj-admin queues list`, `/metrics` gauges                         |
 | What happened to job N              | `pj-admin jobs history N`, `jobs steps N`                         |
 | Throughput/error rates              | `/metrics` counters + duration quantiles                          |

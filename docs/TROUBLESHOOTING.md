@@ -24,6 +24,7 @@ PASS notify-queue: 0.0% full
 WARN workers: no live workers seen in last 60s
 PASS job-threads: 0 live worker(s) claiming
 PASS queue q_reports: depth 1, oldest runnable 51m
+PASS unclaimable: no queued job is invisible to its queue's live workers
 PASS blocked-waiters: no waiting jobs blocked on failed upstreams
 PASS mailbox: no unread mail older than a day
 PASS dlq: empty
@@ -45,6 +46,7 @@ all" is a WARN, so one worker of ten refusing to claim cannot be graver.
 | `workers`         | no heartbeat in the last 60s                                                                                                      | [Nothing is being claimed](#nothing-is-being-claimed)                                    |
 | `job-threads`     | live workers that claim nothing                                                                                                   | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing) |
 | `queue <name>`    | backlog past `--max-depth` (10000) or `--max-age-minutes` (60)                                                                    | [The backlog is growing](#the-backlog-is-growing)                                        |
+| `unclaimable`     | queued, runnable jobs that no live worker on their queue could ever claim — above every ceiling, or wanting a capability nobody advertises | [Jobs sit queued forever](#jobs-sit-queued-forever-and-nothing-is-wrong-with-the-workers) |
 | `blocked-waiters` | jobs in `waiting` whose upstream crashed or was cancelled — the monitor leaves them alone, so this is the only place they show up | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq)                              |
 | `mailbox`         | unread durable mail older than a day — usually a sender using a topic nothing `recv()`s                                           | [STATECHARTS.md § Waiting](STATECHARTS.md#waiting)                                       |
 | `dlq`             | jobs have exhausted their retries                                                                                                 | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq)                              |
@@ -60,6 +62,7 @@ draining is fine; an old queue is not. Tune the thresholds per install with
 | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | One named job is not running                                  | `pj-admin jobs why ID`, then [Nothing is being claimed](#nothing-is-being-claimed)       |
 | Jobs sit in `queued`, workers look idle                       | [Nothing is being claimed](#nothing-is-being-claimed)                                    |
+| Jobs sit queued forever and the workers are fine              | [Jobs sit queued forever](#jobs-sit-queued-forever-and-nothing-is-wrong-with-the-workers) |
 | A worker heartbeats but never claims                          | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing) |
 | Queue depth or age climbing                                   | [The backlog is growing](#the-backlog-is-growing)                                        |
 | The table grows even though retention is on                   | [Retention is falling behind](#retention-is-falling-behind)                              |
@@ -211,7 +214,9 @@ The rest of this section is the same walk by hand — for when the symptom is
 "the queue is not moving" and there is no one job to point at:
 
 1. **`pj-admin doctor`.** A `WARN job-threads` line names any worker that
-   is alive and claiming nothing — that is a different problem, below.
+   is alive and claiming nothing — that is a different problem, below. A
+   `WARN unclaimable` line names work that no live worker on that queue
+   could ever claim, and is the next section.
 2. **`pj-admin queues show NAME`.** Is it `Paused: yes`? Is
    `Max concurrency` or `Rate limit` set and binding? Both are enforced in
    the database, so they bind every claimer, and a paused queue stops
@@ -246,6 +251,50 @@ The rest of this section is the same walk by hand — for when the symptom is
 `pj-admin queues pause` / `resume` and `queues limits` change all of this
 live, with no restart — see
 [OPERATIONS.md § Queue controls](OPERATIONS.md#queue-controls-live-no-restarts).
+
+## Jobs sit queued forever and nothing is wrong with the workers
+
+Every other signal reads healthy: the workers heartbeat, the queue is not
+paused, no cap is binding, the DLQ is empty, and the jobs never fail —
+because they are never *tried*. They are runnable and **invisible to every
+live worker on their queue**, so nothing claims them, nothing times them
+out, and no age-based check looks at `queued`. Left alone they sit there
+forever.
+
+`doctor` sweeps for exactly this:
+
+```console
+$ pj-admin doctor
+...
+PASS workers: 1 live worker(s) seen in last 60s
+PASS job-threads: 1 live worker(s) claiming
+PASS queue reports: depth 4, oldest runnable 0m
+WARN unclaimable: 4 claimable job(s) that no live worker can claim: 3 on 'reports' above every live worker's ceiling (prio 500; the highest --max-prio among 1 live worker(s) is 100; e.g. jobs 1, 2, 3); 1 on 'reports' needing capability 'gpu', which none of the 1 live worker(s) advertises (they advertise: cpu; e.g. jobs 4). they are runnable and INVISIBLE to every live worker on their queue, so nothing ever claims them: they stay queued forever, never fail, and never reach the DLQ. Raise the fleet's ceiling (pj --max-prio N), start a worker advertising the capability (pj --queue Q --cap C), or lower the job (pj-admin jobs set-priority ID N). Remember lower prio = more urgent. `pj-admin jobs why ID` explains any one of them in full
+```
+
+Two causes, and the line says which, per queue:
+
+- **Above every live worker's ceiling.** A worker claims only
+  `prio <= --max-prio` (default 1000) and **lower prio is more urgent**, so
+  a big number is not "run it last", it is "run it never". Fix by raising
+  the fleet's ceiling (`pj --queue reports --max-prio 5000`, which must be
+  declared on the client too — see
+  [OPERATIONS.md § Priority](OPERATIONS.md#priority-and-the-ceiling-a-worker-claims-under))
+  or by lowering the jobs: `pj-admin jobs set-priority ID 900`.
+- **A capability nobody advertises.** The line names what the fleet *does*
+  advertise. Fix by starting a worker with it: `pj --queue reports --cap gpu`.
+
+Take an id from the line and `pj-admin jobs why ID` for the full per-job
+answer with the numbers behind it. Rows enqueued through `JobClient` cannot
+reach the priority case (the client refuses them), so when it happens the
+row arrived another way — raw SQL, a schedule, a tool.
+
+The check is a **WARN**, never a FAIL: the platform is healthy, the workload
+is not. A queue with **no live workers at all** is not reported here — that
+is the `workers` check above it, and a different remedy (start a worker,
+rather than change what the running ones accept). Alert on it the same way
+you alert on the DLQ: it is a condition nothing else in the system will ever
+tell you about.
 
 ## A worker is alive, heartbeating, and doing nothing
 

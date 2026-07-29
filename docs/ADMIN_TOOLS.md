@@ -156,8 +156,8 @@ Usage: pj-admin doctor [OPTIONS]
 
   Checks: database reachability, schema/migrations, NOTIFY triggers, NOTIFY
   queue saturation, live workers, workers that are alive but claiming nothing,
-  queue backlogs, blocked waiters, unread mail, the DLQ, and overdue
-  schedules.
+  queue backlogs, jobs no live worker can claim, blocked waiters, unread mail,
+  the DLQ, and overdue schedules.
 
   With --json the same checks come out as [{check, status, message}] and the
   exit code is unchanged, so a CI job can scrape them.
@@ -182,6 +182,7 @@ PASS notify-queue: 0.0% full
 WARN workers: no live workers seen in last 60s
 PASS job-threads: 0 live worker(s) claiming
 PASS queues: no queued jobs
+PASS unclaimable: no queued job is invisible to its queue's live workers
 PASS blocked-waiters: no waiting jobs blocked on failed upstreams
 PASS mailbox: no unread mail older than a day
 PASS dlq: empty
@@ -236,6 +237,35 @@ tell this database from one that never applied the migration at all.
 Triggers get their own check for the same reason the shape does: nothing
 raises when one is missing, the platform just quietly stops waking waiters
 or recording history. All seven the schema installs are checked by name.
+
+### The `unclaimable` check — work the fleet cannot see
+
+The fleet-wide sweep for the condition
+[`jobs why`](#why-is-this-job-not-running) answers one job at a time: a job
+that is `queued`, due, and that **no live worker on its queue could ever
+claim**. Two ways in, and the check names which one, per queue:
+
+| Cause                  | The line says                                                | Fix                                                                     |
+| ---------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------- |
+| `above_worker_ceiling` | `N on 'queue' above every live worker's ceiling (prio …)`     | `pj --max-prio` higher, or `pj-admin jobs set-priority ID N` lower       |
+| `capability_unmet`     | `N on 'queue' needing capability 'x', which none … advertises` | start a worker with `pj --queue Q --cap x`                              |
+
+```console
+$ pj-admin doctor
+...
+WARN unclaimable: 4 claimable job(s) that no live worker can claim: 3 on 'reports' above every live worker's ceiling (prio 500; the highest --max-prio among 1 live worker(s) is 100; e.g. jobs 1, 2, 3); 1 on 'reports' needing capability 'gpu', which none of the 1 live worker(s) advertises (they advertise: cpu; e.g. jobs 4). they are runnable and INVISIBLE to every live worker on their queue, so nothing ever claims them: they stay queued forever, never fail, and never reach the DLQ. Raise the fleet's ceiling (pj --max-prio N), start a worker advertising the capability (pj --queue Q --cap C), or lower the job (pj-admin jobs set-priority ID N). Remember lower prio = more urgent. `pj-admin jobs why ID` explains any one of them in full
+```
+
+It is a **WARN**: the platform is healthy, the workload is not. Up to three
+(queue, cause) groups are named and then summarised; counts past 1000 per
+group are reported as `N+`, and a handful of example ids come with each so
+`pj-admin jobs why ID` can be run on one of them.
+
+A queue with **no live workers at all** is deliberately not reported here —
+that is the `workers` check (and `no_live_workers` from `jobs why`), and it
+is a different remedy: start a worker, rather than change what the running
+ones accept. This check answers what neither of those can — the fleet is up
+and the work is still invisible to it.
 
 FAIL is otherwise reserved for "the platform cannot function" — a missing
 trigger, a NOTIFY queue past half full — and is the only thing that changes
@@ -473,6 +503,12 @@ Every query behind the verb is bounded (a primary-key lookup, an aggregate,
 or a `LIMIT`), and all of them use indexes the schema already keeps — it is
 safe to run against a table with hundreds of millions of rows, and safe to
 run from a monitoring loop.
+
+This verb needs a job id, which means somebody already suspects that job.
+The same two fleet-shaped reasons — `above_worker_ceiling` and
+`capability_unmet` — are swept for across every queue by
+[`doctor`'s `unclaimable` check](#the-unclaimable-check--work-the-fleet-cannot-see),
+which is how those jobs get found in the first place.
 
 ### Acting on jobs
 

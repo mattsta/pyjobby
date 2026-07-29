@@ -2879,6 +2879,67 @@ def stuck_worker_summary(rows: list[asyncpg.Record]) -> str:
     return named
 
 
+# Jobs that are queued, runnable, and that NO live worker on their queue could
+# ever claim -- above every live ceiling, or wanting a capability nobody
+# advertises. WARN and never FAIL: this is a workload problem, not a platform
+# fault. The database is healthy, the fleet is healthy, and what is wrong is
+# the relationship between what a job asks for and what the running workers
+# accept -- which no amount of platform repair fixes, and which is nobody's
+# 3am page (the exit code is). It is also the one condition here that is
+# genuinely SILENT: a backlog grows, a crash lands in the DLQ, a dead worker
+# stops heartbeating, but this just sits.
+DOCTOR_UNCLAIMABLE_REMEDY = (
+    "they are runnable and INVISIBLE to every live worker on their queue, so "
+    "nothing ever claims them: they stay queued forever, never fail, and "
+    "never reach the DLQ. Raise the fleet's ceiling (pj --max-prio N), start "
+    "a worker advertising the capability (pj --queue Q --cap C), or lower the "
+    "job (pj-admin jobs set-priority ID N). Remember lower prio = more "
+    "urgent. `pj-admin jobs why ID` explains any one of them in full"
+)
+
+# How many (queue, cause) groups doctor spells out before summarising. Same
+# shape and same reasoning as DOCTOR_THREADS_NAMED: enough to see whether it
+# is one queue or the whole install, short enough to stay one report line.
+DOCTOR_UNCLAIMABLE_NAMED = 3
+
+
+def _prio_span(lowest: int, highest: int) -> str:
+    return f"prio {lowest}" if lowest == highest else f"prio {lowest}-{highest}"
+
+
+def unclaimable_summary(records: list[dict[str, Any]]) -> str:
+    """Name the unclaimable work, per queue and cause, for doctor's WARN line.
+
+    One clause per record from `AdminAPI.unclaimable_jobs`, each carrying the
+    queue, the cause, the numbers the remedy needs, and example ids to hand
+    to `pj-admin jobs why`.
+    """
+    clauses = []
+    for r in records[:DOCTOR_UNCLAIMABLE_NAMED]:
+        count = f"{r['count']}{'+' if r['count_capped'] else ''}"
+        ids = ", ".join(str(i) for i in r["sample_job_ids"])
+        d = r["details"]
+        if r["reason"] == "above_worker_ceiling":
+            clauses.append(
+                f"{count} on {r['queue']!r} above every live worker's ceiling "
+                f"({_prio_span(d['lowest_blocked_prio'], d['highest_blocked_prio'])}; "
+                f"the highest --max-prio among {r['live_workers']} live "
+                f"worker(s) is {d['max_live_ceiling']}; e.g. jobs {ids})"
+            )
+        else:
+            missing = ", ".join(repr(c) for c in d["missing_capabilities"])
+            advertised = ", ".join(d["advertised_capabilities"]) or "nothing"
+            clauses.append(
+                f"{count} on {r['queue']!r} needing capability {missing}, "
+                f"which none of the {r['live_workers']} live worker(s) "
+                f"advertises (they advertise: {advertised}; e.g. jobs {ids})"
+            )
+    named = "; ".join(clauses)
+    if len(records) > DOCTOR_UNCLAIMABLE_NAMED:
+        named += f"; and {len(records) - DOCTOR_UNCLAIMABLE_NAMED} more"
+    return named
+
+
 def notify_queue_verdict(usage: float) -> tuple[str, str]:
     """Grade a NOTIFY-queue fill fraction into (status, message).
 
@@ -2968,8 +3029,8 @@ def doctor(
 
     Checks: database reachability, schema/migrations, NOTIFY triggers,
     NOTIFY queue saturation, live workers, workers that are alive but
-    claiming nothing, queue backlogs, blocked waiters, unread mail, the DLQ,
-    and overdue schedules.
+    claiming nothing, queue backlogs, jobs no live worker can claim, blocked
+    waiters, unread mail, the DLQ, and overdue schedules.
 
     With --json the same checks come out as [{check, status, message}] and
     the exit code is unchanged, so a CI job can scrape them.
@@ -3156,6 +3217,34 @@ def doctor(
                     f"{summary} (thresholds: depth {max_depth}, "
                     f"age {max_age_minutes}m)",
                 )
+
+            # Work no live worker on its queue could ever claim. Checked
+            # right after the backlog, because the backlog is what it hides
+            # inside: those jobs are counted in the depth above, and depth
+            # alone reads as "the fleet is behind" when in fact the fleet
+            # cannot see them at all -- forever. The proactive counterpart to
+            # `pj-admin jobs why ID`, which answers this for ONE job somebody
+            # already suspects; nothing warned that such jobs EXIST.
+            #
+            # The API method is the one home for the query and for which
+            # cause a job gets (see AdminAPI.unclaimable_jobs, including why
+            # a queue with no live workers at all is not this check's
+            # business). Built on doctor's own connection; prio_ceiling is
+            # irrelevant to it, because the comparison is against what the
+            # live workers actually registered, not against what this host's
+            # config declares.
+            unclaimable = await AdminAPI(conn).unclaimable_jobs()
+            blocked_total = sum(r["count"] for r in unclaimable)
+            blocked_capped = any(r["count_capped"] for r in unclaimable)
+            doc.warn_if(
+                bool(unclaimable),
+                "unclaimable",
+                "no queued job is invisible to its queue's live workers",
+                f"{blocked_total}{'+' if blocked_capped else ''} claimable "
+                f"job(s) that no live worker can claim: "
+                f"{unclaimable_summary(unclaimable)}. "
+                f"{DOCTOR_UNCLAIMABLE_REMEDY}",
+            )
 
             # Waiters parked on failed upstreams. The monitor deliberately
             # leaves these alone -- a crashed upstream is retryable (crashed

@@ -34,6 +34,7 @@ from click.testing import CliRunner
 
 from pyjobby import migrations
 from pyjobby.cli import DOCTOR_REQUIRED_TRIGGERS, cli
+from pyjobby.client import DEFAULT_PRIO_CEILING
 from tests.conftest import reserved_unused_port
 from tests.schema_fixtures import drop_database
 
@@ -427,15 +428,27 @@ async def insert_worker(
     *,
     last_seen_age: timedelta = timedelta(0),
     shutdown: bool = False,
+    max_prio: int = DEFAULT_PRIO_CEILING,
+    capabilities: tuple[str, ...] = (),
 ) -> int:
+    """Register a worker row directly, as pj.py's WORKER_REGISTER_SQL does.
+
+    `max_prio` and `capabilities` are the whole of what a worker will accept,
+    so they are what the `unclaimable` check reads; starting a real worker to
+    publish two columns it writes once at registration buys nothing and costs
+    a process per case.
+    """
     return await pool.fetchval(
-        """INSERT INTO jorb_worker (host, pid, queue, last_seen, shutdown_at)
+        """INSERT INTO jorb_worker
+               (host, pid, queue, last_seen, shutdown_at, max_prio, capabilities)
            VALUES ('doctor-test', 4242, $1, now() - $2::interval,
-                   CASE WHEN $3 THEN now() ELSE NULL END)
+                   CASE WHEN $3 THEN now() ELSE NULL END, $4, $5)
            RETURNING id""",
         queue,
         last_seen_age,
         shutdown,
+        max_prio,
+        list(capabilities),
     )
 
 
@@ -509,15 +522,29 @@ class TestDoctorWorkers:
 
 
 async def insert_queued(
-    pool, queue: str, count: int = 1, *, run_after_age: timedelta = timedelta(0)
-) -> None:
-    for _ in range(count):
-        await pool.execute(
-            """INSERT INTO jorb (job_class, queue, state, run_after)
-               VALUES ('tests.dxe_jobs.OkJob', $1, 'queued', now() - $2::interval)""",
+    pool,
+    queue: str,
+    count: int = 1,
+    *,
+    run_after_age: timedelta = timedelta(0),
+    prio: int = 100,
+    capability: str | None = None,
+) -> list[int]:
+    """Insert `count` queued jobs; returns their ids in insertion order."""
+    return [
+        await pool.fetchval(
+            """INSERT INTO jorb (job_class, queue, state, run_after, prio,
+                                 capability)
+               VALUES ('tests.dxe_jobs.OkJob', $1, 'queued', now() - $2::interval,
+                       $3, $4)
+               RETURNING id""",
             queue,
             run_after_age,
+            prio,
+            capability,
         )
+        for _ in range(count)
+    ]
 
 
 class TestDoctorQueueBacklog:
@@ -624,6 +651,139 @@ class TestDoctorQueueBacklog:
         assert checks[f"queue {unique_queue}"][0] == "WARN"
         assert checks[f"queue {other}"] == ("PASS", "depth 1, oldest runnable 0m")
         assert "queues" not in checks  # the "no queued jobs" line is suppressed
+
+
+# ============================================================================
+# Work no live worker can claim
+# ============================================================================
+# The proactive half of `pj-admin jobs why ID`. Both ways into the condition
+# need a worker whose registry row says what it will accept (max_prio,
+# capabilities), which is why they are built with insert_worker rather than a
+# real worker: those two columns are written once at registration and never
+# again, so a live process publishes nothing a row cannot.
+
+
+class TestDoctorUnclaimable:
+    async def test_a_job_above_every_live_ceiling_warns(
+        self, dsn, db_pool, unique_queue
+    ):
+        """The silent failure: healthy row, healthy fleet, nobody can see it.
+        It never fails and never reaches the DLQ, so this line is the only
+        warning there is."""
+        await insert_worker(db_pool, unique_queue, max_prio=10)
+        (job,) = await insert_queued(db_pool, unique_queue, prio=900)
+
+        result = await run_doctor(dsn)
+
+        assert result.exit_code == 0, result.output  # a workload problem, not a FAIL
+        status, message = parse_checks(result.output)["unclaimable"]
+        assert status == "WARN"
+        assert message.startswith(
+            "1 claimable job(s) that no live worker can claim: 1 on "
+            f"{unique_queue!r} above every live worker's ceiling (prio 900; "
+            "the highest --max-prio among 1 live worker(s) is 10; "
+            f"e.g. jobs {job})."
+        )
+        # the remedy, and where the per-job detail lives
+        assert "pj --max-prio N" in message
+        assert "pj-admin jobs set-priority ID N" in message
+        assert "`pj-admin jobs why ID`" in message
+
+    async def test_a_capability_no_live_worker_advertises_warns(
+        self, dsn, db_pool, unique_queue
+    ):
+        await insert_worker(db_pool, unique_queue, capabilities=("cpu",))
+        (job,) = await insert_queued(db_pool, unique_queue, capability="gpu")
+
+        result = await run_doctor(dsn)
+
+        assert result.exit_code == 0, result.output
+        status, message = parse_checks(result.output)["unclaimable"]
+        assert status == "WARN"
+        assert message.startswith(
+            "1 claimable job(s) that no live worker can claim: 1 on "
+            f"{unique_queue!r} needing capability 'gpu', which none of the 1 "
+            "live worker(s) advertises (they advertise: cpu; "
+            f"e.g. jobs {job})."
+        )
+        assert "pj --queue Q --cap C" in message
+
+    async def test_claimable_work_does_not_warn(self, dsn, db_pool, unique_queue):
+        await insert_worker(db_pool, unique_queue, max_prio=500, capabilities=("gpu",))
+        await insert_queued(db_pool, unique_queue, prio=500, capability="gpu")
+
+        result = await run_doctor(dsn)
+
+        assert parse_checks(result.output)["unclaimable"] == (
+            "PASS",
+            "no queued job is invisible to its queue's live workers",
+        )
+
+    async def test_an_idle_database_passes(self, dsn, db_pool):
+        assert await db_pool.fetchval("SELECT COUNT(*) FROM jorb") == 0
+
+        result = await run_doctor(dsn)
+
+        assert result.exit_code == 0, result.output
+        assert parse_checks(result.output)["unclaimable"] == (
+            "PASS",
+            "no queued job is invisible to its queue's live workers",
+        )
+
+    async def test_a_queue_with_no_live_workers_is_left_to_the_workers_check(
+        self, dsn, db_pool, unique_queue
+    ):
+        """The deliberate exclusion. "Nothing is running" and "the workers
+        running are blind to this work" are different remedies, and the first
+        is already reported by the `workers` check (and by `jobs why` as
+        no_live_workers). Reporting it here too would fire on every idle queue
+        in the install and bury the condition this check exists to find."""
+        await insert_queued(db_pool, unique_queue, prio=900, capability="gpu")
+
+        result = await run_doctor(dsn)
+
+        assert result.exit_code == 0, result.output
+        checks = parse_checks(result.output)
+        assert checks["unclaimable"][0] == "PASS"
+        assert checks["workers"] == ("WARN", "no live workers seen in last 60s")
+
+    async def test_both_causes_and_both_queues_are_named(
+        self, dsn, db_pool, unique_queue
+    ):
+        other = f"{unique_queue}_b"
+        await insert_worker(db_pool, unique_queue, max_prio=10, capabilities=("cpu",))
+        await insert_worker(db_pool, other, max_prio=10)
+        await insert_queued(db_pool, unique_queue, count=2, prio=900)
+        # under the ceiling, so this one is blocked by its capability alone:
+        # the two causes are disjoint, and a job that is both is counted as
+        # above_worker_ceiling (the cause `jobs why` headlines)
+        await insert_queued(db_pool, unique_queue, prio=5, capability="gpu")
+        await insert_queued(db_pool, other, prio=900)
+
+        result = await run_doctor(dsn)
+
+        status, message = parse_checks(result.output)["unclaimable"]
+        assert status == "WARN"
+        assert message.startswith("4 claimable job(s) that no live worker can claim:")
+        assert f"2 on {unique_queue!r} above every live worker's ceiling" in message
+        assert f"1 on {unique_queue!r} needing capability 'gpu'" in message
+        assert f"1 on {other!r} above every live worker's ceiling" in message
+
+    async def test_the_warning_is_identical_in_json(self, dsn, db_pool, unique_queue):
+        await insert_worker(db_pool, unique_queue, capabilities=("cpu",))
+        await insert_queued(db_pool, unique_queue, capability="gpu")
+
+        text = await run_doctor(dsn)
+        payload = await run_doctor(dsn, "--json")
+
+        assert payload.exit_code == text.exit_code
+        record = next(
+            r for r in json.loads(payload.stdout) if r["check"] == "unclaimable"
+        )
+        assert (record["status"], record["message"]) == parse_checks(text.output)[
+            "unclaimable"
+        ]
+        assert record["status"] == "WARN"
 
 
 class TestDoctorBlockedWaiters:

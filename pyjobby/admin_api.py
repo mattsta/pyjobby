@@ -149,6 +149,27 @@ EXPLAIN_GROUP_LIMIT = 1000
 #: advertising more than this has an answer that no longer fits on a line.
 EXPLAIN_CAPABILITY_LIMIT = 50
 
+#: How many unclaimable jobs `unclaimable_jobs` counts per queue per cause.
+#: Same bound and same reason as :data:`EXPLAIN_AHEAD_LIMIT`: the operator's
+#: question is "does this exist, and how big is it", which "1000+" answers as
+#: well as an exact number, and the exact number costs a scan of the queue's
+#: whole claimable depth. Past the bound the count is reported as capped.
+UNCLAIMABLE_SCAN_LIMIT = 1000
+
+#: How many job ids `unclaimable_jobs` names per queue per cause. Examples to
+#: paste into `pj-admin jobs why`, not a work list -- the fix is per queue.
+UNCLAIMABLE_SAMPLE_LIMIT = 5
+
+#: The reasons `unclaimable_jobs` can report, in the order it reports them.
+#: Both are :data:`EXPLAIN_REASONS` keys, and deliberately so: this is the
+#: fleet-wide sweep for the two conditions `explain_job` answers one job at a
+#: time, and an operator who reads "above_worker_ceiling" in a doctor line and
+#: then in a `jobs why` answer is reading about the same thing.
+UNCLAIMABLE_REASONS: Final[tuple[str, ...]] = (
+    "above_worker_ceiling",
+    "capability_unmet",
+)
+
 
 #: Default page size for the per-job trails (get_job_history, get_job_steps).
 #: Matches web_admin.MAX_PAGE_LIMIT, which is the bound the HTTP surface
@@ -1046,6 +1067,172 @@ class AdminAPI:
                 "queue_serialised": serialised,
             },
         )
+
+    async def unclaimable_jobs(
+        self,
+        stale_after_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS,
+        scan_limit: int = UNCLAIMABLE_SCAN_LIMIT,
+        sample_limit: int = UNCLAIMABLE_SAMPLE_LIMIT,
+    ) -> list[dict[str, Any]]:
+        """Every job no live worker on its queue could ever claim, per queue.
+
+        `explain_job` answers this for ONE job an operator already suspects.
+        This is the sweep: the same two conditions, asked of the whole fleet
+        at once, so the condition can be FOUND rather than confirmed. It is
+        the platform's quietest failure -- a job above every live worker's
+        ceiling, or wanting a capability none of them advertises, stays
+        'queued' forever. It never fails, never retries, never reaches the
+        DLQ, and every other health signal (queue depth, worker liveness,
+        throughput) reads normal while it sits there.
+
+        THE TWO CAUSES ARE THE TWO :data:`UNCLAIMABLE_REASONS`, both
+        :data:`EXPLAIN_REASONS` keys, and they are made DISJOINT here in the
+        order `explain_job` headlines them: a job that is both above the
+        ceiling AND wants an unadvertised capability is counted only under
+        `above_worker_ceiling`. Two verbs that disagreed about which cause a
+        job has would send the operator to the wrong remedy.
+
+        A QUEUE WITH NO LIVE WORKERS IS DELIBERATELY NOT REPORTED. It cannot
+        be: "no live worker could claim it" is trivially true of every job on
+        such a queue, so including them would make this check restate the
+        worker check for every idle queue in the install, and drown the
+        condition it exists to find. The two are also different remedies --
+        "nothing is running" is fixed by starting a worker, "workers are
+        running and blind to this work" is fixed by changing what they accept
+        -- and the platform already reports the first one twice (doctor's
+        `workers` check, and `no_live_workers` from `jobs why`). This verb
+        answers the question neither of those can: the fleet is up, and the
+        work is still invisible to it. The `fleet` CTE below is what enforces
+        it -- a queue with no live rows produces no group, so it never
+        reaches the job table at all.
+
+        Cost: bounded, and it never scans the job table. Live workers come
+        from ``jorb_worker_live_idx``; each cause is then one LATERAL per
+        queue-with-workers over ``jorb_claim_idx (queue, prio, run_after)
+        WHERE state = 'queued'``, stopping at `scan_limit` rows. The ceiling
+        arm is a pure index range scan (prio > ceiling is that index's second
+        column), so it reads only rows it returns. The capability arm has no
+        index for its predicate and walks the queue's claimable rows -- still
+        strictly less than the per-queue backlog aggregate `doctor` already
+        runs beside it, and no index exists or should exist for a column
+        almost no job sets.
+
+        Args:
+            stale_after_seconds: heartbeat age past which a worker is not
+                counted as live (default: 60), matching `list_workers`
+            scan_limit: most jobs counted per queue per cause
+            sample_limit: most job ids named per queue per cause
+
+        Returns:
+            One record per (queue, cause) with at least one job, ordered by
+            queue then cause::
+
+                {queue, reason, count, count_capped, live_workers,
+                 sample_job_ids, details}
+
+            `details` carries the numbers the remedy needs, under the same
+            keys `explain_job` uses for the same facts. Empty list is the
+            healthy answer.
+        """
+        rows = await self.conn.fetch(
+            """
+            WITH fleet AS (
+                -- One row per queue that HAS live workers, holding the whole
+                -- of what those workers will accept: the highest ceiling
+                -- among them and the union of their advertised capabilities.
+                -- The LEFT JOIN keeps a worker that advertises nothing.
+                SELECT w.queue,
+                       count(DISTINCT w.id)                    AS live_workers,
+                       max(w.max_prio)                         AS max_ceiling,
+                       coalesce(array_agg(DISTINCT caps.cap)
+                                    FILTER (WHERE caps.cap IS NOT NULL),
+                                '{}'::text[])                  AS advertised
+                  FROM jorb_worker w
+                  LEFT JOIN LATERAL unnest(w.capabilities) AS caps(cap)
+                       ON TRUE
+                 WHERE w.shutdown_at IS NULL
+                   AND w.last_seen > now() - make_interval(secs => $1)
+                 GROUP BY w.queue
+            ),
+            blocked AS (
+                SELECT f.queue, f.live_workers, f.max_ceiling, f.advertised,
+                       'above_worker_ceiling'::text AS reason,
+                       j.id, j.prio, j.capability
+                  FROM fleet f
+                 CROSS JOIN LATERAL (
+                     SELECT id, prio, capability
+                       FROM jorb
+                      WHERE queue = f.queue
+                        AND state = 'queued'
+                        AND run_after <= now()
+                        AND prio > f.max_ceiling
+                      ORDER BY prio, run_after
+                      LIMIT $2
+                 ) j
+                UNION ALL
+                SELECT f.queue, f.live_workers, f.max_ceiling, f.advertised,
+                       'capability_unmet'::text,
+                       j.id, j.prio, j.capability
+                  FROM fleet f
+                 CROSS JOIN LATERAL (
+                     SELECT id, prio, capability
+                       FROM jorb
+                      WHERE queue = f.queue
+                        AND state = 'queued'
+                        AND run_after <= now()
+                        -- disjoint from the arm above, on purpose
+                        AND prio <= f.max_ceiling
+                        AND capability IS NOT NULL
+                        AND NOT (capability = ANY (f.advertised))
+                      ORDER BY prio, run_after
+                      LIMIT $2
+                 ) j
+            )
+            SELECT queue, reason, live_workers, max_ceiling, advertised,
+                   count(*)::int                              AS blocked_count,
+                   (array_agg(id ORDER BY prio, id))[1:$3::int]
+                                                              AS sample_job_ids,
+                   min(prio)                                  AS lowest_prio,
+                   max(prio)                                  AS highest_prio,
+                   coalesce(array_agg(DISTINCT capability)
+                                FILTER (WHERE capability IS NOT NULL),
+                            '{}'::text[])                     AS missing_caps
+              FROM blocked
+             GROUP BY queue, reason, live_workers, max_ceiling, advertised
+             ORDER BY queue, reason
+            """,
+            stale_after_seconds,
+            scan_limit,
+            sample_limit,
+        )
+
+        report: list[dict[str, Any]] = []
+        for row in rows:
+            reason: str = row["reason"]
+            if reason == "above_worker_ceiling":
+                details: dict[str, Any] = {
+                    "max_live_ceiling": row["max_ceiling"],
+                    "lowest_blocked_prio": row["lowest_prio"],
+                    "highest_blocked_prio": row["highest_prio"],
+                }
+            else:
+                details = {
+                    "missing_capabilities": list(row["missing_caps"] or []),
+                    "advertised_capabilities": list(row["advertised"] or []),
+                }
+            count: int = row["blocked_count"]
+            report.append(
+                {
+                    "queue": row["queue"],
+                    "reason": reason,
+                    "count": count,
+                    "count_capped": count >= scan_limit,
+                    "live_workers": row["live_workers"],
+                    "sample_job_ids": list(row["sample_job_ids"] or []),
+                    "details": details,
+                }
+            )
+        return report
 
     async def retry_job(self, job_id: int) -> dict[str, Any]:
         """
