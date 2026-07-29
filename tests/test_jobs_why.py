@@ -241,6 +241,43 @@ class TestWaiting:
         assert answer["details"]["blocking_job_state"] == "crashed"
         assert "never start" in answer["summary"]
 
+    async def test_waiting_on_a_job_that_no_longer_exists(
+        self, admin_api, db_connection, unique_queue
+    ):
+        """Retention deleted the upstream, or it was never real (a typo'd
+        waitfor_job). Nothing can ever wake this row: the wake fires from the
+        upstream's own terminal transition, and there is no upstream."""
+        ghost = await make_job(db_connection, unique_queue, state="finished")
+        job = await make_job(
+            db_connection, unique_queue, state="waiting", waitfor_job=ghost
+        )
+        await db_connection.execute("DELETE FROM jorb WHERE id = $1", ghost)
+
+        answer = await admin_api.explain_job(job)
+
+        assert answer["reason"] == "waiting_on_job"
+        assert answer["details"]["blocking_job_id"] == ghost
+        assert answer["details"]["blocking_job_state"] is None
+        assert "NO LONGER EXISTS" in answer["summary"]
+
+    async def test_waiting_on_an_already_finished_job_is_a_missed_wake(
+        self, admin_api, db_connection, unique_queue
+    ):
+        """The upstream finished but this row is still waiting -- the wake was
+        lost (a worker died between its terminal write and the wake). The
+        monitor's stranded-waiter sweep repairs it, but an operator looking
+        right now needs to be told that, not left reading 'waiting'."""
+        upstream = await make_job(db_connection, unique_queue, state="finished")
+        job = await make_job(
+            db_connection, unique_queue, state="waiting", waitfor_job=upstream
+        )
+
+        answer = await admin_api.explain_job(job)
+
+        assert answer["reason"] == "waiting_on_job"
+        assert answer["details"]["blocking_job_state"] == "finished"
+        assert "wake was missed" in answer["summary"]
+
     async def test_waiting_on_group_counts_the_unfinished_members(
         self, admin_api, db_connection, unique_queue
     ):
