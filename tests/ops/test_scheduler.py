@@ -4,15 +4,18 @@ TROUBLESHOOTING.md § "A schedule is not firing" names the ways a schedule
 stops and how each one announces itself: the circuit breaker disables it
 with a documented ERROR line and `schedule enable` (after fixing the job)
 arms it again; a due schedule with no scheduler behind it is doctor's
-overdue WARN; a scheduler that was down does not backfill missed fires;
-and a max_concurrent skip is recorded as skipped, not failed. (That a due
-schedule fires exactly once even with two schedulers racing is
-test_multi_instance.py's.)
+overdue WARN; a scheduler that was down backfills missed fires only if the
+schedule asked for it, and then only as many as it asked for; and a
+max_concurrent skip is recorded as skipped, not failed. (That a due schedule
+fires exactly once even with two schedulers racing is test_multi_instance.py's;
+the backfill window's arithmetic is tests/test_cron_semantics.py's and its
+per-tick bookkeeping tests/test_scheduler_correctness.py's.)
 """
 
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 
 import pytest
 
@@ -115,6 +118,8 @@ class TestOverdueWarn:
 
 
 class TestNoBackfill:
+    """The default: `backfill_limit` 0, and missed ticks stay missed."""
+
     async def test_a_long_outage_yields_one_fire_not_one_per_missed_tick(
         self, fleet, admin, db_pool, unique_queue, test_id
     ):
@@ -138,10 +143,94 @@ class TestNoBackfill:
                 "SELECT count(*) FROM jorb WHERE schedule_id = $1", schedule_id
             )
             == 1
-        ), "missed ticks are skipped, never backfilled"
+        ), "at backfill_limit 0, missed ticks are skipped and never backfilled"
         assert await db_pool.fetchval(
             "SELECT next_run > now() FROM jorb_schedule WHERE id = $1", schedule_id
         ), "next_run advances from now"
+
+
+class TestBoundedBackfill:
+    """The opt-in: `--backfill-limit N`, and never more than N + 1 fires.
+
+    The bound is checked through the real `pj-scheduler` process because that
+    is where an unbounded backfill would do its damage -- a burst of jobs
+    landing on a queue that is already behind, from a process nobody is
+    watching at the moment it recovers.
+    """
+
+    async def test_a_recovery_fires_the_bound_and_records_what_it_dropped(
+        self, fleet, admin, db_pool, unique_queue, test_id
+    ):
+        name = f"sched_{test_id}"
+        # max-concurrent 3 is what makes "exactly 3" a FACT rather than a race
+        # with the next minute: the recovery burst fills the allowance, so the
+        # tick after it is refused however long this test then looks.
+        schedule_id = await add_schedule(
+            admin,
+            db_pool,
+            name,
+            unique_queue,
+            "--backfill-limit",
+            "2",
+            "--max-concurrent",
+            "3",
+        )
+        # Ten missed every-minute ticks, of which two may be caught up on.
+        await make_due(db_pool, schedule_id, minutes_ago=10)
+
+        fleet.scheduler(poll_interval=1)
+        await wait_until(
+            lambda: db_pool.fetchval(
+                "SELECT count(*) = 3 FROM jorb WHERE schedule_id = $1", schedule_id
+            ),
+            describe="the due tick and two backfilled ticks fired",
+            timeout=20,
+        )
+        await asyncio.sleep(3)
+        assert (
+            await db_pool.fetchval(
+                "SELECT count(*) FROM jorb WHERE schedule_id = $1", schedule_id
+            )
+            == 3
+        ), "backfill_limit 2 must never mint more than 2 + 1 jobs on recovery"
+
+        # The dropped ticks are RECORDED, as one row -- silence about them is
+        # how an unbounded backfill hides, and a bound set too low hides the
+        # same way if nobody can see what it cost.
+        summaries = await db_pool.fetch(
+            "SELECT * FROM jorb_schedule_log WHERE schedule_id = $1 "
+            "AND skip_reason = 'backfill_limit'",
+            schedule_id,
+        )
+        assert len(summaries) == 1
+        assert "not backfilled (backfill_limit=2)" in summaries[0]["error_message"]
+
+        # and it is in the operator-facing view the docs point at
+        history = admin("schedule", "history", name, "--result", "skipped")
+        assert history.returncode == 0
+        assert "backfill_limit" in history.stdout
+
+        # A backfilled fire is logged against the tick it was FOR, never
+        # against the moment it really ran, so the three rows name three
+        # different ticks and every one of them ran after its own instant.
+        fires = await db_pool.fetch(
+            "SELECT scheduled_time, actual_time FROM jorb_schedule_log "
+            "WHERE schedule_id = $1 AND result = 'success' ORDER BY scheduled_time",
+            schedule_id,
+        )
+        assert len(fires) == 3
+        assert (
+            fires[0]["scheduled_time"]
+            < fires[1]["scheduled_time"]
+            < fires[2]["scheduled_time"]
+        )
+        assert all(r["actual_time"] > r["scheduled_time"] for r in fires)
+        # And they are the MOST RECENT missed ticks, not the oldest: the
+        # freshest one is within a couple of minutes of the recovery, which it
+        # could not be had the bound kept the head of a ten-minute window.
+        assert fires[2]["actual_time"] - fires[2]["scheduled_time"] < timedelta(
+            minutes=3
+        )
 
 
 class TestMaxConcurrentSkip:

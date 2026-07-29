@@ -24,7 +24,7 @@ import asyncpg  # type: ignore[import-untyped]
 from loguru import logger
 
 from .client import ENQUEUE_SQL, JobClient
-from .cron import next_cron_run
+from .cron import missed_cron_runs, next_cron_run
 from .db import utcnow
 
 #: "How many of this schedule's jobs are still in flight?", asked once per
@@ -294,16 +294,16 @@ class ScheduleManager:
                 name, description,
                 job_class, kwargs, queue, prio, capability,
                 cron_expr, timezone, enabled,
-                max_concurrent_jobs, jitter_seconds,
+                max_concurrent_jobs, jitter_seconds, backfill_limit,
                 backpressure_threshold, circuit_breaker_threshold,
                 next_run, created_by
             ) VALUES (
                 $1, $2,
                 $3, $4, $5, $6, $7,
                 $8, $9, $10,
-                $11, $12,
-                $13, $14,
-                $15, $16
+                $11, $12, $13,
+                $14, $15,
+                $16, $17
             )
             RETURNING id
         """,
@@ -319,6 +319,7 @@ class ScheduleManager:
             kwargs.get("enabled", True),
             kwargs.get("max_concurrent_jobs", 1),
             kwargs.get("jitter_seconds", 0),
+            kwargs.get("backfill_limit", 0),
             kwargs.get("backpressure_threshold", 1000),
             kwargs.get("circuit_breaker_threshold", 5),
             next_run,
@@ -663,19 +664,35 @@ class SchedulerWorker:
         )
 
     async def execute_schedule(
-        self, schedule: dict[str, Any]
+        self,
+        schedule: dict[str, Any],
+        scheduled_time: datetime | None = None,
+        *,
+        allow_jitter: bool = True,
     ) -> ScheduleExecutionResult:
         """
         Execute single schedule with all safety checks.
 
         Args:
             schedule: Schedule record
+            scheduled_time: The tick being fired. Defaults to the schedule's
+                own ``next_run``, the tick it is currently due for; a
+                :meth:`backfill_missed_ticks` catch-up passes one of the
+                instants the schedule missed instead. Everything else about
+                the firing -- every safety check, the shared enqueue path, the
+                per-tick deadline key -- is identical, deliberately: a
+                recovery burst that could route around the safety limits would
+                be a way to defeat them by taking the scheduler down.
+            allow_jitter: False suppresses jitter. Jitter spreads a thundering
+                herd of ON-TIME fires across a window; a backfilled tick is
+                already late, so delaying it further buys nothing.
 
         Returns:
             Execution result
         """
         start_time = time.time()
-        scheduled_time = schedule["next_run"]
+        if scheduled_time is None:
+            scheduled_time = schedule["next_run"]
 
         logger.debug(
             f"Executing schedule '{schedule['name']}'",
@@ -742,7 +759,11 @@ class SchedulerWorker:
         # Safety feature 4: Apply jitter as a run_after offset on the created
         # job (never by sleeping here — with N schedules a serial sleep would
         # stall every schedule behind this one).
-        jitter = self.safety.calculate_jitter(schedule["jitter_seconds"])
+        jitter = (
+            self.safety.calculate_jitter(schedule["jitter_seconds"])
+            if allow_jitter
+            else 0
+        )
         if jitter > 0:
             logger.debug(
                 f"Schedule '{schedule['name']}' applying jitter: {jitter}s",
@@ -834,6 +855,114 @@ class SchedulerWorker:
                 result="failure", error_message=str(e), duration_ms=duration_ms
             )
 
+    def record_metrics(self, result: ScheduleExecutionResult) -> None:
+        """Count one firing in this worker's own totals.
+
+        A backfilled tick counts exactly like an on-time one: a recovery that
+        fired three ticks and dropped seven has to be visible in the numbers
+        the process reports, not only in a table somebody has to go and read.
+        """
+        self.executions_total += 1
+        if result.result == "success":
+            self.successes_total += 1
+        elif result.result == "failure":
+            self.failures_total += 1
+        elif result.result == "skipped":
+            self.skips_total += 1
+
+    async def backfill_missed_ticks(self, schedule: dict[str, Any]) -> None:
+        """Fire the recent ticks this schedule missed, up to its own bound.
+
+        ``backfill_limit`` is BOTH the opt-in and the bound, and 0 is the
+        default: a scheduler that was down skips the ticks it missed and
+        ``next_run`` advances from now, which is what this platform has always
+        done and what most schedules want (nobody needs last Tuesday's
+        report). ``N > 0`` fires the N most RECENT missed ticks -- the freshest
+        ones, because the value of a late fire decays -- and records the older
+        excess rather than firing it.
+
+        Never more than N + 1 enqueues per recovery, however long the outage:
+        the current due tick, which the caller fires, plus at most N. That
+        hard ceiling is the whole design. Backfilling without one turns a
+        day-long outage of a minutely schedule into 1,440 jobs landing at once
+        on a queue that is already behind, which is the failure mode this
+        feature exists to make impossible to ask for.
+
+        The dropped ticks are recorded as ONE summary row, not one row apiece:
+        a per-second schedule down for a day misses 86,400 ticks, and writing
+        that many rows into ``jorb_schedule_log`` to describe an outage is its
+        own denial of service. The row carries the count and the window it
+        covers, because silence is how unbounded backfill hides -- an operator
+        must be able to see exactly what was dropped and decide whether the
+        bound was set too low.
+
+        Every backfilled tick goes through :meth:`execute_schedule`, so
+        ``max_concurrent`` and ``backpressure_threshold`` refuse it exactly as
+        they refuse an on-time fire (each refusal recorded as the skip it is),
+        the circuit breaker counts an enqueue failure, and the per-tick
+        deadline key makes two schedulers recovering at once converge on one
+        job per tick. Jitter is not applied -- see :meth:`execute_schedule`.
+        """
+        limit = schedule["backfill_limit"]
+        if limit <= 0:
+            return
+
+        # The window is (next_run, now]. next_run itself is EXCLUDED because it
+        # is the tick the schedule is currently due for, which the caller has
+        # already fired: a backfill therefore only ever ADDS fires, and raising
+        # backfill_limit never moves or removes the fire a schedule was due
+        # for. `until` is this process's own clock -- the same one
+        # calculate_next_run reads -- so a tick can land on both sides of the
+        # boundary only by arriving mid-pass, and the per-tick deadline key
+        # turns that into a recorded `duplicate` skip rather than a second job.
+        missed = missed_cron_runs(
+            schedule["cron_expr"],
+            schedule["timezone"],
+            after=schedule["next_run"],
+            until=utcnow(),
+            keep=limit,
+        )
+
+        if missed.dropped_window is not None:
+            oldest, newest = missed.dropped_window
+            detail = (
+                f"{missed.dropped} older missed tick(s) not backfilled "
+                f"(backfill_limit={limit}): "
+                f"{oldest.isoformat()} .. {newest.isoformat()}"
+            )
+            logger.warning(
+                f"Schedule '{schedule['name']}': {detail}",
+                extra={
+                    "schedule_id": schedule["id"],
+                    "schedule_name": schedule["name"],
+                    "backfill_limit": limit,
+                    "dropped_ticks": missed.dropped,
+                },
+            )
+            # One skip, one log row: every skip in the system is 1:1 with a row
+            # in jorb_schedule_log, and reconciling skip_count against that
+            # table is how an operator checks the log is not lying. How many
+            # ticks this one row stood for is in the row's own detail. Its
+            # scheduled_time is the OLDEST dropped tick, so the row sorts into
+            # the history where the dropped window begins.
+            summary = ScheduleExecutionResult(
+                result="skipped",
+                skip_reason="backfill_limit",
+                error_message=detail,
+            )
+            await self.manager.record_execution_skip(schedule["id"], "backfill_limit")
+            await self.log_execution(schedule, oldest, summary)
+            self.record_metrics(summary)
+
+        for tick in missed.kept:
+            result = await self.execute_schedule(schedule, tick, allow_jitter=False)
+            # Logged against the tick's SCHEDULED time, never against now:
+            # `actual_time` far ahead of `scheduled_time` is the honest and
+            # only marker that a fire was a backfill, and rewriting
+            # scheduled_time to hide the gap would erase the outage.
+            await self.log_execution(schedule, tick, result)
+            self.record_metrics(result)
+
     async def run(self) -> None:
         """Main scheduler loop"""
         logger.info(f"Scheduler worker started (poll interval: {self.poll_interval}s)")
@@ -875,21 +1004,19 @@ class SchedulerWorker:
                                     schedule["cron_expr"], schedule["timezone"]
                                 )
                             except ValueError as e:
+                                unevaluatable = ScheduleExecutionResult(
+                                    result="failure", error_message=str(e)
+                                )
                                 await self.manager.disable_unevaluatable(
                                     schedule["id"], str(e)
                                 )
                                 await self.log_execution(
-                                    schedule,
-                                    schedule["next_run"],
-                                    ScheduleExecutionResult(
-                                        result="failure", error_message=str(e)
-                                    ),
+                                    schedule, schedule["next_run"], unevaluatable
                                 )
-                                self.executions_total += 1
-                                self.failures_total += 1
+                                self.record_metrics(unevaluatable)
                                 continue
 
-                            # Execute schedule
+                            # Execute schedule (the tick it is due for)
                             result = await self.execute_schedule(schedule)
 
                             # Log execution
@@ -898,13 +1025,12 @@ class SchedulerWorker:
                             )
 
                             # Update metrics
-                            self.executions_total += 1
-                            if result.result == "success":
-                                self.successes_total += 1
-                            elif result.result == "failure":
-                                self.failures_total += 1
-                            elif result.result == "skipped":
-                                self.skips_total += 1
+                            self.record_metrics(result)
+
+                            # Catch up on the ticks missed while nothing was
+                            # firing this schedule. A no-op at backfill_limit 0,
+                            # which is the default and stays the default.
+                            await self.backfill_missed_ticks(schedule)
 
                             # Update next_run
                             await self.manager.set_next_run(schedule["id"], next_run)

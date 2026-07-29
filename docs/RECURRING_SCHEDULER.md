@@ -71,10 +71,10 @@ pj-admin schedule delete daily-revenue --force   # prompts without -f/--force
 ```
 
 Every command that names a schedule takes a name **or** an id. `--priority`,
-`--max-prio`, `--capability`, `--jitter`, `--backpressure` and `--disabled`
-(create it switched off) are the remaining `add` options, and `list`, `show`,
-`history` and `stats` all take `--json`; `pj-admin schedule --help` is
-authoritative.
+`--max-prio`, `--capability`, `--jitter`, `--backpressure`,
+`--backfill-limit` and `--disabled` (create it switched off) are the remaining
+`add` options, and `list`, `show`, `history` and `stats` all take `--json`;
+`pj-admin schedule --help` is authoritative.
 
 `--priority` is refused above the deployment's worker priority ceiling — a
 schedule firing into a priority no worker will claim produces a job that sits
@@ -303,6 +303,85 @@ There is nothing to backfill: `jorb.schedule_id` is a column of the **base
 schema** (`sql/schema/10_jobs.sql`), so `pj-admin db migrate` installs it
 with the rest of the schema on any database this release creates, and no
 release that wrote the `admin_data` key has ever shipped.
+
+## Missed fires after an outage — `backfill_limit` (default 0)
+
+A scheduler that was not running at 02:00 did not fire the 02:00 tick, and
+when it comes back the tick is in the past. What happens to it is a
+per-schedule choice, and the default is to let it go.
+
+```bash
+pj-admin schedule add hourly-rollup myapp.Rollup "0 * * * *" --backfill-limit 3
+pj-admin schedule show hourly-rollup      # Missed-Tick Backfill: 3 most recent missed tick(s)
+```
+
+- **`0` (the default) never backfills.** The missed ticks are skipped and
+  `next_run` advances from now. This is what most schedules want: nobody needs
+  last Tuesday's report, and a schedule that means "keep this fresh" is served
+  by the next ordinary fire.
+- **`N > 0` fires the `N` most RECENT missed ticks**, plus the tick the
+  schedule was actually due for, and records the rest. The freshest ticks, not
+  the oldest, because the value of a late fire decays — an hourly rollup that
+  was down for nine hours wants the last three hours, not the three hours from
+  nine hours ago.
+
+The single integer is both the opt-in and the bound, deliberately. **There is
+no way to ask for "all of them."** A day-long outage of a minutely schedule
+is 1,440 missed ticks, and firing them all lands 1,440 jobs at once on a queue
+that is, by construction, already behind — the moment a queue can least afford
+it. `backfill_limit` is a hard ceiling of `N + 1` enqueues per recovery
+however long the outage lasted.
+
+**What was dropped is recorded**, as ONE `skipped` row with
+`skip_reason = 'backfill_limit'`, whose `error_message` carries the count and
+the window it covers:
+
+```console
+$ pj-admin schedule history hourly-rollup --result skipped --json
+[{"result": "skipped", "skip_reason": "backfill_limit",
+  "scheduled_time": "2026-07-29T01:00:00+00:00",
+  "error_message": "7 older missed tick(s) not backfilled (backfill_limit=3): 2026-07-29T01:00:00+00:00 .. 2026-07-29T07:00:00+00:00"}]
+```
+
+One row and not one per dropped tick: a per-second schedule down for a day
+misses 86,400 of them, and describing an outage must not become its own denial
+of service. The scheduler logs the same sentence at `WARNING`. It is there so
+that a bound set too low is *visible* — silence about the dropped work is how
+unbounded backfill hides in the implementations that offer it.
+
+The rest follows from backfilled fires going through the ordinary fire path:
+
+- **`max_concurrent_jobs` and `backpressure_threshold` apply unchanged.** A
+  recovery burst is not a way around the safety limits — otherwise
+  `max_concurrent_jobs 1` could be defeated by stopping the scheduler and
+  starting it again. A backfilled tick the limits refuse is recorded as the
+  skip it is, with its own reason.
+- **The circuit breaker counts a backfilled enqueue failure** like any other.
+- **Two schedulers recovering at once converge.** Each backfilled tick carries
+  the same per-tick `deadline_key` an on-time fire carries, so the loser
+  records a `duplicate` skip rather than writing a second job.
+- **Jitter is NOT applied.** Jitter spreads a thundering herd of _on-time_
+  fires across a window; a backfilled tick is already late, so delaying it
+  further costs the operator the only thing they wanted.
+- **A backfilled fire logs its SCHEDULED time.** `actual_time` far ahead of
+  `scheduled_time` is the marker that a fire was a catch-up — rewriting
+  `scheduled_time` to the moment it really ran would erase the outage from the
+  history. The created job's `run_after` is its tick, so it is claimable
+  immediately.
+
+DST is handled by the same rule the firing path uses, because it is the same
+code: the window is walked with `pyjobby/cron.py`'s one fire series, so a
+backfill cannot enqueue an instant an on-time fire would have skipped. See
+[Daylight saving time](#daylight-saving-time).
+
+Cost: one croniter step per missed tick, once per recovery. That is the price
+of an exact dropped count, and it is nothing next to the cost the bound
+removes — enqueueing those ticks.
+
+`--backfill-limit` is an `add` option; there is no `schedule update` verb, so
+change it on an existing schedule with
+`AdminAPI.update_schedule(id, backfill_limit=N)` (or the web form, on a new
+schedule). `pj-admin schedule show` reports it.
 
 ## When a schedule cannot be evaluated
 

@@ -82,6 +82,21 @@
                         </div>
                     </div>
 
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Missed-Tick Backfill</label>
+                            {#
+                              The bound IS the opt-in: 0 keeps the platform
+                              default (a scheduler that was down skips the
+                              ticks it missed), and N caps a recovery at the N
+                              most recent -- there is deliberately no way to
+                              ask for "all of them".
+                            #}
+                            <input type="number" name="backfill_limit" value="0" min="0">
+                            <small>0 skips missed ticks. N fires the N most recent after an outage, and records the rest.</small>
+                        </div>
+                    </div>
+
                     <div style="margin-top: 2rem; display: flex; gap: 1rem;">
                         <button type="submit" class="btn btn-success">Create Schedule</button>
                         <button type="button" class="btn" onclick="closeAddScheduleModal()">Cancel</button>

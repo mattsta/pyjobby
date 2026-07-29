@@ -420,9 +420,12 @@ for `ABOVE this worker's priority ceiling` (jobs whose `prio` exceeds
 under](#priority-and-the-ceiling-a-worker-claims-under)); and remember that a
 `capability` no worker advertises is invisible in the same way.
 
-**The scheduler missed fires** (was down at fire time). Missed ticks are
-skipped, not backfilled; `next_run` advances from now. Check
-`pj-admin schedule history NAME`.
+**The scheduler missed fires** (was down at fire time). By default missed
+ticks are skipped, not backfilled, and `next_run` advances from now. A
+schedule created with `pj-admin schedule add ... --backfill-limit N` instead
+catches up on the N most recent missed ticks and records the rest as one
+`backfill_limit` skip — never more than N + 1 fires per recovery, so no outage
+can flood the queue on restart. Check `pj-admin schedule history NAME`.
 
 **Database was down.** Workers/monitor/scheduler reconnect with backoff
 automatically and re-prepare their statements; nothing needs a restart.

@@ -523,8 +523,18 @@ triggered: 5 consecutive failures (threshold: 5)`. Fix the job, then
 3. **Was it skipped rather than failed?** `pj-admin schedule history NAME
 --result skipped` — `max_concurrent` and the backpressure threshold both
    skip a fire deliberately.
-4. **Missed fires are not backfilled.** A scheduler that was down at fire
-   time skips those ticks; `next_run` advances from now.
+4. **Missed fires are not backfilled unless the schedule asked.** A scheduler
+   that was down at fire time skips those ticks and `next_run` advances from
+   now — that is `backfill_limit 0`, the default. A schedule created with
+   `--backfill-limit N` instead fires the **N most recent** missed ticks on
+   recovery (never more, however long the outage) and records the older excess
+   as one `skipped` row with `skip_reason = 'backfill_limit'` naming how many
+   ticks and which window. `pj-admin schedule show NAME` reports the bound;
+   `pj-admin schedule history NAME --result skipped --json` shows what a
+   recovery dropped. Backfilled fires are refused by `max_concurrent` and
+   backpressure exactly like on-time ones, so a bound of N does not guarantee
+   N fires — check the skip reasons. Full rules:
+   [RECURRING_SCHEDULER.md § Missed fires after an outage](RECURRING_SCHEDULER.md#missed-fires-after-an-outage--backfill_limit-default-0).
 
 Everything a schedule means is in
 [RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md).

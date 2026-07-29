@@ -407,6 +407,7 @@ def mock_admin_api():
         "next_run": datetime.now() + timedelta(hours=1),
         "max_concurrent_jobs": 1,
         "jitter_seconds": 0,
+        "backfill_limit": 0,
         "backpressure_threshold": 1000,
         "circuit_breaker_threshold": 5,
         "run_count": 100,
@@ -1050,6 +1051,82 @@ class TestScheduleCommands:
             assert sched["job_class"] in result.output
             assert f"Total Runs:            {sched['run_count']}" in result.output
             assert f"Successes:             {sched['success_count']}" in result.output
+            # The backfill bound is spelled out rather than shown as a bare 0,
+            # which reads as a missing value rather than as a policy.
+            assert (
+                "Missed-Tick Backfill:  0 (missed ticks are skipped)" in result.output
+            )
+
+    def test_schedule_show_reports_a_backfill_bound(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        """`show` is where an operator confirms a schedule opted in.
+
+        There is no `schedule update`, so the value a schedule was CREATED with
+        is the value it has -- and a knob that can only be set at creation has
+        to be readable afterwards or nobody can tell what a running install is
+        configured to do after an outage.
+        """
+        mock_admin_api.get_schedule.return_value |= {"backfill_limit": 3}
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "schedule", "show", "test-schedule"]
+            )
+
+            assert result.exit_code == 0
+            assert (
+                "Missed-Tick Backfill:  3 most recent missed tick(s)" in result.output
+            )
+
+    def test_schedule_add_passes_the_backfill_bound_through(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        """`--backfill-limit` reaches the column, and defaults to 0.
+
+        The flag is the entire opt-in surface for the feature: an option that
+        parsed and was then dropped on the floor would leave every schedule on
+        the default while `show` cheerfully reported the bound.
+        """
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli,
+                [
+                    "--config",
+                    "test.py",
+                    "schedule",
+                    "add",
+                    "test-schedule",
+                    "test.Job",
+                    "0 * * * *",
+                    "--backfill-limit",
+                    "5",
+                ],
+            )
+
+            assert result.exit_code == 0
+            assert (
+                mock_admin_api.create_schedule.call_args.kwargs["backfill_limit"] == 5
+            )
+
+        mock_admin_api.create_schedule.reset_mock()
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli,
+                [
+                    "--config",
+                    "test.py",
+                    "schedule",
+                    "add",
+                    "test-schedule",
+                    "test.Job",
+                    "0 * * * *",
+                ],
+            )
+
+            assert result.exit_code == 0
+            assert (
+                mock_admin_api.create_schedule.call_args.kwargs["backfill_limit"] == 0
+            )
 
     def test_schedule_add(self, cli_runner, mock_admin_api, mock_db_params):
         """Test schedule add command."""

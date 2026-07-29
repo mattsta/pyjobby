@@ -1909,6 +1909,16 @@ def schedule_show(ctx: click.Context, name_or_id: str, output_json: bool) -> Non
                 click.echo(f"Cron Expression:       {sched['cron_expr']}")
                 click.echo(f"Timezone:              {sched['timezone']}")
                 click.echo(f"Next Run:              {sched.get('next_run')}")
+                # Spelled out rather than printed as a bare integer: 0 is the
+                # default and reads as "off", and the number alone does not say
+                # whether it counts ticks that WILL be fired or dropped.
+                backfill = sched["backfill_limit"]
+                backfill_text = (
+                    "0 (missed ticks are skipped)"
+                    if backfill <= 0
+                    else f"{backfill} most recent missed tick(s)"
+                )
+                click.echo(f"Missed-Tick Backfill:  {backfill_text}")
                 click.echo(f"\n{Colors.BOLD}Job Configuration:{Colors.ENDC}")
                 click.echo(f"Job Class:             {sched['job_class']}")
                 click.echo(f"Queue:                 {sched['queue']}")
@@ -1970,6 +1980,18 @@ def schedule_show(ctx: click.Context, name_or_id: str, output_json: bool) -> Non
     "--jitter", type=int, default=0, help="Random jitter in seconds (default: 0)"
 )
 @click.option(
+    "--backfill-limit",
+    type=int,
+    default=0,
+    help=(
+        "How many MISSED ticks a recovering scheduler may catch up on "
+        "(default: 0 -- never backfill, which is what a scheduler that was "
+        "down has always done). N fires the N most RECENT missed ticks and "
+        "records the older ones as one summary skip; the bound is hard, so "
+        "no outage can flood the queue"
+    ),
+)
+@click.option(
     "--backpressure",
     type=int,
     default=1000,
@@ -1997,6 +2019,7 @@ def schedule_add(
     timezone: str,
     max_concurrent: int,
     jitter: int,
+    backfill_limit: int,
     backpressure: int,
     circuit_breaker: int,
     description: str | None,
@@ -2008,6 +2031,7 @@ def schedule_add(
         pj-admin schedule add daily-cleanup CleanupJob "0 2 * * *"
         pj-admin schedule add hourly-report ReportJob "0 * * * *" --queue reports
         pj-admin schedule add sync SyncJob "*/5 * * * *" --jitter 60 --max-concurrent 3
+        pj-admin schedule add roll RollupJob "0 * * * *" --backfill-limit 3
     """
     ceiling = max_prio if max_prio is not None else load_prio_ceiling(ctx.obj["config"])
 
@@ -2052,6 +2076,7 @@ def schedule_add(
                 enabled=not disabled,
                 max_concurrent_jobs=max_concurrent,
                 jitter_seconds=jitter,
+                backfill_limit=backfill_limit,
                 backpressure_threshold=backpressure,
                 circuit_breaker_threshold=circuit_breaker,
                 description=description,

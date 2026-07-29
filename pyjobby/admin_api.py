@@ -2754,6 +2754,7 @@ class AdminAPI:
         enabled: bool = True,
         max_concurrent_jobs: int = 1,
         jitter_seconds: int = 0,
+        backfill_limit: int = 0,
         backpressure_threshold: int | None = 1000,
         circuit_breaker_threshold: int = 5,
         description: str | None = None,
@@ -2774,6 +2775,10 @@ class AdminAPI:
             enabled: Is schedule active? (default: True)
             max_concurrent_jobs: Max jobs running at once (default: 1)
             jitter_seconds: Random delay 0-N seconds (default: 0)
+            backfill_limit: How many MISSED ticks a recovering scheduler may
+                catch up on (default: 0 -- never backfill, missed ticks are
+                skipped). N > 0 fires the N most recent missed ticks and
+                records the older excess as one summary skip.
             backpressure_threshold: Skip if queue depth > N (default: 1000)
             circuit_breaker_threshold: Consecutive failures to disable (default: 5)
             description: Human-readable description (optional)
@@ -2804,14 +2809,14 @@ class AdminAPI:
             INSERT INTO jorb_schedule (
                 name, description, job_class, kwargs, queue, prio, capability,
                 cron_expr, timezone, enabled,
-                max_concurrent_jobs, jitter_seconds,
+                max_concurrent_jobs, jitter_seconds, backfill_limit,
                 backpressure_threshold, circuit_breaker_threshold,
                 next_run, created_by
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7,
                 $8, $9, $10,
-                $11, $12, $13, $14,
-                $15, $16
+                $11, $12, $13, $14, $15,
+                $16, $17
             )
             RETURNING *
         """,
@@ -2827,6 +2832,7 @@ class AdminAPI:
             enabled,
             max_concurrent_jobs,
             jitter_seconds,
+            backfill_limit,
             backpressure_threshold,
             circuit_breaker_threshold,
             next_run,
@@ -2867,6 +2873,7 @@ class AdminAPI:
             "enabled",
             "max_concurrent_jobs",
             "jitter_seconds",
+            "backfill_limit",
             "backpressure_threshold",
             "circuit_breaker_threshold",
             "consecutive_failures",  # Allow resetting failure counter

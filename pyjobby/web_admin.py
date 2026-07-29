@@ -1273,6 +1273,7 @@ class WebAdminServer:
                         cast(str | int, data.get("max_concurrent_jobs", 1))
                     ),
                     jitter_seconds=int(cast(str | int, data.get("jitter_seconds", 0))),
+                    backfill_limit=int(cast(str | int, data.get("backfill_limit", 0))),
                     backpressure_threshold=int(
                         cast(str | int, data.get("backpressure_threshold", 1000))
                     ),

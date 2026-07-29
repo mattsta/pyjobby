@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from croniter import croniter
 
-from pyjobby.cron import is_wall_clock_anchored, next_cron_run
+from pyjobby.cron import is_wall_clock_anchored, missed_cron_runs, next_cron_run
 
 NY = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
@@ -256,6 +256,180 @@ class TestDaylightSavingTransitions:
 
         assert result[0] == datetime(2027, 11, 7, 5, 0, tzinfo=NY)
         assert result[1] == datetime(2027, 11, 8, 5, 0, tzinfo=NY)
+
+
+class TestMissedRuns:
+    """The window a recovering scheduler backfills from, and its bound.
+
+    `missed_cron_runs` answers "what did this schedule miss while nothing was
+    firing it", which is arithmetic over the same series `next_cron_run` walks.
+    Every instant it returns becomes a JOB, so the count is not cosmetic: this
+    is the function that decides whether a recovered scheduler enqueues three
+    jobs or an outage's worth.
+    """
+
+    def test_ten_missed_ticks_keeping_three_drops_the_seven_oldest(self):
+        """The shape of a bounded recovery: newest kept, oldest recorded.
+
+        The freshest fires are the valuable ones -- last hour's rollup is
+        worth running, nine hours ago's is not -- so the bound keeps the TAIL
+        of the window and reports the head as dropped.
+        """
+        due = datetime(2026, 6, 1, 0, 0, tzinfo=UTC)
+
+        missed = missed_cron_runs(
+            "0 * * * *",
+            "UTC",
+            after=due,
+            until=datetime(2026, 6, 1, 10, 0, tzinfo=UTC),
+            keep=3,
+        )
+
+        assert missed.kept == (
+            datetime(2026, 6, 1, 8, 0, tzinfo=UTC),
+            datetime(2026, 6, 1, 9, 0, tzinfo=UTC),
+            datetime(2026, 6, 1, 10, 0, tzinfo=UTC),
+        )
+        assert missed.dropped == 7
+        assert missed.dropped_window == (
+            datetime(2026, 6, 1, 1, 0, tzinfo=UTC),  # the oldest missed tick
+            datetime(2026, 6, 1, 7, 0, tzinfo=UTC),  # the newest one dropped
+        )
+
+    def test_the_due_tick_itself_is_never_a_missed_tick(self):
+        """`after` is exclusive.
+
+        A schedule's next_run is the tick it is DUE for, which the scheduler
+        fires on its own. Counting it here too would fire it twice -- or, once
+        the deadline key refused the second copy, record a phantom duplicate
+        skip on every single recovery.
+        """
+        due = datetime(2026, 6, 1, 0, 0, tzinfo=UTC)
+
+        missed = missed_cron_runs(
+            "0 * * * *", "UTC", after=due, until=due + timedelta(hours=2), keep=5
+        )
+
+        assert due not in missed.kept
+        assert missed.kept == (
+            datetime(2026, 6, 1, 1, 0, tzinfo=UTC),
+            datetime(2026, 6, 1, 2, 0, tzinfo=UTC),
+        )
+
+    def test_fewer_missed_than_the_bound_keeps_all_of_them(self):
+        missed = missed_cron_runs(
+            "0 * * * *",
+            "UTC",
+            after=datetime(2026, 6, 1, 0, 0, tzinfo=UTC),
+            until=datetime(2026, 6, 1, 2, 0, tzinfo=UTC),
+            keep=10,
+        )
+
+        assert len(missed.kept) == 2
+        assert missed.dropped == 0
+        assert missed.dropped_window is None
+
+    def test_a_bound_of_zero_keeps_nothing_and_still_counts_everything(self):
+        """The default's arithmetic. Nothing is backfilled, and the size of
+        what was skipped is still known -- the scheduler does not call this at
+        0, but a bound that silently stopped counting would be the exact
+        failure the summary row exists to prevent."""
+        missed = missed_cron_runs(
+            "0 * * * *",
+            "UTC",
+            after=datetime(2026, 6, 1, 0, 0, tzinfo=UTC),
+            until=datetime(2026, 6, 1, 5, 0, tzinfo=UTC),
+            keep=0,
+        )
+
+        assert missed.kept == ()
+        assert missed.dropped == 5
+
+    def test_an_outage_shorter_than_one_tick_missed_nothing(self):
+        """The overwhelmingly common case: a schedule a few seconds overdue
+        because the poll interval is 60s. There is nothing to catch up on, and
+        a backfill must not invent a tick."""
+        due = datetime(2026, 6, 1, 0, 0, tzinfo=UTC)
+
+        missed = missed_cron_runs(
+            "0 * * * *", "UTC", after=due, until=due + timedelta(seconds=30), keep=5
+        )
+
+        assert missed == ((), 0, None)
+
+    def test_kept_instants_carry_the_schedules_own_timezone(self):
+        """They are stored in timestamptz columns and used as a job's
+        run_after, exactly like next_run -- a naive or UTC-coerced result
+        would be a different instant."""
+        missed = missed_cron_runs(
+            "0 * * * *",
+            "America/New_York",
+            after=datetime(2026, 6, 1, 0, 0, tzinfo=NY),
+            until=datetime(2026, 6, 1, 3, 0, tzinfo=NY),
+            keep=5,
+        )
+
+        assert [f.tzinfo for f in missed.kept] == [NY, NY, NY]
+        assert missed.kept[0] == datetime(2026, 6, 1, 1, 0, tzinfo=NY)
+
+    def test_the_bounds_may_be_given_in_a_different_zone(self):
+        """The scheduler hands this UTC datetimes off a timestamptz column
+        while the schedule's own zone is something else."""
+        missed = missed_cron_runs(
+            "0 * * * *",
+            "America/New_York",
+            after=datetime(2026, 6, 1, 4, 0, tzinfo=UTC),  # 00:00 EDT
+            until=datetime(2026, 6, 1, 6, 0, tzinfo=UTC),  # 02:00 EDT
+            keep=5,
+        )
+
+        assert missed.kept == (
+            datetime(2026, 6, 1, 1, 0, tzinfo=NY),
+            datetime(2026, 6, 1, 2, 0, tzinfo=NY),
+        )
+
+    def test_a_daily_schedule_misses_one_tick_per_day_across_fall_back(self):
+        """The DST rule is the SAME rule the firing path uses.
+
+        A backfill that enumerated ticks by any other route would eventually
+        enqueue the repeated 01:30 that `next_cron_run` refuses to fire at --
+        one extra invoice, once a year, from a code path that only runs after
+        an outage.
+        """
+        missed = missed_cron_runs(
+            "30 1 * * *",
+            "America/New_York",
+            after=datetime(2027, 11, 5, 1, 30, tzinfo=NY),
+            until=datetime(2027, 11, 9, 12, 0, tzinfo=NY),
+            keep=10,
+        )
+
+        assert [f.replace(tzinfo=None, fold=0) for f in missed.kept] == [
+            datetime(2027, 11, 6, 1, 30),
+            datetime(2027, 11, 7, 1, 30),  # ONCE on the transition day
+            datetime(2027, 11, 8, 1, 30),
+            datetime(2027, 11, 9, 1, 30),
+        ]
+        assert [f.fold for f in missed.kept] == [0, 0, 0, 0]
+
+    def test_an_interval_schedule_backfills_both_passes_of_the_repeated_hour(self):
+        """The other side of the same rule: an hourly schedule means real
+        elapsed time, so both passes are genuine missed work."""
+        missed = missed_cron_runs(
+            "0 * * * *",
+            "America/New_York",
+            after=datetime(2027, 11, 7, 0, 30, tzinfo=NY),
+            until=datetime(2027, 11, 7, 2, 30, tzinfo=NY),
+            keep=10,
+        )
+
+        utc = [f.astimezone(UTC) for f in missed.kept]
+        gaps = [(b - a).total_seconds() for a, b in zip(utc, utc[1:], strict=False)]
+        assert gaps == [3600.0, 3600.0]
+        assert [f.utcoffset().total_seconds() / 3600 for f in missed.kept[:2]] == [
+            -4,
+            -5,
+        ]
 
 
 class TestZoneInfoIsSufficient:

@@ -15,6 +15,14 @@ CREATE TABLE jorb_schedule (
     enabled                   BOOLEAN NOT NULL DEFAULT TRUE,
     max_concurrent_jobs       INTEGER NOT NULL DEFAULT 1,
     jitter_seconds            INTEGER NOT NULL DEFAULT 0,
+    -- How many MISSED ticks a recovering scheduler may catch up on. The
+    -- single integer is both the opt-in and the bound, deliberately: 0 (the
+    -- default) never backfills -- a scheduler that was down skips the ticks
+    -- it missed and next_run advances from now -- and N > 0 enqueues at most
+    -- the N most recent missed ticks, never the older ones. Unbounded
+    -- backfill is how a recovered scheduler floods an already-behind queue
+    -- with an outage's worth of work, so there is no way to ask for it.
+    backfill_limit            INTEGER NOT NULL DEFAULT 0,
     backpressure_threshold    INTEGER          DEFAULT 1000,
     circuit_breaker_threshold INTEGER NOT NULL DEFAULT 5,
     consecutive_failures      INTEGER NOT NULL DEFAULT 0,

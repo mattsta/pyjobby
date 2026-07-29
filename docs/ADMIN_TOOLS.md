@@ -872,7 +872,11 @@ $ pj-admin schedule add nightly-cleanup examples.jobs.example_jobs.BasicJob "0 2
 
 `add` also takes `-p/--priority`, `--max-prio`, `--capability`,
 `--timezone`, `--jitter`, `--max-concurrent`, `--backpressure`,
-`--circuit-breaker`, `--description` and `--disabled`. `--max-prio N`
+`--circuit-breaker`, `--backfill-limit`, `--description` and `--disabled`.
+`--backfill-limit N` is the opt-in for catching up on ticks missed while the
+scheduler was down, and the bound on it —
+[RECURRING_SCHEDULER.md § Missed fires after an outage](RECURRING_SCHEDULER.md#missed-fires-after-an-outage--backfill_limit-default-0).
+`--max-prio N`
 overrides the deployment's worker priority ceiling for this one command,
 exactly as it does for `jobs set-priority`: a schedule's priority is checked
 against the ceiling when the schedule is created, because a schedule that
@@ -893,6 +897,7 @@ Schedule:
 Cron Expression:       0 2 * * *
 Timezone:              UTC
 Next Run:              2026-07-27 02:00:00+00:00
+Missed-Tick Backfill:  0 (missed ticks are skipped)
 
 Job Configuration:
 Job Class:             examples.jobs.example_jobs.BasicJob

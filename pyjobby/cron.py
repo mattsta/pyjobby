@@ -22,7 +22,9 @@ different times under the two conventions.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import datetime
+from typing import NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter  # type: ignore[import-untyped]
@@ -90,9 +92,97 @@ def next_cron_run(expr: str, timezone: str, after: datetime | None = None) -> da
     """
     tz = resolve_timezone(timezone)
     validate_cron(expr)
-    moment = after.astimezone(tz) if after is not None else datetime.now(tz)
-    it = croniter(expr, moment)
-    fire: datetime = it.get_next(datetime)
-    if fire.fold == 1 and is_wall_clock_anchored(expr):
-        fire = it.get_next(datetime)
-    return fire
+    moment = after if after is not None else datetime.now(tz)
+    return next(_fire_series(expr, tz, moment))
+
+
+def _fire_series(expr: str, tz: ZoneInfo, after: datetime) -> Iterator[datetime]:
+    """Every instant ``expr`` fires at in ``tz``, ascending, strictly after
+    ``after``. Infinite: cron expressions do not end.
+
+    THE one walk of a cron expression in the platform. Both questions asked of
+    one -- "when does this fire next" and "what did it miss while nothing was
+    running" -- read this series, so the fall-back rule below cannot apply to
+    one and not the other. A backfill that enumerated ticks by a second route
+    would eventually enqueue an instant the firing path never fires at, or drop
+    one it does, and neither disagreement announces itself.
+    """
+    anchored = is_wall_clock_anchored(expr)
+    it = croniter(expr, after.astimezone(tz))
+    while True:
+        fire: datetime = it.get_next(datetime)
+        # `fold=1` marks a REPLAY of a wall-clock time an anchored schedule has
+        # already fired at -- see this module's docstring and next_cron_run.
+        if fire.fold == 1 and anchored:
+            continue
+        yield fire
+
+
+class MissedRuns(NamedTuple):
+    """What a schedule would have fired at while nothing was firing it.
+
+    ``kept`` is what a bounded backfill enqueues; ``dropped`` counts the older
+    instants it deliberately will not, and ``dropped_window`` bounds them --
+    ``None`` exactly when ``dropped`` is 0 -- so the one summary row recording
+    them can say which ticks they were.
+    """
+
+    kept: tuple[datetime, ...]
+    dropped: int
+    dropped_window: tuple[datetime, datetime] | None
+
+
+def missed_cron_runs(
+    expr: str, timezone: str, *, after: datetime, until: datetime, keep: int
+) -> MissedRuns:
+    """The instants ``expr`` fires at in ``(after, until]``, newest ``keep``.
+
+    Both bounds are aware datetimes; the results carry ``timezone``, like
+    :func:`next_cron_run`'s, so they can be stored in a timestamptz column or
+    used as a job's ``run_after`` without conversion. ``after`` is EXCLUSIVE:
+    a schedule's own ``next_run`` is the tick it is currently due for, not a
+    tick it missed.
+
+    Only the newest ``keep`` are returned because the value of a late fire
+    decays -- yesterday's report is worth running, last Tuesday's is not --
+    and because returning all of them is how a recovered scheduler floods a
+    queue that is still behind.
+
+    One croniter step per instant in the window, so this costs the length of
+    the outage rather than ``keep``. That is the price of an EXACT dropped
+    count, and the count is the point: an outage whose size is recorded
+    nowhere is an outage nobody notices.
+    """
+    tz = resolve_timezone(timezone)
+    validate_cron(expr)
+
+    kept: list[datetime] = []
+    dropped = 0
+    first_dropped: datetime | None = None
+    last_dropped: datetime | None = None
+
+    def drop(fire: datetime) -> None:
+        nonlocal dropped, first_dropped, last_dropped
+        dropped += 1
+        if first_dropped is None:
+            first_dropped = fire
+        last_dropped = fire
+
+    for fire in _fire_series(expr, tz, after):
+        if fire > until:
+            break
+        if keep <= 0:
+            drop(fire)
+        else:
+            # The window is walked forward, so "the newest keep" is whatever
+            # survives eviction -- and an evicted instant is a dropped one.
+            if len(kept) == keep:
+                drop(kept.pop(0))
+            kept.append(fire)
+
+    window = (
+        None
+        if first_dropped is None or last_dropped is None
+        else (first_dropped, last_dropped)
+    )
+    return MissedRuns(kept=tuple(kept), dropped=dropped, dropped_window=window)

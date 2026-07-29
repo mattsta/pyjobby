@@ -144,7 +144,7 @@ REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
     "jorb_history": _names("id job_id at event detail"),
     "jorb_schedule": _names("""
         id name description job_class kwargs queue prio capability cron_expr
-        timezone enabled max_concurrent_jobs jitter_seconds
+        timezone enabled max_concurrent_jobs jitter_seconds backfill_limit
         backpressure_threshold circuit_breaker_threshold consecutive_failures
         next_run last_run last_success last_failure run_count success_count
         failure_count skip_count created updated created_by

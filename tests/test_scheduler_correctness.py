@@ -4,6 +4,11 @@ Each test here pins a property the scheduler got wrong: an execution-log
 timestamp that was off by the database server's UTC offset, a schedule whose
 cron expression cannot be evaluated wedging the poll loop forever, and a
 stop() that only took effect a whole poll interval later.
+
+`TestBoundedBackfill` is the one section that is not about a past defect: it
+pins the bound on `backfill_limit`, which exists so that catching up after an
+outage can never become the defect -- an unbounded backfill floods a recovering
+queue and records nothing about it.
 """
 
 from __future__ import annotations
@@ -27,23 +32,41 @@ from pyjobby.scheduler import (
 pytestmark = pytest.mark.asyncio
 
 
-async def _insert_schedule(conn, *, cron_expr: str, timezone: str = "UTC") -> int:
+async def _insert_schedule(
+    conn,
+    *,
+    cron_expr: str,
+    timezone: str = "UTC",
+    next_run: datetime | None = None,
+    backfill_limit: int = 0,
+    max_concurrent_jobs: int = 1,
+    jitter_seconds: int = 0,
+) -> int:
     """Insert a schedule row directly, bypassing validation.
 
     Schedules can reach this state through a hand-edited row or a cron
     expression that a newer croniter no longer accepts.
+
+    `next_run` defaults to five minutes ago, which is all "it is due" takes.
+    The backfill tests set it themselves, because how far in the past it sits
+    is exactly what they are about.
     """
     schedule_id: int = await conn.fetchval(
         """
-        INSERT INTO jorb_schedule (name, job_class, cron_expr, timezone, next_run)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO jorb_schedule (name, job_class, cron_expr, timezone, next_run,
+                                   backfill_limit, max_concurrent_jobs,
+                                   jitter_seconds)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         RETURNING id
         """,
         f"correctness-{uuid.uuid4().hex[:8]}",
         f"test.Job_{uuid.uuid4().hex[:8]}",
         cron_expr,
         timezone,
-        datetime.now(UTC) - timedelta(minutes=5),
+        next_run if next_run is not None else datetime.now(UTC) - timedelta(minutes=5),
+        backfill_limit,
+        max_concurrent_jobs,
+        jitter_seconds,
     )
     return schedule_id
 
@@ -469,3 +492,297 @@ class TestScheduleProvenanceHasOneSource:
                 schedule, datetime.now(UTC) + timedelta(minutes=2), jitter_seconds=0
             )
             assert await safety.check_concurrency(schedule_id, 3) == (False, 3)
+
+
+class TestBoundedBackfill:
+    """`backfill_limit`: what a scheduler does about the ticks it missed.
+
+    The default is 0 and the default is to miss them -- these tests pin that
+    first, because the feature is opt-in and a schedule that never asked for
+    catch-up must behave exactly as it did before the column existed.
+
+    Above 0, the number is the BOUND as well as the opt-in. There is no way to
+    ask for "all of them", and that is the design: the reference
+    implementations this parallels flood a recovering queue with an outage's
+    worth of jobs, and the outage is when the queue can least afford it. Both
+    halves are tested, because neither implies the other -- a backfill that
+    fired nothing would pass "it never floods", and one that recorded nothing
+    would pass "it fires the recent ones" while hiding what it dropped.
+    """
+
+    async def _overdue(
+        self, conn, monkeypatch, *, hours: int = 10, **columns
+    ) -> tuple[int, datetime]:
+        """An HOURLY schedule due `hours` whole hours ago, with the
+        scheduler's clock pinned to the top of the current hour.
+
+        Both halves are what make the counts below FACTS rather than a
+        function of when the suite ran. Hour-aligned and hourly, so the window
+        (next_run, now] holds exactly `hours` ticks; and pinned, because
+        otherwise a pass that crosses an hour boundary mid-test measures one
+        more missed tick than the test was written for -- a rare failure with
+        nothing wrong behind it, which is worse than no test.
+        """
+        top_of_hour = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+        monkeypatch.setattr("pyjobby.scheduler.utcnow", lambda: top_of_hour)
+        due = top_of_hour - timedelta(hours=hours)
+        schedule_id = await _insert_schedule(
+            conn, cron_expr="0 * * * *", next_run=due, **columns
+        )
+        return schedule_id, due
+
+    async def test_the_default_of_zero_fires_once_and_catches_up_on_nothing(
+        self, db_pool, monkeypatch
+    ):
+        """Today's behavior, pinned. Ten missed ticks, one job."""
+        async with db_pool.acquire() as conn:
+            schedule_id, due = await self._overdue(conn, monkeypatch)
+
+            await _run_one_pass(SchedulerWorker(conn, poll_interval=0.05))
+
+            jobs = await conn.fetch(
+                "SELECT * FROM jorb WHERE schedule_id = $1", schedule_id
+            )
+            assert len(jobs) == 1, "backfill_limit 0 must not catch up"
+            assert jobs[0]["run_after"] == due, "the tick it was due for, not now"
+            log = await conn.fetch(
+                "SELECT * FROM jorb_schedule_log WHERE schedule_id = $1 ORDER BY id",
+                schedule_id,
+            )
+            assert [(r["result"], r["scheduled_time"]) for r in log] == [
+                ("success", due)
+            ]
+            after = await conn.fetchrow(
+                "SELECT * FROM jorb_schedule WHERE id = $1", schedule_id
+            )
+            assert after["next_run"] > datetime.now(UTC), "next_run advances from now"
+            assert (after["success_count"], after["skip_count"]) == (1, 0)
+
+    async def test_a_limit_of_three_fires_the_three_freshest_and_records_the_seven(
+        self, db_pool, monkeypatch
+    ):
+        """The whole feature in one pass: 10 missed, 3 backfilled, 7 recorded.
+
+        Note WHICH three. The freshest, because the value of a late fire
+        decays: an hourly rollup wants the last three hours, not the three
+        hours nine hours ago. And note the fourth job -- the tick the schedule
+        was actually due for still fires, so raising backfill_limit only ever
+        ADDS fires and never moves the one that was already guaranteed.
+        """
+        async with db_pool.acquire() as conn:
+            schedule_id, due = await self._overdue(
+                conn, monkeypatch, backfill_limit=3, max_concurrent_jobs=10
+            )
+            top_of_hour = due + timedelta(hours=10)
+
+            await _run_one_pass(SchedulerWorker(conn, poll_interval=0.05))
+
+            fired = [
+                r["run_after"]
+                for r in await conn.fetch(
+                    "SELECT run_after FROM jorb WHERE schedule_id = $1 "
+                    "ORDER BY run_after",
+                    schedule_id,
+                )
+            ]
+            assert fired == [
+                due,
+                top_of_hour - timedelta(hours=2),
+                top_of_hour - timedelta(hours=1),
+                top_of_hour,
+            ], "the due tick plus the three most recent missed ones, and nothing else"
+
+            log = await conn.fetch(
+                "SELECT * FROM jorb_schedule_log WHERE schedule_id = $1 ORDER BY id",
+                schedule_id,
+            )
+            successes = [r for r in log if r["result"] == "success"]
+            skips = [r for r in log if r["result"] == "skipped"]
+            assert len(successes) == 4
+            # ONE row for the seven dropped ticks, not seven rows: a per-second
+            # schedule down for a day misses 86,400, and describing an outage
+            # must not be its own denial of service.
+            assert len(skips) == 1
+            assert skips[0]["skip_reason"] == "backfill_limit"
+            detail = skips[0]["error_message"]
+            assert "7 older missed tick(s) not backfilled" in detail
+            assert "backfill_limit=3" in detail
+            # the window it stands for, named at both ends
+            assert (due + timedelta(hours=1)).isoformat() in detail
+            assert (due + timedelta(hours=7)).isoformat() in detail
+            assert skips[0]["scheduled_time"] == due + timedelta(hours=1)
+
+            # actual_time far ahead of scheduled_time is the ONLY marker that a
+            # fire was a backfill, and the honest one -- rewriting
+            # scheduled_time to the moment it really ran would erase the outage
+            oldest_backfill = next(
+                r
+                for r in successes
+                if r["scheduled_time"] == top_of_hour - timedelta(hours=2)
+            )
+            gap = oldest_backfill["actual_time"] - oldest_backfill["scheduled_time"]
+            assert gap == timedelta(hours=2)
+
+            after = await conn.fetchrow(
+                "SELECT * FROM jorb_schedule WHERE id = $1", schedule_id
+            )
+            assert (after["success_count"], after["skip_count"]) == (4, 1)
+            assert after["next_run"] > datetime.now(UTC)
+
+    async def test_fewer_missed_ticks_than_the_bound_fires_all_of_them(
+        self, db_pool, monkeypatch
+    ):
+        """Under the bound there is nothing to drop, and therefore no summary
+        row -- an empty summary on every ordinary recovery would train the
+        operator to ignore the one that matters."""
+        async with db_pool.acquire() as conn:
+            schedule_id, due = await self._overdue(
+                conn, monkeypatch, hours=2, backfill_limit=10, max_concurrent_jobs=10
+            )
+
+            await _run_one_pass(SchedulerWorker(conn, poll_interval=0.05))
+
+            fired = [
+                r["run_after"]
+                for r in await conn.fetch(
+                    "SELECT run_after FROM jorb WHERE schedule_id = $1 "
+                    "ORDER BY run_after",
+                    schedule_id,
+                )
+            ]
+            assert fired == [due, due + timedelta(hours=1), due + timedelta(hours=2)]
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM jorb_schedule_log "
+                    "WHERE schedule_id = $1 AND result = 'skipped'",
+                    schedule_id,
+                )
+                == 0
+            )
+
+    async def test_jitter_is_not_applied_to_a_backfilled_tick(
+        self, db_pool, monkeypatch
+    ):
+        """Jitter spreads a thundering herd of ON-TIME fires. A backfilled tick
+        is already late, so delaying it further buys nothing and costs the
+        operator the one thing they wanted: the work, now.
+
+        Jitter is forced to its maximum here rather than sampled, so the
+        assertion is a fact about the code path and not about a random draw
+        that may have come up 0.
+        """
+        monkeypatch.setattr("pyjobby.scheduler.random.randint", lambda _low, high: high)
+        async with db_pool.acquire() as conn:
+            schedule_id, due = await self._overdue(
+                conn,
+                monkeypatch,
+                backfill_limit=2,
+                max_concurrent_jobs=10,
+                jitter_seconds=300,
+            )
+            top_of_hour = due + timedelta(hours=10)
+
+            await _run_one_pass(SchedulerWorker(conn, poll_interval=0.05))
+
+            log = {
+                r["scheduled_time"]: r
+                for r in await conn.fetch(
+                    "SELECT * FROM jorb_schedule_log WHERE schedule_id = $1 "
+                    "AND result = 'success'",
+                    schedule_id,
+                )
+            }
+            # the due tick got the whole 300s, so the column is live...
+            assert log[due]["jitter_applied_seconds"] == 300
+            # ...and the backfilled ones got none of it
+            for tick in (top_of_hour - timedelta(hours=1), top_of_hour):
+                assert log[tick]["jitter_applied_seconds"] == 0
+            backfilled = await conn.fetch(
+                "SELECT run_after FROM jorb WHERE schedule_id = $1 "
+                "AND run_after >= $2 ORDER BY run_after",
+                schedule_id,
+                top_of_hour - timedelta(hours=1),
+            )
+            assert [r["run_after"] for r in backfilled] == [
+                top_of_hour - timedelta(hours=1),
+                top_of_hour,
+            ], "a backfilled job runs at its tick, not 0-300s after it"
+
+    async def test_max_concurrent_refuses_backfilled_fires_and_records_the_skips(
+        self, db_pool, monkeypatch
+    ):
+        """A recovery burst must not be a way around the safety limits.
+
+        Otherwise `max_concurrent_jobs 1` -- the guard against a schedule
+        outrunning its own job -- would be defeated by taking the scheduler
+        down and bringing it back, which is not a threat model so much as a
+        Tuesday.
+        """
+        async with db_pool.acquire() as conn:
+            schedule_id, _due = await self._overdue(
+                conn, monkeypatch, backfill_limit=3, max_concurrent_jobs=2
+            )
+
+            await _run_one_pass(SchedulerWorker(conn, poll_interval=0.05))
+
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM jorb WHERE schedule_id = $1", schedule_id
+                )
+                == 2
+            ), "the limit is 2, and a backfill does not get its own allowance"
+            reasons = await conn.fetch(
+                "SELECT skip_reason, count(*) AS n FROM jorb_schedule_log "
+                "WHERE schedule_id = $1 AND result = 'skipped' "
+                "GROUP BY skip_reason ORDER BY skip_reason",
+                schedule_id,
+            )
+            assert [(r["skip_reason"], r["n"]) for r in reasons] == [
+                ("backfill_limit", 1),  # the seven ticks dropped by the bound
+                ("max_concurrent", 2),  # the two the limit refused, each recorded
+            ]
+
+    async def test_a_second_recovery_over_the_same_window_mints_nothing(
+        self, db_pool, monkeypatch
+    ):
+        """Racing schedulers converge, through the machinery that already
+        exists.
+
+        In a fleet the loser of `FOR UPDATE SKIP LOCKED` never reaches the
+        backfill at all; this is the backstop for the case where it does, and
+        it is not a second mechanism -- a backfilled tick carries the same
+        per-tick deadline key an on-time fire carries, so the burst is
+        idempotent for free. The duplicates are recorded rather than swallowed.
+        """
+        async with db_pool.acquire() as conn:
+            schedule_id, _due = await self._overdue(
+                conn, monkeypatch, backfill_limit=3, max_concurrent_jobs=10
+            )
+            schedule = dict(
+                await conn.fetchrow(
+                    "SELECT * FROM jorb_schedule WHERE id = $1", schedule_id
+                )
+            )
+            worker = SchedulerWorker(conn)
+
+            await worker.backfill_missed_ticks(schedule)
+            first_pass = await conn.fetchval(
+                "SELECT count(*) FROM jorb WHERE schedule_id = $1", schedule_id
+            )
+            await worker.backfill_missed_ticks(schedule)
+
+            assert first_pass == 3
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM jorb WHERE schedule_id = $1", schedule_id
+                )
+                == 3
+            ), "the second recovery wrote a second copy of every backfilled tick"
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM jorb_schedule_log "
+                    "WHERE schedule_id = $1 AND skip_reason = 'duplicate'",
+                    schedule_id,
+                )
+                == 3
+            )
