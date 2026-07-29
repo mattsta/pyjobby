@@ -722,6 +722,7 @@ Queue 'maintenance'
 Paused:              yes
 Max concurrency:     8 (claimed+running cap; '-' = unlimited)
 Rate limit:          100 start(s) per 60s ('-' = unlimited)
+Partition limits:    no (limits count queue-wide; partition_key is inert labelling)
 
 Depths:
   queued       0
@@ -738,8 +739,28 @@ $ pj-admin queues resume maintenance
 Queue 'maintenance' resumed
 ```
 
-`queues limits NAME --max-concurrency none` clears a limit. `queues list`
-and `queues stats` are the fleet-wide views:
+`queues limits NAME --max-concurrency none` clears a limit.
+
+`--partition-limits` re-scopes the two limits above to each distinct job
+`partition_key`, so one tenant cannot take the whole cap:
+
+```console
+$ pj-admin queues limits ingest --max-concurrency 4 --partition-limits
+Queue 'ingest' limits updated
+Paused:              no
+Max concurrency:     4 PER partition_key (claimed+running cap; '-' = unlimited)
+Rate limit:          - start(s) per 60s PER partition_key ('-' = unlimited)
+Partition limits:    yes (each partition_key gets the limits above; jobs with no key form one lane of their own)
+```
+
+It **re-scopes limits and adds none**: on a queue with neither limit set it
+changes nothing, and the command says so rather than leaving you to notice.
+`--no-partition-limits` puts the queue back to counting queue-wide. Jobs with
+no `partition_key` form one lane of their own and are never hidden by it —
+see
+[Queue controls](OPERATIONS.md#partition_limits-the-same-limits-per-tenant).
+
+`queues list` and `queues stats` are the fleet-wide views:
 
 ```console
 $ pj-admin queues stats

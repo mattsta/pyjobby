@@ -157,6 +157,30 @@ PLAN_STREAM_ROWS_PER_JOB = 3
 #: this is also the bound on what that sweep may read and discard.
 PLAN_SCHEDULES = 50
 
+#: Distinct fair-share lanes (``jorb.partition_key``) the plan seed spreads
+#: its jobs over, one of them left NULL. A gate measured against a single
+#: lane -- or against none -- would certify the partitioned claim on a queue
+#: that is not partitioned in any interesting way, which is the seeding
+#: mistake every budget in this file is written to avoid. The NULL lane is
+#: seeded because it is a lane like the others and the claim's per-row test
+#: spells it out separately; if that branch stopped working, only a seed that
+#: contains unlabelled rows would notice.
+PLAN_PARTITION_LANES = 8
+
+#: Queued rows the plan seed parks in ONE saturated lane, at a priority that
+#: sorts them ahead of every other row in the seed, with a single row of a
+#: free lane immediately behind them.
+#:
+#: This is the partitioned claim's WORST CASE built on purpose: a tenant at
+#: its cap whose whole backlog sorts in front of everybody else's work, so the
+#: claim has to walk past all of it to reach the row it may take. The budget
+#: on the `partitioned_claim_blocked` case is exactly this number, and that is
+#: the honest statement of the cost -- it is the held-back TENANT's queued
+#: depth, not the table's, and it is what turns "does this scan the table?"
+#: into a question with a checkable answer. The caught-up case beside it
+#: (nothing saturated) stops on the first index entry and is budgeted at zero.
+PLAN_PARTITION_BLOCKED = 500
+
 #: Worker registry rows the plan seed leaves RETIRED, for the sweep that
 #: reaps them. A fleet accumulates these per deploy, so unlike in-flight work
 #: the count genuinely does grow — seeding it at the table scale is what
@@ -1920,6 +1944,47 @@ CAP_COUNT_SQL = """
      WHERE queue = $1 AND state IN ('claimed', 'running')
 """
 
+#: The partitioned form of the count above, copied from sql/schema/30_claim.sql
+#: -- what a queue with ``partition_limits`` runs inside the advisory lock
+#: instead of CAP_COUNT_SQL. It answers a different question ("which lanes are
+#: at their cap?") and its cost has to stay the same shape: one queue's
+#: in-flight rows, grouped, and nothing else. Gated because a GROUP BY is the
+#: easiest place in the claim path to lose an index and not notice: it still
+#: returns the right lanes, from a scan.
+LANE_COUNT_SQL = """
+    SELECT partition_key
+      FROM jorb
+     WHERE queue = $1 AND state IN ('claimed', 'running')
+     GROUP BY partition_key
+    HAVING count(*) >= $2
+"""
+
+#: claim_jorb's candidate probe on a PARTITIONED queue: the same claim order,
+#: the same index, plus the per-row test that skips lanes which are at their
+#: limit. Copied from sql/schema/30_claim.sql with the blocked set passed in,
+#: because the whole question this case exists to answer is what that test
+#: costs -- the plan is identical to the unpartitioned probe's until a lane is
+#: saturated, and then it walks.
+PARTITIONED_CLAIM_SQL = """
+    SELECT j.id FROM jorb j
+     WHERE j.queue = $1
+       AND (j.capability = ANY($2::text[]) OR j.capability IS NULL)
+       AND j.prio <= $3
+       AND j.run_after <= now()
+       AND j.state = 'queued'
+       AND CASE WHEN j.partition_key IS NULL
+                THEN NOT $5::boolean
+                ELSE NOT (j.partition_key = ANY($4::text[]))
+           END
+     ORDER BY j.prio, j.run_after
+       FOR UPDATE OF j SKIP LOCKED
+     LIMIT 1
+"""
+
+#: The lane the plan seed saturates, and the free lane parked behind it.
+PLAN_BLOCKED_LANE = "lane-saturated"
+PLAN_OPEN_LANE = "lane-open"
+
 METRICS_COMPLETIONS_SQL = f"""
     SELECT count(*) AS terminal_count,
            count(*) FILTER (WHERE state = 'finished') AS finished_count
@@ -2262,6 +2327,55 @@ def hot_queries() -> tuple[HotQuery, ...]:
             max_rows_removed=PLAN_IN_FLIGHT_BUDGET,
         ),
         HotQuery(
+            "partition_lane_count",
+            "claim_jorb's per-lane concurrency count, inside the serialised "
+            "section (partition_limits)",
+            LANE_COUNT_SQL,
+            lambda queue, _seed: [queue, 1],
+            # Zero, and that is what the dedicated partial index buys: the
+            # group-by runs over ONE queue's in-flight rows through
+            # jorb_partition_inflight_idx (queue, partition_key) instead of
+            # reading every in-flight row in the fleet and heap-fetching each
+            # one to find out whose queue it is. A regression here shows up as
+            # discards, because the fleet's other queues are what would be
+            # read and thrown away.
+            max_rows_removed=0,
+        ),
+        HotQuery(
+            "partitioned_claim",
+            "claim_jorb's claimable-row probe on a partitioned queue, caught "
+            "up (no lane at its limit)",
+            PARTITIONED_CLAIM_SQL,
+            lambda queue, _seed: [queue, ["bench"], 1000, [], False],
+            # The case that has to stay free. With nothing saturated the
+            # blocked set is empty, the per-row test is false for every row,
+            # and the probe stops on the first index entry exactly as the
+            # unpartitioned `claim` case above does -- so it gets the same
+            # budget: zero.
+            max_rows_removed=0,
+        ),
+        HotQuery(
+            "partitioned_claim_blocked",
+            "the same probe with a saturated lane's whole backlog sorting "
+            "ahead of the claimable row",
+            PARTITIONED_CLAIM_SQL,
+            lambda queue, _seed: [
+                queue,
+                ["bench"],
+                1000,
+                [PLAN_BLOCKED_LANE],
+                False,
+            ],
+            # The cost of fairness, stated as a number: the probe walks past
+            # the held-back tenant's queued rows to reach the free lane's.
+            # Bounded by THAT TENANT's backlog (PLAN_PARTITION_BLOCKED, what
+            # the seed parks in front) and never by the table -- the seed puts
+            # tens of thousands of other queued rows behind these, and a plan
+            # that started reading them would blow this budget by orders of
+            # magnitude rather than by a little.
+            max_rows_removed=PLAN_PARTITION_BLOCKED,
+        ),
+        HotQuery(
             "schedule_concurrency",
             "the scheduler's max_concurrent_jobs count, once per firing",
             CONCURRENCY_COUNT_SQL,
@@ -2462,6 +2576,53 @@ async def seed_plan_data(
         """,
         queue,
         in_flight,
+    )
+    # Fair-share lanes across everything seeded so far, in-flight rows
+    # included: the per-lane concurrency count groups over exactly those, and
+    # a seed where every row shares one lane would report a group-by that has
+    # nothing to group. One lane in PLAN_PARTITION_LANES is left NULL, because
+    # unlabelled work is a lane too and the claim's per-row test handles it on
+    # its own branch.
+    await conn.execute(
+        """
+        UPDATE jorb
+           SET partition_key = CASE WHEN id % $2 = 0 THEN NULL
+                                    ELSE 'lane-' || (id % $2)::text END
+         WHERE queue = $1
+        """,
+        queue,
+        PLAN_PARTITION_LANES,
+    )
+    # ...and the shape the partitioned claim is gated on: one lane's backlog
+    # parked at a priority that sorts it ahead of the whole seed, with a
+    # single free-lane row immediately behind it. prio 1 rather than the
+    # seed's 100, and run_after ordered within it, so claim order is decided
+    # and the walk is exactly PLAN_PARTITION_BLOCKED rows long.
+    await conn.execute(
+        """
+        INSERT INTO jorb (job_class, kwargs, queue, prio, state, partition_key,
+                          run_after, created, updated)
+        SELECT $1, '{}'::jsonb, $2, 1, 'queued', $4,
+               now() - interval '2 days', now() - interval '2 days',
+               now() - interval '2 days'
+        FROM generate_series(1, $3::int) i
+        """,
+        BENCH_JOB_CLASS,
+        queue,
+        PLAN_PARTITION_BLOCKED,
+        PLAN_BLOCKED_LANE,
+    )
+    await conn.execute(
+        """
+        INSERT INTO jorb (job_class, kwargs, queue, prio, state, partition_key,
+                          run_after, created, updated)
+        VALUES ($1, '{}'::jsonb, $2, 1, 'queued', $3,
+                now() - interval '1 day', now() - interval '1 day',
+                now() - interval '1 day')
+        """,
+        BENCH_JOB_CLASS,
+        queue,
+        PLAN_OPEN_LANE,
     )
     # Waiting rows for the stranded-waiter sweeps, at IN-FLIGHT scale for the
     # same reason the claimed/running slice is fixed: parked waiters are

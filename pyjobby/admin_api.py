@@ -125,10 +125,19 @@ EXPLAIN_REASONS: dict[str, str] = {
     "queue is calling claim_jorb at all",
     # --- the jorb_queue control plane, checked before the SELECT ---
     "queue_paused": "COALESCE(q.paused, FALSE) -> RETURN",
+    # The two counter reasons are SCOPE-AGNOSTIC on purpose. With
+    # q.partition_limits the very same control declines the row, only counted
+    # over this job's partition_key instead of over the queue -- so it is the
+    # same reason with a different denominator, and minting a second code for
+    # it would split one condition into two an operator has to learn are the
+    # same. Which one applied is in the details (`partition_limits`,
+    # `partition_key`) and named in the summary.
     "queue_at_max_concurrency": "q.max_concurrency <= count(claimed+running "
-    "on the queue) -> RETURN",
+    "on the queue, or on this job's partition_key when q.partition_limits) "
+    "-> RETURN (per queue) / skip this lane (per partition)",
     "rate_limited": "q.rate_limit <= count(claimed_at inside "
-    "q.rate_period_seconds) -> RETURN",
+    "q.rate_period_seconds, per queue or per partition_key as above) "
+    "-> RETURN / skip this lane",
     # --- nothing declines it ---
     "claimable": "every condition above passes: the row is admissible now, "
     "and its position in ORDER BY prio, run_after is how soon",
@@ -289,6 +298,9 @@ class JobInfo:
     # the ceiling collapse may not defer this row past, NULL when the caller
     # accepted unbounded deferral (see sql/schema/10_jobs.sql)
     debounce_deadline: datetime | None = None
+    # the caller's fair-share LANE (a tenant, an account), enforced only on a
+    # queue with jorb_queue.partition_limits (see sql/schema/10_jobs.sql)
+    partition_key: str | None = None
     worker_pid: int | None = None
     worker_host: str | None = None
     result: dict | None = None
@@ -374,6 +386,8 @@ class QueueStats:
     max_concurrency: int | None = None
     rate_limit: int | None = None
     rate_period_seconds: float = 60.0
+    #: The two limits above are counted PER jorb.partition_key, not per queue
+    partition_limits: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -603,6 +617,7 @@ class AdminAPI:
                    j.run_count, j.error_count, j.error_message,
                    j.cancel_requested, j.waitfor_job, j.waitfor_group,
                    j.identity_key, j.debounce_key, j.debounce_deadline,
+                   j.partition_key,
                    EXTRACT(EPOCH FROM (j.run_after - now()))::float8
                        AS run_after_in_seconds,
                    EXTRACT(EPOCH FROM (now() - j.updated))::float8
@@ -911,7 +926,7 @@ class AdminAPI:
         control = await self.conn.fetchrow(
             """
             SELECT paused, max_concurrency, rate_limit, rate_period_seconds,
-                   updated
+                   partition_limits, updated
               FROM jorb_queue WHERE name = $1
             """,
             queue,
@@ -921,6 +936,13 @@ class AdminAPI:
         max_concurrency = control["max_concurrency"] if control else None
         rate_limit = control["rate_limit"] if control else None
         rate_period = float(control["rate_period_seconds"]) if control else 60.0
+        # The LANE this job is in, and whether its queue counts by lane at
+        # all. `partition_limits` on a queue with neither limit set re-scopes
+        # nothing, so the two counts below stay queue-wide exactly as they
+        # were -- the flag never turns a limit on.
+        partitioned = bool(control["partition_limits"]) if control else False
+        lane = row["partition_key"]
+        lane_name = f"partition {lane!r}" if lane is not None else "the NULL partition"
 
         if paused:
             return (
@@ -1028,47 +1050,85 @@ class AdminAPI:
             )
 
         if max_concurrency is not None:
-            # The same count claim_jorb takes under the queue lock.
+            # The same count claim_jorb takes under the queue lock -- and on a
+            # partitioned queue that count is scoped to THIS JOB'S LANE,
+            # because that is the only count that can decline this row. The
+            # queue-wide total is irrelevant there and reporting it would send
+            # the operator to raise a cap that is not the one binding.
             inflight = await self.conn.fetchval(
                 """
                 SELECT count(*) FROM jorb
                  WHERE queue = $1 AND state IN ('claimed', 'running')
+                   AND (NOT $2 OR partition_key IS NOT DISTINCT FROM $3)
                 """,
                 queue,
+                partitioned,
+                lane,
             )
             if max_concurrency <= inflight:
+                scope = (
+                    f"{lane_name} of queue {queue!r}"
+                    if partitioned
+                    else (f"Queue {queue!r}")
+                )
                 return (
                     "queue_at_max_concurrency",
-                    f"Queue {queue!r} is at its concurrency cap: "
+                    f"{scope} is at its concurrency cap: "
                     f"{inflight} job(s) claimed or running against a cap of "
-                    f"{max_concurrency}. This job is admitted as soon as one "
+                    f"{max_concurrency}"
+                    + (
+                        " — this queue counts its limits PER partition_key, so "
+                        "other partitions keep draining and only this one is "
+                        "held back"
+                        if partitioned
+                        else ""
+                    )
+                    + f". This job is admitted as soon as one "
                     f"of them finishes; raise the cap with "
                     f"`pj-admin queues limits {queue} --max-concurrency N`.",
                     {
                         "queue": queue,
                         "max_concurrency": max_concurrency,
                         "inflight": inflight,
+                        "partition_limits": partitioned,
+                        "partition_key": lane,
                     },
                 )
 
         if rate_limit is not None:
             # Admissions, not starts: claim_jorb counts claimed_at, because
             # `started` is written after the claim commits (see jorb.claimed_at).
+            # Per lane on a partitioned queue, for the reason above.
             admissions = await self.conn.fetchval(
                 """
                 SELECT count(*) FROM jorb
                  WHERE queue = $1
                    AND claimed_at > now() - make_interval(secs => $2)
+                   AND (NOT $3 OR partition_key IS NOT DISTINCT FROM $4)
                 """,
                 queue,
                 rate_period,
+                partitioned,
+                lane,
             )
             if rate_limit <= admissions:
+                scope = (
+                    f"{lane_name} of queue {queue!r}"
+                    if partitioned
+                    else (f"Queue {queue!r}")
+                )
                 return (
                     "rate_limited",
-                    f"Queue {queue!r} is rate limited: {admissions} job(s) "
+                    f"{scope} is rate limited: {admissions} job(s) "
                     f"admitted in the last {rate_period:g}s against a limit of "
-                    f"{rate_limit}. Claims resume as the window rolls forward; "
+                    f"{rate_limit}"
+                    + (
+                        " — this queue counts its limits PER partition_key, so "
+                        "every other partition has its own window"
+                        if partitioned
+                        else ""
+                    )
+                    + ". Claims resume as the window rolls forward; "
                     f"change it with `pj-admin queues limits {queue} "
                     f"--rate-limit N`.",
                     {
@@ -1076,6 +1136,8 @@ class AdminAPI:
                         "rate_limit": rate_limit,
                         "rate_period_seconds": rate_period,
                         "recent_admissions": admissions,
+                        "partition_limits": partitioned,
+                        "partition_key": lane,
                     },
                 )
 
@@ -1129,6 +1191,12 @@ class AdminAPI:
                 # (see EXPLAIN_REASONS), but both are why a claimable job on
                 # such a queue can take a poll or two longer than one here.
                 "queue_serialised": serialised,
+                # Which lane this row would be admitted into, and whether
+                # anything counts by lane -- reported even when nothing is
+                # blocking, because "partition_limits is off" is the answer to
+                # "why is one tenant still starving the others?".
+                "partition_limits": partitioned,
+                "partition_key": lane,
             },
         )
 
@@ -1480,15 +1548,16 @@ class AdminAPI:
 
         Returns:
             List of dicts with name, paused, max_concurrency, rate_limit,
-            rate_period_seconds (control fields are defaults when no
-            jorb_queue row exists).
+            rate_period_seconds, partition_limits (control fields are
+            defaults when no jorb_queue row exists).
         """
         records = await self.conn.fetch("""
             SELECT COALESCE(j.queue, q.name) AS name,
                    COALESCE(q.paused, FALSE) AS paused,
                    q.max_concurrency,
                    q.rate_limit,
-                   COALESCE(q.rate_period_seconds, 60) AS rate_period_seconds
+                   COALESCE(q.rate_period_seconds, 60) AS rate_period_seconds,
+                   COALESCE(q.partition_limits, FALSE) AS partition_limits
             FROM (SELECT DISTINCT queue FROM jorb) j
             FULL OUTER JOIN jorb_queue q ON q.name = j.queue
             ORDER BY 1
@@ -1565,6 +1634,7 @@ class AdminAPI:
             stats.max_concurrency = c["max_concurrency"]
             stats.rate_limit = c["rate_limit"]
             stats.rate_period_seconds = c["rate_period_seconds"]
+            stats.partition_limits = c["partition_limits"]
 
         return [queue_stats_map[name].to_dict() for name in sorted(queue_stats_map)]
 
@@ -1639,6 +1709,7 @@ class AdminAPI:
         max_concurrency: int | None | Unset = UNSET,
         rate_limit: int | None | Unset = UNSET,
         rate_period_seconds: float | None = None,
+        partition_limits: bool | None = None,
     ) -> dict[str, Any]:
         """
         Upsert the jorb_queue control row, updating only the provided
@@ -1652,6 +1723,11 @@ class AdminAPI:
             rate_limit: Max starts per rate period; None means unlimited
                 (pass explicitly to clear); omit to leave alone
             rate_period_seconds: Rate window in seconds; None leaves it alone
+            partition_limits: Count the two limits above PER
+                jorb.partition_key instead of per queue; None leaves it
+                alone. It re-scopes the limits and adds none of its own, so
+                turning it on for a queue with neither limit set changes
+                nothing.
 
         Returns:
             The resulting control dictionary
@@ -1664,8 +1740,10 @@ class AdminAPI:
         record = await self.conn.fetchrow(
             """
             INSERT INTO jorb_queue
-                (name, paused, max_concurrency, rate_limit, rate_period_seconds)
-            VALUES ($1, COALESCE($2, FALSE), $3, $4, COALESCE($5, 60))
+                (name, paused, max_concurrency, rate_limit, rate_period_seconds,
+                 partition_limits)
+            VALUES ($1, COALESCE($2, FALSE), $3, $4, COALESCE($5, 60),
+                    COALESCE($8, FALSE))
             ON CONFLICT (name) DO UPDATE SET
                 paused = COALESCE($2, jorb_queue.paused),
                 max_concurrency = CASE WHEN $6 THEN $3
@@ -1674,6 +1752,7 @@ class AdminAPI:
                                   ELSE jorb_queue.rate_limit END,
                 rate_period_seconds =
                     COALESCE($5, jorb_queue.rate_period_seconds),
+                partition_limits = COALESCE($8, jorb_queue.partition_limits),
                 updated = now()
             RETURNING *
             """,
@@ -1684,6 +1763,7 @@ class AdminAPI:
             rate_period_seconds,
             set_mc,
             set_rl,
+            partition_limits,
         )
         return self._queue_control_dict(record)
 

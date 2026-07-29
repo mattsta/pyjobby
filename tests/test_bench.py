@@ -359,6 +359,13 @@ class TestSubcommandsEmitDocumentedJson:
             "claim",
             "recv",
             "concurrency_cap",
+            # the partitioned claim path: the per-lane count that replaces
+            # concurrency_cap inside the lock, and the candidate probe in
+            # both of its states (nothing saturated / a saturated lane's
+            # backlog sorting ahead of the row it may take)
+            "partition_lane_count",
+            "partitioned_claim",
+            "partitioned_claim_blocked",
             "schedule_concurrency",
             "metrics_completions",
             "metrics_arrivals",
@@ -445,12 +452,16 @@ class TestSubcommandsEmitDocumentedJson:
         assert payload["queries"]["concurrency_cap"]["indexes"], payload["queries"][
             "concurrency_cap"
         ]
-        # the gate seeds 20k rows plus the waiter slices for the
-        # stranded-waiter sweeps; leaving any behind would poison every
-        # later measurement taken on the same database
-        assert (
-            payload["cleanup"]["jobs_deleted"]
-            == PLAN_SEED + bench.PLAN_IN_FLIGHT + bench.PLAN_GROUP_WAITERS
+        # the gate seeds 20k rows, plus the waiter slices for the
+        # stranded-waiter sweeps, plus the partitioned claim's saturated lane
+        # and the one free-lane row parked behind it; leaving any behind would
+        # poison every later measurement taken on the same database
+        assert payload["cleanup"]["jobs_deleted"] == (
+            PLAN_SEED
+            + bench.PLAN_IN_FLIGHT
+            + bench.PLAN_GROUP_WAITERS
+            + bench.PLAN_PARTITION_BLOCKED
+            + 1
         )
         assert await db_pool.fetchval("SELECT count(*) FROM jorb") == 0
 

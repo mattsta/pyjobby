@@ -121,15 +121,15 @@ REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
     "jorb": _names("""
         id queue capability prio state job_class kwargs admin_data result uid
         tags run_group waitfor_group waitfor_job dag_id deadline_key
-        identity_key debounce_key debounce_deadline
+        identity_key debounce_key debounce_deadline partition_key
         schedule_id forked_from run_count
         error_count error_message error_backtrace run_epoch cancel_requested
         awaited claimed_by worker_pid worker_host created updated run_after
         claimed_at started finished timeout_at
     """),
     "jorb_queue": _names("""
-        name paused max_concurrency rate_limit rate_period_seconds created
-        updated
+        name paused max_concurrency rate_limit rate_period_seconds
+        partition_limits created updated
     """),
     "jorb_worker": _names("""
         id host pid queue capabilities max_prio version started last_seen
@@ -180,7 +180,8 @@ REQUIRED_TRIGGERS: tuple[str, ...] = (
 
 REQUIRED_INDEXES: frozenset[str] = _names("""
     jorb_pkey jorb_claim_idx jorb_claimed_at_idx jorb_started_idx
-    jorb_inflight_idx jorb_retention_idx jorb_created_idx jorb_timeout_idx
+    jorb_inflight_idx jorb_partition_inflight_idx
+    jorb_retention_idx jorb_created_idx jorb_timeout_idx
     jorb_waitfor_job_idx jorb_waitfor_group_idx jorb_run_group_idx
     jorb_group_unfinished_idx jorb_uid_idx jorb_forked_from_idx
     jorb_dag_idx jorb_tags_idx jorb_deadline_idx jorb_identity_idx

@@ -253,6 +253,8 @@ pj-admin queues pause NAME          # workers stop claiming immediately
 pj-admin queues resume NAME
 pj-admin queues limits NAME --max-concurrency 8 --rate-limit 100 --rate-period 60
 pj-admin queues limits NAME --max-concurrency none      # clear a limit
+pj-admin queues limits NAME --partition-limits          # count them PER tenant
+pj-admin queues limits NAME --no-partition-limits       # back to queue-wide
 pj-admin queues show NAME
 ```
 
@@ -454,6 +456,55 @@ script, anything that admits a job. Two consequences worth knowing:
 window — jobs picked up by a worker, not jobs that reached `running`. The two
 differ by one statement, and counting the latter let a burst slip through.
 
+### `partition_limits`: the same limits, per tenant
+
+A queue-wide `max_concurrency` is a fair-share scheme with one participant.
+Put two tenants on the queue and the busier one takes the whole cap: the
+other's work sits there queued, runnable, and never claimed, because the cap
+is already full of somebody else's jobs.
+
+`partition_limits` **re-scopes the limits that queue already has** to each
+distinct `jorb.partition_key`:
+
+```bash
+pj-admin queues limits ingest --max-concurrency 4 --partition-limits
+```
+
+- `max_concurrency 4` now means **4 in flight per key**, not 4 on the queue.
+- `rate_limit R` per period now means **R admissions per key per window** —
+  every key gets its own window.
+- Jobs get their key at enqueue: `client.enqueue(..., partition_key="acme")`.
+  It flows through every enqueue path (single, batch, `debounce`,
+  `enqueue_identified`) and a **fork inherits it**, because it says whose
+  work this is rather than which piece of work it is.
+
+Three rules worth reading twice:
+
+- **IT ADDS NO LIMIT OF ITS OWN.** On a queue with neither `max_concurrency`
+  nor `rate_limit` set, turning it on changes nothing at all — there is
+  nothing to re-scope. `queues limits` warns when you do that.
+- **THE NULL LANE IS A LANE.** Jobs enqueued without a `partition_key` form
+  **one lane among the others**: counted, capped and admitted exactly like a
+  named one. They are never hidden from the claim and never refused for being
+  unlabelled. A fair-share scheme that quietly blackholes the work nobody
+  remembered to label is a worse failure than the starvation it replaced, so
+  the platform will not do it — you can adopt `partition_key` on a live queue
+  one producer at a time.
+- **Exactness is unchanged, and so is the cost tier.** A queue with a limit
+  serialises its claims whether the limit is per queue or per lane, so the
+  per-lane counts cannot be fooled by an uncommitted claim any more than the
+  queue-wide ones could. A queue with **no** limit still never takes the lock,
+  `partition_limits` set or not.
+
+`pj-admin queues show NAME` reports the scope on the limits themselves
+(`Max concurrency: 4 PER partition_key`), and `pj-admin jobs why ID` names
+the lane a job is waiting behind and how many of that lane's jobs are in
+flight. Work waiting on its lane's limit is **backlog, not unclaimable**:
+`doctor`'s unclaimable sweep stays silent about it, because it is claimed the
+moment the lane lets go.
+
+What it costs is in [SCALE.md](SCALE.md#partitioned-claims-what-fairness-costs).
+
 ## Retry, re-run, fork
 
 Three verbs for "run this again", because they carry different risk. The
@@ -492,8 +543,10 @@ Reach for **fork** when the re-run must not be the same job:
   or different arguments.
 
 What a fork inherits: job class, arguments, queue, priority, capability,
-`uid`, tags, and the retry/timeout policy — everything that describes or
-labels the WORK (`uid` is a tenant tag, so a tenant's fork stays theirs).
+`uid`, tags, `partition_key`, and the retry/timeout policy — everything that
+describes or labels the WORK (`uid` is a tenant tag and `partition_key` is a
+tenant's fair-share lane, so a tenant's fork stays theirs and keeps counting
+against their share).
 What it does not: `deadline_key`, `identity_key`, `debounce_key`,
 `schedule_id`, DAG
 membership, dependency edges, and every execution counter. A fork is a new

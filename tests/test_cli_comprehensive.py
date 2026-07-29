@@ -150,6 +150,7 @@ def mock_admin_api():
             "max_concurrency": None,
             "rate_limit": None,
             "rate_period_seconds": 60.0,
+            "partition_limits": False,
         },
         {
             "name": "high",
@@ -157,6 +158,7 @@ def mock_admin_api():
             "max_concurrency": 4,
             "rate_limit": 10,
             "rate_period_seconds": 60.0,
+            "partition_limits": False,
         },
         {
             "name": "low",
@@ -164,6 +166,7 @@ def mock_admin_api():
             "max_concurrency": None,
             "rate_limit": None,
             "rate_period_seconds": 60.0,
+            "partition_limits": False,
         },
     ]
 
@@ -186,6 +189,7 @@ def mock_admin_api():
             "max_concurrency": None,
             "rate_limit": None,
             "rate_period_seconds": 60.0,
+            "partition_limits": False,
         },
     ]
 
@@ -264,6 +268,7 @@ def mock_admin_api():
         "max_concurrency": None,
         "rate_limit": None,
         "rate_period_seconds": 60.0,
+        "partition_limits": False,
         "created": datetime.now().isoformat(),
         "updated": datetime.now().isoformat(),
     }

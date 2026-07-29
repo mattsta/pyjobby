@@ -65,6 +65,7 @@ draining is fine; an old queue is not. Tune the thresholds per install with
 | Jobs sit queued forever and the workers are fine              | [Jobs sit queued forever](#jobs-sit-queued-forever-and-nothing-is-wrong-with-the-workers) |
 | A worker heartbeats but never claims                          | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing)  |
 | Queue depth or age climbing                                   | [The backlog is growing](#the-backlog-is-growing)                                         |
+| One tenant's jobs pile up while the rest of the queue drains  | [One partition is backed up](#one-partition-is-backed-up-and-the-rest-of-the-queue-is-fine) |
 | The table grows even though retention is on                   | [Retention is falling behind](#retention-is-falling-behind)                               |
 | Enqueues start failing platform-wide                          | [NOTIFY queue saturation](#notify-queue-saturation)                                       |
 | A cron schedule stopped running                               | [A schedule is not firing](#a-schedule-is-not-firing)                                     |
@@ -326,6 +327,55 @@ is the `workers` check above it, and a different remedy (start a worker,
 rather than change what the running ones accept). Alert on it the same way
 you alert on the DLQ: it is a condition nothing else in the system will ever
 tell you about.
+
+## One partition is backed up and the rest of the queue is fine
+
+The queue drains, throughput looks normal, `doctor` is clean — and one
+tenant's jobs are hours old while everyone else's run in seconds. On a queue
+with `partition_limits` that is usually the feature working, not failing:
+that tenant is at **its own share** of the limit, and its work waits while
+the other lanes keep going.
+
+Ask the job:
+
+```console
+$ pj-admin jobs why 84213
+reason: queue_at_max_concurrency
+partition 'acme' of queue 'ingest' is at its concurrency cap: 4 job(s) claimed
+or running against a cap of 4 — this queue counts its limits PER
+partition_key, so other partitions keep draining and only this one is held
+back. ...
+```
+
+The `details` carry `partition_limits` and `partition_key`, and the count is
+that **lane's** in-flight, not the queue's — so the number you would raise is
+the one that is actually binding. Three real fixes, in order of how often
+they are right:
+
+1. **Nothing.** The lane is being throttled on purpose. Look at how far
+   behind it is (`pj-admin queues stats`, `pj-admin metrics`) and decide
+   whether the share is wrong or the tenant is simply sending more than its
+   share allows.
+2. **Raise the share** — `pj-admin queues limits ingest --max-concurrency 8`.
+   It is per lane, so this raises it for every tenant.
+3. **Give that tenant its own queue** if its backlog is enormous. A lane
+   parked at its cap with a huge backlog in front of the queue's claim order
+   is the one shape that costs the claim path real work
+   ([SCALE.md](SCALE.md#partitioned-claims-what-fairness-costs)).
+
+Two answers that mean something else:
+
+- `reason: queue_at_max_concurrency` with `partition_limits: false` — the
+  limit is queue-wide and one tenant _is_ taking all of it. That is the
+  condition `--partition-limits` exists to fix.
+- Jobs with **no** `partition_key` piling up — they are their own lane, and
+  they are at that lane's cap. They are never hidden: if they were, `jobs
+  why` would say so and `doctor`'s unclaimable sweep would find them.
+
+A lane at its limit is **backlog, not unclaimable work**. `doctor` stays
+silent about it deliberately: it is claimed the instant the lane lets go, so
+reporting it would drown the sweep that finds work no worker can _ever_
+claim.
 
 ## A worker is alive, heartbeating, and doing nothing
 

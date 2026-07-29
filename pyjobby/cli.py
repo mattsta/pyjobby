@@ -1250,16 +1250,43 @@ def _parse_optional_limit(value: str | None, option: str) -> int | None | Unset:
 
 
 def _echo_queue_control(control: dict) -> None:
+    partitioned = control["partition_limits"]
+    # The scope is printed ON the two limits and not only as its own line:
+    # "Max concurrency: 4" means something different per queue and per lane,
+    # and an operator reading one number should never have to look further
+    # down the screen to find out which of the two it is.
+    scope = " PER partition_key" if partitioned else ""
     click.echo(f"Paused:              {'yes' if control['paused'] else 'no'}")
     click.echo(
-        f"Max concurrency:     {_fmt_limit(control['max_concurrency'])}"
+        f"Max concurrency:     {_fmt_limit(control['max_concurrency'])}{scope}"
         " (claimed+running cap; '-' = unlimited)"
     )
     click.echo(
         f"Rate limit:          {_fmt_limit(control['rate_limit'])}"
-        f" start(s) per {control['rate_period_seconds']:g}s"
+        f" start(s) per {control['rate_period_seconds']:g}s{scope}"
         " ('-' = unlimited)"
     )
+    click.echo(
+        f"Partition limits:    {'yes' if partitioned else 'no'}"
+        + (
+            " (each partition_key gets the limits above; jobs with no key"
+            " form one lane of their own)"
+            if partitioned
+            else " (limits count queue-wide; partition_key is inert labelling)"
+        )
+    )
+    if (
+        partitioned
+        and control["max_concurrency"] is None
+        and (control["rate_limit"] is None)
+    ):
+        # Loud, because it is the one way to misread the flag: it RE-SCOPES
+        # limits and adds none, so switched on alone it changes nothing at all.
+        print_warning(
+            "Partition limits are on but this queue has no limit to re-scope: "
+            "set --max-concurrency and/or --rate-limit, or the flag does "
+            "nothing."
+        )
 
 
 @queues.command("limits")
@@ -1283,6 +1310,13 @@ def _echo_queue_control(control: dict) -> None:
     default=None,
     help="Rate limit window in seconds (default window: 60)",
 )
+@click.option(
+    "--partition-limits/--no-partition-limits",
+    "partition_limits",
+    default=None,
+    help="Count the limits above PER job partition_key instead of per queue "
+    "(fair share between tenants); re-scopes the limits, adds none",
+)
 @click.pass_context
 def queues_limits(
     ctx: click.Context,
@@ -1290,11 +1324,18 @@ def queues_limits(
     max_concurrency: str | None,
     rate_limit: str | None,
     rate_period: float | None,
+    partition_limits: bool | None,
 ) -> None:
     """Set (or show, with no options) a queue's concurrency/rate limits
 
     Only the options you pass are changed; workers enforce the new values
     on their very next claim attempt.
+
+    --partition-limits re-scopes THIS queue's --max-concurrency and
+    --rate-limit to each distinct job `partition_key`, so one tenant filling
+    its own share cannot starve the others. It adds no limit of its own:
+    on a queue with neither limit set it changes nothing. Jobs with no
+    partition_key form one lane of their own and are never hidden by it.
     """
     mc = _parse_optional_limit(max_concurrency, "--max-concurrency")
     rl = _parse_optional_limit(rate_limit, "--rate-limit")
@@ -1302,7 +1343,12 @@ def queues_limits(
     async def _limits() -> None:
         conn, api = await get_api(ctx)
         try:
-            if isinstance(mc, Unset) and isinstance(rl, Unset) and rate_period is None:
+            if (
+                isinstance(mc, Unset)
+                and isinstance(rl, Unset)
+                and rate_period is None
+                and partition_limits is None
+            ):
                 # No changes requested: show the current control row.
                 control = await api.get_queue_control(queue)
                 if not control:
@@ -1320,6 +1366,7 @@ def queues_limits(
                 max_concurrency=mc,
                 rate_limit=rl,
                 rate_period_seconds=rate_period,
+                partition_limits=partition_limits,
             )
             print_success(f"Queue '{queue}' limits updated")
             _echo_queue_control(control)

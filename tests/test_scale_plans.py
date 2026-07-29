@@ -710,10 +710,15 @@ class TestRetiredWorkerSweepPlan:
 
         jorb.claimed_by has no index and must not get one -- it is written on
         the claim path, on the hottest table in the system, to answer a
-        question only retention asks. jorb_inflight_idx already covers exactly
-        the two states this refusal cares about, and in-flight work is bounded
-        by the fleet however big the job table grows: the assertion is that
-        the join's inner side reads the in-flight rows and NOT the table.
+        question only retention asks. The schema carries TWO indexes partial
+        on exactly the two states this refusal cares about -- jorb_inflight_idx
+        (state, updated), for the reaper, and jorb_partition_inflight_idx
+        (queue, partition_key), for the per-lane cap count -- and either one
+        gives this join the same guarantee: its inner side is bounded by work
+        in flight, i.e. by the fleet, however big the job table grows.
+        Which of the two the planner picks is its business and changes with
+        the row counts; that it picked ONE OF THEM, and read only the
+        in-flight rows through it, is the property.
 
         Buffers are deliberately not asserted here. This statement is a bulk
         DELETE, so most of what it touches is the heap and index writes for
@@ -742,9 +747,14 @@ class TestRetiredWorkerSweepPlan:
 
         plan = await explain_rolled_back(db_pool, DELETE_RETIRED_WORKERS_SQL, doomed)
 
-        assert "jorb_inflight_idx" in plan, plan
+        in_flight_indexes = ("jorb_inflight_idx", "jorb_partition_inflight_idx")
+        used = [name for name in in_flight_indexes if name in plan]
+        assert used, (
+            f"the refusal read the in-flight set through none of "
+            f"{in_flight_indexes}, so it is not bounded by work in flight:\n{plan}"
+        )
         assert_no_seq_scan(plan, "jorb")
-        assert rows_scanned_by(plan, "jorb_inflight_idx") == in_flight, plan
+        assert rows_scanned_by(plan, used[0]) == in_flight, plan
 
 
 class TestClientQueueStatsPlan:

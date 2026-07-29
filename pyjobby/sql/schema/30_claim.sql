@@ -101,6 +101,22 @@ CREATE FUNCTION claim_jorb(
 LANGUAGE plpgsql AS $$
 DECLARE
     q jorb_queue%ROWTYPE;
+    -- Whether the limits above are counted per lane rather than per queue.
+    partitioned BOOLEAN;
+    -- The lanes that may not be admitted from on this attempt, split because
+    -- SQL cannot put a NULL in an "= ANY(...)" set: NULL is a LANE here, not
+    -- a missing value, so it gets its own flag rather than an array entry
+    -- that would silently never match.
+    full_keys   TEXT[]  := '{}';
+    full_null   BOOLEAN := FALSE;
+    rated_keys  TEXT[]  := '{}';
+    rated_null  BOOLEAN := FALSE;
+    -- Initialised, not merely declared: a NULL array would make
+    -- `partition_key = ANY(blocked_keys)` NULL for every labelled row and
+    -- quietly render the whole queue unclaimable, which is the failure mode
+    -- this feature exists to prevent rather than to introduce.
+    blocked_keys TEXT[]  := '{}';
+    blocked_null BOOLEAN := FALSE;
 BEGIN
     SELECT * INTO q FROM jorb_queue WHERE name = p_queue;
 
@@ -108,27 +124,148 @@ BEGIN
         RETURN;
     END IF;
 
+    -- PARTITIONED IS NOT A THIRD TIER, and the AND is what says so. A queue
+    -- with partition_limits and no limit set has nothing to re-scope, so it
+    -- stays on the lock-free fast path exactly as it would with the flag off
+    -- -- the flag re-scopes limits, it never adds one.
+    partitioned := COALESCE(q.partition_limits, FALSE)
+                   AND (q.max_concurrency IS NOT NULL OR q.rate_limit IS NOT NULL);
+
     IF q.max_concurrency IS NOT NULL OR q.rate_limit IS NOT NULL THEN
         -- Bounded on purpose (see claim_queue_lock): wait a little to be
         -- served in order, but never longer than the timeout, so a claim held
         -- open by a slow or stuck transaction can never freeze the queue.
+        --
+        -- THE CONDITION IS THE SAME ONE IT ALWAYS WAS, per-lane or not: the
+        -- lock is what makes a count taken before an uncommitted claim wrong,
+        -- and a per-lane count is no less blind to one than a per-queue count
+        -- is. So partitioning changes WHAT is counted and nothing about WHO
+        -- serialises -- an unlimited queue still never arrives here.
         IF NOT claim_queue_lock(p_queue) THEN
             RETURN;
         END IF;
 
-        IF q.max_concurrency IS NOT NULL AND q.max_concurrency <= (
-               SELECT count(*) FROM jorb
-               WHERE queue = p_queue AND state IN ('claimed', 'running')) THEN
-            RETURN;
-        END IF;
+        IF NOT partitioned THEN
+            IF q.max_concurrency IS NOT NULL AND q.max_concurrency <= (
+                   SELECT count(*) FROM jorb
+                   WHERE queue = p_queue AND state IN ('claimed', 'running')) THEN
+                RETURN;
+            END IF;
 
-        IF q.rate_limit IS NOT NULL AND q.rate_limit <= (
-               SELECT count(*) FROM jorb
-               WHERE queue = p_queue
-                 AND claimed_at > now()
-                     - make_interval(secs => q.rate_period_seconds)) THEN
-            RETURN;
+            IF q.rate_limit IS NOT NULL AND q.rate_limit <= (
+                   SELECT count(*) FROM jorb
+                   WHERE queue = p_queue
+                     AND claimed_at > now()
+                         - make_interval(secs => q.rate_period_seconds)) THEN
+                RETURN;
+            END IF;
+        ELSE
+            -- Per lane, the same two counts GROUPED -- and the difference in
+            -- shape is the whole design. A queue-wide limit answers "is the
+            -- queue full?" and returns; a per-lane limit cannot, because the
+            -- answer is different for every lane and a lane with headroom
+            -- must still be served. So the counts do not decide whether to
+            -- claim, they produce the set of lanes this attempt may not
+            -- claim from, and the claim below skips exactly those.
+            --
+            -- BOUNDED BY THE SAME THING THE OLD COUNTS WERE. The saturated
+            -- set cannot be larger than what produced it: at most
+            -- (in-flight work / max_concurrency) lanes can be at the
+            -- concurrency cap, and at most (admissions in the window /
+            -- rate_limit) can be at the rate limit. Both are bounded by the
+            -- fleet and the window, never by the backlog or by the number of
+            -- lanes that EXIST -- there is deliberately no scan over the
+            -- distinct values of partition_key anywhere in this function.
+            IF q.max_concurrency IS NOT NULL THEN
+                SELECT COALESCE(array_agg(lane.partition_key)
+                                    FILTER (WHERE lane.partition_key IS NOT NULL),
+                                '{}'::text[]),
+                       COALESCE(bool_or(lane.partition_key IS NULL), FALSE)
+                  INTO full_keys, full_null
+                  FROM (SELECT partition_key
+                          FROM jorb
+                         WHERE queue = p_queue
+                           AND state IN ('claimed', 'running')
+                         GROUP BY partition_key
+                        HAVING count(*) >= q.max_concurrency) lane;
+            END IF;
+
+            IF q.rate_limit IS NOT NULL THEN
+                SELECT COALESCE(array_agg(lane.partition_key)
+                                    FILTER (WHERE lane.partition_key IS NOT NULL),
+                                '{}'::text[]),
+                       COALESCE(bool_or(lane.partition_key IS NULL), FALSE)
+                  INTO rated_keys, rated_null
+                  FROM (SELECT partition_key
+                          FROM jorb
+                         WHERE queue = p_queue
+                           AND claimed_at > now()
+                               - make_interval(secs => q.rate_period_seconds)
+                         GROUP BY partition_key
+                        HAVING count(*) >= q.rate_limit) lane;
+            END IF;
+
+            blocked_keys := full_keys || rated_keys;
+            blocked_null := full_null OR rated_null;
         END IF;
+    END IF;
+
+    IF partitioned THEN
+        -- The claim, restricted to lanes with headroom.
+        --
+        -- WHY THIS IS A SECOND STATEMENT and not a predicate bolted onto the
+        -- one below: an unpartitioned queue -- every queue, by default --
+        -- must reach a claim that is byte-identical to the one it always ran,
+        -- with the same plan and the same cost. A single statement carrying a
+        -- lane test that is trivially true for them would still be a
+        -- different statement, and this is the hottest query in the platform.
+        --
+        -- ORDER IS UNCHANGED: prio then run_after, the queue's own claim
+        -- order, served by jorb_claim_idx exactly as below. Partitioning
+        -- decides WHICH rows are eligible, never which eligible row wins.
+        --
+        -- WHAT IT COSTS, honestly: the scan walks past queued rows whose lane
+        -- is saturated to reach the first one whose lane is not. When nothing
+        -- is saturated -- the caught-up case, and the common one -- the
+        -- blocked set is empty, `= ANY('{}')` is false for every row, and the
+        -- scan stops on the first index entry exactly as the unpartitioned
+        -- claim does. The cost is therefore paid only where the feature is
+        -- doing work: it is proportional to the backlog of the lanes that are
+        -- currently AT their limit and sorting ahead of the winner, which is
+        -- the queued depth of the tenants being held back. `pj-bench plans`
+        -- gates that shape (the `partitioned_claim` case) with seeded lanes.
+        --
+        -- THE NULL LANE IS A LANE. Its rows are refused only when the NULL
+        -- lane itself is saturated, and admitted like anyone else's the rest
+        -- of the time; `partition_key = ANY(blocked_keys)` would be NULL for
+        -- them, so the CASE spells the two apart rather than letting three-
+        -- valued logic quietly make every unlabelled job unclaimable forever.
+        RETURN QUERY
+        UPDATE jorb
+           SET state      = 'claimed',
+               worker_pid = p_worker_pid,
+               worker_host= p_worker_host,
+               claimed_by = p_worker_id,
+               claimed_at = now(),
+               run_count  = run_count + 1,
+               run_epoch  = run_epoch + 1,
+               updated    = now()
+         WHERE id = (
+               SELECT j.id FROM jorb j
+                WHERE j.queue = p_queue
+                  AND (j.capability = ANY(p_capabilities) OR j.capability IS NULL)
+                  AND j.prio <= p_max_prio
+                  AND j.run_after <= now()
+                  AND j.state = 'queued'
+                  AND CASE WHEN j.partition_key IS NULL
+                           THEN NOT blocked_null
+                           ELSE NOT (j.partition_key = ANY(blocked_keys))
+                      END
+                ORDER BY j.prio, j.run_after
+                  FOR UPDATE OF j SKIP LOCKED
+                LIMIT 1)
+        RETURNING *;
+        RETURN;
     END IF;
 
     RETURN QUERY
@@ -155,5 +292,5 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION claim_jorb IS 'Atomically admit at most one queued job for a worker, enforcing the queue pause/concurrency/rate controls. Returns zero rows when nothing is claimable.';
+COMMENT ON FUNCTION claim_jorb IS 'Atomically admit at most one queued job for a worker, enforcing the queue pause/concurrency/rate controls. With jorb_queue.partition_limits those two limits are counted PER jorb.partition_key instead of per queue, and the claim skips the lanes that are at theirs -- so a saturated lane never blocks another, and the NULL lane is a lane like any other. Returns zero rows when nothing is claimable.';
 

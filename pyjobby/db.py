@@ -333,7 +333,7 @@ FORK_JOB_SQL = """
     ), forked AS (
         INSERT INTO jorb (
             job_class, kwargs, queue, prio, capability, uid, tags, admin_data,
-            state, forked_from
+            state, forked_from, partition_key
         )
         SELECT src.job_class,
                COALESCE($5::jsonb, src.kwargs),
@@ -346,7 +346,13 @@ FORK_JOB_SQL = """
                    'fork', jsonb_build_object(
                        'from_step', $2::int, 'steps_copied', recorded.prefix)),
                'queued'::jorbstate,
-               src.id
+               src.id,
+               -- INHERITED, unlike the three dedupe keys below it in the
+               -- docstring: a partition_key says WHOSE work this is, not
+               -- WHICH piece of work it is, so a tenant's fork is still that
+               -- tenant's job and still counts against that tenant's lane.
+               -- Same reasoning that carries uid and tags across.
+               src.partition_key
           FROM src, recorded
          WHERE $2::int <= recorded.steps + 1
         RETURNING id, queue, prio
@@ -422,7 +428,9 @@ async def fork_job(
     and the fork will not see the later rows.
 
     What the new row inherits: job_class, kwargs (or ``kwargs_override``),
-    queue and prio (or the overrides), capability, tags, and admin_data —
+    queue and prio (or the overrides), capability, tags, ``partition_key``
+    (whose work it is, so the fork stays in the same fair-share lane), and
+    admin_data —
     the retry/timeout policy describes the WORK, so the fork runs under the
     same rules. What it does not: uid, deadline_key, identity_key and
     debounce_key

@@ -218,6 +218,16 @@ Enqueue a single job.
   running, finished, crashed — the enqueue returns **that job's id** instead
   of writing a second row, and never raises (default: None). Bounded by
   retention; see [At-most-once work](#4b-at-most-once-work-identity-keys).
+- `partition_key` (str): The fair-share **lane** this job belongs to — a
+  tenant, an account, an api key (default: None). Inert labelling unless the
+  job's queue has `partition_limits` set
+  (`pj-admin queues limits QUEUE --partition-limits`), and on such a queue
+  that queue's `max_concurrency` and `rate_limit` are counted **per key**, so
+  one tenant filling its own share cannot starve the rest. Jobs with no key
+  form **one lane of their own** — never hidden, never refused for being
+  unlabelled. Inherited by a fork, like `uid` and `tags`. Max 256 characters;
+  longer raises `ValueError`. See
+  [Queue controls](OPERATIONS.md#queue-controls-what-the-limits-actually-promise).
 - `admin_data` (dict): Metadata for tracking (default: None)
 - `tags` (dict): Your own labels — customer, region, batch — that you can
   filter jobs by later (default: None). See [Job Tags](#8-job-tags).
@@ -440,7 +450,8 @@ result = await client.wait_for_result(fork["job_id"])
 ```
 
 The fork inherits the job class, arguments, queue, priority, capability,
-tags and retry/timeout policy. It does **not** inherit identity or
+tags, `partition_key` (whose work it is, so it stays in the same fair-share
+lane) and retry/timeout policy. It does **not** inherit identity or
 structure: `uid`, `deadline_key`, `identity_key`, `debounce_key`,
 `schedule_id`, DAG
 membership and dependency edges are left unset, because two live rows

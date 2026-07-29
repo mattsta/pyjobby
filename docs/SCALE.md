@@ -308,6 +308,41 @@ from 87% to 2.3%.
 The wait stays bounded so a claim held open by a stuck transaction can still
 never freeze the queue, which is what the non-blocking version was protecting.
 
+### Partitioned claims: what fairness costs
+
+`partition_limits` re-scopes a queue's limits to each `jorb.partition_key`
+([OPERATIONS.md](OPERATIONS.md#partition_limits-the-same-limits-per-tenant)).
+It changes what the claim counts, not who serialises: the same queues take
+the same lock, and a queue with no limit still never takes it.
+
+Two things were measured, both gated in `pj-bench plans` against a seed of
+20,000 jobs spread over 8 lanes:
+
+- **The per-lane count** (`partition_lane_count`) — the `GROUP BY
+  partition_key` that runs inside the advisory lock. **2 buffers, 0 rows
+  discarded**: an index-only scan of `jorb_partition_inflight_idx (queue,
+  partition_key) WHERE state IN ('claimed','running')`, so it reads one
+  queue's in-flight rows and nothing else. That index is the cheapest one in
+  the schema to keep — enqueue never touches it, because a `queued` row is
+  not in it.
+- **The claim probe** (`partitioned_claim`) — **5 buffers, 0 rows
+  discarded** when nothing is saturated, which is the same first-index-entry
+  stop the unpartitioned probe makes. The caught-up case is free.
+
+The cost appears only where the feature is doing work, and it is the walk:
+with a lane at its cap the probe reads past that lane's queued rows to reach
+one it may take. Measured in the worst arrangement — a saturated tenant with
+**500 queued jobs sorting ahead of everybody**, tens of thousands of other
+queued rows behind them — that is **17 buffers and exactly 500 rows
+discarded** (`partitioned_claim_blocked`). The bound is the **held-back
+tenant's own backlog**, not the table's, and the gate fails if it ever
+becomes the latter.
+
+So the shape to avoid is one lane parked at its cap with an enormous backlog
+in front of the queue's ordering: every claim on that queue re-walks it. If
+that is your workload, give the hog its own queue, or raise its lane's share
+so the backlog drains.
+
 ---
 
 ## Sizing

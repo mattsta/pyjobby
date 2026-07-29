@@ -113,10 +113,10 @@ ENQUEUE_SQL = """
         capability, uid, run_group,
         waitfor_job, waitfor_group,
         deadline_key, admin_data, tags, state, schedule_id,
-        identity_key, debounce_key, debounce_deadline
+        identity_key, debounce_key, debounce_deadline, partition_key
     )
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-            $16, $17, $18)
+            $16, $17, $18, $19)
     RETURNING id
 """
 
@@ -168,10 +168,10 @@ ENQUEUE_IDENTIFIED_SQL = """
             capability, uid, run_group,
             waitfor_job, waitfor_group,
             deadline_key, admin_data, tags, state, schedule_id,
-            identity_key, debounce_key, debounce_deadline
+            identity_key, debounce_key, debounce_deadline, partition_key
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                $15, $16, $17, $18)
+                $15, $16, $17, $18, $19)
         ON CONFLICT (identity_key) WHERE identity_key IS NOT NULL DO NOTHING
         RETURNING id, job_class
     )
@@ -266,10 +266,10 @@ ENQUEUE_DEBOUNCED_SQL = """
         capability, uid, run_group,
         waitfor_job, waitfor_group,
         deadline_key, admin_data, tags, state, schedule_id,
-        identity_key, debounce_key, debounce_deadline
+        identity_key, debounce_key, debounce_deadline, partition_key
     )
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-            $16, $17, $18)
+            $16, $17, $18, $19)
     ON CONFLICT (debounce_key)
         WHERE debounce_key IS NOT NULL AND state = 'queued' AND run_count = 0
         DO NOTHING
@@ -287,7 +287,7 @@ ENQUEUE_BATCH_SQL = """
         capability, uid, run_group,
         waitfor_job, waitfor_group,
         deadline_key, admin_data, tags, state, schedule_id,
-        identity_key, debounce_key, debounce_deadline
+        identity_key, debounce_key, debounce_deadline, partition_key
     )
     SELECT * FROM UNNEST(
         $1::text[], $2::jsonb[], $3::text[], $4::int[],
@@ -295,7 +295,7 @@ ENQUEUE_BATCH_SQL = """
         $8::bigint[], $9::bigint[], $10::bigint[],
         $11::text[], $12::jsonb[], $13::jsonb[],
         $14::jorbstate[], $15::bigint[], $16::text[],
-        $17::text[], $18::timestamptz[]
+        $17::text[], $18::timestamptz[], $19::text[]
     )
     RETURNING id
 """
@@ -411,6 +411,19 @@ _KEYS_CONTRADICT: Final = (
     "promise you want (docs/writing-jobs.md, 'Choosing your dedupe "
     "primitive')."
 )
+
+#: Longest ``partition_key`` an enqueue accepts.
+#:
+#: A partition key is a GROUPING KEY read inside the serialised claim
+#: section, not a payload: on a queue with ``partition_limits`` every
+#: saturated lane's key is carried in an array that the claim's per-row test
+#: probes, so an unbounded key would put an unbounded string into the one
+#: critical section that sets a capped queue's whole ceiling. 256 characters
+#: is far past every real lane name (a tenant id, an account, an api key, a
+#: region) and short enough that a thousand saturated lanes is still a small
+#: array. Refused at the door, where the caller can still be told, rather
+#: than accepted and paid for on every claim forever.
+MAX_PARTITION_KEY_LENGTH: Final = 256
 
 #: Why a debounced job cannot also wait on something. `waitfor_job` /
 #: `waitfor_group` insert the row as 'waiting', and jorb_debounce_idx covers
@@ -1020,6 +1033,7 @@ class JobClient:
         waitfor_group: int | None = None,
         deadline_key: str | None = None,
         identity_key: str | None = None,
+        partition_key: str | None = None,
         admin_data: dict[str, Any] | None = None,
         tags: dict[str, Any] | None = None,
         # result storage & passing
@@ -1069,6 +1083,15 @@ class JobClient:
                 need uniqueness beyond `--retention-days`. Use
                 enqueue_identified() when you must know which of the two
                 happened (default: None)
+            partition_key: The FAIR-SHARE LANE this job belongs to — a
+                tenant, an account, an api key. Inert unless the job's queue
+                has `partition_limits` set (`pj-admin queues limits QUEUE
+                --partition-limits`), and on such a queue the queue's
+                max_concurrency and rate_limit are counted PER lane, so one
+                tenant cannot starve the rest. Jobs with no key form ONE lane
+                of their own: never hidden, never refused for being
+                unlabelled. Inherited by a fork, like uid and tags. Max
+                MAX_PARTITION_KEY_LENGTH characters (default: None)
             admin_data: Metadata dict (default: None)
             tags: The caller's OWN labels — customer, tenant, region, batch —
                 as a flat dict of string keys to scalar values, filterable
@@ -1106,7 +1129,8 @@ class JobClient:
             ValueError: If both waitfor_job and waitfor_group specified, if
                 on_timeout is neither 'retry' nor 'fail', if priority is
                 above this client's worker priority ceiling, if tags are
-                not a flat dict of string keys to scalar values, or if
+                not a flat dict of string keys to scalar values, if
+                partition_key is longer than MAX_PARTITION_KEY_LENGTH, or if
                 identity_key names an existing job of a DIFFERENT job_class
 
         Examples:
@@ -1177,6 +1201,7 @@ class JobClient:
                     waitfor_group=waitfor_group,
                     deadline_key=deadline_key,
                     identity_key=identity_key,
+                    partition_key=partition_key,
                     admin_data=admin_data,
                     tags=tags,
                     save_result=save_result,
@@ -1645,6 +1670,7 @@ class JobClient:
         identity_key: str | None = None,
         debounce_key: str | None = None,
         debounce_deadline: datetime | None = None,
+        partition_key: str | None = None,
         admin_data: dict[str, Any] | None = None,
         tags: dict[str, Any] | None = None,
         save_result: bool = True,
@@ -1706,6 +1732,19 @@ class JobClient:
             raise ValueError(
                 "debounce_deadline without debounce_key: the cap bounds a "
                 "collapse window, and there is no window without a key"
+            )
+
+        # Bounded here because here is the last place a caller exists to be
+        # told: past this point the key is a row, and the cost of an oversized
+        # one is paid by every claim on that queue rather than by the enqueue
+        # that wrote it.
+        if partition_key is not None and len(partition_key) > MAX_PARTITION_KEY_LENGTH:
+            raise ValueError(
+                f"partition_key is {len(partition_key)} characters, above the "
+                f"{MAX_PARTITION_KEY_LENGTH} the platform accepts: it names a "
+                f"fair-share LANE (a tenant, an account, an api key) and is "
+                f"read inside the serialised claim section, so it is a label "
+                f"and not a payload"
             )
 
         validate_priority(priority, prio_ceiling)
@@ -1806,6 +1845,7 @@ class JobClient:
             identity_key,
             debounce_key,
             debounce_deadline,
+            partition_key,
         ]
 
     async def enqueue_batch(

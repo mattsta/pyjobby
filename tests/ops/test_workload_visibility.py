@@ -185,3 +185,127 @@ class TestExactConcurrencyLimit:
             await asyncio.sleep(0.05)
         else:
             pytest.fail("queue did not drain under the cap")
+
+
+class TestExactPartitionedConcurrencyLimit:
+    async def test_each_partition_gets_its_own_cap_against_a_racing_fleet(
+        self, fleet, admin, db_pool, unique_queue
+    ):
+        """The same exactness promise, re-scoped: one in flight PER LANE.
+
+        Queue-wide, four workers on a cap of 1 share one slot and the three
+        tenants take turns. With `--partition-limits` the same cap means one
+        slot EACH, so the fleet runs three jobs at once and no lane ever holds
+        two -- both halves sampled here, because either alone is satisfiable
+        by a bug: a cap that never binds passes the exactness check, and a cap
+        that binds queue-wide passes the concurrency check.
+
+        The third lane is deliberately the NULL one. Unlabelled work is the
+        case a per-key scheme silently loses, and a fleet is where it would
+        show up as jobs that simply never run.
+        """
+        limits = admin(
+            "queues",
+            "limits",
+            unique_queue,
+            "--max-concurrency",
+            "1",
+            "--partition-limits",
+        )
+        assert limits.returncode == 0, limits.stdout + limits.stderr
+
+        fleet.worker(unique_queue, workers=4)
+        await wait_until(
+            lambda: registered_workers(db_pool, unique_queue),
+            describe="workers registered",
+            timeout=30,
+        )
+        client = JobClient(pool=db_pool)
+        lanes: tuple[str | None, ...] = ("tenant-a", "tenant-b", None)
+        # Two per lane, and long enough that a lane stays saturated for
+        # SECONDS: `jobs why` below is a subprocess, and a job that finishes
+        # while it runs answers about a state the test is not asking about.
+        job_ids = [
+            await client.enqueue(
+                "tests.dxe_jobs.SlowJob",
+                queue=unique_queue,
+                seconds=2,
+                partition_key=lane,
+            )
+            for lane in lanes
+            for _ in range(2)
+        ]
+
+        # Sample the in-flight count PER LANE the whole way down the drain.
+        max_per_lane: dict[str | None, int] = {}
+        lanes_at_once = 0
+        held_back: dict | None = None
+        rejected: list[str] = []
+        for _ in range(600):
+            rows = await db_pool.fetch(
+                "SELECT partition_key, count(*) AS n FROM jorb "
+                "WHERE id = ANY($1) AND state IN ('claimed', 'running') "
+                "GROUP BY partition_key",
+                job_ids,
+            )
+            for row in rows:
+                lane, n = row["partition_key"], row["n"]
+                max_per_lane[lane] = max(max_per_lane.get(lane, 0), n)
+                assert n <= 1, f"lane {lane!r} held {n} jobs against a cap of 1"
+            lanes_at_once = max(lanes_at_once, len(rows))
+            if held_back is None:
+                # Ask the platform about a job whose own lane is busy, WHILE
+                # it is busy: this reason only exists in flight, and asking
+                # after the drain gets the terminal answer instead.
+                waiting = await db_pool.fetchval(
+                    "SELECT id FROM jorb WHERE id = ANY($1) AND state = 'queued' "
+                    "AND partition_key IS NOT DISTINCT FROM ("
+                    "  SELECT partition_key FROM jorb WHERE id = ANY($1) "
+                    "   AND state IN ('claimed', 'running') LIMIT 1) LIMIT 1",
+                    job_ids,
+                )
+                if waiting is not None:
+                    answer = json.loads(
+                        admin("jobs", "why", str(waiting), "--json").stdout
+                    )
+                    # `jobs why` is a subprocess, so the job it was asked
+                    # about may have been claimed while it ran -- that answer
+                    # is about a different state and is retried, not accepted.
+                    if answer["reason"] == "queue_at_max_concurrency":
+                        held_back = answer
+                    else:
+                        rejected.append(answer["reason"])
+            done = await db_pool.fetchval(
+                "SELECT count(*) = $2 FROM jorb WHERE id = ANY($1) "
+                "AND state = 'finished'",
+                job_ids,
+                len(job_ids),
+            )
+            if done:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            pytest.fail("the partitioned queue did not drain under the caps")
+
+        assert lanes_at_once > 1, (
+            "never more than one lane ran at a time: the cap is still being "
+            "counted queue-wide, so partitioning bought nothing"
+        )
+        assert set(max_per_lane) == set(lanes), (
+            f"only {sorted(max_per_lane, key=str)} ever ran -- a lane was "
+            f"starved for the whole drain (the NULL lane is a lane)"
+        )
+
+        assert held_back is not None, (
+            "no job waiting behind its own lane's cap was ever explained as "
+            "queue_at_max_concurrency -- `jobs why` cannot see the per-lane "
+            f"count. What it answered instead: {rejected}"
+        )
+        assert held_back["details"]["partition_limits"] is True
+        assert held_back["details"]["inflight"] == 1, (
+            f"the count reported is the queue's, not the lane's: {held_back}"
+        )
+
+        # A lane at its cap is BACKLOG, not work the fleet cannot see: doctor's
+        # unclaimable sweep must stay silent through all of it.
+        assert "WARN unclaimable" not in admin("doctor").stdout
