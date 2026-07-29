@@ -282,18 +282,18 @@ and nothing anywhere else. Naming a second queue adds four more on it —
 each — so adding a queue never changes the capacity of the queues you already
 named.
 
-| Flag                | Default       | What it decides                                        |
-| ------------------- | ------------- | ------------------------------------------------------ |
-| `--queue`           | `default`     | a queue to staff; repeatable, duplicates collapse      |
-| `--cap`             | none          | capabilities this host advertises; repeatable          |
+| Flag                | Default       | What it decides                                                                                   |
+| ------------------- | ------------- | ------------------------------------------------------------------------------------------------- |
+| `--queue`           | `default`     | a queue to staff; repeatable, duplicates collapse                                                 |
+| `--cap`             | none          | capabilities this host advertises; repeatable                                                     |
 | `--workers`         | CPU count / 2 | worker processes **per queue** (`pj --help` prints the value computed for the machine it runs on) |
-| `--max-prio`        | 1000          | priority ceiling; jobs above it are not claimed        |
-| `--max-retries`     | 10            | attempts before a job is dead-lettered (`crashed`)     |
-| `--default-timeout` | 3600          | fallback job timeout in seconds; `0` disables          |
-| `--check-interval`  | 5.0           | idle poll interval; LISTEN/NOTIFY wakes workers sooner |
-| `--job-threads`     | 8             | this worker's own job-thread pool                      |
-| `--path`            | `.`           | extra import paths for job classes; repeatable         |
-| `--reload`          | off           | re-import a job module when its source changes         |
+| `--max-prio`        | 1000          | priority ceiling; jobs above it are not claimed                                                   |
+| `--max-retries`     | 10            | attempts before a job is dead-lettered (`crashed`)                                                |
+| `--default-timeout` | 3600          | fallback job timeout in seconds; `0` disables                                                     |
+| `--check-interval`  | 5.0           | idle poll interval; LISTEN/NOTIFY wakes workers sooner                                            |
+| `--job-threads`     | 8             | this worker's own job-thread pool                                                                 |
+| `--path`            | `.`           | extra import paths for job classes; repeatable                                                    |
+| `--reload`          | off           | re-import a job module when its source changes                                                    |
 
 Leave `--reload` off in production: on it re-executes module code on every
 job.

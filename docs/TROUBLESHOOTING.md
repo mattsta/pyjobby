@@ -543,7 +543,7 @@ Retries re-run `task()` from the beginning unless the job checkpoints its
 work. That is the design: at-least-once execution, with the tools to make
 it exactly-once where it matters.
 
-First rule out the one *configuration* that repeats every long job: a
+First rule out the one _configuration_ that repeats every long job: a
 monitor `--liveness-grace` at or below the worker heartbeat interval (10s
 default, `pj --heartbeat-interval`). Live workers then look dead between
 beats and their in-flight jobs are requeued mid-run, over and over — the
