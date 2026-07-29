@@ -374,6 +374,15 @@ A job claimed by a worker that never managed to register at all has no
 heartbeat to judge by; the monitor requeues those by claim AGE instead,
 after `--claimed-grace` (300s default).
 
+Tuning either half of that: workers heartbeat every 10s
+(`pj --heartbeat-interval`), and `--liveness-grace` must stay comfortably
+above it — keep the default 6× ratio when lowering both for faster
+failover. A grace the heartbeat cannot reliably beat declares **live**
+workers dead between beats and requeues their in-flight jobs out from
+under them, over and over; no job longer than the grace ever finishes,
+while the monitor logs `Requeued job ... from dead worker` for workers
+that are fine. The monitor warns at startup when configured that way.
+
 **A job is stuck running / hung.** `pj-admin jobs inspect ID` — if past its
 `timeout_at`, the monitor will retry/dead-letter it per its `on_timeout`
 policy. To intervene now: `pj-admin jobs cancel ID` (running jobs receive

@@ -1353,6 +1353,22 @@ async def monitor(
         f"checkpoint retention {window(checkpoint_retention_days)})"
     )
 
+    # A grace at or below the heartbeat cadence declares LIVE workers dead
+    # between beats: their in-flight jobs are requeued out from under them,
+    # over and over, and no job longer than the grace can ever finish. The
+    # monitor cannot see what --heartbeat-interval the workers actually run
+    # with, so this judges against the default and says so.
+    if liveness_grace_seconds < 2 * db.DEFAULT_HEARTBEAT_INTERVAL_SECONDS:
+        logger.warning(
+            f"--liveness-grace {liveness_grace_seconds:g}s is under twice the "
+            f"default worker heartbeat interval "
+            f"({db.DEFAULT_HEARTBEAT_INTERVAL_SECONDS:g}s, pj "
+            f"--heartbeat-interval). A grace the heartbeat cannot reliably "
+            f"beat makes LIVE workers look dead mid-job and requeues their "
+            f"jobs out from under them, repeatedly. Ignore this only if the "
+            f"whole fleet runs a proportionally faster heartbeat."
+        )
+
     try:
         while not stop.is_set():
             timed_out = await _run_sweep(

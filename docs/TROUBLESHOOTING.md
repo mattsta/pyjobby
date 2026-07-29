@@ -543,6 +543,15 @@ Retries re-run `task()` from the beginning unless the job checkpoints its
 work. That is the design: at-least-once execution, with the tools to make
 it exactly-once where it matters.
 
+First rule out the one *configuration* that repeats every long job: a
+monitor `--liveness-grace` at or below the worker heartbeat interval (10s
+default, `pj --heartbeat-interval`). Live workers then look dead between
+beats and their in-flight jobs are requeued mid-run, over and over — the
+signature is the monitor logging `Requeued job ... from dead worker` for
+workers that are alive, `run_count` climbing on jobs that never finish,
+and a monitor startup WARNING naming the two flags. Raise the grace
+(default 60s, 6× the heartbeat).
+
 - **Durable steps** — `self.step(...)` records each completed step, and a
   completed step never runs twice, fenced by `run_epoch` against a zombie
   execution. This is the real answer for side effects. See

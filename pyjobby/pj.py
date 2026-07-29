@@ -391,7 +391,7 @@ class JobSystem:
     # Maximum attempts before terminal 'crashed' (one home: retry_strategies)
     max_retries: int = DEFAULT_MAX_RETRIES
     default_timeout: int = 3600  # Default job timeout in seconds (1 hour)
-    heartbeat_interval: float = 10.0  # seconds between registry heartbeats
+    heartbeat_interval: float = db.DEFAULT_HEARTBEAT_INTERVAL_SECONDS
     # Size of this worker's own job-thread pool, and therefore the number of
     # ABANDONED job threads it tolerates before it stops claiming and says so.
     # A worker runs one job at a time, so anything above 1 is headroom for
@@ -2263,6 +2263,7 @@ def runAndDone(
     reload_jobs: bool = False,
     job_threads: int = 8,
     max_prio: int = DEFAULT_PRIO_CEILING,
+    heartbeat_interval: float = db.DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
 ) -> None:
     """Run the JobSystem for this worker process.
 
@@ -2285,6 +2286,7 @@ def runAndDone(
         default_timeout=default_timeout,
         reload_jobs=reload_jobs,
         job_threads=job_threads,
+        heartbeat_interval=heartbeat_interval,
         _launcher_pid=launcher_pid,
     )
 
@@ -2373,6 +2375,16 @@ def runAndDone(
     show_default=True,
 )
 @click.option(
+    "--heartbeat-interval",
+    default=db.DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+    help="Seconds between worker registry heartbeats (jorb_worker.last_seen). "
+    "The monitor's --liveness-grace judges death against this cadence and "
+    "must stay comfortably above it -- a grace below the heartbeat interval "
+    "makes live workers look dead mid-job and their jobs get requeued out "
+    "from under them",
+    show_default=True,
+)
+@click.option(
     "--reload",
     "reload_jobs",
     is_flag=True,
@@ -2402,6 +2414,7 @@ def workit(
     default_timeout: int,
     check_interval: float,
     job_threads: int,
+    heartbeat_interval: float,
     reload_jobs: bool,
     v: bool,
     config: str,
@@ -2542,6 +2555,7 @@ def workit(
                 "check_interval": check_interval,
                 "reload_jobs": reload_jobs,
                 "job_threads": job_threads,
+                "heartbeat_interval": heartbeat_interval,
                 "max_prio": max_prio,
             },
         )

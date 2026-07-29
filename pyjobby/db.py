@@ -46,6 +46,16 @@ class JobState(enum.StrEnum):
 #
 # ``pj-bench notify`` asserts these against the running database's triggers.
 
+#: Seconds between worker registry heartbeats (``pj --heartbeat-interval``).
+#: It lives HERE because two different processes have to agree about it: the
+#: worker writes ``jorb_worker.last_seen`` on this cadence, and the monitor's
+#: ``--liveness-grace`` judges staleness against it. A grace below the
+#: heartbeat interval makes every LIVE worker look dead between beats -- the
+#: monitor then requeues in-flight jobs from workers that are fine, over and
+#: over, and no job longer than the grace can ever finish. The monitor warns
+#: at startup when the two are configured into that state.
+DEFAULT_HEARTBEAT_INTERVAL_SECONDS: Final[float] = 10.0
+
 #: A claimable job appeared on a queue some worker has published demand for
 #: (payload: the queue name). The wakeup an idle worker sleeps on.
 CHANNEL_ENQUEUED: Final[str] = "jorb_enqueued"
