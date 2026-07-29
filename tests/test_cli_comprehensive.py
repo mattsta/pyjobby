@@ -1233,6 +1233,44 @@ class TestHelperFunctions:
         for cell in ("ID", "Status", "test", "inactive"):
             assert cell in out
 
+    def test_print_table_pads_by_visible_width_not_ansi_length(self, capsys):
+        """Colored cells must not skew the columns after them.
+
+        `jobs steps` and `schedule history` color their status cells; the
+        column math has to measure what the terminal SHOWS. Measured with
+        len(), a colored "ok" pads its column to the escape codes' length
+        and every later column drifts under the wrong header -- the exact
+        misalignment the docs-only usability audit reported.
+        """
+        from pyjobby.cli import print_table
+        from pyjobby.termout import Colors
+
+        ok = f"{Colors.OKGREEN}ok{Colors.ENDC}"
+        print_table(
+            ["Seq", "Status", "Duration"],
+            [["1", ok, "0.001s"], ["2", "timeout", "9.000s"]],
+        )
+        lines = capsys.readouterr().out.splitlines()
+        # Both data rows must place Duration at the same visible offset.
+        # (click strips the codes itself on a non-tty, so alignment is the
+        # whole observable claim here: the padding math must strip them too,
+        # or the colored row's later columns land short of the header.)
+        import re
+
+        plain = [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in lines]
+        assert plain[2].index("0.001s") == plain[3].index("9.000s")
+
+    def test_print_table_truncation_never_slices_an_escape_code(self, capsys):
+        """A colored cell wider than its column loses the color whole --
+        slicing mid-sequence would bleed color over the rest of the table."""
+        from pyjobby.cli import print_table
+
+        wide = "\x1b[92m" + "x" * 200 + "\x1b[0m"
+        print_table(["A", "B"], [[wide, "b"]])
+        data_row = capsys.readouterr().out.splitlines()[2]
+        assert "xxx" in data_row
+        assert "\x1b[92m" not in data_row
+
 
 # ============================================================================
 # Test Error Handling

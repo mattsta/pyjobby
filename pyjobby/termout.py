@@ -12,6 +12,7 @@ two modules wrote them, and a copy in each is how they drift.
 
 from __future__ import annotations
 
+import re
 from typing import NoReturn
 
 import click
@@ -45,17 +46,34 @@ def print_warning(msg: str) -> None:
     click.echo(f"{Colors.WARNING}{msg}{Colors.ENDC}")
 
 
+#: ANSI SGR sequences (the color codes Colors.* emit). Table layout must
+#: measure what the TERMINAL shows, not what Python stores: a colored "ok"
+#: is two visible characters wrapped in ~13 invisible ones, and measuring
+#: with len() both over-pads its column and lets the truncating slice cut
+#: an escape sequence in half, bleeding color into the rest of the table.
+_ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _fit(cell: str, width: int) -> str:
+    """`cell` padded (or truncated) to `width` VISIBLE characters."""
+    plain = _ANSI_SGR.sub("", cell)
+    if len(plain) > width:
+        # Truncation drops the color rather than risk slicing a code.
+        return plain[:width]
+    return cell + " " * (width - len(plain))
+
+
 def print_table(headers: list[str], rows: list[list[str]], max_width: int = 80) -> None:
     """Print data as formatted table"""
     if not rows:
         print_warning("No data to display")
         return
 
-    # Calculate column widths
+    # Calculate column widths from VISIBLE lengths
     col_widths = [len(h) for h in headers]
     for row in rows:
         for i, cell in enumerate(row):
-            col_widths[i] = max(col_widths[i], len(str(cell)))
+            col_widths[i] = max(col_widths[i], len(_ANSI_SGR.sub("", str(cell))))
 
     # Limit column widths to fit terminal
     for i in range(len(col_widths)):
@@ -71,8 +89,7 @@ def print_table(headers: list[str], rows: list[list[str]], max_width: int = 80) 
     # Print rows
     for row in rows:
         row_str = "  ".join(
-            str(cell)[: col_widths[i]].ljust(col_widths[i])
-            for i, cell in enumerate(row)
+            _fit(str(cell), col_widths[i]) for i, cell in enumerate(row)
         )
         click.echo(row_str)
 
