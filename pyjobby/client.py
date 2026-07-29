@@ -40,7 +40,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import TracebackType
@@ -606,9 +606,11 @@ class JobClient:
         self._db_params = db_params
         self._listener_conn: asyncpg.Connection | None = None
         self._listener_lock = asyncio.Lock()
-        # waiters keyed by job id ('jorb_done') / (job_id, key) ('jorb_event')
+        # waiters keyed by job id ('jorb_done') / (job_id, key) ('jorb_event',
+        # 'jorb_stream')
         self._done_waiters: dict[int, list[asyncio.Event]] = {}
         self._event_waiters: dict[tuple[int, str], list[asyncio.Event]] = {}
+        self._stream_waiters: dict[tuple[int, str], list[asyncio.Event]] = {}
 
     @classmethod
     async def create(
@@ -1583,6 +1585,7 @@ class JobClient:
                 try:
                     await conn.add_listener(db.CHANNEL_DONE, self._on_jorb_done)
                     await conn.add_listener(db.CHANNEL_EVENT, self._on_jorb_event)
+                    await conn.add_listener(db.CHANNEL_STREAM, self._on_jorb_stream)
                 except BaseException:
                     # never leak the half-registered connection
                     with contextlib.suppress(Exception):
@@ -1607,9 +1610,18 @@ class JobClient:
             for waiter in self._event_waiters.get((data["job_id"], data["key"]), ()):
                 waiter.set()
 
-    # Registering demand for the gated notification channels. jorb_done and
-    # jorb_event are only emitted for a job somebody is waiting on, so
-    # waiting means SAYING SO FIRST — this is the client half of the
+    def _on_jorb_stream(
+        self, _conn: Any, _pid: int, _channel: str, payload: str
+    ) -> None:
+        """NOTIFY 'jorb_stream' payload: {"job_id": N, "key": K}."""
+        with contextlib.suppress(Exception):
+            data = json.loads(payload)
+            for waiter in self._stream_waiters.get((data["job_id"], data["key"]), ()):
+                waiter.set()
+
+    # Registering demand for the gated notification channels. jorb_done,
+    # jorb_event and jorb_stream are only emitted for a job somebody is
+    # waiting on, so waiting means SAYING SO FIRST — the client half of the
     # ordering argument written out in sql/schema/90_notify.sql. `AND NOT awaited`
     # makes every registration after the first a no-op at the server. The
     # latch is not a refcount: for a job that terminates it simply dies
@@ -1625,6 +1637,98 @@ class JobClient:
     _REGISTER_DEMAND_SQL = (
         "UPDATE jorb SET awaited = TRUE WHERE id = $1 AND NOT awaited"
     )
+
+    async def _register_demand(
+        self,
+        waiters: dict[Any, list[asyncio.Event]],
+        key: Any,
+        job_id: int,
+        register_demand: bool = True,
+    ) -> asyncio.Event | None:
+        """Say this client is waiting, and return the Event it parks on.
+
+        None when the client has no listener (pure-polling mode) or the
+        caller asked for no registration. ONE implementation, because every
+        waiting API here — the single-answer `_poll_until` and the streaming
+        reader — has to register in the same order and release the same way,
+        and two copies of that would drift.
+
+        Deliberately a pair of plain methods rather than one async context
+        manager: `read_stream` is an async GENERATOR, and closing one throws
+        `GeneratorExit` at its `yield` — which an `async with` around that
+        yield cannot unwind cleanly. A `try/finally` can.
+
+        Demand is registered BEFORE the caller's first look at the state,
+        never after: a change landing between the look and the registration
+        would be one this client is neither told about nor has already seen.
+        `register_demand=False` is for a wait with no per-job NOTIFY channel
+        (a group wait, whose `job_id` is a run_group and not a job id): it
+        then pure-polls without writing to `jorb` and without a dead waiter
+        Event nothing dispatches to.
+        """
+        waiter: asyncio.Event | None = None
+        if register_demand and not self.listening and not self._polling_reported:
+            # Once per client, not per wait: a pool-only client polls every
+            # wait at _PURE_POLL_INTERVAL by design, and nothing else ever
+            # says so — a team following the shared-pool construction found
+            # out from pg_stat_activity.
+            self._polling_reported = True
+            logger.info(
+                "JobClient was built without db_params: waits poll at "
+                f"{self._PURE_POLL_INTERVAL}s instead of riding "
+                "LISTEN/NOTIFY. Pass db_params (or use create()/"
+                "from_config()) for push latency."
+            )
+        if register_demand and await self._ensure_listener():
+            await self.pool.execute(self._REGISTER_DEMAND_SQL, job_id)
+            waiter = asyncio.Event()
+            waiters.setdefault(key, []).append(waiter)
+        return waiter
+
+    def _release_demand(
+        self,
+        waiters: dict[Any, list[asyncio.Event]],
+        key: Any,
+        waiter: asyncio.Event | None,
+    ) -> None:
+        """Drop this wait's Event, and the key with it when it was the last.
+
+        The `jorb.awaited` latch is deliberately NOT cleared: it is not a
+        refcount (see `_REGISTER_DEMAND_SQL`), and writing to the job row on
+        every finished wait is the polling this design exists to avoid.
+        """
+        if waiter is None:
+            return
+        entries = waiters.get(key)
+        if entries is not None:
+            with contextlib.suppress(ValueError):
+                entries.remove(waiter)
+            if not entries:
+                waiters.pop(key, None)
+
+    async def _wait_beat(
+        self, waiter: asyncio.Event | None, budget: float | None = None
+    ) -> None:
+        """Sleep until the next notification, the fallback poll, or `budget`.
+
+        The fallback is what makes every gated channel safe to miss: a
+        notification the demand race dropped costs latency, never an answer.
+        A client with no listener has nothing to be woken by and polls
+        faster instead.
+        """
+        interval = (
+            self._LISTEN_POLL_INTERVAL
+            if waiter is not None
+            else self._PURE_POLL_INTERVAL
+        )
+        if budget is not None:
+            interval = min(interval, budget)
+        if waiter is not None:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(waiter.wait(), interval)
+            waiter.clear()
+        else:
+            await asyncio.sleep(interval)
 
     async def _poll_until(
         self,
@@ -1642,71 +1746,28 @@ class JobClient:
         a 2s fallback poll), or plain-sleep when no listener is configured.
         The check ALWAYS runs once before any waiting — the condition may
         already hold.
-
-        Demand for `job_id` is registered before that first check and only
-        when a listener exists: a pure-polling client depends on no
-        notification, so it asks for none. Pass ``register_demand=False``
-        for a wait that has no per-job NOTIFY channel (a group wait, whose
-        `job_id` is a run_group not a job id): it then pure-polls without
-        writing to `jorb` and without a dead waiter Event nothing dispatches.
         """
         loop = asyncio.get_running_loop()
         deadline = None if timeout is None else loop.time() + timeout
 
-        waiter: asyncio.Event | None = None
-        if register_demand and not self.listening and not self._polling_reported:
-            # Once per client, not per wait: a pool-only client polls every
-            # wait at _PURE_POLL_INTERVAL by design, and nothing else ever
-            # says so — a team following the shared-pool construction found
-            # out from pg_stat_activity.
-            self._polling_reported = True
-            logger.info(
-                "JobClient was built without db_params: waits poll at "
-                f"{self._PURE_POLL_INTERVAL}s instead of riding "
-                "LISTEN/NOTIFY. Pass db_params (or use create()/"
-                "from_config()) for push latency."
-            )
-        if register_demand and await self._ensure_listener():
-            # BEFORE the first check, never after: a terminal state reached
-            # between the check and the registration would be one this
-            # client is neither told about nor has already seen.
-            await self.pool.execute(self._REGISTER_DEMAND_SQL, job_id)
-            waiter = asyncio.Event()
-            waiters.setdefault(key, []).append(waiter)
-
+        waiter = await self._register_demand(waiters, key, job_id, register_demand)
         try:
             while True:
                 value = await check()
                 if value is not _PENDING:
                     return value
 
-                interval = (
-                    self._LISTEN_POLL_INTERVAL
-                    if waiter is not None
-                    else self._PURE_POLL_INTERVAL
-                )
+                remaining = None
                 if deadline is not None:
                     remaining = deadline - loop.time()
                     if remaining <= 0:
                         raise TimeoutError(
                             f"timed out after {timeout}s waiting for {what}"
                         )
-                    interval = min(interval, remaining)
 
-                if waiter is not None:
-                    with contextlib.suppress(TimeoutError):
-                        await asyncio.wait_for(waiter.wait(), interval)
-                    waiter.clear()
-                else:
-                    await asyncio.sleep(interval)
+                await self._wait_beat(waiter, remaining)
         finally:
-            if waiter is not None:
-                entries = waiters.get(key)
-                if entries is not None:
-                    with contextlib.suppress(ValueError):
-                        entries.remove(waiter)
-                    if not entries:
-                        waiters.pop(key, None)
+            self._release_demand(waiters, key, waiter)
 
     async def wait_for_result(self, job_id: int, timeout: float | None = None) -> Any:
         """
@@ -1903,6 +1964,145 @@ class JobClient:
             f"event {key!r} on job {job_id}",
             job_id=job_id,
         )
+
+    # Rows one read takes at a time. A reader that has fallen behind a fast
+    # producer (or started at offset 0 on a long stream) drains in batches
+    # rather than materialising the whole stream in one fetch — the loop
+    # keeps reading while a batch comes back full, so batching costs a round
+    # trip per batch and bounds memory instead of the other way round.
+    _STREAM_READ_BATCH: Final[int] = 1000
+
+    #: A page of one job's stream from `offset` upward. Served as a range
+    #: scan of jorb_stream's primary key (job_id, key, seq), which is why the
+    #: sequence is dense: a reader resumes by NUMBER, holding no cursor and
+    #: no server-side state between beats.
+    _READ_STREAM_SQL = """SELECT seq, value, closed
+             FROM jorb_stream
+            WHERE job_id = $1 AND key = $2 AND seq >= $3
+            ORDER BY seq
+            LIMIT $4"""
+
+    async def read_stream(
+        self, job_id: int, key: str, *, offset: int = 0
+    ) -> AsyncGenerator[Any]:
+        """Yield a job's stream values in order, from `offset` upward, as they
+        are written.
+
+        Jobs append with `await self.stream_write(key, value)`; this is the
+        client-side reader. It rides the shared 'jorb_stream' LISTEN
+        connection (the same one as `wait_for_result`) with a 2-second
+        fallback poll, and pool-only clients poll.
+
+        The reader is RESUMABLE because positions are dense and 0-based:
+        count what you consumed and pass it back as `offset` to pick up
+        exactly where you stopped, with no cursor held anywhere.
+
+        It stops on the first of:
+
+        * the closing marker `stream_close(key)` wrote — end of stream,
+          declared by the job;
+        * the job reaching a terminal state. A cancel or a timeout ends a job
+          out of band while a fenced-out execution may still believe it is
+          writing, so a terminal job's stream is over whether or not it was
+          closed. One final read happens after the terminal state is
+          observed, so a row committed just before the end is still
+          delivered.
+
+        `offset` past the end is not an error: the reader simply waits there
+        for rows that may never come, exactly as it would at position 0 of a
+        stream the job has not started writing.
+
+        Demand is registered ONCE for the whole read, not once per row —
+        which is the difference between this and a loop around
+        `get_stream()`: that loop would `UPDATE` the `jorb` row on every
+        pass, writing to the hottest table in the system to ask a question a
+        notification already answers.
+
+        Raises `JobError` if the job does not exist (a bad id, or retention
+        removed it) — nothing will ever append, so waiting only delays the
+        same answer. Bound a read with `asyncio.timeout()` around the loop;
+        a stream has no deadline of its own because the job's is the real one.
+
+        Example:
+            async for row in client.read_stream(job_id, 'progress'):
+                print(row)
+        """
+        next_seq = offset
+        # True once a terminal state has been observed: the loop makes ONE
+        # more pass to collect anything that committed in the window, then
+        # stops. Without it a row written microseconds before the terminal
+        # transition would be dropped by the reader that was watching for it.
+        final = False
+
+        waiter = await self._register_demand(
+            self._stream_waiters, (job_id, key), job_id
+        )
+        try:
+            while True:
+                rows = await self.pool.fetch(
+                    self._READ_STREAM_SQL,
+                    job_id,
+                    key,
+                    next_seq,
+                    self._STREAM_READ_BATCH,
+                )
+                for row in rows:
+                    if row["closed"]:
+                        return
+                    next_seq = row["seq"] + 1
+                    yield row["value"]
+
+                if len(rows) == self._STREAM_READ_BATCH:
+                    continue  # a full batch means there may be more, now
+                if final:
+                    return
+
+                state = await self.pool.fetchval(
+                    "SELECT state FROM jorb WHERE id = $1", job_id
+                )
+                if state is None:
+                    raise JobError(
+                        f"job {job_id} does not exist, so stream {key!r} will "
+                        f"never be written",
+                        job_id=job_id,
+                    )
+                if state in _TERMINAL_JOB_STATES:
+                    final = True
+                    continue
+
+                await self._wait_beat(waiter)
+        finally:
+            # runs on the caller's `break` (GeneratorExit at the yield) as
+            # well as on a normal end, which is what keeps a reader that
+            # stopped early from leaving a waiter behind
+            self._release_demand(self._stream_waiters, (job_id, key), waiter)
+
+    async def get_stream(self, job_id: int, key: str) -> dict[str, Any]:
+        """Snapshot one of a job's streams: `{"values": [...], "closed": bool}`.
+
+        The non-streaming read, for a caller that wants what has been written
+        so far and not a live feed — a report page, an assertion, a job that
+        has already finished. `values` are in order from position 0, and
+        `closed` says whether the job declared the stream finished.
+
+        Values after a closing marker are not reported, so this and
+        `read_stream()` agree about where a stream ends. A job that does not
+        exist (or never wrote this key) is an empty, unclosed snapshot rather
+        than an error: this is a query, not a wait, so there is nothing to
+        wait in vain for.
+        """
+        rows = await self.pool.fetch(
+            "SELECT value, closed FROM jorb_stream "
+            "WHERE job_id = $1 AND key = $2 ORDER BY seq",
+            job_id,
+            key,
+        )
+        values: list[Any] = []
+        for row in rows:
+            if row["closed"]:
+                return {"values": values, "closed": True}
+            values.append(row["value"])
+        return {"values": values, "closed": False}
 
     async def get_steps(self, job_id: int) -> list[dict[str, Any]]:
         """A job's recorded DXE checkpoints, oldest first.
@@ -3179,6 +3379,34 @@ class SyncJobClient:
         """Synchronous JobClient.get_steps()."""
         steps: list[dict[str, Any]] = self._run(self._client.get_steps(job_id))
         return steps
+
+    def read_stream(self, job_id: int, key: str, *, offset: int = 0) -> Iterator[Any]:
+        """Synchronous JobClient.read_stream(): a plain generator.
+
+        Each row costs one turn of the wrapped loop (`__anext__` is a
+        coroutine like any other method here), so the sync reader parks on
+        the same notification and the same fallback poll as the async one.
+        Closing the generator early — `break`, or an exception in the
+        caller's loop — closes the async one, releasing its demand
+        registration rather than leaving a waiter behind.
+        """
+        rows = self._client.read_stream(job_id, key, offset=offset)
+        try:
+            while True:
+                try:
+                    yield self._run(rows.__anext__())
+                except StopAsyncIteration:
+                    return
+        finally:
+            # A client closed while the caller still held the generator has
+            # already torn its loop down; there is nothing left to close on.
+            if not self._closed:
+                self._run(rows.aclose())
+
+    def get_stream(self, job_id: int, key: str) -> dict[str, Any]:
+        """Synchronous JobClient.get_stream()."""
+        snapshot: dict[str, Any] = self._run(self._client.get_stream(job_id, key))
+        return snapshot
 
     def queue_depth(self, queue: str | None = None) -> int:
         """Synchronous JobClient.queue_depth()."""

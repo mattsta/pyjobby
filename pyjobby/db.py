@@ -69,6 +69,11 @@ CHANNEL_DONE: Final[str] = "jorb_done"
 #: job being awaited.
 CHANNEL_EVENT: Final[str] = "jorb_event"
 
+#: A job appended to one of its durable streams (payload: {"job_id", "key"}),
+#: gated on the job being awaited exactly like ``jorb_event``. The wakeup a
+#: ``read_stream()`` reader parks on between rows.
+CHANNEL_STREAM: Final[str] = "jorb_stream"
+
 #: A RUNNING job was asked to stop (payload: the job id). The executing
 #: worker cancels the task at its next await point.
 CHANNEL_CANCEL: Final[str] = "jorb_cancel"

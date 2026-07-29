@@ -376,6 +376,8 @@ class TestSubcommandsEmitDocumentedJson:
             "expired_jobs_backlog",
             "checkpoint_jobs",
             "checkpoint_jobs_backlog",
+            "stream_jobs",
+            "stream_jobs_backlog",
             "mailbox",
             "mailbox_backlog",
             "history",
@@ -409,6 +411,11 @@ class TestSubcommandsEmitDocumentedJson:
             # are retryable and resume from checkpoints), on its own partial
             # index rather than the all-terminal one
             ("checkpoint_jobs", "jorb_finished_retention_idx"),
+            # streams share that window and that index; the existence probe
+            # into jorb_stream rides its primary key, which is why the table
+            # carries no index of its own
+            ("stream_jobs", "jorb_finished_retention_idx"),
+            ("stream_jobs", "jorb_stream_pkey"),
             ("mailbox_backlog", "jorb_mailbox_consumed_idx"),
             ("orphaned_dags_backlog", "jorb_dag_retention_idx"),
             ("schedule_log_backlog", "jorb_schedule_log_retention_idx"),

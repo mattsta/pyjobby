@@ -216,9 +216,9 @@ ceiling](#why-notify-set-the-ceiling)).
 
 What remains is gated on demand, which means the notification rate now scales
 with how many consumers are actually parked rather than with job throughput:
-`jorb_enqueued` fires only when a worker is idle on that queue, `jorb_done` and
-`jorb_event` only when a client is waiting, `jorb_cancel` only for a running
-job. Under load — the regime that fills the queue — almost nobody is parked, so
+`jorb_enqueued` fires only when a worker is idle on that queue, `jorb_done`,
+`jorb_event` and `jorb_stream` only when a client is waiting, `jorb_cancel`
+only for a running job. Under load — the regime that fills the queue — almost nobody is parked, so
 almost nothing is sent. There is no longer a channel to turn off for relief;
 the levers are the consumer side (find the listener that stopped draining) and
 the `notify_queue_usage` metric that warns before the cliff.
@@ -594,7 +594,9 @@ considered and rejected: none of them has a lifetime of its own to argue for
 five more ways for an install to be quietly wrong in a direction nobody
 checks. `--checkpoint-retention-days` stays separate because checkpoints
 genuinely do have their own lifetime: bulkiest rows in the system, useless
-the instant their job goes terminal.
+the instant their job goes terminal. `jorb_stream` joins that window rather
+than earning a third knob — a stream is read while the job runs and every
+reader stops at the terminal state, which is the same lifetime written out.
 
 ### `DELETE ... USING (a CTE of victims)`: rejected, measured, three times
 

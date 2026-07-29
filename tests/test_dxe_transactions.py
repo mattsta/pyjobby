@@ -35,7 +35,6 @@ from typing import Any
 
 import asyncpg
 import pytest
-import pytest_asyncio
 
 from pyjobby import dxe
 from pyjobby.db import requeue_job
@@ -170,21 +169,10 @@ async def enqueue(pool, queue: str, job_class: str, kwargs=None, admin=None) -> 
     return job_id
 
 
-@pytest_asyncio.fixture
-async def prepared_worker(db_params, unique_queue) -> Any:
-    """A JobSystem with a live connection and prepared statements, no loop.
-
-    The transaction/savepoint semantics are properties of the worker's
-    connection, so testing them needs the real connection and the real
-    prepared statements — but not the claim loop."""
-    system = JobSystem(
-        dsn=db_params, qname=unique_queue, capabilities=("test",), workerId=0
-    )
-    await system._connect_and_prepare()
-    try:
-        yield system
-    finally:
-        await system.cxn.close()
+# The `prepared_worker` fixture (a JobSystem with a real connection and real
+# prepared statements, but no claim loop) lives in conftest: the stream tests
+# need the same harness, and a second copy would drift from the worker's
+# actual startup path.
 
 
 # ============================================================================

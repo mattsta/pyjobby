@@ -858,6 +858,63 @@ async def test_a_dead_lettered_job_raises_at_the_waiter(
 
 
 # ===========================================================================
+# 11. Streaming a long job's output to a client that renders it live
+# ===========================================================================
+
+
+class ExportLedger(Job):
+    """Streams each page of an export as it is produced, then closes."""
+
+    async def task(self, account: int, pages: int = 3) -> dict[str, Any]:
+        for page in range(pages):
+            rows = await self.step(f"page-{page}", self.fetch_page, account, page)
+            await self.stream_write("pages", {"page": page, "rows": rows})
+            await asyncio.sleep(0.4)  # stands in for the work of a real page
+        await self.stream_close("pages")
+        return {"pages": pages}
+
+    def fetch_page(self, account: int, page: int) -> list[dict[str, Any]]:
+        FETCHES.append(page)
+        return [{"account": account, "id": page * 10 + n} for n in range(2)]
+
+
+async def test_the_client_renders_pages_while_the_job_is_still_running(
+    client, live_worker, unique_queue
+):
+    """The claim the example makes: output arrives DURING the run.
+
+    The job pauses between pages, so a reader that only worked once the job
+    had finished would fail this on the state assertion rather than pass it
+    slowly.
+    """
+    await live_worker()
+    FETCHES.clear()
+
+    job_id = await client.enqueue(
+        "tests.test_examples_doc.ExportLedger", queue=unique_queue, account=42
+    )
+
+    pages = []
+    async with asyncio.timeout(30):
+        async for page in client.read_stream(job_id, "pages"):
+            if not pages:
+                assert (await client.get_job(job_id)).state in ("claimed", "running")
+            pages.append(page)
+
+    assert [p["page"] for p in pages] == [0, 1, 2]
+    assert pages[0]["rows"] == [{"account": 42, "id": 0}, {"account": 42, "id": 1}]
+
+    row = await wait_for_job_state(client.pool, job_id, ("finished",))
+    assert row["result"] == {"pages": 3}
+    assert await client.get_stream(job_id, "pages") == {
+        "values": pages,
+        "closed": True,
+    }
+    # every page was produced once, by the one attempt that ran
+    assert FETCHES == [0, 1, 2]
+
+
+# ===========================================================================
 # The connection an admin call needs
 # ===========================================================================
 

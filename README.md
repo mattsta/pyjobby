@@ -66,7 +66,9 @@ class ProcessOrder(Job):
 - **Durable sleeps** are rows, not processes — a million sleeping jobs cost
   zero workers.
 - **Events** (`set_event` / `client.get_event`) publish live job state;
-  **mailboxes** (`send` / `recv`) give exactly-once job-to-job messaging.
+  **mailboxes** (`send` / `recv`) give exactly-once job-to-job messaging;
+  **streams** (`stream_write` / `client.read_stream`) give ordered, durable
+  output a client consumes while the job is still producing it.
 - **Cancellation reaches running jobs** (~1s via NOTIFY), cancelling the
   task at its next await point; `self.cancelled` for sync loops.
 - Every attempt of every job is recorded in `jorb_history`; every

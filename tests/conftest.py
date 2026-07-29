@@ -733,6 +733,31 @@ async def live_worker(db_params: dict[str, str], unique_queue: str):
             task.cancel()
 
 
+@pytest_asyncio.fixture
+async def prepared_worker(db_params: dict[str, str], unique_queue: str):
+    """A JobSystem with a live connection and prepared statements, no loop.
+
+    The DXE primitives that commit on the worker's OWN connection —
+    transaction(), and every primitive built on it — are properties of that
+    connection, so testing them needs the real connection and the real
+    prepared statements, but not the claim loop.
+
+    In conftest because two files need the same harness: a private copy
+    would drift from the worker's actual startup path, which is the one
+    thing this fixture exists to reproduce.
+    """
+    from pyjobby.pj import JobSystem
+
+    system = JobSystem(
+        dsn=db_params, qname=unique_queue, capabilities=("test",), workerId=0
+    )
+    await system._connect_and_prepare()
+    try:
+        yield system
+    finally:
+        await system.cxn.close()
+
+
 async def wait_for_job_state(
     conn: asyncpg.Connection,
     job_id: int,

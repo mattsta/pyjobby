@@ -806,17 +806,29 @@ circuit breaker, timezone handling — is in
 `pj-scheduler` is running; `doctor` warns about schedules overdue by more
 than five minutes for exactly that reason.
 
-## Mail and events have no CLI verb, on purpose
+## Mail, events and streams have no CLI verb, on purpose
 
-There is no `pj-admin mailbox`/`events` group. Durable mail and events are
-job-scoped data, and the job surfaces already carry them: a `recv()` or
-`sleep()` is a checkpoint, so `pj-admin jobs steps ID` shows it by its
-implicit name (`dxe.recv:<topic>`, `dxe.sleep`) with its status, and
+There is no `pj-admin mailbox`/`events`/`streams` group. Durable mail, events
+and streams are job-scoped data, and the job surfaces already carry them: a
+`recv()`, `sleep()` or `stream_write()` is a checkpoint, so `pj-admin jobs
+steps ID` shows it by its implicit name (`dxe.recv:<topic>`, `dxe.sleep`,
+`dxe.stream:<key>`, `dxe.stream-close:<key>`) with its status, and
 `client.get_event(job_id, key)` reads a published event. `doctor`'s
 `mailbox` check covers the aggregate failure (unread durable mail older
 than a day — a sender using a topic nothing `recv()`s). For anything
 finer, the `jorb_mailbox` table is the source of truth: `consumed_at` set
 means delivered.
+
+Streams work the same way, one level apart: `jobs steps` says what the job
+**attempted** — one `dxe.stream:<key>` checkpoint per write, in call order,
+whose output is the position that row took — and `jorb_stream` is the source
+of truth for the **values**, keyed `(job_id, key, seq)` with `closed = TRUE`
+on the end-of-stream marker. A checkpoint whose epoch is older than the job's
+current one is a write that fast-forwarded on a retry rather than one that
+appended twice, which is the question an operator reading a retried streaming
+job actually has. Reading the values back is
+`client.get_stream(job_id, key)`; retention reaps a finished job's stream on
+`--checkpoint-retention-days`, with its checkpoints.
 
 ## `dag`
 

@@ -566,6 +566,11 @@ class TestSyncFacadeParity:
         SyncMachine mirror test: a method added to JobClient without a sync
         wrapper is invisible until a script author calls it, and scripts
         are exactly the callers least likely to be covered by tests.
+
+        Async GENERATORS count as public async surface too (read_stream is
+        one): they are not coroutine functions, so a presence check written
+        only around `iscoroutinefunction` would wave every future streaming
+        method through unmirrored.
         """
         import inspect
 
@@ -582,7 +587,11 @@ class TestSyncFacadeParity:
         async_public = {
             name
             for name, member in vars(JobClient).items()
-            if not name.startswith("_") and inspect.iscoroutinefunction(member)
+            if not name.startswith("_")
+            and (
+                inspect.iscoroutinefunction(member)
+                or inspect.isasyncgenfunction(member)
+            )
         }
         sync_names = set(vars(SyncJobClient))
         missing = sorted(async_public - excluded - sync_names)

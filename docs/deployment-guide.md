@@ -586,8 +586,9 @@ cannot answer in that time must not hold one of the ten connections.
 For the database, give the platform a role that can write every `jorb*`
 table. It needs `DELETE` — retention is a delete — and it needs to create
 the schema on first deploy. Do not narrow it to `SELECT, INSERT, UPDATE`
-on `jorb` alone; the platform owns eleven tables (`jorb`, `jorb_queue`,
-`jorb_worker`, `jorb_step`, `jorb_event`, `jorb_mailbox`, `jorb_history`,
+on `jorb` alone; the platform owns twelve tables (`jorb`, `jorb_queue`,
+`jorb_worker`, `jorb_step`, `jorb_event`, `jorb_stream`, `jorb_mailbox`,
+`jorb_history`,
 `jorb_schedule`, `jorb_schedule_log`, `jorb_dag`, `jorb_dependencies`) plus
 `schema_migrations`, and the monitor deletes from most of them.
 

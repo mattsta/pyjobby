@@ -2,7 +2,8 @@
 
 Jobs gain durable primitives on the Job base class (``await self.step``,
 ``await self.sleep``, ``await self.set_event``, ``await self.send`` /
-``recv``); this module holds the exceptions and SQL those primitives share.
+``recv``, ``await self.stream_write`` / ``stream_close``); this module holds
+the exceptions and SQL those primitives share.
 
 Execution model:
 
@@ -168,6 +169,32 @@ SET_EVENT_SQL = """INSERT INTO jorb_event (job_id, key, value)
         RETURNING key"""
 
 GET_EVENT_SQL = """SELECT value FROM jorb_event WHERE job_id = $1 AND key = $2"""
+
+# Append one row to a job's stream, at the next free position, and return it.
+#
+# THE POSITION IS ASSIGNED IN THIS STATEMENT, never read back and reused: a
+# writer that SELECTed max(seq) and then INSERTed would have to loop until it
+# found a free slot, and a loop is the thing a dense sequence must not need.
+# COALESCE(max(seq), -1) + 1 makes the first row seq 0 and every later row the
+# one after the last, decided by the same snapshot that writes it.
+#
+# Run through Job.transaction(), so this row and its checkpoint commit
+# together: exactly-once per call site, and a replay fast-forwards on the
+# recorded seq rather than appending a second copy of the same value.
+#
+# Fenced on the WRITER's epoch, like every other durable write -- a superseded
+# execution's appends must not land in a stream a live attempt is still
+# writing, because a reader cannot tell the two writers apart.
+#
+# Params: $1 job_id, $2 key, $3 value, $4 closed, $5 writer run_epoch.
+STREAM_APPEND_SQL = """INSERT INTO jorb_stream
+            (job_id, key, seq, value, closed, run_epoch)
+        SELECT $1, $2,
+               COALESCE((SELECT max(s.seq) FROM jorb_stream s
+                          WHERE s.job_id = $1 AND s.key = $2), -1) + 1,
+               $3, $4, $5
+        WHERE EXISTS (SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $5)
+        RETURNING seq"""
 
 # Discard a job's whole checkpoint log so its step sequence can restart at 1.
 #

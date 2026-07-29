@@ -138,6 +138,7 @@ REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
         job_id step_seq name output error run_epoch started finished
     """),
     "jorb_event": _names("job_id key value updated"),
+    "jorb_stream": _names("job_id key seq value closed run_epoch created"),
     "jorb_mailbox": _names("id dest_job_id topic message created consumed_at"),
     "jorb_history": _names("id job_id at event detail"),
     "jorb_schedule": _names("""
@@ -170,6 +171,7 @@ REQUIRED_TRIGGERS: tuple[str, ...] = (
     "jorb_done_notify",
     "jorb_cancel_notify",
     "jorb_event_notify",
+    "jorb_stream_notify",
     "schedule_executed_notify",
     "jorb_history_record",
     "jorb_dag_complete",
@@ -187,6 +189,7 @@ REQUIRED_INDEXES: frozenset[str] = _names("""
     jorb_worker_idle_idx
     jorb_step_pkey
     jorb_event_pkey
+    jorb_stream_pkey
     jorb_mailbox_pkey jorb_mailbox_pending_idx jorb_mailbox_consumed_idx
     jorb_history_pkey jorb_history_job_idx jorb_history_at_idx
     jorb_schedule_pkey jorb_schedule_name_key jorb_schedule_due_idx

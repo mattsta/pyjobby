@@ -33,6 +33,7 @@ class ChargeAndShip(Job):
 | `await self.set_event(key, value)`                             | `jorb_event`            | a durable key/value another job or an operator can read                                                                                                                                                                                                      |
 | `await self.get_event(key)`                                    | `jorb_event`            | reads one back — this job's, or another's by id. **Not a step**: an event is durable state, so reading it is a query, and recording the answer would freeze the first value read into every later replay                                                     |
 | `await self.send(job_id, msg)` / `await self.recv(topic)`      | `jorb_mailbox`          | a durable mailbox, **exactly-once on both ends**: a send commits with its checkpoint (it runs through `transaction()`), and a recv consumes and checkpoints in one statement — no crash timing can deliver twice, consume twice, or eat a message unrecorded |
+| `await self.stream_write(key, value)` / `await self.stream_close(key)` | `jorb_stream`   | an ordered, durable output channel a client reads incrementally, **exactly-once per call site** — the row and its checkpoint are one commit, so a retry continues the stream instead of repeating it                                                       |
 | `await self.compact()`                                         | `jorb_step`             | discards this job's checkpoint log and restarts its step sequence, bounding replay for a job that lives indefinitely                                                                                                                                         |
 | `self.cancelled`                                               | `jorb.cancel_requested` | cooperative cancellation for long synchronous loops                                                                                                                                                                                                          |
 
@@ -351,6 +352,135 @@ continues past it.
 
 ---
 
+## Streams: output a client reads while the job runs
+
+A step's result is readable when the step is done. An event holds one current
+value. A stream is the third shape: **an ordered sequence of values a job
+appends to and anyone reads from, incrementally, from any position.**
+
+```python
+class ReportJob(Job):
+    async def task(self, account: int) -> dict:
+        rows = await self.step("query", self.fetch_rows, account)
+        for row in rows:
+            await self.stream_write("rows", row)
+        await self.stream_close("rows")
+        return {"rows": len(rows)}
+```
+
+```python
+async for row in client.read_stream(job_id, "rows"):
+    render(row)
+```
+
+`jorb_stream` holds one row per value, keyed `(job_id, key, seq)`:
+
+```
+jorb_stream
+  job_id     BIGINT      ─ the job, stable across every attempt
+  key        TEXT        ─ which stream (a job may write several)
+  seq        INTEGER     ─ position: DENSE, 0-based, per (job_id, key)
+  value      JSONB       ─ the value (NULL is a streamed null)
+  closed     BOOLEAN     ─ end-of-stream marker; carries no value
+  run_epoch  INTEGER     ─ which attempt appended this row
+  created    TIMESTAMPTZ
+  PRIMARY KEY (job_id, key, seq)
+```
+
+### Exactly-once, stated precisely
+
+`stream_write` runs through `transaction()`: the row and the checkpoint that
+records it are one commit on one connection. So **each call site appends at
+most one row, ever**, across every attempt — the guarantee `send()` has, for
+the same reason and by the same code path. A job that writes five rows and
+crashes writes rows six onward on the retry, because the first five
+fast-forward from their checkpoints and return the positions they already
+took.
+
+That is a claim about **call sites**, not about values. A loop whose length
+changes between attempts is a change to the step sequence, which is
+nondeterminism DXE catches (`NondeterminismError`); a loop whose length is
+derived from a checkpointed step is deterministic and streams exactly once.
+
+The position comes from the same statement that writes the row — one past
+the highest that key holds — so a resumed job continues its own sequence and
+nothing has to loop looking for a free slot.
+
+Appends are fenced on `run_epoch` like every other durable write: a
+superseded execution appends nothing, because a reader has no way to tell two
+writers apart.
+
+### The closing marker is a column, never a value
+
+End of stream is `closed = TRUE` on a row of its own. It is deliberately not
+a sentinel inside `value`: any magic value is a collision with the job's own
+data domain by construction, and the collision shows up as a reader that
+stops early on real data. Because the marker is out of band, **every JSON
+value a job can produce is streamable, including `None`** — `stream_write(k,
+None)` is a streamed null and the reader yields it.
+
+Closing is optional. `stream_close` exists for the job whose stream ends
+before the job does; a job that simply returns, crashes or is cancelled ends
+its readers anyway (below).
+
+### What an operator sees
+
+One checkpoint per call, in call order, under implicit names:
+
+```
+Seq  Name                    Epoch  Status   Output
+1    dxe.stream:rows           1    ok       0
+2    dxe.stream:rows           1    ok       1
+3    dxe.stream-close:rows     1    ok       2
+```
+
+The output is the position the row took, which is what makes the replay
+decision visible: a fast-forwarded write shows the epoch of the attempt that
+really appended it. `jorb_stream` itself is the source of truth for the
+values; `pj-admin jobs steps <id>` is the source of truth for what was
+attempted.
+
+### When a reader stops
+
+`client.read_stream(job_id, key, offset=0)` is an async generator. It stops
+on the first of:
+
+- **the closing marker** — the job said the stream was over;
+- **the job reaching a terminal state** — `finished`, `crashed` or
+  `cancelled`. A cancel or a timeout ends a job out of band while a
+  fenced-out execution may still believe it is writing, so the reader trusts
+  the job's state and not the writer's intent. It re-reads **once** after
+  observing the terminal state, so a row committed just before the end is
+  still delivered.
+
+A job that does not exist raises `JobError` immediately: nothing will ever
+append, so waiting only delays the same answer. Everything else is a wait,
+and it is the caller's to bound — `asyncio.timeout()` around the loop —
+because the job's own deadline is the real one.
+
+Between rows the reader parks on the `jorb_stream` notification with a
+2-second fallback poll, and registers demand **once for the whole read**
+rather than once per row. Positions are dense precisely so that resuming is
+`offset=`: count what you consumed, pass it back, hold no cursor anywhere.
+
+`client.get_stream(job_id, key)` is the snapshot form —
+`{"values": [...], "closed": bool}` — for a caller that wants what exists
+now rather than a live feed.
+
+### Retention
+
+Stream rows share the **checkpoint** window (`--checkpoint-retention-days`,
+default 1 day) rather than the job window, because they share the argument: a
+stream exists to be read while the job runs, every reader stops at the
+terminal state, and after that the rows are audit material exactly as
+checkpoints are. `finished` jobs only — a `crashed` or `cancelled` job is
+retryable, its retry fast-forwards completed `stream_write` checkpoints
+without appending, and reaping early would leave the resumed job's stream
+permanently missing what its first attempt wrote. Those live until the whole
+job ages out under `--retention-days`, when the cascade takes them.
+
+---
+
 ## Fencing: why a zombie cannot corrupt a checkpoint
 
 The dangerous case is not a crash — it is a worker that is _presumed_ dead but
@@ -420,7 +550,8 @@ step the old attempts completed.
    For work against _this_ database the window is closed, not merely narrow:
    `transaction()` writes the effect and the checkpoint in one transaction on
    one connection, so the pair commits or rolls back together and the step is
-   **exactly-once**. See [Transactional steps](#transactional-steps) — and note
+   **exactly-once**. `send()` and `stream_write()` are that primitive wearing
+   different names, which is why both are exactly-once per call site. See [Transactional steps](#transactional-steps) — and note
    that the guarantee covers only what `fn` does on the connection it is
    handed.
 
@@ -428,7 +559,7 @@ step the old attempts completed.
    `jorb_history` is the per-attempt audit trail.
 3. **`run_epoch` only increases**, and a write at a stale epoch is a no-op.
 4. **A superseded execution cannot write** — a result, a checkpoint, a timeout,
-   a reschedule, a published event, or a mailbox message. The list is every
+   a reschedule, a published event, a mailbox message, or a stream row. The list is every
    durable write there is; a new one that skips the fence is caught by
    `test_every_state_changing_statement_carries_the_fence`. `send` is fenced on
    the **sender's** epoch, not the destination's: the question is whether this
@@ -447,6 +578,7 @@ step the old attempts completed.
 
 These are enforced by tests, not just asserted here: see
 `tests/test_dxe_primitives.py`, `tests/test_dxe_transactions.py`,
+`tests/test_dxe_streams.py`,
 `tests/test_dxe_step_timeouts.py`, `tests/test_job_timeout_ceiling.py`,
 `tests/test_dxe_faults.py`, `tests/test_dxe_concurrency.py`, and
 `tests/test_invariants.py`.
@@ -534,19 +666,19 @@ Both windows apply in `pj-monitor` and both are **on by default**:
 
 ```
 --retention-days 30              delete terminal jobs, with their history,
-                                 events, mailbox and checkpoints — and the
-                                 five things no cascade reaches: consumed
-                                 mail of LIVE jobs, history of LIVE jobs,
-                                 emptied DAGs, aged schedule executions,
-                                 retired worker rows
---checkpoint-retention-days 1    delete the CHECKPOINTS of terminal jobs,
-                                 keeping the job row itself
+                                 events, streams, mailbox and checkpoints —
+                                 and the five things no cascade reaches:
+                                 consumed mail of LIVE jobs, history of LIVE
+                                 jobs, emptied DAGs, aged schedule
+                                 executions, retired worker rows
+--checkpoint-retention-days 1    delete the CHECKPOINTS and STREAMS of
+                                 terminal jobs, keeping the job row itself
 ```
 
 Pass `0` to either to keep that data forever. So by default a finished job
-keeps its step checkpoints for a day — long enough to answer "which step
-failed, and why" after an incident — and the job row, its result and its
-history for thirty.
+keeps its step checkpoints and its streams for a day — long enough to answer
+"which step failed, and why" after an incident — and the job row, its result
+and its history for thirty.
 
 `--retention-days` drives six separate sweeps, not one. Five of the tables
 it covers are not reachable from a job at all — `jorb_dag` is the _parent_ of
@@ -578,6 +710,12 @@ The job sweep is deliberately conservative:
   durable machine that never terminates is never reached by the job cascade,
   so nothing else would ever bound its wake/sleep audit trail.
 
+`jorb_stream` is reaped on the checkpoint window by a sweep of its own, with
+the same `finished`-only rule and for the same reason (see
+[Streams § Retention](#retention)). It is a second statement rather than a
+second table in the checkpoint sweep because each probes for the table it
+deletes from, and a sweep that deletes nothing must stay a two-buffer answer.
+
 The child rows go with the job through `ON DELETE CASCADE`.
 
 Operators can also delete explicitly:
@@ -588,4 +726,7 @@ pj-admin jobs delete <id>
 ```
 
 Sizing rule of thumb: budget one `jorb_step` row per `step()` call per job, and
-roughly four `jorb_history` rows per attempt.
+roughly four `jorb_history` rows per attempt. A streaming job costs two rows
+per value — the `jorb_stream` row and its checkpoint — which is what makes
+streams the wrong shape for output measured in millions of rows and the right
+one for output a human or a client is watching.

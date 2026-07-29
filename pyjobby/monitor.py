@@ -21,16 +21,19 @@ recovery:
    indefinitely accumulates every completed job forever otherwise, and a
    retention policy nobody remembers to switch on is not a policy. Pass
    ``--retention-days 0`` to keep everything forever.
-5. **Checkpoint retention**: ``jorb_step`` rows of ``finished`` jobs older
-   than ``--checkpoint-retention-days`` (default 1) are deleted while the job
-   row itself stays. FINISHED only, deliberately: ``crashed`` and
-   ``cancelled`` are retryable, and ``retry_job`` resumes from checkpoints,
-   so reaping those early would make a DLQ retry re-execute every completed
-   step. A finished job is only re-run by an explicit ``rerun_job``, which is
+5. **Checkpoint retention**: ``jorb_step`` and ``jorb_stream`` rows of
+   ``finished`` jobs older than ``--checkpoint-retention-days`` (default 1)
+   are deleted while the job row itself stays. A stream shares the window
+   because it shares the argument: it exists to be read while the job runs,
+   and every reader stops at the terminal state. FINISHED only, deliberately:
+   ``crashed`` and ``cancelled`` are retryable, and ``retry_job`` resumes from
+   checkpoints, so reaping those early would make a DLQ retry re-execute every
+   completed step — and leave its stream missing the rows the first attempt
+   wrote. A finished job is only re-run by an explicit ``rerun_job``, which is
    meant to re-execute, so its checkpoints — the bulkiest thing on the row —
    are pure audit from the moment it finishes. Crashed/cancelled checkpoints
-   live until the whole job ages out under ``--retention-days``. ``0`` keeps
-   finished checkpoints for as long as the job.
+   and streams live until the whole job ages out under ``--retention-days``.
+   ``0`` keeps both for as long as the job.
 6. **The five tables the job cascade cannot reach**, all on the same
    ``--retention-days`` window, because none of them has a lifetime argument
    of its own — they are all "as long as the jobs they describe":
@@ -293,6 +296,50 @@ DELETE_CHECKPOINTS_SQL = """
     DELETE FROM jorb_step
     WHERE job_id = ANY($1::bigint[])
     RETURNING job_id, step_seq
+"""
+
+#: Jobs whose DXE STREAM rows have outlived the checkpoint window. ($1, $2)
+#:
+#: The same shape and the same window as the checkpoint probe above, because
+#: it is the same argument: a stream exists to be read WHILE the job runs,
+#: every reader of a terminal job's stream has already stopped (they stop at
+#: the terminal state whether or not the job closed the stream), and what is
+#: left is audit material of exactly the kind checkpoints are -- readable
+#: through the job surfaces and nothing else, and the bulkiest thing hanging
+#: off a job that produced output row by row.
+#:
+#: state = 'finished' ONLY, for the reason SWEEP_CHECKPOINT_JOBS_SQL spells
+#: out and one of its own: `crashed`/`cancelled` are retryable, a retry
+#: RESUMES from checkpoints, and a stream_write whose checkpoint fast-forwards
+#: appends nothing. Reaping a crashed job's stream early would therefore leave
+#: a retry that "succeeds" having produced a stream with a hole in it -- the
+#: rows the first attempt wrote gone, and no attempt left that will write them
+#: again. Their stream lives until the whole job ages out under
+#: --retention-days and the cascade takes it.
+#:
+#: The existence test is a scalar subquery and not the EXISTS it reads like,
+#: for the measured reason SWEEP_CHECKPOINT_JOBS_SQL documents: an EXISTS
+#: sublink flattens into a semi-join, whose hash against the whole of
+#: jorb_stream makes a sequential scan of jorb look free. A scalar subquery
+#: stays a per-row probe of jorb_stream's primary key, whose leading column
+#: is job_id -- which is why that table needs no index of its own for this.
+SWEEP_STREAM_JOBS_SQL = """
+    SELECT j.id
+    FROM jorb j
+    WHERE j.state = 'finished'
+      AND COALESCE(j.finished, j.updated) < now() - $1::interval
+      AND (SELECT s.job_id FROM jorb_stream s
+            WHERE s.job_id = j.id LIMIT 1) IS NOT NULL
+    ORDER BY COALESCE(j.finished, j.updated)
+    LIMIT $2
+"""
+
+#: ...and the delete, by the primary key's leading column, for the same
+#: reason the checkpoint delete is a second statement rather than a CTE.
+DELETE_STREAM_ROWS_SQL = """
+    DELETE FROM jorb_stream
+    WHERE job_id = ANY($1::bigint[])
+    RETURNING job_id, key, seq
 """
 
 #: DAGs whose jobs are all gone and which outlived the window. ($1, $2)
@@ -895,8 +942,9 @@ async def sweep_expired_jobs(
     upstream would strand the waiter in 'waiting' forever — nothing but the
     upstream's own terminal transition ever wakes it.
 
-    Every child table — jorb_step, jorb_event, jorb_mailbox, jorb_history —
-    follows via ON DELETE CASCADE, so deleting the job row is the whole job.
+    Every child table — jorb_step, jorb_event, jorb_stream, jorb_mailbox,
+    jorb_history — follows via ON DELETE CASCADE, so deleting the job row is
+    the whole job.
 
     Bounded and batched: one bite of ``batch_size`` per call, holding only
     those rows' locks. FOR UPDATE SKIP LOCKED makes concurrent monitors
@@ -983,6 +1031,45 @@ async def sweep_completed_checkpoints(
 
         deleted = await conn.fetch(
             DELETE_CHECKPOINTS_SQL, [row["id"] for row in doomed]
+        )
+
+    return len(deleted)
+
+
+async def sweep_completed_streams(
+    pool: asyncpg.Pool,
+    checkpoint_retention_days: float,
+    batch_size: int = 1000,
+) -> int:
+    """Delete the DXE stream rows of jobs that terminated long enough ago.
+
+    A stream is output a client reads WHILE the job runs. Once the job is
+    terminal every reader has stopped — `read_stream` ends at a terminal
+    state whether or not the job closed the stream — so from that instant the
+    rows are audit material, readable through the job surfaces and nothing
+    else. That is the same lifetime argument checkpoints have, so they share
+    the same (short) window rather than getting a knob of their own.
+
+    A stream row of a NON-terminal job is never touched at any age, and a
+    'crashed' or 'cancelled' job's stream survives to the long window: those
+    states are retryable, a retry fast-forwards completed `stream_write`
+    checkpoints without appending, and reaping early would leave the resumed
+    job's stream permanently missing the rows its first attempt wrote.
+
+    Probe then delete by key, the shape every retention sweep here uses, and
+    ``batch_size`` bounds the JOBS taken per call rather than their rows —
+    all of a doomed job's stream goes together, for the reasons
+    ``sweep_completed_checkpoints`` documents at length. Returns the number
+    of rows deleted."""
+    retention = datetime.timedelta(days=checkpoint_retention_days)
+
+    async with pool.acquire() as conn, conn.transaction():
+        doomed = await conn.fetch(SWEEP_STREAM_JOBS_SQL, retention, batch_size)
+        if not doomed:
+            return 0
+
+        deleted = await conn.fetch(
+            DELETE_STREAM_ROWS_SQL, [row["id"] for row in doomed]
         )
 
     return len(deleted)
@@ -1316,14 +1403,14 @@ async def monitor(
     ``retention_days`` deletes whole terminal jobs — and the emptied DAGs,
     aged schedule executions, consumed mail and retired worker rows that no
     cascade can reach — while ``checkpoint_retention_days`` deletes just the
-    checkpoints of terminal jobs much sooner. Either set to ``0`` means keep
-    forever: those sweeps do not run at all.
+    checkpoints and streams of terminal jobs much sooner. Either set to ``0``
+    means keep forever: those sweeps do not run at all.
 
     One window covers all five of those tables rather than five knobs because
     none of them has its own lifetime to argue for: they all mean "as long as
-    the work they describe". Checkpoints get the second knob because they
-    genuinely do — they are the bulkiest rows in the system and stop being
-    useful the instant their job goes terminal.
+    the work they describe". Checkpoints and streams get the second knob
+    because they genuinely do — they are the bulkiest rows in the system and
+    stop being useful the instant their job goes terminal.
 
     Each retention sweep drains its backlog within a ``retention_max_seconds``
     budget per cycle, so it can catch up on a busy install without ever
@@ -1400,6 +1487,18 @@ async def monitor(
                     retention_max_seconds,
                     stop,
                 )
+                # streams share the checkpoint window and the checkpoint
+                # argument: both stop being useful the moment the job does
+                if not stop.is_set():
+                    await _run_retention(
+                        "completed streams",
+                        lambda: sweep_completed_streams(
+                            pool, checkpoint_retention_days, retention_batch_size
+                        ),
+                        retention_batch_size,
+                        retention_max_seconds,
+                        stop,
+                    )
 
             if retention_days and not stop.is_set():
                 await _run_retention(
@@ -1513,8 +1612,8 @@ def cli() -> None:
         type=float,
         default=1.0,
         show_default=True,
-        help="Delete the DXE checkpoints of terminal jobs this long after they "
-        "terminated, keeping the job itself. 0 keeps checkpoints as long as "
+        help="Delete the DXE checkpoints and streams of terminal jobs this long "
+        "after they terminated, keeping the job itself. 0 keeps them as long as "
         "the job.",
     )
     @click.option(

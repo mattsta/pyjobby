@@ -34,6 +34,7 @@ Its companions:
 8. [Priority and capability routing](#8-priority-and-capability-routing)
 9. [A recurring report](#9-a-recurring-report)
 10. [Waiting for the answer](#10-waiting-for-the-answer)
+11. [Streaming output a client renders live](#11-streaming-output-a-client-renders-live)
 
 ---
 
@@ -607,6 +608,53 @@ polling — example 1 — for anything that is not fast and bounded.
 
 ---
 
+## 11. Streaming output a client renders live
+
+A long job that produces its output in pieces — an export, a report, a
+migration log — does not have to make the caller wait for all of it. Append
+each piece to a durable stream and the caller renders them as they land.
+
+```python
+class ExportLedger(Job):
+    """Streams each page of an export as it is produced, then closes."""
+
+    async def task(self, account: int, pages: int = 3) -> dict[str, Any]:
+        for page in range(pages):
+            rows = await self.step(f"page-{page}", self.fetch_page, account, page)
+            await self.stream_write("pages", {"page": page, "rows": rows})
+        await self.stream_close("pages")
+        return {"pages": pages}
+```
+
+```python
+job_id = await client.enqueue("myapp.exports.ExportLedger", queue="exports", account=42)
+
+async for page in client.read_stream(job_id, "pages"):
+    render(page)  # arrives while the job is still running
+```
+
+The test asserts exactly that: the job is still `running` when the first page
+reaches the reader, and the loop ends on the marker `stream_close()` wrote.
+
+Each `stream_write` appends **exactly once for that call site**, across every
+attempt — the row and its checkpoint are one commit — so a retry after a
+crash continues the export from where it stopped instead of re-sending pages
+the client already rendered. Fetching each page inside `step()` is what makes
+the loop deterministic across that retry, which is the obligation every
+checkpointed primitive shares.
+
+A reader stops on the closing marker, or on the job reaching a terminal state
+— a crashed or cancelled export ends its readers with no marker at all. For
+a snapshot instead of a feed, `await client.get_stream(job_id, "pages")`
+returns `{"values": [...], "closed": bool}`; to resume after a disconnect,
+count what you rendered and pass it as `offset=`.
+
+Use a stream when every value matters. Use `set_event()` when only the latest
+does — a percentage, a phase — and the mailbox when the output is work for
+exactly one other job.
+
+---
+
 ## Patterns at a glance
 
 | You want                           | Reach for                                                      |
@@ -623,6 +671,7 @@ polling — example 1 — for anything that is not fast and bounded.
 | only on that hardware              | `capability="gpu"`, and `pj --cap gpu`                         |
 | every night at 2am                 | `pj-admin schedule add` + `pj-scheduler`                       |
 | the caller wants the value         | `enqueue_handle(...)` → `await handle.wait()`                  |
+| the caller wants it piece by piece | `stream_write(key, v)` → `async for v in client.read_stream()` |
 | find it later                      | `tags={...}` → `search_jobs(tags=...)`                         |
 
 ## Practices these examples are built on

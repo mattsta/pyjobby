@@ -312,6 +312,7 @@ STMTS["set-event"] = dxe.SET_EVENT_SQL
 STMTS["get-event"] = dxe.GET_EVENT_SQL
 STMTS["send"] = dxe.SEND_SQL
 STMTS["recv"] = dxe.RECV_SQL
+STMTS["stream-append"] = dxe.STREAM_APPEND_SQL
 
 # Publish (or withdraw) this worker's demand for jorb_enqueued wakeups.
 # `idle IS DISTINCT FROM $2` makes a redundant call a no-op at the server:
@@ -1510,6 +1511,8 @@ class Job:
         await self.set_event("progress", {"pct": 50})   # publish to waiters
         await self.send(other_job_id, {"go": True})     # durable message
         msg = await self.recv(timeout=60)               # await a message
+        await self.stream_write("rows", {"n": 1})       # ordered, read live
+        await self.stream_close("rows")                 # end of that stream
         if self.cancelled: ...               # cooperative cancel check
     """
 
@@ -2160,6 +2163,83 @@ class Job:
                 f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
             )
         return None
+
+    async def _stream_append(
+        self, name: str, key: str, value: Any, closed: bool
+    ) -> int:
+        """Append one row to stream ``key`` and checkpoint it as one commit.
+
+        The shared body of ``stream_write`` and ``stream_close``: the two
+        differ only in the marker column and the checkpoint name they consume
+        a sequence number under, so the exactly-once argument is written
+        once. Returns the position the row took.
+        """
+
+        async def _do_append(conn: asyncpg.Connection) -> int:
+            rows = await conn.fetch(
+                dxe.STREAM_APPEND_SQL,
+                self.job["id"],
+                key,
+                value,
+                closed,
+                self._dxe_epoch,
+            )
+            if not rows:
+                raise dxe.StaleExecutionError(
+                    f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
+                )
+            return int(rows[0]["seq"])
+
+        return int(await self.transaction(name, _do_append))
+
+    async def stream_write(self, key: str, value: Any) -> int:
+        """Append ``value`` to this job's durable stream ``key``; returns the
+        position it took (dense, 0-based, per key).
+
+        A stream is ordered output a client reads INCREMENTALLY while the job
+        is still running — progress rows, log lines, partial results — where
+        ``set_event`` keeps one current value and the mailbox delivers to one
+        consumer.
+
+        **Exactly once per call site**, by the same mechanism as ``send()``:
+        the append is a write to this database, so it runs through
+        ``transaction()`` and commits with its own checkpoint. A crash cannot
+        land the row without recording it (a retry would append a second copy)
+        nor record it without landing it. On a later attempt the checkpoint
+        fast-forwards and returns the recorded position, so a job that streams
+        five rows and then crashes streams the remaining rows on the retry,
+        never the first five again.
+
+        The position is assigned inside that transaction as "one past the
+        highest this key has", so a resumed job continues its own stream
+        rather than restarting it, and there is no read-then-write loop.
+
+        Checkpointed under ``dxe.stream:<key>``, which is what an operator
+        sees in ``pj-admin jobs steps`` — one checkpoint per write, in call
+        order, with the position as its output.
+
+        Fenced on this execution's epoch: a superseded attempt appends
+        nothing, because a reader cannot tell two writers apart.
+        """
+        return await self._stream_append(f"dxe.stream:{key}", key, value, closed=False)
+
+    async def stream_close(self, key: str) -> None:
+        """End stream ``key``: append the closing marker readers stop on.
+
+        End of stream is a COLUMN on the marker row, never a sentinel value,
+        so every JSON value the job can produce stays streamable — including
+        ``None``, which ``stream_write`` sends as a streamed null.
+
+        Closing is OPTIONAL. A reader also stops when the job reaches a
+        terminal state, so a job that simply returns (or crashes) ends its
+        readers too. Close explicitly when the stream ends BEFORE the job
+        does — the reader then stops at the marker instead of waiting out the
+        rest of the run.
+
+        Checkpointed under ``dxe.stream-close:<key>``, exactly-once and
+        epoch-fenced like ``stream_write``.
+        """
+        await self._stream_append(f"dxe.stream-close:{key}", key, None, closed=True)
 
     async def rescheduleBackoff(self, attempt: int | None = None) -> datetime.timedelta:
         """Calculate this job's retry delay from its admin_data strategy.

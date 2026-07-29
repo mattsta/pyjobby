@@ -552,6 +552,81 @@ class TestEventGate:
         await client.close()
 
 
+class TestStreamGate:
+    async def test_append_is_silent_when_nobody_reads(
+        self, db_pool, db_params, unique_queue
+    ):
+        """A job streaming into the void pays no commit lock at all."""
+        job_id = await enqueue(db_pool, unique_queue, state="running")
+
+        async with listening(db_params, "jorb_stream") as heard:
+            await db_pool.execute(
+                """INSERT INTO jorb_stream (job_id, key, seq, value, run_epoch)
+                   VALUES ($1, 'rows', 0, '1', 1)""",
+                job_id,
+            )
+            await heard.settle()
+
+        assert heard.on("jorb_stream") == []
+        assert (
+            await db_pool.fetchval(
+                "SELECT count(*) FROM jorb_stream WHERE job_id = $1", job_id
+            )
+            == 1
+        )
+
+    async def test_append_notifies_when_the_job_is_awaited(
+        self, db_pool, db_params, unique_queue
+    ):
+        job_id = await enqueue(db_pool, unique_queue, state="running")
+        await db_pool.execute("UPDATE jorb SET awaited = TRUE WHERE id = $1", job_id)
+
+        async with listening(db_params, "jorb_stream") as heard:
+            await db_pool.execute(
+                """INSERT INTO jorb_stream (job_id, key, seq, value, run_epoch)
+                   VALUES ($1, 'rows', 0, '1', 1)""",
+                job_id,
+            )
+            await heard.settle()
+
+        assert [json.loads(p) for p in heard.on("jorb_stream")] == [
+            {"job_id": job_id, "key": "rows"}
+        ]
+
+    async def test_read_stream_registers_demand_and_is_woken(
+        self, db_pool, db_params, unique_queue
+    ):
+        """The reader's half of the gate: it says it is listening BEFORE its
+        first look, so an append that lands a moment later reaches it as a
+        notification rather than on the 2-second fallback poll."""
+        from pyjobby.client import JobClient
+
+        client = JobClient(pool=db_pool, db_params=db_params)
+        job_id = await enqueue(db_pool, unique_queue, state="running")
+
+        rows = client.read_stream(job_id, "rows")
+        reading = asyncio.create_task(anext(rows))
+        for _ in range(100):
+            if await db_pool.fetchval("SELECT awaited FROM jorb WHERE id = $1", job_id):
+                break
+            await asyncio.sleep(0.02)
+        else:
+            reading.cancel()
+            pytest.fail("read_stream never registered demand")
+
+        started = time.monotonic()
+        await db_pool.execute(
+            """INSERT INTO jorb_stream (job_id, key, seq, value, run_epoch)
+               VALUES ($1, 'rows', 0, $2, 1)""",
+            job_id,
+            {"i": 0},
+        )
+        assert await reading == {"i": 0}
+        assert time.monotonic() - started < 1.0
+        await rows.aclose()
+        await client.close()
+
+
 # =========================================================================
 # The channels that are NOT gated, and the one that is gone
 # =========================================================================
@@ -642,6 +717,7 @@ class TestUngatedChannels:
                  FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid
                 WHERE NOT t.tgisinternal
                   AND t.tgrelid IN ('jorb'::regclass, 'jorb_event'::regclass,
+                                    'jorb_stream'::regclass,
                                     'jorb_mailbox'::regclass,
                                     'jorb_schedule_log'::regclass)"""
         )
@@ -652,6 +728,7 @@ class TestUngatedChannels:
             "jorb_done_notify",
             "jorb_cancel_notify",
             "jorb_event_notify",
+            "jorb_stream_notify",
             "schedule_executed_notify",
         }
         assert notify_triggers <= set(by_name)

@@ -320,15 +320,17 @@ bulkiest rows in the system with the shortest useful life:
 
 | Window                            | Deletes                                                                                                                                                                                                                                                                                                                                        |
 | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--retention-days` (30)           | terminal jobs — and with them, by cascade, their history, events, mail and checkpoints — plus **the five tables no cascade reaches**: consumed mailbox rows of _live_ jobs, history rows of _live_ jobs (a durable machine that never terminates writes ~3 per wake, forever), emptied DAGs, schedule executions, retired worker registry rows |
-| `--checkpoint-retention-days` (1) | the `jorb_step` checkpoints of terminal jobs, keeping the job row itself                                                                                                                                                                                                                                                                       |
+| `--retention-days` (30)           | terminal jobs — and with them, by cascade, their history, events, streams, mail and checkpoints — plus **the five tables no cascade reaches**: consumed mailbox rows of _live_ jobs, history rows of _live_ jobs (a durable machine that never terminates writes ~3 per wake, forever), emptied DAGs, schedule executions, retired worker registry rows |
+| `--checkpoint-retention-days` (1) | the `jorb_step` checkpoints **and `jorb_stream` rows** of terminal jobs, keeping the job row itself. Both are `finished`-only: a `crashed`/`cancelled` job is retryable, its retry fast-forwards completed checkpoints, and reaping either early would make the resumed job re-run steps or leave its stream missing what the first attempt wrote |
 
 `0` on either means keep forever; that sweep does not run at all.
 
 **One window covers all five job-scoped tables** rather than a knob per
 table, because none of them has a lifetime of its own to argue for — they all
 mean "as long as the work they describe". Checkpoints get the second knob
-because they genuinely do.
+because they genuinely do, and streams share it rather than earning a third:
+a stream is read while the job runs, and every reader stops at the terminal
+state.
 
 The three tables added last are the ones a cascade can never reach, and two
 of them were leaking an _answer_, not just rows:

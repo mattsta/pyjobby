@@ -27,8 +27,8 @@ WHAT THIS TOUCHES (the cleanup guarantee)
 Every subcommand creates its rows in a queue named ``pjbench_<cmd>_<hex>``
 that cannot collide with anything else, and deletes exactly that queue's
 rows in a ``finally`` — including on Ctrl-C. Child rows (``jorb_history``,
-``jorb_step``, ``jorb_event``, ``jorb_mailbox``) follow by ON DELETE
-CASCADE. Nothing here ever runs TRUNCATE, ever issues an unqualified
+``jorb_step``, ``jorb_event``, ``jorb_stream``, ``jorb_mailbox``) follow by
+ON DELETE CASCADE. Nothing here ever runs TRUNCATE, ever issues an unqualified
 DELETE, and never touches a row outside its own queue. The only global
 state it writes is a ``jorb_queue`` control row for its own queue name,
 deleted in the same ``finally``.
@@ -145,6 +145,13 @@ PLAN_STEP_EVERY = 3
 PLAN_STEPS_PER_JOB = 3
 PLAN_DAG_EVERY = 3
 
+#: ...and one job in this many wrote a DXE stream, with this many rows. The
+#: stream retention sweep walks past jobs that never streamed exactly as the
+#: checkpoint sweep walks past jobs that never checkpointed, so seeding a
+#: FRACTION is what makes its discard budget mean anything.
+PLAN_STREAM_EVERY = 3
+PLAN_STREAM_ROWS_PER_JOB = 3
+
 #: Schedules the plan seed creates, sharing the seeded log between them. The
 #: schedule-log sweep refuses to delete each schedule's newest execution, so
 #: this is also the bound on what that sweep may read and discard.
@@ -247,6 +254,7 @@ NOTIFY_CHANNELS = (
     db.CHANNEL_DONE,
     db.CHANNEL_CANCEL,
     db.CHANNEL_EVENT,
+    db.CHANNEL_STREAM,
     db.CHANNEL_SCHEDULE_EXECUTED,
 )
 
@@ -429,8 +437,8 @@ async def cleanup_queue(conn: asyncpg.Connection, queue: str) -> dict[str, int]:
     """Delete everything this run created, and nothing else.
 
     Scoped to one queue name by design: ``jorb_history``, ``jorb_step``,
-    ``jorb_event`` and ``jorb_mailbox`` rows follow via ON DELETE CASCADE,
-    so deleting the job rows is the whole cleanup.
+    ``jorb_event``, ``jorb_stream`` and ``jorb_mailbox`` rows follow via ON
+    DELETE CASCADE, so deleting the job rows is the whole cleanup.
 
     The global tables this can reach — ``jorb_queue``, the worker registry
     rows the real processes ``pj-bench e2e`` starts register, and the
@@ -1839,7 +1847,7 @@ def _payload_is_ours(channel: str, payload: str, queue: str, job_ids: set[int]) 
         return False
     if channel == "jorb_done":
         return int(data.get("id", -1)) in job_ids
-    if channel == "jorb_event":
+    if channel in ("jorb_event", "jorb_stream"):
         return int(data.get("job_id", -1)) in job_ids
     return False
 
@@ -2071,6 +2079,15 @@ SWEEP_GATES: dict[str, SweepGate] = {
         # One job in PLAN_STEP_EVERY checkpoints and three in four are
         # terminal, so a batch costs about 4x itself.
         backlog_discards=(PLAN_STEP_EVERY + 1) * PLAN_BATCH,
+    ),
+    "SWEEP_STREAM_JOBS_SQL": SweepGate(
+        "monitor stream retention sweep (same window as the checkpoints)",
+        ("jorb", "jorb_stream"),
+        # Same shape as the checkpoint sweep: most terminal jobs streamed
+        # nothing, so filling a batch means walking past the ones that did
+        # not — a multiple of the batch set by the seeded streaming fraction,
+        # independent of table size.
+        backlog_discards=(PLAN_STREAM_EVERY + 1) * PLAN_BATCH,
     ),
     "SWEEP_MAILBOX_SQL": SweepGate(
         "monitor consumed-mailbox sweep",
@@ -2546,6 +2563,29 @@ async def seed_plan_data(
             PLAN_STEP_EVERY,
         )
     )
+    # ...and the same for streams, on their own fraction of the jobs: the
+    # stream sweep's cost turns on how many terminal jobs it walks past to
+    # find one that streamed, which is a property of the seed and not of the
+    # query only if the seed keeps it a fraction.
+    stream_rows = int(
+        await conn.fetchval(
+            """
+            WITH inserted AS (
+                INSERT INTO jorb_stream (job_id, key, seq, value, run_epoch)
+                SELECT j.id, 'bench', i - 1, '{}'::jsonb, 0
+                  FROM (SELECT id, row_number() OVER (ORDER BY id) AS n
+                          FROM jorb WHERE queue = $1) j,
+                       generate_series(1, $2) i
+                 WHERE j.n % $3 = 0
+                RETURNING 1
+            )
+            SELECT count(*) FROM inserted
+            """,
+            queue,
+            PLAN_STREAM_ROWS_PER_JOB,
+            PLAN_STREAM_EVERY,
+        )
+    )
     mailbox = min(rows, 20000)
     await conn.execute(
         """
@@ -2655,6 +2695,7 @@ async def seed_plan_data(
     for table in (
         "jorb",
         "jorb_step",
+        "jorb_stream",
         "jorb_mailbox",
         "jorb_history",
         "jorb_dag",
@@ -2666,6 +2707,7 @@ async def seed_plan_data(
     return {
         "jobs": rows,
         "steps": steps,
+        "stream_rows": stream_rows,
         "mailbox": mailbox,
         "in_flight": in_flight,
         "dags": rows,

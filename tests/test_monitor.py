@@ -44,6 +44,7 @@ from pyjobby.monitor import (
     handle_timed_out_job,
     monitor,
     sweep_completed_checkpoints,
+    sweep_completed_streams,
     sweep_consumed_mailbox,
     sweep_dead_workers,
     sweep_expired_jobs,
@@ -271,6 +272,14 @@ async def add_child_rows(pool, job_id: int) -> None:
         job_id,
         {"hello": "world"},
     )
+    await pool.execute(
+        """
+        INSERT INTO jorb_stream (job_id, key, seq, value, run_epoch)
+        VALUES ($1, 'rows', 0, $2, 0)
+        """,
+        job_id,
+        {"i": 0},
+    )
 
 
 async def add_checkpoints(
@@ -292,6 +301,33 @@ async def add_checkpoints(
     return seqs
 
 
+async def add_stream_rows(pool, job_id: int, count: int, *, key: str = "rows") -> None:
+    """Append ``count`` DXE stream rows to a job, at positions 0..count-1."""
+    for seq in range(count):
+        await pool.execute(
+            """
+            INSERT INTO jorb_stream (job_id, key, seq, value, run_epoch)
+            VALUES ($1, $2, $3, $4, 0)
+            """,
+            job_id,
+            key,
+            seq,
+            {"i": seq},
+        )
+
+
+async def stream_seqs(pool, job_id: int, *, key: str = "rows") -> list[int]:
+    """Every surviving stream position for a job, in order."""
+    return [
+        r["seq"]
+        for r in await pool.fetch(
+            "SELECT seq FROM jorb_stream WHERE job_id = $1 AND key = $2 ORDER BY seq",
+            job_id,
+            key,
+        )
+    ]
+
+
 async def step_seqs(pool, job_id: int) -> list[int]:
     """Every surviving checkpoint sequence for a job, in order."""
     return [
@@ -310,6 +346,9 @@ async def child_counts(pool, job_id: int) -> dict[str, int]:
         ),
         "jorb_event": await pool.fetchval(
             "SELECT count(*) FROM jorb_event WHERE job_id = $1", job_id
+        ),
+        "jorb_stream": await pool.fetchval(
+            "SELECT count(*) FROM jorb_stream WHERE job_id = $1", job_id
         ),
         "jorb_mailbox": await pool.fetchval(
             "SELECT count(*) FROM jorb_mailbox WHERE dest_job_id = $1", job_id
@@ -996,6 +1035,7 @@ class TestRetentionCascade:
         assert cascading == {
             "jorb_step",
             "jorb_event",
+            "jorb_stream",
             "jorb_mailbox",
             "jorb_dependencies",
             "jorb_history",
@@ -1019,6 +1059,7 @@ class TestSweepExpiredJobs:
         assert await child_counts(db_pool, expired) == {
             "jorb_step": 1,
             "jorb_event": 1,
+            "jorb_stream": 1,
             "jorb_mailbox": 1,
             "jorb_history": 2,
         }
@@ -1030,6 +1071,7 @@ class TestSweepExpiredJobs:
         assert await child_counts(db_pool, expired) == {
             "jorb_step": 0,
             "jorb_event": 0,
+            "jorb_stream": 0,
             "jorb_mailbox": 0,
             "jorb_history": 0,
         }
@@ -1037,6 +1079,7 @@ class TestSweepExpiredJobs:
         assert await child_counts(db_pool, recent) == {
             "jorb_step": 1,
             "jorb_event": 1,
+            "jorb_stream": 1,
             "jorb_mailbox": 1,
             "jorb_history": 2,
         }
@@ -1078,6 +1121,7 @@ class TestSweepExpiredJobs:
         assert await child_counts(db_pool, live) == {
             "jorb_step": 1,
             "jorb_event": 1,
+            "jorb_stream": 1,
             "jorb_mailbox": 1,
             "jorb_history": 1,
         }
@@ -1182,6 +1226,7 @@ class TestSweepCompletedCheckpoints:
         assert await child_counts(db_pool, job) == {
             "jorb_step": 1,
             "jorb_event": 1,
+            "jorb_stream": 1,
             "jorb_mailbox": 1,
             "jorb_history": 2,
         }
@@ -1195,6 +1240,9 @@ class TestSweepCompletedCheckpoints:
         assert await child_counts(db_pool, job) == {
             "jorb_step": 0,
             "jorb_event": 1,
+            # the stream shares the window but not the sweep: two statements,
+            # so this one reaps checkpoints and nothing else
+            "jorb_stream": 1,
             "jorb_mailbox": 1,
             "jorb_history": 2,
         }
@@ -1332,6 +1380,7 @@ class TestSweepCompletedCheckpoints:
         assert await child_counts(db_pool, job) == {
             "jorb_step": 0,
             "jorb_event": 1,
+            "jorb_stream": 1,
             "jorb_mailbox": 1,
             "jorb_history": 2,
         }
@@ -1357,6 +1406,91 @@ class TestSweepCompletedCheckpoints:
         assert sum(counts) == 6
         assert await step_seqs(db_pool, job) == []
         assert await job_ids(db_pool) == [job]
+
+
+class TestSweepCompletedStreams:
+    """A stream shares the checkpoint window because it shares the argument:
+    it exists to be read WHILE the job runs, every reader stops at the
+    terminal state, and what is left is audit material.
+
+    The retryable states are the interesting refusal here for a reason of
+    their own: a retry fast-forwards completed `stream_write` checkpoints
+    without appending, so reaping a crashed job's stream early would leave
+    the resumed job's stream permanently missing what its first attempt
+    wrote."""
+
+    async def test_finished_job_loses_its_stream_and_keeps_the_row(
+        self, db_pool, unique_queue
+    ):
+        job = await insert_terminal_job(db_pool, unique_queue, days_ago=3)
+        await add_stream_rows(db_pool, job, 3)
+
+        assert await sweep_completed_streams(db_pool, checkpoint_retention_days=1) == 3
+
+        assert await job_ids(db_pool) == [job]
+        assert await stream_seqs(db_pool, job) == []
+
+    async def test_retryable_states_keep_their_stream(self, db_pool, unique_queue):
+        by_state = {
+            state: await insert_terminal_job(
+                db_pool, unique_queue, state=state, days_ago=3
+            )
+            for state in ("finished", "crashed", "cancelled")
+        }
+        for job in by_state.values():
+            await add_stream_rows(db_pool, job, 2)
+
+        assert await sweep_completed_streams(db_pool, checkpoint_retention_days=1) == 2
+
+        remaining = {
+            state: await stream_seqs(db_pool, job) for state, job in by_state.items()
+        }
+        assert remaining == {"finished": [], "crashed": [0, 1], "cancelled": [0, 1]}
+
+    @pytest.mark.parametrize("state", ["queued", "claimed", "running", "waiting"])
+    async def test_live_job_keeps_its_stream_however_old(
+        self, db_pool, unique_queue, state
+    ):
+        """The refusal that matters most: a live job's readers are still
+        reading, and a durable machine parked in 'queued' for months is
+        exactly the job most likely to be streaming."""
+        live = await insert_job(db_pool, unique_queue, state=state)
+        await age_job(db_pool, live, days=365)
+        await add_stream_rows(db_pool, live, 2)
+
+        assert await sweep_completed_streams(db_pool, checkpoint_retention_days=1) == 0
+        assert await stream_seqs(db_pool, live) == [0, 1]
+
+    async def test_job_terminated_inside_the_window_keeps_its_stream(
+        self, db_pool, unique_queue
+    ):
+        job = await insert_terminal_job(db_pool, unique_queue, days_ago=0.5)
+        await add_stream_rows(db_pool, job, 2)
+
+        assert await sweep_completed_streams(db_pool, checkpoint_retention_days=1) == 0
+        assert await stream_seqs(db_pool, job) == [0, 1]
+
+    async def test_batch_size_bounds_the_jobs_taken_not_their_rows(
+        self, db_pool, unique_queue
+    ):
+        jobs = [
+            await insert_terminal_job(db_pool, unique_queue, days_ago=3 + n)
+            for n in range(3)
+        ]
+        for job in jobs:
+            await add_stream_rows(db_pool, job, 2)
+
+        # two jobs per batch, two stream rows each; the oldest go first
+        for expected, remaining in ((4, 2), (2, 0), (0, 0)):
+            deleted = await sweep_completed_streams(
+                db_pool, checkpoint_retention_days=1, batch_size=2
+            )
+            left = 0
+            for job in jobs:
+                left += len(await stream_seqs(db_pool, job))
+            assert (deleted, left) == (expected, remaining)
+
+        assert await job_ids(db_pool) == sorted(jobs)
 
 
 class TestRetentionDrain:
@@ -2045,6 +2179,7 @@ class TestMonitorLoop:
         assert await child_counts(db_pool, ancient) == {
             "jorb_step": 0,
             "jorb_event": 0,
+            "jorb_stream": 0,
             "jorb_mailbox": 0,
             "jorb_history": 0,
         }
@@ -2094,6 +2229,7 @@ class TestMonitorLoop:
         assert await child_counts(db_pool, ancient) == {
             "jorb_step": 1,
             "jorb_event": 1,
+            "jorb_stream": 1,
             "jorb_mailbox": 1,
             "jorb_history": 2,
         }
@@ -2107,7 +2243,9 @@ class TestMonitorLoop:
         self, db_pool, unique_queue, db_params
     ):
         """The two windows stay independent inside the running daemon: the
-        checkpoints of a job that terminated 5 days ago go, the job does not."""
+        checkpoints AND the stream of a job that terminated 5 days ago go,
+        the job does not. Both ride the checkpoint window, in two sweeps of
+        one cycle, so the wait covers both tables."""
         job = await insert_terminal_job(db_pool, unique_queue, days_ago=5)
         await add_child_rows(db_pool, job)
 
@@ -2117,7 +2255,11 @@ class TestMonitorLoop:
         try:
             await wait_until(
                 lambda: db_pool.fetchval(
-                    "SELECT NOT EXISTS (SELECT 1 FROM jorb_step WHERE job_id = $1)", job
+                    """SELECT NOT EXISTS (SELECT 1 FROM jorb_step
+                                           WHERE job_id = $1)
+                          AND NOT EXISTS (SELECT 1 FROM jorb_stream
+                                           WHERE job_id = $1)""",
+                    job,
                 ),
                 timeout=10,
             )
@@ -2130,6 +2272,7 @@ class TestMonitorLoop:
         assert await child_counts(db_pool, job) == {
             "jorb_step": 0,
             "jorb_event": 1,
+            "jorb_stream": 0,
             "jorb_mailbox": 1,
             "jorb_history": 2,
         }
@@ -2171,6 +2314,7 @@ class TestMonitorLoop:
         assert await child_counts(db_pool, expired) == {
             "jorb_step": 0,
             "jorb_event": 0,
+            "jorb_stream": 0,
             "jorb_mailbox": 0,
             "jorb_history": 0,
         }

@@ -493,7 +493,12 @@ class TestStorageFootprint:
 
         storage = await api.storage_stats()
 
-        assert set(storage["tables"]) == {"jorb", "jorb_history", "jorb_step"}
+        assert set(storage["tables"]) == {
+            "jorb",
+            "jorb_history",
+            "jorb_step",
+            "jorb_stream",
+        }
         for name, stats in storage["tables"].items():
             assert stats["total_bytes"] > 0, name
             assert stats["table_bytes"] >= 0, name
@@ -532,6 +537,7 @@ class TestStorageFootprint:
             "jorb",
             "jorb_history",
             "jorb_step",
+            "jorb_stream",
         }
         assert 0.0 <= metrics["storage"]["dead_tuple_ratio"] <= 1.0
 

@@ -431,6 +431,66 @@ print(f"Finished (last 24h): {stats['finished']}")
 print(f"Crashed (last 24h): {stats['crashed']}")
 ```
 
+### Reading a job's stream
+
+#### `read_stream(job_id, key, *, offset=0)`
+
+Consume a job's durable stream as it is written. Jobs append with
+`await self.stream_write(key, value)`; this is the reader, an async generator
+that yields values in order and returns when the stream ends.
+
+```python
+async for row in client.read_stream(job_id, "progress"):
+    print(row)
+```
+
+It stops on the closing marker the job wrote (`stream_close`), or on the job
+reaching a terminal state — a crashed or cancelled job ends its readers even
+though no marker exists, and one final read happens after that state is
+observed so nothing committed in the window is lost. A job that does not
+exist raises `JobError` immediately rather than waiting for a stream nothing
+will write.
+
+Positions are dense and 0-based, so resuming is arithmetic: count what you
+consumed and pass it back.
+
+```python
+seen = 0
+async for row in client.read_stream(job_id, "progress"):
+    seen += 1
+    render(row)
+
+# ...and after a disconnect, pick up exactly where that left off
+async for row in client.read_stream(job_id, "progress", offset=seen):
+    seen += 1
+    render(row)
+```
+
+There is no `timeout=`: the read lasts as long as the job does, and a caller
+that needs a bound puts one around the loop.
+
+```python
+async with asyncio.timeout(60):
+    async for row in client.read_stream(job_id, "progress"):
+        render(row)
+```
+
+The sync twin is a plain generator: `for row in sync_client.read_stream(...)`.
+
+#### `get_stream(job_id, key)`
+
+The snapshot form — everything written so far, and whether the stream is
+closed — for a caller that wants a value rather than a feed.
+
+```python
+snapshot = await client.get_stream(job_id, "progress")
+snapshot["values"]  # [{'pct': 10}, {'pct': 20}, ...]
+snapshot["closed"]  # True once the job called stream_close()
+```
+
+An unwritten key is `{"values": [], "closed": False}`, not an error: a
+snapshot is a query, so there is nothing to wait in vain for.
+
 ### Health Check
 
 #### `health_check()`
@@ -465,6 +525,8 @@ marked "async only" below.
 - `send_message(dest_job_id, message, topic=None)` — put a durable message in a job's mailbox.
 - `get_event(job_id, key, timeout=None)` — wait for a job's published event value.
 - `wait_for_event(job_id, key, accept=None, timeout=None)` — wait until the event exists _and_ satisfies `accept`.
+- `read_stream(job_id, key, offset=0)` — yield a job's stream values in order, as they are written (an async generator; the sync twin is a plain generator).
+- `get_stream(job_id, key)` — everything written to that stream so far, and whether it is closed.
 
 **Bulk operations** (the single-job verbs over a list of ids)
 

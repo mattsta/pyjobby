@@ -536,7 +536,14 @@ async def test_unregistered_claim_is_reclaimed_only_after_the_grace_period(
 #: testable rather than aspirational.
 EPOCH_FENCED = ("run", "finished", "retry", "crashed", "cancelled")
 
-STALE_WRITE_CASES = (*EPOCH_FENCED, "record-step", "set-event", "send", "recv")
+STALE_WRITE_CASES = (
+    *EPOCH_FENCED,
+    "record-step",
+    "set-event",
+    "send",
+    "recv",
+    "stream-append",
+)
 
 
 async def apply_fenced_statement(pool, name: str, job_id: int, epoch: int) -> int:
@@ -602,6 +609,9 @@ async def apply_fenced_statement(pool, name: str, job_id: int, epoch: int) -> in
             )
         )[0]
         return int(row["consumed"])
+    if name == "stream-append":
+        rows = await pool.fetch(STMTS[name], job_id, "fence", {"v": 1}, False, epoch)
+        return len(rows)
     raise AssertionError(f"unhandled statement {name}")
 
 
@@ -673,6 +683,9 @@ async def test_every_state_changing_statement_carries_the_fence():
     # recv: a superseded execution could consume (and fail to checkpoint) a
     # message the live attempt was entitled to -- eaten by a zombie.
     assert "run_epoch = $5" in STMTS["recv"]
+    # stream-append: a superseded execution's rows would interleave with the
+    # live attempt's in a stream whose reader cannot tell the two apart.
+    assert "run_epoch = $5" in STMTS["stream-append"]
 
 
 @pytest.mark.parametrize("statement", STALE_WRITE_CASES)

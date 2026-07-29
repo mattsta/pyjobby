@@ -43,6 +43,7 @@
 --   jorb_enqueued      idle_worker    a worker on that queue is parked
 --   jorb_done          row_local      jorb.awaited on the very row changing
 --   jorb_event         job_awaited    jorb.awaited on the publishing job
+--   jorb_stream        job_awaited    jorb.awaited on the streaming job
 --   jorb_cancel        row_local      the job is actually running
 --   schedule_executed  ungated        (see below)
 --
@@ -94,6 +95,7 @@ BEGIN
         WHEN 'jorb_done'         THEN topic := NEW.id::TEXT;
         WHEN 'jorb_cancel'       THEN topic := NEW.id::TEXT;
         WHEN 'jorb_event'        THEN topic := NEW.job_id::TEXT;
+        WHEN 'jorb_stream'       THEN topic := NEW.job_id::TEXT;
         WHEN 'schedule_executed' THEN topic := NEW.schedule_id::TEXT;
         ELSE RAISE EXCEPTION 'jorb_notify: unknown channel %', channel;
     END CASE;
@@ -139,6 +141,9 @@ BEGIN
             payload := json_build_object(
                 'id', NEW.id, 'state', NEW.state)::TEXT;
         WHEN 'jorb_event' THEN
+            payload := json_build_object(
+                'job_id', NEW.job_id, 'key', NEW.key)::TEXT;
+        WHEN 'jorb_stream' THEN
             payload := json_build_object(
                 'job_id', NEW.job_id, 'key', NEW.key)::TEXT;
         WHEN 'schedule_executed' THEN
@@ -250,6 +255,30 @@ CREATE TRIGGER jorb_cancel_notify
 CREATE TRIGGER jorb_event_notify
     AFTER INSERT OR UPDATE ON jorb_event
     FOR EACH ROW EXECUTE FUNCTION jorb_notify('jorb_event', 'job_awaited');
+
+-- ----------------------------------------------------------------------------
+-- jorb_stream -- wake read_stream() readers when a job appends
+-- ----------------------------------------------------------------------------
+-- INSERT only: a stream row is never updated, and end of stream is a row of
+-- its own rather than a flag flipped on an existing one, so there is exactly
+-- one edge per thing a reader can learn.
+--
+-- Gated on jorb.awaited, like jorb_event and for the same reason: a reader
+-- commonly starts before the first row exists, so there is no stream row to
+-- hang a row-local flag on and the demand latch has to live on the job. Same
+-- consequence, too -- a reader that registers while an append is mid-commit
+-- can miss that one notification and learns about the row from the client's
+-- 2-second fallback poll. Bounded latency on a race, never a lost value: the
+-- rows are durable and the reader re-reads from its own offset.
+--
+-- The latch is per JOB, not per key. A job that streams while ANY client
+-- awaits it (a wait_for_result caller, an event waiter) pays a notification
+-- per append. That is the price of a demand signal cheap enough to evaluate
+-- on the write path -- one primary-key probe -- and it is bounded by the
+-- appends a job actually makes, which is the job's own choice.
+CREATE TRIGGER jorb_stream_notify
+    AFTER INSERT ON jorb_stream
+    FOR EACH ROW EXECUTE FUNCTION jorb_notify('jorb_stream', 'job_awaited');
 
 -- ----------------------------------------------------------------------------
 -- (deleted) job_state_change -- the dashboard firehose

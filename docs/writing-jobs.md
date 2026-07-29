@@ -171,6 +171,7 @@ write.
 | `await self.sleep(seconds)`                           | you need to wait                                          | the job leaves the worker entirely and resumes later                  |
 | `await self.set_event(key, value)`                    | someone outside wants progress                            | a durable key/value readable by clients and operators                 |
 | `await self.send(id, msg)` / `await self.recv(topic)` | jobs must coordinate                                      | a durable mailbox, each message consumed once                         |
+| `await self.stream_write(key, value)`                 | output arrives in pieces and someone wants it as it does  | an ordered, durable stream a client reads live from any position      |
 | `if self.cancelled:`                                  | a long **synchronous** loop                               | an operator's cancel can actually stop it                             |
 
 Two rules apply to all of them, and they are the whole contract:
@@ -326,6 +327,55 @@ outside the job use `await client.get_event(job_id, "awaiting", timeout=...)`.
 `recv()` **occupies a worker while it waits** (it polls), so keep its
 `timeout` short-ish and prefer `waitfor_job` dependencies for plain
 "run after that one finished" ordering.
+
+### `stream_write()` — output somebody reads while you produce it
+
+Three primitives publish out of a job, and they answer three different
+questions:
+
+| Use               | To answer                     | Reader sees                                          |
+| ----------------- | ----------------------------- | ---------------------------------------------------- |
+| `set_event()`     | "where is it up to?"          | the LATEST value; earlier ones are overwritten        |
+| `stream_write()`  | "what has it produced?"       | EVERY value, in order, from any position              |
+| `send()`          | "who should act next?"        | one consumer takes each message and nobody else can   |
+
+So: a percentage, a phase name, a machine's current state is an **event** — a
+reader wants the current answer and does not care how many times it changed.
+A log line, a report row, a partial result is a **stream** — dropping the
+middle would lose the output itself. Work handed to exactly one other job is
+**mail**.
+
+```python
+class ReportJob(Job):
+    """Streams each row as it is produced, then closes the stream."""
+
+    async def task(self, account: int) -> dict[str, Any]:
+        rows = await self.step("query", self.fetch_rows, account)
+        for row in rows:
+            await self.stream_write("rows", row)
+        await self.stream_close("rows")
+        return {"rows": len(rows)}
+```
+
+```python
+async for row in client.read_stream(job_id, "rows"):
+    render(row)
+```
+
+Each call site appends **exactly once** across every attempt — the row and
+its checkpoint are one commit — so a job that streams half its rows and then
+crashes streams the *rest* on the retry rather than repeating what it already
+sent. That is what makes the loop above safe to retry, and it is also why the
+loop's LENGTH must be deterministic: `rows` comes from a checkpointed
+`step()`, so the retry sees the same list and the same call sequence.
+
+`stream_close()` is optional. Readers also stop when the job reaches a
+terminal state, so close only when the stream ends before the job does.
+
+The costs are worth knowing: two rows per value (the stream row and its
+checkpoint), and a job whose reader is live pays a notification per append.
+Stream what a human or a client is watching; write bulk output to storage and
+stream the progress.
 
 ### `self.cancelled` — stop a long synchronous loop
 

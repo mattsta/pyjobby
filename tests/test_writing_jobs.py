@@ -286,6 +286,46 @@ async def test_an_operator_can_deliver_the_same_message(
 
 
 # ===========================================================================
+# stream_write(): output somebody reads while you produce it
+# ===========================================================================
+
+
+class ReportJob(Job):
+    """Streams each row as it is produced, then closes the stream."""
+
+    async def task(self, account: int) -> dict[str, Any]:
+        rows = await self.step("query", self.fetch_rows, account)
+        for row in rows:
+            await self.stream_write("rows", row)
+        await self.stream_close("rows")
+        return {"rows": len(rows)}
+
+    def fetch_rows(self, account: int) -> list[dict[str, Any]]:
+        return [{"account": account, "line": n} for n in range(3)]
+
+
+async def test_a_client_reads_the_rows_as_they_are_written(
+    client, live_worker, unique_queue
+):
+    await live_worker()
+
+    job_id = await client.enqueue(
+        "tests.test_writing_jobs.ReportJob", queue=unique_queue, account=7
+    )
+
+    seen = []
+    async with asyncio.timeout(30):
+        async for row in client.read_stream(job_id, "rows"):
+            seen.append(row)
+
+    assert seen == [{"account": 7, "line": n} for n in range(3)]
+    row = await wait_for_job_state(client.pool, job_id, ("finished",))
+    assert row["result"] == {"rows": 3}
+    # the reader stopped on the marker the job wrote
+    assert (await client.get_stream(job_id, "rows"))["closed"] is True
+
+
+# ===========================================================================
 # self.cancelled: cooperative cancellation in a long synchronous loop
 # ===========================================================================
 

@@ -120,6 +120,57 @@ class FirstAttemptBlocksStepJob(Job):
         return {"epoch": self.job["run_epoch"]}
 
 
+class StreamProducerJob(Job):
+    """Streams `n` values on `key`, then closes the stream.
+
+    `delay` spaces the writes out so a reader can be observed consuming them
+    WHILE the job runs rather than after it finishes.
+    """
+
+    async def task(
+        self, key: str = "rows", n: int = 5, delay: float = 0.0
+    ) -> dict[str, Any]:
+        for i in range(n):
+            if delay:
+                await asyncio.sleep(delay)
+            await self.stream_write(key, {"i": i})
+        await self.stream_close(key)
+        return {"wrote": n}
+
+
+class StreamThenCrashJob(Job):
+    """Streams `n` values on `key` and then raises, never closing.
+
+    The reader's other termination rule: a job that dies mid-stream ends its
+    readers by reaching a terminal state, with no marker to stop on.
+    """
+
+    async def task(self, key: str = "rows", n: int = 3) -> None:
+        for i in range(n):
+            await self.stream_write(key, {"i": i})
+        raise RuntimeError("crashed mid-stream")
+
+
+class StreamRetryJob(Job):
+    """Streams `n` values, fails once AFTER them, then closes on the retry.
+
+    The replay probe: every completed ``stream_write`` fast-forwards on
+    attempt 2, so the stream must hold `n` rows and not `2n`.
+    """
+
+    async def task(self, key: str = "rows", n: int = 3) -> dict[str, Any]:
+        for i in range(n):
+            await self.stream_write(key, {"i": i})
+        await self.step("maybe-explode", self._maybe_boom)
+        await self.stream_close(key)
+        return {"wrote": n}
+
+    def _maybe_boom(self) -> dict[str, Any]:
+        if self.job["error_count"] == 0:
+            raise RuntimeError("after the stream writes")
+        return {"ok": True}
+
+
 class PingJob(Job):
     """Sends one durable message to another job."""
 

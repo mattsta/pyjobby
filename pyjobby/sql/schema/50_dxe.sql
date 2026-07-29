@@ -48,3 +48,50 @@ CREATE INDEX jorb_mailbox_pending_idx ON jorb_mailbox (dest_job_id, topic, id)
 CREATE INDEX jorb_mailbox_consumed_idx ON jorb_mailbox (consumed_at)
     WHERE consumed_at IS NOT NULL;
 
+-- ============================================================================
+-- DXE: durable streams (a job appends, anyone reads from any offset)
+-- ============================================================================
+-- END OF STREAM IS A COLUMN, NEVER A VALUE IN BAND. A sentinel inside `value`
+-- -- a magic string, a reserved envelope -- collides with the job's own data
+-- domain by construction: the one payload a job may never send is the one
+-- nobody remembers is reserved, and the collision surfaces as a reader that
+-- stops early on real data. `closed` is out of band, so EVERY JSON value a
+-- job can produce is streamable. That includes NULL: a row with value NULL
+-- and closed = FALSE is a streamed null and readers yield it, while value
+-- NULL with closed = TRUE is the end marker and carries no value at all.
+--
+-- `seq` is DENSE and 0-based per (job_id, key), assigned inside the appending
+-- transaction as COALESCE(max(seq), -1) + 1 over that key. Dense is what
+-- lets a reader resume at an offset with a range scan and no cursor, and the
+-- primary key is what enforces it: one live execution owns a job (the
+-- run_epoch fence) and it appends on one connection, so nothing contends for
+-- the next position -- and if anything ever did, the key refuses the
+-- duplicate rather than writing two rows at one position.
+--
+-- `run_epoch` records WHICH attempt appended the row. It is observability,
+-- never a read filter: a resumed job's later rows continue the same stream,
+-- and a reader that filtered by epoch would tear the stream at every retry.
+--
+-- NO INDEX BUT THE PRIMARY KEY, deliberately. Both queries lead with job_id:
+-- the reader ranges over (job_id, key, seq >= offset) and the retention sweep
+-- probes (job_id) for existence. A second index would be write amplification
+-- on an append-only table for a question the key already answers.
+--
+-- LIFETIME: rows die with the job through the cascade, and the stream of a
+-- FINISHED job is reaped early on --checkpoint-retention-days, beside the
+-- checkpoints it was written with (monitor.SWEEP_STREAM_JOBS_SQL). A stream
+-- exists to be read while the job runs; once the job is done and its readers
+-- have terminated it is audit material, exactly like a checkpoint.
+CREATE TABLE jorb_stream (
+    job_id    BIGINT      NOT NULL REFERENCES jorb (id) ON DELETE CASCADE,
+    key       TEXT        NOT NULL,
+    seq       INTEGER     NOT NULL,    -- dense, 0-based, per (job_id, key)
+    value     JSONB,                   -- NULL is a streamed null, or no value
+    closed    BOOLEAN     NOT NULL DEFAULT FALSE,  -- end of stream, out of band
+    run_epoch INTEGER     NOT NULL,    -- which attempt appended this row
+    created   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (job_id, key, seq)
+);
+
+COMMENT ON TABLE jorb_stream IS 'DXE streams: ordered, durable, per-(job,key) output a client reads incrementally; end of stream is the closed column, never a value.';
+

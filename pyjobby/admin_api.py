@@ -51,8 +51,9 @@ DEFAULT_STUCK_AFTER_SECONDS = 300.0
 
 # Tables whose footprint an operator has to watch: jorb is the hot table,
 # jorb_history is the biggest (one row per transition), jorb_step is written
-# once per DXE checkpoint.
-FOOTPRINT_TABLES = ("jorb", "jorb_history", "jorb_step")
+# once per DXE checkpoint, and jorb_stream once per streamed VALUE -- the only
+# child table whose size an application can drive without adding jobs.
+FOOTPRINT_TABLES = ("jorb", "jorb_history", "jorb_step", "jorb_stream")
 
 #: How long the oldest CLAIMABLE job has been waiting, per queue. The state
 #: counts beside it come from :data:`pyjobby.db.QUEUE_STATS_SQL` — this is
