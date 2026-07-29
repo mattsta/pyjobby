@@ -78,8 +78,11 @@ addopts = [
     # Disruptive tests restart the machine's shared PostgreSQL instance --
     # every other database on it included -- so they too run deliberately,
     # alone (sequentially, no -n):    poetry run pytest -m disruptive
+    # Soak runs hold sustained load for minutes to hours (duration and rate
+    # from PYJOBBY_SOAK_SECONDS / PYJOBBY_SOAK_RATE) and measure what
+    # accumulates; they share nothing well:  poetry run pytest -m soak
     "-m",
-    "not performance and not disruptive",
+    "not performance and not disruptive and not soak",
 ]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
@@ -89,6 +92,7 @@ markers = [
     "hypothesis: marks tests as property-based tests using Hypothesis",
     "ops: process-level operational validation -- spawns real pj*/pj-admin processes and holds OPERATIONS.md / TROUBLESHOOTING.md to their word",
     "disruptive: restarts the host's PostgreSQL instance; excluded by default, run alone with `pytest -m disruptive`",
+    "soak: sustained-load accumulation run (PYJOBBY_SOAK_SECONDS, default 180); excluded by default, run alone with `pytest -m soak`",
     # Comparisons between configurations only. A test marked here never runs
     # in CI, so an invariant asserted only inside one is never checked against
     # any commit -- see docs/TESTING.md, "The performance marker".
