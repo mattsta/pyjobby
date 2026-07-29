@@ -79,7 +79,11 @@ class PyjobbyCLI(click.Group):
 #: verb does accept -- "no" without saying what would have worked is not an
 #: answer an operator can act on.
 NOT_CANCELLABLE = "cannot be cancelled (not found, or already terminal)"
-NOT_RETRIABLE = "cannot be retried (not found, or not crashed/cancelled)"
+NOT_RETRIABLE = (
+    "cannot be retried (not found, or not crashed/cancelled). A finished "
+    "job is rerun, not retried: `pj-admin jobs rerun` -- a separate verb "
+    "because running successful work again repeats its side effects"
+)
 NOT_RERUNNABLE = "cannot be rerun (not found, or not crashed, cancelled, or finished)"
 NOT_IN_DLQ = "is not in the DLQ (not found, or not crashed)"
 

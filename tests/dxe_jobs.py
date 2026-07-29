@@ -9,6 +9,7 @@ infrastructure, not per-test one-offs.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 from pyjobby.pj import Job
@@ -64,6 +65,22 @@ class SleeperJob(Job):
         await self.sleep(seconds)
         await self.set_event("phase", {"at": "after-sleep"})
         return "woke"
+
+
+class SyncBlockFirstAttemptJob(Job):
+    """SYNCHRONOUS task that blocks straight past its timeout on attempt 1.
+
+    A timed-out synchronous task cannot be interrupted: the worker records
+    the timeout on time but the thread runs on, abandoned -- the exact
+    condition the abandoned-thread accounting and NOT CLAIMING refusal
+    exist for. The second attempt returns immediately, so the worker
+    recovers once the thread drains.
+    """
+
+    def task(self, seconds: float = 8) -> str:
+        if self.job["run_count"] <= 1:
+            time.sleep(seconds)
+        return "done"
 
 
 class EpochSleeperJob(Job):
