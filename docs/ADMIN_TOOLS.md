@@ -245,10 +245,10 @@ The fleet-wide sweep for the condition
 that is `queued`, due, and that **no live worker on its queue could ever
 claim**. Two ways in, and the check names which one, per queue:
 
-| Cause                  | The line says                                                | Fix                                                                     |
-| ---------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------- |
-| `above_worker_ceiling` | `N on 'queue' above every live worker's ceiling (prio …)`     | `pj --max-prio` higher, or `pj-admin jobs set-priority ID N` lower       |
-| `capability_unmet`     | `N on 'queue' needing capability 'x', which none … advertises` | start a worker with `pj --queue Q --cap x`                              |
+| Cause                  | The line says                                                  | Fix                                                                |
+| ---------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `above_worker_ceiling` | `N on 'queue' above every live worker's ceiling (prio …)`      | `pj --max-prio` higher, or `pj-admin jobs set-priority ID N` lower |
+| `capability_unmet`     | `N on 'queue' needing capability 'x', which none … advertises` | start a worker with `pj --queue Q --cap x`                         |
 
 ```console
 $ pj-admin doctor

@@ -412,7 +412,7 @@ automatically and re-prepare their statements; nothing needs a restart.
 | ----------------------------------- | ----------------------------------------------------------------- |
 | Fleet health                        | `pj-admin doctor`, `pj-admin workers list`                        |
 | A worker is alive but doing nothing | `pyjobby_workers_not_claiming`, `doctor`'s `job-threads` check    |
-| Queued work nothing can ever claim  | `doctor`'s `unclaimable` check, then `pj-admin jobs why ID`      |
+| Queued work nothing can ever claim  | `doctor`'s `unclaimable` check, then `pj-admin jobs why ID`       |
 | Queue depths/ages                   | `pj-admin queues list`, `/metrics` gauges                         |
 | What happened to job N              | `pj-admin jobs history N`, `jobs steps N`                         |
 | Throughput/error rates              | `/metrics` counters + duration quantiles                          |

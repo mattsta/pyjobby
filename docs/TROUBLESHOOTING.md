@@ -37,20 +37,20 @@ FAIL means the platform cannot function and is the only thing that changes
 the exit code. Lost capacity is a WARN, deliberately: "no live workers at
 all" is a WARN, so one worker of ten refusing to claim cannot be graver.
 
-| Check             | FAIL / WARN means                                                                                                                 | Go to                                                                                    |
-| ----------------- | --------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `database`        | cannot connect with the DSN or config given                                                                                       | [Config and connection](#the-database-is-unreachable-or-the-config-is-wrong)             |
-| `schema`          | no schema at all, or a schema **missing objects this release needs** (each one named)                                             | [Schema is missing or stale](#the-schema-is-missing-or-stale)                            |
-| `triggers`        | one of the schema's triggers is missing — NOTIFY waiters degrade to polling, or history stops being recorded                      | [Schema is missing or stale](#the-schema-is-missing-or-stale)                            |
-| `notify-queue`    | WARN at 25% full, FAIL past 50%                                                                                                   | [NOTIFY queue saturation](#notify-queue-saturation)                                      |
-| `workers`         | no heartbeat in the last 60s                                                                                                      | [Nothing is being claimed](#nothing-is-being-claimed)                                    |
-| `job-threads`     | live workers that claim nothing                                                                                                   | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing) |
-| `queue <name>`    | backlog past `--max-depth` (10000) or `--max-age-minutes` (60)                                                                    | [The backlog is growing](#the-backlog-is-growing)                                        |
+| Check             | FAIL / WARN means                                                                                                                          | Go to                                                                                     |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- |
+| `database`        | cannot connect with the DSN or config given                                                                                                | [Config and connection](#the-database-is-unreachable-or-the-config-is-wrong)              |
+| `schema`          | no schema at all, or a schema **missing objects this release needs** (each one named)                                                      | [Schema is missing or stale](#the-schema-is-missing-or-stale)                             |
+| `triggers`        | one of the schema's triggers is missing — NOTIFY waiters degrade to polling, or history stops being recorded                               | [Schema is missing or stale](#the-schema-is-missing-or-stale)                             |
+| `notify-queue`    | WARN at 25% full, FAIL past 50%                                                                                                            | [NOTIFY queue saturation](#notify-queue-saturation)                                       |
+| `workers`         | no heartbeat in the last 60s                                                                                                               | [Nothing is being claimed](#nothing-is-being-claimed)                                     |
+| `job-threads`     | live workers that claim nothing                                                                                                            | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing)  |
+| `queue <name>`    | backlog past `--max-depth` (10000) or `--max-age-minutes` (60)                                                                             | [The backlog is growing](#the-backlog-is-growing)                                         |
 | `unclaimable`     | queued, runnable jobs that no live worker on their queue could ever claim — above every ceiling, or wanting a capability nobody advertises | [Jobs sit queued forever](#jobs-sit-queued-forever-and-nothing-is-wrong-with-the-workers) |
-| `blocked-waiters` | jobs in `waiting` whose upstream crashed or was cancelled — the monitor leaves them alone, so this is the only place they show up | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq)                              |
-| `mailbox`         | unread durable mail older than a day — usually a sender using a topic nothing `recv()`s                                           | [STATECHARTS.md § Waiting](STATECHARTS.md#waiting)                                       |
-| `dlq`             | jobs have exhausted their retries                                                                                                 | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq)                              |
-| `schedules`       | an enabled schedule is overdue by >5m                                                                                             | [A schedule is not firing](#a-schedule-is-not-firing)                                    |
+| `blocked-waiters` | jobs in `waiting` whose upstream crashed or was cancelled — the monitor leaves them alone, so this is the only place they show up          | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq)                               |
+| `mailbox`         | unread durable mail older than a day — usually a sender using a topic nothing `recv()`s                                                    | [STATECHARTS.md § Waiting](STATECHARTS.md#waiting)                                        |
+| `dlq`             | jobs have exhausted their retries                                                                                                          | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq)                               |
+| `schedules`       | an enabled schedule is overdue by >5m                                                                                                      | [A schedule is not firing](#a-schedule-is-not-firing)                                     |
 
 Age is the more honest queue alarm than depth: a deep queue that is
 draining is fine; an old queue is not. Tune the thresholds per install with
@@ -58,22 +58,22 @@ draining is fine; an old queue is not. Tune the thresholds per install with
 
 ## Symptom index
 
-| Symptom                                                       | Section                                                                                  |
-| ------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| One named job is not running                                  | `pj-admin jobs why ID`, then [Nothing is being claimed](#nothing-is-being-claimed)       |
-| Jobs sit in `queued`, workers look idle                       | [Nothing is being claimed](#nothing-is-being-claimed)                                    |
+| Symptom                                                       | Section                                                                                   |
+| ------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| One named job is not running                                  | `pj-admin jobs why ID`, then [Nothing is being claimed](#nothing-is-being-claimed)        |
+| Jobs sit in `queued`, workers look idle                       | [Nothing is being claimed](#nothing-is-being-claimed)                                     |
 | Jobs sit queued forever and the workers are fine              | [Jobs sit queued forever](#jobs-sit-queued-forever-and-nothing-is-wrong-with-the-workers) |
-| A worker heartbeats but never claims                          | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing) |
-| Queue depth or age climbing                                   | [The backlog is growing](#the-backlog-is-growing)                                        |
-| The table grows even though retention is on                   | [Retention is falling behind](#retention-is-falling-behind)                              |
-| Enqueues start failing platform-wide                          | [NOTIFY queue saturation](#notify-queue-saturation)                                      |
-| A cron schedule stopped running                               | [A schedule is not firing](#a-schedule-is-not-firing)                                    |
-| Jobs stuck in `claimed` or `running`                          | [A job is stuck](#a-job-is-stuck-in-claimed-or-running)                                  |
-| `crashed` count rising                                        | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq)                              |
-| `column ... does not exist`, `relation "jorb" does not exist` | [Schema is missing or stale](#the-schema-is-missing-or-stale)                            |
-| `Job class not found`                                         | [A job class cannot be imported](#a-job-class-cannot-be-imported)                        |
-| A job ran twice                                               | [A job ran more than once](#a-job-ran-more-than-once)                                    |
-| A process exits immediately at startup                        | [Config and connection](#the-database-is-unreachable-or-the-config-is-wrong)             |
+| A worker heartbeats but never claims                          | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing)  |
+| Queue depth or age climbing                                   | [The backlog is growing](#the-backlog-is-growing)                                         |
+| The table grows even though retention is on                   | [Retention is falling behind](#retention-is-falling-behind)                               |
+| Enqueues start failing platform-wide                          | [NOTIFY queue saturation](#notify-queue-saturation)                                       |
+| A cron schedule stopped running                               | [A schedule is not firing](#a-schedule-is-not-firing)                                     |
+| Jobs stuck in `claimed` or `running`                          | [A job is stuck](#a-job-is-stuck-in-claimed-or-running)                                   |
+| `crashed` count rising                                        | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq)                               |
+| `column ... does not exist`, `relation "jorb" does not exist` | [Schema is missing or stale](#the-schema-is-missing-or-stale)                             |
+| `Job class not found`                                         | [A job class cannot be imported](#a-job-class-cannot-be-imported)                         |
+| A job ran twice                                               | [A job ran more than once](#a-job-ran-more-than-once)                                     |
+| A process exits immediately at startup                        | [Config and connection](#the-database-is-unreachable-or-the-config-is-wrong)              |
 
 ---
 
@@ -256,7 +256,7 @@ live, with no restart — see
 
 Every other signal reads healthy: the workers heartbeat, the queue is not
 paused, no cap is binding, the DLQ is empty, and the jobs never fail —
-because they are never *tried*. They are runnable and **invisible to every
+because they are never _tried_. They are runnable and **invisible to every
 live worker on their queue**, so nothing claims them, nothing times them
 out, and no age-based check looks at `queued`. Left alone they sit there
 forever.
@@ -281,7 +281,7 @@ Two causes, and the line says which, per queue:
   declared on the client too — see
   [OPERATIONS.md § Priority](OPERATIONS.md#priority-and-the-ceiling-a-worker-claims-under))
   or by lowering the jobs: `pj-admin jobs set-priority ID 900`.
-- **A capability nobody advertises.** The line names what the fleet *does*
+- **A capability nobody advertises.** The line names what the fleet _does_
   advertise. Fix by starting a worker with it: `pj --queue reports --cap gpu`.
 
 Take an id from the line and `pj-admin jobs why ID` for the full per-job
