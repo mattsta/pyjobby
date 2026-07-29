@@ -153,6 +153,8 @@ influence what gets enqueued.
 ```python
 # Enqueue and wait — request/response in one call. Raises what
 # wait_for_result raises (JobFailedError, JobCancelledError, TimeoutError).
+# `timeout` here is the WAIT budget, consumed by run() itself — it is never
+# passed to task() (the payload/option collision rule below applies).
 report = await client.run("myapp.jobs.Report", day="mon", timeout=60)
 
 # Cancel and wait for the cancellation to LAND. 'cancel_requested' is a
@@ -452,6 +454,7 @@ marked "async only" below.
 
 - `get_job_full(job_id)` — complete row: kwargs, result, error, timestamps.
 - `get_job_result(job_id)` — a finished job's stored result, without waiting.
+- `wait_for_result(job_id, timeout=None)` — block until the job is terminal and return its result; raises `JobFailedError` / `JobCancelledError` / `TimeoutError`. The by-id form of `run()`, for a job enqueued earlier.
 - `get_steps(job_id)` — a job's recorded DXE checkpoints, oldest first.
 - `get_jobs(queue=None, state=None, limit=100, offset=0, order_by='created', ascending=False)` — list jobs, filtered and paginated.
 - `get_failed_jobs(queue=None, limit=100)` / `get_waiting_jobs(limit=100)` — filtered views of `get_jobs`.
@@ -470,7 +473,7 @@ marked "async only" below.
 
 **Advanced enqueue**
 
-- `enqueue_handle(...)` — enqueue and get a `JobHandle` (`.result()`, `.wait_for_result()`, `.cancel()`, `.event()`) (async only; a handle's own methods are coroutines bound to the async client, so `run()` / `wait_for_result()` are the sync shapes of this workflow).
+- `enqueue_handle(...)` — enqueue and get a `JobHandle` (`.wait()` — alias `.result()` —, `.status()`, `.cancel()`, `.event()`) (async only; a handle's own methods are coroutines bound to the async client, so `run()` / `wait_for_result()` are the sync shapes of this workflow).
 - `enqueue_in_transaction(conn, ...)` — enqueue on the CALLER's asyncpg connection, inside their transaction (async only; no sync twin).
 - `create_pipeline_with_results(stages, ...)` — a pipeline where each stage receives the previous stage's result.
 

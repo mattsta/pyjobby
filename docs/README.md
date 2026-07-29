@@ -80,10 +80,11 @@ below is a file you can open.
     source, commented end to end, including the measurements behind the
     indexes and autovacuum settings.
 
-Configuration is not a separate document: `pyjobby.toml` in the
-repository root is the annotated example, and
+Configuration is not a separate document:
 [deployment-guide.md § Configuration](deployment-guide.md#configuration)
-covers which process reads what.
+carries the sample config, a laptop-setup block, and which process reads
+what. (`pyjobby.toml` in the repository root is a further annotated copy,
+for readers working from a checkout.)
 
 ## Quick Reference
 

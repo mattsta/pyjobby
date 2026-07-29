@@ -59,7 +59,10 @@ is also the source of DXE's single obligation on your code:
 
 That obligation is _enforced_, not merely documented. The step's `name` is
 recorded alongside its sequence number, and on replay a mismatch raises
-`NondeterminismError` rather than silently returning another step's result:
+`NondeterminismError` rather than silently returning another step's result.
+(The primitives checkpoint under implicit names an operator will meet in
+`pj-admin jobs steps`: `dxe.sleep` for a durable sleep, `dxe.recv:<topic>`
+for a receive, `dxe.send:<dest>:<topic>` for a send.)
 
 ```
 step 2 was 'charge' on a previous attempt but is 'refund' now
@@ -465,9 +468,11 @@ pj-admin jobs rerun <id> --resume
 pj-admin jobs rerun <id>       # restart: deletes checkpoints, runs from step 1
 ```
 
-Use `--fresh` when the recorded results are _wrong_ rather than merely
-incomplete — after fixing a bug in a step, for instance. It is the operator's
-way to discard checkpoints for a job that is going to run again.
+Fresh is the default — a plain `rerun` (no flag; there is no `--fresh`,
+`fresh=` is the `AdminAPI.rerun_job` keyword) discards the checkpoints. Use
+it when the recorded results are _wrong_ rather than merely incomplete —
+after fixing a bug in a step, for instance. It is the operator's way to
+discard checkpoints for a job that is going to run again.
 
 ---
 

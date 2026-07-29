@@ -133,7 +133,21 @@ explicitly — any string value of the exact form `"${VAR_NAME}"` is replaced
 with that environment variable at load time, and a reference to an unset
 variable is a loud startup error naming the variable. (A `.py` config is
 refused by name: an executable config format means every daemon runs
-arbitrary code from whatever path it is pointed at.)
+arbitrary code from whatever path it is pointed at.) The loud error is
+about an unset _referenced_ variable, not a missing key: on trust/peer
+auth (a typical laptop PostgreSQL), omit `password` entirely.
+
+**On your laptop**, the whole setup is four commands — a database, a
+config pointing at it, the schema, and the health check:
+
+```bash
+createdb myapp_jobs
+printf '[db_params]\ndatabase = "myapp_jobs"\nhost = "localhost"\nport = 5432\n' > pyjobby.toml
+pj-admin -c ./pyjobby.toml db migrate
+pj-admin -c ./pyjobby.toml doctor
+```
+
+(add `user`/`password` keys if your server requires them.)
 
 `prio_ceiling` (an int) is the worker fleet's priority ceiling, read by
 `pj`, `pj-scheduler`, `pj-web` and `pj-ws` when their `--max-prio` flag is
@@ -214,7 +228,7 @@ process for the whole install — not one per host.
 ```console
 $ pj-monitor --config /etc/pyjobby/pyjobby.toml
 Starting monitor (check every 10.0s)...
-DSN: localhost:5432/pyjobby
+Database: localhost:5432/pyjobby
 Retention: jobs older than 30.0d, checkpoints 1.0d after the job terminates
 Monitor started (interval 10.0s, liveness grace 60.0s, job retention 30.0d, checkpoint retention 1.0d)
 ```
@@ -272,7 +286,7 @@ named.
 | ------------------- | ------------- | ------------------------------------------------------ |
 | `--queue`           | `default`     | a queue to staff; repeatable, duplicates collapse      |
 | `--cap`             | none          | capabilities this host advertises; repeatable          |
-| `--workers`         | CPU count / 2 | worker processes **per queue**                         |
+| `--workers`         | CPU count / 2 | worker processes **per queue** (`pj --help` prints the value computed for the machine it runs on) |
 | `--max-prio`        | 1000          | priority ceiling; jobs above it are not claimed        |
 | `--max-retries`     | 10            | attempts before a job is dead-lettered (`crashed`)     |
 | `--default-timeout` | 3600          | fallback job timeout in seconds; `0` disables          |

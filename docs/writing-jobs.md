@@ -86,10 +86,12 @@ overriding it is also how a job gets at the row before dispatch.
 
 ### What you have on `self`
 
-- `self.job` — the job's row as a dict: `id`, `kwargs`, `queue`, `prio`,
-  `uid`, `tags`, `error_count`, `run_count`, `run_epoch`, `admin_data`. The
-  examples below use `self.job["error_count"]` to mean "which attempt is
-  this".
+- `self.job` — the job's **whole row** as a dict: every `jorb` column is
+  present. The commonly useful keys: `id`, `kwargs`, `queue`, `prio`,
+  `uid`, `tags`, `error_count`, `run_count`, `run_epoch`, `admin_data`,
+  and `schedule_id` (the schedule that minted this job, else None — see
+  RECURRING_SCHEDULER.md § Deadline keys). The examples below use
+  `self.job["error_count"]` to mean "which attempt is this".
 - `self.s` — the `JobSystem` running the job. `self.s.cxn` is the worker's
   own PostgreSQL connection (also what `transaction()` hands you) and
   `self.s.cache` is a plain per-worker dict for expensive objects you want to
@@ -538,8 +540,10 @@ pj-admin jobs rerun <id> --resume   # resume: completed steps fast-forward
 pj-admin jobs rerun <id>            # restart: discard checkpoints first
 ```
 
-Use `--fresh` when the recorded results are _wrong_ (you fixed a bug in a
-step), not merely incomplete.
+Fresh is the default — a plain `rerun` discards the checkpoints; there is
+no `--fresh` flag (`fresh=` is the `AdminAPI.rerun_job` keyword). Rerun
+fresh when the recorded results are _wrong_ (you fixed a bug in a step);
+`--resume` when they are merely incomplete.
 
 Failures that are not exceptions from your code:
 

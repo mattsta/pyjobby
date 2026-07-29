@@ -407,11 +407,12 @@ ids = await client.enqueue_batch(rows, queue="imports")
 stats = await client.queue_stats("imports")  # {'queued': …, 'finished': …, …}
 ```
 
-The trade is that a batch is uniform: `queue`, `priority`, `run_after` and
-`run_group` apply to every row, and per-row options — `deadline_key`,
-`waitfor_job`, `tags`, timeouts — are not available. When you need those, loop
-over `enqueue()`, or use `create_fan_out()`, which is `enqueue_batch()` plus a
-group id.
+Shared options (`queue`, `priority`, `run_after`, `run_group`, ...) apply to
+every row, and a row that needs its own carries them itself: a 3-tuple
+`(job_class, kwargs, per_job_options)` layers that job's `deadline_key`,
+`tags`, `uid` or timeouts over the shared set — so a batch loses nothing
+against a loop of `enqueue()` calls. `create_fan_out()` is `enqueue_batch()`
+plus a group id.
 
 Register the job class with `@job` and the producer gets its arguments checked
 before anything reaches the database:

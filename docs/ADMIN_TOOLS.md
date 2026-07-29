@@ -782,16 +782,41 @@ Last Failure:          Never
 ```
 
 `schedule history NAME_OR_ID` takes `--result success|failure|skipped`,
-`-l/--limit` and `--json`; `schedule stats` is the fleet view. `schedule
-delete NAME_OR_ID` prompts unless `-f/--force`, like every other destructive
-verb here. Prefer `disable` to `delete` either way: it keeps the execution
-log.
+`-l/--limit` and `--json`; `schedule stats` is the fleet view. A success
+renders as `✓` with its job id, a failure as `✗` with the error, a skip as
+`-` with the reason in Details:
+
+```console
+$ pj-admin schedule history order-report --result skipped
+Execution History: order-report
+Time              Result  Job ID  Duration  Details
+---------------------------------------------------
+2026-07-29 01:16  -       -       -         max_concurrent
+
+Total: 1 execution(s)
+```
+
+`schedule delete NAME_OR_ID` prompts unless `-f/--force`, like every other
+destructive verb here. Prefer `disable` to `delete` either way: it keeps
+the execution log.
 
 Everything a schedule _means_ — cron syntax, jitter, backpressure, the
 circuit breaker, timezone handling — is in
 [RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md). Nothing fires unless
 `pj-scheduler` is running; `doctor` warns about schedules overdue by more
 than five minutes for exactly that reason.
+
+## Mail and events have no CLI verb, on purpose
+
+There is no `pj-admin mailbox`/`events` group. Durable mail and events are
+job-scoped data, and the job surfaces already carry them: a `recv()` or
+`sleep()` is a checkpoint, so `pj-admin jobs steps ID` shows it by its
+implicit name (`dxe.recv:<topic>`, `dxe.sleep`) with its status, and
+`client.get_event(job_id, key)` reads a published event. `doctor`'s
+`mailbox` check covers the aggregate failure (unread durable mail older
+than a day — a sender using a topic nothing `recv()`s). For anything
+finer, the `jorb_mailbox` table is the source of truth: `consumed_at` set
+means delivered.
 
 ## `dag`
 
