@@ -27,6 +27,13 @@ CREATE TABLE jorb (
     -- long as the row exists (see the COMMENT -- retention is the bound)
     identity_key    TEXT,
 
+    -- quiet-period collapse: one QUEUED row per debounce_key, whose
+    -- run_after every duplicate enqueue pushes further out (see the COMMENT)
+    debounce_key    TEXT,
+    -- the ceiling that collapse may never push run_after past, NULL when the
+    -- caller asked for no cap (see the COMMENT)
+    debounce_deadline TIMESTAMPTZ,
+
     -- provenance: the recurring schedule that fired this job into existence
     schedule_id     BIGINT,
 
@@ -69,6 +76,8 @@ COMMENT ON COLUMN jorb.waitfor_group IS 'Becomes queued only when ALL jobs with 
 COMMENT ON COLUMN jorb.waitfor_job IS 'Becomes queued only when the job with this id is finished.';
 COMMENT ON COLUMN jorb.forked_from IS 'The job this one was forked from: a fork is a NEW row that re-executes an existing job''s work from step N, with steps 1..N-1 copied in as checkpoints (jorb.admin_data->''fork'' records which N, and how many rows were copied). Retry and re-run keep ONE row; a fork does not, which is the whole point -- the source is never touched, so a fork of a running job is safe and a fork of a finished one does not disturb its result. ON DELETE SET NULL because LINEAGE IS BEST-EFFORT AUDIT, NOT A DEPENDENCY: retention reaps terminal jobs on its own schedule and the source is usually older than the fork, so a fork must outlive the row it came from rather than be deleted with it (ON DELETE CASCADE) or pin it forever (RESTRICT). A NULL here therefore means "no source, or the source has aged out", and the fork''s own history row -- written at insert, before anything could be reaped -- keeps the source id and step regardless.';
 COMMENT ON COLUMN jorb.identity_key IS 'The CALLER''s name for a piece of work, unique across this table IN ANY STATE: enqueueing an identity that already exists returns the existing job instead of writing a second row. THE CONTRAST WITH deadline_key IS THE WHOLE POINT, and the two indexes say it: jorb_deadline_idx is unique only among QUEUED rows and per QUEUE, so a deadline_key collapses duplicate submissions of work that has not started and then RE-ARMS the moment the job is claimed -- tomorrow''s "send the 09:00 digest" is a legitimate second job. jorb_identity_idx has no state predicate and no queue column, so an identity_key is claimed by the row for its entire life, running and finished and crashed alike, and never re-arms. RETENTION IS THE HORIZON, and it is the honest bound on "at most once": when the sweep reaps the terminal row (--retention-days) the key goes with it and the same identity enqueued afterwards creates a new job. A caller who needs uniqueness beyond the horizon scopes the key to a time it can name -- an order id, a date stamp, a ULID -- rather than expecting the platform to remember further back than it remembers anything else. NOT inherited by a fork (FORK_JOB_SQL lists its columns and this is not one: two live rows sharing an identity would make it mean nothing), and untouched by retry, rerun and dlq retry, which requeue the SAME row and so keep the identity they already had.';
+COMMENT ON COLUMN jorb.debounce_key IS 'The CALLER''s name for a BURST of equivalent enqueues that should become ONE job, run once the burst stops. Every duplicate enqueue of the key updates the one queued row rather than writing another: run_after moves to now + the caller''s quiet period and kwargs are REPLACED, so the collapsed job runs with the freshest arguments and last writer wins. THE DISTINCTION FROM THE OTHER TWO KEYS IS WHAT A DUPLICATE DOES, not what the index covers: a deadline_key IGNORES duplicates (the second enqueue raises and nothing about the first job changes), an identity_key RETURNS the existing job untouched, and a debounce_key MOVES the job -- later, and with different arguments. So debounce is only for work whose latest arguments are the right ones; work that must run with the arguments it was first submitted with wants deadline_key. THE KEY IS HELD WHILE THE ROW IS QUEUED AND HAS NEVER BEEN CLAIMED, which jorb_debounce_idx says and which means it is released at the CLAIM and never taken back: once a worker takes the collapsed job, the next enqueue of the key opens a NEW collapse window, and the two rows coexist (one running, one parked) with no conflict -- as do a RETRY of the first and a parked second, since a requeued row no longer holds the key it came in with. A duplicate arriving after run_after has passed but BEFORE a worker claims the row still collapses onto it and pushes the wait out again -- the work has not started, so there is nothing to collapse it out of. NOT inherited by a fork (FORK_JOB_SQL lists its columns and this is not one). Set only by JobClient.debounce(), which owns the bounce-or-insert statement pair; combining it with identity_key or deadline_key in one enqueue is refused, because their promises about a duplicate contradict each other.';
+COMMENT ON COLUMN jorb.debounce_deadline IS 'The ceiling a bounce may not push run_after past, written by the FIRST enqueue of a debounce_key as now + the caller''s cap and never rewritten. It exists because collapse without a bound is starvation: a key bounced faster than its own quiet period is deferred forever, and the job that was supposed to run "once the burst stops" never runs at all. Persisted rather than recomputed per call so that bounces from OTHER processes -- which know only their own cap, or none -- still respect the ceiling the first caller set. NULL means the caller accepted unbounded deferral, which is a legitimate choice for work that is worthless until the burst really does stop. Bounces clamp with LEAST, so once the deadline is reached run_after stops moving and the job becomes claimable while duplicates keep collapsing onto it.';
 COMMENT ON COLUMN jorb.schedule_id IS 'The jorb_schedule row that fired this job, NULL for every job enqueued directly. This is the SOLE source of that fact -- it used to live in admin_data->>''schedule_id'', which no index could serve, so the scheduler''s max_concurrent_jobs check scanned the whole job table on every firing. Deliberately NOT a foreign key: jobs outlive the schedules that made them (deleting a schedule must not delete or rewrite its history), and a REFERENCES here would need an index over EVERY schedule-created job to serve the cascade, undoing the point of the partial index below.';
 
 -- the poll/claim path
@@ -239,6 +248,51 @@ CREATE UNIQUE INDEX jorb_deadline_idx ON jorb (deadline_key, queue)
 -- retry, rerun and dlq retry all requeue the same row.
 CREATE UNIQUE INDEX jorb_identity_idx ON jorb (identity_key)
     WHERE identity_key IS NOT NULL;
+-- quiet-period collapse. Read this one against the two above as well: all
+-- three are partial unique indexes over a caller-chosen key, and the shape
+-- of each is the promise it makes.
+--
+--   `state = 'queued' AND run_count = 0` -- "queued, and never claimed",
+--   which is exactly "the collapse window is still open". Not
+--   `run_after > now()`, although "parked" is what a debounced row usually
+--   is: an index predicate must be IMMUTABLE, so the clock cannot appear in
+--   one -- and it should not, since the question is "has this work
+--   started?", and between run_after passing and a worker claiming the row
+--   it has not.
+--
+--   RUN_COUNT IS WHAT MAKES THE RELEASE PERMANENT, and it is not
+--   decoration. claim_jorb increments run_count, so it is 0 on exactly
+--   those rows no worker has ever admitted. Without it, a row that was
+--   claimed, failed and was RETRIED would come back to 'queued' still
+--   holding the key -- and if a burst had opened a new window in the
+--   meantime, that retry UPDATE (pyjobby/pj.py STMTS["retry"], and every
+--   other requeue path: the monitor's dead-worker sweep, `jobs retry`)
+--   would violate this index inside a worker's failure handler, leaving a
+--   job that can never be retried. With it, the key is released at the
+--   FIRST claim and can never be taken back, which is what "released at the
+--   claim" has to mean for a row that lives on. The row keeps the key as
+--   provenance -- `jobs inspect` still names the window a finished job came
+--   out of -- and holds nothing.
+--
+--   No `queue` column, unlike jorb_deadline_idx. A debounce_key names a
+--   burst of events in the application ("cart 991 changed"), and the same
+--   burst routed to another queue is still one burst.
+--
+-- WHAT MAKES IT DIFFERENT FROM ITS TWO NEIGHBOURS IS NOT THE PREDICATE, it
+-- is what a duplicate enqueue DOES: deadline_key raises and leaves the job
+-- alone, identity_key hands back the job untouched, and a debounce_key
+-- UPDATES the job -- pushing run_after out and replacing kwargs. The column
+-- COMMENT spells that out; the index only guarantees there is one row to
+-- update.
+--
+-- Partial for the reason every partial index here is: debounce_key is NULL
+-- on the overwhelming majority of jobs. And as with jorb_identity_idx, ON
+-- CONFLICT inference requires the predicate RESTATED in the statement;
+-- pyjobby/client.py ENQUEUE_DEBOUNCED_SQL is the one place that does, and
+-- DEBOUNCE_BOUNCE_SQL restates it again for a different reason (its own
+-- EvalPlanQual recheck).
+CREATE UNIQUE INDEX jorb_debounce_idx ON jorb (debounce_key)
+    WHERE debounce_key IS NOT NULL AND state = 'queued' AND run_count = 0;
 
 -- ----------------------------------------------------------------------------
 -- Autovacuum, tuned for this table's write pattern rather than left at the

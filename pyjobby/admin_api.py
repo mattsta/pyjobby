@@ -283,6 +283,12 @@ class JobInfo:
     # the caller's at-most-once name for this work, unique across every state
     # for as long as the row survives retention (see sql/schema/10_jobs.sql)
     identity_key: str | None = None
+    # the caller's name for a burst of enqueues collapsed onto this one row;
+    # held only while the row is queued (see sql/schema/10_jobs.sql)
+    debounce_key: str | None = None
+    # the ceiling collapse may not defer this row past, NULL when the caller
+    # accepted unbounded deferral (see sql/schema/10_jobs.sql)
+    debounce_deadline: datetime | None = None
     worker_pid: int | None = None
     worker_host: str | None = None
     result: dict | None = None
@@ -338,6 +344,7 @@ class JobInfo:
             "started",
             "finished",
             "timeout_at",
+            "debounce_deadline",
         ]:
             if data.get(key):
                 data[key] = data[key].isoformat()
@@ -595,7 +602,7 @@ class AdminAPI:
                    j.claimed_by, j.worker_host, j.worker_pid,
                    j.run_count, j.error_count, j.error_message,
                    j.cancel_requested, j.waitfor_job, j.waitfor_group,
-                   j.identity_key,
+                   j.identity_key, j.debounce_key, j.debounce_deadline,
                    EXTRACT(EPOCH FROM (j.run_after - now()))::float8
                        AS run_after_in_seconds,
                    EXTRACT(EPOCH FROM (now() - j.updated))::float8
@@ -862,17 +869,44 @@ class AdminAPI:
 
         if (row["run_after_in_seconds"] or 0.0) > 0:
             wait = float(row["run_after_in_seconds"])
-            return (
-                "deferred",
+            details: dict[str, Any] = {
+                "run_after": _iso(row["run_after"]),
+                "seconds_until_run_after": wait,
+            }
+            summary = (
                 f"Deferred: run_after is {_span(wait)} in the future "
                 f"({_iso(row['run_after'])}). This is how retry backoff, "
                 f"`enqueue_at` and durable sleep are implemented — nothing is "
-                f"wrong.",
-                {
-                    "run_after": _iso(row["run_after"]),
-                    "seconds_until_run_after": wait,
-                },
+                f"wrong."
             )
+            # A debounced row is deferred for a reason the operator can ACT
+            # on, unlike backoff: the wait is being pushed out by producers
+            # that are still enqueuing, so "it has been queued for ten
+            # minutes" is the feature working. Say which key, and say what
+            # bounds it — an uncapped window can be deferred indefinitely,
+            # and that is the one case where the answer is "look at the
+            # producers", not "wait".
+            # `run_count == 0` is jorb_debounce_idx's predicate: a retried
+            # debounced job is queued and deferred by BACKOFF, not by a
+            # collapse window that closed at its first claim, and telling an
+            # operator that producers are pushing it out would be a lie.
+            if row["debounce_key"] and row["run_count"] == 0:
+                capped = _iso(row["debounce_deadline"])
+                details["debounce_key"] = row["debounce_key"]
+                details["debounce_deadline"] = capped or "none"
+                summary += (
+                    f" This job is DEBOUNCED on key {row['debounce_key']!r}: "
+                    f"every duplicate enqueue of that key moves run_after "
+                    f"further out and replaces this row's arguments, so it "
+                    f"fires once the burst stops"
+                )
+                summary += (
+                    f" — and no later than {capped}, its cap."
+                    if capped
+                    else ", and nothing caps that — an unbroken stream of "
+                    "producers can defer it indefinitely."
+                )
+            return ("deferred", summary, details)
 
         control = await self.conn.fetchrow(
             """

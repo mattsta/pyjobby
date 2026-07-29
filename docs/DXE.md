@@ -673,7 +673,7 @@ copied and everything re-runs.
 
 | Copied | Not copied |
 | --- | --- |
-| `job_class`, `kwargs` (or an override) | `uid`, `deadline_key`, `identity_key` |
+| `job_class`, `kwargs` (or an override) | `uid`, `deadline_key`, `identity_key`, `debounce_key` |
 | `queue`, `prio` (or overrides) | `schedule_id` |
 | `capability`, `tags` | `dag_id`, `run_group`, `waitfor_*` |
 | `admin_data` (retry/timeout policy) | `result`, error fields, `run_count`, `error_count` |

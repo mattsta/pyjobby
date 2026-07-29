@@ -449,6 +449,25 @@ def jobs_inspect(ctx: click.Context, job_id: int, output_json: bool) -> None:
                 # to this job instead of creating another.
                 if job["identity_key"]:
                     click.echo(f"Identity:        {job['identity_key']}")
+                # Also only when set, and for the same reason as Identity
+                # above: it explains why a queued job's run_after keeps
+                # moving. "Fires" repeats run_after deliberately -- read
+                # here it is a deadline the producers control, not a delay
+                # somebody configured once.
+                if job["debounce_key"]:
+                    click.echo(f"Debounce:        {job['debounce_key']}")
+                    # The key stays on the row as provenance -- which window
+                    # produced this job -- but the window itself closes at
+                    # the first claim, so the fire time is only news while
+                    # the row can still be bounced.
+                    if job["state"] == "queued" and job["run_count"] == 0:
+                        click.echo(f"  fires:         {job['run_after']}")
+                        cap = job["debounce_deadline"]
+                        click.echo(
+                            f"  cap:           {cap or 'none (may defer indefinitely)'}"
+                        )
+                    else:
+                        click.echo("  window:        closed (released at the claim)")
                 if job["capability"]:
                     click.echo(f"Capability:      {job['capability']}")
                 if job["uid"]:
@@ -917,7 +936,8 @@ def jobs_fork(
 
     The fork inherits the job's class, arguments, queue, priority,
     capability, tags and retry/timeout policy. It does NOT inherit identity:
-    no uid, no deadline_key, no identity_key, no schedule, no DAG or
+    no uid, no deadline_key, no identity_key, no debounce_key, no
+    schedule, no DAG or
     dependency edges -- two live rows sharing an idempotency key would make
     that key mean nothing, and an identity_key promises there is only one.
 

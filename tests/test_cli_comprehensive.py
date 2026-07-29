@@ -108,6 +108,8 @@ def mock_admin_api():
         "waitfor_group": None,
         "deadline_key": None,
         "identity_key": None,
+        "debounce_key": None,
+        "debounce_deadline": None,
         "worker_pid": None,
         "worker_host": None,
         "result": None,

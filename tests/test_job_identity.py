@@ -434,7 +434,7 @@ class TestTheRace:
         The message is pinned too, because this exception is the one place a
         caller learns their isolation level cannot support an identity.
         """
-        monkeypatch.setattr(client_module, "_IDENTITY_ATTEMPTS", 1)
+        monkeypatch.setattr(client_module, "_SPECULATIVE_ATTEMPTS", 1)
         key = f"identity:{unique_queue}:one-attempt"
         holding = asyncio.Event()
         release = asyncio.Event()

@@ -441,7 +441,8 @@ result = await client.wait_for_result(fork["job_id"])
 
 The fork inherits the job class, arguments, queue, priority, capability,
 tags and retry/timeout policy. It does **not** inherit identity or
-structure: `uid`, `deadline_key`, `identity_key`, `schedule_id`, DAG
+structure: `uid`, `deadline_key`, `identity_key`, `debounce_key`,
+`schedule_id`, DAG
 membership and dependency edges are left unset, because two live rows
 sharing an idempotency key would make that key mean nothing — and an
 `identity_key` most of all, since its whole promise is that the row holding
@@ -607,6 +608,7 @@ marked "async only" below.
 **Advanced enqueue**
 
 - `enqueue_identified(job_class, *, identity_key, ...)` — the at-most-once enqueue, returning `(job_id, created)` so a caller can tell "I started this" from "this was already under way". Plain `enqueue(..., identity_key=...)` does the same write and returns the bare id.
+- `debounce(job_class, *, key, period, cap=None, ...)` — collapse a burst of equivalent enqueues onto one job that fires `period` seconds after the last of them, carrying that last call's arguments; returns `(job_id, created)`. See [Debouncing a burst](#4c-debouncing-a-burst-debounce).
 - `enqueue_handle(...)` — enqueue and get a `JobHandle` (`.wait()` — alias `.result()` —, `.status()`, `.cancel()`, `.event()`) (async only; a handle's own methods are coroutines bound to the async client, so `run()` / `wait_for_result()` are the sync shapes of this workflow).
 - `enqueue_in_transaction(conn, ...)` — enqueue on the CALLER's asyncpg connection, inside their transaction (async only; no sync twin).
 - `create_pipeline_with_results(stages, ...)` — a pipeline where each stage receives the previous stage's result.
@@ -875,6 +877,88 @@ separate meanings, but you usually want one or the other — see
 Identity is **not** a batch option: `enqueue_batch()` returns one id per row
 in order, and an identity that already exists has no row in that INSERT to
 return, so it is refused rather than silently dropped.
+
+### 4c. Debouncing a burst (`debounce()`)
+
+```python
+job_id, created = await client.debounce(
+    job_class, *, key, period, cap=None, **enqueue_options_and_kwargs
+)
+```
+
+Collapse a burst of equivalent enqueues onto **one** job that runs once the
+burst stops. The first call with a quiet `key` enqueues an ordinary job
+parked `period` seconds in the future; every call after it, while that row is
+still queued, **bounces** the row instead of writing another — `run_after`
+moves to now + `period`, and the row's kwargs are replaced with this call's.
+
+```python
+# nine edits in three seconds, one re-index -- of the last revision
+job_id, created = await client.debounce(
+    "myapp.jobs.ReindexDocument",
+    key=f"reindex:{doc_id}",
+    period=5.0,
+    cap=30.0,
+    doc_id=doc_id,
+    revision=revision,
+)
+```
+
+**Returns** `(job_id, created)`, the same shape and the same meaning as
+`enqueue_identified()`: `created` is True only for the call that opened the
+window.
+
+**Parameters**
+
+- `key` (str): your name for the burst. The row holds it while it is
+  `queued`; a worker claiming the job releases it.
+- `period` (float): the quiet window in seconds. It **restates** the wait
+  rather than extending it, so a bounce asking for a shorter period pulls the
+  job in — the last caller to bounce decides when it fires.
+- `cap` (float | None): the longest the job may be deferred, measured from
+  the **first** call. Written to the row, so bounces from other processes
+  respect it even though they never saw it; a later call passing a different
+  `cap` does not change the window it joined. `None` means an endlessly
+  bounced key is deferred indefinitely — a legitimate choice for work that is
+  worthless until the burst really stops, and a starvation bug otherwise.
+- everything else `enqueue()` takes, plus the job's kwargs.
+
+**Last writer wins on the arguments**, and that is the feature: the collapsed
+job runs the freshest input. It also means `debounce()` is only for work
+whose latest arguments are the right ones. Work that must run with the
+arguments it was first submitted with wants `deadline_key`.
+
+**What it refuses**, all with `ValueError`:
+
+- `identity_key` or `deadline_key` in the same call. The three keys answer
+  "what happens to a duplicate?" differently — return the existing job,
+  refuse the duplicate, move the existing job — and a row carrying two of
+  them would have to do two of those at once.
+- `waitfor_job` / `waitfor_group`. A dependent job is inserted `waiting`, and
+  the collapse window is held by a `queued` row, so nothing would ever
+  collapse.
+- a `key` already naming a job of a **different** class, exactly as
+  `identity_key` does, and the parked row is left untouched when it happens.
+- a non-positive `period` or `cap`, and a `priority` above the worker ceiling
+  (see [Priority, and the ceiling](#5-priority-and-the-ceiling)).
+
+It is also **not** a batch option: collapsing is a bounce-or-insert pair of
+statements and `enqueue_batch()` is one INSERT with no bounce in front of it,
+so a key already held would fail the batch rather than collapse into it.
+
+**The window closes at the claim, not at `run_after`.** A duplicate arriving
+after the wait has elapsed but before any worker has taken the row still
+collapses onto it — the work has not started. Once a worker does claim it,
+the key is free and the next burst opens a new window while the collapsed job
+runs. That release is permanent: a job that failed and is retrying is queued
+again, but it is not bounceable, so a burst collapses onto the open window
+rather than onto a job that is already on its second attempt. The row keeps
+the key as **provenance** — `pj-admin jobs inspect` still names the window a
+finished job came out of, and says the window is closed.
+
+`pj-admin jobs why` reports a parked debounced job as `deferred` and names
+the key, when it fires, and what caps it — and says nothing about debouncing
+for a retried one, whose deferral is ordinary backoff.
 
 ### 5. Priority, and the ceiling
 

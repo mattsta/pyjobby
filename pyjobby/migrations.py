@@ -121,7 +121,8 @@ REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
     "jorb": _names("""
         id queue capability prio state job_class kwargs admin_data result uid
         tags run_group waitfor_group waitfor_job dag_id deadline_key
-        identity_key schedule_id forked_from run_count
+        identity_key debounce_key debounce_deadline
+        schedule_id forked_from run_count
         error_count error_message error_backtrace run_epoch cancel_requested
         awaited claimed_by worker_pid worker_host created updated run_after
         claimed_at started finished timeout_at
@@ -183,6 +184,7 @@ REQUIRED_INDEXES: frozenset[str] = _names("""
     jorb_waitfor_job_idx jorb_waitfor_group_idx jorb_run_group_idx
     jorb_group_unfinished_idx jorb_uid_idx jorb_forked_from_idx
     jorb_dag_idx jorb_tags_idx jorb_deadline_idx jorb_identity_idx
+    jorb_debounce_idx
     jorb_schedule_id_idx
     jorb_finished_retention_idx
     jorb_queue_pkey

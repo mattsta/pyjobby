@@ -157,14 +157,16 @@ workers for less-urgent work, say so on both sides —
 
 ### Choosing your dedupe primitive
 
-Two of those options stop the same job being enqueued twice, and they mean
+Three of those options stop the same job being enqueued twice, and they mean
 different things. Pick by what you want to be true, not by which name reads
-better.
+better — and the question that separates them is **what happens to the
+duplicate**.
 
-| Option         | Unique among            | What it promises                                                       |
-| -------------- | ----------------------- | ---------------------------------------------------------------------- |
-| `deadline_key` | `queued` rows, per queue | at most one job of this key is **pending**; the key re-arms once claimed |
-| `identity_key` | all rows, table-wide     | this exact work happens **at most once**, until retention reaps the row |
+| Option         | Unique among            | A duplicate enqueue…                                                     |
+| -------------- | ----------------------- | ------------------------------------------------------------------------ |
+| `deadline_key` | `queued` rows, per queue | is **ignored** — it raises, and the pending job is untouched; the key re-arms once claimed |
+| `identity_key` | all rows, table-wide     | **returns the existing job** untouched: this exact work happens at most once, until retention reaps the row |
+| `debounce()`   | `queued` rows never claimed, table-wide | **moves the job** — later, and with the new arguments: the burst collapses into one run once it goes quiet |
 
 **`deadline_key` collapses, then re-arms.** The unique index covers queued
 rows only, so while a job sits in the queue a duplicate submission raises
@@ -212,9 +214,41 @@ safe because order ids are never reused, `nightly-rebuild` is not, and
 retention window on purpose — because the work genuinely recurs — you wanted
 `deadline_key`.
 
-Neither is an execution-side guarantee. Both stop a duplicate **row**; they
-do nothing about a job whose own `task()` runs twice after a retry. That is
-what [`step()`](#step--do-not-do-that-twice) and
+**`debounce()` collapses a burst, and runs the freshest arguments.** The
+other two leave the pending job alone; this one changes it. Each call parks
+one job `period` seconds out and every duplicate while it is still queued
+pushes `run_after` further out *and replaces the row's kwargs*, so what
+finally runs is a single job carrying the arguments of the last call. That
+is right for work whose input is a moving target: re-index this document,
+recompute this cart, reload the config that just changed nine times.
+
+```python
+# one re-index per document, 5s after the edits stop -- and never more
+# than 30s after the first one, however long the editing goes on
+job_id, created = await client.debounce(
+    "myapp.jobs.ReindexDocument",
+    key=f"reindex:{doc_id}",
+    period=5.0,
+    cap=30.0,
+    doc_id=doc_id,
+    revision=revision,   # the LAST revision is the one indexed
+)
+```
+
+Because the kwargs are replaced, `debounce()` is **only** for work whose
+latest arguments are the right ones. Work that must run with the arguments
+it was first submitted with wants `deadline_key`.
+
+Two things bound it. `period` restates the wait rather than extending it, so
+a caller asking for a shorter quiet window pulls the job in; and without
+`cap`, a key bounced faster than its own period is deferred forever. Pass a
+`cap` unless indefinite deferral is genuinely what you want. The key is
+released when a **worker claims** the job, so the next burst opens a new
+window while the collapsed one runs.
+
+None of the three is an execution-side guarantee. All of them stop a
+duplicate **row**; they do nothing about a job whose own `task()` runs twice
+after a retry. That is what [`step()`](#step--do-not-do-that-twice) and
 [`transaction()`](#transaction--exactly-once-for-writes-to-this-database)
 are for, and the two layers compose: an `identity_key` makes the work exist
 once, `step()` makes each part of it execute once.

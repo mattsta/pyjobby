@@ -251,6 +251,32 @@ The rest of this section is the same walk by hand — for when the symptom is
 6. **`run_after`.** A job with a future `run_after` is _supposed_ to be
    invisible — that is how retry backoff and durable sleep are
    implemented. `pj-admin jobs inspect ID` shows it.
+
+   **A debounced job is this case, working as designed**, and it is the one
+   where `run_after` keeps moving while you watch. `client.debounce()` parks
+   one job per key and every duplicate enqueue of that key pushes the row
+   further out, so a busy key can sit `queued` for as long as its producers
+   keep going. `pj-admin jobs why ID` says so in as many words and gives the
+   two numbers that settle it — when it fires, and the cap past which no
+   bounce may defer it (`none` if the caller asked for no cap, in which case
+   the answer is to look at the producers, not the fleet):
+
+   ```console
+   $ pj-admin jobs why 51203
+
+   Job 51203: deferred
+   queued  search  myapp.jobs.ReindexDocument  prio 100
+   --------------------------------------------------
+   Deferred: run_after is 4s in the future (2026-07-29T11:02:19+00:00). This is how retry backoff, `enqueue_at` and durable sleep are implemented — nothing is wrong. This job is DEBOUNCED on key 'reindex:8814': every duplicate enqueue of that key moves run_after further out and replaces this row's arguments, so it fires once the burst stops — and no later than 2026-07-29T11:02:45+00:00, its cap.
+
+       run_after:                       2026-07-29T11:02:19+00:00
+       seconds_until_run_after:         4.0
+       debounce_key:                    reindex:8814
+       debounce_deadline:               2026-07-29T11:02:45+00:00
+   ```
+
+   See
+   [CLIENT_LIBRARY.md § Debouncing a burst](CLIENT_LIBRARY.md#4c-debouncing-a-burst-debounce).
 7. **The worker's own log**, for `NOT CLAIMING` (next section).
 
 `pj-admin queues pause` / `resume` and `queues limits` change all of this
@@ -580,7 +606,13 @@ and a monitor startup WARNING naming the two flags. Raise the grace
   scope keys to a time you can name (`nightly-rebuild:2026-07-29`, not
   `nightly-rebuild`). See
   [CLIENT_LIBRARY.md](CLIENT_LIBRARY.md#4b-at-most-once-work-identity-keys).
-- **Idempotent side effects** — the fallback when neither applies.
+- **`client.debounce()`** — the enqueue-side guard for a _burst_: the
+  duplicates are not refused and not answered with the existing job, they
+  **move** it, so a hundred enqueues become one run carrying the last call's
+  arguments. Use it when the duplicates are genuine (nine edits really did
+  happen) and only the final state matters. See
+  [CLIENT_LIBRARY.md](CLIENT_LIBRARY.md#4c-debouncing-a-burst-debounce).
+- **Idempotent side effects** — the fallback when none of them applies.
 
 Note that a re-run you asked for is a separate verb precisely because it
 repeats side effects: `jobs retry` refuses a finished job, `jobs rerun`

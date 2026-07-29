@@ -113,12 +113,19 @@ ENQUEUE_SQL = """
         capability, uid, run_group,
         waitfor_job, waitfor_group,
         deadline_key, admin_data, tags, state, schedule_id,
-        identity_key
+        identity_key, debounce_key, debounce_deadline
     )
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-            $16)
+            $16, $17, $18)
     RETURNING id
 """
+
+#: Where the job's kwargs sit in build_enqueue_row's parameter row, i.e.
+#: ENQUEUE_SQL's $2. The debounce bounce writes THAT value into the row it
+#: collapses onto, so "this call's kwargs" means exactly what it would have
+#: meant had the call inserted instead — including the job_kwargs/**kwargs
+#: resolution the builder did.
+_ROW_KWARGS: Final = 1
 
 # The identified form of ENQUEUE_SQL: same columns, same row, but the write
 # is "claim this identity or tell me who holds it". ONE statement, because
@@ -161,10 +168,10 @@ ENQUEUE_IDENTIFIED_SQL = """
             capability, uid, run_group,
             waitfor_job, waitfor_group,
             deadline_key, admin_data, tags, state, schedule_id,
-            identity_key
+            identity_key, debounce_key, debounce_deadline
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                $15, $16)
+                $15, $16, $17, $18)
         ON CONFLICT (identity_key) WHERE identity_key IS NOT NULL DO NOTHING
         RETURNING id, job_class
     )
@@ -174,6 +181,99 @@ ENQUEUE_IDENTIFIED_SQL = """
       FROM jorb held
      WHERE held.identity_key = $16
        AND NOT EXISTS (SELECT 1 FROM claimed)
+"""
+
+# The bounce half of debounce(): collapse this call onto the row that already
+# holds the key, if there is one.
+#
+# ONE statement doing two things, because they have to agree about which row
+# they are talking about. `parked` is the row the key belongs to right now;
+# `bounced` is that same row, updated -- and the UPDATE RESTATES the whole
+# predicate instead of joining `parked` on id, which is the load-bearing
+# detail. Under READ COMMITTED an UPDATE that finds its target row locked
+# waits, then re-evaluates its OWN quals against the version that committed
+# (EvalPlanQual). A qual of `id = parked.id` is satisfied by every version of
+# that row, including one a worker has just claimed -- so the statement would
+# move run_after and rewrite the kwargs of a job that is already RUNNING.
+# Restated, the recheck fails, nothing is bounced, and the caller falls
+# through to the insert. That fall-through IS the bounce-vs-claim race, and
+# it resolves correctly: the claimed row has left jorb_debounce_idx, so the
+# fresh insert opens the next collapse window rather than conflicting.
+#
+# `run_count = 0` is jorb_debounce_idx's predicate, restated for the same
+# reason and carrying the same meaning: queued and never claimed, i.e. the
+# window is still open. It is what keeps a RETRIED debounced job -- queued
+# again, but long past its window -- from being bounced by a burst that has
+# nothing to do with it.
+#
+# LEAST clamps to debounce_deadline, the cap the FIRST enqueue of this key
+# wrote (NULL means the caller accepted unbounded deferral -- 'infinity'
+# makes that the same expression rather than a second statement). A bounce
+# never rewrites the deadline: the cap belongs to the window, not to the call.
+#
+# The class check is a QUAL, not a check on the returned row, so a key used
+# for two different job classes updates nothing rather than leaving one class
+# running with the other's arguments. `parked` still reports the holder, so
+# the caller can name it in the refusal; a NULL `fires_at` with a MATCHING
+# class is the lost race above, and means "insert instead".
+#
+# Params: $1 debounce_key, $2 the new run_after, $3 the new kwargs,
+#         $4 the job_class the caller is debouncing.
+DEBOUNCE_BOUNCE_SQL = """
+    WITH parked AS (
+        SELECT id, job_class
+          FROM jorb
+         WHERE debounce_key = $1
+           AND state = 'queued'
+           AND run_count = 0
+    ), bounced AS (
+        UPDATE jorb
+           SET run_after = LEAST(
+                   $2::timestamptz,
+                   COALESCE(debounce_deadline, 'infinity'::timestamptz)),
+               kwargs = $3,
+               updated = now()
+         WHERE debounce_key = $1
+           AND state = 'queued'
+           AND run_count = 0
+           AND job_class = $4
+        RETURNING id, run_after
+    )
+    SELECT parked.id, parked.job_class, bounced.run_after AS fires_at
+      FROM parked LEFT JOIN bounced ON bounced.id = parked.id
+"""
+
+# The insert half: open a new collapse window, or discover that somebody else
+# opened it first.
+#
+# ENQUEUE_SQL's columns and parameters exactly, plus the conflict clause --
+# and the four-step sequence written out on ENQUEUE_IDENTIFIED_SQL above
+# applies here VERBATIM, down to the reason the answer can be no rows at all:
+# a speculative insert BLOCKS on an uncommitted conflicting tuple, and the
+# row that commits underneath it is then newer than this statement's
+# snapshot. The loop that re-asks with a fresh snapshot is JobClient.debounce,
+# and its next attempt bounces the row it could not see.
+#
+# Inference restates jorb_debounce_idx's predicate for the same reason
+# ENQUEUE_IDENTIFIED_SQL restates jorb_identity_idx's: PostgreSQL refuses to
+# guess which partial index an ON CONFLICT means.
+#
+# Params: ENQUEUE_SQL's, with $17 the debounce_key (never NULL here) and $18
+# the cap, or NULL for unbounded deferral.
+ENQUEUE_DEBOUNCED_SQL = """
+    INSERT INTO jorb (
+        job_class, kwargs, queue, prio, run_after,
+        capability, uid, run_group,
+        waitfor_job, waitfor_group,
+        deadline_key, admin_data, tags, state, schedule_id,
+        identity_key, debounce_key, debounce_deadline
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+            $16, $17, $18)
+    ON CONFLICT (debounce_key)
+        WHERE debounce_key IS NOT NULL AND state = 'queued' AND run_count = 0
+        DO NOTHING
+    RETURNING id, run_after
 """
 
 # The multi-row form of ENQUEUE_SQL: the same columns, filled from one array
@@ -187,14 +287,15 @@ ENQUEUE_BATCH_SQL = """
         capability, uid, run_group,
         waitfor_job, waitfor_group,
         deadline_key, admin_data, tags, state, schedule_id,
-        identity_key
+        identity_key, debounce_key, debounce_deadline
     )
     SELECT * FROM UNNEST(
         $1::text[], $2::jsonb[], $3::text[], $4::int[],
         $5::timestamptz[], $6::text[], $7::bigint[],
         $8::bigint[], $9::bigint[], $10::bigint[],
         $11::text[], $12::jsonb[], $13::jsonb[],
-        $14::jorbstate[], $15::bigint[], $16::text[]
+        $14::jorbstate[], $15::bigint[], $16::text[],
+        $17::text[], $18::timestamptz[]
     )
     RETURNING id
 """
@@ -243,25 +344,29 @@ DEFAULT_MACHINE_QUEUE: Final = "machines"
 #: Short on purpose — the cancel is best effort, the exception is not.
 _RUN_CANCEL_TIMEOUT: Final = 5.0
 
-#: How many times an identified enqueue re-runs ENQUEUE_IDENTIFIED_SQL when
-#: it comes back empty. Empty means the identity was committed by another
-#: transaction AFTER this statement's snapshot was taken, so the statement
-#: could neither insert over the row nor see it (that statement's comment
-#: walks through the four steps). Re-running takes a FRESH SNAPSHOT, which is
-#: why this is a loop and not a longer statement, and one retry is normally
-#: the whole of it: the writer we waited for has already committed.
+#: How many times a SPECULATIVE ENQUEUE re-runs its statement when that
+#: statement comes back empty -- shared by the identified and the debounced
+#: paths, which face the same semantics because they are the same shape:
+#: INSERT ... ON CONFLICT DO NOTHING against a caller-chosen key.
 #:
-#: More than one is only needed if ANOTHER writer claims the identity in the
-#: gap, so the budget is a backstop against a pathological stream of them and
-#: not a wait for anything. It is deliberately NOT the answer to a
-#: transaction that never commits -- that case blocks inside PostgreSQL at
-#: step 2 and never reaches this loop at all.
-_IDENTITY_ATTEMPTS: Final = 5
+#: Empty means the key was committed by another transaction AFTER this
+#: statement's snapshot was taken, so the statement could neither insert over
+#: the row nor see it (ENQUEUE_IDENTIFIED_SQL's comment walks through the
+#: four steps). Re-running takes a FRESH SNAPSHOT, which is why this is a
+#: loop and not a longer statement, and one retry is normally the whole of
+#: it: the writer we waited for has already committed.
+#:
+#: More than one is only needed if ANOTHER writer claims the key in the gap,
+#: so the budget is a backstop against a pathological stream of them and not
+#: a wait for anything. It is deliberately NOT the answer to a transaction
+#: that never commits -- that case blocks inside PostgreSQL at step 2 and
+#: never reaches this loop at all.
+_SPECULATIVE_ATTEMPTS: Final = 5
 
 #: Pause between those attempts, growing linearly. Nonzero so a pile-up of
 #: writers is not spun on, and tiny because there is nothing to wait for:
 #: the commit we lost to has already happened.
-_IDENTITY_BACKOFF: Final = 0.01
+_SPECULATIVE_BACKOFF: Final = 0.01
 
 #: Why a batch cannot carry identity keys. A batch is ONE multi-row INSERT
 #: whose contract is "the ids, in the order given" -- and the identified
@@ -275,6 +380,48 @@ _NO_BATCH_IDENTITY: Final = (
     "id per row IN ORDER, and an identity that already exists has no row in "
     "it to return. Enqueue identified jobs one at a time with "
     "enqueue_identified(), which tells you which ones were already there."
+)
+
+#: Why a batch cannot carry debounce keys either, and it is a different
+#: reason. A batch is a plain multi-row INSERT: it has no bounce statement in
+#: front of it, so a key already held would not collapse -- the row would
+#: simply violate jorb_debounce_idx and take the whole batch down with it.
+#: Every guarantee debounce makes lives in JobClient.debounce()'s
+#: bounce-or-insert pair, so the option is refused where it would silently
+#: mean nothing.
+_NO_BATCH_DEBOUNCE: Final = (
+    "debounce_key is not a batch option: collapsing a burst is a "
+    "bounce-or-insert pair of statements, and a batch is one INSERT with no "
+    "bounce in front of it -- a key already held would fail the batch rather "
+    "than collapse into the job holding it. Call debounce() per key."
+)
+
+#: Why the three enqueue-side keys cannot be combined. Each one answers "what
+#: happens to a DUPLICATE enqueue?" and they answer it differently: an
+#: identity_key hands back the existing job untouched, a deadline_key raises
+#: and leaves it untouched, a debounce_key moves it later and rewrites its
+#: arguments. A row carrying two of them would have to do two of those at
+#: once, so the combination is a design error in the caller and is refused
+#: loudly rather than resolved by whichever statement happens to run.
+_KEYS_CONTRADICT: Final = (
+    "debounce_key cannot be combined with {other}: they promise different "
+    "things about a duplicate enqueue -- debounce_key defers the existing "
+    "job and replaces its kwargs, identity_key returns it untouched, and "
+    "deadline_key refuses the duplicate outright. Pick the one whose "
+    "promise you want (docs/writing-jobs.md, 'Choosing your dedupe "
+    "primitive')."
+)
+
+#: Why a debounced job cannot also wait on something. `waitfor_job` /
+#: `waitfor_group` insert the row as 'waiting', and jorb_debounce_idx covers
+#: QUEUED rows only -- so the key would not be held, no duplicate would ever
+#: find the row to collapse onto, and every call in the burst would write
+#: another job. Refused rather than silently degrading to no debouncing at all.
+_NO_DEBOUNCE_WAITFOR: Final = (
+    "debounce_key cannot be combined with waitfor_job/waitfor_group: a "
+    "dependent job is inserted 'waiting', and the collapse window is held by "
+    "a QUEUED row -- so nothing would ever collapse and every call would "
+    "write another job. Debounce the work that runs after the wait instead."
 )
 
 
@@ -1105,6 +1252,175 @@ class JobClient:
             except asyncpg.UndefinedTableError as e:
                 raise self._unmigrated_database_error() from e
 
+    async def debounce(
+        self,
+        job_class: str,
+        *,
+        key: str,
+        period: float,
+        cap: float | None = None,
+        **options: Any,
+    ) -> tuple[int, bool]:
+        """Collapse a burst of equivalent enqueues onto ONE job that runs
+        once the burst stops.
+
+        The first call with a quiet ``key`` enqueues an ordinary job parked
+        ``period`` seconds in the future — a queued row with a future
+        ``run_after``, which is the same durable-sleep the claim path already
+        implements, so nothing about claiming changes. Every call after it
+        while that row is still queued BOUNCES it: ``run_after`` moves to now
+        + ``period`` and the row's kwargs are REPLACED with this call's.
+
+        Returns ``(job_id, created)`` — the same shape as
+        enqueue_identified(), and ``created`` means the same thing: this call
+        wrote the row, rather than joining the window somebody else opened.
+
+        LAST WRITER WINS, and that is the feature. The collapsed job runs
+        with the freshest arguments, which is right for "re-index document
+        7", "recompute cart 991's totals", "the config changed, reload" — and
+        wrong for anything whose arguments must be the ones first submitted.
+        That work wants ``deadline_key``.
+
+        ``period`` RESTATES the wait rather than extending it: it is the
+        caller's current quiet window, so a bounce that asks for a shorter
+        period pulls the job in. Callers in a fleet that disagree about the
+        period therefore each get their own answer for as long as they keep
+        bouncing, and the last one to bounce decides when it fires.
+
+        ``cap`` bounds the collapse. Without it, a key bounced faster than
+        its own period is deferred forever — a legitimate choice for work
+        that is worthless until the burst really stops, and a starvation bug
+        otherwise. With it, ``run_after`` never moves past the FIRST call's
+        now + ``cap``: the ceiling is written to the row, so bounces from
+        other processes respect it even though they never saw the cap. The
+        first caller sets it; later ones passing a different ``cap`` do not
+        change the window they joined.
+
+        THE KEY IS RELEASED AT THE CLAIM, not at the enqueue. A worker taking
+        the job frees the key, so a burst arriving while it runs opens a new
+        window and the two rows coexist. A duplicate arriving after
+        ``run_after`` has passed but before any worker claimed the row still
+        collapses onto it: the work has not started.
+
+        Accepts the rest of enqueue()'s options and the job's kwargs.
+        ``identity_key``, ``deadline_key`` and ``waitfor_job``/
+        ``waitfor_group`` are refused — the first two promise something else
+        about a duplicate, and a 'waiting' row does not hold the key.
+
+        Example:
+            # one re-index per document, fired 5s after the edits stop, and
+            # never more than 30s after the first one
+            job_id, created = await client.debounce(
+                "myapp.jobs.ReindexDocument",
+                key=f"reindex:{doc_id}",
+                period=5.0,
+                cap=30.0,
+                doc_id=doc_id,
+                revision=revision,   # the LAST revision is the one indexed
+            )
+        """
+        if period <= 0:
+            raise ValueError(
+                f"period must be a positive number of seconds, got {period!r}: "
+                f"a debounce with no quiet window collapses nothing"
+            )
+        if cap is not None and cap <= 0:
+            raise ValueError(
+                f"cap must be a positive number of seconds, got {cap!r}: "
+                f"pass None for a collapse window with no ceiling"
+            )
+
+        # enqueue()'s ceiling rule, applied here too (see enqueue_identified).
+        ceiling = options.pop("prio_ceiling", None)
+        options["prio_ceiling"] = self.prio_ceiling if ceiling is None else ceiling
+
+        # ONE clock for both halves. The bounce compares its new run_after
+        # against a debounce_deadline some earlier call computed, and the
+        # insert writes both from here -- so they are the same clock as every
+        # other run_after in the platform (the caller's), and the database's
+        # now() appears nowhere in the comparison.
+        now = datetime.now(UTC)
+        deadline = now + timedelta(seconds=cap) if cap is not None else None
+        fires_at = now + timedelta(seconds=period)
+        # A cap below the period is not an error: the ceiling is what the
+        # caller asked to be bounded by, so the very first parking already
+        # honours it rather than overshooting once and then clamping.
+        if deadline is not None and deadline < fires_at:
+            fires_at = deadline
+
+        args = self.build_enqueue_row(
+            job_class,
+            run_after=fires_at,
+            debounce_key=key,
+            debounce_deadline=deadline,
+            **options,
+        )
+        async with self.pool.acquire() as conn:
+            try:
+                return await self._debounce_on(conn, args, job_class, key, fires_at)
+            except asyncpg.UndefinedTableError as e:
+                raise self._unmigrated_database_error() from e
+
+    @staticmethod
+    async def _debounce_on(
+        conn: asyncpg.Connection,
+        args: list[Any],
+        job_class: str,
+        key: str,
+        fires_at: datetime,
+    ) -> tuple[int, bool]:
+        """Bounce the row holding ``key``, or open the window ourselves.
+
+        The loop is here for the reason _enqueue_identity's is, and it is the
+        same reason: ENQUEUE_DEBOUNCED_SQL is a speculative insert, and a
+        speculative insert that WAITED for the conflicting transaction
+        answers with no row at all — the winner committed after this
+        statement's snapshot was taken. Re-asking takes a fresh snapshot, and
+        on the next pass the bounce finds the row that was invisible. Both
+        loops therefore converge only under READ COMMITTED; the budget is a
+        backstop against an unbroken stream of writers, not a wait.
+
+        Two statements rather than one because the common case is the bounce
+        and it costs one round trip. The gap between them is exactly the race
+        the loop exists for, and it is not a new one: it is the same window
+        the insert would have to survive anyway.
+        """
+        for attempt in range(_SPECULATIVE_ATTEMPTS):
+            held = await conn.fetchrow(
+                DEBOUNCE_BOUNCE_SQL, key, fires_at, args[_ROW_KWARGS], job_class
+            )
+            if held is not None:
+                if held["fires_at"] is not None:
+                    return held["id"], False
+                # The row holding the key is real but was not bounced. Either
+                # it is somebody else's job class -- a caller error, and the
+                # only one this verb can detect -- or a worker claimed it out
+                # from under the UPDATE, which is not an error at all: the key
+                # is free now, so fall through and open the next window.
+                if held["job_class"] != job_class:
+                    raise ValueError(
+                        f"debounce key {key!r} already names job "
+                        f"{held['id']}, which is a {held['job_class']} — not "
+                        f"the requested {job_class}. A debounce key names one "
+                        f"burst of one kind of work, and bouncing this row "
+                        f"would leave it running the other class's arguments."
+                    )
+
+            created = await conn.fetchrow(ENQUEUE_DEBOUNCED_SQL, *args)
+            if created is not None:
+                return created["id"], True
+            await asyncio.sleep(_SPECULATIVE_BACKOFF * (attempt + 1))
+
+        raise RuntimeError(
+            f"debounce key {key!r} was claimed by another transaction after "
+            f"each of {_SPECULATIVE_ATTEMPTS} attempts' snapshots, so this "
+            f"call could neither bounce the collapse window nor open one. "
+            f"Nothing was written. Either an unbroken stream of writers is "
+            f"opening and claiming this one window, or this call is running "
+            f"at REPEATABLE READ or higher, where a retry reuses the "
+            f"transaction's snapshot and can never see the row."
+        )
+
     async def enqueue_handle(self, job_class: str, **options: Any) -> JobHandle:
         """Enqueue a job (same keyword arguments as enqueue()) and return a
         JobHandle instead of a bare id.
@@ -1288,7 +1604,7 @@ class JobClient:
         inserted. Checking a row read beforehand would let the loser insert
         against a row that no longer says what it read.
         """
-        for attempt in range(_IDENTITY_ATTEMPTS):
+        for attempt in range(_SPECULATIVE_ATTEMPTS):
             row = await conn.fetchrow(ENQUEUE_IDENTIFIED_SQL, *args)
             if row is not None:
                 held: str = row["job_class"]
@@ -1302,10 +1618,10 @@ class JobClient:
                         f"silently hand back a job of the other class."
                     )
                 return row["id"], row["created"]
-            await asyncio.sleep(_IDENTITY_BACKOFF * (attempt + 1))
+            await asyncio.sleep(_SPECULATIVE_BACKOFF * (attempt + 1))
         raise RuntimeError(
             f"identity_key {identity_key!r} was claimed by another "
-            f"transaction after each of {_IDENTITY_ATTEMPTS} attempts' "
+            f"transaction after each of {_SPECULATIVE_ATTEMPTS} attempts' "
             f"snapshots, so this call can neither create the job nor name the "
             f"one that holds it. Nothing was written. Either an unbroken "
             f"stream of writers is claiming this one identity, or this "
@@ -1327,6 +1643,8 @@ class JobClient:
         waitfor_group: int | None = None,
         deadline_key: str | None = None,
         identity_key: str | None = None,
+        debounce_key: str | None = None,
+        debounce_deadline: datetime | None = None,
         admin_data: dict[str, Any] | None = None,
         tags: dict[str, Any] | None = None,
         save_result: bool = True,
@@ -1364,6 +1682,31 @@ class JobClient:
             )
         if waitfor_job and waitfor_group:
             raise ValueError("Cannot specify both waitfor_job and waitfor_group")
+
+        # The three enqueue-side keys, checked HERE rather than in debounce()
+        # because this is the one construction path every writer goes
+        # through: a row that reached the INSERT carrying two of them would
+        # have been assembled somewhere this check is not.
+        if debounce_key is not None:
+            conflicting = [
+                name
+                for name, value in (
+                    ("identity_key", identity_key),
+                    ("deadline_key", deadline_key),
+                )
+                if value is not None
+            ]
+            if conflicting:
+                raise ValueError(
+                    _KEYS_CONTRADICT.format(other=" and ".join(conflicting))
+                )
+            if waitfor_job or waitfor_group:
+                raise ValueError(_NO_DEBOUNCE_WAITFOR)
+        elif debounce_deadline is not None:
+            raise ValueError(
+                "debounce_deadline without debounce_key: the cap bounds a "
+                "collapse window, and there is no window without a key"
+            )
 
         validate_priority(priority, prio_ceiling)
 
@@ -1461,6 +1804,8 @@ class JobClient:
             state,
             schedule_id,
             identity_key,
+            debounce_key,
+            debounce_deadline,
         ]
 
     async def enqueue_batch(
@@ -1543,6 +1888,8 @@ class JobClient:
             )
         if "identity_key" in options:
             raise ValueError(_NO_BATCH_IDENTITY)
+        if "debounce_key" in options:
+            raise ValueError(_NO_BATCH_DEBOUNCE)
 
         ceiling = self.prio_ceiling if prio_ceiling is None else prio_ceiling
         rows = []
@@ -1559,6 +1906,8 @@ class JobClient:
                 )
             if "identity_key" in per_job:
                 raise ValueError(f"job {index}: {_NO_BATCH_IDENTITY}")
+            if "debounce_key" in per_job:
+                raise ValueError(f"job {index}: {_NO_BATCH_DEBOUNCE}")
             rows.append(
                 self.build_enqueue_row(
                     job_class,
@@ -1796,7 +2145,8 @@ class JobClient:
         The fork inherits job_class, kwargs (or `kwargs_override`), queue and
         priority (or the overrides), capability, tags and the retry/timeout
         policy in admin_data. It does NOT inherit identity or structure: uid,
-        deadline_key, identity_key, schedule_id, dag_id, run_group and the
+        deadline_key, identity_key, debounce_key, schedule_id, dag_id,
+        run_group and the
         waitfor edges are all left unset, because two live rows sharing an
         idempotency key (or a DAG slot) would make that key mean nothing —
         and an identity_key most of all, since ITS whole promise is that the
@@ -3670,6 +4020,21 @@ class SyncJobClient:
             self._client.enqueue_identified(
                 job_class, identity_key=identity_key, **options
             )
+        )
+        return outcome
+
+    def debounce(
+        self,
+        job_class: str,
+        *,
+        key: str,
+        period: float,
+        cap: float | None = None,
+        **options: Any,
+    ) -> tuple[int, bool]:
+        """Synchronous JobClient.debounce()."""
+        outcome: tuple[int, bool] = self._run(
+            self._client.debounce(job_class, key=key, period=period, cap=cap, **options)
         )
         return outcome
 

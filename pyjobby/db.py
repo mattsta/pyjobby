@@ -424,7 +424,8 @@ async def fork_job(
     What the new row inherits: job_class, kwargs (or ``kwargs_override``),
     queue and prio (or the overrides), capability, tags, and admin_data —
     the retry/timeout policy describes the WORK, so the fork runs under the
-    same rules. What it does not: uid, deadline_key and identity_key
+    same rules. What it does not: uid, deadline_key, identity_key and
+    debounce_key
     (identity and dedupe; two live rows sharing an idempotency key would make
     it mean nothing, and an identity_key promises exactly that there is only
     one), schedule_id (no schedule fired this), dag_id / waitfor_* / run_group (a

@@ -217,6 +217,8 @@ jorb_history; pj-monitor reaps timeouts and jobs of dead workers
 | `run_group`       | Group identifier for this job                                                                                                                                     |
 | `deadline_key`    | Unique key for singleton scheduling — among `queued` rows only, so it re-arms once the job is claimed                                                              |
 | `identity_key`    | Caller-chosen at-most-once identity — unique in every state, for as long as retention keeps the row                                                                |
+| `debounce_key`    | Caller-chosen name for a burst collapsed onto this row — unique among `queued` rows never claimed, so it is released for good when a worker claims the job          |
+| `debounce_deadline` | The ceiling a bounce may not defer that row past, set by the first call of the burst; NULL when the caller asked for no cap                                       |
 
 ## Example Workflows
 

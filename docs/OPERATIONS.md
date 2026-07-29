@@ -494,7 +494,8 @@ Reach for **fork** when the re-run must not be the same job:
 What a fork inherits: job class, arguments, queue, priority, capability,
 `uid`, tags, and the retry/timeout policy — everything that describes or
 labels the WORK (`uid` is a tenant tag, so a tenant's fork stays theirs).
-What it does not: `deadline_key`, `identity_key`, `schedule_id`, DAG
+What it does not: `deadline_key`, `identity_key`, `debounce_key`,
+`schedule_id`, DAG
 membership, dependency edges, and every execution counter. A fork is a new
 identity, so it cannot inherit one: two live rows sharing an idempotency key
 would make that key mean nothing, and an `identity_key` promises there is
