@@ -66,6 +66,43 @@ class SleeperJob(Job):
         return "woke"
 
 
+class EpochSleeperJob(Job):
+    """Sleeps, then reports the run_epoch it executed under.
+
+    The fencing probe: kill/stall the worker mid-sleep, let the monitor
+    reclaim the job, and the surviving result must carry the NEW epoch --
+    a stale execution that wakes up later is fenced out of overwriting it.
+    """
+
+    async def task(self, seconds: float = 8) -> dict[str, Any]:
+        await asyncio.sleep(seconds)
+        return {"epoch": self.job["run_epoch"]}
+
+
+class FirstAttemptBlocksStepJob(Job):
+    """Step "first" checkpoints fast; step "blocker" hangs on attempt 1 only.
+
+    Kill the worker while "blocker" sleeps: the reclaimed retry must
+    fast-forward "first" (returning the RECORDED value, with the original
+    epoch inside) and re-execute only "blocker", which sails through on
+    run_count 2. The result carries both epochs so a test can prove which
+    steps re-ran from the outside.
+    """
+
+    async def task(self) -> dict[str, Any]:
+        first = await self.step("first", self._mark)
+        blocker = await self.step("blocker", self._block)
+        return {"first": first, "blocker": blocker}
+
+    def _mark(self) -> dict[str, Any]:
+        return {"epoch": self.job["run_epoch"]}
+
+    async def _block(self) -> dict[str, Any]:
+        if self.job["run_count"] <= 1:
+            await asyncio.sleep(600)
+        return {"epoch": self.job["run_epoch"]}
+
+
 class PingJob(Job):
     """Sends one durable message to another job."""
 

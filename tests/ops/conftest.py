@@ -125,8 +125,14 @@ class Fleet:
         *args: str,
         workers: int = 1,
         check_interval: float = 0.2,
+        heartbeat_interval: float = 0.5,
         name: str | None = None,
     ) -> OpsProc:
+        # heartbeat_interval 0.5 with the monitor fixture's liveness_grace
+        # 3.0 keeps the production ratio (10s beat, 60s grace) while letting
+        # dead-worker scenarios resolve in seconds. A grace the heartbeat
+        # cannot beat requeues jobs from LIVE workers -- the exact failure
+        # the monitor now warns about.
         return self.spawn(
             "pj",
             "-c",
@@ -137,6 +143,8 @@ class Fleet:
             str(workers),
             "--check-interval",
             str(check_interval),
+            "--heartbeat-interval",
+            str(heartbeat_interval),
             *args,
             name=name,
         )
