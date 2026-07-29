@@ -3,13 +3,38 @@ Comprehensive tests for web_admin.py - Web Admin Interface.
 Using LIVE database operations with NO MOCKS for maximum correctness guarantees!
 """
 
+import re
+import urllib.parse
 import uuid
 
 import pytest
 import pytest_asyncio
 
-from pyjobby.web_admin import WebAdminServer
+from pyjobby.web_admin import WebAdminServer, build_template_env
 from tests.conftest import unique_name
+
+# Every page served by the admin, and the one template set that backs them.
+# The page list doubles as the parametrization of the no-duplication test
+# below; EXPECTED_TEMPLATES is the packaging contract (CI asserts the same
+# files reach the wheel).
+ADMIN_PAGES = ["/", "/jobs", "/queues", "/workers", "/dlq", "/schedules"]
+
+EXPECTED_TEMPLATES = {
+    "base.html",
+    "dlq.html",
+    "index.html",
+    "jobs.html",
+    "queues.html",
+    "schedules.html",
+    "workers.html",
+    "fragments/dlq_table.html",
+    "fragments/jobs_table.html",
+    "fragments/metrics.html",
+    "fragments/queues_table.html",
+    "fragments/schedules_table.html",
+    "fragments/worker_stats.html",
+    "fragments/workers_table.html",
+}
 
 
 class TestWebAdminServerInit:
@@ -124,6 +149,144 @@ class TestHTMLPages:
         assert resp.status == 200
         text = await resp.text()
         assert "<html" in text
+
+
+class TestTemplates:
+    """The template set is one shell plus one file per surface.
+
+    HTML used to be four inline documents in web_admin.py with the stylesheet
+    written out three times and the htmx tag pinned four times. These tests
+    are what stops that coming back, and what turns a typo'd template name
+    from a 500 at request time into a failure here.
+    """
+
+    def test_every_packaged_template_loads_and_compiles(self):
+        """Each template in the package parses (and finds its parent)."""
+        env = build_template_env()
+        names = env.list_templates()
+        # The loader reads through importlib.resources, so an empty listing
+        # means the templates did not ship -- not that there are none.
+        assert names, "no templates found in the installed package"
+        for name in names:
+            env.get_template(name)
+
+    def test_template_set_is_exactly_the_audited_one(self):
+        """Adding or renaming a template must update this list (and CI's
+        packaging assertion, which is keyed to the same directory)."""
+        assert set(build_template_env().list_templates()) == EXPECTED_TEMPLATES
+
+    def test_unknown_template_is_a_load_error_not_a_500(self):
+        """A name the package does not contain fails as TemplateNotFound."""
+        import jinja2
+
+        env = build_template_env()
+        with pytest.raises(jinja2.TemplateNotFound):
+            env.get_template("fragments/no_such_template.html")
+        # ...and the loader cannot be walked out of its own root.
+        with pytest.raises(jinja2.TemplateNotFound):
+            env.get_template("../__init__.py")
+
+    @pytest.mark.parametrize("path", ADMIN_PAGES)
+    @pytest.mark.asyncio
+    async def test_page_has_one_stylesheet_and_one_htmx_tag(
+        self, web_admin_client, path
+    ):
+        """Both live in base.html, so every page carries exactly one copy.
+
+        The duplication this replaced is why a colour change was three edits
+        and an htmx bump was four.
+        """
+        resp = await web_admin_client.get(path)
+        assert resp.status == 200
+        text = await resp.text()
+
+        assert text.count("<style") == 1, f"{path}: not exactly one style block"
+        assert text.count('<link rel="stylesheet"') == 0, (
+            f"{path}: stylesheet is inlined by base.html; an external link is "
+            f"a second copy of the styling"
+        )
+        assert text.count("unpkg.com/htmx.org") == 1, (
+            f"{path}: not exactly one htmx tag"
+        )
+
+    @pytest.mark.asyncio
+    async def test_every_page_pins_the_same_htmx_version(self, web_admin_client):
+        """One tag per page is only half the property: they must agree."""
+        pinned = set()
+        for path in ADMIN_PAGES:
+            text = await (await web_admin_client.get(path)).text()
+            pinned.update(re.findall(r"unpkg\.com/htmx\.org@([\w.]+)", text))
+        assert len(pinned) == 1, f"htmx pinned at more than one version: {pinned}"
+
+
+@pytest_asyncio.fixture
+async def hostile_named_rows(db_pool):
+    """Seed every table the HTML fragments read with a <script> in its name.
+
+    One value, five fragments: the queue column appears in all of them, so a
+    single hostile queue name reaches the jobs, queues, workers, DLQ and
+    schedules tables at once.
+    """
+    marker = unique_name("xss")
+    value = f"<script>alert('{marker}')</script>"
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+            VALUES ($1, '{}', $1, 100, 'queued')
+        """,
+            value,
+        )
+        await conn.execute(
+            """
+            INSERT INTO jorb (job_class, kwargs, queue, prio, state,
+                              error_count, error_message)
+            VALUES ($1, '{}', $1, 100, 'crashed', 1, $1)
+        """,
+            value,
+        )
+        await conn.execute(
+            "INSERT INTO jorb_worker (host, pid, queue) VALUES ($1, 4242, $1)",
+            value,
+        )
+        await conn.execute(
+            """
+            INSERT INTO jorb_schedule (name, job_class, cron_expr, queue,
+                                       description, next_run)
+            VALUES ($1, $1, '0 * * * *', $1, $1, NOW() + INTERVAL '1 hour')
+        """,
+            value,
+        )
+    return value
+
+
+class TestAutoescape:
+    """Escaping is the environment's default, not a habit of each handler."""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "/api/jobs?format=html&queue={value}",
+            "/api/queues?format=html",
+            "/api/workers?format=html",
+            "/api/dlq?format=html&limit=1000",
+            "/api/schedules?format=html",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_fragment_escapes_a_script_tag(
+        self, web_admin_client, hostile_named_rows, url
+    ):
+        """Every htmx fragment renders the hostile name escaped, never raw."""
+        value = hostile_named_rows
+        resp = await web_admin_client.get(
+            url.format(value=urllib.parse.quote(value, safe=""))
+        )
+        assert resp.status == 200
+        text = await resp.text()
+
+        assert value not in text, f"{url}: raw <script> reached the page"
+        assert "&lt;script&gt;alert(&#39;" in text, f"{url}: escaped form missing"
 
 
 class TestJobsAPI:

@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block content %}
+        <div class="actions">
+            <button class="btn btn-success" onclick="showAddScheduleModal()">+ Add Schedule</button>
+            <button class="btn" hx-get="/api/schedules?format=html" hx-target="#schedules-table" hx-swap="innerHTML">
+                🔄 Refresh
+            </button>
+        </div>
+
+        <div id="schedules-table" hx-get="/api/schedules?format=html" hx-trigger="load, every 10s" hx-swap="innerHTML">
+            Loading schedules...
+        </div>
+
+        <!-- Add Schedule Modal -->
+        <div id="addScheduleModal" class="modal">
+            <div class="modal-content">
+                <h2>Create New Schedule</h2>
+                <form hx-post="/api/schedules" hx-target="#schedules-table" hx-swap="innerHTML" onsubmit="closeAddScheduleModal()">
+                    <div class="form-group">
+                        <label>Schedule Name *</label>
+                        <input type="text" name="name" required placeholder="daily-cleanup">
+                    </div>
+
+                    <div class="form-group">
+                        <label>Job Class *</label>
+                        <input type="text" name="job_class" required placeholder="myapp.jobs.CleanupJob">
+                    </div>
+
+                    <div class="form-group">
+                        <label>Cron Expression *</label>
+                        <input type="text" name="cron_expr" required placeholder="0 2 * * *">
+                        <small>Examples: "0 2 * * *" (2am daily), "0 * * * *" (hourly), "*/5 * * * *" (every 5 min)</small>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Queue</label>
+                            <input type="text" name="queue" value="default">
+                        </div>
+                        <div class="form-group">
+                            <label>Priority</label>
+                            {#
+                              The one value on this page the server has to
+                              supply: the fleet's priority ceiling. The
+                              browser-side `max` is a courtesy; POST
+                              /api/schedules refuses the value anyway. The
+                              wording is the point -- the ordering is inverted
+                              from everyone's intuition, and that inversion is
+                              what mints the unclaimable job.
+                            #}
+                            <input type="number" name="priority" value="100" max="{{ prio_ceiling }}">
+                            <small>LOWER is MORE urgent. Above the worker priority ceiling ({{ prio_ceiling }}) no worker ever claims the job.</small>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Description</label>
+                        <textarea name="description" rows="2" placeholder="What does this schedule do?"></textarea>
+                    </div>
+
+                    <h3 style="margin-top: 1.5rem; margin-bottom: 1rem;">Safety Features</h3>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Max Concurrent Jobs</label>
+                            <input type="number" name="max_concurrent_jobs" value="1" min="1">
+                        </div>
+                        <div class="form-group">
+                            <label>Jitter (seconds)</label>
+                            <input type="number" name="jitter_seconds" value="0" min="0">
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Backpressure Threshold</label>
+                            <input type="number" name="backpressure_threshold" value="1000" min="0">
+                        </div>
+                        <div class="form-group">
+                            <label>Circuit Breaker Threshold</label>
+                            <input type="number" name="circuit_breaker_threshold" value="5" min="1">
+                        </div>
+                    </div>
+
+                    <div style="margin-top: 2rem; display: flex; gap: 1rem;">
+                        <button type="submit" class="btn btn-success">Create Schedule</button>
+                        <button type="button" class="btn" onclick="closeAddScheduleModal()">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+{% endblock %}
+{% block scripts %}
+    <script>
+        function showAddScheduleModal() {
+            document.getElementById('addScheduleModal').classList.add('active');
+        }
+
+        function closeAddScheduleModal() {
+            document.getElementById('addScheduleModal').classList.remove('active');
+        }
+
+        window.onclick = function(event) {
+            const modal = document.getElementById('addScheduleModal');
+            if (event.target === modal) {
+                closeAddScheduleModal();
+            }
+        }
+    </script>
+{% endblock %}

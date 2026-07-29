@@ -1,0 +1,47 @@
+{# htmx target #schedules-table: the recurring schedule registry. #}
+<table>
+    <thead>
+        <tr>
+            <th>Name</th>
+            <th>Status</th>
+            <th>Cron</th>
+            <th>Queue</th>
+            <th>Next Run</th>
+            <th>Stats</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+{% for s in schedules %}
+{% set attempts = s["success_count"] + s["failure_count"] %}
+        <tr>
+            <td><strong>{{ s["name"] }}</strong><br><small>{{ s.get("description") or "" }}</small></td>
+            <td>
+{% if s["enabled"] %}
+                <span class="badge badge-enabled">Enabled</span>
+{% else %}
+                <span class="badge badge-disabled">Disabled</span>
+{% endif %}
+            </td>
+            <td><code>{{ s["cron_expr"] }}</code></td>
+            <td>{{ s["queue"] }}</td>
+            <td>{{ s["next_run"].strftime("%Y-%m-%d %H:%M") if s.get("next_run") else "-" }}</td>
+            <td>
+                {{ s["run_count"] | int }} runs<br>
+{% if attempts > 0 %}
+{% set success_rate = s["success_count"] / attempts * 100 %}
+                <span class="badge {{ "badge-success" if success_rate >= 95 else "badge-warning" }}">{{ "%.1f" | format(success_rate) }}% success</span>
+{% endif %}
+            </td>
+            <td>
+{% if s["enabled"] %}
+                <button class="btn btn-danger" hx-post="/api/schedules/{{ s["id"] | int }}/disable" hx-target="#schedules-table" hx-swap="innerHTML">Disable</button>
+{% else %}
+                <button class="btn btn-success" hx-post="/api/schedules/{{ s["id"] | int }}/enable" hx-target="#schedules-table" hx-swap="innerHTML">Enable</button>
+{% endif %}
+                <button class="btn btn-danger" hx-delete="/api/schedules/{{ s["id"] | int }}" hx-confirm="Delete schedule {{ s["name"] }}?" hx-target="#schedules-table" hx-swap="innerHTML">Delete</button>
+            </td>
+        </tr>
+{% endfor %}
+    </tbody>
+</table>

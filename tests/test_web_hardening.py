@@ -130,7 +130,14 @@ def marked(hostile: str) -> str:
 def assert_html_escaped(body: str, value: str, where: str) -> None:
     """The escaped form of `value` is rendered and the raw form never is."""
     escaped = html.escape(value)
-    assert escaped in body, f"{where}: escaped form of {value!r} is missing"
+    # The templates escape through MarkupSafe (jinja2 autoescape), which
+    # writes the two quote characters as the numeric references `&#34;`/`&#39;`
+    # where html.escape writes `&quot;`/`&#x27;`. Same characters, same
+    # neutralization, different spelling -- so compare on a body normalized to
+    # html.escape's spelling. Only the escaped form is normalized: the
+    # raw-value assertion below still runs against the bytes actually served.
+    normalized = body.replace("&#34;", "&quot;").replace("&#39;", "&#x27;")
+    assert escaped in normalized, f"{where}: escaped form of {value!r} is missing"
     if escaped != value:
         assert value not in body, (
             f"{where}: RAW hostile value {value!r} rendered unescaped (XSS)"

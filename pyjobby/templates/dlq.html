@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+        <h1>Dead Letter Queue</h1>
+        <p class="hint">
+            Jobs in the terminal <span class="badge crashed">crashed</span>
+            state: their retries are exhausted. Retrying requeues the
+            <strong>same</strong> job row with a fresh error budget.
+        </p>
+        <div id="dlq-table" hx-get="/api/dlq?format=html"
+             hx-trigger="load, every 10s" hx-swap="innerHTML">
+            Loading dead letter queue...
+        </div>
+{% endblock %}

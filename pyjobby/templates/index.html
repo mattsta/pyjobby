@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Pyjobby Admin{% endblock %}
+{% block content %}
+        <div class="dashboard-grid">
+            <div class="card">
+                <h2>Queue Statistics</h2>
+                <div hx-get="/api/queues?format=html" hx-trigger="load, every 5s" hx-swap="innerHTML">
+                    <div class="loading">Loading...</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>Active Workers</h2>
+                <div hx-get="/api/workers/stats?format=html" hx-trigger="load, every 5s" hx-swap="innerHTML">
+                    <div class="loading">Loading...</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>Recent Activity (24h)</h2>
+                <div hx-get="/api/metrics?since_hours=24&format=html" hx-trigger="load, every 10s" hx-swap="innerHTML">
+                    <div class="loading">Loading...</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Recent Jobs</h2>
+            <div hx-get="/api/jobs?limit=10&format=html" hx-trigger="load, every 5s" hx-swap="innerHTML">
+                <div class="loading">Loading jobs...</div>
+            </div>
+        </div>
+{% endblock %}

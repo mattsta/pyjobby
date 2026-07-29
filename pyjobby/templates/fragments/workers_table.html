@@ -1,0 +1,58 @@
+{# htmx target #workers-table: the jorb_worker registry. #}
+{% if not workers %}
+<p class="empty">No workers registered</p>
+{% else %}
+<table>
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>Host</th>
+            <th>PID</th>
+            <th>Queue</th>
+            <th>Status</th>
+            <th>Job Threads</th>
+            <th>Last Seen</th>
+            <th>Current Job</th>
+        </tr>
+    </thead>
+    <tbody>
+{% for w in workers %}
+{% set age = w.get("last_seen_age_seconds") %}
+        <tr>
+            <td>{{ w["id"] | int }}</td>
+            <td>{{ w["host"] }}</td>
+            <td>{{ w["pid"] | int }}</td>
+            <td>{{ w["queue"] }}</td>
+            <td>
+{% if w["shutdown_at"] is not none %}
+                <span class="badge dead">shut down</span>
+{% elif w["not_claiming"] %}
+                {# live, beating, and doing nothing: abandoned threads fill
+                   its pool, so a "live" badge here would be a lie #}
+                <span class="badge crashed">not claiming</span>
+{% elif w["live"] %}
+                <span class="badge live">live</span>
+{% else %}
+                <span class="badge paused">stale</span>
+{% endif %}
+            </td>
+            <td>
+{% if w["job_threads"] %}
+                {{ w["job_threads_abandoned"] | int }} abandoned / {{ w["job_threads"] | int }}
+{% else %}
+                -
+{% endif %}
+            </td>
+            <td>{{ "%.0fs ago" | format(age) if age is not none else "-" }}</td>
+            <td>
+{% if w.get("current_job_id") is not none %}
+                #{{ w["current_job_id"] | int }} {{ w["current_job_class"] }} ({{ w["current_job_state"] }})
+{% else %}
+                -
+{% endif %}
+            </td>
+        </tr>
+{% endfor %}
+    </tbody>
+</table>
+{% endif %}

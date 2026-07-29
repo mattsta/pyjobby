@@ -1,0 +1,34 @@
+{# htmx target #dlq-table: terminal crashed jobs (retries exhausted). #}
+{% if not jobs %}
+<p class="empty">Dead letter queue is empty — no crashed jobs.</p>
+{% else %}
+<table>
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>Queue</th>
+            <th>Job Class</th>
+            <th>Errors</th>
+            <th>Last Error</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+{% for job in jobs %}
+{% set error = job.get("error_message") or "" %}
+        <tr>
+            <td>{{ job["id"] | int }}</td>
+            <td>{{ job["queue"] }}</td>
+            <td>{{ job["job_class"] }}</td>
+            <td>{{ job["error_count"] | int }}</td>
+            <td><code>{{ error if error | length <= 120 else error[:120] ~ "…" }}</code></td>
+            <td>
+                <button class="btn btn-success"
+                        hx-post="/api/dlq/{{ job["id"] | int }}/retry?format=html"
+                        hx-target="#dlq-table" hx-swap="innerHTML">Retry</button>
+            </td>
+        </tr>
+{% endfor %}
+    </tbody>
+</table>
+{% endif %}

@@ -1,0 +1,32 @@
+{# htmx target: the jobs listing on / and /jobs. #}
+{% if not jobs %}
+<p class="empty">No jobs found</p>
+{% else %}
+<table>
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>State</th>
+            <th>Queue</th>
+            <th>Job Class</th>
+            <th>Created</th>
+            <th>Details</th>
+        </tr>
+    </thead>
+    <tbody>
+{% for job in jobs %}
+        <tr>
+            <td>{{ job["id"] | int }}</td>
+            <td><span class="badge {{ job["state"] }}">{{ job["state"] }}</span></td>
+            <td>{{ job["queue"] }}</td>
+            <td>{{ job["job_class"] }}</td>
+            <td>{{ (job["created"] or "")[:19] }}</td>
+            <td>
+                <a href="/api/jobs/{{ job["id"] | int }}/history">history</a> |
+                <a href="/api/jobs/{{ job["id"] | int }}/steps">steps</a>
+            </td>
+        </tr>
+{% endfor %}
+    </tbody>
+</table>
+{% endif %}

@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block content %}
+        <h1>Job Management</h1>
+        <div hx-get="/api/jobs?format=html" hx-trigger="load, every 5s" hx-swap="innerHTML">
+            <div class="loading">Loading jobs...</div>
+        </div>
+{% endblock %}

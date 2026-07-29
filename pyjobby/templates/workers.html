@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+        <h1>Worker Registry</h1>
+        <p class="hint">
+            A worker is live while it has not shut down and its heartbeat is
+            recent; recently shut-down workers stay listed for an hour.
+        </p>
+        <div id="workers-table" hx-get="/api/workers?format=html"
+             hx-trigger="load, every 5s" hx-swap="innerHTML">
+            Loading workers...
+        </div>
+{% endblock %}

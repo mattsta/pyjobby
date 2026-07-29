@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+        <h1>Queue Management</h1>
+        <p class="hint">
+            Paused queues stop being claimed immediately; limits are enforced
+            live by the worker claim statement.
+        </p>
+        <div id="queues-table" hx-get="/api/queues?format=html"
+             hx-trigger="load, every 5s" hx-swap="innerHTML">
+            Loading queues...
+        </div>
+{% endblock %}

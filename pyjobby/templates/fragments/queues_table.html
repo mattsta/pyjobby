@@ -1,0 +1,58 @@
+{# htmx target #queues-table: queue depths plus the pause/resume controls. #}
+{% if not stats %}
+<p class="empty">No queue data</p>
+{% else %}
+<table>
+    <thead>
+        <tr>
+            <th>Queue</th>
+            <th>Queued</th>
+            <th>Running</th>
+            <th>Crashed</th>
+            <th>Status</th>
+            <th>Max Concurrency</th>
+            <th>Rate Limit</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+{% for s in stats %}
+{% set paused = s.get("paused") | default(false, true) %}
+{% set max_concurrency = s.get("max_concurrency") %}
+{% set rate_limit = s.get("rate_limit") %}
+        <tr>
+            <td><strong>{{ s["queue"] }}</strong></td>
+            <td>{{ s["queued"] | int }}</td>
+            <td>{{ s["running"] | int }}</td>
+            <td>{{ s["crashed"] | int }}</td>
+            <td>
+{% if paused %}
+                <span class="badge paused">paused</span>
+{% else %}
+                <span class="badge running">active</span>
+{% endif %}
+            </td>
+            <td>{{ max_concurrency | int if max_concurrency is not none else "unlimited" }}</td>
+            <td>
+{% if rate_limit is not none %}
+                {{ rate_limit | int }}/{{ "%g" | format(s.get("rate_period_seconds") or 60) }}s
+{% else %}
+                unlimited
+{% endif %}
+            </td>
+            <td>
+{% if paused %}
+                <button class="btn btn-success"
+                        hx-post="/api/queues/{{ s["queue"] | urlpath }}/resume?format=html"
+                        hx-target="#queues-table" hx-swap="innerHTML">Resume</button>
+{% else %}
+                <button class="btn btn-danger"
+                        hx-post="/api/queues/{{ s["queue"] | urlpath }}/pause?format=html"
+                        hx-target="#queues-table" hx-swap="innerHTML">Pause</button>
+{% endif %}
+            </td>
+        </tr>
+{% endfor %}
+    </tbody>
+</table>
+{% endif %}

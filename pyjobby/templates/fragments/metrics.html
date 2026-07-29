@@ -1,0 +1,39 @@
+{#
+  htmx target: the "Recent Activity" card on the dashboard.
+
+  Throughput sits next to arrivals because the comparison is the signal:
+  either number alone says nothing about whether the fleet is keeping up.
+#}
+{% set backlog = metrics["backlog"] %}
+{% set inflight = metrics["inflight"] %}
+{% set storage = metrics["storage"] %}
+<div class="stats-grid">
+    <div class="stat-item">
+        <span>Throughput</span><span>{{ "%.2f" | format(metrics["throughput_per_second"]) }}/s</span>
+        <span>Arrivals</span><span>{{ "%.2f" | format(metrics["arrival_rate_per_second"]) }}/s</span>
+        <span>Retry Pressure</span><span>{{ "%.2f" | format(metrics["retry_rate_per_second"]) }}/s</span>
+        <span>DLQ Growth</span><span>{{ "%.4f" | format(metrics["dlq_growth_per_second"]) }}/s</span>
+    </div>
+    <div class="stat-item">
+        <span>Finished</span><span class="badge finished">{{ metrics["finished_count"] | int }}</span>
+    </div>
+    <div class="stat-item">
+        <span>Crashed</span><span class="badge crashed">{{ metrics["crashed_count"] | int }}</span>
+    </div>
+    <div class="stat-item">
+        <span>Avg Duration</span><span>{{ "%.2f" | format(metrics["avg_duration_seconds"]) }}s</span>
+        <span>Avg Queue Wait</span><span>{{ "%.2f" | format(metrics["avg_wait_seconds"]) }}s</span>
+        <span>Max Queue Wait</span><span>{{ "%.2f" | format(metrics["max_wait_seconds"]) }}s</span>
+    </div>
+    <div class="stat-item">
+        <span>Backlog Depth</span><span>{{ backlog["depth"] }}</span>
+        <span>Oldest Ready</span><span>{{ "%.1f" | format(backlog["oldest_age_seconds"]) }}s</span>
+        <span>In Flight</span><span>{{ inflight["inflight"] }}</span>
+        <span>Stuck</span><span>{{ inflight["stuck"] }}</span>
+    </div>
+    <div class="stat-item">
+        <span>NOTIFY Queue</span><span>{{ "%.1f" | format(metrics["notify_queue_usage"] * 100) }}%</span>
+        <span>Dead Tuples</span><span>{{ "%.1f" | format(storage["dead_tuple_ratio"] * 100) }}%</span>
+        <span>Storage</span><span>{{ "%.1f" | format(storage["total_bytes"] / (1024 * 1024)) }} MB</span>
+    </div>
+</div>

@@ -10,17 +10,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import html as html_mod
 import json
 import re
 import signal
 import urllib.parse
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from importlib.resources import files
+from importlib.resources.abc import Traversable
 from typing import Any, cast
 
 import asyncpg  # type: ignore[import-untyped]
+import jinja2
 from aiohttp import web
 from aiohttp.typedefs import Handler
 
@@ -293,6 +295,120 @@ def _path_queue_name(request: web.Request) -> str:
 
 
 # =============================================================================
+# Templates
+#
+# Every byte of HTML this server serves lives in pyjobby/templates. It used to
+# live in this file: four complete <!DOCTYPE html> documents, the stylesheet
+# written out three times, the htmx tag pinned four times, and sixteen places
+# that built <tr>/<td> by string concatenation. A colour change was three
+# edits, an htmx bump was four, and the three stylesheets had already drifted
+# apart from each other.
+#
+# WHY Jinja2 AND NOT str.format. Two properties, and both are load-bearing:
+#
+#   INHERITANCE. base.html carries the doctype, the ONE stylesheet and the ONE
+#   htmx tag; every page extends it. There is no second copy left to forget,
+#   which is what made the duplication possible in the first place.
+#
+#   autoescape=True. This surface is unauthenticated and renders queue names,
+#   job classes, schedule names and error messages that an anonymous client
+#   put in the database. The old code defended that with seventeen hand-
+#   written html.escape() calls -- a scheme that is correct exactly until
+#   somebody adds the eighteenth interpolation and forgets, which is a stored
+#   XSS hole rather than a formatting slip. Escaping is now the default and
+#   NOT escaping is what has to be spelled out (`| safe`).
+#
+# The templates are addressed the way migrations.py addresses its SQL and
+# websocket_server.py addresses its dashboard: through importlib.resources, so
+# they are read out of the INSTALLED package -- a wheel, or a zip on sys.path
+# -- and not out of a source checkout that `pip install pyjobby` never has.
+# =============================================================================
+
+#: Root of the packaged template set.
+TEMPLATE_ROOT = files("pyjobby") / "templates"
+
+
+class PackageTemplateLoader(jinja2.BaseLoader):
+    """Jinja2 loader reading templates from an importlib.resources root.
+
+    Deliberately a Traversable rather than a filesystem path: a Traversable is
+    whatever the import system says the package is (a directory today, a zip
+    entry if the package is ever imported from one), so the loader works from
+    an installed wheel and not only from a checkout.
+    """
+
+    def __init__(self, root: Traversable) -> None:
+        self.root = root
+
+    def _resolve(self, template: str) -> Traversable | None:
+        """Map a template name onto a Traversable inside the root, or None."""
+        node = self.root
+        for part in template.split("/"):
+            # Template names come from this module and never from a request,
+            # but a loader that can be walked out of its own root is not a
+            # thing to leave next to an anonymous HTTP surface.
+            if part in ("", ".", ".."):
+                return None
+            node = node / part
+        return node
+
+    def get_source(
+        self, environment: jinja2.Environment, template: str
+    ) -> tuple[str, str | None, Callable[[], bool] | None]:
+        node = self._resolve(template)
+        if node is not None:
+            try:
+                # uptodate is None: packaged assets do not change under a
+                # running process, so a compiled template is cached forever.
+                return node.read_text(encoding="utf-8"), None, None
+            except OSError:
+                # Missing, or a directory: both are "no such template".
+                pass
+        raise jinja2.TemplateNotFound(template)
+
+    def list_templates(self) -> list[str]:
+        """Every ``.html`` in the package, including the fragment subtree."""
+        found: list[str] = []
+
+        def walk(node: Traversable, prefix: str) -> None:
+            for child in node.iterdir():
+                name = f"{prefix}{child.name}"
+                if child.is_dir():
+                    walk(child, f"{name}/")
+                elif name.endswith(".html"):
+                    found.append(name)
+
+        walk(self.root, "")
+        return sorted(found)
+
+
+def _url_path_segment(value: object) -> str:
+    """Percent-encode a value for use as ONE URL path segment.
+
+    ``safe=""``, unlike Jinja's built-in ``urlencode`` filter, which leaves
+    ``/`` alone: a queue name is free-form text, and a slash left unencoded
+    addresses a different route than the one the button says it does.
+    """
+    return urllib.parse.quote(str(value), safe="")
+
+
+def build_template_env() -> jinja2.Environment:
+    """Build the Jinja2 environment (see the section note above for why)."""
+    env = jinja2.Environment(
+        loader=PackageTemplateLoader(TEMPLATE_ROOT),
+        autoescape=True,
+        trim_blocks=True,
+        lstrip_blocks=True,
+        # A missing key is a bug in the handler, not a blank cell in an
+        # operator's dashboard: fail loudly, exactly as the KeyError of the
+        # string-concatenation code did.
+        undefined=jinja2.StrictUndefined,
+    )
+    env.filters["urlpath"] = _url_path_segment
+    return env
+
+
+# =============================================================================
 # Cross-site request defense
 #
 # THE ATTACK. This surface is unauthenticated by design (bind to localhost, or
@@ -405,6 +521,10 @@ class WebAdminServer:
         self.prio_ceiling = prio_ceiling
         self.pool: asyncpg.Pool | None = None
         self._pool_lock = asyncio.Lock()
+        # Built once and cached on the instance: compiling a template is not
+        # per-request work, and the environment is also the compiled-template
+        # cache. See the Templates section above for why it exists at all.
+        self.templates = build_template_env()
         self.app = web.Application(middlewares=[cross_site_guard])
         self.app.on_cleanup.append(self._on_cleanup)
         self.setup_routes()
@@ -521,316 +641,53 @@ class WebAdminServer:
         await self.close()
 
     # =========================================================================
+    # Rendering
+    # =========================================================================
+
+    def render(self, template: str, **context: Any) -> web.Response:
+        """Render a packaged template into a ``text/html`` response.
+
+        The only way HTML leaves this module. Values go in raw and are escaped
+        on the way out by the environment's autoescape.
+        """
+        page = self.templates.get_template(template).render(**context)
+        return web.Response(text=page, content_type="text/html")
+
+    def _queues_table(self, stats: list[dict[str, Any]]) -> web.Response:
+        """The queues fragment: three routes swap it into #queues-table."""
+        return self.render("fragments/queues_table.html", stats=stats)
+
+    def _dlq_table(self, jobs: list[dict[str, Any]]) -> web.Response:
+        """The DLQ fragment: two routes swap it into #dlq-table."""
+        return self.render("fragments/dlq_table.html", jobs=jobs)
+
+    def _schedules_table(self, schedules: list[dict[str, Any]]) -> web.Response:
+        """The schedules fragment: every schedule route swaps it in."""
+        return self.render("fragments/schedules_table.html", schedules=schedules)
+
+    # =========================================================================
     # HTML Pages
     # =========================================================================
 
     async def index(self, request: web.Request) -> web.Response:
         """Dashboard index page"""
-        html = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pyjobby Admin</title>
-    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background: #f5f5f5;
-            color: #333;
-        }
-
-        .header {
-            background: #2c3e50;
-            color: white;
-            padding: 1rem 2rem;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-
-        .header h1 { font-size: 1.5rem; font-weight: 600; }
-
-        .nav {
-            background: white;
-            border-bottom: 1px solid #ddd;
-            padding: 0 2rem;
-            display: flex;
-            gap: 0;
-        }
-
-        .nav a {
-            padding: 1rem 1.5rem;
-            text-decoration: none;
-            color: #555;
-            border-bottom: 3px solid transparent;
-            transition: all 0.2s;
-        }
-
-        .nav a:hover { background: #f8f8f8; color: #2c3e50; }
-        .nav a.active { color: #2c3e50; border-bottom-color: #3498db; font-weight: 600; }
-
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 2rem;
-        }
-
-        .dashboard-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 1.5rem;
-            margin-bottom: 2rem;
-        }
-
-        .card {
-            background: white;
-            border-radius: 8px;
-            padding: 1.5rem;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-
-        .card h2 {
-            font-size: 0.9rem;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            color: #888;
-            margin-bottom: 0.5rem;
-        }
-
-        .stat-value {
-            font-size: 2.5rem;
-            font-weight: 700;
-            color: #2c3e50;
-        }
-
-        .stat-label {
-            color: #888;
-            font-size: 0.9rem;
-            margin-top: 0.25rem;
-        }
-
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 1rem;
-            margin-top: 1rem;
-        }
-
-        .stat-item {
-            display: flex;
-            justify-content: space-between;
-            padding: 0.5rem 0;
-            border-bottom: 1px solid #eee;
-        }
-
-        .stat-item:last-child { border-bottom: none; }
-
-        .badge {
-            padding: 0.25rem 0.75rem;
-            border-radius: 12px;
-            font-size: 0.85rem;
-            font-weight: 600;
-        }
-
-        .badge.queued { background: #e3f2fd; color: #1976d2; }
-        .badge.running { background: #fff3e0; color: #f57c00; }
-        .badge.finished { background: #e8f5e9; color: #388e3c; }
-        .badge.crashed { background: #ffebee; color: #d32f2f; }
-        .badge.waiting { background: #f3e5f5; color: #7b1fa2; }
-
-        .loading {
-            text-align: center;
-            padding: 2rem;
-            color: #888;
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>📊 Pyjobby Administration</h1>
-    </div>
-
-    <div class="nav">
-        <a href="/" class="active">Dashboard</a>
-        <a href="/jobs">Jobs</a>
-        <a href="/queues">Queues</a>
-        <a href="/workers">Workers</a>
-        <a href="/dlq">Dead Letter Queue</a>
-        <a href="/metrics">Metrics</a>
-    </div>
-
-    <div class="container">
-        <div class="dashboard-grid">
-            <div class="card">
-                <h2>Queue Statistics</h2>
-                <div hx-get="/api/queues?format=html" hx-trigger="load, every 5s" hx-swap="innerHTML">
-                    <div class="loading">Loading...</div>
-                </div>
-            </div>
-
-            <div class="card">
-                <h2>Active Workers</h2>
-                <div hx-get="/api/workers/stats?format=html" hx-trigger="load, every 5s" hx-swap="innerHTML">
-                    <div class="loading">Loading...</div>
-                </div>
-            </div>
-
-            <div class="card">
-                <h2>Recent Activity (24h)</h2>
-                <div hx-get="/api/metrics?since_hours=24&format=html" hx-trigger="load, every 10s" hx-swap="innerHTML">
-                    <div class="loading">Loading...</div>
-                </div>
-            </div>
-        </div>
-
-        <div class="card">
-            <h2>Recent Jobs</h2>
-            <div hx-get="/api/jobs?limit=10&format=html" hx-trigger="load, every 5s" hx-swap="innerHTML">
-                <div class="loading">Loading jobs...</div>
-            </div>
-        </div>
-    </div>
-</body>
-</html>"""
-        return web.Response(text=html, content_type="text/html")
+        return self.render("index.html", title="Dashboard", active="/")
 
     async def jobs_page(self, request: web.Request) -> web.Response:
         """Jobs management page"""
-        html = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Jobs - Pyjobby Admin</title>
-    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
-    <link rel="stylesheet" href="/static/admin.css">
-</head>
-<body>
-    <div class="header">
-        <h1>📊 Pyjobby Administration</h1>
-    </div>
-
-    <div class="nav">
-        <a href="/">Dashboard</a>
-        <a href="/jobs" class="active">Jobs</a>
-        <a href="/queues">Queues</a>
-        <a href="/workers">Workers</a>
-        <a href="/dlq">Dead Letter Queue</a>
-        <a href="/metrics">Metrics</a>
-    </div>
-
-    <div class="container">
-        <h1>Job Management</h1>
-        <div hx-get="/api/jobs?format=html" hx-trigger="load" hx-swap="innerHTML">
-            Loading jobs...
-        </div>
-    </div>
-</body>
-</html>"""
-        return web.Response(text=html, content_type="text/html")
-
-    def _page(self, title: str, active: str, body: str) -> str:
-        """Render a simple admin page with shared nav around `body`."""
-        nav_links = [
-            ("/", "Dashboard"),
-            ("/jobs", "Jobs"),
-            ("/queues", "Queues"),
-            ("/workers", "Workers"),
-            ("/dlq", "Dead Letter Queue"),
-            ("/schedules", "Schedules"),
-        ]
-        nav = ""
-        for href, label in nav_links:
-            cls = ' class="active"' if href == active else ""
-            nav += f'<a href="{href}"{cls}>{label}</a>'
-
-        return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{html_mod.escape(title)} - Pyjobby Admin</title>
-    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #333; }}
-        .header {{ background: #2c3e50; color: white; padding: 1rem 2rem; }}
-        .nav {{ background: white; border-bottom: 1px solid #ddd; padding: 0 2rem; display: flex; }}
-        .nav a {{ padding: 1rem 1.5rem; text-decoration: none; color: #555; border-bottom: 3px solid transparent; }}
-        .nav a.active {{ color: #2c3e50; border-bottom-color: #3498db; font-weight: 600; }}
-        .container {{ max-width: 1400px; margin: 0 auto; padding: 2rem; }}
-        table {{ width: 100%; background: white; border-collapse: collapse; }}
-        th, td {{ padding: 0.75rem; border-bottom: 1px solid #eee; text-align: left; }}
-        .badge {{ padding: 0.25rem 0.75rem; border-radius: 12px; font-size: 0.85rem; font-weight: 600; }}
-        .badge.queued {{ background: #e3f2fd; color: #1976d2; }}
-        .badge.running {{ background: #fff3e0; color: #f57c00; }}
-        .badge.finished {{ background: #e8f5e9; color: #388e3c; }}
-        .badge.crashed {{ background: #ffebee; color: #d32f2f; }}
-        .badge.paused {{ background: #fff3cd; color: #856404; }}
-        .badge.live {{ background: #e8f5e9; color: #388e3c; }}
-        .badge.dead {{ background: #eceff1; color: #546e7a; }}
-        .btn {{ background: #3498db; color: white; border: none; padding: 0.4rem 0.9rem; border-radius: 4px; cursor: pointer; }}
-        .btn-danger {{ background: #e74c3c; }}
-        .btn-success {{ background: #27ae60; }}
-    </style>
-</head>
-<body>
-    <div class="header"><h1>📊 Pyjobby Administration</h1></div>
-    <div class="nav">{nav}</div>
-    <div class="container">{body}</div>
-</body>
-</html>"""
+        return self.render("jobs.html", title="Jobs", active="/jobs")
 
     async def queues_page(self, request: web.Request) -> web.Response:
         """Queues management page: depths plus pause/resume controls."""
-        body = """
-        <h1>Queue Management</h1>
-        <p style="color: #888; margin: 0.5rem 0 1rem;">
-            Paused queues stop being claimed immediately; limits are enforced
-            live by the worker claim statement.
-        </p>
-        <div id="queues-table" hx-get="/api/queues?format=html"
-             hx-trigger="load, every 5s" hx-swap="innerHTML">
-            Loading queues...
-        </div>"""
-        return web.Response(
-            text=self._page("Queues", "/queues", body), content_type="text/html"
-        )
+        return self.render("queues.html", title="Queues", active="/queues")
 
     async def workers_page(self, request: web.Request) -> web.Response:
         """Workers page backed by the jorb_worker registry."""
-        body = """
-        <h1>Worker Registry</h1>
-        <p style="color: #888; margin: 0.5rem 0 1rem;">
-            A worker is live while it has not shut down and its heartbeat is
-            recent; recently shut-down workers stay listed for an hour.
-        </p>
-        <div id="workers-table" hx-get="/api/workers?format=html"
-             hx-trigger="load, every 5s" hx-swap="innerHTML">
-            Loading workers...
-        </div>"""
-        return web.Response(
-            text=self._page("Workers", "/workers", body), content_type="text/html"
-        )
+        return self.render("workers.html", title="Workers", active="/workers")
 
     async def dlq_page(self, request: web.Request) -> web.Response:
         """DLQ page: terminal crashed jobs (retries exhausted)."""
-        body = """
-        <h1>Dead Letter Queue</h1>
-        <p style="color: #888; margin: 0.5rem 0 1rem;">
-            Jobs in the terminal <span class="badge crashed">crashed</span>
-            state: their retries are exhausted. Retrying requeues the
-            <strong>same</strong> job row with a fresh error budget.
-        </p>
-        <div id="dlq-table" hx-get="/api/dlq?format=html"
-             hx-trigger="load, every 10s" hx-swap="innerHTML">
-            Loading dead letter queue...
-        </div>"""
-        return web.Response(
-            text=self._page("Dead Letter Queue", "/dlq", body),
-            content_type="text/html",
-        )
+        return self.render("dlq.html", title="Dead Letter Queue", active="/dlq")
 
     # =========================================================================
     # Prometheus metrics
@@ -1129,44 +986,7 @@ class WebAdminServer:
             )
 
             if format_type == "html":
-                # Return HTML fragment for htmx
-                if not jobs:
-                    html = '<p style="padding: 1rem; color: #888;">No jobs found</p>'
-                else:
-                    html = '<table style="width: 100%; border-collapse: collapse;">'
-                    html += '<thead><tr style="border-bottom: 2px solid #ddd; text-align: left;">'
-                    html += '<th style="padding: 0.75rem;">ID</th>'
-                    html += '<th style="padding: 0.75rem;">State</th>'
-                    html += '<th style="padding: 0.75rem;">Queue</th>'
-                    html += '<th style="padding: 0.75rem;">Job Class</th>'
-                    html += '<th style="padding: 0.75rem;">Created</th>'
-                    html += '<th style="padding: 0.75rem;">Details</th>'
-                    html += "</tr></thead><tbody>"
-
-                    for job in jobs:
-                        created = html_mod.escape(
-                            job["created"][:19] if job["created"] else ""
-                        )
-                        job_state = html_mod.escape(str(job["state"]))
-                        job_queue = html_mod.escape(str(job["queue"]))
-                        job_class = html_mod.escape(str(job["job_class"]))
-                        job_id = int(job["id"])
-                        html += '<tr style="border-bottom: 1px solid #eee;">'
-                        html += f'<td style="padding: 0.75rem;">{job_id}</td>'
-                        html += f'<td style="padding: 0.75rem;"><span class="badge {job_state}">{job_state}</span></td>'
-                        html += f'<td style="padding: 0.75rem;">{job_queue}</td>'
-                        html += f'<td style="padding: 0.75rem;">{job_class}</td>'
-                        html += f'<td style="padding: 0.75rem;">{created}</td>'
-                        html += (
-                            f'<td style="padding: 0.75rem;">'
-                            f'<a href="/api/jobs/{job_id}/history">history</a> | '
-                            f'<a href="/api/jobs/{job_id}/steps">steps</a></td>'
-                        )
-                        html += "</tr>"
-
-                    html += "</tbody></table>"
-
-                return web.Response(text=html, content_type="text/html")
+                return self.render("fragments/jobs_table.html", jobs=jobs)
             else:
                 return web.json_response(jobs)
 
@@ -1256,73 +1076,6 @@ class WebAdminServer:
                 return web.json_response({"status": "deleted", "job_id": job_id})
             raise _api_error(web.HTTPNotFound, f"Job {job_id} not found")
 
-    def _render_queues_table(self, stats: list[dict[str, Any]]) -> str:
-        """Render queue stats + control plane as an HTML fragment."""
-        if not stats:
-            return '<p style="padding: 1rem; color: #888;">No queue data</p>'
-
-        html = '<table style="width: 100%; border-collapse: collapse;">'
-        html += "<thead><tr>"
-        for col in (
-            "Queue",
-            "Queued",
-            "Running",
-            "Crashed",
-            "Status",
-            "Max Concurrency",
-            "Rate Limit",
-            "Actions",
-        ):
-            html += f'<th style="padding: 0.75rem; text-align: left;">{col}</th>'
-        html += "</tr></thead><tbody>"
-
-        for s in stats:
-            queue_name = str(s["queue"])
-            queue_html = html_mod.escape(queue_name)
-            queue_url = urllib.parse.quote(queue_name, safe="")
-            paused = bool(s.get("paused"))
-            status = (
-                '<span class="badge paused">paused</span>'
-                if paused
-                else '<span class="badge running">active</span>'
-            )
-            max_conc = s.get("max_concurrency")
-            rate = s.get("rate_limit")
-            rate_html = (
-                f"{int(rate)}/{s.get('rate_period_seconds', 60):g}s"
-                if rate is not None
-                else "unlimited"
-            )
-            if paused:
-                action = (
-                    f'<button class="btn btn-success" '
-                    f'hx-post="/api/queues/{queue_url}/resume?format=html" '
-                    f'hx-target="#queues-table" hx-swap="innerHTML">Resume</button>'
-                )
-            else:
-                action = (
-                    f'<button class="btn btn-danger" '
-                    f'hx-post="/api/queues/{queue_url}/pause?format=html" '
-                    f'hx-target="#queues-table" hx-swap="innerHTML">Pause</button>'
-                )
-
-            html += "<tr>"
-            html += f'<td style="padding: 0.75rem;"><strong>{queue_html}</strong></td>'
-            html += f'<td style="padding: 0.75rem;">{int(s["queued"])}</td>'
-            html += f'<td style="padding: 0.75rem;">{int(s["running"])}</td>'
-            html += f'<td style="padding: 0.75rem;">{int(s["crashed"])}</td>'
-            html += f'<td style="padding: 0.75rem;">{status}</td>'
-            html += (
-                f'<td style="padding: 0.75rem;">'
-                f"{int(max_conc) if max_conc is not None else 'unlimited'}</td>"
-            )
-            html += f'<td style="padding: 0.75rem;">{rate_html}</td>'
-            html += f'<td style="padding: 0.75rem;">{action}</td>'
-            html += "</tr>"
-
-        html += "</tbody></table>"
-        return html
-
     async def api_queues_list(self, request: web.Request) -> web.Response:
         """List queue statistics (with paused/limit control-plane columns)"""
         async with self.api() as api:
@@ -1330,8 +1083,7 @@ class WebAdminServer:
             format_type = request.query.get("format", "json")
 
             if format_type == "html":
-                html = self._render_queues_table(stats)
-                return web.Response(text=html, content_type="text/html")
+                return self._queues_table(stats)
             else:
                 # oldest_queued_age_seconds arrives as Decimal from EXTRACT()
                 return web.json_response(
@@ -1362,10 +1114,7 @@ class WebAdminServer:
         async with self.api() as api:
             control = await api.pause_queue(queue)
             if request.query.get("format") == "html":
-                stats = await api.queue_stats()
-                return web.Response(
-                    text=self._render_queues_table(stats), content_type="text/html"
-                )
+                return self._queues_table(await api.queue_stats())
             return web.json_response(control)
 
     async def api_queue_resume(self, request: web.Request) -> web.Response:
@@ -1375,10 +1124,7 @@ class WebAdminServer:
         async with self.api() as api:
             control = await api.resume_queue(queue)
             if request.query.get("format") == "html":
-                stats = await api.queue_stats()
-                return web.Response(
-                    text=self._render_queues_table(stats), content_type="text/html"
-                )
+                return self._queues_table(await api.queue_stats())
             return web.json_response(control)
 
     async def api_workers_list(self, request: web.Request) -> web.Response:
@@ -1390,65 +1136,7 @@ class WebAdminServer:
             if format_type != "html":
                 return web.json_response(workers)
 
-            if not workers:
-                html = (
-                    '<p style="padding: 1rem; color: #888;">No workers registered</p>'
-                )
-                return web.Response(text=html, content_type="text/html")
-
-            html = '<table style="width: 100%; border-collapse: collapse;">'
-            html += "<thead><tr>"
-            for col in (
-                "ID",
-                "Host",
-                "PID",
-                "Queue",
-                "Status",
-                "Job Threads",
-                "Last Seen",
-                "Current Job",
-            ):
-                html += f'<th style="padding: 0.75rem; text-align: left;">{col}</th>'
-            html += "</tr></thead><tbody>"
-            for w in workers:
-                if w["shutdown_at"] is not None:
-                    status = '<span class="badge dead">shut down</span>'
-                elif w["not_claiming"]:
-                    # live, beating, and doing nothing: abandoned threads fill
-                    # its pool, so a "live" badge here would be a lie
-                    status = '<span class="badge crashed">not claiming</span>'
-                elif w["live"]:
-                    status = '<span class="badge live">live</span>'
-                else:
-                    status = '<span class="badge paused">stale</span>'
-                threads = (
-                    f"{int(w['job_threads_abandoned'])} abandoned "
-                    f"/ {int(w['job_threads'])}"
-                    if w["job_threads"]
-                    else "-"
-                )
-                age = w.get("last_seen_age_seconds")
-                age_html = f"{age:.0f}s ago" if age is not None else "-"
-                if w.get("current_job_id") is not None:
-                    current = (
-                        f"#{int(w['current_job_id'])} "
-                        f"{html_mod.escape(str(w['current_job_class']))} "
-                        f"({html_mod.escape(str(w['current_job_state']))})"
-                    )
-                else:
-                    current = "-"
-                html += "<tr>"
-                html += f'<td style="padding: 0.75rem;">{int(w["id"])}</td>'
-                html += f'<td style="padding: 0.75rem;">{html_mod.escape(str(w["host"]))}</td>'
-                html += f'<td style="padding: 0.75rem;">{int(w["pid"])}</td>'
-                html += f'<td style="padding: 0.75rem;">{html_mod.escape(str(w["queue"]))}</td>'
-                html += f'<td style="padding: 0.75rem;">{status}</td>'
-                html += f'<td style="padding: 0.75rem;">{threads}</td>'
-                html += f'<td style="padding: 0.75rem;">{age_html}</td>'
-                html += f'<td style="padding: 0.75rem;">{current}</td>'
-                html += "</tr>"
-            html += "</tbody></table>"
-            return web.Response(text=html, content_type="text/html")
+            return self.render("fragments/workers_table.html", workers=workers)
 
     async def api_workers_stats(self, request: web.Request) -> web.Response:
         """Get worker statistics"""
@@ -1457,44 +1145,9 @@ class WebAdminServer:
             format_type = request.query.get("format", "json")
 
             if format_type == "html":
-                html = f'<div class="stat-value">{int(stats["live_workers"])}</div>'
-                html += '<div class="stat-label">Active Workers</div>'
-                return web.Response(text=html, content_type="text/html")
+                return self.render("fragments/worker_stats.html", stats=stats)
             else:
                 return web.json_response(stats)
-
-    def _render_dlq_table(self, jobs: list[dict[str, Any]]) -> str:
-        """Render terminal crashed (DLQ) jobs as an HTML fragment."""
-        if not jobs:
-            return (
-                '<p style="padding: 1rem; color: #888;">'
-                "Dead letter queue is empty — no crashed jobs.</p>"
-            )
-
-        html = '<table style="width: 100%; border-collapse: collapse;">'
-        html += "<thead><tr>"
-        for col in ("ID", "Queue", "Job Class", "Errors", "Last Error", "Actions"):
-            html += f'<th style="padding: 0.75rem; text-align: left;">{col}</th>'
-        html += "</tr></thead><tbody>"
-        for job in jobs:
-            job_id = int(job["id"])
-            error = str(job.get("error_message") or "")
-            if len(error) > 120:
-                error = error[:120] + "…"
-            html += "<tr>"
-            html += f'<td style="padding: 0.75rem;">{job_id}</td>'
-            html += f'<td style="padding: 0.75rem;">{html_mod.escape(str(job["queue"]))}</td>'
-            html += f'<td style="padding: 0.75rem;">{html_mod.escape(str(job["job_class"]))}</td>'
-            html += f'<td style="padding: 0.75rem;">{int(job["error_count"])}</td>'
-            html += f'<td style="padding: 0.75rem;"><code>{html_mod.escape(error)}</code></td>'
-            html += (
-                f'<td style="padding: 0.75rem;"><button class="btn btn-success" '
-                f'hx-post="/api/dlq/{job_id}/retry?format=html" '
-                f'hx-target="#dlq-table" hx-swap="innerHTML">Retry</button></td>'
-            )
-            html += "</tr>"
-        html += "</tbody></table>"
-        return html
 
     async def api_dlq_list(self, request: web.Request) -> web.Response:
         """List Dead Letter Queue jobs (terminal crashed state)"""
@@ -1502,9 +1155,7 @@ class WebAdminServer:
         async with self.api() as api:
             jobs = await api.list_dlq(limit=limit)
             if request.query.get("format") == "html":
-                return web.Response(
-                    text=self._render_dlq_table(jobs), content_type="text/html"
-                )
+                return self._dlq_table(jobs)
             return web.json_response(jobs)
 
     async def api_dlq_retry(self, request: web.Request) -> web.Response:
@@ -1531,10 +1182,7 @@ class WebAdminServer:
                 )
             if request.query.get("format") == "html":
                 # Refresh the DLQ table for htmx buttons
-                jobs = await api.list_dlq(limit=100)
-                return web.Response(
-                    text=self._render_dlq_table(jobs), content_type="text/html"
-                )
+                return self._dlq_table(await api.list_dlq(limit=100))
             return web.json_response(result)
 
     async def api_metrics(self, request: web.Request) -> web.Response:
@@ -1549,67 +1197,7 @@ class WebAdminServer:
             metrics = await api.get_metrics(since=since, queue=queue)
 
             if format_type == "html":
-                backlog = metrics["backlog"]
-                inflight = metrics["inflight"]
-                storage = metrics["storage"]
-                # Throughput sits next to arrivals because the comparison is
-                # the signal: either number alone says nothing about whether
-                # the fleet is keeping up.
-                html = '<div class="stats-grid">'
-                html += '<div class="stat-item">'
-                html += (
-                    f"<span>Throughput</span>"
-                    f"<span>{metrics['throughput_per_second']:.2f}/s</span>"
-                )
-                html += (
-                    f"<span>Arrivals</span>"
-                    f"<span>{metrics['arrival_rate_per_second']:.2f}/s</span>"
-                )
-                html += (
-                    f"<span>Retry Pressure</span>"
-                    f"<span>{metrics['retry_rate_per_second']:.2f}/s</span>"
-                )
-                html += (
-                    f"<span>DLQ Growth</span>"
-                    f"<span>{metrics['dlq_growth_per_second']:.4f}/s</span>"
-                )
-                html += "</div>"
-                html += '<div class="stat-item">'
-                html += f'<span>Finished</span><span class="badge finished">{int(metrics["finished_count"])}</span>'
-                html += "</div>"
-                html += '<div class="stat-item">'
-                html += f'<span>Crashed</span><span class="badge crashed">{int(metrics["crashed_count"])}</span>'
-                html += "</div>"
-                html += '<div class="stat-item">'
-                html += f"<span>Avg Duration</span><span>{metrics['avg_duration_seconds']:.2f}s</span>"
-                html += f"<span>Avg Queue Wait</span><span>{metrics['avg_wait_seconds']:.2f}s</span>"
-                html += f"<span>Max Queue Wait</span><span>{metrics['max_wait_seconds']:.2f}s</span>"
-                html += "</div>"
-                html += '<div class="stat-item">'
-                html += f"<span>Backlog Depth</span><span>{backlog['depth']}</span>"
-                html += (
-                    f"<span>Oldest Ready</span>"
-                    f"<span>{backlog['oldest_age_seconds']:.1f}s</span>"
-                )
-                html += f"<span>In Flight</span><span>{inflight['inflight']}</span>"
-                html += f"<span>Stuck</span><span>{inflight['stuck']}</span>"
-                html += "</div>"
-                html += '<div class="stat-item">'
-                html += (
-                    f"<span>NOTIFY Queue</span>"
-                    f"<span>{metrics['notify_queue_usage']:.1%}</span>"
-                )
-                html += (
-                    f"<span>Dead Tuples</span>"
-                    f"<span>{storage['dead_tuple_ratio']:.1%}</span>"
-                )
-                html += (
-                    f"<span>Storage</span>"
-                    f"<span>{storage['total_bytes'] / (1024 * 1024):.1f} MB</span>"
-                )
-                html += "</div>"
-                html += "</div>"
-                return web.Response(text=html, content_type="text/html")
+                return self.render("fragments/metrics.html", metrics=metrics)
             else:
                 return web.json_response(metrics)
 
@@ -1619,351 +1207,12 @@ class WebAdminServer:
 
     async def schedules_page(self, request: web.Request) -> web.Response:
         """Schedules management page"""
-        html = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Schedules - Pyjobby Admin</title>
-    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #f5f5f5;
-        }
-
-        .header {
-            background: #2c3e50;
-            color: white;
-            padding: 1rem 2rem;
-        }
-
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 2rem;
-        }
-
-        .actions {
-            margin-bottom: 2rem;
-            display: flex;
-            gap: 1rem;
-            align-items: center;
-        }
-
-        .btn {
-            background: #3498db;
-            color: white;
-            border: none;
-            padding: 0.5rem 1rem;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 14px;
-        }
-
-        .btn:hover {
-            background: #2980b9;
-        }
-
-        .btn-danger {
-            background: #e74c3c;
-        }
-
-        .btn-danger:hover {
-            background: #c0392b;
-        }
-
-        .btn-success {
-            background: #27ae60;
-        }
-
-        .btn-success:hover {
-            background: #229954;
-        }
-
-        table {
-            width: 100%;
-            background: white;
-            border-radius: 8px;
-            overflow: hidden;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-
-        th {
-            background: #34495e;
-            color: white;
-            padding: 1rem;
-            text-align: left;
-            font-weight: 500;
-        }
-
-        td {
-            padding: 1rem;
-            border-bottom: 1px solid #ecf0f1;
-        }
-
-        tr:hover {
-            background: #f8f9fa;
-        }
-
-        .badge {
-            display: inline-block;
-            padding: 0.25rem 0.75rem;
-            border-radius: 12px;
-            font-size: 12px;
-            font-weight: 500;
-        }
-
-        .badge-enabled {
-            background: #d4edda;
-            color: #155724;
-        }
-
-        .badge-disabled {
-            background: #f8d7da;
-            color: #721c24;
-        }
-
-        .badge-success {
-            background: #d4edda;
-            color: #155724;
-        }
-
-        .badge-warning {
-            background: #fff3cd;
-            color: #856404;
-        }
-
-        .modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0,0,0,0.5);
-            z-index: 1000;
-        }
-
-        .modal.active {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-
-        .modal-content {
-            background: white;
-            padding: 2rem;
-            border-radius: 8px;
-            width: 90%;
-            max-width: 600px;
-            max-height: 90vh;
-            overflow-y: auto;
-        }
-
-        .form-group {
-            margin-bottom: 1rem;
-        }
-
-        .form-group label {
-            display: block;
-            margin-bottom: 0.5rem;
-            font-weight: 500;
-        }
-
-        .form-group input,
-        .form-group select,
-        .form-group textarea {
-            width: 100%;
-            padding: 0.5rem;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            font-size: 14px;
-        }
-
-        .form-row {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 1rem;
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>Pyjobby Admin - Recurring Schedules</h1>
-        <nav>
-            <a href="/" style="color: white; margin-right: 1rem;">Dashboard</a>
-            <a href="/jobs" style="color: white; margin-right: 1rem;">Jobs</a>
-            <a href="/queues" style="color: white; margin-right: 1rem;">Queues</a>
-            <a href="/schedules" style="color: #3498db; margin-right: 1rem;">Schedules</a>
-        </nav>
-    </div>
-
-    <div class="container">
-        <div class="actions">
-            <button class="btn btn-success" onclick="showAddScheduleModal()">+ Add Schedule</button>
-            <button class="btn" hx-get="/api/schedules?format=html" hx-target="#schedules-table" hx-swap="innerHTML">
-                🔄 Refresh
-            </button>
-        </div>
-
-        <div id="schedules-table" hx-get="/api/schedules?format=html" hx-trigger="load, every 10s" hx-swap="innerHTML">
-            Loading schedules...
-        </div>
-    </div>
-
-    <!-- Add Schedule Modal -->
-    <div id="addScheduleModal" class="modal">
-        <div class="modal-content">
-            <h2>Create New Schedule</h2>
-            <form hx-post="/api/schedules" hx-target="#schedules-table" hx-swap="innerHTML" onsubmit="closeAddScheduleModal()">
-                <div class="form-group">
-                    <label>Schedule Name *</label>
-                    <input type="text" name="name" required placeholder="daily-cleanup">
-                </div>
-
-                <div class="form-group">
-                    <label>Job Class *</label>
-                    <input type="text" name="job_class" required placeholder="myapp.jobs.CleanupJob">
-                </div>
-
-                <div class="form-group">
-                    <label>Cron Expression *</label>
-                    <input type="text" name="cron_expr" required placeholder="0 2 * * *">
-                    <small>Examples: "0 2 * * *" (2am daily), "0 * * * *" (hourly), "*/5 * * * *" (every 5 min)</small>
-                </div>
-
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>Queue</label>
-                        <input type="text" name="queue" value="default">
-                    </div>
-                    <div class="form-group">
-                        <label>Priority</label>
-                        <!--PRIO_FIELD-->
-                    </div>
-                </div>
-
-                <div class="form-group">
-                    <label>Description</label>
-                    <textarea name="description" rows="2" placeholder="What does this schedule do?"></textarea>
-                </div>
-
-                <h3 style="margin-top: 1.5rem; margin-bottom: 1rem;">Safety Features</h3>
-
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>Max Concurrent Jobs</label>
-                        <input type="number" name="max_concurrent_jobs" value="1" min="1">
-                    </div>
-                    <div class="form-group">
-                        <label>Jitter (seconds)</label>
-                        <input type="number" name="jitter_seconds" value="0" min="0">
-                    </div>
-                </div>
-
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>Backpressure Threshold</label>
-                        <input type="number" name="backpressure_threshold" value="1000" min="0">
-                    </div>
-                    <div class="form-group">
-                        <label>Circuit Breaker Threshold</label>
-                        <input type="number" name="circuit_breaker_threshold" value="5" min="1">
-                    </div>
-                </div>
-
-                <div style="margin-top: 2rem; display: flex; gap: 1rem;">
-                    <button type="submit" class="btn btn-success">Create Schedule</button>
-                    <button type="button" class="btn" onclick="closeAddScheduleModal()">Cancel</button>
-                </div>
-            </form>
-        </div>
-    </div>
-
-    <script>
-        function showAddScheduleModal() {
-            document.getElementById('addScheduleModal').classList.add('active');
-        }
-
-        function closeAddScheduleModal() {
-            document.getElementById('addScheduleModal').classList.remove('active');
-        }
-
-        window.onclick = function(event) {
-            const modal = document.getElementById('addScheduleModal');
-            if (event.target === modal) {
-                closeAddScheduleModal();
-            }
-        }
-    </script>
-</body>
-</html>"""
-        # The priority field is built here rather than inlined above because
-        # it has to carry a number this server was told (the fleet's ceiling)
-        # into a page template that is otherwise a constant. The browser-side
-        # `max` is a courtesy; POST /api/schedules refuses the value anyway.
-        # The wording is the point: the ordering is inverted from everyone's
-        # intuition, and that inversion is what mints the unclaimable job.
-        html = html.replace(
-            "<!--PRIO_FIELD-->",
-            '<input type="number" name="priority" value="100" '
-            f'max="{self.prio_ceiling}">\n'
-            "                        <small>LOWER is MORE urgent. Above the "
-            f"worker priority ceiling ({self.prio_ceiling}) no worker ever "
-            f"claims the job.</small>",
+        return self.render(
+            "schedules.html",
+            title="Schedules",
+            active="/schedules",
+            prio_ceiling=self.prio_ceiling,
         )
-        return web.Response(text=html, content_type="text/html")
-
-    def _render_schedules_table(self, schedules: list[dict[str, Any]]) -> str:
-        """Render the schedules table HTML fragment (all values escaped)."""
-        html = "<table><thead><tr>"
-        html += "<th>Name</th><th>Status</th><th>Cron</th><th>Queue</th>"
-        html += "<th>Next Run</th><th>Stats</th><th>Actions</th>"
-        html += "</tr></thead><tbody>"
-
-        for s in schedules:
-            status_badge = "badge-enabled" if s["enabled"] else "badge-disabled"
-            status_text = "Enabled" if s["enabled"] else "Disabled"
-
-            success_rate = None
-            if s["success_count"] + s["failure_count"] > 0:
-                success_rate = (
-                    s["success_count"] / (s["success_count"] + s["failure_count"])
-                ) * 100
-
-            name = html_mod.escape(str(s["name"]))
-            description = html_mod.escape(str(s.get("description") or ""))
-            cron_expr = html_mod.escape(str(s["cron_expr"]))
-            queue = html_mod.escape(str(s["queue"]))
-
-            html += "<tr>"
-            html += f"<td><strong>{name}</strong><br><small>{description}</small></td>"
-            html += f'<td><span class="badge {status_badge}">{status_text}</span></td>'
-            html += f"<td><code>{cron_expr}</code></td>"
-            html += f"<td>{queue}</td>"
-            html += f"<td>{s['next_run'].strftime('%Y-%m-%d %H:%M') if s.get('next_run') else '-'}</td>"
-            html += f"<td>{int(s['run_count'])} runs<br>"
-            if success_rate is not None:
-                rate_class = "badge-success" if success_rate >= 95 else "badge-warning"
-                html += f'<span class="badge {rate_class}">{success_rate:.1f}% success</span>'
-            html += "</td>"
-            html += "<td>"
-
-            schedule_id = int(s["id"])
-            if s["enabled"]:
-                html += f'<button class="btn btn-danger" hx-post="/api/schedules/{schedule_id}/disable" hx-target="#schedules-table" hx-swap="innerHTML">Disable</button>'
-            else:
-                html += f'<button class="btn btn-success" hx-post="/api/schedules/{schedule_id}/enable" hx-target="#schedules-table" hx-swap="innerHTML">Enable</button>'
-
-            html += f' <button class="btn btn-danger" hx-delete="/api/schedules/{schedule_id}" hx-confirm="Delete schedule {name}?" hx-target="#schedules-table" hx-swap="innerHTML">Delete</button>'
-            html += "</td>"
-            html += "</tr>"
-
-        html += "</tbody></table>"
-        return html
 
     async def api_schedules_list(self, request: web.Request) -> web.Response:
         """List schedules (JSON or HTML)"""
@@ -1982,8 +1231,7 @@ class WebAdminServer:
             )
 
             if format_type == "html":
-                html = self._render_schedules_table(schedules)
-                return web.Response(text=html, content_type="text/html")
+                return self._schedules_table(schedules)
             else:
                 # JSON response
                 return web.json_response(
@@ -2034,9 +1282,7 @@ class WebAdminServer:
                 )
 
                 # Return refreshed schedules list as HTML
-                schedules = await api.list_schedules()
-                html = self._render_schedules_table(schedules)
-                return web.Response(text=html, content_type="text/html")
+                return self._schedules_table(await api.list_schedules())
             except ValueError as e:
                 return web.json_response({"error": str(e)}, status=400)
             except asyncpg.UniqueViolationError:

@@ -104,8 +104,12 @@ jobs:
           names = zipfile.ZipFile(wheel).namelist()
 
           def packaged(prefix: str, suffix: str) -> set[str]:
+              # Keyed by the path BELOW the prefix, not by basename: the admin
+              # templates are a subtree (fragments/ inside templates/), and a
+              # file that ships under the wrong name is the same 500 at
+              # request time as one that does not ship at all.
               return {
-                  n.split("/")[-1]
+                  n[len(prefix):]
                   for n in names
                   if n.startswith(prefix) and n.endswith(suffix)
               }
@@ -122,8 +126,16 @@ jobs:
           for label, source, prefix, suffix in (
               ("base-schema", "pyjobby/sql/schema", "pyjobby/sql/schema/", ".sql"),
               ("dashboard", "pyjobby/static", "pyjobby/static/", ".html"),
+              # web_admin.py serves NO html of its own: every page and htmx
+              # fragment is one of these files, loaded out of the installed
+              # package. A wheel without them is a wheel whose admin UI is
+              # nothing but 500s.
+              ("admin-template", "pyjobby/templates", "pyjobby/templates/", ".html"),
           ):
-              want = {p.name for p in Path(source).glob(f"*{suffix}")}
+              want = {
+                  p.relative_to(source).as_posix()
+                  for p in Path(source).rglob(f"*{suffix}")
+              }
               assert want, f"no {label} files in the source tree ({source})"
               missing = sorted(want - packaged(prefix, suffix))
               assert not missing, f"{wheel} is missing {label} files: {missing}"
