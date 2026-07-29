@@ -114,9 +114,7 @@ class TestRetryVersusRerun:
     ):
         fleet.worker(unique_queue)
         client = JobClient(pool=db_pool)
-        job_id = await client.enqueue(
-            "tests.dxe_jobs.OkJob", queue=unique_queue, x=21
-        )
+        job_id = await client.enqueue("tests.dxe_jobs.OkJob", queue=unique_queue, x=21)
         await wait_for_job_state(db_pool, job_id, ("finished",), timeout=30)
 
         refused = admin("jobs", "retry", str(job_id))
