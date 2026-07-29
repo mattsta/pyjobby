@@ -12,6 +12,10 @@ concurrency:
 
 env:
   PYJOBBY_TEST_DSN: postgresql://pyjobby_test:pyjobby_test_password@localhost:5432/pyjobby_test
+  # tests/ops spawns the real entry points through the operator's tool
+  # runner. Pinned explicitly: this environment is synced by uv, and the
+  # runner image may carry a poetry that does not own it.
+  PYJOBBY_TOOL_RUNNER: uv run
   # Leak attribution (tests/conftest.py::gc_after_each_test): collect at every
   # teardown so a leaked connection's ResourceWarning fires in the leaking
   # test's own teardown. Without it the unraisable-exception plugin fails

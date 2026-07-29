@@ -271,7 +271,11 @@ class TestBadDsn:
     async def test_unknown_role_exits_one(self, db_params):
         # NOTE: an authentication *failure* (wrong password) is not testable on
         # a host whose pg_hba.conf trusts local connections; an unknown role
-        # exercises the same connection-error handler.
+        # exercises the same connection-error handler. What the server SAYS
+        # about it is the server's business and differs by auth method --
+        # trust answers 'role ... does not exist', scram answers 'password
+        # authentication failed for user ...' -- so the assertion is the
+        # handler's framing plus the role name, not the server's sentence.
         bad = (
             f"postgresql://pj_no_such_role:whatever"
             f"@{db_params['host']}:{db_params['port']}/{db_params['database']}"
@@ -280,10 +284,8 @@ class TestBadDsn:
         result = await run_cli("--dsn", bad, "workers", "list")
 
         assert result.exit_code == 1
-        assert (
-            'Error: Failed to connect to database: role "pj_no_such_role" '
-            "does not exist" in result.stderr
-        )
+        assert "Error: Failed to connect to database:" in result.stderr
+        assert "pj_no_such_role" in result.stderr
 
     async def test_every_group_fails_the_same_way(self, db_params):
         """One broken DSN, one shared handler: no group swallows the error."""
@@ -1507,13 +1509,36 @@ class TestDbCommands:
         name = await scratch_db()
         conn = await asyncpg.connect(**{**db_params, "database": name})
         try:
+            # A superuser bypasses schema ACLs entirely, so on an install
+            # where the test role IS the superuser (CI's postgres container
+            # has no other role) the revoke below would never bind and
+            # migrate would succeed. The premise then needs a dedicated
+            # unprivileged role to connect as; everywhere else the test
+            # role itself is the unprivileged one.
+            is_super = await conn.fetchval(
+                "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
+            )
+            if is_super:
+                await conn.execute("DROP ROLE IF EXISTS pj_test_nocreate")
+                await conn.execute(
+                    "CREATE ROLE pj_test_nocreate LOGIN PASSWORD 'pj_test_nocreate'"
+                )
             # strip CREATE from the only schema the role can write
             await conn.execute("REVOKE CREATE ON SCHEMA public FROM pg_database_owner")
             await conn.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
         finally:
             await conn.close()
 
-        result = await run_cli("--dsn", dsn_for(db_params, name), "db", "migrate")
+        connect_as = (
+            {
+                **db_params,
+                "user": "pj_test_nocreate",
+                "password": "pj_test_nocreate",
+            }
+            if is_super
+            else db_params
+        )
+        result = await run_cli("--dsn", dsn_for(connect_as, name), "db", "migrate")
 
         # the privilege error is translated into an operator-facing message
         # naming the missing grant -- no traceback escapes asyncio.run()
@@ -1531,6 +1556,8 @@ class TestDbCommands:
         check = await asyncpg.connect(**{**db_params, "database": name})
         try:
             assert await check.fetchval("SELECT to_regclass('public.jorb')") is None
+            if is_super:
+                await check.execute("DROP ROLE IF EXISTS pj_test_nocreate")
         finally:
             await check.close()
 

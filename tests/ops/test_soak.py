@@ -36,7 +36,7 @@ import time
 import pytest
 
 from pyjobby.client import JobClient
-from tests.ops.conftest import REPO_ROOT, wait_until
+from tests.ops.conftest import REPO_ROOT, TOOL_RUNNER, wait_until
 from tests.schema_fixtures import dsn_from
 
 SOAK_SECONDS = float(os.environ.get("PYJOBBY_SOAK_SECONDS", "180"))
@@ -241,8 +241,7 @@ class TestSoak:
         fleet.destroy_all()
         plans = subprocess.run(
             [
-                "poetry",
-                "run",
+                *TOOL_RUNNER,
                 "pj-bench",
                 "--dsn",
                 dsn_from(db_params),

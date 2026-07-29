@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -31,6 +32,17 @@ import pytest
 from tests.schema_fixtures import ScratchDatabases, dsn_from
 
 REPO_ROOT = Path(__file__).parent.parent.parent
+
+#: How spawned platform processes are launched — the operator's runner, so
+#: these tests exercise the path users actually use. Explicit override
+#: first (CI pins `uv run`: its runner image may carry a poetry that does
+#: NOT own the synced environment), else whichever runner is on PATH,
+#: poetry preferred because it owns the local .venv.
+TOOL_RUNNER: list[str] = (
+    os.environ["PYJOBBY_TOOL_RUNNER"].split()
+    if os.environ.get("PYJOBBY_TOOL_RUNNER")
+    else (["poetry", "run"] if shutil.which("poetry") else ["uv", "run"])
+)
 
 
 @pytest.fixture
@@ -59,13 +71,21 @@ class OpsProc:
         self.name = name
         self.log_path = log_path
         self._log_handle = log_path.open("ab")
-        self.popen = subprocess.Popen(
-            argv,
-            cwd=REPO_ROOT,
-            stdout=self._log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        try:
+            self.popen = subprocess.Popen(
+                argv,
+                cwd=REPO_ROOT,
+                stdout=self._log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except Exception:
+            # A spawn that never happened still opened the log; leaking it
+            # fails whichever LATER test the collector runs under
+            # (PYJOBBY_GC_EACH_TEST), which is how CI reported a missing
+            # runner as seventeen unrelated errors.
+            self._log_handle.close()
+            raise
 
     @property
     def pid(self) -> int:
@@ -113,7 +133,7 @@ class Fleet:
         name = name or f"{entry_point}-{self._counter}"
         proc = OpsProc(
             name,
-            ["poetry", "run", entry_point, *args],
+            [*TOOL_RUNNER, entry_point, *args],
             self.tmp_path / f"{name}.log",
         )
         self.procs.append(proc)
@@ -209,7 +229,7 @@ def admin(
     def run(
         *args: str, dsn: str | None = "session"
     ) -> subprocess.CompletedProcess[str]:
-        argv = ["poetry", "run", "pj-admin"]
+        argv = [*TOOL_RUNNER, "pj-admin"]
         if dsn == "session":
             argv += ["--dsn", dsn_from(db_params)]
         elif dsn is not None:
