@@ -2799,13 +2799,28 @@ DOCTOR_MISSING_NAMED = 5
 
 
 def missing_shape_summary(missing: list[str]) -> str:
-    """doctor's FAIL line for a database whose schema is the wrong shape."""
+    """doctor's FAIL line for a database whose schema is the wrong shape.
+
+    The remedy half is conditional because the two cases have different
+    fixes and doctor must not prescribe one that will refuse: `db migrate`
+    recreates missing triggers and indexes, but a missing table, column,
+    view or function means the database was installed from a different
+    schema revision, and the only remedies are recreating it or reconciling
+    by hand.
+    """
     named = ", ".join(missing[:DOCTOR_MISSING_NAMED])
     if len(missing) > DOCTOR_MISSING_NAMED:
         named += f", and {len(missing) - DOCTOR_MISSING_NAMED} more"
+    remedy = (
+        migrations.MIGRATE_REMEDY
+        if all(migrations.repairable(entry) for entry in missing)
+        else "installed from a different schema revision -- recreate the "
+        "database or reconcile by hand; pj-admin db status lists every "
+        "missing object"
+    )
     return (
         f"installed, but {len(missing)} object(s) this release needs are "
-        f"missing: {named} ({migrations.MIGRATE_REMEDY})"
+        f"missing: {named} ({remedy})"
     )
 
 
@@ -3116,12 +3131,7 @@ def doctor(
             # doing something. A dropped jorb_history_record loses the audit
             # trail silently; a dropped NOTIFY trigger degrades every waiter
             # to its polling fallback.
-            rows = await conn.fetch(
-                "SELECT tgname FROM pg_trigger WHERE tgname = ANY($1::text[])",
-                list(DOCTOR_REQUIRED_TRIGGERS),
-            )
-            present = {r["tgname"] for r in rows}
-            missing = [t for t in DOCTOR_REQUIRED_TRIGGERS if t not in present]
+            missing = await migrations.missing_triggers(conn)
             doc.check(
                 not missing,
                 "triggers",
@@ -3371,6 +3381,8 @@ def db_migrate(ctx: click.Context) -> None:
                     )
             if result.applied:
                 print_success(f"Applied migrations: {result.applied}")
+            for entry in result.repaired:
+                print_success(f"Recreated missing {entry} from the base schema")
             # The shape check, so this command can never say "up to date"
             # about a database `doctor` FAILs. A database with jorb present
             # but objects missing was installed from a DIFFERENT schema

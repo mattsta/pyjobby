@@ -263,10 +263,14 @@ class MigrationResult:
     installed_base: bool = False
     applied: list[int] = field(default_factory=list)
     recorded: list[int] = field(default_factory=list)
+    #: "kind name" drift entries recreated from the base schema (see
+    #: _repair_drift): dropped triggers and indexes, healed rather than
+    #: refused, because doctor's FAIL lines send the operator here.
+    repaired: list[str] = field(default_factory=list)
 
     @property
     def changed(self) -> bool:
-        return self.installed_base or bool(self.applied)
+        return self.installed_base or bool(self.applied) or bool(self.repaired)
 
 
 def available_migrations() -> list[Migration]:
@@ -325,6 +329,48 @@ def base_schema_sql() -> str:
             f"installed package is broken, so there is nothing to install"
         )
     return sql
+
+
+def canonical_create_statement(kind: str, name: str) -> str | None:
+    """The base schema's own CREATE statement for one trigger or index.
+
+    None when the schema has no standalone CREATE for it -- constraint-backed
+    indexes (``*_pkey``, ``*_key``) exist only through their table's
+    constraint, and every other object kind is out of scope on purpose: a
+    trigger or index can be recreated verbatim with no risk to data, which is
+    what lets ``migrate`` repair one instead of refusing.
+
+    First ``;`` ends the statement: trigger and index DDL carries no function
+    body, so it never contains an embedded semicolon.
+    """
+    if kind not in ("trigger", "index"):
+        return None
+    match = re.search(
+        rf"CREATE\s+(?:UNIQUE\s+|CONSTRAINT\s+)?{kind}\s+{re.escape(name)}\b[^;]*;",
+        base_schema_sql(),
+        re.IGNORECASE,
+    )
+    return match.group(0) if match else None
+
+
+def repairable(entry: str) -> bool:
+    """Whether ``migrate`` can recreate this "kind name" drift entry."""
+    kind, _, name = entry.partition(" ")
+    return canonical_create_statement(kind, name) is not None
+
+
+async def missing_triggers(conn: asyncpg.Connection) -> list[str]:
+    """REQUIRED_TRIGGERS entries this database does not have.
+
+    Deliberately not part of missing_objects(): doctor reports a dropped
+    trigger as the specific thing it is, on its own check line.
+    """
+    rows = await conn.fetch(
+        "SELECT tgname FROM pg_trigger WHERE tgname = ANY($1::text[])",
+        list(REQUIRED_TRIGGERS),
+    )
+    present = {r["tgname"] for r in rows}
+    return [t for t in REQUIRED_TRIGGERS if t not in present]
 
 
 async def applied_versions(conn: asyncpg.Connection) -> set[int]:
@@ -472,10 +518,46 @@ async def _migrate_locked(conn: asyncpg.Connection) -> MigrationResult:
 
     if result.applied:
         logger.info(f"Applied migrations: {result.applied}")
-    else:
+
+    result.repaired = await _repair_drift(conn)
+
+    if not result.changed:
         logger.info("Database schema is up to date")
 
     return result
+
+
+async def _repair_drift(conn: asyncpg.Connection) -> list[str]:
+    """Recreate missing triggers and indexes from the base schema, verbatim.
+
+    ``doctor``'s triggers and shape checks both end in "run: pj-admin db
+    migrate", so this command has to actually fix what they report or the
+    operator loops between the two forever. Triggers and indexes are the
+    drift it can fix: their canonical DDL is a standalone CREATE statement in
+    sql/schema/ and recreating one risks no data.
+
+    All-or-nothing on purpose: any deeper drift -- a missing table, column,
+    view, function or enum label, or an index that only a table constraint
+    can rebuild -- means this database was installed from a different schema
+    revision, and recreating an index on top of it would dress a wreck up as
+    current. The caller's shape check then reports the whole list and
+    refuses, which is the honest answer there.
+    """
+    drift = await missing_objects(conn)
+    drift += [f"trigger {t}" for t in await missing_triggers(conn)]
+
+    statements: list[tuple[str, str]] = []
+    for entry in drift:
+        kind, _, name = entry.partition(" ")
+        statement = canonical_create_statement(kind, name)
+        if statement is None:
+            return []
+        statements.append((entry, statement))
+
+    for entry, statement in statements:
+        logger.info(f"Recreating missing {entry} from the base schema")
+        await conn.execute(statement)
+    return [entry for entry, _ in statements]
 
 
 async def _record(conn: asyncpg.Connection, migration: Migration) -> None:

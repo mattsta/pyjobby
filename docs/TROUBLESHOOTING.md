@@ -155,9 +155,14 @@ through is worse than one that stops.
 base schema; on a database with pending migration files (a live-deployment
 concern — none ship today) it applies them, one transaction per file,
 serialised fleet-wide by an advisory lock, so running it from every host's
-deploy step is safe. A database that is missing objects with nothing
-pending was installed from a different schema revision: recreate it (or
-reconcile by hand from the object list). See
+deploy step is safe. It also recreates a missing **trigger or index** from
+the base schema — the two kinds of drift whose canonical DDL is a
+standalone CREATE statement, so recreating one risks no data. Anything
+deeper — a missing table, column, view or function — means the database
+was installed from a different schema revision; `db migrate` refuses
+rather than repairing on top of it, the FAIL line says so instead of
+prescribing it, and the remedies are recreating the database or
+reconciling by hand from the object list. See
 [deployment-guide.md § The database](deployment-guide.md#the-database).
 
 If a stale schema is reached by a command rather than by `doctor`, you get

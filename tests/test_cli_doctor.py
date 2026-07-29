@@ -235,7 +235,11 @@ class TestDoctorSchema:
         check ("is jorb there") reported PASS schema -- and the very next
         check died on the missing column. The health probe certified a
         database it could not use. Now the check is the SHAPE, it FAILs, it
-        names objects the operator can look up, and it names the command.
+        names objects the operator can look up, and it prescribes the remedy
+        that is actually true for the drift it found: columns and functions
+        are not something `db migrate` can recreate, so the line must say
+        recreate-or-reconcile rather than send the operator to a command
+        that will refuse.
         """
         drifted = await scratch_db()
         conn = await asyncpg.connect(drifted)
@@ -257,7 +261,8 @@ class TestDoctorSchema:
         # one asserted here has to be one that sorts near the front and will
         # stay there: jorb's own columns precede every other table's.
         assert "column jorb.tags" in message
-        assert "run: pj-admin db migrate" in message
+        assert "run: pj-admin db migrate" not in message
+        assert "recreate the database or reconcile by hand" in message
         # It stops there on purpose: every check below queries something this
         # one just reported missing, and doctor must not end in a traceback.
         assert set(checks) == {"database", "schema"}

@@ -377,6 +377,105 @@ class TestRequiredShapeManifest:
 
 
 # ============================================================================
+# Drift repair: what migrate() can heal, and what it must refuse
+# ============================================================================
+
+
+class TestDriftRepair:
+    """`doctor`'s trigger and shape FAILs both end in "run: pj-admin db
+    migrate", so migrate has to actually fix what they report -- for the
+    drift whose canonical DDL is a standalone CREATE statement (triggers and
+    plain indexes), and refuse everything deeper rather than dress a
+    different schema revision up as current."""
+
+    async def test_every_required_trigger_has_canonical_ddl(self):
+        """The repair path is only a remedy if it can never meet a trigger
+        it has no statement for."""
+        for name in migrations.REQUIRED_TRIGGERS:
+            statement = migrations.canonical_create_statement("trigger", name)
+            assert statement is not None, name
+            assert name in statement
+
+    async def test_index_ddl_exists_exactly_for_non_constraint_indexes(self):
+        """Constraint-backed indexes (``*_pkey``, ``*_key``) exist only
+        through their table's constraint -- no standalone CREATE to extract,
+        so they are deep drift by definition. Everything else must have one."""
+        for name in migrations.REQUIRED_INDEXES:
+            statement = migrations.canonical_create_statement("index", name)
+            if name.endswith(("_pkey", "_key")):
+                assert statement is None, name
+            else:
+                assert statement is not None, name
+                assert name in statement
+
+    async def test_only_triggers_and_plain_indexes_are_repairable(self):
+        assert migrations.repairable("trigger jorb_history_record")
+        assert migrations.repairable("index jorb_tags_idx")
+        assert not migrations.repairable("index jorb_pkey")
+        assert not migrations.repairable("column jorb_worker.job_threads")
+        assert not migrations.repairable("table jorb")
+        assert not migrations.repairable("function claim_jorb")
+        assert not migrations.repairable("view jorb_dag_status")
+
+    async def test_migrate_recreates_dropped_trigger_and_index_verbatim(
+        self, scratch: ScratchDatabases
+    ):
+        """After repair the catalog is byte-identical to a fresh install --
+        the strongest version of "recreated from the base schema"."""
+        conn = await connect(await scratch.create())
+        try:
+            fresh = await catalog(conn)
+            await conn.execute("DROP TRIGGER jorb_history_record ON jorb")
+            await conn.execute("DROP INDEX jorb_dag_retention_idx")
+
+            result = await migrations.migrate(conn)
+
+            assert result.repaired == [
+                "index jorb_dag_retention_idx",
+                "trigger jorb_history_record",
+            ]
+            assert result.changed
+            assert await catalog(conn) == fresh
+            assert await migrations.missing_objects(conn) == []
+            assert await migrations.missing_triggers(conn) == []
+        finally:
+            await conn.close()
+
+    async def test_migrate_repairs_nothing_on_top_of_deep_drift(
+        self, scratch: ScratchDatabases
+    ):
+        """All-or-nothing: a missing column means a different schema
+        revision, and recreating the index on top of it would make doctor's
+        report SHRINK while the database stays wrong."""
+        conn = await connect(await scratch.create())
+        try:
+            await conn.execute("DROP INDEX jorb_dag_retention_idx")
+            await conn.execute("ALTER TABLE jorb_worker DROP COLUMN job_threads")
+
+            result = await migrations.migrate(conn)
+
+            assert result.repaired == []
+            assert not result.changed
+            assert await migrations.missing_objects(conn) == [
+                "column jorb_worker.job_threads",
+                "index jorb_dag_retention_idx",
+            ]
+        finally:
+            await conn.close()
+
+    async def test_migrate_on_a_healthy_database_repairs_nothing(
+        self, scratch: ScratchDatabases
+    ):
+        conn = await connect(await scratch.create())
+        try:
+            result = await migrations.migrate(conn)
+            assert result.repaired == []
+            assert not result.changed
+        finally:
+            await conn.close()
+
+
+# ============================================================================
 # Concurrency
 # ============================================================================
 
