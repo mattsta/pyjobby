@@ -558,6 +558,19 @@ class TestErrorSurface:
         assert [r["id"] for r in rows] == [high, low]
 
 
+def _is_async_surface(member: object) -> bool:
+    """Is this class-dict entry part of the async client's public surface?
+
+    Coroutine functions AND async GENERATORS: `read_stream` is the second
+    kind, and a check written only around `iscoroutinefunction` waves every
+    streaming method through unexamined -- which is exactly what the presence
+    test found and the two signature tests below did not.
+    """
+    import inspect
+
+    return inspect.iscoroutinefunction(member) or inspect.isasyncgenfunction(member)
+
+
 class TestSyncFacadeParity:
     async def test_every_public_async_method_has_a_sync_counterpart(self):
         """SyncJobClient is written out by hand, so it can fall behind.
@@ -572,7 +585,6 @@ class TestSyncFacadeParity:
         only around `iscoroutinefunction` would wave every future streaming
         method through unmirrored.
         """
-        import inspect
 
         from pyjobby.client import SyncJobClient
 
@@ -587,11 +599,7 @@ class TestSyncFacadeParity:
         async_public = {
             name
             for name, member in vars(JobClient).items()
-            if not name.startswith("_")
-            and (
-                inspect.iscoroutinefunction(member)
-                or inspect.isasyncgenfunction(member)
-            )
+            if not name.startswith("_") and _is_async_surface(member)
         }
         sync_names = set(vars(SyncJobClient))
         missing = sorted(async_public - excluded - sync_names)
@@ -603,14 +611,19 @@ class TestSyncFacadeParity:
         """A name match is not a signature match: a wrapper that silently
         drops a keyword (window, timeout, ...) type-checks and passes the
         presence test above while quietly denying sync callers a capability
-        the async client has. Compare the parameter NAMES, method by method."""
+        the async client has. Compare the parameter NAMES, method by method.
+
+        Async GENERATORS are in scope here too (`_is_async_surface`). The
+        presence test already counted them; these two did not, so a streaming
+        method was required to EXIST on the sync facade and then allowed to
+        take whatever arguments it liked."""
         import inspect
 
         from pyjobby.client import SyncJobClient
 
         offenders: dict[str, list[str]] = {}
         for name, member in vars(JobClient).items():
-            if name.startswith("_") or not inspect.iscoroutinefunction(member):
+            if name.startswith("_") or not _is_async_surface(member):
                 continue
             sync = vars(SyncJobClient).get(name)
             if sync is None:
@@ -678,7 +691,7 @@ class TestSyncFacadeParity:
 
         offenders: dict[str, str] = {}
         for name, member in vars(JobClient).items():
-            if name.startswith("_") or not inspect.iscoroutinefunction(member):
+            if name.startswith("_") or not _is_async_surface(member):
                 continue
             sync = vars(SyncJobClient).get(name)
             if sync is None:
@@ -746,6 +759,58 @@ class TestSyncFacadeParity:
                 offenders[name] = complaint
 
         assert not offenders, f"SyncJobClient signature mismatches: {offenders}"
+
+    async def test_every_sync_method_mirrors_something_on_the_async_client(self):
+        """The other direction, which nothing checked.
+
+        Every test above walks JobClient and asks what SyncJobClient is
+        missing. None of them walks SyncJobClient -- so a wrapper for a method
+        that was RENAMED or REMOVED on the async client stays behind as a
+        method that mirrors nothing, and the failure a caller gets is an
+        AttributeError from inside the facade rather than at the call.
+
+        The exclusions are the sync facade's OWN surface, and each is a thing
+        the async client legitimately does differently: lifecycle it manages
+        itself (its background loop, its context manager), and the
+        constructors that build it.
+        """
+
+        from pyjobby.client import SyncJobClient
+
+        excluded = {
+            # the facade's own lifecycle. The async client is closed with an
+            # `await` and entered with `async with`, so these three have no
+            # async counterpart by construction.
+            "close",
+            "__enter__",
+            "__exit__",
+            "__init__",
+            # the constructors: `from_config` reads a config file and starts
+            # the loop every wrapper runs on, and `_create` is the coroutine it
+            # runs to build the async client it wraps
+            "from_config",
+            "_create",
+            # the wrapper machinery itself -- what every method below calls to
+            # get from a synchronous frame onto that loop
+            "_run",
+        }
+        async_names = set(vars(JobClient))
+        # NOT filtered by leading underscore: an internal that is genuinely
+        # the facade's own belongs in the list above by name, where a reader
+        # can see the whole of what this test forgives. A blanket `_`-prefix
+        # skip would forgive the next one silently.
+        orphans = sorted(
+            name
+            for name, member in vars(SyncJobClient).items()
+            if name not in excluded
+            and (callable(member) or isinstance(member, property))
+            and name not in async_names
+        )
+        assert not orphans, (
+            f"SyncJobClient methods that mirror nothing on JobClient: "
+            f"{orphans}. Either the async method was renamed and the wrapper "
+            f"was not, or the wrapper outlived it."
+        )
 
     async def test_from_config_builds_a_working_sync_client(self, db_params, tmp_path):
         """Scripts and cron jobs are exactly where a config file lives, and

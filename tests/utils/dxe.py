@@ -60,16 +60,24 @@ class ConnectionBoundSystem:
 
 
 async def connection_bound_job(
-    conn: asyncpg.Connection, job_row: Any, epoch: int | None = None
+    conn: asyncpg.Connection,
+    job_row: Any,
+    epoch: int | None = None,
+    cls: type[Job[Any]] = Job,
 ) -> Job[Any]:
     """A `Job` for `job_row` on one real connection, transaction-capable.
 
     Same contract as ``bound_job`` — real statements, real rows, recorded
     checkpoints loaded and bound — but ``transaction()`` and ``send()``
     work, because the system exposes the connection they scope to.
+
+    ``cls`` builds a SUBCLASS instead, which is what lets a test drive a real
+    ``StateMachineJob.task()`` at a chosen resume point: the machine's turn is
+    a decision the object makes in process, and reaching a specific point in
+    it through a live worker would bury the property under timing.
     """
     system = ConnectionBoundSystem(conn)
-    job = Job(s=system, job=dict(job_row))  # type: ignore[arg-type]
+    job = cls(s=system, job=dict(job_row))  # type: ignore[arg-type]
     resolved = job_row["run_epoch"] if epoch is None else epoch
     checkpoints = await conn.fetch(STMTS["load-steps"], job_row["id"])
     job._dxe_bind(list(checkpoints), resolved)

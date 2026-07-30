@@ -3097,7 +3097,21 @@ class AdminAPI:
             cron_expr = updates.get("cron_expr", schedule["cron_expr"])
             timezone = updates.get("timezone", schedule["timezone"])
 
-            updates["next_run"] = next_cron_run(cron_expr, timezone)
+            # AGAINST THE DATABASE'S CLOCK, not this process's. `next_run` is
+            # compared to the database's NOW() by every scheduler that reads
+            # it, so an admin host whose clock lags writes a next_run the
+            # database already considers due -- the schedule fires immediately,
+            # for a tick it may have fired seconds ago, and the per-tick
+            # deadline key does not collapse the pair once the earlier job has
+            # been claimed. Same mechanism as the firing path's advance
+            # (scheduler.ScheduleManager.calculate_next_run), same fix.
+            #
+            # Anchored on the database clock ALONE, and deliberately not
+            # clamped up to the existing next_run: moving a schedule EARLIER is
+            # what an operator changing `0 3 * * *` to `*/5 * * * *` is asking
+            # for, and refusing it would be a different bug.
+            db_now = await self.conn.fetchval("SELECT now()")
+            updates["next_run"] = next_cron_run(cron_expr, timezone, after=db_now)
 
         # Build UPDATE query dynamically
         set_clauses = []

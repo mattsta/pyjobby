@@ -73,6 +73,39 @@ class CrashOnceMachine(StateMachineJob):
         return {"attempt": attempt}
 
 
+class RelayMachine(StateMachineJob):
+    """Its action does the thing the module docstring promises: a durable
+    ``send()`` to another job, from inside the transition's step.
+
+    That composition is what makes a turn's checkpoint log NESTED -- the
+    action consumes a sequence number and the ``send()`` inside it consumes
+    the next one, under it -- which is the shape that has to survive a resume
+    at every point in the turn. The action also counts its own executions in a
+    ``jorb_event``, so a test can tell "replayed" from "ran again" without
+    reading the checkpoint log it is asserting about.
+
+    The action's target is deliberately NOT final: a machine that stopped
+    there would never allocate another sequence number, and the stranded one
+    the nested send left behind would never be claimed by anything. The second
+    edge is what makes the turn a turn.
+    """
+
+    initial = "start"
+    final = frozenset({"done"})
+    transitions = {
+        "start": {"go": ("relayed", "relay")},
+        "relayed": {"finish": "done"},
+    }
+    wait_seconds = 2.0
+    idle_seconds = 1.0
+
+    async def relay(self, event: str, payload: Any) -> dict[str, Any]:
+        prior = await self.get_event("ran.relay") or {"n": 0}
+        await self.set_event("ran.relay", {"n": int(prior["n"]) + 1})
+        await self.send(int(payload["peer"]), {"relayed": True}, topic="relay")
+        return {"sent_to": int(payload["peer"])}
+
+
 class QuietMachine(StateMachineJob):
     """Parks for a long time without waking, so a client-side measurement of
     round trips measures the CLIENT.

@@ -1150,11 +1150,22 @@ class WebSocketServer:
         )
 
     async def broadcast_event(self, channel: str, event: dict[str, Any]) -> None:
-        """Broadcast event to all subscribers of channel"""
+        """Broadcast event to all subscribers of channel.
+
+        ITERATES A SNAPSHOT, not the live set. There is an ``await`` in the
+        loop, so anything that runs while a send is in flight can mutate the
+        set under it -- a client disconnecting (``detach``), a new one
+        subscribing, or this method's own dead-client cleanup on a re-entrant
+        broadcast. Mutating a set mid-iteration raises ``RuntimeError``, which
+        here would abandon the fan-out partway: the subscribers after the one
+        that changed never receive an event that was successfully delivered to
+        the ones before them, and the channels with no polling fallback (a
+        job watch) never learn of it at all.
+        """
         subscribers = self.subscriptions.get(channel, set())
         dead_clients = set()
 
-        for ws in subscribers:
+        for ws in list(subscribers):
             try:
                 await self.send_to_client(ws, event)
             except Exception as e:

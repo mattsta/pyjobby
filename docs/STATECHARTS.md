@@ -175,14 +175,24 @@ time.
 Resuming a job replays its checkpoint log, and a machine records a `recv` and a
 `sleep` on every idle wake — so a naive machine's replay cost would grow with
 how long it has existed rather than with how much it has done.
-`StateMachineJob` calls [`compact()`](DXE.md#bounding-replay-compact) at each
-turn boundary, which discards the log and restarts the step sequence, so the log
-never exceeds one turn and a machine may live indefinitely.
+`StateMachineJob` discards the log and restarts the step sequence at each turn
+boundary, so the log never exceeds one turn and a machine may live indefinitely.
+
+That wipe and the **state publish** are one commit, not two
+(`Job.commit_position`). They have to be: the machine re-derives its position
+from the published state and then replays the log forward from it, so a crash
+between the two writes leaves a pair that describes no machine that can run —
+and the next attempt raises `NondeterminismError` on a log it will replay
+identically on every retry after that. Committed together, every crash point
+leaves either the old state with the whole log (which replays convergently) or
+the new state with an empty one (which starts clean).
 
 The consequence for you is that `history()` shows the **current** stretch of
-work, not everything the machine has ever done. If you need a permanent audit
-trail, publish one: as machine events, or into your own table from inside a
-`transaction()`.
+work, not everything the machine has ever done. A machine that has reached a
+final state is the exception, and keeps its last turn: nothing replays from a
+final state, so there is nothing left for the wipe to bound. If you need a
+permanent audit trail, publish one: as machine events, or into your own table
+from inside a `transaction()`.
 
 ---
 

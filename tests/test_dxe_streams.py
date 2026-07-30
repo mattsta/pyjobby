@@ -576,7 +576,7 @@ async def test_the_sync_client_reads_a_finished_stream(
     )
     await wait_for_job_state(db_pool, job_id, ("finished",))
 
-    def _drive() -> tuple[list, dict, list]:
+    def _drive() -> tuple[list, dict, list, dict]:
         with SyncJobClient.from_config(str(config)) as client:
             values = list(client.read_stream(job_id, "rows"))
             snapshot = client.get_stream(job_id, "rows")
@@ -586,10 +586,23 @@ async def test_the_sync_client_reads_a_finished_stream(
             for value in client.read_stream(job_id, "rows"):
                 partial.append(value)
                 break
-            return values, snapshot, partial
+            # ...and the waiter map is the evidence. `_stream_waiters` is
+            # where read_stream registers its demand, and the `finally` that
+            # releases it only runs if the generator is actually closed --
+            # which a `break` does through GeneratorExit, and which the sync
+            # wrapper has to forward to the async generator it drives. A leak
+            # here is unbounded: one entry per abandoned read, for the life of
+            # a long-lived client, each one a job the schema keeps notifying
+            # about.
+            waiters = dict(client._client._stream_waiters)
+            return values, snapshot, partial, waiters
 
-    values, snapshot, partial = await asyncio.to_thread(_drive)
+    values, snapshot, partial, waiters = await asyncio.to_thread(_drive)
 
     assert values == [{"i": i} for i in range(3)]
     assert snapshot == {"values": values, "closed": True}
     assert partial == [{"i": 0}]
+    assert not waiters, (
+        f"breaking out of read_stream left {waiters} registered: the async "
+        f"generator was never closed, so its release never ran"
+    )

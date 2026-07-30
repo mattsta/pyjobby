@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
 
 import pytest
 
@@ -714,14 +715,20 @@ async def test_every_state_changing_statement_carries_the_fence():
             f"snapshot test and commits anyway"
         )
     assert "FOR SHARE" in STMTS["stream-append"]
-    # Compaction fences with an UPDATE, which takes the EXCLUSIVE lock -- the
-    # deliberate exception (see dxe.COMPACT_FENCE_SQL): it has to write the
-    # `awaited` latch anyway, and two concurrent compactions each holding a
-    # share lock and then reaching for the exclusive one is a lock-upgrade
-    # deadlock. The DELETE it fences is a SEPARATE statement in the same
-    # transaction, and carries no epoch of its own on purpose: a fresh
-    # snapshot is the point, and it is unreachable except behind the fence.
-    assert "UPDATE jorb" in STMTS["compact-fence"]
+    # Compaction takes the EXCLUSIVE lock -- the deliberate exception (see
+    # dxe.COMPACT_FENCE_SQL): two concurrent compactions each holding a share
+    # lock and then reaching for the exclusive one is a lock-upgrade deadlock.
+    # It WRITES NOTHING while doing it: a locking SELECT holds the row to
+    # COMMIT exactly as an UPDATE would, and the version this statement used to
+    # write cleared `awaited` -- the demand gate three channels share. The
+    # DELETE it fences is a SEPARATE statement in the same transaction, and
+    # carries no epoch of its own on purpose: a fresh snapshot is the point,
+    # and it is unreachable except behind the fence.
+    assert "FOR UPDATE" in STMTS["compact-fence"]
+    assert "UPDATE jorb" not in STMTS["compact-fence"], (
+        "the compaction fence writes the job row again; the lock is all it "
+        "needs, and the write it used to make lowered a notification latch"
+    )
     assert "run_epoch = $2" in STMTS["compact-fence"]
     assert "run_epoch" not in STMTS["compact-steps"]
     assert "jorb_step" in STMTS["compact-steps"]
@@ -1051,20 +1058,18 @@ async def test_live_attempt_can_still_reschedule_itself(db_pool, unique_queue):
     assert row["run_after"] > row["started"]
 
 
-async def test_compaction_drops_the_notification_latch(
+async def test_compaction_preserves_the_notification_latch(
     db_pool, db_params, unique_queue
 ):
-    """compact() clears jorb.awaited alongside the checkpoint log.
+    """compact() discards the checkpoint log and NOTHING else.
 
-    The latch's design ("set once, dies with the row") assumes rows die; a
-    compacting job is exactly the one that never does, so one wait ever
-    would make every future publish a NOTIFY-bearing commit forever. An
-    ACTIVE waiter re-arms from its fallback poll (client._poll_until), so
-    clearing costs at most one fallback interval of latency, once per turn.
-
-    The clearing IS the fence now: `compact-fence` is the UPDATE that writes
-    it, so a compaction that reports success has necessarily cleared the latch
-    and one that reports supersession has necessarily left it alone.
+    ``jorb.awaited`` is the demand gate for jorb_done, jorb_event and
+    jorb_stream alike (sql/schema/90_notify.sql). The fence used to clear it,
+    to bound the notification bill of a machine that never terminates -- and
+    that silently downgraded three channels at once for every consumer
+    watching a compacting job, which is precisely the job a dashboard watches.
+    The fence is a pure lock now (``dxe.COMPACT_FENCE_SQL``), so the latch a
+    watcher raised survives every turn boundary the machine takes.
     """
     job_id = await enqueue(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {"x": 1})
     claimed = await claim_once(db_pool, unique_queue)
@@ -1077,11 +1082,10 @@ async def test_compaction_drops_the_notification_latch(
 
         assert (
             await db_pool.fetchval("SELECT awaited FROM jorb WHERE id = $1", job_id)
-            is False
-        )
+            is True
+        ), "the compact fence lowered a latch it does not own"
 
-        # a zombie's compact must not drop a live attempt's latch
-        await db_pool.execute("UPDATE jorb SET awaited = TRUE WHERE id = $1", job_id)
+        # ...and it is still a fence: a zombie's compact is refused
         zombie = await connection_bound_job(
             caller, claimed, epoch=claimed["run_epoch"] - 1
         )
@@ -1093,6 +1097,54 @@ async def test_compaction_drops_the_notification_latch(
     assert (
         await db_pool.fetchval("SELECT awaited FROM jorb WHERE id = $1", job_id) is True
     )
+
+
+async def test_a_terminal_notification_survives_a_compaction(db_pool, db_params):
+    """The end-to-end shape a dashboard watch has, over real LISTEN/NOTIFY.
+
+    A watcher raises ``jorb.awaited`` (the websocket server's WATCH_JOB_SQL,
+    JobClient's demand write) and then has nothing to do but listen; jorb_done
+    is gated on that very latch. With the latch cleared by the machine's next
+    turn boundary, the terminal UPDATE emitted nothing and a bare listener
+    waited forever. Reproduced before the fence became a pure lock.
+    """
+    listener = await db.connect(**db_params)
+    caller = await db.connect(**db_params)
+    received: list[str] = []
+    try:
+        await listener.add_listener(
+            db.CHANNEL_DONE, lambda *args: received.append(args[3])
+        )
+        job_id = await db_pool.fetchval(
+            "INSERT INTO jorb (job_class, state, run_epoch) "
+            "VALUES ('M', 'running', 1) RETURNING id"
+        )
+        # the watcher registers demand, exactly as watch_job does
+        await db_pool.execute(
+            "UPDATE jorb SET awaited = TRUE WHERE id = $1 AND NOT awaited", job_id
+        )
+
+        # the machine takes a turn boundary while the watch is parked
+        fenced = await caller.fetch(dxe.COMPACT_FENCE_SQL, job_id, 1)
+        assert fenced, "the fence refused a live epoch"
+
+        await db_pool.execute(
+            "UPDATE jorb SET state = 'finished', finished = now() WHERE id = $1",
+            job_id,
+        )
+
+        for _ in range(100):
+            if received:
+                break
+            await asyncio.sleep(0.05)
+        assert received, (
+            "no jorb_done notification after a compaction: the watch's demand "
+            "latch did not survive the turn boundary"
+        )
+        assert json.loads(received[0])["id"] == job_id
+    finally:
+        await listener.close()
+        await caller.close()
 
 
 # ============================================================================

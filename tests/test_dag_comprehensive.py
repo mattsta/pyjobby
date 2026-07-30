@@ -865,8 +865,19 @@ class TestDAGCompletionTrigger:
         )
 
     @pytest.mark.asyncio
-    async def test_completion_timestamp_is_not_overwritten(self, db_pool, unique_queue):
-        """Re-running a job in a finished DAG keeps the original stamp."""
+    async def test_completion_timestamp_follows_the_dag_being_re_opened(
+        self, db_pool, unique_queue
+    ):
+        """Re-running a job RE-OPENS the DAG, and the stamp says so.
+
+        `completed` used to be write-once, so a requeued member left the DAG
+        claiming it had finished while `jorb_dag_status` reported pending work
+        -- a wrong answer, not a stale one, on the column `pj-admin dag list`
+        reads. It is cleared when a member leaves a terminal state and set
+        again when the last one arrives back, so the timestamp always means
+        "the instant this DAG last had nothing left to do" rather than "the
+        first time it ever did".
+        """
         dag_id = await db_pool.fetchval(
             "INSERT INTO jorb_dag (name) VALUES ($1) RETURNING id", "stable stamp"
         )
@@ -884,15 +895,22 @@ class TestDAGCompletionTrigger:
             "SELECT completed FROM jorb_dag WHERE id = $1", dag_id
         )
 
-        # operator requeues and it finishes again
+        # operator requeues: the DAG has pending work again, so it is not
+        # completed any more
         await db_pool.execute("UPDATE jorb SET state = 'queued' WHERE id = $1", job_id)
-        await db_pool.execute(
-            "UPDATE jorb SET state = 'finished' WHERE id = $1", job_id
-        )
-
         assert (
             await db_pool.fetchval(
                 "SELECT completed FROM jorb_dag WHERE id = $1", dag_id
             )
-            == first
+            is None
         )
+
+        # ...and it finishes again, at a new instant
+        await db_pool.execute(
+            "UPDATE jorb SET state = 'finished' WHERE id = $1", job_id
+        )
+        again = await db_pool.fetchval(
+            "SELECT completed FROM jorb_dag WHERE id = $1", dag_id
+        )
+        assert again is not None
+        assert again > first

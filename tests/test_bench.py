@@ -734,6 +734,45 @@ class TestPlansGate:
         assert summary["rows_removed_by_filter"] == 600
         assert summary["scans"][0]["actual_rows"] == 200
 
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "Rows Removed by Filter",
+            "Rows Removed by Index Recheck",
+            "Rows Removed by Join Filter",
+        ],
+    )
+    def test_every_name_explain_gives_a_discard_counts_as_one(self, key):
+        """ "Read it and threw it away" arrives under three different keys.
+
+        A bitmap heap scan that had to re-check the index condition against
+        the heap reports "Rows Removed by Index Recheck"; a join node reports
+        "Rows Removed by Join Filter". A budget that only knew the first name
+        was satisfied by a plan discarding the whole table under either of the
+        other two -- the exact failure this number exists to catch, arriving
+        under a name nobody was reading.
+        """
+        query = bench.HotQuery(
+            "probe", "", "SELECT 1", lambda _q: [], max_rows_removed=1000
+        )
+
+        summary = bench.summarize_plan(
+            {
+                "Plan": {
+                    "Node Type": "Bitmap Heap Scan",
+                    "Relation Name": "jorb",
+                    "Actual Rows": 0,
+                    "Actual Loops": 1,
+                    key: 20_000,
+                    "Shared Hit Blocks": 465,
+                }
+            },
+            query,
+        )
+
+        assert summary["rows_removed_by_filter"] == 20_000
+        assert summary["over_discard_budget"] is True
+
     def test_a_scan_of_a_table_this_query_does_not_gate_is_not_a_failure(self):
         """The gate is per-query, because the tables are.
 

@@ -35,7 +35,7 @@ import click
 import pytest
 from loguru import logger
 
-from pyjobby import migrations
+from pyjobby import db, migrations
 from pyjobby import monitor as monitor_module
 from pyjobby.monitor import (
     CANCEL_UNSATISFIABLE_WAITERS_SQL,
@@ -813,6 +813,106 @@ class TestSweepStrandedWaiters:
         assert row["result"] == {"doubled": 8}
 
 
+class TestRetryingAWaiterParksItAgain:
+    """A retry does not make a dependency go away.
+
+    `cancelled` is retryable (db.RETRYABLE_STATES) and a parked waiter reaches
+    it two ways -- an operator cancels it, or the sweep above cancels it as
+    unsatisfiable. The requeue used to put every such row straight into
+    'queued', where `claim_jorb` (which never reads the waitfor columns) hands
+    it to a worker: the job RUNS with its upstream still going, or with its
+    upstream gone entirely. That is the hazard
+    CANCEL_UNSATISFIABLE_WAITERS_SQL's own comment described, and then chose a
+    state that has it.
+
+    So the requeue's target is a CASE (db.build_requeue_sql): a row still
+    carrying a waitfor column goes back to 'waiting', and the machinery in the
+    class above is what releases or re-cancels it.
+    """
+
+    async def test_a_retried_waiter_is_parked_and_not_claimable(
+        self, db_pool, unique_queue
+    ):
+        upstream = await insert_job(db_pool, unique_queue, state="running")
+        waiter = await insert_job(
+            db_pool, unique_queue, state="waiting", waitfor_job=upstream
+        )
+        # a positive control on the same queue, so an empty claim below is
+        # evidence about the waiter rather than about the claim call
+        control = await insert_job(db_pool, unique_queue, state="queued")
+
+        assert await db.cancel_job(db_pool, waiter) == "cancelled"
+        assert await db.retry_job(db_pool, waiter) == waiter
+
+        assert (await get_job(db_pool, waiter))["state"] == "waiting", (
+            "the retried waiter is claimable again while its upstream is still running"
+        )
+        claimed = await db_pool.fetch(
+            "SELECT id FROM claim_jorb($1, ARRAY[]::text[], 1000, NULL, 1, 'h', 10)",
+            unique_queue,
+        )
+        assert [r["id"] for r in claimed] == [control], (
+            "claim_jorb took the waiter: it does not read the waitfor columns, "
+            "which is exactly why the requeue must not put it in 'queued'"
+        )
+
+    async def test_a_retried_waiter_is_woken_when_its_upstream_finishes(
+        self, db_pool, unique_queue
+    ):
+        """It is parked, not stuck: the ordinary level-triggered wake
+        releases it as soon as the dependency is satisfied."""
+        upstream = await insert_job(db_pool, unique_queue, state="running")
+        waiter = await insert_job(
+            db_pool, unique_queue, state="waiting", waitfor_job=upstream
+        )
+        await db.cancel_job(db_pool, waiter)
+        await db.retry_job(db_pool, waiter)
+
+        await db_pool.execute(
+            "UPDATE jorb SET state = 'finished', finished = now() WHERE id = $1",
+            upstream,
+        )
+        assert await sweep_stranded_waiters(db_pool) == 1
+        assert (await get_job(db_pool, waiter))["state"] == "queued"
+
+    async def test_retrying_an_unsatisfiable_waiter_cancels_it_again(
+        self, db_pool, unique_queue
+    ):
+        """The one that used to run a job whose upstream does not exist.
+
+        The sweep cancels a waiter whose target is gone; a DLQ/operator retry
+        of that row put it in 'queued', and the next worker executed it.
+        Parked instead, the same sweep sees the same unsatisfiable dependency
+        and cancels it again -- the honest answer for as long as the upstream
+        is missing.
+        """
+        ghost = 2_000_000_000
+        waiter = await insert_job(
+            db_pool, unique_queue, state="waiting", waitfor_job=ghost
+        )
+
+        assert await sweep_stranded_waiters(db_pool) == 1
+        assert (await get_job(db_pool, waiter))["state"] == "cancelled"
+
+        assert await db.retry_job(db_pool, waiter) == waiter
+        assert (await get_job(db_pool, waiter))["state"] == "waiting"
+
+        assert await sweep_stranded_waiters(db_pool) == 1
+        row = await get_job(db_pool, waiter)
+        assert row["state"] == "cancelled"
+        assert f"waitfor_job {ghost} does not exist" in row["error_message"]
+
+    async def test_a_retried_job_with_no_dependency_is_queued_as_before(
+        self, db_pool, unique_queue
+    ):
+        """The other branch of the CASE, and the overwhelmingly common one:
+        an ordinary crashed job comes back claimable, immediately."""
+        job_id = await insert_job(db_pool, unique_queue, state="crashed")
+
+        assert await db.retry_job(db_pool, job_id) == job_id
+        assert (await get_job(db_pool, job_id))["state"] == "queued"
+
+
 class TestSweepDeadWorkers:
     async def test_requeues_jobs_of_stale_worker_and_retires_it(
         self, db_pool, unique_queue
@@ -1163,6 +1263,63 @@ class TestSweepExpiredJobs:
 
         assert await sweep_expired_jobs(db_pool, retention_days=7) == 0
         assert await job_ids(db_pool) == sorted([member, waiter])
+
+    @pytest.mark.parametrize("dependent_state", ["queued", "claimed", "running"])
+    async def test_expired_upstream_of_an_already_woken_job_is_kept(
+        self, db_pool, unique_queue, dependent_state
+    ):
+        """A dependent that has been WOKEN is still a dependent.
+
+        The refusal used to test ``state = 'waiting'``, so it protected the
+        upstream only while its dependent was parked. The instant the wake
+        moved that dependent to 'queued' -- which is the whole point of the
+        wake -- the upstream became deletable, and ``waitfor_job`` carries no
+        foreign key to stop it. Nothing re-reads ``waitfor_job`` after the
+        wake, so this one is not a stranded job but a silently rewritten
+        history: the DAG's own record of what it depended on is gone.
+        """
+        upstream = await insert_terminal_job(db_pool, unique_queue, days_ago=30)
+        dependent = await insert_job(db_pool, unique_queue, state=dependent_state)
+        await db_pool.execute(
+            "UPDATE jorb SET waitfor_job = $2 WHERE id = $1", dependent, upstream
+        )
+
+        assert await sweep_expired_jobs(db_pool, retention_days=7) == 0
+        assert await job_ids(db_pool) == sorted([upstream, dependent])
+
+        # ...and a TERMINAL dependent protects nothing: both age out together
+        await db_pool.execute(
+            "UPDATE jorb SET state = 'finished', finished = now() - interval '30 days'"
+            " WHERE id = $1",
+            dependent,
+        )
+        assert await sweep_expired_jobs(db_pool, retention_days=7) == 2
+
+    async def test_expired_upstream_a_queued_job_reads_its_result_from_is_kept(
+        self, db_pool, unique_queue
+    ):
+        """The dependency with no column of its own.
+
+        ``use_result_from`` lives in ``admin_data``, and the worker reads the
+        upstream's stored ``result`` when it claims the reader. The reader is
+        never parked -- it is enqueued claimable -- so a refusal that only
+        looked at 'waiting' rows never saw it at all, and deleting the
+        upstream turned the reader into a job that raises ``LookupError`` on
+        every attempt until its retry budget is gone.
+        """
+        upstream = await insert_terminal_job(db_pool, unique_queue, days_ago=30)
+        reader = await insert_job(db_pool, unique_queue, state="queued")
+        await db_pool.execute(
+            "UPDATE jorb SET admin_data = $2 WHERE id = $1",
+            reader,
+            {"use_result_from": upstream},
+        )
+
+        assert await sweep_expired_jobs(db_pool, retention_days=7) == 0
+        assert await job_ids(db_pool) == sorted([upstream, reader])
+
+        await db_pool.execute("DELETE FROM jorb WHERE id = $1", reader)
+        assert await sweep_expired_jobs(db_pool, retention_days=7) == 1
 
     async def test_batch_size_bounds_one_sweep_taking_the_oldest_first(
         self, db_pool, unique_queue

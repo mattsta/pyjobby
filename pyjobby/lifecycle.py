@@ -59,6 +59,16 @@ LIVE_STATES: tuple[str, ...] = tuple(
     state for state in JOB_STATES if state not in TERMINAL_STATES
 )
 
+#: :data:`LIVE_STATES` as the inside of a SQL ``IN (...)`` list, interpolated
+#: rather than bound for the reason :data:`TERMINAL_STATES_SQL` is: the
+#: partial indexes the retention sweep's dependency refusal rides
+#: (``jorb_waitfor_job_idx``, ``jorb_waitfor_group_idx``,
+#: ``jorb_use_result_from_idx``) are declared on exactly this predicate, and a
+#: bound parameter falls off a partial index the moment PostgreSQL switches to
+#: a generic plan. The values are these four literals, so there is nothing to
+#: inject.
+LIVE_STATES_SQL: str = ", ".join(f"'{state}'" for state in LIVE_STATES)
+
 #: The states in which a job has NOT YET BEEN MATCHED TO A WORKER, and the
 #: only ones whose CLAIM GATES an operator may still change.
 #:
@@ -112,20 +122,36 @@ LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
     # guard instead would be a behaviour change on the hot path whose failure
     # mode is a silently uncompleted job, which is not a trade worth making
     # for a tidier table.
-    "claimed": frozenset({"running", "queued", "cancelled", "crashed", "finished"}),
+    # `waiting` is in here for the same reason it is on the terminal states
+    # below: db.build_requeue_sql's target is a CASE, and a caller that widens
+    # `allowed_states` to an in-flight state (the monitor's basis, and the DXE
+    # fault tests') requeues a row that may still carry waitfor columns.
+    "claimed": frozenset(
+        {"running", "queued", "waiting", "cancelled", "crashed", "finished"}
+    ),
     # running -> terminal, or back to queued: retry backoff, self-reschedule,
     # durable sleep, or a monitor requeue. The running -> running self-edge is
     # the idempotent `run` statement: ex()'s reconnect-replay of a run whose
     # COMMIT ack was lost re-applies it to the already-running row at the same
     # epoch, a no-op transition rather than a spurious "superseded".
-    "running": frozenset({"finished", "crashed", "cancelled", "queued", "running"}),
+    "running": frozenset(
+        {"finished", "crashed", "cancelled", "queued", "waiting", "running"}
+    ),
     # Terminal states are final EXCEPT for an explicit operator requeue. That
     # is the one edge that makes them "terminal for the platform" rather than
     # "immutable", and it is why retention deletes rows instead of trusting
     # that nothing will touch them again.
-    "finished": frozenset({"queued"}),
-    "crashed": frozenset({"queued"}),
-    "cancelled": frozenset({"queued"}),
+    #
+    # THE REQUEUE HAS TWO TARGETS, not one. db.build_requeue_sql returns a row
+    # that still carries a waitfor_job/waitfor_group to 'waiting', never to
+    # 'queued': `cancelled` is retryable and a parked waiter is exactly what
+    # the monitor's unsatisfiable-waiter sweep cancels, so requeueing straight
+    # into 'queued' would hand claim_jorb a job whose dependency is unmet
+    # (claim_jorb does not read the waitfor columns). The wake machinery then
+    # releases it, or the unsatisfiable sweep cancels it again.
+    "finished": frozenset({"queued", "waiting"}),
+    "crashed": frozenset({"queued", "waiting"}),
+    "cancelled": frozenset({"queued", "waiting"}),
 }
 
 

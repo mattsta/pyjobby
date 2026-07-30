@@ -2137,13 +2137,62 @@ class Job:
 
         Fenced like every other durable write: a superseded execution cannot
         delete a live one's checkpoints. Two statements in one transaction --
-        the fence (which is also what clears the ``awaited`` latch, and takes
-        the row's EXCLUSIVE lock rather than the shared one every other fence
-        takes), then the delete under a fresh snapshot. ``COMPACT_FENCE_SQL``
-        says why the pair beats the single statement it replaced.
+        the fence (which takes the row's EXCLUSIVE lock rather than the shared
+        one every other fence takes), then the delete under a fresh snapshot.
+        ``COMPACT_FENCE_SQL`` says why the pair beats the single statement it
+        replaced.
+
+        **When the position you re-derive from is a durable value this job
+        publishes, use** :meth:`commit_position` **instead**: it writes that
+        value and wipes the log in ONE transaction, which is the only way a
+        crash cannot land between the two.
         """
         if self._dxe_steps and self._dxe_seq < max(self._dxe_steps):
             return False
+        await self._dxe_compact(None)
+        return True
+
+    async def commit_position(self, key: str, value: Any) -> None:
+        """Publish ``key = value`` and discard the checkpoint log, ATOMICALLY.
+
+        :meth:`compact` plus :meth:`set_event` in one transaction, and the
+        combination is the point. A loop that re-derives its position from a
+        published value has exactly two durable facts -- the value, and the log
+        of how it got there -- and they must never be committed separately:
+
+        * publish, THEN wipe, and a crash in between leaves the NEW position
+          with the OLD log. The next attempt re-derives the new position and
+          then replays a log recorded against the old one, which mismatches at
+          the first sequence number and raises ``NondeterminismError``. The log
+          is unchanged by the failed attempt, so every retry replays it
+          identically: the job is poisoned permanently, and only a
+          checkpoint-wiping ``rerun --fresh`` recovers it. Reproduced.
+        * wipe, THEN publish, and a crash in between leaves the OLD position
+          with an EMPTY log -- the last turn's work silently un-done and about
+          to be re-done, with its side effects.
+
+        Committed together there is no third state: every crash point leaves
+        either (old position, whole log), which replays convergently, or (new
+        position, empty log), which starts clean.
+
+        THE WIPE IS UNCONDITIONAL HERE, where :meth:`compact` refuses while a
+        previous attempt's log is still being replayed. That guard exists
+        because a caller that has not caught up may still consume checkpoints
+        it has not reached; a caller that is publishing its position in this
+        very transaction has, by definition, finished with everything the log
+        holds. It also has to be unconditional: a checkpointed primitive nested
+        INSIDE a completed step (the documented ``transaction()``-in-an-action
+        pattern) consumed a sequence number that the step's fast-forward never
+        re-allocates, so the log's high-water mark is permanently out of the
+        replaying execution's reach and the guard would refuse forever.
+
+        Raises ``StaleExecutionError`` if this execution has been superseded,
+        and then neither half has been written.
+        """
+        await self._dxe_compact((key, value))
+
+    async def _dxe_compact(self, publish: tuple[str, Any] | None) -> None:
+        """The compaction transaction, shared by both call sites above."""
         async with self.s.cxn.transaction():  # type: ignore[union-attr]
             # Direct statement execution, NOT self.s.ex: ex reconnects on a
             # lost connection and RETRIES the statement on the new one, in
@@ -2152,6 +2201,12 @@ class Job:
             # possibly for a NEW attempt the monitor started during the same
             # outage. Same rule as _record_step(atomic=True): inside a
             # transaction, a connection error must abandon the attempt.
+            #
+            # THE FENCE GOES FIRST, always, and takes the row EXCLUSIVELY. The
+            # publish below fences with `FOR SHARE` on the same row, so
+            # publishing first would leave this transaction holding a share
+            # lock and reaching for the exclusive one -- the lock-upgrade
+            # deadlock dxe.COMPACT_FENCE_SQL takes the exclusive lock to avoid.
             fenced = await self.s.stmts["compact-fence"].fetch(
                 self.job["id"], self._dxe_epoch
             )
@@ -2159,6 +2214,15 @@ class Job:
                 raise dxe.StaleExecutionError(
                     f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
                 )
+            if publish is not None:
+                key, value = publish
+                published = await self.s.stmts["set-event"].fetch(
+                    self.job["id"], key, value, self._dxe_epoch
+                )
+                if not published:
+                    raise dxe.StaleExecutionError(
+                        f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
+                    )
             # No epoch filter on this one: it is unreachable except behind the
             # fence above, in this transaction, on the connection holding the
             # lock that fence took.
@@ -2168,7 +2232,6 @@ class Job:
         self._dxe_seq = 0
         if removed:
             logger.debug(f"[job {self.job['id']}] compacted {removed} checkpoints")
-        return True
 
     async def _reschedule(self, interval: datetime.timedelta) -> None:
         """Requeue this job for a future run, fenced to THIS attempt.

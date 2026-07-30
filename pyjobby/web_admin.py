@@ -1397,7 +1397,10 @@ class WebAdminServer:
             queue = request.query.get("queue")
             format_type = request.query.get("format", "json")
 
-            # jorb timestamps are naive-UTC, so compare with a naive-UTC value
+            # jorb timestamps are timestamptz, so this window bound is AWARE.
+            # A naive value here would be encoded by asyncpg in the SERVER's
+            # zone, displacing the window by the server's UTC offset -- correct
+            # on a UTC server and hours wrong on any other.
             since = datetime.now(UTC) - timedelta(hours=since_hours)
             # `state_counts` already reports deferred rows as 'scheduled'
             # rather than 'queued' -- the split is in get_metrics' GROUP BY, so

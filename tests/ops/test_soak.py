@@ -268,7 +268,18 @@ class TestSoak:
         # retention (30s); four windows of slack for sweep cadence. A broken
         # sweep exceeds this even in the default 180-second run and diverges
         # further at any longer duration.
-        stream_rows = await db_pool.fetchval("SELECT count(*) FROM jorb_stream")
+        #
+        # SCOPED TO THIS RUN'S OWN JOBS, by joining jorb on the queue. A global
+        # count over jorb_stream is a count of whatever else shares the
+        # database -- another xdist worker's tests, a leftover from an earlier
+        # run -- so it can fail for reasons that have nothing to do with the
+        # sweep, and (worse) it can PASS while this soak's own streams grow
+        # unbounded, as long as somebody else's table is small.
+        stream_rows = await db_pool.fetchval(
+            "SELECT count(*) FROM jorb_stream s "
+            " JOIN jorb j ON j.id = s.job_id WHERE j.queue = $1",
+            unique_queue,
+        )
         stream_row_bound = SOAK_RATE * 0.8 * 30 * 4
         assert stream_rows < stream_row_bound, (
             f"jorb_stream holds {stream_rows:,} rows against a "

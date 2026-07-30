@@ -109,7 +109,7 @@ from loguru import logger
 
 from . import db, migrations
 from .configloader import describe_db_target
-from .lifecycle import TERMINAL_STATES_SQL
+from .lifecycle import LIVE_STATES_SQL, TERMINAL_STATES_SQL
 
 # The monitor sizes its own pool: its sweeps run one at a time, so two
 # connections is the whole daemon's concurrency. These are NOT the operator's
@@ -128,9 +128,11 @@ MONITOR_POOL_SIZES: Final[dict[str, int]] = {"min_size": 1, "max_size": 2}
 # gate exists to prevent, so the monitor and the benchmark now read the same
 # string.
 #
-# The `TERMINAL_STATES_SQL` interpolation below is a module constant from
-# lifecycle.py, never user input; the states are inlined rather than bound
-# because ``jorb_retention_idx`` is PARTIAL on exactly this predicate. A
+# The `TERMINAL_STATES_SQL` and `LIVE_STATES_SQL` interpolations below are
+# module constants from lifecycle.py, never user input; the states are inlined
+# rather than bound because the indexes they ride -- ``jorb_retention_idx`` for
+# one, the three dependency indexes for the other -- are PARTIAL on exactly
+# these predicates. A
 # bound ``state = ANY($1)`` reads fine under the custom plan of the first few
 # executions and then silently falls off the index: asyncpg prepares its
 # statements, and once PostgreSQL switches to a GENERIC plan it can no longer
@@ -231,6 +233,31 @@ SWEEP_STUCK_CLAIMS_SQL = f"""
 """
 
 #: Terminal jobs whose retention window elapsed. ($1 retention, $2 batch)
+#:
+#: THE REFUSAL COVERS EVERY UNFINISHED DEPENDENT, not just parked ones. None of
+#: the three ways one job depends on another carries a foreign key, so nothing
+#: in the schema stops this DELETE from stranding a reader:
+#:
+#:   * ``waitfor_job`` / ``waitfor_group`` -- a waiter of a deleted upstream is
+#:     parked forever; nothing but the upstream's own terminal transition wakes
+#:     it, and the monitor's unsatisfiable sweep then cancels it.
+#:   * ``admin_data.use_result_from`` -- the reader is handed the upstream's
+#:     stored ``result`` at execution time, and a reader whose upstream is gone
+#:     raises ``LookupError`` on every attempt until its retries run out
+#:     (pj._process says why running without the input would be worse).
+#:
+#: The refusal used to test ``state = 'waiting'`` alone, which protected a
+#: dependent only while it was PARKED. A woken dependent -- queued, claimed or
+#: running -- is just as unfinished and just as dependent, and a
+#: ``use_result_from`` reader is never parked at all: it is enqueued
+#: claimable and reads its input on claim. Both were deletable the moment the
+#: upstream aged out.
+#:
+#: Every probe rides a partial index that holds only LIVE dependents
+#: (``jorb_waitfor_job_idx``, ``jorb_waitfor_group_idx``,
+#: ``jorb_use_result_from_idx``), so the widened refusal costs three index
+#: lookups per candidate rather than three scans -- and the indexes shrink as
+#: the dependents finish.
 SWEEP_EXPIRED_JOBS_SQL = f"""
     SELECT j.id
     FROM jorb j
@@ -238,11 +265,17 @@ SWEEP_EXPIRED_JOBS_SQL = f"""
       AND COALESCE(j.finished, j.updated) < now() - $1::interval
       AND NOT EXISTS (
           SELECT 1 FROM jorb w
-          WHERE w.state = 'waiting' AND w.waitfor_job = j.id
+          WHERE w.state IN ({LIVE_STATES_SQL}) AND w.waitfor_job = j.id
       )
       AND NOT EXISTS (
           SELECT 1 FROM jorb w
-          WHERE w.state = 'waiting' AND w.waitfor_group = j.run_group
+          WHERE w.state IN ({LIVE_STATES_SQL}) AND w.waitfor_group = j.run_group
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM jorb r
+          WHERE r.state IN ({LIVE_STATES_SQL})
+            AND r.admin_data ? 'use_result_from'
+            AND r.admin_data ->> 'use_result_from' = j.id::text
       )
     ORDER BY COALESCE(j.finished, j.updated)
     FOR UPDATE OF j SKIP LOCKED
@@ -668,9 +701,19 @@ SWEEP_UNSATISFIABLE_WAITERS_SQL = """
 
 #: The cancellation those rows get, with the reason written where every
 #: surface shows it. waiting -> cancelled is the lifecycle's declared edge
-#: for "this parked work is not going to happen"; crashed would be wrong
-#: because a DLQ retry re-queues the row and it would then RUN with its
-#: dependency unsatisfied.
+#: for "this parked work is not going to happen".
+#:
+#: `cancelled` rather than `crashed` for surface reasons only -- this is not a
+#: failure of the job, it is the platform declaring the work unreachable -- and
+#: NOT because one is safer to retry than the other. Both are retryable
+#: (db.RETRYABLE_STATES), and the original argument here ("crashed would be
+#: wrong because a DLQ retry re-queues the row and it would then RUN with its
+#: dependency unsatisfied") was true of `cancelled` too: it named a real hazard
+#: and then chose the state that had it. The hazard is closed where it belongs,
+#: in the requeue itself -- db.build_requeue_sql returns any row still carrying
+#: a waitfor column to 'waiting', not to 'queued' -- so a retry of one of these
+#: rows parks again and this sweep cancels it again on the next pass, which is
+#: the honest answer while the upstream is still missing.
 CANCEL_UNSATISFIABLE_WAITERS_SQL = """
     UPDATE jorb AS j
     SET state = 'cancelled',
@@ -962,10 +1005,14 @@ async def sweep_expired_jobs(
     ``finished`` is somehow NULL so a terminal row can never become immortal
     and leak.
 
-    Jobs an unfinished job is still parked on are kept regardless of age:
-    ``waitfor_job``/``waitfor_group`` carry no foreign key, so deleting the
-    upstream would strand the waiter in 'waiting' forever — nothing but the
-    upstream's own terminal transition ever wakes it.
+    Jobs that any UNFINISHED job still depends on are kept regardless of age.
+    None of the three dependency links carries a foreign key, so nothing in the
+    schema stops the delete: ``waitfor_job``/``waitfor_group`` strand a waiter
+    in 'waiting' forever (only the upstream's own terminal transition wakes
+    it), and ``admin_data.use_result_from`` leaves a reader that fails on every
+    claim because the result it was told to read is gone. "Unfinished" means
+    every live state and not merely 'waiting': a woken dependent is still
+    dependent, and a ``use_result_from`` reader is never parked at all.
 
     Every child table — jorb_step, jorb_event, jorb_stream, jorb_mailbox,
     jorb_history — follows via ON DELETE CASCADE, so deleting the job row is

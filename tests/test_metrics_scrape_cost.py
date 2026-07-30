@@ -240,7 +240,13 @@ class TestScrapeQueryPlans:
         # touches the heap at all.
         assert "Index Only Scan using jorb_claim_idx" in plan, plan
         assert "jorb_inflight_idx" in plan, plan
-        assert "jorb_waitfor" in plan, plan
+        # The parked arm rides an index that is ABOUT parked work. It used to
+        # ride one of the two waitfor indexes -- an accident of their partial
+        # predicate being `state = 'waiting'` and nothing else, which stopped
+        # being true the moment those indexes said what they are for
+        # (dependencies, in every live state). jorb_waiting_idx leads with
+        # `queue`, so this arm is index-only too.
+        assert "Index Only Scan using jorb_waiting_idx" in plan, plan
 
     async def test_terminal_gauge_rides_the_retention_index(self, db_pool):
         """The terminal states are the unbounded ones, so they are only ever

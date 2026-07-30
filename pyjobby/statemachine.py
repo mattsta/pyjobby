@@ -20,7 +20,10 @@ What you get that an in-process FSM library cannot give you:
   on, so the log is written by the same mechanism that makes the action
   exactly-once and no code path can forget to append to it (read it back with
   ``MachineHandle.history()`` / ``JobClient.get_steps``, bounded to the
-  current turn by ``compact()``);
+  current turn by the turn boundary);
+* a turn is ATOMIC: the state the machine moves to and the log of how it got
+  there are one commit (``Job.commit_position``), so no crash can leave a
+  position the log does not explain -- see ``StateMachineJob.task``;
 * a machine can wait six months for an event without holding a process, a
   connection, or a thread.
 
@@ -153,8 +156,9 @@ class StateMachineJob(Job):
         if cls.edges and not cls.final:
             logger.warning(
                 f"{cls.__name__} declares no final states: it will run until "
-                f"cancelled. That is legal — see StateMachineJob.compact() for "
-                f"why its replay cost stays bounded — but it is usually a typo."
+                f"cancelled. That is legal — see StateMachineJob._turn_boundary "
+                f"for why its replay cost stays bounded — but it is usually a "
+                f"typo."
             )
 
     # ------------------------------------------------------------------
@@ -215,28 +219,57 @@ class StateMachineJob(Job):
 
         The loop is ordinary Python; every durable thing in it is a DXE
         primitive doing what it already did for every other job.
+
+        **THE TURN IS THE UNIT OF DURABILITY, and it ends with ONE COMMIT.**
+        A machine holds two durable facts: where it is (the published state
+        event) and how it got there (the checkpoint log). Its position is
+        re-derived from the first at entry, and the second is replayed forward
+        from that position -- so the two are only meaningful together, and a
+        crash that lands between writing one and writing the other leaves a
+        pair that describes no reachable machine. ``commit_position`` writes
+        both in one transaction, which is what removes that window entirely;
+        ``_turn_boundary`` below is the only place either one is written after
+        the first publish.
+
+        Every crash point in a turn therefore leaves one of exactly two
+        states, and both converge:
+
+        * **before the boundary commits** -- old state, whole log. The next
+          attempt re-derives the SAME state, replays the recv (which returns
+          the message the mailbox has already consumed and checkpointed), takes
+          the SAME edge out of the SAME state, fast-forwards the action's
+          recorded checkpoint rather than repeating its effect, and arrives at
+          the boundary again. If the crash landed inside the action, the action
+          re-runs -- and any ``transaction()``/``send()`` it completed
+          fast-forwards on its own checkpoint, so effects are not repeated.
+        * **after the boundary commits** -- new state, empty log. The next
+          attempt re-derives the new state and starts a fresh turn at sequence
+          1, owing nothing.
+
+        There is no third state to recover from, which is the whole design: the
+        old shape published the new state and then wiped the log at the top of
+        the NEXT iteration, so a crash in between left the new state with the
+        old turn's log -- and the replayed recv fed the previous turn's event
+        to a state that has no edge for it, raising ``NondeterminismError``
+        deterministically, on that attempt and on every retry of it forever.
         """
         state = await self.current_state()
+        # The entry publish, and it is NOT a boundary: on a resume it rewrites
+        # the value already there, and the log it must not touch is the partial
+        # turn this attempt is about to replay.
         await self._publish(state)
         turns = 0
 
         while state not in self.final:
-            # Bounds replay. Once this attempt owes nothing to a previous
-            # one, the log so far is dead weight -- the machine re-derives
-            # its position from the state event above, not by replaying --
-            # so it goes, and the step sequence starts at 1 again. Without
-            # this an idle machine accumulates two checkpoints per wake
-            # forever, at ~0.9us and 260 bytes each on EVERY subsequent
-            # wake (pj-bench replay). With it, the log never exceeds one
-            # turn.
-            await self.compact()
-
             payload = await self.recv(topic=self.topic, timeout=self.wait_seconds)
             if payload is None:
                 # No worker is held across this. The job checkpoints a wake
                 # time, requeues itself, and unwinds; the next claim resumes
-                # here with the sleep already satisfied.
+                # here with the sleep already satisfied and this call RETURNS
+                # instead of raising -- which is the one moment an idle machine
+                # has caught up with its whole log and can shed it.
                 await self.sleep(self.idle_seconds)
+                await self._turn_boundary(state)
                 continue
 
             turns += 1
@@ -248,6 +281,10 @@ class StateMachineJob(Job):
             edge = self.edges.get(state, {}).get(event)
             if edge is None:
                 await self.on_unhandled(state, event, payload)
+                # The event is consumed and dropped, so the machine is exactly
+                # where it was -- and the recv that consumed it is the whole of
+                # the log, which makes this a boundary like any other.
+                await self._turn_boundary(state)
                 continue
 
             if edge.action is not None:
@@ -263,10 +300,40 @@ class StateMachineJob(Job):
                 )
 
             source, state = state, edge.target
-            await self._publish(state)
+            # THE turn boundary: the new state and the empty log commit
+            # together. Nothing between the recv above and this line is
+            # durable on its own.
+            await self._turn_boundary(state)
             await self.on_transition(source, event, state)
 
         return {"final_state": state, "turns": turns}
+
+    async def _turn_boundary(self, state: str) -> None:
+        """Commit ``state`` as this machine's position and shed the log.
+
+        Bounds replay, which is what the compaction is for: replay costs about
+        0.9 us and 260 bytes per recorded checkpoint (``pj-bench replay``), and
+        an idle machine records two per wake -- a recv that timed out and a
+        durable sleep -- forever. Wiping at every boundary keeps the log to one
+        turn whatever the machine's lifetime.
+
+        And it is where the state is published, because the wipe and the
+        publish have to be the same commit. ``Job.commit_position`` is that
+        commit; :meth:`task` states the convergence argument for each crash
+        point around it.
+
+        A FINAL state is the exception, and publishes without wiping. Both
+        halves of the argument fall away at once: nothing ever replays from a
+        final state (:meth:`task`'s loop is not entered), so the atomicity
+        buys nothing, and the log will never grow again, so the bound buys
+        nothing either. What the wipe would cost is real -- the last turn's
+        steps are the only trace a completed machine leaves of how it ended,
+        and ``MachineHandle.history()`` is where an operator reads it.
+        """
+        if state in self.final:
+            await self._publish(state)
+            return
+        await self.commit_position(self.state_key, {"state": state})
 
     def _action(self, name: str) -> Callable[..., Awaitable[Any]]:
         """The bound method for a declared action name.
@@ -282,5 +349,10 @@ class StateMachineJob(Job):
         Idempotent (an upsert on ``(job_id, key)``), which is what lets it sit
         outside the checkpoint log: re-running it on replay writes the value
         that is already there.
+
+        The ENTRY publish only. Every later one goes through
+        :meth:`_turn_boundary`, which writes it in the same transaction as the
+        log wipe -- and this one does not need to, because it writes the value
+        it just read.
         """
         await self.set_event(self.state_key, {"state": state})

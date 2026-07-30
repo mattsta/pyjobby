@@ -68,8 +68,24 @@ _SET_LIST = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-#: `state = 'x'` anywhere in a SET list — what a statement moves a job TO.
-_WRITES_STATE = re.compile(r"\bstate\s*=\s*'(\w+)'", re.IGNORECASE)
+#: The right-hand side of a `state = ...` assignment in a SET list: either one
+#: quoted label, or a whole CASE expression.
+#:
+#: The CASE alternative is not hypothetical robustness. ``db.build_requeue_sql``
+#: writes ``state = CASE WHEN waitfor_job IS NOT NULL ... THEN 'waiting' ELSE
+#: 'queued' END`` -- a requeue has TWO possible targets, because a row that
+#: still carries a dependency must not come back claimable. A pattern that only
+#: understood a literal would have read that statement as writing no state at
+#: all and dropped it out of the inventory, which is the same silent-shrinkage
+#: failure ``_SET_LIST`` documents.
+_WRITES_STATE = re.compile(
+    r"\bstate\s*=\s*(CASE\b.*?\bEND\b|'\w+')", re.IGNORECASE | re.DOTALL
+)
+
+#: The labels a CASE can actually land on: the ones a THEN or an ELSE names.
+#: Anchored on those keywords so a literal used in a CASE's *condition*
+#: (``WHEN state = 'queued' THEN ...``) is not mistaken for a target.
+_CASE_RESULTS = re.compile(r"\b(?:THEN|ELSE)\s+'(\w+)'", re.IGNORECASE)
 
 #: `AND state = 'x'` or `AND state IN ('x', 'y')` — what it moves a job FROM.
 _GUARDS_STATE = re.compile(
@@ -77,17 +93,27 @@ _GUARDS_STATE = re.compile(
 )
 
 
-def transition_in(sql: str) -> tuple[frozenset[str], str] | None:
-    """The (sources, target) one statement implies, or None if it writes no
+def transition_in(sql: str) -> tuple[frozenset[str], frozenset[str]] | None:
+    """The (sources, targets) one statement implies, or None if it writes no
     state. A function so the extractor itself can be fed a synthetic
-    statement and checked, rather than only ever being pointed at STMTS."""
-    target = None
+    statement and checked, rather than only ever being pointed at STMTS.
+
+    ``targets`` is a SET because a target can be conditional: a requeue lands
+    a dependent row in 'waiting' and everything else in 'queued', and both
+    edges have to be checked against the declaration.
+    """
+    written = None
     for set_list in _SET_LIST.finditer(sql):
-        target = _WRITES_STATE.search(set_list.group(1))
-        if target is not None:
+        written = _WRITES_STATE.search(set_list.group(1))
+        if written is not None:
             break
-    if target is None:
+    if written is None:
         return None
+    expression = written.group(1)
+    if expression.startswith("'"):
+        targets = frozenset({expression.strip("'")})
+    else:
+        targets = frozenset(_CASE_RESULTS.findall(expression))
     guard = _GUARDS_STATE.search(sql)
     if guard is None:
         sources: frozenset[str] = frozenset()
@@ -97,17 +123,17 @@ def transition_in(sql: str) -> tuple[frozenset[str], str] | None:
         sources = frozenset(
             part.strip().strip("'") for part in guard.group(2).split(",")
         )
-    return sources, target.group(1)
+    return sources, targets
 
 
-def statement_transitions() -> dict[str, tuple[frozenset[str], str]]:
-    """Every state change ``STMTS`` can perform: {name: (sources, target)}.
+def statement_transitions() -> dict[str, tuple[frozenset[str], frozenset[str]]]:
+    """Every state change ``STMTS`` can perform: {name: (sources, targets)}.
 
     Read out of the SQL text rather than maintained by hand, because a list
     maintained by hand is precisely the thing this is checking for. A new
     statement is picked up by existing, not by anyone remembering to add it.
     """
-    found: dict[str, tuple[frozenset[str], str]] = {}
+    found: dict[str, tuple[frozenset[str], frozenset[str]]] = {}
     for name, sql in STMTS.items():
         transition = transition_in(sql)
         if transition is not None:
@@ -120,8 +146,11 @@ def test_the_extractor_finds_the_statements_that_change_state():
     every test below vacuously pass."""
     found = statement_transitions()
     assert {"run", "finished", "retry", "crashed", "cancelled"} <= set(found)
-    assert found["run"] == (frozenset({"claimed", "running"}), "running")
-    assert found["finished"] == (frozenset({"claimed", "running"}), "finished")
+    assert found["run"] == (frozenset({"claimed", "running"}), frozenset({"running"}))
+    assert found["finished"] == (
+        frozenset({"claimed", "running"}),
+        frozenset({"finished"}),
+    )
 
 
 def test_the_extractor_sees_a_state_written_anywhere_in_the_set_list():
@@ -137,13 +166,36 @@ def test_the_extractor_sees_a_state_written_anywhere_in_the_set_list():
     assert transition_in(
         "UPDATE jorb SET updated = now(), state = 'queued' "
         "WHERE id = $1 AND state IN ('crashed', 'cancelled') RETURNING id"
-    ) == (frozenset({"crashed", "cancelled"}), "queued")
+    ) == (frozenset({"crashed", "cancelled"}), frozenset({"queued"}))
 
     # ...and the guard against the opposite failure: a WHERE-clause state test
     # is not a state WRITE, so a pure read must still extract nothing.
     assert transition_in("SELECT id FROM jorb WHERE state = 'queued'") is None
     assert (
         transition_in("UPDATE jorb SET awaited = FALSE WHERE state = 'running'") is None
+    )
+
+
+def test_the_extractor_sees_every_branch_of_a_conditional_target():
+    """A statement whose target depends on the row writes MORE than one edge.
+
+    ``db.build_requeue_sql`` is the real one: a requeued row that still carries
+    a waitfor column goes back to 'waiting', everything else to 'queued'. Read
+    as a single literal, the whole statement would vanish from the inventory;
+    read as one target, half its edges would go unchecked.
+    """
+    sources, targets = transition_in(
+        "UPDATE jorb SET state = CASE WHEN waitfor_job IS NOT NULL "
+        "THEN 'waiting' ELSE 'queued' END, updated = now() "
+        "WHERE id = $1 AND state IN ('crashed', 'cancelled') RETURNING id"
+    )
+    assert sources == frozenset({"crashed", "cancelled"})
+    assert targets == frozenset({"waiting", "queued"})
+
+    # and the shipped statement itself, so a rewrite that loses a branch fails
+    assert transition_in(build_requeue_sql(("crashed", "cancelled"))) == (
+        frozenset({"crashed", "cancelled"}),
+        frozenset({"waiting", "queued"}),
     )
 
 
@@ -156,15 +208,24 @@ def test_no_statement_realises_an_undeclared_transition(statement):
     permits, so a new statement with a wrong or missing guard fails here rather
     than months later as a surprising row in ``jorb_history``.
     """
-    sources, target = statement_transitions()[statement]
+    sources, targets = statement_transitions()[statement]
     assert sources, (
-        f"STMTS[{statement!r}] writes state = {target!r} with no "
+        f"STMTS[{statement!r}] writes state = {sorted(targets)!r} with no "
         f"`AND state IN (...)` guard: it can move a job there from ANY state, "
         f"including a terminal one"
     )
-    illegal = sorted(source for source in sources if not is_legal(source, target))
+    assert targets, (
+        f"STMTS[{statement!r}] was parsed as writing state with no target at "
+        f"all; the extractor has lost a branch"
+    )
+    illegal = sorted(
+        (source, target)
+        for source in sources
+        for target in targets
+        if not is_legal(source, target)
+    )
     assert not illegal, (
-        f"STMTS[{statement!r}] moves {illegal} -> {target!r}, which "
+        f"STMTS[{statement!r}] realises {illegal}, which "
         f"pyjobby.lifecycle.LEGAL_TRANSITIONS does not permit"
     )
 
@@ -184,8 +245,8 @@ def test_every_statement_leaving_an_attempt_bumps_the_fence():
     attempt_states = {"claimed", "running"}
     leaving = {
         name
-        for name, (sources, target) in statement_transitions().items()
-        if sources <= attempt_states and target not in attempt_states
+        for name, (sources, targets) in statement_transitions().items()
+        if sources <= attempt_states and not (targets <= attempt_states)
     }
     assert {"finished", "retry", "crashed", "cancelled", "reschedule"} <= leaving
     for name in leaving:
@@ -223,8 +284,8 @@ def _statements_that_return_a_job_to_queued() -> tuple[dict[str, str], dict[str,
     """
     requeues: dict[str, str] = {}
     wakes: dict[str, str] = {}
-    for name, (sources, target) in statement_transitions().items():
-        if target != "queued":
+    for name, (sources, targets) in statement_transitions().items():
+        if "queued" not in targets:
             continue
         bucket = wakes if sources <= {"waiting"} else requeues
         bucket[f"pj.STMTS[{name}]"] = STMTS[name]
@@ -317,17 +378,23 @@ def test_every_declared_state_is_reachable_and_leaves_somewhere():
         )
 
 
-def test_terminal_states_lead_only_back_to_queued():
+def test_terminal_states_lead_only_back_into_the_queue():
     """What "terminal" means here, stated as a property.
 
     A terminal job is done for the platform, not immutable: an operator may
-    requeue it, and that single edge is why retention DELETES rows rather than
+    requeue it, and that single VERB is why retention DELETES rows rather than
     trusting that nothing will touch them again.
+
+    The verb has two landing states, not one, and both belong to it: a row that
+    still carries a waitfor column comes back PARKED ('waiting'), everything
+    else comes back claimable ('queued'). Nothing else may leave a terminal
+    state — in particular no terminal state leads to another terminal state,
+    or to 'claimed'/'running' without passing back through the queue.
     """
     for state in TERMINAL_STATES:
-        assert LEGAL_TRANSITIONS[state] == frozenset({"queued"}), (
+        assert LEGAL_TRANSITIONS[state] == frozenset({"queued", "waiting"}), (
             f"{state!r} leads to {sorted(LEGAL_TRANSITIONS[state])}; a terminal "
-            f"state's only edge is the operator requeue"
+            f"state's only edges are the operator requeue's two landing states"
         )
 
 

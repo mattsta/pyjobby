@@ -420,9 +420,16 @@ of them were leaking an _answer_, not just rows:
 
 That last point is the general rule: **every retention sweep refuses to
 delete a row something live still needs**, and the refusal is the half worth
-knowing. Job retention already keeps a terminal job that a `waiting` job
-depends on; these keep a populated DAG, a schedule's last execution, and a
-worker with jobs in flight.
+knowing. Job retention keeps a terminal job that any **unfinished** job still
+depends on — through `waitfor_job`, through `waitfor_group`, or through
+`use_result_from` — whether that dependent is still parked in `waiting` or has
+already been woken and is sitting in the queue. None of the three carries a
+foreign key, so the refusal is the only thing standing between a long window
+and a job that can never run: a waiter whose upstream is gone parks forever
+(and is then cancelled by the monitor), and a `use_result_from` reader fails
+on every attempt because the result it was told to read no longer exists.
+These others keep a populated DAG, a schedule's last execution, and a worker
+with jobs in flight.
 
 One thing the job window deletes is not a row but a **promise**: reaping a
 terminal job frees its `identity_key`, so the retention horizon _is_ the

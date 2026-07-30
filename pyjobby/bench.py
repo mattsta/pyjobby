@@ -257,14 +257,24 @@ BENCH_JOB_CLASS = "pyjobby.bench.BenchJob"
 #: manifest the doctor and the schema-shape check read -- at import, so a
 #: trigger renamed in the schema breaks `pj-bench` on the spot instead of
 #: producing a variant that silently disables nothing.
+#:
+#: A ``RuntimeError`` and not an ``assert``: `python -O` strips assertions, so
+#: the one check standing between a renamed trigger and a benchmark that
+#: reports a "notifications off" number with the notifications still on would
+#: vanish exactly where a released build runs it.
 TRIGGER_HISTORY = "jorb_history_record"
 TRIGGER_ENQUEUED = "jorb_enqueued_notify"
 TRIGGER_DONE = "jorb_done_notify"
 TRIGGER_CANCEL = "jorb_cancel_notify"
 
-assert {TRIGGER_HISTORY, TRIGGER_ENQUEUED, TRIGGER_DONE, TRIGGER_CANCEL} <= set(
+_DRIFTED = {TRIGGER_HISTORY, TRIGGER_ENQUEUED, TRIGGER_DONE, TRIGGER_CANCEL} - set(
     migrations.REQUIRED_TRIGGERS
-), "bench trigger names have drifted from migrations.REQUIRED_TRIGGERS"
+)
+if _DRIFTED:
+    raise RuntimeError(
+        f"bench trigger names have drifted from "
+        f"migrations.REQUIRED_TRIGGERS: {sorted(_DRIFTED)}"
+    )
 
 #: Every trigger on ``jorb`` that issues a NOTIFY. Disabling all of them is
 #: the upper bound for enqueue: the cost of the commit lock is paid once per
@@ -2495,15 +2505,29 @@ def summarize_plan(document: dict[str, Any], query: HotQuery) -> dict[str, Any]:
         # against that number is comparing against a two-hundredth of the
         # work actually done.
         loops = max(int(node.get("Actual Loops", 1)), 1)
+        # ALL THREE DISCARD COUNTERS, not just the filter. EXPLAIN reports
+        # "read it and threw it away" under a different key depending on the
+        # node: a bitmap heap scan that had to re-check the index condition
+        # against the heap reports "Rows Removed by Index Recheck", and a join
+        # node reports "Rows Removed by Join Filter". A budget that counted
+        # only the first key is satisfied by a plan that discards the whole
+        # table under either of the other two -- which is the failure this
+        # number exists to catch, arriving under a name it was not looking at.
+        discarded = sum(
+            int(node.get(key, 0))
+            for key in (
+                "Rows Removed by Filter",
+                "Rows Removed by Index Recheck",
+                "Rows Removed by Join Filter",
+            )
+        )
         scans.append(
             {
                 "node": node_type,
                 "relation": relation,
                 "index": node.get("Index Name"),
                 "loops": loops,
-                "rows_removed_by_filter": (
-                    int(node.get("Rows Removed by Filter", 0)) * loops
-                ),
+                "rows_removed_by_filter": discarded * loops,
                 "actual_rows": int(node.get("Actual Rows", 0)) * loops,
             }
         )

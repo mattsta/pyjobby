@@ -837,24 +837,59 @@ call site: call it every time round, and it takes effect on the first pass that
 owes nothing to a previous attempt.
 
 Fenced, so a superseded execution cannot delete a live one's checkpoints —
-but it is the one durable write in the engine whose fence takes the job row's
-**exclusive** lock rather than the shared one every other fence takes.
-Compaction also has to write the row (it clears the `awaited` notification
-latch, which a job that never terminates would otherwise hold forever), and
-two concurrent compactions each holding a share lock and then reaching for
-the exclusive one is a lock-upgrade deadlock. Taking it exclusively up front
-costs nothing a share lock was buying: compaction happens at a turn boundary,
-not on the hot path.
+but it is the one fence in the engine that takes the job row's **exclusive**
+lock rather than the shared one every other fence takes: two concurrent
+compactions each holding a share lock and then reaching for the exclusive one
+is a lock-upgrade deadlock. Taking it exclusively up front costs nothing a
+share lock was buying, because compaction happens at a turn boundary and not
+on the hot path.
+
+The fence **writes nothing** — a locking `SELECT` holds the row to `COMMIT`
+exactly as an `UPDATE` would. It used to clear `jorb.awaited` on the way past,
+to stop a machine that never terminates holding a demand latch forever; that
+latch gates `jorb_done`, `jorb_event` and `jorb_stream` alike, so lowering it
+downgraded three channels at once for whoever was watching the job — and the
+job a dashboard watches is exactly the long-lived one that compacts.
 
 It is also **two statements in one transaction**, for the same reason a fresh
-`rerun`'s wipe is (see [above](#resuming-an-interrupted-job)): the fence — an
-`UPDATE` on the job row, which both clears the latch and IS the lock — and
-then the `DELETE`, under a snapshot taken after the lock was granted. Written
+`rerun`'s wipe is (see [above](#resuming-an-interrupted-job)): the fence, which
+takes the lock, and then the `DELETE`, under a snapshot taken after the lock
+was granted. Written
 as one statement, the `DELETE` ran against the snapshot the statement began
 with, which is before it waited out any durable write in flight; a checkpoint
 that writer committed during the wait survived the compaction, at a sequence
 the restarted log was about to reuse. The next `step()` at that sequence would
 then replay the previous turn's output instead of running.
+
+### Publishing where you are, and forgetting how you got there
+
+```python
+await self.commit_position("my.position", {"stage": "packing"})
+```
+
+`compact()` is only safe where your loop can re-derive its position from
+durable state it wrote itself — and when that state is an event this job
+publishes, the publish and the wipe **must be one commit**. `commit_position()`
+is that commit: a `set_event` and the compaction, inside the same fenced
+transaction.
+
+Separately, they leave a pair no resume can make sense of. Publish and then
+wipe, and a crash in between leaves the NEW position with the OLD log: the next
+attempt re-derives the new position and replays a log recorded against the old
+one, which mismatches at the first sequence number and raises
+`NondeterminismError` — and since the failed attempt changed nothing, every
+retry replays exactly the same log and raises exactly the same error. Wipe and
+then publish, and a crash in between silently un-does the last stretch of work
+and re-does it, side effects included.
+
+The wipe is **unconditional** here, where `compact()` refuses while a previous
+attempt's log is still being replayed. A caller publishing its position in this
+very transaction has finished with everything the log holds — and it has to be
+unconditional anyway, because a checkpointed primitive nested inside a
+completed step (a `transaction()` inside a `step()`, which is how `send()`
+composes) consumed a sequence number that the step's fast-forward never
+re-allocates. That leaves the log's high-water mark permanently out of the
+replaying execution's reach, and `compact()`'s guard would refuse forever.
 
 [`StateMachineJob`](../pyjobby/statemachine.py) does all of this for you; see
 [STATECHARTS.md](STATECHARTS.md).

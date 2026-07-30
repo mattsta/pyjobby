@@ -452,6 +452,46 @@ class TestBroadcastEventNoClients:
         # Messages sent should still be 0
         assert server.stats["messages_sent"] == 0
 
+    @pytest.mark.asyncio
+    async def test_a_subscriber_leaving_mid_fanout_does_not_drop_the_rest(
+        self, db_params
+    ):
+        """The fan-out has an `await` in it, so the subscriber set can change
+        under the loop -- a client disconnecting is the ordinary way.
+
+        Iterating the live set raised RuntimeError partway through, which
+        abandoned the broadcast: every subscriber after the mutation lost an
+        event the ones before it received, and a job watch has no polling
+        fallback to learn it another way. The loop iterates a snapshot.
+        """
+        server = WebSocketServer(db_params)
+        channel = "jobs"
+        delivered: list[object] = []
+
+        class FakeSocket:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            async def send_json(self, event: dict) -> None:
+                delivered.append(self.name)
+                # the client hangs up as soon as it has the event, which is
+                # `detach` removing it from the live subscriber set -- and
+                # whichever socket the set happens to yield first, the removal
+                # lands before the loop has finished with it
+                server.subscriptions[channel].discard(self)
+
+        sockets = [FakeSocket("a"), FakeSocket("b"), FakeSocket("c")]
+        server.subscriptions[channel] = set(sockets)
+        for ws in sockets:
+            server.clients[ws] = {"channels": {channel}}
+
+        await server.broadcast_event(channel, {"event": "probe", "data": {}})
+
+        assert sorted(delivered) == ["a", "b", "c"], (
+            f"the fan-out stopped when a subscriber left mid-broadcast: only "
+            f"{sorted(delivered)} were delivered"
+        )
+
 
 class TestSendError:
     """Test send_error method - covers lines 530-538."""

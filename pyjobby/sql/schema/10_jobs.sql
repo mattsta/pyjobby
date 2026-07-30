@@ -186,9 +186,64 @@ CREATE INDEX jorb_finished_retention_idx ON jorb (COALESCE(finished, updated))
 CREATE INDEX jorb_created_idx ON jorb (created);
 CREATE INDEX jorb_timeout_idx ON jorb (timeout_at)
     WHERE state = 'running' AND timeout_at IS NOT NULL;
--- dependency wakeups
-CREATE INDEX jorb_waitfor_job_idx   ON jorb (waitfor_job)   WHERE state = 'waiting';
-CREATE INDEX jorb_waitfor_group_idx ON jorb (waitfor_group) WHERE state = 'waiting';
+-- dependency wakeups -- AND the retention refusal, which is why the predicate
+-- is every LIVE state and not just 'waiting'.
+--
+-- The wakes only ever look at waiting rows, so 'waiting' alone would serve
+-- them. The retention sweep asks the other question: "is any UNFINISHED job
+-- still pointing at this one?", and a dependent that has already been woken
+-- (queued, claimed, running) is just as unfinished as one still parked -- a
+-- job reading `upstream_result` from a row retention deleted while it sat in
+-- the queue fails on claim with a LookupError it can never retry past. One
+-- index serves both questions: `state = 'waiting'` implies this predicate, so
+-- the wakes still ride it.
+--
+-- `IS NOT NULL` IS LOAD-BEARING, not tidiness. A btree indexes NULLs, and
+-- almost no job declares a dependency -- so without it, widening the state set
+-- from 'waiting' to every live state puts an entry for EVERY queued, claimed
+-- and running row in the system into an index about dependencies. That is
+-- write amplification on the hottest table (the argument the run_group and uid
+-- indexes below make), and it is also read amplification: the arms of
+-- db.QUEUE_STATS_SQL are matched to partial indexes, and a dependency index
+-- holding every live row is one the planner will happily pick for "count the
+-- waiting jobs" and then discard the whole live table through.
+--
+-- Bounded by LIVE dependencies twice over, then: a terminal row leaves the
+-- index and a job with no dependency never enters it.
+CREATE INDEX jorb_waitfor_job_idx   ON jorb (waitfor_job)
+    WHERE waitfor_job IS NOT NULL
+      AND state IN ('queued', 'claimed', 'running', 'waiting');
+CREATE INDEX jorb_waitfor_group_idx ON jorb (waitfor_group)
+    WHERE waitfor_group IS NOT NULL
+      AND state IN ('queued', 'claimed', 'running', 'waiting');
+-- "how many jobs are parked on this queue?" -- one arm of db.QUEUE_STATS_SQL,
+-- which every dashboard timer and `pj-admin queues stats` runs.
+--
+-- It used to be answered by whichever of the two indexes above the planner
+-- picked, because their predicate was `state = 'waiting'` and nothing else --
+-- an accident of their shape rather than a decision, and one that broke the
+-- moment those indexes started saying what they are actually about. This is
+-- the arm's own index: the queue it groups by, over the parked rows it counts,
+-- and nothing else. Tiny, because parked work is bounded by the dependencies
+-- in flight -- and untouched by an ordinary enqueue, which is never 'waiting'.
+CREATE INDEX jorb_waiting_idx ON jorb (queue) WHERE state = 'waiting';
+-- The THIRD way one job depends on another, and the one with no column of its
+-- own: `use_result_from` is carried in admin_data, and the worker reads the
+-- upstream's stored `result` at execution time (pj.STMTS['get-result']).
+-- Deleting that upstream is exactly as destructive as deleting a waitfor
+-- target -- more so, because the reader is not parked where an operator can
+-- see it waiting; it is queued, and it fails on claim.
+--
+-- Compared as TEXT, and indexed as text, deliberately: admin_data is a JSONB
+-- document, so a `::bigint` cast in the index expression would make a single
+-- malformed value an INSERT failure on the hottest table in the system. The
+-- writer always stores an integer, so `->>` and `id::text` agree.
+--
+-- Doubly partial (the key is present, and the row is live), so an ordinary
+-- enqueue -- which has no admin_data key at all -- writes nothing here.
+CREATE INDEX jorb_use_result_from_idx ON jorb ((admin_data ->> 'use_result_from'))
+    WHERE admin_data ? 'use_result_from'
+      AND state IN ('queued', 'claimed', 'running', 'waiting');
 -- Partial like their neighbours, and for the same reason: run_group and uid
 -- are NULL on the overwhelming majority of jobs (only grouped work and
 -- multi-tenant callers set them), but a plain btree indexes NULLs too. That

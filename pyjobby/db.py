@@ -245,6 +245,31 @@ def build_requeue_sql(
     append nothing, so the rows the first attempt wrote are the only copy there
     will ever be).
 
+    A JOB WITH AN UNMET DEPENDENCY GOES BACK TO 'waiting', NOT TO 'queued'.
+    ``cancelled`` and ``crashed`` are both retryable, and a row parked in
+    'waiting' can reach either -- an operator cancels it, or the monitor's
+    unsatisfiable-waiter sweep does (monitor.CANCEL_UNSATISFIABLE_WAITERS_SQL).
+    Requeueing such a row straight into 'queued' hands it to ``claim_jorb``,
+    which never reads the waitfor columns: the job then RUNS while its upstream
+    is still running, or while its upstream does not exist at all. Reproduced.
+    So the target state is a CASE: a row that still carries a ``waitfor_job``
+    or a ``waitfor_group`` re-enters 'waiting' and is released by the SAME
+    machinery that released it the first time -- the worker's edge-triggered
+    wake (``STMTS['enqueue-next-self-finished']`` /
+    ``['enqueue-next-if-peer-group-is-finished']``) when the upstream
+    finishes, or the monitor's level-triggered
+    ``sweep_stranded_waiters`` when the edge has already fired -- and
+    re-cancelled by the unsatisfiable sweep when the upstream is gone for
+    good.
+
+    The waitfor columns are NOT consulted for whether the dependency is
+    already SATISFIED, deliberately. A retried waiter whose upstream finished
+    long ago parks for at most one monitor cycle (10s by default) before the
+    level sweep queues it, and paying that costs one correlated subquery per
+    requeued row instead of a column read. The alternative -- deciding
+    satisfaction here -- would put a second copy of the wake predicate in a
+    statement that is not the wake, and the two would drift.
+
     THE DEDUPE KEYS ARE CLEARED, always. A deadline_key and a debounce_key are
     held by a QUEUED row and their collapse duty is over the first time the row
     leaves 'queued' (jorb_deadline_idx and jorb_debounce_idx say so with their
@@ -262,7 +287,11 @@ def build_requeue_sql(
     states = ", ".join(f"'{s}'" for s in allowed_states)
     target = "id = ANY($1::bigint[])" if many else "id = $1::bigint"
     requeue = f"""UPDATE jorb
-            SET state = 'queued',
+            SET state = CASE
+                    WHEN waitfor_job IS NOT NULL OR waitfor_group IS NOT NULL
+                    THEN 'waiting'::jorbstate
+                    ELSE 'queued'::jorbstate
+                END,
                 run_epoch = run_epoch + 1,
                 run_after = now() + $2::interval,
                 error_count = CASE WHEN $3 THEN 0 ELSE error_count END,

@@ -358,24 +358,10 @@ STREAM_APPEND_SQL = """WITH locked AS MATERIALIZED (
 # requeue's DELETEs carry none: it is unreachable except behind statement 1's
 # match, on a connection that holds the lock.
 #
-# THE FENCE IS AN UPDATE, which is what makes it the lock (`FOR UPDATE` would
-# do as much, and this has to write anyway). It drops the `awaited`
-# notification latch: that latch's design ("set once, dies with the row")
-# assumes rows die, and a compacting job is exactly the one that never does, so
-# one wait_for_state ever would make every future publish a NOTIFY-bearing
-# commit forever. Clearing it at the turn boundary bounds that the same way
-# compaction bounds replay. A wait that is IN FLIGHT across the clearing is
-# degraded, not broken: its 2-second fallback poll still answers, and every NEW
-# wait registers demand afresh before its first check. (Deliberately no
-# waiter-side re-arm: that would be a write to the hottest row per fallback
-# beat -- the polling the demand-gated design exists to avoid.)
-#
-# Written without an `AND awaited` guard, so the UPDATE matches whenever the
-# epoch does: the row it returns IS the fence answer, and a guard that skipped
-# the write on an unlatched job would report a live execution as superseded.
-# The cost is one row version per compaction, at a turn boundary rather than on
-# the hot path, and it wakes no trigger -- every trigger on jorb is `UPDATE OF
-# state` or `UPDATE OF cancel_requested`.
+# THE FENCE IS A PURE LOCK, and writes nothing. What this statement owes the
+# transaction is the row's exclusive lock plus the epoch answer, and a locking
+# SELECT delivers both: the lock is held to COMMIT exactly as an UPDATE's would
+# be, and the row it returns (or does not) IS the fence answer.
 #
 # THE EXCLUSIVE LOCK is deliberate where every other fence here takes `FOR
 # SHARE`: two concurrent compactions holding a share lock each and then both
@@ -383,11 +369,33 @@ STREAM_APPEND_SQL = """WITH locked AS MATERIALIZED (
 # nothing a share lock was buying, and it serializes only against the writers
 # that would take the row exclusively anyway.
 #
+# `awaited` IS DELIBERATELY PRESERVED, and this statement used to clear it. The
+# argument for clearing was real: the latch's design ("set once, dies with the
+# row", sql/schema/10_jobs.sql) assumes rows die, and a compacting job is
+# exactly the one that never does -- so one wait ever made every future publish
+# of an immortal machine a NOTIFY-bearing commit, forever. The argument against
+# is the stronger one. `awaited` is the demand gate for THREE channels
+# (jorb_done, jorb_event, jorb_stream, sql/schema/90_notify.sql), and lowering
+# it silently converts every one of them from "delivered" to "delivered only if
+# the consumer polls". Consumers that poll degrade; a consumer that does not
+# learns nothing at all. Making the one statement in the platform that lowers a
+# latch nobody else ever lowers into the exception every reader of the column
+# has to remember is not worth a notification bill that is paid at MACHINE
+# TRANSITION rate on a job somebody explicitly asked to watch -- and the schema's
+# own cost argument is per COMMIT, while a machine's turn boundary is one commit
+# it was making anyway (see StateMachineJob.task).
+#
+# The websocket server's snapshot-beat re-arm (`_rearm_job_watches`) stays where
+# it is. It was added for this clearing, but it earns its keep against every
+# other way a gated notification can go missing -- a LISTEN connection that
+# dropped and came back, a demand write that raced a terminal commit -- and it
+# is the only level trigger a push-only consumer has.
+#
 # Params: $1 job_id, $2 run_epoch. Returns one row when this execution still
 # owns the job, none when it has been superseded.
-COMPACT_FENCE_SQL = """UPDATE jorb SET awaited = FALSE
+COMPACT_FENCE_SQL = """SELECT id AS fenced FROM jorb
         WHERE id = $1 AND run_epoch = $2
-        RETURNING 1 AS fenced"""
+        FOR UPDATE"""
 
 # Statement 2: the delete, under a snapshot taken AFTER the fence's lock was
 # granted. Returns the count rather than the rows -- a compacting job can hold

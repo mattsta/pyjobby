@@ -12,6 +12,7 @@ for the same reason, and the reason is worth stating once.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import pytest
@@ -356,3 +357,136 @@ class TestWaitForDAG:
         )
 
         assert await wait_for_dag(db_pool, dag_id, timeout=1) is False
+
+
+class TestDAGCompletionStamp:
+    """`jorb_dag.completed` is what an operator reads to know a DAG is done,
+    so it has to be right under concurrency and it has to stay right.
+
+    Both properties are the trigger's (`sql/schema/91_dag_complete.sql`): no
+    writer of `jorb` knows about DAGs, which is the point of recording it
+    there.
+    """
+
+    async def _dag_with_members(self, db_pool, n: int) -> tuple[int, list[int]]:
+        dag_id = await db_pool.fetchval(
+            "INSERT INTO jorb_dag (name) VALUES ($1) RETURNING id", _dag_name()
+        )
+        members = [
+            await db_pool.fetchval(
+                "INSERT INTO jorb (job_class, state, dag_id) "
+                "VALUES ('M', 'running', $1) RETURNING id",
+                dag_id,
+            )
+            for _ in range(n)
+        ]
+        return dag_id, members
+
+    async def test_two_concurrent_last_finishers_stamp_it_exactly_once(
+        self, db_pool, db_params
+    ):
+        """The write skew, interleaved on purpose.
+
+        Two READ COMMITTED transactions each finish one of the DAG's last two
+        jobs, and neither commits until both have written. Counting unfinished
+        members against each transaction's own snapshot, each one saw the
+        OTHER still running -- so neither stamped, both committed, and the DAG
+        sat at completed = NULL forever with every member terminal.
+        """
+        from pyjobby import db
+
+        dag_id, (a, b) = await self._dag_with_members(db_pool, 2)
+
+        first = await db.connect(**db_params)
+        second = await db.connect(**db_params)
+        try:
+            t1 = first.transaction()
+            t2 = second.transaction()
+            await t1.start()
+            await t2.start()
+            await first.execute("UPDATE jorb SET state='finished' WHERE id=$1", a)
+
+            # The two finish DIFFERENT jorb rows, so nothing about the jobs
+            # themselves orders them. What orders them is the DAG row the
+            # first one's trigger is holding, and this is where it shows: the
+            # second finisher waits for it rather than deciding, alone and
+            # against a stale snapshot, that the DAG is not done.
+            blocked = asyncio.create_task(
+                second.execute("UPDATE jorb SET state='finished' WHERE id=$1", b)
+            )
+            await asyncio.sleep(0.3)
+            assert not blocked.done(), (
+                "the second finisher did not serialise against the first: "
+                "each will count the other as still running"
+            )
+
+            await t1.commit()
+            await blocked
+            await t2.commit()
+        finally:
+            await first.close()
+            await second.close()
+
+        row = await db_pool.fetchrow(
+            "SELECT d.completed, s.pending_jobs FROM jorb_dag d "
+            "JOIN jorb_dag_status s ON s.dag_id = d.id WHERE d.id = $1",
+            dag_id,
+        )
+        assert row["pending_jobs"] == 0
+        assert row["completed"] is not None, (
+            "every member is terminal and the DAG was never stamped complete: "
+            "the two finishers each decided the other was still running"
+        )
+
+    async def test_a_serial_finish_still_stamps_it(self, db_pool):
+        """The control: nothing about the locking changed the ordinary path."""
+        dag_id, members = await self._dag_with_members(db_pool, 2)
+        for job_id in members:
+            await db_pool.execute(
+                "UPDATE jorb SET state='finished' WHERE id=$1", job_id
+            )
+        assert (
+            await db_pool.fetchval("SELECT completed FROM jorb_dag WHERE id=$1", dag_id)
+            is not None
+        )
+
+    async def test_requeueing_a_member_unstamps_the_dag(self, db_pool):
+        """A DAG with work pending again is not a completed DAG.
+
+        `completed` was write-once, so a retried member left the row saying
+        the DAG finished while `jorb_dag_status` reported pending_jobs > 0 --
+        and nothing ever corrected it, because the member's eventual second
+        completion only re-stamps a row that is already stamped.
+        """
+        dag_id, members = await self._dag_with_members(db_pool, 2)
+        for job_id in members:
+            await db_pool.execute(
+                "UPDATE jorb SET state='finished' WHERE id=$1", job_id
+            )
+        assert await db_pool.fetchval(
+            "SELECT completed FROM jorb_dag WHERE id=$1", dag_id
+        )
+
+        await db_pool.execute(
+            "UPDATE jorb SET state='queued', run_epoch = run_epoch + 1 WHERE id=$1",
+            members[-1],
+        )
+
+        row = await db_pool.fetchrow(
+            "SELECT d.completed, s.pending_jobs FROM jorb_dag d "
+            "JOIN jorb_dag_status s ON s.dag_id = d.id WHERE d.id = $1",
+            dag_id,
+        )
+        assert row["pending_jobs"] == 1
+        assert row["completed"] is None, (
+            "the DAG reports completed with a member back in the queue"
+        )
+
+        # ...and it is stamped again, with a NEW timestamp, when that member
+        # finishes for the second time
+        await db_pool.execute(
+            "UPDATE jorb SET state='finished' WHERE id=$1", members[-1]
+        )
+        assert await db_pool.fetchval(
+            "SELECT completed FROM jorb_dag WHERE id=$1", dag_id
+        )

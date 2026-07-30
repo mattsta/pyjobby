@@ -242,13 +242,31 @@ class ScheduleManager:
         self.conn = conn
 
     @staticmethod
-    def calculate_next_run(cron_expr: str, timezone: str = "UTC") -> datetime:
+    def calculate_next_run(
+        cron_expr: str, timezone: str = "UTC", after: datetime | None = None
+    ) -> datetime:
         """
         Calculate next run time from cron expression.
 
         Args:
             cron_expr: Standard cron expression (minute hour day month weekday)
             timezone: Timezone name (default: UTC)
+            after: The instant to advance FROM, exclusive. Defaults to this
+                process's clock, which is correct only where nothing has
+                already judged the schedule against another one.
+
+        **PASS ``after`` FROM THE DATABASE CLOCK ON THE FIRING PATH.**
+        Due-ness is decided by ``next_run <= NOW()`` -- the DATABASE's now --
+        and every advance has to be measured against that same clock or the
+        two disagree by the host's skew. A scheduler whose clock lags the
+        database by more than the fired job's time-to-claim advances
+        ``next_run`` to an instant the database ALREADY considers due, fires
+        the same tick again on the next poll, and keeps doing it: the per-tick
+        ``deadline_key`` only collapses duplicates while the earlier job is
+        still queued (``jorb_deadline_idx`` is partial on ``state='queued'``),
+        so an ordinary fast worker re-arms the key by claiming. Reproduced at a
+        120s skew: four jobs for one cron tick. One clock domain per decision,
+        the rule ``pj.STMTS['now']`` states for durable sleep.
 
         Returns:
             Next execution time as datetime
@@ -256,7 +274,7 @@ class ScheduleManager:
         Raises:
             ValueError: If cron expression is invalid
         """
-        next_run = next_cron_run(cron_expr, timezone)
+        next_run = next_cron_run(cron_expr, timezone, after=after)
         logger.debug(
             f"Calculated next run: {next_run} (cron: {cron_expr}, tz: {timezone})"
         )
@@ -284,9 +302,15 @@ class ScheduleManager:
         Raises:
             ValueError: If validation fails
         """
-        # Calculate initial next_run
+        # Calculate initial next_run, against the DATABASE's clock: the
+        # scheduler judges due-ness with `next_run <= NOW()`, so a creating
+        # host whose clock lags writes a schedule that is already due and fires
+        # the instant it is created. One clock domain per decision, exactly as
+        # on the firing path (see calculate_next_run).
         timezone = kwargs.get("timezone", "UTC")
-        next_run = self.calculate_next_run(cron_expr, timezone)
+        next_run = self.calculate_next_run(
+            cron_expr, timezone, after=await self.conn.fetchval("SELECT now()")
+        )
 
         # Insert schedule
         schedule_id: int = await self.conn.fetchval(
@@ -869,7 +893,9 @@ class SchedulerWorker:
         elif result.result == "skipped":
             self.skips_total += 1
 
-    async def backfill_missed_ticks(self, schedule: dict[str, Any]) -> None:
+    async def backfill_missed_ticks(
+        self, schedule: dict[str, Any], *, until: datetime | None = None
+    ) -> None:
         """Fire the recent ticks this schedule missed, up to its own bound.
 
         ``backfill_limit`` is BOTH the opt-in and the bound, and 0 is the
@@ -920,19 +946,22 @@ class SchedulerWorker:
         if limit <= 0:
             return
 
-        # The window is (next_run, now]. next_run itself is EXCLUDED because it
-        # is the tick the schedule is currently due for, which the caller has
+        # The window is (next_run, until]. next_run itself is EXCLUDED because
+        # it is the tick the schedule is currently due for, which the caller has
         # already fired: a backfill therefore only ever ADDS fires, and raising
         # backfill_limit never moves or removes the fire a schedule was due
-        # for. `until` is this process's own clock -- the same one
-        # calculate_next_run reads -- so a tick can land on both sides of the
-        # boundary only by arriving mid-pass, and the per-tick deadline key
-        # turns that into a recorded `duplicate` skip rather than a second job.
+        # for. `until` is the DATABASE's clock, handed down by ``run()`` from
+        # the same read that anchors the next_run advance -- so the backfilled
+        # window ends exactly where the next tick begins, and a scheduler host
+        # whose clock is skewed cannot open a gap between them (backfilling
+        # ticks the advance then skips) or an overlap (backfilling a tick the
+        # advance is about to fire). It falls back to this process's clock only
+        # for a caller that has no transaction to read the database's in.
         missed = missed_cron_runs(
             schedule["cron_expr"],
             schedule["timezone"],
             after=schedule["next_run"],
-            until=utcnow(),
+            until=until if until is not None else utcnow(),
             keep=limit,
         )
 
@@ -1027,14 +1056,33 @@ class SchedulerWorker:
                                 continue
                             schedule = dict(locked)
 
+                            # THE DATABASE'S CLOCK, read inside the same
+                            # transaction that holds the row lock, and the one
+                            # clock every decision in this block is made
+                            # against. `next_run <= NOW()` above judged
+                            # due-ness on it; the advance below has to be
+                            # measured on it too, or a skewed scheduler host
+                            # advances next_run to an instant the database
+                            # already considers due and re-fires the same tick
+                            # (see calculate_next_run).
+                            db_now = await self.conn.fetchval("SELECT now()")
+
                             # Resolve the following fire time BEFORE firing:
                             # if the expression is unevaluatable, firing
                             # would only be rolled back by the failure to
                             # advance next_run, and the schedule would spin
                             # on every poll forever.
+                            #
+                            # GREATEST(db_now, next_run): the locked re-check
+                            # already guarantees next_run <= db_now, so this is
+                            # a no-op that states the invariant -- the advance
+                            # never goes BACKWARDS past the tick just fired,
+                            # whatever a future caller does to the guard.
                             try:
                                 next_run = self.manager.calculate_next_run(
-                                    schedule["cron_expr"], schedule["timezone"]
+                                    schedule["cron_expr"],
+                                    schedule["timezone"],
+                                    after=max(db_now, schedule["next_run"]),
                                 )
                             except ValueError as e:
                                 unevaluatable = ScheduleExecutionResult(
@@ -1062,8 +1110,11 @@ class SchedulerWorker:
 
                             # Catch up on the ticks missed while nothing was
                             # firing this schedule. A no-op at backfill_limit 0,
-                            # which is the default and stays the default.
-                            await self.backfill_missed_ticks(schedule)
+                            # which is the default and stays the default. Given
+                            # the same database clock the advance uses, so the
+                            # backfill window and the next tick cannot overlap
+                            # or leave a gap between them.
+                            await self.backfill_missed_ticks(schedule, until=db_now)
 
                             # Update next_run
                             await self.manager.set_next_run(schedule["id"], next_run)

@@ -875,3 +875,141 @@ class TestBoundedBackfill:
                 )
                 == 3
             )
+
+
+class TestClockDomains:
+    """Due-ness and the advance are decided on ONE clock: the database's.
+
+    ``next_run <= NOW()`` is evaluated by the server. If the advance is
+    computed from the scheduler HOST's clock instead, the two disagree by the
+    host's skew -- and a host that lags advances ``next_run`` to an instant
+    the database already considers due, so the very next poll fires the same
+    cron tick again. The per-tick ``deadline_key`` does not save it:
+    ``jorb_deadline_idx`` is partial on ``state = 'queued'``, so an ordinary
+    worker claiming the job re-arms the key and the duplicate lands.
+
+    The lag is shimmed on ``pyjobby.cron``'s ``datetime``, which is the single
+    place a process clock enters cron evaluation at all -- so the shim proves
+    the fix rather than the test's own arithmetic.
+    """
+
+    @staticmethod
+    def _lagging(skew: timedelta):
+        import datetime as stdlib_datetime
+
+        class LaggingDatetime(stdlib_datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):  # type: ignore[override]
+                return stdlib_datetime.datetime.now(tz) - skew
+
+        return LaggingDatetime
+
+    async def test_a_lagging_scheduler_mints_one_job_per_tick(
+        self, db_pool, monkeypatch
+    ):
+        """The reproduction: a 120s-lagging host, a minutely schedule, and a
+        claimer as fast as any real worker. Every scheduled_time must hold
+        exactly one job."""
+        import pyjobby.cron as cron_module
+
+        monkeypatch.setattr(
+            cron_module, "datetime", self._lagging(timedelta(seconds=120))
+        )
+
+        async with db_pool.acquire() as conn:
+            schedule_id = await _insert_schedule(
+                conn,
+                cron_expr="* * * * *",
+                next_run=datetime.now(UTC) - timedelta(seconds=1),
+                max_concurrent_jobs=100,
+            )
+
+            worker = SchedulerWorker(conn, poll_interval=0.05)
+
+            async def claim_everything() -> None:
+                """A worker taking each minted job, which is what re-arms the
+                per-tick deadline key and lets a duplicate through."""
+                async with db_pool.acquire() as claimer:
+                    while True:
+                        await claimer.execute(
+                            "UPDATE jorb SET state = 'claimed', "
+                            "run_count = run_count + 1, "
+                            "run_epoch = run_epoch + 1, claimed_at = now(), "
+                            "updated = now() "
+                            "WHERE state = 'queued' AND schedule_id = $1",
+                            schedule_id,
+                        )
+                        await asyncio.sleep(0.05)
+
+            claimer_task = asyncio.create_task(claim_everything())
+            try:
+                task = asyncio.create_task(worker.run())
+                await asyncio.sleep(1.5)
+                worker.stop()
+                await asyncio.wait_for(task, timeout=5.0)
+            finally:
+                claimer_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await claimer_task
+
+            ticks = await db_pool.fetch(
+                "SELECT admin_data->>'scheduled_time' AS tick, count(*) AS jobs "
+                "FROM jorb WHERE schedule_id = $1 GROUP BY 1",
+                schedule_id,
+            )
+            assert ticks, "the schedule never fired at all"
+            duplicated = [dict(t) for t in ticks if t["jobs"] > 1]
+            assert not duplicated, (
+                f"a cron tick was fired more than once: {duplicated}. The "
+                f"advance was measured on the scheduler host's clock while "
+                f"due-ness was measured on the database's."
+            )
+
+    async def test_the_advance_lands_ahead_of_the_database_clock(self, db_pool):
+        """Whatever the host's clock says, the row this transaction writes is
+        not due again the moment it commits."""
+        async with db_pool.acquire() as conn:
+            schedule_id = await _insert_schedule(conn, cron_expr="* * * * *")
+
+            worker = SchedulerWorker(conn, poll_interval=0.05)
+            await _run_one_pass(worker)
+
+            still_due = await conn.fetchval(
+                "SELECT next_run <= now() FROM jorb_schedule WHERE id = $1",
+                schedule_id,
+            )
+            assert still_due is False, (
+                "the schedule is still due after firing: it will fire the same "
+                "tick again on the next poll"
+            )
+
+    async def test_update_schedule_never_leaves_a_schedule_already_due(
+        self, db_pool, monkeypatch
+    ):
+        """The operator-race door onto the same mechanism.
+
+        ``AdminAPI.update_schedule`` recomputes ``next_run`` when the cron or
+        the timezone changes. Computed on a lagging admin host, the value it
+        writes is one the database already considers due -- so the schedule
+        fires immediately, for a tick it may have fired seconds earlier.
+        """
+        import pyjobby.cron as cron_module
+        from pyjobby.admin_api import AdminAPI
+
+        async with db_pool.acquire() as conn:
+            schedule_id = await _insert_schedule(conn, cron_expr="0 3 * * *")
+
+            monkeypatch.setattr(
+                cron_module, "datetime", self._lagging(timedelta(hours=2))
+            )
+            api = AdminAPI(conn)
+            updated = await api.update_schedule(schedule_id, cron_expr="*/5 * * * *")
+
+            assert updated["next_run"] > await conn.fetchval("SELECT now()"), (
+                "update_schedule wrote a next_run the database already considers due"
+            )
+            # ...and it did not refuse to move the schedule EARLIER, which is
+            # what changing a daily cron to a five-minutely one asks for
+            assert updated["next_run"] < await conn.fetchval(
+                "SELECT now()"
+            ) + timedelta(minutes=6)
