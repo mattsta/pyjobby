@@ -725,7 +725,7 @@ async def fork_job(
       here would mean either inventing a default ceiling that silently differs
       from the caller's or plumbing one through every call -- so it stays where
       the number lives. Every wrapper does check it, with the same
-      ``client.validate_priority``.
+      ``enqueue_rules.validate_priority``.
 
     ``from_step`` is 1-based and names the step the fork EXECUTES first:
     ``1`` (the default) copies no checkpoints and re-runs the whole job under
@@ -950,15 +950,15 @@ QUEUE_STATS_STATES: tuple[str, ...] = (*lifecycle.JOB_STATES, "scheduled")
 
 
 CANCEL_SQL = f"""UPDATE jorb
-        SET state = CASE WHEN state IN ('queued', 'waiting')
+        SET state = CASE WHEN state IN ({lifecycle.PRE_CLAIM_STATES_SQL})
                          THEN 'cancelled'::jorbstate ELSE state END,
             cancel_requested = CASE WHEN state IN ({lifecycle.IN_FLIGHT_STATES_SQL})
                                     THEN TRUE ELSE cancel_requested END,
-            finished = CASE WHEN state IN ('queued', 'waiting')
+            finished = CASE WHEN state IN ({lifecycle.PRE_CLAIM_STATES_SQL})
                             THEN now() ELSE finished END,
             updated = now()
         WHERE id = $1
-          AND state IN ('queued', 'waiting', 'claimed', 'running')
+          AND state IN ({lifecycle.LIVE_STATES_SQL})
         RETURNING state, cancel_requested"""
 
 #: cancel over a list, one statement — identical CASE logic to CANCEL_SQL.

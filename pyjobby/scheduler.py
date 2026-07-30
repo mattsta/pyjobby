@@ -63,7 +63,7 @@ from .client import ENQUEUE_SQL, JobClient
 from .cron import missed_cron_runs, next_cron_run
 from .db import utcnow
 from .enqueue_rules import DEFAULT_PRIO_CEILING
-from .lifecycle import IN_FLIGHT_STATES_SQL
+from .lifecycle import IN_FLIGHT_STATES_SQL, LIVE_STATES_SQL
 
 #: "How many of this schedule's jobs are still in flight?", asked once per
 #: firing of every schedule by ``ScheduleSafetyManager.check_concurrency``.
@@ -81,10 +81,10 @@ from .lifecycle import IN_FLIGHT_STATES_SQL
 #: parameter. Written as ``state = ANY($2)`` this query is correct, index-less
 #: and a sequential scan of the whole job table, which is precisely the defect
 #: the column and the index were added to fix.
-CONCURRENCY_COUNT_SQL = """
+CONCURRENCY_COUNT_SQL = f"""
     SELECT count(*) FROM jorb
      WHERE schedule_id = $1
-       AND state IN ('queued', 'claimed', 'running', 'waiting')
+       AND state IN ({LIVE_STATES_SQL})
 """
 
 #: The backpressure depth count, split into one arm per partial index.

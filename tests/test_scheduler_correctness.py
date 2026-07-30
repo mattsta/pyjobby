@@ -1013,3 +1013,30 @@ class TestClockDomains:
             assert updated["next_run"] < await conn.fetchval(
                 "SELECT now()"
             ) + timedelta(minutes=6)
+
+    async def test_create_schedule_never_writes_a_schedule_already_due(
+        self, db_pool, monkeypatch
+    ):
+        """The third and last door onto the mechanism: creation.
+
+        ``AdminAPI.create_schedule`` seeds the first ``next_run``. Computed on
+        a lagging admin host, the seed is an instant the database already
+        considers due, and the schedule fires the moment it is created --
+        before its first real tick.
+        """
+        import pyjobby.cron as cron_module
+        from pyjobby.admin_api import AdminAPI
+
+        async with db_pool.acquire() as conn:
+            monkeypatch.setattr(
+                cron_module, "datetime", self._lagging(timedelta(hours=2))
+            )
+            api = AdminAPI(conn)
+            created = await api.create_schedule(
+                name=f"clock_create_{uuid.uuid4().hex[:8]}",
+                job_class="tests.dxe_jobs.OkJob",
+                cron_expr="*/5 * * * *",
+            )
+            assert created["next_run"] > await conn.fetchval("SELECT now()"), (
+                "create_schedule seeded a next_run the database already considers due"
+            )

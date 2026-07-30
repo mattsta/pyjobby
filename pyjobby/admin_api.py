@@ -3041,7 +3041,12 @@ class AdminAPI:
 
         # Reject the expression here rather than at fire time: a schedule
         # that cannot be evaluated is a schedule that silently never runs.
-        next_run = next_cron_run(cron_expr, timezone)
+        # Evaluated against the DATABASE clock (one clock domain per
+        # decision, like update_schedule below and the firing loop): a
+        # creating host whose clock lags would otherwise write a schedule
+        # that is already due and fires the instant it is created.
+        db_now = await self.conn.fetchval("SELECT now()")
+        next_run = next_cron_run(cron_expr, timezone, after=db_now)
 
         # Create schedule
         record = await self.conn.fetchrow(

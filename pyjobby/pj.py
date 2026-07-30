@@ -447,7 +447,7 @@ class JobSystem:
     # This worker's priority CEILING: it claims jobs with prio <= this and
     # is blind to everything above it (lower prio is more urgent). Set from
     # `pj --max-prio`; the default is shared with the client, which refuses
-    # to enqueue above it (see client.DEFAULT_PRIO_CEILING).
+    # to enqueue above it (see enqueue_rules.DEFAULT_PRIO_CEILING).
     prio: int = DEFAULT_PRIO_CEILING
     # The APPLICATION code version this worker advertises (`pj
     # --app-version`, else the config file's `app_version`). None -- the
@@ -882,7 +882,7 @@ class JobSystem:
         without it.
 
         The client refuses to enqueue above its declared ceiling
-        (``client.validate_priority``), which is where the caller can still
+        (``enqueue_rules.validate_priority``), which is where the caller can still
         be told. This is the other half, for the jobs that got in anyway —
         raw SQL, another tool, a schedule, a client that declared a higher
         ceiling than the workers actually run with. Nothing can refuse a
@@ -2569,7 +2569,7 @@ def resolve_app_version(flag: str | None, configured: Any) -> str | None:
     distinction is not pedantry: ``--app-version "$GIT_SHA"`` with the variable
     unset is exactly how one arrives, and a worker advertising ``''`` would
     claim only jobs pinned to ``''`` -- which nothing can enqueue, because the
-    client refuses to write one (client.validate_app_version). The fleet would
+    client refuses to write one (enqueue_rules.validate_app_version). The fleet would
     come up healthy and claim nothing at all. The enqueue side RAISES on the
     same input because a caller is there to be told; a launcher flag has no
     caller, and refusing to boot would take a whole fleet down over a blank
@@ -2577,7 +2577,7 @@ def resolve_app_version(flag: str | None, configured: Any) -> str | None:
 
     EVERY WAY THE ENQUEUE SIDE REFUSES A VERSION, THIS SIDE WARNS AND
     ADVERTISES NONE -- the same three rules, the same
-    ``client.validate_app_version`` bounds, and never a version the enqueue
+    ``enqueue_rules.validate_app_version`` bounds, and never a version the enqueue
     side could not have written. A worker advertising something no job can
     carry claims nothing, silently, which is the failure the empty case
     already documented; a version above ``MAX_APP_VERSION_LENGTH`` and a
