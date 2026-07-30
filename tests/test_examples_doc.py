@@ -915,6 +915,306 @@ async def test_the_client_renders_pages_while_the_job_is_still_running(
 
 
 # ===========================================================================
+# 12. Multi-tenant reports: lanes, a debounced burst, an identity, a fork
+# ===========================================================================
+
+
+# The tenants whose reports were really collected, so the examples can count
+# the expensive query rather than assert about elapsed time.
+COLLECTED: list[tuple[str, str]] = []
+
+
+class TenantReport(Job):
+    """One tenant's report: collect the rows, render them, stream the stages.
+
+    Two steps, because the collect is the expensive half and a fork of a
+    failed render must not pay for it twice. Two stream rows, because the
+    caller renders a progress list while this runs rather than waiting for
+    the result.
+
+    ``render_ok`` and ``pause`` are the two kwargs the document omits, and
+    both stand in for something a doc example cannot have: ``render_ok``
+    is the bug the incident story deploys a fix for (the fork flips it
+    through ``kwargs_override`` instead of waiting for a release), and
+    ``pause`` is the work a real report does, without which nothing would
+    still be running when the stream reader arrives.
+    """
+
+    async def task(
+        self,
+        tenant: str,
+        month: str,
+        revision: int = 1,
+        render_ok: bool = True,
+        pause: float = 0.0,
+    ) -> dict[str, Any]:
+        rows = await self.step("collect", self.collect, tenant, month)
+        await self.stream_write("progress", {"stage": "collected", "rows": rows})
+        await asyncio.sleep(pause)  # stands in for the work of a real report
+        url = await self.step("render", self.render, tenant, month, render_ok)
+        await self.stream_write("progress", {"stage": "rendered", "url": url})
+        await self.stream_close("progress")
+        return {"tenant": tenant, "revision": revision, "url": url}
+
+    def collect(self, tenant: str, month: str) -> int:
+        COLLECTED.append((tenant, month))  # the expensive query, counted
+        return 3
+
+    def render(self, tenant: str, month: str, render_ok: bool) -> str:
+        if not render_ok:
+            raise RuntimeError("the renderer has no template for that month")
+        return f"s3://reports/{tenant}/{month}.pdf"
+
+
+async def test_a_burst_of_regenerate_clicks_becomes_one_run_of_the_latest(
+    client, live_worker, unique_queue, batch_ref
+):
+    """The dashboard's `Regenerate` button, pressed three times in a row.
+
+    Three calls, one job, and the revision that runs is the one from the
+    LAST click -- which is the whole reason this is `debounce()` and not a
+    `deadline_key`.
+    """
+    COLLECTED.clear()
+    key = f"report:{batch_ref}"
+
+    ids = []
+    for revision in (1, 2, 3):
+        job_id, created = await client.debounce(
+            "tests.test_examples_doc.TenantReport",
+            key=key,
+            period=1.0,
+            cap=2.0,
+            queue=unique_queue,
+            partition_key=batch_ref,
+            tenant=batch_ref,
+            month="2026-07",
+            revision=revision,
+        )
+        ids.append(job_id)
+        assert created is (revision == 1)  # only the first call opened a window
+
+    assert len(set(ids)) == 1  # three clicks, one row
+    row = await client.pool.fetchrow("SELECT * FROM jorb WHERE id = $1", ids[0])
+    assert row["kwargs"]["revision"] == 3  # the freshest arguments win
+    assert row["partition_key"] == batch_ref
+    # the cap the FIRST call wrote is a ceiling every later bounce clamps to
+    assert row["debounce_deadline"] is not None
+    assert row["run_after"] <= row["debounce_deadline"]
+
+    # a fourth click asking for a much longer quiet window cannot push the
+    # job past that ceiling
+    await client.debounce(
+        "tests.test_examples_doc.TenantReport",
+        key=key,
+        period=600.0,
+        cap=2.0,
+        queue=unique_queue,
+        partition_key=batch_ref,
+        tenant=batch_ref,
+        month="2026-07",
+        revision=4,
+    )
+    capped = await client.pool.fetchrow("SELECT * FROM jorb WHERE id = $1", ids[0])
+    assert capped["run_after"] == capped["debounce_deadline"]
+
+    await live_worker()
+    finished = await wait_for_job_state(client.pool, ids[0], ("finished",), timeout=30)
+    assert finished["result"]["revision"] == 4
+    assert [(batch_ref, "2026-07")] == COLLECTED  # one run, not four
+
+
+async def test_the_client_tails_the_report_it_asked_for(
+    client, live_worker, unique_queue, batch_ref
+):
+    """The progress list the dashboard renders while the report is built."""
+    await live_worker()
+
+    job_id = await client.enqueue(
+        "tests.test_examples_doc.TenantReport",
+        queue=unique_queue,
+        partition_key=batch_ref,
+        tenant=batch_ref,
+        month="2026-07",
+        pause=1.0,  # so the first row really does arrive mid-run
+    )
+
+    stages = []
+    async with asyncio.timeout(30):
+        async for update in client.read_stream(job_id, "progress"):
+            if not stages:
+                assert (await client.get_job(job_id)).state in ("claimed", "running")
+            stages.append(update["stage"])
+
+    assert stages == ["collected", "rendered"]
+    row = await wait_for_job_state(client.pool, job_id, ("finished",), timeout=20)
+    assert row["result"]["url"].endswith(f"{batch_ref}/2026-07.pdf")
+
+
+async def test_the_billing_webhook_cannot_generate_the_same_close_twice(
+    client, unique_queue, batch_ref
+):
+    """The other entry point: a webhook that retries must not double-generate."""
+    identity = f"report:{batch_ref}:2026-07:final"
+
+    first, created = await client.enqueue_identified(
+        "tests.test_examples_doc.TenantReport",
+        identity_key=identity,
+        queue=unique_queue,
+        partition_key=batch_ref,
+        tenant=batch_ref,
+        month="2026-07",
+    )
+    assert created is True
+
+    # the webhook's own retry, with the same body
+    again, created_again = await client.enqueue_identified(
+        "tests.test_examples_doc.TenantReport",
+        identity_key=identity,
+        queue=unique_queue,
+        partition_key=batch_ref,
+        tenant=batch_ref,
+        month="2026-07",
+    )
+    assert (again, created_again) == (first, False)  # the job it already made
+
+    # ...and it does not re-arm when the job finishes, unlike a deadline_key
+    await client.pool.execute("UPDATE jorb SET state='finished' WHERE id=$1", first)
+    once_more, created_once_more = await client.enqueue_identified(
+        "tests.test_examples_doc.TenantReport",
+        identity_key=identity,
+        queue=unique_queue,
+        tenant=batch_ref,
+        month="2026-07",
+    )
+    assert (once_more, created_once_more) == (first, False)
+
+    found = await client.get_job_by_identity(identity)
+    assert found is not None and found.id == first
+
+
+async def test_one_tenants_backlog_does_not_hold_up_another_tenant(
+    client, live_worker, unique_queue, batch_ref
+):
+    """The starvation `partition_limits` exists to end, in the shape that
+    produces it: the noisy tenant's whole backlog is enqueued FIRST, so it
+    sorts ahead of the quiet tenant's single report at every claim.
+
+    Queue-wide, a cap of 1 makes the quiet tenant wait out all four. Per
+    lane, a cap of 1 means one in flight PER TENANT, so the second worker
+    takes the quiet tenant's report while the first is still on the noisy
+    one -- and it finishes before the noisy backlog does.
+    """
+    from pyjobby.admin_api import AdminAPI
+
+    noisy, quiet = f"{batch_ref}-noisy", f"{batch_ref}-quiet"
+
+    async with client.pool.acquire() as conn:
+        await AdminAPI(conn).set_queue_control(
+            unique_queue, max_concurrency=1, partition_limits=True
+        )
+
+    noisy_ids = [
+        await client.enqueue(
+            "tests.test_examples_doc.TenantReport",
+            queue=unique_queue,
+            partition_key=noisy,
+            tenant=noisy,
+            month=f"2026-0{n}",
+            pause=0.3,
+        )
+        for n in range(1, 5)
+    ]
+    quiet_id = await client.enqueue(
+        "tests.test_examples_doc.TenantReport",
+        queue=unique_queue,
+        partition_key=quiet,
+        tenant=quiet,
+        month="2026-07",
+        pause=0.3,
+    )
+
+    await live_worker()
+    await live_worker()
+
+    quiet_row = await wait_for_job_state(
+        client.pool, quiet_id, ("finished",), timeout=30
+    )
+    for jid in noisy_ids:
+        await wait_for_job_state(client.pool, jid, ("finished",), timeout=30)
+
+    # the quiet tenant did not queue behind four of somebody else's reports
+    noisy_last = await client.pool.fetchval(
+        "SELECT max(finished) FROM jorb WHERE id = ANY($1::bigint[])", noisy_ids
+    )
+    assert quiet_row["finished"] < noisy_last
+
+    # and the cap still bound the noisy lane: its four ran one at a time
+    starts = await client.pool.fetch(
+        "SELECT started, finished FROM jorb WHERE id = ANY($1::bigint[]) "
+        "ORDER BY started",
+        noisy_ids,
+    )
+    for earlier, later in zip(starts, starts[1:], strict=False):
+        assert earlier["finished"] <= later["started"]
+
+
+async def test_the_fix_is_forked_from_the_failing_step_and_keeps_the_lane(
+    client, live_worker, unique_queue, batch_ref
+):
+    """The incident: the render broke, the collect was expensive, the
+    original stays crashed as the record of what happened."""
+    COLLECTED.clear()
+    await live_worker()
+
+    broken = await client.enqueue(
+        "tests.test_examples_doc.TenantReport",
+        queue=unique_queue,
+        partition_key=batch_ref,
+        max_retries=1,
+        initial_retry_delay=0,
+        tenant=batch_ref,
+        month="2026-07",
+        render_ok=False,
+    )
+    await wait_for_job_state(client.pool, broken, ("crashed",), timeout=30)
+    assert [(batch_ref, "2026-07")] == COLLECTED
+
+    # deploy the fix, then fork from the step that broke
+    fork = await client.fork_job_from_failure(
+        broken,
+        kwargs_override={
+            "tenant": batch_ref,
+            "month": "2026-07",
+            "render_ok": True,
+        },
+    )
+    # the render is step 3: `collect`, the `stream_write` that follows it,
+    # then `render` -- every checkpointed call takes a number, streams too
+    assert fork["from_step"] == 3 and fork["steps_copied"] == 2
+
+    row = await wait_for_job_state(
+        client.pool, fork["job_id"], ("finished",), timeout=30
+    )
+    assert row["result"]["url"].endswith(f"{batch_ref}/2026-07.pdf")
+    assert row["forked_from"] == broken
+    assert row["partition_key"] == batch_ref  # whose work it is, so it carries
+    assert row["identity_key"] is None  # which work it is, so it does not
+
+    # the expensive collect was fast-forwarded, not paid for again
+    assert [(batch_ref, "2026-07")] == COLLECTED
+    # ...and the fork's stream holds only what the fork really produced: the
+    # copied `stream_write` checkpoint fast-forwards and appends nothing
+    assert await client.get_stream(fork["job_id"], "progress") == {
+        "values": [{"stage": "rendered", "url": row["result"]["url"]}],
+        "closed": True,
+    }
+    # ...and the source is untouched, still crashed, still the record
+    source = await client.pool.fetchrow("SELECT * FROM jorb WHERE id = $1", broken)
+    assert source["state"] == "crashed"
+
+
+# ===========================================================================
 # The connection an admin call needs
 # ===========================================================================
 

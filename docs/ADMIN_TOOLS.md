@@ -673,9 +673,13 @@ which is the second reason to fork (a retry cannot change either). A
 `--priority` above the deployment's worker ceiling is refused exactly as
 `set-priority` refuses it — no worker would claim the fork — and
 `--max-prio N` raises the ceiling for one command. The fork
-inherits the job's class, arguments, capability, tags and retry/timeout
-policy, and inherits **no identity** — no `uid`, no `deadline_key`, no
-`identity_key`, no schedule, no DAG or dependency edges. Streams, events and mail are the
+inherits the job's class, arguments, capability, retry/timeout policy and
+everything that says whose work it is — `uid`, `tags` and `partition_key`,
+so a tenant's fork stays theirs and stays in their fair-share lane — and
+inherits **no identity**: no `deadline_key`, no `identity_key`, no
+`debounce_key`, no schedule, no DAG or dependency edges. It is unpinned
+unless `--app-version` says otherwise, because forking is usually how work
+is re-run under new code. Streams, events and mail are the
 source's output and are not copied
 ([DXE.md](DXE.md#forking-a-job-a-new-row-from-a-checkpoint-prefix)).
 

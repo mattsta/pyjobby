@@ -22,11 +22,14 @@ below is a file you can open.
 ### Understanding it
 
 1. **[ARCHITECTURE.md](ARCHITECTURE.md)** — the components, the life of a
-   job, why claiming lives in the database, the notification model, and
-   liveness/fencing/recovery.
+   job, why claiming lives in the database (and what else it filters on:
+   capabilities, code-version pins, fair-share lanes), the families of
+   columns on `jorb`, the three dedupe keys and their indexes, the
+   notification model, and liveness/fencing/recovery.
 2. **[DXE.md](DXE.md)** — the Durable Execution Engine: checkpointed
-   `step()`, `transaction()`, durable `sleep()`, events and mailboxes, and
-   the invariant that a completed step never runs twice.
+   `step()`, `transaction()`, durable `sleep()`, events, mailboxes,
+   streams, forking a job from a checkpoint prefix, and the invariant that
+   a completed step never runs twice.
 3. **[SCALE.md](SCALE.md)** — every measured number, what breaks first at
    1M jobs/hour, and the design decisions on the write path that were
    rejected and why. All of it reproducible with `pj-bench`.
@@ -34,19 +37,24 @@ below is a file you can open.
 ### Building on it
 
 4. **[writing-jobs.md](writing-jobs.md)** — what goes _inside_ one job:
-   `task()`, sync vs async vs generator, which durable primitive to reach
-   for, the determinism obligation, timeouts, retries, tags, and a
-   checklist for a new job class.
+   `task()`, sync vs async vs generator, choosing a dedupe primitive,
+   which durable primitive to reach for, which of result/event/stream/mail
+   fits the conversation, the determinism obligation, timeouts, retries,
+   tags, and a checklist for a new job class.
 5. **[CLIENT_LIBRARY.md](CLIENT_LIBRARY.md)** — the enqueue API in full:
    `JobClient`, every `enqueue()` option, batches, pipelines,
-   fan-out/fan-in, deadline keys, priority and the worker ceiling.
+   fan-out/fan-in, the three dedupe keys (`deadline_key`, `identity_key`,
+   `debounce()`), reading a job's stream, forking, partition keys, code
+   version pins, priority and the worker ceiling.
 6. **[EXAMPLES.md](EXAMPLES.md)** — complete applications: accept-now/
    work-later, an ETL pipeline, the transactional outbox, a rate-limited
-   third-party API, human-in-the-loop, batch import. Every complete example
-   is executed against a real worker by `tests/test_examples_doc.py`.
+   third-party API, human-in-the-loop, batch import, live-streamed output,
+   and a multi-tenant report pipeline. Every complete example is executed
+   against a real worker by `tests/test_examples_doc.py`.
 7. **[RECURRING_SCHEDULER.md](RECURRING_SCHEDULER.md)** — cron schedules:
-   `pj-scheduler`, timezones and DST, and the five safety features
-   (circuit breaker, max concurrent, backpressure, jitter, deadline keys).
+   `pj-scheduler`, timezones and DST, the five safety features
+   (circuit breaker, max concurrent, backpressure, jitter, deadline keys),
+   and the bounded catch-up after an outage (`backfill_limit`).
 8. **[STATECHARTS.md](STATECHARTS.md)** — durable state machines: declaring
    one with `StateMachineJob`, driving it with the `MachineHandle` client
    API, and running the queue they live on. A machine survives a crash,
@@ -60,8 +68,9 @@ below is a file you can open.
    exposure, backup/restore and how to verify a deployment.
 10. **[OPERATIONS.md](OPERATIONS.md)** — the runbook: the process
     inventory, `pj-admin doctor`, the state machine, timeouts, abandoned job
-    threads, live queue controls, priority and the worker ceiling,
-    retention, and the failure playbooks.
+    threads, live queue controls (including per-tenant `partition_limits`),
+    priority and the worker ceiling, pinning work to a code version,
+    retention, retry/re-run/fork, and the failure playbooks.
 11. **[ADMIN_TOOLS.md](ADMIN_TOOLS.md)** — the reference for _what exists_:
     every `pj-admin` command with real output, `pj-web`, and the
     `AdminAPI` Python interface.
@@ -170,8 +179,10 @@ CLI (pj) → spawns --workers processes on EACH --queue named
 Worker sleeps on LISTEN jorb_enqueued (poll is the fallback)
     ↓
 Claim: claim_jorb() — FOR UPDATE SKIP LOCKED, enforcing jorb_queue
-       (paused / max_concurrency / rate_limit), stamping claimed_at
-       and bumping run_epoch
+       (paused / max_concurrency / rate_limit, per queue or per
+       partition_key lane), skipping jobs whose capability or
+       app_version this worker does not advertise, stamping
+       claimed_at and bumping run_epoch
     ↓
 claimed → running (records `started`; timeouts key off this)
     ↓
@@ -191,7 +202,7 @@ jorb_history; pj-monitor reaps timeouts and jobs of dead workers
 - ✅ **Focused**: a small worker loop; the platform is explicit and readable
 - ✅ **Reliable**: PostgreSQL-backed persistence
 - ✅ **Type-safe**: Full mypy strict compliance
-- ✅ **Powerful**: durable execution (checkpointed steps, durable sleep, events, messaging), dependencies, priorities, cron
+- ✅ **Powerful**: durable execution (checkpointed steps, durable sleep, events, messaging, streams, forking), dependencies, priorities, cron
 - ✅ **Flexible**: Sync/async jobs, web integration
 - ✅ **Observable**: full transition history, DXE step checkpoints, Prometheus `/metrics`
 - ✅ **Scalable**: Horizontal scaling via database
@@ -205,6 +216,8 @@ jorb_history; pj-monitor reaps timeouts and jobs of dead workers
 | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `id`              | Primary key                                                                                                                                                       |
 | `queue`           | Route jobs to specific workers                                                                                                                                    |
+| `capability`      | A worker must advertise this to claim the job; NULL means anyone may                                                                                              |
+| `app_version`     | Pin the job's remaining work to one build — only a worker advertising the same version claims it; NULL (the default) means any worker may                          |
 | `state`           | Current status (queued → claimed → running → finished/crashed)                                                                                                    |
 | `prio`            | Priority as a finishing position: the **smallest** number is claimed first, and each worker claims only `prio <=` its own ceiling (`pj --max-prio`, default 1000) |
 | `run_after`       | Minimum start time                                                                                                                                                |
@@ -219,6 +232,10 @@ jorb_history; pj-monitor reaps timeouts and jobs of dead workers
 | `identity_key`    | Caller-chosen at-most-once identity — unique in every state, for as long as retention keeps the row                                                                |
 | `debounce_key`    | Caller-chosen name for a burst collapsed onto this row — unique among `queued` rows never claimed, so it is released for good when a worker claims the job          |
 | `debounce_deadline` | The ceiling a bounce may not defer that row past, set by the first call of the burst; NULL when the caller asked for no cap                                       |
+| `partition_key`   | The caller's fair-share lane (a tenant, a customer): inert until the queue sets `jorb_queue.partition_limits`, and then the queue's limits count per lane          |
+| `schedule_id`     | The `jorb_schedule` row that fired this job; NULL for every direct enqueue                                                                                         |
+| `forked_from`     | The job this one was forked from — lineage only, `ON DELETE SET NULL`, so a fork outlives the source retention reaps                                               |
+| `tags`            | The caller's own labels, indexed for `search_jobs()` and `pj-admin jobs list --tag`                                                                                |
 
 ## Example Workflows
 

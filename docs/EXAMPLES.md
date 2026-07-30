@@ -1,7 +1,7 @@
 # Examples
 
 Complete applications, not snippets: how jobs are composed into a pipeline, a
-fan-out, an outbox, a schedule.
+fan-out, an outbox, a schedule, a multi-tenant queue.
 
 **Every complete example below is executed against a real worker by
 `tests/test_examples_doc.py`.** The document is written from that file, so an
@@ -35,6 +35,7 @@ Its companions:
 9. [A recurring report](#9-a-recurring-report)
 10. [Waiting for the answer](#10-waiting-for-the-answer)
 11. [Streaming output a client renders live](#11-streaming-output-a-client-renders-live)
+12. [A per-tenant report pipeline](#12-a-per-tenant-report-pipeline)
 
 ---
 
@@ -655,6 +656,151 @@ exactly one other job.
 
 ---
 
+## 12. A per-tenant report pipeline
+
+One job class, several ways in, and a shared queue that several customers are
+on at once. Nothing below is a new component — every piece is an option on an
+enqueue. This is what the earlier examples turn into once the work belongs to
+_somebody_.
+
+```python
+class TenantReport(Job):
+    """One tenant's report: collect the rows, render them, stream the stages."""
+
+    async def task(self, tenant: str, month: str, revision: int = 1) -> dict[str, Any]:
+        rows = await self.step("collect", self.collect, tenant, month)
+        await self.stream_write("progress", {"stage": "collected", "rows": rows})
+        url = await self.step("render", self.render, tenant, month)
+        await self.stream_write("progress", {"stage": "rendered", "url": url})
+        await self.stream_close("progress")
+        return {"tenant": tenant, "revision": revision, "url": url}
+
+    def collect(self, tenant: str, month: str) -> int:
+        return len(warehouse.rows_for(tenant, month))  # fragment: the slow query
+
+    def render(self, tenant: str, month: str) -> str:
+        return f"s3://reports/{tenant}/{month}.pdf"
+```
+
+Two steps, because `collect` is the expensive half and the incident at the end
+of this example must not pay for it twice. Two stream rows, because the caller
+watches a progress list rather than waiting for the result.
+
+### One lane per tenant
+
+Every enqueue below carries `partition_key=tenant`. On its own that is a
+label; the queue is what gives it teeth:
+
+```bash
+pj-admin queues limits reports --max-concurrency 1 --partition-limits
+```
+
+`max_concurrency 1` now means **one report in flight per tenant** rather than
+one on the whole queue, so the customer who asks for a year of monthly
+reports at once cannot take the cap and leave everybody else's single report
+queued behind it. The test enqueues the noisy tenant's four reports _first_ —
+so they sort ahead of everything at every claim — then one report for a quiet
+tenant, runs two workers, and asserts both halves: the quiet tenant's report
+finishes before the noisy backlog does, and the noisy lane still ran strictly
+one job at a time.
+
+Jobs with no `partition_key` are not excluded from this; they form one lane
+among the others, which is what lets you adopt the key on a live queue one
+producer at a time. [OPERATIONS.md](OPERATIONS.md#partition_limits-the-same-limits-per-tenant)
+has the rest of the rules.
+
+### The dashboard button: a burst, collapsed
+
+A "Regenerate" button gets pressed. Then pressed again. `debounce()` parks one
+job and every further press moves it, replacing its arguments:
+
+```python
+job_id, created = await client.debounce(
+    "myapp.reports.TenantReport",
+    key=f"report:{tenant}",
+    period=1.0,  # fire one second after the clicking stops...
+    cap=2.0,  # ...and never later than two seconds after the first click
+    queue="reports",
+    partition_key=tenant,
+    tenant=tenant,
+    month="2026-07",
+    revision=revision,  # the LAST revision is the one rendered
+)
+```
+
+Three presses, one row, and the revision that runs is the third one — which is
+the whole reason this is `debounce()` and not a `deadline_key`. `cap` is
+written to the row by the first call, so a fourth press asking for a much
+longer quiet window still cannot push the job past it; the test asserts
+`run_after` has landed exactly on that ceiling.
+
+### The client tails the run
+
+```python
+async for update in client.read_stream(job_id, "progress"):
+    show(update["stage"])  # 'collected', then 'rendered'
+```
+
+The test asserts the job is still `running` when the first stage reaches the
+reader, and that the loop ends on the marker `stream_close()` wrote.
+
+### The billing webhook: at most once, ever
+
+Month-end close comes from somewhere else entirely — a provider webhook that
+retries on any non-2xx, including the ones your own timeout caused. This work
+must happen once:
+
+```python
+job_id, created = await client.enqueue_identified(
+    "myapp.reports.TenantReport",
+    identity_key=f"report:{tenant}:2026-07:final",
+    queue="reports",
+    partition_key=tenant,
+    tenant=tenant,
+    month="2026-07",
+)
+if not created:
+    log.info("close for %s was already job %s", tenant, job_id)
+```
+
+The retried webhook gets the same id back rather than an exception, and —
+unlike `deadline_key` — the key does **not** re-arm when the job finishes: the
+test finishes the job and calls again, and still gets the first id. That
+guarantee lasts as long as the row does, so the key names a month rather than
+just a tenant. `await client.get_job_by_identity(key)` looks it up later.
+
+### The incident: fork from the failing step
+
+The renderer breaks and the close dead-letters after the expensive collect had
+already succeeded. Deploy the fix, then fork:
+
+```python
+fork = await client.fork_job_from_failure(crashed_id)
+```
+
+The fork is a **new** job that starts at the step that failed, with the
+completed prefix copied in as checkpoints, so the collect is not paid for a
+second time — the test counts the real query and sees one call across both
+jobs. (The real fix is a deploy; the test's `render` takes a flag and the
+fork passes `kwargs_override` to flip it, which is the same thing with no
+deploy in the loop.) The fork inherits `partition_key`, because that says
+whose work this is; it does not inherit `identity_key`, because that says
+_which_ work it is and two live rows holding one identity would make it mean
+nothing. The crashed original is untouched, and stays crashed as the record
+of what happened.
+
+One detail the test pins because it surprises people: the fork's `progress`
+stream contains only the `rendered` row. Streams are the source job's output
+and are never copied, so the fast-forwarded `stream_write` checkpoint appends
+nothing to the fork's own stream.
+
+Note also what `--from-failure` resolved to: **step 3**, not step 2. `collect`
+is step 1, the `stream_write` after it is step 2, and `render` is step 3 —
+every checkpointed call takes a sequence number, streams included. See
+[the determinism obligation](writing-jobs.md#the-determinism-obligation).
+
+---
+
 ## Patterns at a glance
 
 | You want                           | Reach for                                                      |
@@ -662,6 +808,8 @@ exactly one other job.
 | fire and forget                    | `enqueue(...)`                                                 |
 | run later                          | `enqueue(..., run_after=when)`                                 |
 | never twice for the same request   | `enqueue(..., deadline_key=key)`, catch `UniqueViolationError` |
+| never twice, ever                  | `enqueue_identified(..., identity_key=key)` → `(id, created)`  |
+| a burst of clicks, run once        | `debounce(..., key=k, period=s, cap=s)`                        |
 | A then B then C                    | `waitfor_job=`, or `create_pipeline([...])`                    |
 | B needs A's result                 | `waitfor_job=a, use_result_from=a` → `upstream_result`         |
 | many in parallel, then one         | `create_fan_out(...)` → `enqueue(..., waitfor_group=g)`        |
@@ -669,9 +817,12 @@ exactly one other job.
 | the job must not outlive its order | `JobClient.enqueue_in_transaction(conn, ...)`                  |
 | this one first                     | `priority=` a **smaller** number than 100 (10 goes before 100) |
 | only on that hardware              | `capability="gpu"`, and `pj --cap gpu`                         |
+| only on that build                 | `app_version="…"`, and `pj --app-version …`                    |
+| no tenant starves another          | `partition_key=t` + `queues limits Q --partition-limits`       |
 | every night at 2am                 | `pj-admin schedule add` + `pj-scheduler`                       |
 | the caller wants the value         | `enqueue_handle(...)` → `await handle.wait()`                  |
 | the caller wants it piece by piece | `stream_write(key, v)` → `async for v in client.read_stream()` |
+| run the tail again, under new code | `fork_job_from_failure(id)` → a **new** id                     |
 | find it later                      | `tags={...}` → `search_jobs(tags=...)`                         |
 
 ## Practices these examples are built on
@@ -685,11 +836,15 @@ exactly one other job.
 4. **Queues are separated by what they need**, not by importance: a queue for
    blocking jobs, a queue for GPU jobs, a queue for the slow nightly batch.
    Priority orders work _within_ a queue; it does not isolate it.
-5. **Duplicates are prevented at enqueue** with `deadline_key`, so the
-   producer's own retry is free.
+5. **Duplicates are prevented at enqueue**, so the producer's own retry is
+   free — with `deadline_key` while the job is pending, `identity_key` for
+   work that must happen at most once, or `debounce()` for a burst whose
+   latest arguments are the right ones.
 6. **Failures are visible.** `crashed` is the dead-letter state; the row keeps
    its arguments, its backtrace and its checkpoints, and
-   `pj-admin jobs rerun <id> --resume` resumes from the last completed step.
+   `pj-admin jobs rerun <id> --resume` resumes from the last completed step —
+   or `jobs fork <id> --from-failure` re-runs the tail as a new job, leaving
+   the original as the record.
 
 ## See also
 

@@ -440,11 +440,12 @@ async def fork_job(
     and the fork will not see the later rows.
 
     What the new row inherits: job_class, kwargs (or ``kwargs_override``),
-    queue and prio (or the overrides), capability, tags, ``partition_key``
-    (whose work it is, so the fork stays in the same fair-share lane), and
+    queue and prio (or the overrides), capability, ``uid``, tags,
+    ``partition_key`` (all three say WHOSE work it is, so a tenant's fork is
+    still that tenant's job and stays in their fair-share lane), and
     admin_data —
     the retry/timeout policy describes the WORK, so the fork runs under the
-    same rules. What it does not: uid, deadline_key, identity_key and
+    same rules. What it does not: deadline_key, identity_key and
     debounce_key
     (identity and dedupe; two live rows sharing an idempotency key would make
     it mean nothing, and an identity_key promises exactly that there is only

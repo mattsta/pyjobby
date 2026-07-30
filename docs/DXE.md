@@ -63,7 +63,8 @@ recorded alongside its sequence number, and on replay a mismatch raises
 `NondeterminismError` rather than silently returning another step's result.
 (The primitives checkpoint under implicit names an operator will meet in
 `pj-admin jobs steps`: `dxe.sleep` for a durable sleep, `dxe.recv:<topic>`
-for a receive, `dxe.send:<dest>:<topic>` for a send.)
+for a receive, `dxe.send:<dest>:<topic>` for a send, `dxe.stream:<key>`
+for a stream append and `dxe.stream-close:<key>` for its closing marker.)
 
 ```
 step 2 was 'charge' on a previous attempt but is 'refund' now
@@ -673,17 +674,29 @@ copied and everything re-runs.
 
 | Copied | Not copied |
 | --- | --- |
-| `job_class`, `kwargs` (or an override) | `uid`, `deadline_key`, `identity_key`, `debounce_key` |
+| `job_class`, `kwargs` (or an override) | `deadline_key`, `identity_key`, `debounce_key` |
 | `queue`, `prio` (or overrides) | `schedule_id` |
 | `capability`, `tags` | `dag_id`, `run_group`, `waitfor_*` |
+| `uid`, `partition_key` | `app_version` (pass one to pin the fork) |
 | `admin_data` (retry/timeout policy) | `result`, error fields, `run_count`, `error_count` |
 
-The split is identity: everything that describes the **work** comes across,
-and nothing that names **this job** or wires it into somebody else's
-structure does. Two live rows sharing a `deadline_key` would make idempotent
+The split is identity: everything that describes the **work**, or says
+**whose** it is, comes across — and nothing that names **this particular
+job** or wires it into somebody else's structure does. So `uid` and
+`partition_key` are copied, because a tenant's fork is still that tenant's
+job and still counts against that tenant's fair-share lane, exactly as
+`tags` does. Two live rows sharing a `deadline_key` would make idempotent
 enqueue meaningless, an `identity_key` promises there is exactly one row
 holding it (its unique index would refuse the second), and a fork is
 nobody's DAG member.
+
+`app_version` is the one routing column that is deliberately **not**
+inherited, and the contrast with `partition_key` is the reason: a
+`partition_key` says whose work this is, an `app_version` says which build
+may run it — and the main reason to fork is to re-run the work under new
+code. A fork that inherited the pin would be stranded by the deploy the
+operator just made. Pass `app_version=` when the fork really does belong
+to a version.
 
 Lineage lives in `jorb.forked_from` (`ON DELETE SET NULL`, so a fork
 outlives the retention sweep that reaps its source) and, permanently, in the

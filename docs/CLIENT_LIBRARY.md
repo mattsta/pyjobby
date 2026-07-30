@@ -458,11 +458,11 @@ result = await client.wait_for_result(fork["job_id"])
 ```
 
 The fork inherits the job class, arguments, queue, priority, capability,
-tags, `partition_key` (whose work it is, so it stays in the same fair-share
-lane) and retry/timeout policy. It does **not** inherit identity or
-structure: `uid`, `deadline_key`, `identity_key`, `debounce_key`,
-`schedule_id`, DAG
-membership and dependency edges are left unset, because two live rows
+retry/timeout policy, and everything that says **whose** work it is —
+`uid`, `tags` and `partition_key`, so a tenant's fork stays theirs and
+stays in the same fair-share lane. It does **not** inherit identity or
+structure: `deadline_key`, `identity_key`, `debounce_key`, `schedule_id`,
+DAG membership and dependency edges are left unset, because two live rows
 sharing an idempotency key would make that key mean nothing — and an
 `identity_key` most of all, since its whole promise is that the row holding
 it is the only one. It does not inherit the source's `app_version` either, nor

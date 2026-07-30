@@ -1019,8 +1019,10 @@ def jobs_fork(
     completed prefix is not paid for twice.
 
     The fork inherits the job's class, arguments, queue, priority,
-    capability, tags and retry/timeout policy. It does NOT inherit identity:
-    no uid, no deadline_key, no identity_key, no debounce_key, no
+    capability, retry/timeout policy, and everything that says whose work it
+    is -- uid, tags and partition_key, so a tenant's fork stays theirs and
+    stays in their fair-share lane. It does NOT inherit identity:
+    no deadline_key, no identity_key, no debounce_key, no
     schedule, no DAG or
     dependency edges -- two live rows sharing an idempotency key would make
     that key mean nothing, and an identity_key promises there is only one. It

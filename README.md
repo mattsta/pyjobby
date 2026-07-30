@@ -73,6 +73,10 @@ class ProcessOrder(Job):
   task at its next await point; `self.cancelled` for sync loops.
 - Every attempt of every job is recorded in `jorb_history`; every
   checkpoint in `jorb_step` (`pj-admin jobs history/steps ID`).
+- **Forking** (`pj-admin jobs fork ID --from-failure`, `client.fork_job`)
+  makes a **new** job from an existing one's checkpoint prefix: deploy the
+  fix, re-run from the step that broke, do not pay for the expensive
+  prefix twice, and leave the crashed original as the record.
 - `run_epoch` fencing guarantees a superseded execution can never write
   results or checkpoints.
 
@@ -112,15 +116,21 @@ See [docs/STATECHARTS.md](docs/STATECHARTS.md).
 ```bash
 pj-admin queues pause imports          # takes effect on the next claim
 pj-admin queues limits imports --max-concurrency 8 --rate-limit 100 --rate-period 60
+pj-admin queues limits reports --max-concurrency 2 --partition-limits
+                                       # ...the same caps, counted PER TENANT
 pj-admin workers list                  # real registry: idle workers visible,
                                        # dead workers detected by heartbeat
 pj-admin doctor                        # executable health runbook
 ```
 
 Pause, concurrency caps, and rate limits are enforced _inside_ the claim
-statement — no worker restarts, no config deploys. Dead workers are
-detected by registry heartbeat and their jobs requeued globally by
-`pj-monitor` (jobs resume from their last completed step).
+statement — no worker restarts, no config deploys. With
+`--partition-limits` those same caps are counted per `partition_key`
+instead of per queue, so one tenant filling its own lane cannot starve the
+rest (and jobs carrying no key form one lane among the others, never a
+blackhole). Dead workers are detected by registry heartbeat and their jobs
+requeued globally by `pj-monitor` (jobs resume from their last completed
+step).
 
 ### Client Library
 
@@ -166,7 +176,11 @@ pj-admin jobs list --queue default --state queued
 pj-admin jobs inspect 12345
 pj-admin jobs cancel 12345
 pj-admin jobs retry 12345
-pj-admin jobs fork 12345 --from-failure   # a NEW job from the failing step on
+pj-admin jobs rerun 12345 --resume        # the SAME row, from its checkpoints
+pj-admin jobs fork 12345 --from-failure   # a NEW job from the failing step,
+                                          # leaving the original untouched
+pj-admin jobs why 12345                   # so why isn't it running?
+pj-admin jobs set-app-version 12345 --clear
 
 # Queue monitoring
 pj-admin queues list
@@ -267,6 +281,9 @@ deadline keys prevent duplicate jobs).
 - Backpressure handling (skip when overloaded)
 - Circuit breaker (auto-disable failing schedules)
 - Deadline keys (prevent duplicates)
+- Bounded catch-up after an outage (`--backfill-limit N` enqueues at most
+  the N most recent missed ticks; the default of 0 skips them all, and
+  there is no way to ask for "all of them")
 
 See [docs/RECURRING_SCHEDULER.md](docs/RECURRING_SCHEDULER.md) for complete documentation.
 
@@ -454,7 +471,7 @@ to `finished`, the job returns to `queued` for the requested future run.
   - On other platforms, only one of the workers will receive all web requests
 - Workers `LISTEN` on postgres `NOTIFY` channels (the triggers are in `pyjobby/sql/schema/90_notify.sql`), so a newly enqueued job wakes an idle worker **immediately**; the periodic poll (`--check-interval`, default 5 seconds) is only a fallback
 - If a worker finds a job, it claims it (state `claimed`), marks it `running` while executing, completes it, then immediately checks the job database for more jobs without entering the delay loop again
-  - see query `claim` for logic behind next job selection based on: matching server capability, most urgent job priority first (priority is a finishing position — the **smallest** `prio` is claimed first — and each worker claims only `prio <=` its own ceiling, `pj --max-prio`, default 1000), scheduled run time, and current job state
+  - see `claim_jorb()` in `pyjobby/sql/schema/30_claim.sql` for the logic behind next job selection: matching server capability, matching `app_version` when the job pins one (an unpinned job — the default — is claimable by every worker), the queue's pause/concurrency/rate controls (counted per queue, or per `partition_key` lane when the queue sets `partition_limits`), most urgent job priority first (priority is a finishing position — the **smallest** `prio` is claimed first — and each worker claims only `prio <=` its own ceiling, `pj --max-prio`, default 1000), scheduled run time, and current job state
 - If a worker doesn't find an eligible job, it waits for a `NOTIFY` or the next `--check-interval` poll
 - On startup, workers recover abandoned same-host jobs by checking pid liveness: jobs claimed by a process on this host that is no longer alive get requeued
 
@@ -704,8 +721,11 @@ job_ids = await client.enqueue_batch(jobs)
 
 ### Idempotent Jobs (Prevent Duplicates)
 
-While a queued row holds that key, a second enqueue raises instead of
-creating a duplicate:
+Three keys, and what separates them is what happens to the **duplicate**.
+
+`deadline_key` — while a queued row holds it, a second enqueue raises; the
+key re-arms the moment a worker claims the job, so tomorrow's digest is a
+legitimately new one:
 
 ```python
 import asyncpg
@@ -720,6 +740,30 @@ try:
     print(f"Payment job created: {job_id}")
 except asyncpg.UniqueViolationError:
     print("Payment already processing")
+```
+
+`identity_key` — the work happens **at most once**. The key is held in every
+state, so a duplicate returns the existing job rather than raising, and it
+never re-arms (retention is the horizon):
+
+```python
+job_id, created = await client.enqueue_identified(
+    "ShipOrder", identity_key=f"order:{order_id}:ship", order_id=order_id
+)
+```
+
+`debounce()` — a burst of equivalent enqueues collapses onto one job that
+fires once the burst stops, carrying the **latest** arguments:
+
+```python
+job_id, created = await client.debounce(
+    "ReindexDocument",
+    key=f"reindex:{doc_id}",
+    period=5.0,  # fire 5s after the edits stop...
+    cap=30.0,  # ...and never later than 30s after the first one
+    doc_id=doc_id,
+    revision=revision,
+)
 ```
 
 ### Priority
@@ -746,6 +790,22 @@ await client.enqueue("Whenever", priority=5000)  # ValueError, nothing written
 ```python
 # Route to GPU workers
 await client.enqueue("TrainModel", capability="gpu", model="resnet50")
+
+# Route to one BUILD: only a worker started with the same
+# `pj --app-version 2026.07.28+a1b2c3d` claims it. Jobs with no
+# app_version -- the default -- are still claimed by every worker, so a
+# rolling deploy never stops the fleet draining its ordinary backlog.
+await client.enqueue("MigrateTenant", app_version="2026.07.28+a1b2c3d")
+```
+
+### Fair Share Between Tenants
+
+```python
+# Whose work this is. Inert until the queue counts limits per lane:
+#   pj-admin queues limits reports --max-concurrency 2 --partition-limits
+# ...and then `2` means two in flight PER TENANT, so one customer's
+# thousand reports cannot starve everybody else's one.
+await client.enqueue("TenantReport", queue="reports", partition_key=tenant)
 ```
 
 ---

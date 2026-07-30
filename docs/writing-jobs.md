@@ -428,20 +428,28 @@ outside the job use `await client.get_event(job_id, "awaiting", timeout=...)`.
 
 ### `stream_write()` — output somebody reads while you produce it
 
-Three primitives publish out of a job, and they answer three different
-questions:
+Four ways a job says something to the outside, and each answers a different
+question. Pick by the **conversation**, not by which call is nearest:
 
-| Use               | To answer                     | Reader sees                                          |
-| ----------------- | ----------------------------- | ---------------------------------------------------- |
-| `set_event()`     | "where is it up to?"          | the LATEST value; earlier ones are overwritten        |
-| `stream_write()`  | "what has it produced?"       | EVERY value, in order, from any position              |
-| `send()`          | "who should act next?"        | one consumer takes each message and nobody else can   |
+| Use              | To answer               | Reader sees                                         | Readable    |
+| ---------------- | ----------------------- | --------------------------------------------------- | ----------- |
+| `return`         | "how did it come out?"  | ONE value, once, at the end                         | after       |
+| `set_event()`    | "where is it up to?"    | the LATEST value; earlier ones are overwritten      | during      |
+| `stream_write()` | "what has it produced?" | EVERY value, in order, from any position            | during      |
+| `send()`         | "who should act next?"  | one consumer takes each message and nobody else can | on delivery |
 
-So: a percentage, a phase name, a machine's current state is an **event** — a
-reader wants the current answer and does not care how many times it changed.
-A log line, a report row, a partial result is a **stream** — dropping the
-middle would lose the output itself. Work handed to exactly one other job is
-**mail**.
+So: the answer the caller was waiting for is the **result** — one value, at
+the end, and `enqueue_handle().wait()` or `use_result_from=` is how it
+travels. A percentage, a phase name, a machine's current state is an
+**event** — a reader wants the current answer and does not care how many
+times it changed. A log line, a report row, a partial result is a **stream**
+— dropping the middle would lose the output itself, and a reader can resume
+at an offset. Work handed to exactly one other job is **mail**.
+
+The two failure modes this table exists to prevent: returning a growing list
+so a caller can watch it (nothing can read a result until the job ends —
+stream it), and streaming a value that is only ever read last (two rows per
+write to deliver what `return` delivers in none).
 
 ```python
 class ReportJob(Job):
@@ -521,7 +529,9 @@ Two things `self.cancelled` is **not**:
 Checkpoints are keyed by **position**: the first checkpointed call in an
 attempt is step 1, the second is step 2. So the _sequence_ of those calls
 must be the same on every attempt — `step()`, `transaction()`, `sleep()`,
-`send()` and `recv()` all consume a number.
+`send()`, `recv()`, `stream_write()` and `stream_close()` all consume a
+number. (`set_event()` does not: it overwrites one row per key and has
+nothing to replay.)
 
 This is enforced. The recorded name is compared on replay:
 

@@ -2333,10 +2333,12 @@ class JobClient:
         id; 4 copies steps 1-3.
 
         The fork inherits job_class, kwargs (or `kwargs_override`), queue and
-        priority (or the overrides), capability, tags and the retry/timeout
-        policy in admin_data. It does NOT inherit identity or structure: uid,
-        deadline_key, identity_key, debounce_key, schedule_id, dag_id,
-        run_group and the
+        priority (or the overrides), capability, the retry/timeout policy in
+        admin_data, and everything that says WHOSE work it is: uid, tags and
+        partition_key, so a tenant's fork is still that tenant's job and
+        still counts against that tenant's lane. It does NOT inherit
+        identity or structure: deadline_key, identity_key, debounce_key,
+        schedule_id, dag_id, run_group and the
         waitfor edges are all left unset, because two live rows sharing an
         idempotency key (or a DAG slot) would make that key mean nothing —
         and an identity_key most of all, since ITS whole promise is that the
