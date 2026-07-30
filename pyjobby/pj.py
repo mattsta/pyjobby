@@ -2145,7 +2145,16 @@ class Job:
         if self._dxe_steps and self._dxe_seq < max(self._dxe_steps):
             return False
         async with self.s.cxn.transaction():  # type: ignore[union-attr]
-            fenced = await self.s.ex("compact-fence", self.job["id"], self._dxe_epoch)
+            # Direct statement execution, NOT self.s.ex: ex reconnects on a
+            # lost connection and RETRIES the statement on the new one, in
+            # autocommit -- which for the unfenced delete below would mean
+            # wiping checkpoints outside the transaction, outside the lock,
+            # possibly for a NEW attempt the monitor started during the same
+            # outage. Same rule as _record_step(atomic=True): inside a
+            # transaction, a connection error must abandon the attempt.
+            fenced = await self.s.stmts["compact-fence"].fetch(
+                self.job["id"], self._dxe_epoch
+            )
             if not fenced:
                 raise dxe.StaleExecutionError(
                     f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
@@ -2153,7 +2162,7 @@ class Job:
             # No epoch filter on this one: it is unreachable except behind the
             # fence above, in this transaction, on the connection holding the
             # lock that fence took.
-            gone = await self.s.ex("compact-steps", self.job["id"])
+            gone = await self.s.stmts["compact-steps"].fetch(self.job["id"])
         removed = int(gone[0]["removed"])
         self._dxe_steps.clear()
         self._dxe_seq = 0

@@ -258,16 +258,21 @@ class TestSoak:
         assert "caught up" in monitor.log_text()
 
         # jorb_stream reaches a steady state too, on the SEPARATE and shorter
-        # checkpoint window. It is bounded here the same way jorb_rows is --
-        # by rate x window rather than by throughput -- but per STREAM ROW:
-        # 4 producers per 100 jobs, twenty rows each, so the arrival rate of
-        # stream rows is 0.8 x the job rate. ~200 bytes a row with its index,
-        # three windows of slack, and a floor because an empty table is still
-        # a few pages.
-        stream_bound = 2 + (SOAK_RATE * 0.8 * 20 * 60 * 3 * 200) / 1e6
-        assert final.numbers["stream_mb"] < stream_bound, (
-            f"jorb_stream is {final.numbers['stream_mb']:,.1f} MB against a "
-            f"{stream_bound:,.1f} MB bound: the checkpoint sweep is not "
+        # checkpoint window -- asserted on ROW COUNT, which is what the sweep
+        # governs. Disk size cannot carry this assertion at soak durations:
+        # deleted rows leave pages behind that autovacuum reclaims lazily, so
+        # a healthy table's pg_total_relation_size plateaus megabytes above
+        # its live-row mass and a broken sweep hides inside the bloat.
+        # Arithmetic: 4 producers per 100 jobs x twenty rows each = stream
+        # rows arrive at 0.8 x the job rate; the window is the CHECKPOINT
+        # retention (30s); four windows of slack for sweep cadence. A broken
+        # sweep exceeds this even in the default 180-second run and diverges
+        # further at any longer duration.
+        stream_rows = await db_pool.fetchval("SELECT count(*) FROM jorb_stream")
+        stream_row_bound = SOAK_RATE * 0.8 * 30 * 4
+        assert stream_rows < stream_row_bound, (
+            f"jorb_stream holds {stream_rows:,} rows against a "
+            f"{stream_row_bound:,.0f}-row bound: the checkpoint sweep is not "
             f"keeping up with the streams, and a stream's row count is set by "
             f"the job's OUTPUT rather than by the job count"
         )
