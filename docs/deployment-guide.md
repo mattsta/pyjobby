@@ -116,7 +116,8 @@ Every process reaches the database one of two ways.
 
 ```toml
 # /etc/pyjobby/pyjobby.toml
-prio_ceiling = 1000  # must match what your `pj` workers claim under
+prio_ceiling = 1000           # must match what your `pj` workers claim under
+liveness_grace_seconds = 60   # when a silent worker counts as dead
 
 [db_params]
 database = "pyjobby"
@@ -168,6 +169,22 @@ A deployment that sets it usually templates it from the build:
 ```toml
 app_version = "2026.07.28+a1b2c3d"
 ```
+
+`liveness_grace_seconds` (a number, default 60) is how long a worker may go
+without a heartbeat before the platform calls it dead. **Five processes read
+it, and only one of them acts on it**: `pj-monitor` requeues a dead worker's
+in-flight jobs, while `pj-admin doctor`, `pj-web`'s `/metrics` and workers
+page, and the `pj-ws` dashboard merely report the same judgement. That is why
+it belongs in the file rather than only on `pj-monitor --liveness-grace`:
+raise it on the monitor alone and every UI goes on calling those workers
+dead, five minutes before anything reclaims their jobs. The flag still wins
+for a one-off run.
+
+Keep it comfortably above **twice** the worker heartbeat interval (`pj
+--heartbeat-interval`, default 10s). A grace the heartbeat cannot reliably
+beat makes LIVE workers look dead mid-job and requeues their work out from
+under them, repeatedly; `pj-monitor` warns at startup when the two are
+configured into that state.
 
 `db_params` is **`asyncpg.connect()` keyword arguments**, and only those.
 Do not put `min_size` or `max_size` in it: workers, the scheduler,

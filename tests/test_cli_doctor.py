@@ -34,7 +34,7 @@ from click.testing import CliRunner
 
 from pyjobby import migrations
 from pyjobby.cli import DOCTOR_REQUIRED_TRIGGERS, cli
-from pyjobby.client import DEFAULT_PRIO_CEILING
+from pyjobby.enqueue_rules import DEFAULT_PRIO_CEILING
 from tests.conftest import reserved_unused_port
 from tests.schema_fixtures import drop_database
 
@@ -523,6 +523,75 @@ class TestDoctorWorkers:
         status, message = parse_checks(result.output)["workers"]
         assert status == "PASS"
         assert message.endswith("live worker(s) seen in last 60s")
+
+
+class TestDoctorHonorsTheConfiguredLivenessGrace:
+    """Doctor judges liveness by the DEPLOYMENT's threshold, not a constant.
+
+    pj-monitor is the process that ACTS on this number -- it requeues a silent
+    worker's in-flight jobs -- and doctor only reports on it. When the number
+    was a constant with a flag on the monitor alone, a deployment running
+    `liveness_grace_seconds = 300` had a doctor that called workers dead five
+    minutes before anything requeued their jobs, and a "no live workers"
+    verdict over a fleet that was fine. Both halves read the config file now,
+    so they cannot disagree.
+    """
+
+    @staticmethod
+    def _config(tmp_path, db_params, grace):
+        from pyjobby.procs import write_config_toml
+
+        return str(
+            write_config_toml(
+                tmp_path / "pyjobby.toml", db_params, liveness_grace_seconds=grace
+            )
+        )
+
+    async def test_a_worker_stale_by_the_default_is_live_under_a_raised_grace(
+        self, dsn, db_pool, db_params, unique_queue, tmp_path
+    ):
+        """The worker the default calls dead and a 300s grace calls alive.
+
+        Five minutes without a heartbeat: WARN at the platform default (the
+        test above pins that), PASS here -- and the message has to quote the
+        threshold it actually used, or the operator cannot tell which number
+        produced the verdict.
+        """
+        await insert_worker(db_pool, unique_queue, last_seen_age=timedelta(minutes=5))
+        config = self._config(tmp_path, db_params, 3600)
+
+        def _invoke():
+            return CliRunner().invoke(cli, ["-c", config, "--dsn", dsn, "doctor"])
+
+        result = await asyncio.to_thread(_invoke)
+
+        assert parse_checks(result.output)["workers"] == (
+            "PASS",
+            "1 live worker(s) seen in last 3600s",
+        )
+        assert result.exit_code == 0, result.output
+
+    async def test_a_fresh_worker_is_dead_under_a_tightened_grace(
+        self, dsn, db_pool, db_params, unique_queue, tmp_path
+    ):
+        """The other direction, so the test cannot pass by ignoring the key.
+
+        A worker seen 30 seconds ago is live at the default and dead under a
+        10-second grace -- which is a misconfiguration, and reporting it is
+        the point: this is what the fleet's monitor would be sweeping with.
+        """
+        await insert_worker(db_pool, unique_queue, last_seen_age=timedelta(seconds=30))
+        config = self._config(tmp_path, db_params, 10)
+
+        def _invoke():
+            return CliRunner().invoke(cli, ["-c", config, "--dsn", dsn, "doctor"])
+
+        result = await asyncio.to_thread(_invoke)
+
+        assert parse_checks(result.output)["workers"] == (
+            "WARN",
+            "no live workers seen in last 10s",
+        )
 
 
 # ============================================================================

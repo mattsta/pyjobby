@@ -1,9 +1,34 @@
 #!/usr/bin/env python3
-"""
-Pyjobby CLI Management Tools
+"""``pj-admin``: the operator's command line over a running installation.
 
-Command-line interface for managing jobs, queues, and workers.
-Built on top of the admin API for clean separation of concerns.
+MOST OF IT IS A THIN SHELL OVER ``AdminAPI``. Every verb that reads or
+changes jobs, queues, workers, schedules and DAGs opens its connection
+through ``get_api``, which is the only place an ``AdminAPI`` is constructed
+here -- so no command can be built without this deployment's ``prio_ceiling``
+and ``liveness_grace_seconds``, and none of them can answer a question
+differently from the web admin, which calls the same methods. That is the
+"clean separation" this file used to merely claim: the CLI owns argument
+parsing, output formatting and exit codes, and owns no semantics.
+
+WHAT DELIBERATELY BYPASSES IT, AND WHY: ``doctor``. A health check is not an
+admin operation, and three kinds of its probes cannot come from the API:
+
+* **Plan-pinned probes.** Several checks are written as SQL here because
+  their COST is the point -- a doctor that scans the job table on a
+  production install is a doctor nobody runs twice. Those statements say so
+  where they stand, naming the index each one rides.
+* **Probes whose SHAPE the API does not return.** ``worker_stats`` gives the
+  fleet-wide counts; doctor's job-threads check has to NAME the stuck workers
+  so the operator knows which hosts to restart, so it reads the rows itself.
+* **Catalog and server checks.** Schema shape, triggers, NOTIFY queue
+  saturation: these are questions about the DATABASE, and ``migrations`` owns
+  the answers.
+
+Everything in doctor that is NOT one of those three goes through the API like
+the rest of the file -- the live-worker count is ``worker_stats``, the
+unclaimable sweep is ``unclaimable_jobs`` -- because a health check that
+computes a number the platform already computes is a second answer for the
+operator to reconcile, and it will drift.
 """
 
 from __future__ import annotations
@@ -21,10 +46,9 @@ from click.core import ParameterSource
 
 from . import db, migrations
 from .admin_api import CLEAR_QUEUE_STATES, UNSET, AdminAPI, Unset
-from .client import DEFAULT_PRIO_CEILING, validate_priority
 from .configloader import load_config_from_file
 from .db import JobState
-from .monitor import DEFAULT_LIVENESS_GRACE_SECONDS
+from .enqueue_rules import DEFAULT_PRIO_CEILING, validate_priority
 
 # Terminal output lives in termout.py, which pj-bench shares; imported by
 # name here so every call site in this file (and everything importing them
@@ -242,6 +266,35 @@ def load_prio_ceiling(config_path: str, *, named: bool = False) -> int:
     return int(ceiling) if ceiling is not None else DEFAULT_PRIO_CEILING
 
 
+def load_liveness_grace(config_path: str, *, named: bool = False) -> float:
+    """This deployment's liveness threshold, from the config file.
+
+    THE SIBLING OF ``load_prio_ceiling``, and unfailing for the same reason:
+    it is a lookup every command does, including the ones running on --dsn
+    with no config file at all.
+
+    It matters more here than the argument for the ceiling does, because this
+    number is what ANOTHER process is acting on. `pj-admin doctor` is where an
+    operator goes to ask "is my fleet healthy?", and a doctor judging liveness
+    by 60s while pj-monitor sweeps at 300s reports dead workers whose jobs
+    nothing is requeueing -- or, worse, the reverse: a clean bill of health
+    over workers the monitor is already recovering from.
+    """
+    try:
+        config = load_config_from_file(config_path, keys=["liveness_grace_seconds"])
+    except RuntimeError as e:  # ConfigError: missing, unreadable, or bad
+        if named:
+            print_warning(
+                f"Could not read {config_path} ({e}); worker liveness is "
+                f"judged by the default {db.DEFAULT_LIVENESS_GRACE_SECONDS:g}s "
+                f"instead of the liveness_grace_seconds declared there, which "
+                f"may not be what pj-monitor is sweeping with.",
+                err=True,
+            )
+        return db.DEFAULT_LIVENESS_GRACE_SECONDS
+    return db.resolve_liveness_grace(None, config.get("liveness_grace_seconds"))
+
+
 def max_prio_option(command: Callable[..., Any]) -> Callable[..., Any]:
     """The `--max-prio` flag, declared once for every verb that writes a
     priority (`schedule add`, `jobs set-priority`).
@@ -277,12 +330,18 @@ async def get_api(
     ``prio_ceiling`` is an explicit override (a `--max-prio` flag); without
     one the config file's declaration applies.
     """
+    named = ctx.obj.get("config_named", False)
     conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
     if prio_ceiling is None:
-        prio_ceiling = load_prio_ceiling(
-            ctx.obj["config"], named=ctx.obj.get("config_named", False)
-        )
-    return conn, AdminAPI(conn, prio_ceiling=prio_ceiling)
+        prio_ceiling = load_prio_ceiling(ctx.obj["config"], named=named)
+    return conn, AdminAPI(
+        conn,
+        prio_ceiling=prio_ceiling,
+        # Same argument as the ceiling: the API is never constructed without
+        # this deployment's number, so `pj-admin workers` cannot call a worker
+        # dead that pj-monitor considers alive.
+        liveness_grace_seconds=load_liveness_grace(ctx.obj["config"], named=named),
+    )
 
 
 # =========================================================================
@@ -3558,6 +3617,19 @@ def doctor(
             return 1
         doc.report("PASS", "database", "connected")
 
+        # The checks that are plain admin reads go through the admin API, on
+        # this deployment's liveness threshold -- so doctor's verdict on a
+        # worker is the same verdict `pj-admin workers` gives and the same one
+        # pj-monitor is about to act on. The probes that stay on `conn` below
+        # are the ones whose PLAN is pinned or whose shape the API does not
+        # return; each says so where it is.
+        api = AdminAPI(
+            conn,
+            liveness_grace_seconds=load_liveness_grace(
+                ctx.obj["config"], named=ctx.obj.get("config_named", False)
+            ),
+        )
+
         try:
             # THE SCHEMA CHECK, and the one that used to be a lie. It asked
             # two questions -- is `jorb` there, and does schema_migrations
@@ -3642,20 +3714,24 @@ def doctor(
             status, message = notify_queue_verdict(notify_usage)
             doc.report(status, "notify-queue", message)
 
-            # Live workers, judged by THE liveness threshold the monitor
-            # sweeps with — a literal here drifted from --liveness-grace
-            # and called live workers dead
-            grace = int(DEFAULT_LIVENESS_GRACE_SECONDS)
-            live_workers = await conn.fetchval(f"""
-                SELECT COUNT(*) FROM jorb_worker
-                WHERE shutdown_at IS NULL
-                  AND last_seen > now() - interval '{grace} seconds'
-            """)
+            # Live workers, judged by THE liveness threshold pj-monitor
+            # sweeps with -- this deployment's `liveness_grace_seconds`, not a
+            # constant. A literal here drifted from --liveness-grace once and
+            # called live workers dead; a constant would do it again the day a
+            # deployment raises the file's value.
+            #
+            # Through AdminAPI rather than a probe of its own: "count workers
+            # with a fresh heartbeat" is `worker_stats`, exactly, and a second
+            # spelling of it is a second answer for the operator to reconcile.
+            # The probes below that stay on `conn` are the ones that are NOT
+            # duplicates -- see each.
+            grace = api.liveness_grace_seconds
+            live_workers = (await api.worker_stats())["live_workers"]
             doc.warn_if(
                 not live_workers,
                 "workers",
-                f"{live_workers} live worker(s) seen in last {grace}s",
-                f"no live workers seen in last {grace}s",
+                f"{live_workers} live worker(s) seen in last {grace:g}s",
+                f"no live workers seen in last {grace:g}s",
             )
 
             # Live workers that are claiming nothing. Checked immediately
@@ -3669,15 +3745,23 @@ def doctor(
             # One row per worker, filtered on the same live predicate
             # jorb_worker_live_idx exists for: bounded by fleet size, never by
             # the job table.
-            stuck = await conn.fetch(f"""
+            #
+            # NOT AdminAPI.job_thread_stats, and not a duplicate of it: that
+            # returns the fleet-wide aggregate, while this report has to NAME
+            # the stuck workers (stuck_worker_summary) so the operator knows
+            # which hosts to restart. The grace is the same object either way.
+            stuck = await conn.fetch(
+                """
                 SELECT id, host, pid, queue, job_threads, job_threads_abandoned
                 FROM jorb_worker
                 WHERE shutdown_at IS NULL
-                  AND last_seen > now() - interval '{grace} seconds'
+                  AND last_seen > now() - make_interval(secs => $1)
                   AND job_threads > 0
                   AND job_threads_abandoned >= job_threads
                 ORDER BY id
-            """)
+                """,
+                grace,
+            )
             doc.warn_if(
                 bool(stuck),
                 "job-threads",
@@ -3812,7 +3896,7 @@ def doctor(
             # irrelevant to it, because the comparison is against what the
             # live workers actually registered, not against what this host's
             # config declares.
-            unclaimable = await AdminAPI(conn).unclaimable_jobs()
+            unclaimable = await api.unclaimable_jobs()
             blocked_total = sum(r["count"] for r in unclaimable)
             blocked_capped = any(r["count_capped"] for r in unclaimable)
             doc.warn_if(

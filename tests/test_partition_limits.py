@@ -40,8 +40,8 @@ import asyncpg
 import pytest
 
 from pyjobby.admin_api import AdminAPI
-from pyjobby.client import MAX_PARTITION_KEY_LENGTH
 from pyjobby.db import fork_job
+from pyjobby.enqueue_rules import MAX_KEY_LENGTH
 
 from .test_claim_contention import CLAIM_LOCK_KEY, claim_once
 from .test_cli_errors import dsn_for, run_cli
@@ -590,13 +590,13 @@ class TestPartitionKeyOnTheEnqueuePaths:
             await job_client.enqueue(
                 "tests.dxe_jobs.OkJob",
                 queue=unique_queue,
-                partition_key="x" * (MAX_PARTITION_KEY_LENGTH + 1),
+                partition_key="x" * (MAX_KEY_LENGTH + 1),
             )
 
     async def test_a_key_at_the_bound_is_accepted(
         self, job_client, db_pool, unique_queue
     ):
-        key = "x" * MAX_PARTITION_KEY_LENGTH
+        key = "x" * MAX_KEY_LENGTH
         job_id = await job_client.enqueue(
             "tests.dxe_jobs.OkJob", queue=unique_queue, partition_key=key
         )

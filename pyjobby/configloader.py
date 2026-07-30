@@ -18,6 +18,7 @@ would fail later, further from the cause.
     # pyjobby.toml
     prio_ceiling = 1000
     app_version = "2026.07.28+a1b2c3d"
+    liveness_grace_seconds = 60
 
     [db_params]
     host = "postgres.internal"
@@ -30,12 +31,12 @@ would fail later, further from the cause.
     sites = [{ host = "127.0.0.1", port = 8080 }]
     paths = []
 
-Note the ORDER: ``prio_ceiling`` and ``app_version`` come BEFORE the first
-table header, and they have to. TOML has no way back out to the root, so a
-bare key written after ``[db_params]`` is a db_params key -- which is how a
-deployment ends up with a priority ceiling that is silently an asyncpg
-connect() keyword nobody passes. ``load_config_from_file`` refuses that
-arrangement by name rather than letting it load.
+Note the ORDER: every bare key comes BEFORE the first table header, and they
+have to. TOML has no way back out to the root, so a bare key written after
+``[db_params]`` is a db_params key -- which is how a deployment ends up with a
+priority ceiling that is silently an asyncpg connect() keyword nobody passes.
+``load_config_from_file`` refuses that arrangement by name rather than letting
+it load.
 
 ``db_params`` is asyncpg.connect() keyword arguments and only those
 (``ASYNCPG_CONNECT_KEYS``).
@@ -48,6 +49,14 @@ deployment does not pin work to a code version at all.
 it from the same file: ``pj --app-version`` defaults to it (what the workers
 advertise) and ``JobClient.from_config`` defaults to it (what an enqueue
 stamps). Two places to write the same string is one place to forget it.
+
+``liveness_grace_seconds`` is here for a stronger version of that argument:
+it has FIVE readers. ``pj-monitor`` sweeps by it (requeueing a silent
+worker's in-flight jobs) while ``pj-admin doctor``, ``/metrics``, the web
+admin's workers page and the WebSocket dashboard all merely REPORT by it --
+so ``pj-monitor --liveness-grace 300`` alone produces a fleet whose monitor
+considers a worker alive and whose every UI calls it dead. The flag remains,
+for a one-off run; the file is how a deployment says it once.
 """
 
 from __future__ import annotations
@@ -89,7 +98,13 @@ _MAX_CONFIG_BYTES = 1024 * 1024
 #: the setting at its default in every process, forever, with the file
 #: sitting there looking like it said otherwise.
 KNOWN_TOP_LEVEL_KEYS = frozenset(
-    {"app_version", "db_params", "prio_ceiling", "web_listen"}
+    {
+        "app_version",
+        "db_params",
+        "liveness_grace_seconds",
+        "prio_ceiling",
+        "web_listen",
+    }
 )
 
 #: Every key ``[db_params]`` may hold: the ``asyncpg.connect()`` keyword

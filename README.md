@@ -584,6 +584,11 @@ class SendEmailJob(Job):
 # The priority ceiling this deployment's workers run with (`pj --max-prio`).
 prio_ceiling = 1000
 
+# Seconds without a heartbeat before a worker counts as dead. pj-monitor
+# sweeps by it; doctor, /metrics, the workers page and the pj-ws dashboard
+# all report by it.
+liveness_grace_seconds = 60
+
 [db_params]
 database = "pyjobby"
 user = "postgres"

@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import signal
+import subprocess
 import uuid
 from collections import Counter
 from datetime import UTC, datetime, timedelta
@@ -21,15 +22,19 @@ from datetime import UTC, datetime, timedelta
 import aiohttp
 import pytest
 
+from pyjobby import migrations
 from pyjobby.procs import (
     daemon,
     dsn_from,
     free_port,
     port_is_open,
+    script_path,
     spawn,
     terminate,
     wait_until,
+    write_config_toml,
 )
+from tests.schema_fixtures import ScratchDatabases
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -420,6 +425,36 @@ class TestSchedulerEntryPoint:
                 "SELECT count(*) FROM jorb WHERE queue = $1", unique_queue
             )
         assert count == 0
+
+    async def test_a_database_without_the_schema_exits_2_naming_the_remedy(
+        self, db_params, tmp_path
+    ):
+        """The startup precondition pj and pj-monitor already answered, and
+        this daemon did not.
+
+        Pointed at a reachable but schema-less database, pj-scheduler used to
+        come up, enter its poll loop and fail every poll forever — while the
+        process stayed healthy to systemd and to every liveness check, and no
+        schedule fired. Nothing in that picture says "migrate". It has to be
+        an exit code, which means asking BEFORE the loop.
+        """
+        factory = ScratchDatabases(db_params)
+        try:
+            params = await factory.create(install=None)
+            config = write_config_toml(tmp_path / "pyjobby.toml", params)
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                [str(script_path("pj-scheduler")), "--config", str(config)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        finally:
+            await factory.close()
+
+        assert proc.returncode == 2, proc.stdout + proc.stderr
+        assert params["database"] in proc.stderr
+        assert migrations.MIGRATE_REMEDY in proc.stderr
 
 
 # ============================================================================

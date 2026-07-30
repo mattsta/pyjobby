@@ -34,7 +34,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient
 
 from pyjobby import websocket_server
-from pyjobby.client import DEFAULT_PRIO_CEILING
+from pyjobby.enqueue_rules import DEFAULT_PRIO_CEILING
 from pyjobby.procs import wait_until
 from pyjobby.websocket_server import (
     ACTIONS,

@@ -1,13 +1,49 @@
 #!/usr/bin/env python3
-"""
-Pyjobby Recurring Scheduler
+"""``pj-scheduler``: the daemon that turns cron expressions into jobs.
 
-Production-grade recurring job scheduler with comprehensive safety features:
-- Max concurrent jobs per schedule
-- Random jitter to prevent thundering herd
-- Backpressure handling (skip if queue overloaded)
-- Circuit breaker (disable after consecutive failures)
-- Comprehensive logging and metrics
+It polls ``jorb_schedule`` for rows whose ``next_run`` has arrived, enqueues
+one job per due tick, and advances ``next_run``. Nothing else in the platform
+mints work on a timer.
+
+SEVERAL INSTANCES ARE SAFE, and that is the design constraint everything here
+answers to: a schedule row is LOCKED while it is being fired, so exactly one
+scheduler owns a tick, and the enqueue itself carries a deadline key so even
+a lost lock cannot produce two jobs for one tick. Running one is enough;
+running two is how the schedule survives a host.
+
+A SCHEDULE IS A GENERATOR, WHICH IS WHY IT NEEDS BRAKES. Every other producer
+in the system is a caller who will notice; a schedule fires whether or not
+anything is consuming, forever, so a misconfigured one is an unbounded stream
+rather than a bad request. Hence four refusals. Every one of them records
+what it did in ``jorb_schedule_log``, and they split by whether the next poll
+could plausibly answer differently.
+
+SKIP THIS TICK, try again next poll -- the condition is transient:
+
+* **max_concurrent_jobs** -- this schedule's own jobs still in flight
+  (``CONCURRENCY_COUNT_SQL``); a job that takes longer than its period would
+  otherwise pile up its own successors.
+* **backpressure_threshold** -- the target queue's depth
+  (``BACKPRESSURE_COUNT_SQL``); firing into a queue nobody is draining just
+  makes the backlog it is measuring worse.
+
+DISABLE THE SCHEDULE -- polling again cannot change the answer, and a
+schedule left enabled in these states produces one failure per poll forever:
+
+* **circuit_breaker_threshold** -- consecutive failures; a schedule whose
+  jobs always crash stops rather than filling the DLQ on a timer.
+* **the fleet's priority ceiling** -- a priority above what any worker claims
+  would mint a job that is never claimed, never fails and never reaches the
+  DLQ. (An unevaluatable cron expression or timezone is disabled by the same
+  path and for the same reason -- see ``disable_unevaluatable``.)
+
+``jitter_seconds`` spreads the fire time of schedules that share a minute;
+``backfill_limit`` (0 by default, and it stays 0) decides how many ticks
+missed while nothing was running are caught up rather than skipped.
+
+Both counting statements are module constants because ``pj-bench plans``
+EXPLAINs them: they run once per firing of every schedule, and each has a
+partial index whose predicate they must match literally -- see each constant.
 """
 
 from __future__ import annotations
@@ -27,6 +63,7 @@ from .client import ENQUEUE_SQL, JobClient
 from .cron import missed_cron_runs, next_cron_run
 from .db import utcnow
 from .enqueue_rules import DEFAULT_PRIO_CEILING
+from .lifecycle import IN_FLIGHT_STATES_SQL
 
 #: "How many of this schedule's jobs are still in flight?", asked once per
 #: firing of every schedule by ``ScheduleSafetyManager.check_concurrency``.
@@ -59,11 +96,11 @@ CONCURRENCY_COUNT_SQL = """
 #: queued arm walks the queue's own backlog (the number being measured);
 #: the in-flight arm walks fleet-wide in-flight work and discards other
 #: queues', bounded by workers, never by the table.
-BACKPRESSURE_COUNT_SQL = """
+BACKPRESSURE_COUNT_SQL = f"""
     SELECT (SELECT count(*) FROM jorb
              WHERE queue = $1 AND state = 'queued')
          + (SELECT count(*) FROM jorb
-             WHERE state IN ('claimed', 'running') AND queue = $1)
+             WHERE state IN ({IN_FLIGHT_STATES_SQL}) AND queue = $1)
 """
 
 
@@ -1159,7 +1196,7 @@ class SchedulerWorker:
         with backoff until it works or stop() is called. With no db_params
         (a caller-managed connection) there is nothing to rebuild: log that
         loudly and back off so the loop does not spin."""
-        from . import db
+        from . import db, migrations
 
         if self.db_params is None:
             logger.error(
@@ -1179,7 +1216,14 @@ class SchedulerWorker:
                 logger.info("Scheduler database connection re-established")
                 return
             except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as e:
-                logger.warning(f"Scheduler reconnect failed ({e}); retrying in 5s")
+                # The hint is the whole point of logging this twice a minute:
+                # a network blip and a database with no schema produce the
+                # same line otherwise, and only the second one has an answer.
+                hint = migrations.schema_error_hint(e)
+                logger.warning(
+                    f"Scheduler reconnect failed ({e}); retrying in 5s"
+                    + (f". {hint}" if hint else "")
+                )
                 await self._sleep(5)
 
     async def _sleep(self, seconds: float) -> None:
@@ -1259,6 +1303,9 @@ def main() -> None:
         Safe to run multiple instances: schedules are row-locked while
         being fired and duplicate jobs are prevented by deadline keys.
         """
+        import sys
+
+        from . import migrations
         from .configloader import load_config_from_file
 
         cfg = load_config_from_file(config, keys=["db_params", "prio_ceiling"])
@@ -1268,6 +1315,16 @@ def main() -> None:
 
         # precedence: explicit flag > config file's prio_ceiling > default
         ceiling = max_prio if max_prio is not None else cfg.get("prio_ceiling")
+
+        # Ask the question every poll is about to ask, once, before the loop --
+        # the same startup precondition pj and pj-monitor answer with exit code
+        # 2, and the same failure without it: against a schema-less database
+        # this daemon polls forever, logging one failure per cycle, while every
+        # health check reports a healthy scheduler and no schedule ever fires.
+        problem = asyncio.run(migrations.preflight_problem(db_params))
+        if problem is not None:
+            click.echo(problem, err=True)
+            sys.exit(2)
 
         asyncio.run(
             run_scheduler(db_params, poll_interval=poll_interval, prio_ceiling=ceiling)

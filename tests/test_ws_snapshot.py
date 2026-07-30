@@ -66,6 +66,11 @@ TICK = 0.05
 #: The window the snapshot asks for, as the server binds it.
 WINDOW = timedelta(seconds=60)
 
+#: ...and the liveness grace, which is the server's second bound argument now
+#: that it is the deployment's `liveness_grace_seconds` rather than a constant
+#: interpolated into the statement at import.
+GRACE = db.DEFAULT_LIVENESS_GRACE_SECONDS
+
 #: "Seq Scan on jorb", and not on jorb_queue/jorb_worker/jorb_history.
 _SEQ_SCAN_ON_JORB = re.compile(r"Seq Scan on jorb\b(?!_)")
 
@@ -472,7 +477,7 @@ class TestSnapshotPlan:
         """
         await seed_for_plans(db_pool)
 
-        plan = await plan_for(db_pool, SNAPSHOT_SQL, WINDOW)
+        plan = await plan_for(db_pool, SNAPSHOT_SQL, WINDOW, GRACE)
 
         # `jorb_queue` and `jorb_worker` are control tables — one row per
         # queue, one per worker process — so scanning them is correct and is
@@ -488,7 +493,7 @@ class TestSnapshotPlan:
         )
         assert heap_pages > 100, "seed too small for this to prove anything"
 
-        plan = await plan_for(db_pool, SNAPSHOT_SQL, WINDOW)
+        plan = await plan_for(db_pool, SNAPSHOT_SQL, WINDOW, GRACE)
         buffers = [int(m) for m in re.findall(r"shared hit=(\d+)", plan)]
         assert buffers, f"no buffer accounting in plan:\n{plan}"
         assert max(buffers) < heap_pages, (
@@ -884,3 +889,39 @@ class TestWatchJob:
             await ws.send_json({"action": "watch_job", "job_id": bad})
             reply = await h.drain(ws, "error")
             assert "job_id" in reply["data"]["message"], bad
+
+
+class TestTheConfiguredLivenessGrace:
+    """The dashboard's live-worker count uses the DEPLOYMENT's threshold.
+
+    ``pj-monitor`` ACTS on that number -- it requeues a silent worker's
+    in-flight jobs -- and this feed only draws it. The grace used to be a
+    module constant INTERPOLATED INTO ``SNAPSHOT_SQL`` at import, so a
+    deployment that raised `liveness_grace_seconds` could not move it here at
+    all: the dashboard went on showing workers as gone while nothing was
+    reclaiming their jobs. It is a bound parameter now, and it comes from the
+    server the config built.
+    """
+
+    async def test_a_stale_worker_is_live_under_a_raised_grace(
+        self, snapshot_server, db_pool, unique_queue
+    ):
+        await db_pool.execute(
+            """INSERT INTO jorb_worker (host, pid, queue, last_seen)
+               VALUES ('ws-grace', 4244, $1, now() - interval '120 seconds')""",
+            unique_queue,
+        )
+
+        strict = await snapshot_server()
+        loose = await snapshot_server(liveness_grace_seconds=3600)
+
+        tight = (await strict.server.collect_snapshot())["workers_live"]
+        wide = (await loose.server.collect_snapshot())["workers_live"]
+
+        assert wide == tight + 1
+
+    async def test_the_default_is_the_platform_constant(self, db_params):
+        """Constructed without one, the server falls back to the same number
+        pj-monitor does when nothing configured a grace."""
+        server = websocket_server.WebSocketServer(db_params)
+        assert server.liveness_grace_seconds == db.DEFAULT_LIVENESS_GRACE_SECONDS

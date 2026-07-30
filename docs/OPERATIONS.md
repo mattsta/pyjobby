@@ -463,6 +463,15 @@ under them, over and over; no job longer than the grace ever finishes,
 while the monitor logs `Requeued job ... from dead worker` for workers
 that are fine. The monitor warns at startup when configured that way.
 
+**Change it in the config file, not on the flag.** `liveness_grace_seconds`
+in `pyjobby.toml` is read by all five processes that have an opinion about
+worker liveness: `pj-monitor` (which acts on it), and `pj-admin doctor`,
+`pj-web`'s `/metrics` and workers page, and the `pj-ws` dashboard (which
+report it). `pj-monitor --liveness-grace 300` alone gives you a fleet whose
+monitor considers a worker alive while every dashboard calls it dead — so
+every health signal you have disagrees with the process doing the recovery.
+The flag still overrides the file, for a one-off run.
+
 **A job is stuck running / hung.** `pj-admin jobs inspect ID` — if past its
 `timeout_at`, the monitor will retry/dead-letter it per its `on_timeout`
 policy. To intervene now: `pj-admin jobs cancel ID` (running jobs receive

@@ -10,8 +10,10 @@ import uuid
 import pytest
 import pytest_asyncio
 
+from pyjobby import db
 from pyjobby.web_admin import WebAdminServer, build_template_env
 from tests.conftest import unique_name
+from tests.test_metrics_scrape_cost import parse_samples
 
 # Every page served by the admin, and the one template set that backs them.
 # The page list doubles as the parametrization of the no-duplication test
@@ -648,6 +650,43 @@ class TestScheduledVocabulary:
         text = await resp.text()
         assert '<span class="badge queued">queued</span>' in text
         assert "scheduled" not in text
+
+    @pytest.mark.asyncio
+    async def test_the_queues_table_shows_scheduled_beside_queued(
+        self, web_admin_client, db_pool
+    ):
+        """The queues page was the last surface folding the two together.
+
+        ``AdminAPI.queue_stats`` has always returned them apart, and the
+        fragment simply had no column for the second one -- so on the page
+        NAMED after queue depth, a retry storm or a campaign scheduled for
+        next week was invisible, and the one number shown could sit at 0
+        while thousands of rows waited.
+        """
+        queue = unique_name("queues_table_sched")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state, run_after)
+                VALUES ('DueJob', '{}', $1, 100, 'queued', now() - interval '1 minute'),
+                       ('DeferredJob', '{}', $1, 100, 'queued',
+                        now() + interval '1 hour'),
+                       ('DeferredJob', '{}', $1, 100, 'queued',
+                        now() + interval '2 hours')
+                """,
+                queue,
+            )
+
+        resp = await web_admin_client.get("/api/queues?format=html")
+        assert resp.status == 200
+        text = await resp.text()
+
+        assert "<th>Scheduled</th>" in text
+        row = next(r for r in _table_rows(text) if f"<strong>{queue}</strong>" in r)
+        # the queue-name cell wraps its text in <strong>, so the plain-text
+        # cells start at Queued; the next one is the column under test
+        counts = re.findall(r"<td>\s*([^<\s][^<]*?)\s*</td>", row)
+        assert counts[:2] == ["1", "2"], row  # one claimable now, two deferred
 
     @pytest.mark.asyncio
     async def test_json_jobs_keep_the_stored_state(self, web_admin_client, db_pool):
@@ -1722,6 +1761,53 @@ class TestSchedulesAPI:
 
         data = await resp.json()
         assert isinstance(data, list)
+        assert [r["job_id"] for r in data] == [job_id]
+
+    @pytest.mark.asyncio
+    async def test_schedule_history_is_the_admin_apis_answer(
+        self, web_admin_client, db_pool, db_params
+    ):
+        """The handler reads through ``AdminAPI.get_schedule_history``.
+
+        It used to issue its own SELECT against jorb_schedule_log -- the same
+        table, the same order, from a handler that already holds an AdminAPI
+        -- so the CLI's `pj-admin schedule history` and this endpoint were two
+        implementations of one question, free to drift on ordering, on
+        pagination, and on what a row contains.
+        """
+        from pyjobby.admin_api import AdminAPI
+
+        name = unique_name("history_parity")
+        async with db_pool.acquire() as conn:
+            schedule_id = await conn.fetchval(
+                """
+                INSERT INTO jorb_schedule (name, job_class, cron_expr, queue, next_run)
+                VALUES ($1, 'ParityJob', '0 * * * *', 'test',
+                        NOW() + INTERVAL '1 hour')
+                RETURNING id
+                """,
+                name,
+            )
+            for result in ("success", "failure", "skipped"):
+                await conn.execute(
+                    """
+                    INSERT INTO jorb_schedule_log
+                        (schedule_id, schedule_name, scheduled_time, result)
+                    VALUES ($1, $2, NOW(), $3)
+                    """,
+                    schedule_id,
+                    name,
+                    result,
+                )
+
+            direct = await AdminAPI(conn).get_schedule_history(schedule_id, limit=50)
+
+        resp = await web_admin_client.get(f"/api/schedules/{schedule_id}/history")
+        over_http = await resp.json()
+
+        assert [r["id"] for r in over_http] == [r["id"] for r in direct]
+        # newest first, which is the ordering the API promises
+        assert [r["result"] for r in over_http] == ["skipped", "failure", "success"]
 
 
 class TestHTMLEscaping:
@@ -1809,3 +1895,73 @@ class TestConnectionPool:
 
         await client.close()
         assert server.pool is None
+
+
+class TestTheConfiguredLivenessGrace:
+    """Every worker reading on this server uses the DEPLOYMENT's threshold.
+
+    pj-monitor is the process that ACTS on it -- it requeues a silent
+    worker's in-flight jobs -- and this server only reports. When the number
+    was a module constant interpolated at import, a deployment that raised
+    `liveness_grace_seconds` moved the monitor and left this page (and the
+    /metrics gauge every alert is built on) calling those workers dead.
+
+    Two readers on this server, and they are separate code paths: the workers
+    page goes through AdminAPI, while `pyjobby_workers_live` runs its own
+    SQL. Both are asserted, because it was the second that had the constant
+    baked into a module-level f-string.
+    """
+
+    @staticmethod
+    async def _stale_worker(db_pool, queue: str, age_seconds: int) -> None:
+        await db_pool.execute(
+            """INSERT INTO jorb_worker (host, pid, queue, last_seen)
+               VALUES ('grace-test', 4243, $1, now() - make_interval(secs => $2))""",
+            queue,
+            age_seconds,
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_metrics_gauge_counts_by_the_servers_grace(
+        self, db_params, db_pool, aiohttp_client
+    ):
+        """A worker 120s stale: dead at the default, live at 3600."""
+        queue = unique_name("grace_metrics")
+        await self._stale_worker(db_pool, queue, 120)
+
+        default = WebAdminServer(db_params)
+        raised = WebAdminServer(db_params, liveness_grace_seconds=3600)
+
+        strict_client = await aiohttp_client(default.app)
+        loose_client = await aiohttp_client(raised.app)
+
+        strict = parse_samples(await (await strict_client.get("/metrics")).text())
+        loose = parse_samples(await (await loose_client.get("/metrics")).text())
+
+        assert loose["pyjobby_workers_live"] == strict["pyjobby_workers_live"] + 1
+
+    @pytest.mark.asyncio
+    async def test_the_workers_page_counts_by_the_servers_grace(
+        self, db_params, db_pool, aiohttp_client
+    ):
+        """The same worker, through AdminAPI rather than the scrape SQL."""
+        queue = unique_name("grace_workers")
+        await self._stale_worker(db_pool, queue, 120)
+
+        raised = WebAdminServer(db_params, liveness_grace_seconds=3600)
+        client = await aiohttp_client(raised.app)
+
+        resp = await client.get("/api/workers")
+        assert resp.status == 200
+        rows = [r for r in await resp.json() if r["queue"] == queue]
+
+        assert rows and all(r["live"] for r in rows), rows
+
+    @pytest.mark.asyncio
+    async def test_the_default_is_the_platform_constant(self, db_params):
+        """Constructed without one, the server judges by db's default -- the
+        same fallback pj-monitor uses when nothing configured a grace."""
+        assert (
+            WebAdminServer(db_params).liveness_grace_seconds
+            == db.DEFAULT_LIVENESS_GRACE_SECONDS
+        )

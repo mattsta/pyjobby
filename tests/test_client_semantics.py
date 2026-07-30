@@ -1102,7 +1102,7 @@ class TestFromConfig:
     async def test_a_file_without_a_ceiling_gets_the_platform_default(
         self, db_params, tmp_path
     ):
-        from pyjobby.client import DEFAULT_PRIO_CEILING
+        from pyjobby.enqueue_rules import DEFAULT_PRIO_CEILING
 
         client = await JobClient.from_config(self.write(tmp_path, db_params))
         try:

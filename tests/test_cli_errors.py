@@ -26,7 +26,7 @@ from click.testing import CliRunner
 
 from pyjobby import migrations
 from pyjobby.cli import cli
-from pyjobby.client import DEFAULT_PRIO_CEILING
+from pyjobby.enqueue_rules import DEFAULT_PRIO_CEILING
 from tests.conftest import reserved_unused_port
 from tests.schema_fixtures import drop_database
 

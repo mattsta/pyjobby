@@ -37,6 +37,7 @@ suite, not by this file.
 
 from __future__ import annotations
 
+import contextlib
 import re
 from dataclasses import dataclass, field
 from importlib.resources import files
@@ -45,7 +46,8 @@ from typing import Any
 import asyncpg  # type: ignore[import-untyped]
 from loguru import logger
 
-from . import lifecycle
+from . import db, lifecycle
+from .configloader import describe_db_target
 
 _SQL_ROOT = files("pyjobby") / "sql"
 
@@ -252,6 +254,61 @@ def schema_error_hint(e: BaseException) -> str | None:
     database that has no schema, and only the second one has an answer.
     """
     return SCHEMA_REMEDY if isinstance(e, SCHEMA_ERRORS) else None
+
+
+async def preflight_problem(target: str | dict[str, Any]) -> str | None:
+    """Connect once and check the schema is there. Returns the operator-facing
+    problem, or None when the database is usable.
+
+    THE STARTUP QUESTION EVERY DAEMON HAS TO ASK, asked in one place. ``pj``
+    asks it before forking any worker, ``pj-monitor`` before its sweep loop and
+    ``pj-scheduler`` before its poll loop, and all three fail the same way
+    without it: against a database with no schema (or none reachable) the
+    process comes up healthy and then fails the same operation forever, from
+    inside a retry loop, while every health check sees a live daemon and
+    nothing in that picture says "migrate". pj made it worse by a factor of N,
+    logging it from N forked children several times a second behind a launcher
+    that reported success.
+
+    So the daemon asks ONCE, at startup, where the answer can still be an exit
+    code. The loops' own resilience is deliberately unchanged -- a database
+    that goes away mid-run is transient and must be retried, not exited on.
+
+    ``target`` is a DSN string or a dict of ``asyncpg.connect`` keyword
+    arguments (a config file's ``db_params`` table), matching what the daemons
+    already hold; ``describe_db_target`` names it in the message without
+    printing the password either form carries.
+
+    It lives HERE rather than in any one daemon because the remedy does: this
+    module owns ``SCHEMA_REMEDY``, ``schema_error_hint`` and the required-shape
+    manifest, and a preflight is that knowledge asked as a yes/no question.
+    Two of the three daemons had a private copy, the third had none at all --
+    which is exactly the distribution a duplicated startup check produces.
+    """
+    described = describe_db_target(target)
+    try:
+        conn = (
+            await db.connect(target)
+            if isinstance(target, str)
+            else await db.connect(**target)
+        )
+    except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as e:
+        hint = schema_error_hint(e)
+        return f"Cannot connect to the database at {described}: {e}" + (
+            f" {hint}" if hint else ""
+        )
+    try:
+        if not await conn.fetchval("SELECT to_regclass('public.jorb')"):
+            return f"No pyjobby schema in the database at {described}: {SCHEMA_REMEDY}"
+    except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as e:
+        hint = schema_error_hint(e)
+        return f"Cannot query the database at {described}: {e}" + (
+            f" {hint}" if hint else ""
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await conn.close()
+    return None
 
 
 @dataclass

@@ -28,7 +28,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from pyjobby.admin_api import EXPLAIN_REASONS, UNCLAIMABLE_REASONS, AdminAPI
-from pyjobby.client import DEFAULT_PRIO_CEILING
+from pyjobby.enqueue_rules import DEFAULT_PRIO_CEILING
 from pyjobby.lifecycle import JOB_STATES
 
 from .test_cli_errors import dsn_for, run_cli

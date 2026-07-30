@@ -109,7 +109,7 @@ from loguru import logger
 
 from . import db, migrations
 from .configloader import describe_db_target
-from .lifecycle import LIVE_STATES_SQL, TERMINAL_STATES_SQL
+from .lifecycle import IN_FLIGHT_STATES_SQL, LIVE_STATES_SQL, TERMINAL_STATES_SQL
 
 # The monitor sizes its own pool: its sweeps run one at a time, so two
 # connections is the whole daemon's concurrency. These are NOT the operator's
@@ -163,7 +163,7 @@ SWEEP_DEAD_WORKER_JOBS_SQL = f"""
     WITH doomed AS MATERIALIZED (
         SELECT j.id FROM jorb j
         JOIN jorb_worker w ON w.id = j.claimed_by
-        WHERE j.state IN ('claimed', 'running')
+        WHERE j.state IN ({IN_FLIGHT_STATES_SQL})
           AND w.last_seen < now() - $1::interval
         FOR UPDATE OF j SKIP LOCKED
         LIMIT $2
@@ -177,7 +177,7 @@ SWEEP_DEAD_WORKER_JOBS_SQL = f"""
         updated = now()
     FROM doomed
     WHERE jorb.id = doomed.id
-      AND jorb.state IN ('claimed', 'running')
+      AND jorb.state IN ({IN_FLIGHT_STATES_SQL})
     RETURNING jorb.id, jorb.job_class, jorb.worker_host, jorb.claimed_by
 """
 
@@ -519,19 +519,20 @@ SWEEP_RETIRED_WORKERS_SQL = """
 #: by hand.
 #:
 #: The check runs on the DELETE rather than in the probe on purpose: it is
-#: driven by ``jorb_inflight_idx``, whose partial predicate is exactly these
-#: two states written as literals, so it costs the in-flight set (bounded by
+#: driven by ``jorb_inflight_idx``, whose partial predicate is exactly
+#: ``lifecycle.IN_FLIGHT_STATES_SQL`` interpolated as literals (which is what
+#: that constant exists to guarantee), so it costs the in-flight set (bounded by
 #: work in flight, never by table size) and not a scan of jorb. Putting it in
 #: the probe would make the planner cost that join against jorb_worker's
 #: whole-table statistics on every cycle, including the overwhelmingly common
 #: one where the probe returns nothing at all.
-DELETE_RETIRED_WORKERS_SQL = """
+DELETE_RETIRED_WORKERS_SQL = f"""
     DELETE FROM jorb_worker w
     WHERE w.id = ANY($1::bigint[])
       AND NOT EXISTS (
           SELECT 1 FROM jorb j
           WHERE j.claimed_by = w.id
-            AND j.state IN ('claimed', 'running')
+            AND j.state IN ({IN_FLIGHT_STATES_SQL})
       )
     RETURNING w.id
 """
@@ -569,14 +570,6 @@ SWEEP_MAILBOX_SQL = """
 
 #: ...and the delete, by the primary key's leading column.
 DELETE_MAILBOX_SQL = "DELETE FROM jorb_mailbox WHERE id = ANY($1::bigint[])"
-
-#: Seconds without a heartbeat before a worker counts as dead — THE liveness
-#: threshold, defined once. The monitor sweeps by it, and every operator
-#: surface (doctor, /metrics, the workers page) must judge liveness by the
-#: SAME number: when this was written out six separate times, raising
-#: `--liveness-grace` on the monitor left every UI still calling those
-#: workers dead.
-DEFAULT_LIVENESS_GRACE_SECONDS = 60.0
 
 #: History rows past the retention window, oldest first. ($1 window, $2 batch)
 #:
@@ -657,6 +650,13 @@ SWEEP_SATISFIED_GROUP_WAITERS_SQL = """
 #: 'queued' would make the pair violate the index, roll the statement back, and
 #: leave every other waiter in the batch parked -- and since the sweep is
 #: level-triggered it would do it again on every pass, forever.
+#:
+#: RETURNING is part of the constant, not appended by the caller. The sweep
+#: counts what the wake ACTUALLY moved (the statement re-verifies the
+#: dependency under the lock, so the probe's row count is an upper bound),
+#: which means the ids are not optional -- and a constant that has to be
+#: concatenated before it can be run is a constant the plan gates and the
+#: SQL-shape tests were reading a different string from than the sweep did.
 WAKE_WAITERS_SQL = f"""
     UPDATE jorb w
     SET state = 'queued',
@@ -673,6 +673,7 @@ WAKE_WAITERS_SQL = f"""
             AND NOT EXISTS (
                 SELECT 1 FROM jorb g
                 WHERE g.run_group = w.waitfor_group AND g.state != 'finished')))
+    RETURNING w.id
 """
 
 #: Waiting jobs that can never be woken: their waitfor target does not
@@ -907,7 +908,7 @@ async def sweep_stranded_waiters(pool: asyncpg.Pool, batch_size: int = 500) -> i
                 # found: the wake re-verifies the dependency under the lock,
                 # so a probe hit whose upstream was re-run in the gap is
                 # correctly refused -- and must not be logged as woken.
-                woken = await conn.fetch(WAKE_WAITERS_SQL + " RETURNING w.id", ids)
+                woken = await conn.fetch(WAKE_WAITERS_SQL, ids)
                 if woken:
                     woken_ids = [r["id"] for r in woken]
                     logger.warning(
@@ -932,7 +933,7 @@ async def sweep_stranded_waiters(pool: asyncpg.Pool, batch_size: int = 500) -> i
 
 async def sweep_dead_workers(
     pool: asyncpg.Pool,
-    liveness_grace_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS,
+    liveness_grace_seconds: float = db.DEFAULT_LIVENESS_GRACE_SECONDS,
     batch_size: int = 500,
 ) -> int:
     """Requeue in-flight jobs owned by workers whose heartbeat went stale,
@@ -944,6 +945,16 @@ async def sweep_dead_workers(
     worker to still look live would strand exactly the jobs that need
     recovery — those of a worker that deregistered (or was retired by an
     earlier sweep) while a job was still in flight.
+
+    THIS SWEEP IS THE ONLY PLACE THE LIVENESS THRESHOLD IS ACTED ON. Doctor,
+    /metrics, the workers page and the WebSocket dashboard all report by the
+    same number, and they get it from the same declaration this daemon does:
+    ``liveness_grace_seconds`` in the config file, falling back to
+    ``db.DEFAULT_LIVENESS_GRACE_SECONDS``. That is what makes their four
+    readings and this one requeue describe a single fleet -- the number used
+    to be a constant with a flag on one daemon, so ``--liveness-grace 300``
+    left every surface still calling those workers dead while nothing here
+    was recovering them.
 
     Single atomic statements; safe with concurrent monitor instances."""
     grace = datetime.timedelta(seconds=liveness_grace_seconds)
@@ -1409,52 +1420,11 @@ def _pool_kwargs(target: dict[str, Any]) -> dict[str, Any]:
     return {**MONITOR_POOL_SIZES, **target}
 
 
-async def _preflight_problem(target: str | dict[str, Any]) -> str | None:
-    """Connect once and check the schema is there. Returns the operator-facing
-    problem, or None when the database is usable.
-
-    Run BEFORE the sweep loop, for the same reason pj.py's namesake runs
-    before the fork: against a database with no schema the monitor loops
-    forever logging a failed sweep per cycle while every health check sees a
-    live process, and nothing in that picture says "migrate". The loop's own
-    resilience is deliberately unchanged — a database that goes away
-    mid-run is transient and must be retried, not exited on. This asks the
-    question once, at startup, where the answer can be an exit code.
-    """
-    described = describe_db_target(target)
-    try:
-        conn = (
-            await db.connect(target)
-            if isinstance(target, str)
-            else await db.connect(**target)
-        )
-    except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as e:
-        hint = migrations.schema_error_hint(e)
-        return f"Cannot connect to the database at {described}: {e}" + (
-            f" {hint}" if hint else ""
-        )
-    try:
-        if not await conn.fetchval("SELECT to_regclass('public.jorb')"):
-            return (
-                f"No pyjobby schema in the database at {described}: "
-                f"{migrations.SCHEMA_REMEDY}"
-            )
-    except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as e:
-        hint = migrations.schema_error_hint(e)
-        return f"Cannot query the database at {described}: {e}" + (
-            f" {hint}" if hint else ""
-        )
-    finally:
-        with contextlib.suppress(Exception):
-            await conn.close()
-    return None
-
-
 async def monitor(
     target: str | dict[str, Any],
     check_interval: float = 10,
     batch_size: int = 100,
-    liveness_grace_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS,
+    liveness_grace_seconds: float = db.DEFAULT_LIVENESS_GRACE_SECONDS,
     claimed_grace_seconds: float = 300,
     retention_days: float = 30.0,
     checkpoint_retention_days: float = 1.0,
@@ -1659,9 +1629,14 @@ def cli() -> None:
     )
     @click.option(
         "--liveness-grace",
-        default=DEFAULT_LIVENESS_GRACE_SECONDS,
-        show_default=True,
-        help="Seconds without a heartbeat before a worker counts as dead",
+        type=float,
+        default=None,
+        help="Seconds without a heartbeat before a worker counts as dead. "
+        "Defaults to the config file's liveness_grace_seconds, else "
+        f"{db.DEFAULT_LIVENESS_GRACE_SECONDS:g}. Declare it in the FILE unless "
+        "this run is a one-off: doctor, /metrics, the dashboard and the "
+        "workers page all read the file's value, and only the file can make "
+        "them agree with what this daemon sweeps by.",
     )
     @click.option(
         "--claimed-grace",
@@ -1707,7 +1682,7 @@ def cli() -> None:
         dsn: str | None,
         config: str | None,
         check_interval: float,
-        liveness_grace: float,
+        liveness_grace: float | None,
         claimed_grace: float,
         retention_days: float,
         checkpoint_retention_days: float,
@@ -1721,20 +1696,30 @@ def cli() -> None:
         from .configloader import load_config_from_file
 
         target: str | dict[str, Any]
+        configured_grace: Any = None
         if dsn:
             target = dsn
         elif config:
             # The config's db_params are handed to asyncpg WHOLE. Rebuilding
             # a URL from five of its keys silently dropped the rest and could
             # not express a unix-socket host at all.
-            cfg = load_config_from_file(config, keys=["db_params"])
+            cfg = load_config_from_file(
+                config, keys=["db_params", "liveness_grace_seconds"]
+            )
             db_params = cfg.get("db_params")
             if not db_params:
                 raise click.ClickException(f"No db_params found in config: {config}")
             target = db_params
+            configured_grace = cfg.get("liveness_grace_seconds")
         else:
             click.echo("Error: Must provide --dsn or --config", err=True)
             sys.exit(1)
+
+        # precedence: explicit flag > config file > platform default. A --dsn
+        # run has no file to read, so it gets the flag or the default -- and
+        # that is the case the config key exists to discourage, since nothing
+        # else in the deployment can learn a number passed only here.
+        grace = db.resolve_liveness_grace(liveness_grace, configured_grace)
 
         # Refuse the db_params keys the monitor owns BEFORE anything tries to
         # connect with them: min_size/max_size are not asyncpg.connect
@@ -1746,7 +1731,7 @@ def cli() -> None:
         # Ask the question every sweep is about to ask, once, before the loop:
         # exit code 2 (a startup precondition) rather than a daemon that runs
         # forever failing every sweep while looking perfectly alive.
-        problem = asyncio.run(_preflight_problem(target))
+        problem = asyncio.run(migrations.preflight_problem(target))
         if problem is not None:
             click.echo(problem, err=True)
             sys.exit(2)
@@ -1768,7 +1753,7 @@ def cli() -> None:
             monitor(
                 target,
                 check_interval=check_interval,
-                liveness_grace_seconds=liveness_grace,
+                liveness_grace_seconds=grace,
                 claimed_grace_seconds=claimed_grace,
                 retention_days=retention_days,
                 checkpoint_retention_days=checkpoint_retention_days,

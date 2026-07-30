@@ -346,7 +346,7 @@ class TestWorkitPriorityCeiling:
     ):
         """...and the zero above is a real declaration rather than the
         default arriving by another route."""
-        from pyjobby.client import DEFAULT_PRIO_CEILING
+        from pyjobby.enqueue_rules import DEFAULT_PRIO_CEILING
 
         launched = self._run(live_config, monkeypatch)
 

@@ -1,11 +1,32 @@
 #!/usr/bin/env python3
-"""
-Pyjobby Admin API
+"""The administrative operations, defined once for every operator surface.
 
-Clean, well-encapsulated administrative API for managing jobs, queues, and workers.
-Designed to be used by both CLI tools and web interfaces.
+``pj-admin``, the web admin's REST API and its HTML pages all reach the
+platform through this class. That is not tidiness, it is the only way the
+surfaces can AGREE: retry, cancel, requeue, pause, set-priority and the
+schedule verbs each have a state guard, a validation and a set of side
+effects, and a second implementation of any of them is a second set -- so the
+CLI would refuse a priority the dashboard accepts, or requeue from a state
+the API refuses, and only one of them would be right.
 
-All methods are async and return structured data (dicts/lists).
+Every method is async, takes an ``asyncpg.Connection`` (one per request/
+command; the pooling belongs to the caller) and returns plain dicts and
+lists. No object here holds a transaction open across calls.
+
+TWO DEPLOYMENT FACTS ARE HANDED IN AT CONSTRUCTION, because neither is
+visible from a connection and both are enforced on every relevant call:
+``prio_ceiling`` (what the worker fleet runs with -- a job above it is never
+claimed) and ``liveness_grace_seconds`` (when a worker counts as dead --
+which has to be the number ``pj-monitor`` sweeps with, since the monitor ACTS
+on that judgement while everything here only reports it). Both come from the
+config file; see ``configloader``.
+
+WHAT IS NOT HERE, on purpose: the write verbs whose SQL is shared with the
+CLIENT library live in ``db`` (``retry_job``, ``cancel_job``,
+``UPDATE_PRIORITY_SQL``, ``update_job_app_version``, ...), because an
+application calling ``JobClient.cancel`` and an operator typing ``pj-admin
+jobs cancel`` must do the identical thing. This module wraps those; it does
+not restate them.
 """
 
 from __future__ import annotations
@@ -19,15 +40,15 @@ from typing import Any, Final
 import asyncpg  # type: ignore[import-untyped]
 
 from . import db
-from .client import (
-    DEFAULT_PRIO_CEILING,
-    tags_filter_sql,
-    validate_priority,
-    validate_tags,
-)
+from .client import tags_filter_sql
 from .cron import next_cron_run
-from .lifecycle import TERMINAL_STATES, TERMINAL_STATES_SQL
-from .monitor import DEFAULT_LIVENESS_GRACE_SECONDS
+from .enqueue_rules import DEFAULT_PRIO_CEILING, validate_priority, validate_tags
+from .lifecycle import (
+    IN_FLIGHT_STATES,
+    IN_FLIGHT_STATES_SQL,
+    TERMINAL_STATES,
+    TERMINAL_STATES_SQL,
+)
 
 
 class Unset:
@@ -536,7 +557,10 @@ class AdminAPI:
     """
 
     def __init__(
-        self, conn: asyncpg.Connection, prio_ceiling: int = DEFAULT_PRIO_CEILING
+        self,
+        conn: asyncpg.Connection,
+        prio_ceiling: int = DEFAULT_PRIO_CEILING,
+        liveness_grace_seconds: float = db.DEFAULT_LIVENESS_GRACE_SECONDS,
     ):
         """
         Initialize AdminAPI with database connection.
@@ -551,9 +575,37 @@ class AdminAPI:
                 Declared here for the same reason `JobClient` takes it: the
                 ceiling belongs to the worker fleet and nothing about it is
                 visible from a connection.
+            liveness_grace_seconds: seconds without a heartbeat before this
+                API calls a worker dead (`liveness_grace_seconds` in
+                pyjobby.toml, default 60). Declared here for exactly the
+                reason `prio_ceiling` is -- it is a fact about the
+                DEPLOYMENT, invisible from a connection -- and it must be
+                the number `pj-monitor` sweeps with, because the monitor
+                ACTS on that judgement while everything reached through
+                this API only reports it. The five worker-liveness methods
+                below take it as their default rather than a constant, so a
+                caller that configured this object cannot be contradicted by
+                one of its own reads.
         """
         self.conn = conn
         self.prio_ceiling = prio_ceiling
+        self.liveness_grace_seconds = liveness_grace_seconds
+
+    def _grace(self, stale_after_seconds: float | None) -> float:
+        """This call's liveness threshold: the argument, else this API's.
+
+        Every method that judges a worker live takes ``None`` to mean "the
+        deployment's threshold" rather than defaulting to the platform
+        constant in its own signature. The difference matters exactly when a
+        deployment HAS configured one: a default baked into five signatures
+        makes each of them a separate chance to report liveness by a number
+        `pj-monitor` is not sweeping with.
+        """
+        return (
+            self.liveness_grace_seconds
+            if stale_after_seconds is None
+            else stale_after_seconds
+        )
 
     # =========================================================================
     # Job Management
@@ -688,7 +740,7 @@ class AdminAPI:
     async def explain_job(
         self,
         job_id: int,
-        stale_after_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS,
+        stale_after_seconds: float | None = None,
     ) -> dict[str, Any] | None:
         """Why job `job_id` is not running, as one structured answer.
 
@@ -762,19 +814,16 @@ class AdminAPI:
         if row is None:
             return None
 
+        grace = self._grace(stale_after_seconds)
         state: str = row["state"]
         if state in TERMINAL_STATES:
             reason, summary, details = self._explain_terminal(row)
-        elif state in ("claimed", "running"):
-            reason, summary, details = await self._explain_inflight(
-                row, stale_after_seconds
-            )
+        elif state in IN_FLIGHT_STATES:
+            reason, summary, details = await self._explain_inflight(row, grace)
         elif state == "waiting":
             reason, summary, details = await self._explain_waiting(row)
         else:
-            reason, summary, details = await self._explain_queued(
-                row, stale_after_seconds
-            )
+            reason, summary, details = await self._explain_queued(row, grace)
 
         return {
             "job_id": row["id"],
@@ -1251,9 +1300,9 @@ class AdminAPI:
             # queue-wide total is irrelevant there and reporting it would send
             # the operator to raise a cap that is not the one binding.
             inflight = await self.conn.fetchval(
-                """
+                f"""
                 SELECT count(*) FROM jorb
-                 WHERE queue = $1 AND state IN ('claimed', 'running')
+                 WHERE queue = $1 AND state IN ({IN_FLIGHT_STATES_SQL})
                    AND (NOT $2 OR partition_key IS NOT DISTINCT FROM $3)
                 """,
                 queue,
@@ -1397,7 +1446,7 @@ class AdminAPI:
 
     async def unclaimable_jobs(
         self,
-        stale_after_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS,
+        stale_after_seconds: float | None = None,
         scan_limit: int = UNCLAIMABLE_SCAN_LIMIT,
         sample_limit: int = UNCLAIMABLE_SAMPLE_LIMIT,
     ) -> list[dict[str, Any]]:
@@ -1472,7 +1521,7 @@ class AdminAPI:
         """
         rows = await self.conn.fetch(
             UNCLAIMABLE_JOBS_SQL,
-            stale_after_seconds,
+            self._grace(stale_after_seconds),
             scan_limit,
             sample_limit,
             list(UNCLAIMABLE_REASONS),
@@ -1842,7 +1891,7 @@ class AdminAPI:
         Returns:
             List of control dictionaries
         """
-        records = await self.conn.fetch("SELECT * FROM jorb_queue ORDER BY name")
+        records = await self.conn.fetch(db.QUEUE_CONTROLS_SQL)
         return [self._queue_control_dict(r) for r in records]
 
     async def get_queue_control(self, name: str) -> dict[str, Any] | None:
@@ -1956,7 +2005,7 @@ class AdminAPI:
 
     async def list_workers(
         self,
-        stale_after_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS,
+        stale_after_seconds: float | None = None,
         include_dead_for_seconds: float = 3600.0,
     ) -> list[dict[str, Any]]:
         """
@@ -1982,7 +2031,7 @@ class AdminAPI:
             List of worker dictionaries
         """
         records = await self.conn.fetch(
-            """
+            f"""
             SELECT w.id, w.host, w.pid, w.queue, w.capabilities,
                    w.app_version, w.version,
                    w.started, w.last_seen, w.shutdown_at,
@@ -2003,7 +2052,7 @@ class AdminAPI:
             FROM jorb_worker w
             LEFT JOIN LATERAL (
                 SELECT id, job_class, state FROM jorb
-                WHERE claimed_by = w.id AND state IN ('claimed', 'running')
+                WHERE claimed_by = w.id AND state IN ({IN_FLIGHT_STATES_SQL})
                 ORDER BY id
                 LIMIT 1
             ) j ON TRUE
@@ -2011,7 +2060,7 @@ class AdminAPI:
                OR w.shutdown_at > now() - make_interval(secs => $2)
             ORDER BY w.id
             """,
-            stale_after_seconds,
+            self._grace(stale_after_seconds),
             include_dead_for_seconds,
         )
 
@@ -2026,7 +2075,7 @@ class AdminAPI:
         return workers
 
     async def worker_stats(
-        self, stale_after_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS
+        self, stale_after_seconds: float | None = None
     ) -> dict[str, Any]:
         """
         Aggregate worker registry statistics.
@@ -2039,6 +2088,7 @@ class AdminAPI:
             Dictionary with live/stale/shutdown counts and per-queue live
             worker counts
         """
+        grace = self._grace(stale_after_seconds)
         summary = await self.conn.fetchrow(
             """
             SELECT
@@ -2054,7 +2104,7 @@ class AdminAPI:
                 COUNT(*) FILTER (WHERE shutdown_at IS NOT NULL) AS shutdown
             FROM jorb_worker
             """,
-            stale_after_seconds,
+            grace,
         )
 
         per_queue = await self.conn.fetch(
@@ -2066,7 +2116,7 @@ class AdminAPI:
             GROUP BY queue
             ORDER BY queue
             """,
-            stale_after_seconds,
+            grace,
         )
 
         return {
@@ -2192,7 +2242,7 @@ class AdminAPI:
                    EXTRACT(EPOCH FROM (now() - MIN(updated)))::float8
                                                                      AS oldest_age
             FROM jorb
-            WHERE state IN ('claimed', 'running') {queue_sql}
+            WHERE state IN ({IN_FLIGHT_STATES_SQL}) {queue_sql}
             """,
             *params,
         )
@@ -2205,7 +2255,7 @@ class AdminAPI:
         }
 
     async def job_thread_stats(
-        self, stale_after_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS
+        self, stale_after_seconds: float | None = None
     ) -> dict[str, Any]:
         """
         Workers that are alive and claiming nothing, and how close the rest
@@ -2251,7 +2301,7 @@ class AdminAPI:
               AND last_seen > now() - make_interval(secs => $1)
               AND job_threads > 0
             """,
-            stale_after_seconds,
+            self._grace(stale_after_seconds),
         )
 
         return {

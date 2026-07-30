@@ -107,7 +107,7 @@ import asyncpg  # type: ignore[import-untyped]
 import click
 from loguru import logger
 
-from . import db, dxe, migrations, monitor
+from . import db, dxe, lifecycle, migrations, monitor
 from .configloader import load_config_from_file
 from .lifecycle import TERMINAL_STATES_SQL
 from .pj import STMTS, Job, JobSystem
@@ -1974,9 +1974,9 @@ CLAIM_PROBE_SQL = """
 #: because count(*) is O(rows matched) however good the index is -- the plan
 #: decides only whether that is "rows in flight on this queue" or "every row
 #: this queue ever claimed".
-CAP_COUNT_SQL = """
+CAP_COUNT_SQL = f"""
     SELECT count(*) FROM jorb
-     WHERE queue = $1 AND state IN ('claimed', 'running')
+     WHERE queue = $1 AND state IN ({lifecycle.IN_FLIGHT_STATES_SQL})
 """
 
 #: The partitioned form of the count above, copied from sql/schema/30_claim.sql
@@ -1986,10 +1986,10 @@ CAP_COUNT_SQL = """
 #: in-flight rows, grouped, and nothing else. Gated because a GROUP BY is the
 #: easiest place in the claim path to lose an index and not notice: it still
 #: returns the right lanes, from a scan.
-LANE_COUNT_SQL = """
+LANE_COUNT_SQL = f"""
     SELECT partition_key
       FROM jorb
-     WHERE queue = $1 AND state IN ('claimed', 'running')
+     WHERE queue = $1 AND state IN ({lifecycle.IN_FLIGHT_STATES_SQL})
      GROUP BY partition_key
     HAVING count(*) >= $2
 """
@@ -2928,12 +2928,12 @@ async def seed_plan_data(
     # The in-flight jobs point at the live workers, so the dead-worker sweep
     # plans a real join instead of one whose inner side is always empty.
     await conn.execute(
-        """
+        f"""
         UPDATE jorb SET claimed_by = w.id
           FROM (SELECT id, row_number() OVER (ORDER BY id) AS n
                   FROM jorb_worker WHERE queue = $1 AND shutdown_at IS NULL) w
          WHERE jorb.queue = $1
-           AND jorb.state IN ('claimed', 'running')
+           AND jorb.state IN ({lifecycle.IN_FLIGHT_STATES_SQL})
            AND w.n = 1 + (jorb.id % $2)
         """,
         queue,

@@ -33,8 +33,15 @@ The rules themselves come in three kinds:
   duplicate, with no error anywhere. Refused, because silence in the
   direction of duplicate work is the expensive kind.
 
-``client`` re-exports every name here at its old path, so nothing outside the
-package has to know the split happened.
+THIS MODULE IS THE ONE HOME for every name below -- ``pyjobby.enqueue_rules``
+is the import path, for the platform's own modules and for applications
+alike. It was briefly re-exported through ``client`` as well; two paths to
+one constant is two things to keep in step and one of them to grep past, and
+this module has no imports of its own, so nothing is made cheaper by reaching
+it through the client. The one exception is deliberate and narrow:
+``SpeculativeEnqueueExhausted`` is also exported from ``pyjobby`` itself,
+because an application has to be able to CATCH it without importing a rules
+module.
 """
 
 from __future__ import annotations
@@ -329,31 +336,25 @@ def validate_app_version(app_version: str | None) -> str | None:
 
 #: Longest any caller-chosen key an enqueue accepts may be, and the shortest.
 #:
-#: One bound for all four (deadline_key, identity_key, debounce_key,
+#: ONE bound for all four (deadline_key, identity_key, debounce_key,
 #: partition_key) because they are the same KIND of thing: a name the caller
 #: chose, stored in a column something INDEXES or GROUPS BY, never a payload.
-#: partition_key documented the reasoning first (MAX_PARTITION_KEY_LENGTH,
-#: which this unifies) and the argument transfers unchanged: an unbounded key
-#: is an unbounded string in a btree the enqueue path writes and the claim path
-#: reads. 256 characters is far past every real one -- an order id, a tenant, a
-#: date-stamped digest name, a ULID -- and short enough that a saturated queue's
-#: worth of them is still small.
-MAX_KEY_LENGTH: Final = 256
-
-#: Longest ``partition_key`` an enqueue accepts.
+#: An unbounded key is an unbounded string in a btree the enqueue path writes
+#: and the claim path reads.
 #:
-#: A partition key is a GROUPING KEY read inside the serialised claim
-#: section, not a payload: on a queue with ``partition_limits`` every
-#: saturated lane's key is carried in an array that the claim's per-row test
-#: probes, so an unbounded key would put an unbounded string into the one
+#: ``partition_key`` is where the argument was made first and where it bites
+#: hardest, so it is worth keeping: a partition key is a GROUPING KEY read
+#: inside the SERIALISED claim section. On a queue with ``partition_limits``
+#: every saturated lane's key is carried in an array that the claim's per-row
+#: test probes, so an unbounded key would put an unbounded string into the one
 #: critical section that sets a capped queue's whole ceiling. Refused at the
 #: door, where the caller can still be told, rather than accepted and paid for
 #: on every claim forever.
 #:
-#: The SAME bound as every other caller-chosen key, and named separately only
-#: because the name is public API; :data:`MAX_KEY_LENGTH` is where the number
-#: and the reasoning live.
-MAX_PARTITION_KEY_LENGTH: Final = MAX_KEY_LENGTH
+#: 256 characters is far past every real key -- an order id, a tenant, a
+#: date-stamped digest name, a ULID -- and short enough that a saturated
+#: queue's worth of them is still small.
+MAX_KEY_LENGTH: Final = 256
 
 
 def validate_key(name: str, value: str | None) -> str | None:

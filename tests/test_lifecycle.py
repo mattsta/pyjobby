@@ -29,30 +29,47 @@ worker; only the enum comparison touches a database.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import pytest
 
+import pyjobby
+from pyjobby import migrations
+from pyjobby.bench import CAP_COUNT_SQL, LANE_COUNT_SQL
 from pyjobby.db import (
+    CANCEL_SQL,
+    QUEUE_STATS_SQL,
     REQUEUE_CLEARS_KEYS,
+    UPDATE_APP_VERSION_SQL,
+    UPDATE_PRIORITY_MANY_SQL,
+    UPDATE_PRIORITY_SQL,
     WAKE_CLEARS_KEYS,
     build_requeue_sql,
 )
 from pyjobby.lifecycle import (
+    IN_FLIGHT_STATES,
+    IN_FLIGHT_STATES_SQL,
     JOB_STATES,
     LEGAL_TRANSITIONS,
     LIVE_STATES,
+    PRE_CLAIM_STATES,
+    PRE_CLAIM_STATES_SQL,
     TERMINAL_STATES,
     illegal_transitions,
     is_legal,
 )
 from pyjobby.monitor import (
     DEADLETTER_TIMED_OUT_SQL,
+    DELETE_RETIRED_WORKERS_SQL,
     RETRY_TIMED_OUT_SQL,
     SWEEP_DEAD_WORKER_JOBS_SQL,
     SWEEP_STUCK_CLAIMS_SQL,
     WAKE_WAITERS_SQL,
 )
 from pyjobby.pj import STMTS
+from pyjobby.scheduler import BACKPRESSURE_COUNT_SQL
+from pyjobby.web_admin import PROM_SQL_LIVE_STATES
+from pyjobby.websocket_server import SNAPSHOT_SQL
 
 #: An UPDATE's SET list: everything from `SET` to the clause that ends it.
 #:
@@ -447,3 +464,163 @@ async def test_every_python_state_list_is_the_same_list():
 
     assert tuple(JobState) == JOB_STATES
     assert migrations.REQUIRED_ENUM_LABELS["jorbstate"] == JOB_STATES
+
+
+# ============================================================================
+# The state SETS, and the statements that must be built from them
+# ============================================================================
+
+
+def test_the_in_flight_set_is_the_matched_to_a_worker_states():
+    """``IN_FLIGHT_STATES`` is 'claimed' and 'running', in that order.
+
+    The ORDER is not cosmetic. ``IN_FLIGHT_STATES_SQL`` is interpolated into
+    the predicates of two PARTIAL indexes -- ``jorb_inflight_idx`` and
+    ``jorb_partition_inflight_idx`` -- and PostgreSQL proves a partial index
+    usable by MATCHING the query's clauses against the index predicate. This
+    tuple is therefore pinned to the schema's spelling, and reordering it is a
+    schema change, not a refactor.
+    """
+    assert IN_FLIGHT_STATES == ("claimed", "running")
+    assert IN_FLIGHT_STATES_SQL == "'claimed', 'running'"
+    # it is a strict subset of the live states, disjoint from the terminal
+    # ones and from the states an operator may still edit a claim gate in
+    assert set(IN_FLIGHT_STATES) < set(LIVE_STATES)
+    assert not set(IN_FLIGHT_STATES) & set(TERMINAL_STATES)
+    assert not set(IN_FLIGHT_STATES) & set(PRE_CLAIM_STATES)
+
+
+def test_the_schema_partial_indexes_use_exactly_the_declared_in_flight_list():
+    """The literal the Python constant produces is the literal the base
+    schema declares its partial indexes on.
+
+    This is the binding the whole constant exists for: every in-flight count,
+    sweep and dashboard interpolates ``IN_FLIGHT_STATES_SQL`` precisely so it
+    matches these predicates, and a Python-side reorder that the schema did
+    not follow would silently drop every one of them onto a sequential scan
+    of the largest table in the system -- correct answers, growing cost, no
+    error anywhere.
+    """
+    schema = migrations.base_schema_sql()
+
+    for index in ("jorb_inflight_idx", "jorb_partition_inflight_idx"):
+        create = migrations.canonical_create_statement("index", index)
+        assert create is not None, f"{index} is not in the base schema"
+        assert f"state IN ({IN_FLIGHT_STATES_SQL})" in create, (
+            f"{index}'s partial predicate is not the declared in-flight list:\n{create}"
+        )
+
+    assert f"state IN ({IN_FLIGHT_STATES_SQL})" in schema
+
+
+#: Every statement the platform builds from ``IN_FLIGHT_STATES_SQL``, by the
+#: name a reader would look for it under. Imported objects, never copies: a
+#: test that re-spells the SQL certifies a string nobody runs.
+IN_FLIGHT_STATEMENTS = {
+    "pj.STMTS[run]": STMTS["run"],
+    "pj.STMTS[finished]": STMTS["finished"],
+    "pj.STMTS[crashed]": STMTS["crashed"],
+    "pj.STMTS[cancelled]": STMTS["cancelled"],
+    "pj.STMTS[retry]": STMTS["retry"],
+    "pj.STMTS[reschedule]": STMTS["reschedule"],
+    "db.QUEUE_STATS_SQL": QUEUE_STATS_SQL,
+    "db.CANCEL_SQL": CANCEL_SQL,
+    "monitor.SWEEP_DEAD_WORKER_JOBS_SQL": SWEEP_DEAD_WORKER_JOBS_SQL,
+    "monitor.DELETE_RETIRED_WORKERS_SQL": DELETE_RETIRED_WORKERS_SQL,
+    "scheduler.BACKPRESSURE_COUNT_SQL": BACKPRESSURE_COUNT_SQL,
+    "web_admin.PROM_SQL_LIVE_STATES": PROM_SQL_LIVE_STATES,
+    "websocket_server.SNAPSHOT_SQL": SNAPSHOT_SQL,
+    "bench.CAP_COUNT_SQL": CAP_COUNT_SQL,
+    "bench.LANE_COUNT_SQL": LANE_COUNT_SQL,
+}
+
+
+@pytest.mark.parametrize("name", sorted(IN_FLIGHT_STATEMENTS))
+def test_every_in_flight_predicate_is_the_declared_list(name):
+    """No statement spells the in-flight pair by hand.
+
+    It was written out in twenty places before this constant existed, which is
+    twenty chances to type ``('claimed')`` and undercount running work forever
+    -- no error, no failing row, just a concurrency cap admitting twice what
+    it was set to, or a dead-worker sweep that never reclaims a job that had
+    started.
+    """
+    sql = IN_FLIGHT_STATEMENTS[name]
+    assert f"state IN ({IN_FLIGHT_STATES_SQL})" in sql, (
+        f"{name} does not carry the declared in-flight list:\n{sql}"
+    )
+
+
+def test_no_module_spells_the_in_flight_pair_by_hand():
+    """The sweep, over the package source itself.
+
+    A per-statement assertion only covers the statements somebody remembered
+    to list; this covers the next one. The SQL FILES are deliberately out of
+    scope -- ``sql/schema/`` is where these literals are DECLARED, and the
+    test above binds the Python constant to them.
+
+    The pattern is the IN-FLIGHT predicate exactly, not the substring: the
+    four-state live list (``'queued', 'claimed', 'running', 'waiting'``) is a
+    different set answering a different question, and it has its own
+    declaration in ``LIVE_STATES_SQL``.
+    """
+    in_flight = re.compile(
+        r"state\s+IN\s*\(\s*'claimed'\s*,\s*'running'\s*\)", re.IGNORECASE
+    )
+    package = Path(pyjobby.__file__).parent
+    offenders = []
+    for source in sorted(package.rglob("*.py")):
+        text = source.read_text()
+        for number, line in enumerate(text.splitlines(), start=1):
+            if in_flight.search(line):
+                offenders.append(
+                    f"{source.relative_to(package)}:{number}: {line.strip()}"
+                )
+
+    # lifecycle.py declares it; that is the one place it may be written.
+    offenders = [o for o in offenders if not o.startswith("lifecycle.py")]
+    assert not offenders, (
+        "these hand-spelled the in-flight states instead of interpolating "
+        "lifecycle.IN_FLIGHT_STATES_SQL:\n" + "\n".join(offenders)
+    )
+
+
+def test_the_priority_edit_is_one_statement_for_every_surface():
+    """``db.UPDATE_PRIORITY_SQL`` guards on the pre-claim states, and the
+    surfaces that offer the edit all execute THAT object.
+
+    Priority and app_version are CLAIM GATES: editing one after the claim
+    decides nothing, and editing a terminal job's rewrites history. The
+    dashboard's ``adjust_priority`` and the client's BULK re-prioritise are
+    both in the count because both had written their own copy of the guard --
+    and the bulk one is why the many-row form is DERIVED from the single-row
+    statement rather than being a second string.
+    """
+    assert f"state IN ({PRE_CLAIM_STATES_SQL})" in UPDATE_PRIORITY_SQL
+    assert f"state IN ({PRE_CLAIM_STATES_SQL})" in UPDATE_PRIORITY_MANY_SQL
+    assert f"state IN ({PRE_CLAIM_STATES_SQL})" in UPDATE_APP_VERSION_SQL
+    assert "id = ANY($1::bigint[])" in UPDATE_PRIORITY_MANY_SQL
+
+    package = Path(pyjobby.__file__).parent
+    for module in ("client.py", "admin_api.py", "websocket_server.py"):
+        text = (package / module).read_text()
+        assert "UPDATE_PRIORITY" in text, (
+            f"{module} offers a priority edit but does not reach for the "
+            f"shared statement"
+        )
+        assert "SET prio = $2" not in text, (
+            f"{module} spells its own priority UPDATE; the state guard is the "
+            f"part that must not drift"
+        )
+
+
+def test_the_wake_statement_returns_its_ids_without_being_concatenated():
+    """``RETURNING`` belongs to the constant, not to the call site.
+
+    The sweep counts what the wake ACTUALLY moved -- it re-verifies each
+    dependency under the lock, so the probe's row count is only an upper
+    bound -- so the ids are not optional. While the caller appended
+    ``" RETURNING w.id"`` itself, the plan gates and these SQL-shape tests
+    were reading a string the sweep never ran.
+    """
+    assert WAKE_WAITERS_SQL.rstrip().endswith("RETURNING w.id")

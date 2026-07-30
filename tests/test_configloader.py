@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 
+from pyjobby import db
 from pyjobby.configloader import (
     _ASYNCPG_CONNECT_KEYS_FALLBACK,
     ASYNCPG_CONNECT_KEYS,
@@ -126,7 +127,14 @@ class TestUnknownKeys:
         monkeypatch.setenv("PYJOBBY_DB_PASSWORD", "from-the-environment")
 
         cfg = load_config_from_file(
-            str(shipped), ["db_params", "prio_ceiling", "app_version", "web_listen"]
+            str(shipped),
+            [
+                "db_params",
+                "prio_ceiling",
+                "app_version",
+                "liveness_grace_seconds",
+                "web_listen",
+            ],
         )
 
         assert cfg["prio_ceiling"] == 1000, (
@@ -135,9 +143,48 @@ class TestUnknownKeys:
             "surface ever reads it"
         )
         assert "prio_ceiling" not in cfg["db_params"]
+        # ...and the same for the liveness grace, which has five readers and
+        # would otherwise be an asyncpg.connect() keyword that does not exist.
+        assert cfg["liveness_grace_seconds"] == 60
+        assert "liveness_grace_seconds" not in cfg["db_params"]
         assert cfg["db_params"]["database"] == "pyjobby"
         # the secret really is substituted, not left as the literal reference
         assert cfg["db_params"]["password"] == "from-the-environment"
+
+    def test_the_liveness_grace_round_trips_as_a_top_level_key(self, tmp_path):
+        """`liveness_grace_seconds` is a config key, not just a monitor flag.
+
+        The value has FIVE readers -- pj-monitor sweeps by it while doctor,
+        /metrics, the workers page and the WebSocket dashboard report by it --
+        so it has to survive the loader as a top-level setting or the only
+        place it can be declared is a flag on one daemon, which is exactly
+        the state that let the monitor and every UI disagree.
+        """
+        path = write(
+            tmp_path,
+            'liveness_grace_seconds = 300\n\n[db_params]\nhost = "h"\n',
+        )
+
+        cfg = load_config_from_file(path, ["db_params", "liveness_grace_seconds"])
+
+        assert cfg == {"db_params": {"host": "h"}, "liveness_grace_seconds": 300}
+        assert db.resolve_liveness_grace(None, cfg["liveness_grace_seconds"]) == 300.0
+
+    def test_the_liveness_grace_resolves_flag_then_file_then_default(self):
+        """The precedence every deployment setting in this platform uses.
+
+        ``is not None`` and not ``or``: a configured 0 is a real (bad)
+        threshold, and silently substituting 60 for it would hide the
+        misconfiguration the monitor warns about at startup.
+        """
+        assert db.resolve_liveness_grace(300.0, 120) == 300.0  # flag wins
+        assert db.resolve_liveness_grace(None, 120) == 120.0  # then the file
+        assert (
+            db.resolve_liveness_grace(None, None)  # then the platform default
+            == db.DEFAULT_LIVENESS_GRACE_SECONDS
+        )
+        assert db.resolve_liveness_grace(None, 0) == 0.0
+        assert db.resolve_liveness_grace(0, 120) == 0.0
 
     def test_a_top_level_setting_written_under_db_params_is_refused(self, tmp_path):
         """The misplacement the shipped file itself had.

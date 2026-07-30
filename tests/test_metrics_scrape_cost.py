@@ -34,12 +34,12 @@ from datetime import timedelta
 import pytest
 
 from pyjobby.admin_api import (
-    DEFAULT_LIVENESS_GRACE_SECONDS,
     UNCLAIMABLE_JOBS_SQL,
     UNCLAIMABLE_REASONS,
     UNCLAIMABLE_SAMPLE_LIMIT,
     UNCLAIMABLE_SCAN_LIMIT,
 )
+from pyjobby.db import DEFAULT_LIVENESS_GRACE_SECONDS
 from pyjobby.web_admin import (
     PROM_RATE_WINDOW_SECONDS,
     PROM_SQL_DURATION_QUANTILES,

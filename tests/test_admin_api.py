@@ -13,7 +13,7 @@ from pyjobby.admin_api import (
     AdminAPI,
     validate_job_class,
 )
-from pyjobby.client import DEFAULT_PRIO_CEILING
+from pyjobby.enqueue_rules import DEFAULT_PRIO_CEILING
 from pyjobby.web_admin import MAX_PAGE_LIMIT
 
 

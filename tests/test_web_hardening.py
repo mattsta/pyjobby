@@ -32,7 +32,7 @@ from aiohttp.test_utils import TestClient
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from pyjobby.client import DEFAULT_PRIO_CEILING
+from pyjobby.enqueue_rules import DEFAULT_PRIO_CEILING
 from pyjobby.web_admin import (
     MAX_PAGE_LIMIT,
     MAX_QUEUE_NAME_LENGTH,

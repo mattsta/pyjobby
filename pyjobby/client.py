@@ -51,22 +51,16 @@ from loguru import logger
 
 from . import db, fsm, lifecycle
 from .enqueue_rules import (
-    _EMPTY_APP_VERSION,
     _IDENTITY_AND_DEADLINE,
     _KEYS_CONTRADICT,
     _NO_BATCH_DEBOUNCE,
     _NO_BATCH_IDENTITY,
-    _NO_DAG_IDENTITY,
     _NO_DEADLINE_WAITFOR,
     _NO_DEBOUNCE_WAITFOR,
     _NO_IDENTITY_WAITFOR,
     _NO_OUTBOX_DEBOUNCE,
     _ON_TIMEOUT_POLICIES,
-    _TAG_VALUE_TYPES,
     DEFAULT_PRIO_CEILING,
-    MAX_APP_VERSION_LENGTH,
-    MAX_KEY_LENGTH,
-    MAX_PARTITION_KEY_LENGTH,
     SpeculativeEnqueueExhausted,
     validate_app_version,
     validate_key,
@@ -79,37 +73,6 @@ from .retry_strategies import (
     DEFAULT_MAX_RETRY_DELAY,
     DEFAULT_RETRY_STRATEGY,
     RetryStrategy,
-)
-
-#: EVERY RULE ``enqueue_rules`` OWNS IS RE-EXPORTED AT ITS OLD PATH HERE.
-#: These names were ``pyjobby.client`` names for the whole life of the project
-#: -- imported by ``pj``, the CLI, the admin API, the websocket server, the
-#: scheduler and by applications -- and the module split is an internal
-#: layering change, not an API break. Named in ``__all__``-style explicitly so
-#: the re-export is a decision a reader can see rather than a side effect of an
-#: import that could be tidied away by a linter.
-_RE_EXPORTED_ENQUEUE_RULES: Final = (
-    DEFAULT_PRIO_CEILING,
-    MAX_APP_VERSION_LENGTH,
-    MAX_KEY_LENGTH,
-    MAX_PARTITION_KEY_LENGTH,
-    _EMPTY_APP_VERSION,
-    _IDENTITY_AND_DEADLINE,
-    _KEYS_CONTRADICT,
-    _NO_BATCH_DEBOUNCE,
-    _NO_BATCH_IDENTITY,
-    _NO_DAG_IDENTITY,
-    _NO_DEADLINE_WAITFOR,
-    _NO_DEBOUNCE_WAITFOR,
-    _NO_IDENTITY_WAITFOR,
-    _NO_OUTBOX_DEBOUNCE,
-    _ON_TIMEOUT_POLICIES,
-    _TAG_VALUE_TYPES,
-    SpeculativeEnqueueExhausted,
-    validate_app_version,
-    validate_key,
-    validate_priority,
-    validate_tags,
 )
 
 if TYPE_CHECKING:
@@ -1051,7 +1014,7 @@ class JobClient:
                 tenant cannot starve the rest. Jobs with no key form ONE lane
                 of their own: never hidden, never refused for being
                 unlabelled. Inherited by a fork, like uid and tags. Max
-                MAX_PARTITION_KEY_LENGTH characters (default: None)
+                MAX_KEY_LENGTH characters (default: None)
             app_version: PIN this job to a code version: only a worker
                 advertising the same `pj --app-version` will claim it, and it
                 stays 'queued' while none is running. Default None means this
@@ -1101,7 +1064,7 @@ class JobClient:
                 on_timeout is neither 'retry' nor 'fail', if priority is
                 above this client's worker priority ceiling, if tags are
                 not a flat dict of string keys to scalar values, if
-                partition_key is longer than MAX_PARTITION_KEY_LENGTH, or if
+                partition_key is longer than MAX_KEY_LENGTH, or if
                 identity_key names an existing job of a DIFFERENT job_class
 
         Examples:
@@ -3663,12 +3626,7 @@ class JobClient:
 
         async with self.pool.acquire() as conn:
             result = await conn.execute(
-                """
-                UPDATE jorb
-                SET prio = $2
-                WHERE id = ANY($1::bigint[])
-                  AND state IN ('queued', 'waiting')
-            """,
+                db.UPDATE_PRIORITY_MANY_SQL,
                 job_ids,
                 new_priority,
             )

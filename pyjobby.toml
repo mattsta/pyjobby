@@ -26,6 +26,18 @@ prio_ceiling = 1000
 # want; a job with no app_version is claimed by every worker.
 # app_version = "2026.07.28+a1b2c3d"
 
+# Seconds without a heartbeat before a worker counts as dead. Workers beat
+# every 10s by default (`pj --heartbeat-interval`), so keep this comfortably
+# above twice that: a grace the heartbeat cannot beat makes LIVE workers look
+# dead and requeues their jobs out from under them, repeatedly.
+#
+# FIVE PROCESSES READ THIS, which is why it belongs in the file and not only
+# on `pj-monitor --liveness-grace`. pj-monitor ACTS on it (it is the one that
+# requeues a silent worker's jobs); `pj-admin doctor`, pj-web's /metrics and
+# workers page, and the pj-ws dashboard all REPORT by it. Raise it on the
+# monitor alone and every UI goes on calling those workers dead.
+liveness_grace_seconds = 60
+
 [db_params]
 database = "pyjobby"
 user = "postgres"

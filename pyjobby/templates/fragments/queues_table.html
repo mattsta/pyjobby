@@ -1,6 +1,16 @@
 {#
   htmx target #queues-table: queue depths plus the pause/resume controls.
 
+  "QUEUED" AND "SCHEDULED" ARE TWO COLUMNS, and folding them into one is the
+  mistake every other aggregate surface in the platform carries a comment
+  against (db.QUEUE_STATS_SQL, web_admin.PROM_SQL_LIVE_STATES,
+  websocket_server.SNAPSHOT_SQL): "queued" is claimable RIGHT NOW and is the
+  number an operator pages on, while "scheduled" is deliberately parked in
+  the future (retry backoff, an enqueue-at, a batch for next week) and is not
+  a backlog. AdminAPI.queue_stats has always reported them apart; this table
+  showed only the first, so a retry storm or a scheduled campaign was simply
+  invisible on the page named after queue depth.
+
   THE "/lane" SUFFIX IS LOAD-BEARING. On a queue with partition_limits both
   limits are counted PER jorb.partition_key, so a bare "5" against a queue
   running 40 jobs reads as a broken limit -- it is 5 per lane across eight
@@ -18,6 +28,7 @@
         <tr>
             <th>Queue</th>
             <th>Queued</th>
+            <th>Scheduled</th>
             <th>Running</th>
             <th>Crashed</th>
             <th>Status</th>
@@ -40,6 +51,7 @@
         <tr>
             <td><strong>{{ s["queue"] }}</strong></td>
             <td>{{ s["queued"] | int }}</td>
+            <td>{{ s["scheduled"] | int }}</td>
             <td>{{ s["running"] | int }}</td>
             <td>{{ s["crashed"] | int }}</td>
             <td>

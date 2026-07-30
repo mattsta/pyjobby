@@ -36,12 +36,9 @@ import pytest
 from loguru import logger
 
 from pyjobby.admin_api import AdminAPI
-from pyjobby.client import (
-    MAX_APP_VERSION_LENGTH,
-    JobClient,
-    validate_app_version,
-)
+from pyjobby.client import JobClient
 from pyjobby.db import fork_job, retry_job
+from pyjobby.enqueue_rules import MAX_APP_VERSION_LENGTH, validate_app_version
 from pyjobby.pj import STMTS, resolve_app_version
 
 from .test_cli_errors import dsn_for, run_cli

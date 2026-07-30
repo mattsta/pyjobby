@@ -69,6 +69,33 @@ LIVE_STATES: tuple[str, ...] = tuple(
 #: inject.
 LIVE_STATES_SQL: str = ", ".join(f"'{state}'" for state in LIVE_STATES)
 
+#: The states in which a job IS MATCHED TO A WORKER: claimed but not yet
+#: started, or executing. "In flight" in every count, sweep and dashboard the
+#: platform has -- fleet saturation, per-queue concurrency, the monitor's
+#: dead-worker and stuck-claim sweeps, the cancel path's "ask it to stop
+#: rather than cancel it outright" arm.
+#:
+#: It is the busiest predicate in the system and it was written out by hand in
+#: twenty places, which is twenty chances to type ``('claimed')`` and silently
+#: under-count running work forever -- no error, no failing row, just a
+#: concurrency cap that admits twice what it was set to.
+IN_FLIGHT_STATES: tuple[str, ...] = ("claimed", "running")
+
+#: :data:`IN_FLIGHT_STATES` as the inside of a SQL ``IN (...)`` list.
+#:
+#: Interpolated rather than bound, for the reason :data:`TERMINAL_STATES_SQL`
+#: is and with more riding on it: ``jorb_inflight_idx`` and
+#: ``jorb_partition_inflight_idx`` are PARTIAL indexes whose predicate is
+#: exactly this literal list. PostgreSQL proves a partial index usable only by
+#: matching the query's own clauses against that predicate -- it cannot derive
+#: the list from a bound array parameter -- so ``state = ANY($1)`` here is
+#: correct, index-less, and a sequential scan of the largest table in the
+#: system. THE PARTIAL INDEXES PIN THIS LITERAL: the order and spelling below
+#: are the schema's, and changing either is a schema change.
+#:
+#: The values are two literals chosen here, so there is nothing to inject.
+IN_FLIGHT_STATES_SQL: str = ", ".join(f"'{state}'" for state in IN_FLIGHT_STATES)
+
 #: The states in which a job has NOT YET BEEN MATCHED TO A WORKER, and the
 #: only ones whose CLAIM GATES an operator may still change.
 #:
@@ -76,11 +103,18 @@ LIVE_STATES_SQL: str = ", ".join(f"'{state}'" for state in LIVE_STATES)
 #: may take the row (``prio <= the worker's ceiling``, ``app_version`` equal to
 #: what the worker advertises or NULL). Editing either one after the claim
 #: decides nothing -- the gate has already been passed -- and editing a
-#: terminal job's is rewriting history. So the four surfaces that offer those
-#: edits (``JobClient`` and ``AdminAPI``, priority and version) all guard on
-#: exactly this pair, and they name it here rather than each spelling
-#: ``state IN ('queued', 'waiting')`` into its own SQL. A fifth editable gate
-#: would otherwise be a fifth literal, and the first one to be written wrong.
+#: terminal job's is rewriting history. So the FIVE surfaces that offer those
+#: edits -- ``JobClient`` and ``AdminAPI`` for both priority and version, plus
+#: the WebSocket dashboard's ``adjust_priority`` -- all guard on exactly this
+#: pair, and they get it from ``db.UPDATE_PRIORITY_SQL`` /
+#: ``db.UPDATE_PRIORITY_MANY_SQL`` / ``db.UPDATE_APP_VERSION_SQL`` rather than
+#: each spelling ``state IN ('queued', 'waiting')`` into its own SQL.
+#:
+#: The dashboard and the client's BULK re-prioritise are both in that count
+#: because both had written their own copy of the guard, which is the shape of
+#: the defect: every hand-written editable gate is another literal, and the
+#: first one to be written wrong fails silently -- an edit that matches zero
+#: rows, or one that rewrites a job somebody is already running.
 #:
 #: ``waiting`` is in it: a blocked job is not claimable YET, but it will be,
 #: and it will be claimed under whatever gates it carries at that moment.
@@ -113,7 +147,7 @@ LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
     #
     # `finished` is in here for symmetry with the code rather than because a
     # worker produces it: `finished`, `crashed` and `cancelled` share ONE
-    # guard, `AND state IN ('claimed', 'running')`, so all three permit the
+    # guard, `AND state IN (IN_FLIGHT_STATES_SQL)`, so all three permit the
     # same sources. The worker always records `run` (claimed -> running)
     # before completing, and both statements are fenced on the same epoch --
     # so if `run` no-ops, `finished` no-ops too and the job never moves. The

@@ -37,6 +37,68 @@ class JobState(enum.StrEnum):
 
 
 # =========================================================================
+# Worker liveness
+# =========================================================================
+# The heartbeat cadence and the staleness threshold judged against it. The
+# PAIR lives here, in the module every process imports, because they are one
+# agreement between separate programs: the worker writes on one, the monitor
+# and every operator surface read on the other, and they are only meaningful
+# relative to each other.
+
+#: Seconds between worker registry heartbeats (``pj --heartbeat-interval``).
+#: It lives HERE because two different processes have to agree about it: the
+#: worker writes ``jorb_worker.last_seen`` on this cadence, and the monitor's
+#: ``--liveness-grace`` judges staleness against it. A grace below the
+#: heartbeat interval makes every LIVE worker look dead between beats -- the
+#: monitor then requeues in-flight jobs from workers that are fine, over and
+#: over, and no job longer than the grace can ever finish. The monitor warns
+#: at startup when the two are configured into that state.
+DEFAULT_HEARTBEAT_INTERVAL_SECONDS: Final[float] = 10.0
+
+#: Seconds without a heartbeat before a worker counts as dead -- THE liveness
+#: threshold's DEFAULT, defined once.
+#:
+#: A default, and not the answer: the answer is the deployment's, and it is
+#: ``liveness_grace_seconds`` in pyjobby.toml (see ``configloader``). This is
+#: what every surface falls back to when nothing configured one.
+#:
+#: The monitor SWEEPS by that number -- it is the monitor that requeues a dead
+#: worker's jobs -- and doctor, /metrics, the dashboard and the workers page
+#: only REPORT by it. They must agree, because a fleet where the monitor
+#: considers a worker alive and every UI calls it dead (or the reverse) gives
+#: the operator no true reading anywhere. When this was written out six
+#: separate times, raising ``--liveness-grace`` on the monitor left every UI
+#: still calling those workers dead; the config key is the fix for the same
+#: defect one level up, since a flag on one daemon was never going to reach
+#: the other four processes.
+DEFAULT_LIVENESS_GRACE_SECONDS: Final[float] = 60.0
+
+
+def resolve_liveness_grace(flag: float | None, configured: Any = None) -> float:
+    """The liveness threshold this process judges by: the flag, else the config
+    file's ``liveness_grace_seconds``, else :data:`DEFAULT_LIVENESS_GRACE_SECONDS`.
+
+    THE SAME PRECEDENCE AS ``prio_ceiling`` AND ``app_version``, and it is
+    shared with the other processes for the same reason theirs are: a liveness
+    threshold has one half that ACTS on it (the monitor's sweep) and four that
+    REPORT by it (doctor, /metrics, the dashboard, the workers page), and they
+    have to agree. Only ``pj-monitor`` has a flag for it -- the reporting
+    surfaces take the file's value or the default -- so the file is the only
+    place a deployment can state it once and have every process hear it.
+
+    ``is not None``, not ``or``: a configured ``0`` is a real threshold
+    ("anything but a heartbeat this instant is dead"), not an unset one. It is
+    a bad threshold, and the monitor warns about it at startup rather than
+    silently substituting a different number.
+    """
+    if flag is not None:
+        return float(flag)
+    if configured is not None:
+        return float(configured)
+    return DEFAULT_LIVENESS_GRACE_SECONDS
+
+
+# =========================================================================
 # NOTIFY channels
 # =========================================================================
 # Every channel the schema can emit on, spelled once. The names are declared
@@ -48,16 +110,6 @@ class JobState(enum.StrEnum):
 # zero forever. Named constants make that a NameError at import instead.
 #
 # ``pj-bench notify`` asserts these against the running database's triggers.
-
-#: Seconds between worker registry heartbeats (``pj --heartbeat-interval``).
-#: It lives HERE because two different processes have to agree about it: the
-#: worker writes ``jorb_worker.last_seen`` on this cadence, and the monitor's
-#: ``--liveness-grace`` judges staleness against it. A grace below the
-#: heartbeat interval makes every LIVE worker look dead between beats -- the
-#: monitor then requeues in-flight jobs from workers that are fine, over and
-#: over, and no job longer than the grace can ever finish. The monitor warns
-#: at startup when the two are configured into that state.
-DEFAULT_HEARTBEAT_INTERVAL_SECONDS: Final[float] = 10.0
 
 #: A claimable job appeared on a queue some worker has published demand for
 #: (payload: the queue name). The wakeup an idle worker sleeps on.
@@ -228,7 +280,7 @@ def build_requeue_sql(
     the epoch -- recording a DXE checkpoint, setting a timeout -- would still
     apply, letting a job the platform has given up on write checkpoints for
     the attempt that replaces it. Terminal writes were never exposed: they
-    also guard on state IN ('claimed','running'). Checkpoints are loaded
+    also guard on ``lifecycle.IN_FLIGHT_STATES``. Checkpoints are loaded
     without an epoch filter, so bumping costs no resume capability.
 
     THIS IS STATEMENT 1 OF THE "FRESH" RERUN, whose second statement is
@@ -330,6 +382,15 @@ RERUNNABLE_STATES: tuple[str, ...] = ("crashed", "cancelled", "finished")
 #: the validation stays with whoever knows the ceiling.
 UPDATE_PRIORITY_SQL: Final = f"""UPDATE jorb SET prio = $2
              WHERE id = $1 AND state IN ({lifecycle.PRE_CLAIM_STATES_SQL})"""
+
+#: Re-prioritise a LIST of jobs, one statement -- derived from the single-row
+#: form by the same ``.replace`` idiom :data:`CANCEL_MANY_SQL` uses, so the
+#: state guard cannot be right in one and wrong in the other. A bulk edit
+#: getting a different guard from the single edit is not a hypothetical: it is
+#: how ``JobClient.bulk_update_priority`` came to carry its own copy.
+UPDATE_PRIORITY_MANY_SQL: Final = UPDATE_PRIORITY_SQL.replace(
+    "WHERE id = $1", "WHERE id = ANY($1::bigint[])"
+)
 
 #: Re-pin (or unpin) a job that has not been matched to a worker yet. The
 #: state guard is ``lifecycle.PRE_CLAIM_STATES``, which is where the argument
@@ -832,7 +893,7 @@ async def fork_job_from_failure(
 #: $2 is written as an OR-NULL predicate, which trades the index *condition*
 #: for a filter over each partial index's bounded live set -- the price of one
 #: query shape serving both "this queue" and "all queues".
-QUEUE_STATS_SQL = """
+QUEUE_STATS_SQL = f"""
     SELECT queue, 'queued' AS state, COUNT(*)::bigint AS n
       FROM jorb
      WHERE state = 'queued' AND run_after <= now()
@@ -847,7 +908,8 @@ QUEUE_STATS_SQL = """
     UNION ALL
     SELECT queue, state::text, COUNT(*)::bigint
       FROM jorb
-     WHERE state IN ('claimed', 'running') AND ($2::text IS NULL OR queue = $2)
+     WHERE state IN ({lifecycle.IN_FLIGHT_STATES_SQL})
+       AND ($2::text IS NULL OR queue = $2)
      GROUP BY queue, state
     UNION ALL
     SELECT queue, 'waiting', COUNT(*)::bigint
@@ -863,6 +925,23 @@ QUEUE_STATS_SQL = """
      GROUP BY queue, state
 """
 
+#: Every queue's control row, in name order: the pause flag and the limits the
+#: claim path enforces.
+#:
+#: Here rather than in ``AdminAPI`` because it has TWO readers that cannot
+#: share an object: ``AdminAPI.list_queue_controls`` (which holds a
+#: Connection) and ``WebSocketServer.get_queue_controls`` (which holds a
+#: Pool). The dashboard server deliberately does not import the admin API --
+#: its dependencies are this module, ``client`` and ``lifecycle``, and nothing
+#: it does is an admin operation -- so making it construct an AdminAPI to read
+#: four columns would invert that arrow for a single SELECT. A constant both
+#: import inverts nothing and still leaves one statement.
+#:
+#: ``SELECT *`` on purpose: this is a small control table read by name, both
+#: callers project the columns they want in Python, and a column list here
+#: would be a third place to update when the control plane grows a knob.
+QUEUE_CONTROLS_SQL: Final = "SELECT * FROM jorb_queue ORDER BY name"
+
 #: The reported state names :data:`QUEUE_STATS_SQL` can emit: every
 #: ``jorbstate`` label plus the ``scheduled`` split of ``queued``. Callers
 #: zero-fill their result dicts from this so a quiet queue reports 0 rather
@@ -870,10 +949,10 @@ QUEUE_STATS_SQL = """
 QUEUE_STATS_STATES: tuple[str, ...] = (*lifecycle.JOB_STATES, "scheduled")
 
 
-CANCEL_SQL = """UPDATE jorb
+CANCEL_SQL = f"""UPDATE jorb
         SET state = CASE WHEN state IN ('queued', 'waiting')
                          THEN 'cancelled'::jorbstate ELSE state END,
-            cancel_requested = CASE WHEN state IN ('claimed', 'running')
+            cancel_requested = CASE WHEN state IN ({lifecycle.IN_FLIGHT_STATES_SQL})
                                     THEN TRUE ELSE cancel_requested END,
             finished = CASE WHEN state IN ('queued', 'waiting')
                             THEN now() ELSE finished END,

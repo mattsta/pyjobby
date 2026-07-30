@@ -41,6 +41,18 @@ rather than tailing every transition; that rides ``jorb_done``, which is gated
 on ``jorb.awaited`` and therefore costs a notification only for jobs somebody
 actually asked about.
 
+WHAT THIS MODULE DEPENDS ON, AND WHY IT IS NOT ``AdminAPI``
+
+It imports ``db``, ``client`` and ``lifecycle``, and stops there. This is a
+PUSH server holding a connection POOL, not an admin surface: nothing it does
+is an admin operation, and ``AdminAPI`` is built around a single Connection.
+So where a read genuinely IS shared with the admin API -- the queue control
+rows -- the SQL moves down into ``db`` as a constant both import
+(:data:`db.QUEUE_CONTROLS_SQL`), rather than this module reaching up for an
+object it would have to construct per request. Same rule for the writes it
+offers: ``adjust_priority`` executes ``db.UPDATE_PRIORITY_SQL``, so its state
+guard cannot drift from the four other surfaces that edit a claim gate.
+
 Features:
 - Aggregate dashboard snapshots on an interval, one query for all clients
 - Per-job watches over the demand-gated ``jorb_done`` channel
@@ -71,9 +83,9 @@ import asyncpg  # type: ignore[import-untyped]
 from aiohttp import web
 
 from . import db
-from .client import DEFAULT_PRIO_CEILING, validate_priority
-from .lifecycle import TERMINAL_STATES, TERMINAL_STATES_SQL
-from .monitor import DEFAULT_LIVENESS_GRACE_SECONDS
+from .db import DEFAULT_LIVENESS_GRACE_SECONDS
+from .enqueue_rules import DEFAULT_PRIO_CEILING, validate_priority
+from .lifecycle import IN_FLIGHT_STATES_SQL, TERMINAL_STATES, TERMINAL_STATES_SQL
 
 # Configure logging
 logging.basicConfig(
@@ -218,11 +230,17 @@ DEFAULT_SNAPSHOT_WINDOW_SECONDS = 60.0
 #: answer to (queued = claimable now, scheduled = deferred and NOT backlog,
 #: terminal states windowed); this string stays separate only because its
 #: plan is pinned and it carries the kind/age columns the snapshot needs.
-# f-string ONLY for module constants (the liveness grace from monitor.py and
-# the terminal states from lifecycle.py, never user input): the dashboard's
-# live-worker count must use the same grace as the monitor and pj-web, and
-# the same three terminal states as everything else, or the surfaces
-# disagree the day either declaration changes.
+# f-string ONLY for module constants from lifecycle.py, never user input: the
+# terminal and in-flight state lists have to be the same literals as
+# everywhere else (and as the partial indexes) or the surfaces disagree the
+# day either declaration changes.
+#
+# The liveness grace used to be interpolated here too and is now BOUND ($2):
+# it is the deployment's `liveness_grace_seconds`, not a constant, so a value
+# baked in at import could not be the one this server was constructed with.
+# Binding costs nothing on the plan -- `jorb_worker_live_idx` is partial on
+# `shutdown_at IS NULL` (spelled out below) and ordered on `last_seen`, so the
+# threshold is a range condition on the index key either way.
 SNAPSHOT_SQL = f"""
     SELECT 'backlog'::text AS kind, queue, 'queued'::text AS state,
            COUNT(*)::bigint AS n,
@@ -236,7 +254,7 @@ SNAPSHOT_SQL = f"""
     UNION ALL
     SELECT 'inflight', queue, state::text, COUNT(*)::bigint,
            EXTRACT(EPOCH FROM (now() - MIN(updated)))::float8
-      FROM jorb WHERE state IN ('claimed', 'running')
+      FROM jorb WHERE state IN ({IN_FLIGHT_STATES_SQL})
      GROUP BY queue, state
     UNION ALL
     SELECT 'live', queue, 'waiting', COUNT(*)::bigint, NULL::float8
@@ -256,7 +274,7 @@ SNAPSHOT_SQL = f"""
     SELECT 'workers', NULL::text, NULL::text, COUNT(*)::bigint, NULL::float8
       FROM jorb_worker
      WHERE shutdown_at IS NULL
-       AND last_seen > now() - interval '{DEFAULT_LIVENESS_GRACE_SECONDS} seconds'
+       AND last_seen > now() - make_interval(secs => $2)
 """
 
 #: Registers a client's interest in one specific job and reports that job's
@@ -325,6 +343,7 @@ class WebSocketServer:
         snapshot_interval: float = DEFAULT_SNAPSHOT_INTERVAL,
         snapshot_window_seconds: float = DEFAULT_SNAPSHOT_WINDOW_SECONDS,
         prio_ceiling: int = DEFAULT_PRIO_CEILING,
+        liveness_grace_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS,
     ):
         self.db_params = db_params
         self.max_subscriptions = max_subscriptions
@@ -339,6 +358,12 @@ class WebSocketServer:
         # DLQ. Declared, not observed, for the reason client.py gives: the
         # ceiling belongs to the worker fleet and is invisible from here.
         self.prio_ceiling = prio_ceiling
+        # Seconds without a heartbeat before this dashboard calls a worker
+        # dead (`liveness_grace_seconds` in pyjobby.toml). Declared, not
+        # observed, for the same reason the ceiling above it is -- and it must
+        # match what pj-monitor sweeps with, because the monitor ACTS on that
+        # judgement (requeueing the worker's jobs) while this only draws it.
+        self.liveness_grace_seconds = liveness_grace_seconds
         self.snapshot_interval = snapshot_interval
         self.snapshot_window = timedelta(seconds=snapshot_window_seconds)
 
@@ -1047,13 +1072,13 @@ class WebSocketServer:
         assert self.db_pool is not None
         try:
             async with self.db_pool.acquire() as conn:
+                # db.UPDATE_PRIORITY_SQL, not a copy of it: the state guard is
+                # the part that must not drift (see lifecycle.PRE_CLAIM_STATES
+                # -- editing a claim gate after the claim decides nothing, and
+                # editing a terminal job's rewrites history), and this handler
+                # was the surface that had written its own.
                 result = await conn.execute(
-                    """
-                    UPDATE jorb
-                    SET prio = $2
-                    WHERE id = $1
-                      AND state IN ('queued', 'waiting')
-                """,
+                    db.UPDATE_PRIORITY_SQL,
                     job_id,
                     new_priority,
                 )
@@ -1089,14 +1114,14 @@ class WebSocketServer:
             self.stats["errors"] += 1
 
     async def get_queue_controls(self) -> dict[str, dict[str, Any]]:
-        """Fetch jorb_queue control rows keyed by queue name."""
+        """Fetch jorb_queue control rows keyed by queue name.
+
+        The statement is :data:`db.QUEUE_CONTROLS_SQL`, shared with
+        ``AdminAPI.list_queue_controls`` -- see that constant for why the
+        sharing goes through ``db`` rather than through the admin API.
+        """
         assert self.db_pool is not None
-        rows = await self.db_pool.fetch(
-            """
-            SELECT name, paused, max_concurrency, rate_limit
-            FROM jorb_queue ORDER BY name
-            """
-        )
+        rows = await self.db_pool.fetch(db.QUEUE_CONTROLS_SQL)
         return {
             r["name"]: {
                 "paused": r["paused"],
@@ -1107,9 +1132,14 @@ class WebSocketServer:
         }
 
     async def get_live_worker_count(
-        self, stale_after_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS
+        self, stale_after_seconds: float | None = None
     ) -> int:
-        """Count live workers in the registry (no shutdown, fresh heartbeat)."""
+        """Count live workers in the registry (no shutdown, fresh heartbeat).
+
+        ``None`` means this server's configured threshold, not a platform
+        constant: the dashboard has to call a worker dead at the same moment
+        pj-monitor does, and only the deployment knows when that is.
+        """
         assert self.db_pool is not None
         count: int = await self.db_pool.fetchval(
             """
@@ -1117,7 +1147,9 @@ class WebSocketServer:
             WHERE shutdown_at IS NULL
               AND last_seen > now() - make_interval(secs => $1)
             """,
-            stale_after_seconds,
+            self.liveness_grace_seconds
+            if stale_after_seconds is None
+            else stale_after_seconds,
         )
         return count
 
@@ -1250,7 +1282,9 @@ class WebSocketServer:
         second the platform is running.
         """
         assert self.db_pool is not None
-        rows = await self.db_pool.fetch(SNAPSHOT_SQL, self.snapshot_window)
+        rows = await self.db_pool.fetch(
+            SNAPSHOT_SQL, self.snapshot_window, self.liveness_grace_seconds
+        )
         self.stats["snapshot_queries"] += 1
 
         queues: dict[str, dict[str, Any]] = {}
@@ -1532,12 +1566,14 @@ async def serve(
     port: int,
     snapshot_interval: float = DEFAULT_SNAPSHOT_INTERVAL,
     prio_ceiling: int = DEFAULT_PRIO_CEILING,
+    liveness_grace_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS,
 ) -> None:
     """Create and run a WebSocketServer until interrupted."""
     server = WebSocketServer(
         db_params=db_params,
         snapshot_interval=snapshot_interval,
         prio_ceiling=prio_ceiling,
+        liveness_grace_seconds=liveness_grace_seconds,
     )
     try:
         await server.start(host=host, port=port)
@@ -1560,8 +1596,9 @@ def main() -> None:
         # that claimed uniformity sent operators to write `pj-monitor -c ...`
         # and get "no such option".
         help="Config file path (must define db_params; may define "
-        "prio_ceiling) — the same -c/--config pj, pj-admin, pj-scheduler, "
-        "pj-web and pj-bench take (pj-monitor takes --config only)",
+        "prio_ceiling and liveness_grace_seconds) — the same -c/--config pj, "
+        "pj-admin, pj-scheduler, pj-web and pj-bench take (pj-monitor takes "
+        "--config only)",
     )
     @click.option(
         "--host",
@@ -1599,7 +1636,9 @@ def main() -> None:
         """Run the realtime websocket dashboard server."""
         from .configloader import load_config_from_file
 
-        cfg = load_config_from_file(config, keys=["db_params", "prio_ceiling"])
+        cfg = load_config_from_file(
+            config, keys=["db_params", "prio_ceiling", "liveness_grace_seconds"]
+        )
         db_params = cfg.get("db_params")
         if not db_params:
             raise click.ClickException(f"No db_params found in config: {config}")
@@ -1612,7 +1651,12 @@ def main() -> None:
         if snapshot_interval <= 0:
             raise click.ClickException("--snapshot-interval must be positive")
 
-        asyncio.run(serve(db_params, host, port, snapshot_interval, max_prio))
+        # No flag: this server REPORTS liveness rather than acting on it, so
+        # the only useful value is the one pj-monitor sweeps with, and the
+        # config file is the only place both processes read.
+        grace = db.resolve_liveness_grace(None, cfg.get("liveness_grace_seconds"))
+
+        asyncio.run(serve(db_params, host, port, snapshot_interval, max_prio, grace))
 
     cli()
 

@@ -603,3 +603,65 @@ class TestStatus:
             assert info["missing"] == []
         finally:
             await conn.close()
+
+
+# ============================================================================
+# The startup preflight every daemon shares
+# ============================================================================
+
+
+class TestPreflightProblem:
+    """``migrations.preflight_problem`` -- the one question pj, pj-monitor and
+    pj-scheduler each ask once before their loop.
+
+    It lives here because the REMEDY does: this module owns SCHEMA_REMEDY,
+    schema_error_hint and the required-shape manifest, and a preflight is that
+    knowledge asked as a yes/no question. Two of the three daemons carried a
+    private copy of it and the third had none at all -- which is the shape a
+    duplicated startup check always ends up in, and why the daemons' own tests
+    now cover only their WIRING (that they call this, before the loop, and
+    turn the answer into an exit code).
+    """
+
+    async def test_a_usable_database_has_no_problem(self, db_params: dict):
+        """Both target forms, because the daemons hold different ones: a
+        db_params table (pj, pj-scheduler, pj-monitor --config) and a DSN
+        string (pj-monitor --dsn)."""
+        dsn = (
+            f"postgresql://{db_params['user']}:{db_params['password']}"
+            f"@{db_params['host']}:{db_params['port']}/{db_params['database']}"
+        )
+        assert await migrations.preflight_problem(db_params) is None
+        assert await migrations.preflight_problem(dsn) is None
+
+    async def test_a_database_without_the_schema_names_the_remedy(
+        self, scratch: ScratchDatabases
+    ):
+        """The problem string has to carry BOTH halves an operator needs:
+        which database, and what to do about it."""
+        params = await scratch.create(install=None)
+
+        problem = await migrations.preflight_problem(params)
+
+        assert problem is not None
+        assert params["database"] in problem
+        assert migrations.MIGRATE_REMEDY in problem
+
+    async def test_an_unreachable_database_names_the_target_not_the_password(self):
+        """A failure message must say WHICH database -- an operator running
+        four deployments cannot act on "connection refused" -- and must do it
+        without printing the password every target form carries."""
+        problem = await migrations.preflight_problem(
+            {
+                "host": "127.0.0.1",
+                # privileged and unbound: connection refused, now
+                "port": 1,
+                "database": "pyjobby",
+                "user": "nobody",
+                "password": "hunter2-must-not-be-logged",
+            }
+        )
+
+        assert problem is not None
+        assert "127.0.0.1:1/pyjobby" in problem
+        assert "hunter2" not in problem

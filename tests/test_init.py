@@ -4,7 +4,10 @@ Tests for pyjobby/__init__.py module initialization.
 Covers version detection and fallback mechanisms.
 """
 
+import pathlib
 from unittest.mock import patch
+
+import pyjobby
 
 
 class TestVersionDetection:
@@ -122,38 +125,110 @@ class TestTheErrorTaxonomyIsImportable:
 
 
 class TestTheEnqueueRulesSplitIsAnInternalMove:
-    """``pyjobby.enqueue_rules`` was carved out of ``pyjobby.client``.
+    """``pyjobby.enqueue_rules`` was carved out of ``pyjobby.client``, and it
+    is the ONE home for what it owns.
 
-    Every name it owns was a ``pyjobby.client`` name for the whole life of the
-    project -- imported by ``pj``, the CLI, the admin API, the websocket
-    server, the scheduler and by applications -- so the split is a layering
-    change and must not be an API break. And the layering is the point: the
-    new module imports nothing from the package, which is what lets
-    ``db.fork_job`` and ``dag`` reach a validator at the TOP of the file
-    instead of with a function-local ``from .client import`` written to dodge
-    an import cycle.
+    The carve-out shipped with every name re-exported at its old
+    ``pyjobby.client`` path "for API compatibility". There is nothing to be
+    compatible with: this is a forward-only framework with no live
+    deployments, so the re-export bought no user anything and cost the
+    codebase two import paths for one constant -- two things to keep in step,
+    and one of them to grep past. It is gone.
+
+    The layering is what the split was actually for: the new module imports
+    nothing from the package, which is what lets ``db.fork_job`` and ``dag``
+    reach a validator at the TOP of the file instead of with a
+    function-local ``from .client import`` written to dodge an import cycle.
     """
 
-    def test_every_moved_name_is_the_same_object_at_its_old_path(self):
+    def test_the_rules_have_exactly_one_import_path(self):
+        """``client`` does not re-export them, and nothing asks it to.
+
+        ``SpeculativeEnqueueExhausted`` is the one deliberate second path,
+        and it is ``pyjobby`` itself rather than ``pyjobby.client``: an
+        application has to be able to CATCH it without importing a rules
+        module. Everything else -- the bounds, the validators, the refusal
+        messages -- is ``pyjobby.enqueue_rules`` and nowhere else.
+        """
+        import pyjobby
         from pyjobby import client, enqueue_rules
 
-        moved = [
+        owned = {
             name
             for name in dir(enqueue_rules)
             # `annotations` is the __future__ import, not a rule
             if not name.startswith("__") and name != "annotations"
-        ]
-        assert len(moved) > 15, "the sweep found almost nothing; check the filter"
-        for name in moved:
-            assert hasattr(client, name), (
-                f"client.{name} disappeared in the move: it was a public "
-                f"import path before the split"
+        }
+        assert len(owned) > 15, "the sweep found almost nothing; check the filter"
+
+        # client legitimately USES several of these; what it must not do is
+        # hold a name it neither uses nor defines purely to re-export it.
+        re_exported = {
+            name
+            for name in owned
+            if getattr(client, name, None) is getattr(enqueue_rules, name)
+        }
+        unused_by_client = {
+            name for name in re_exported if client.__dict__.get(name) is not None
+        }
+        source = pathlib.Path(client.__file__).read_text()
+        for name in sorted(unused_by_client):
+            # one mention is the import line itself; a genuine user has more
+            assert source.count(name) > 1, (
+                f"client imports {name} without using it -- that is a "
+                f"re-export, and enqueue_rules is the only import path"
             )
-            assert getattr(client, name) is getattr(enqueue_rules, name), (
-                f"client.{name} is a COPY of enqueue_rules.{name}, not the "
-                f"same object; two definitions of one rule is the thing the "
-                f"split was supposed to remove"
-            )
+
+        assert pyjobby.SpeculativeEnqueueExhausted is (
+            enqueue_rules.SpeculativeEnqueueExhausted
+        )
+
+    def test_the_key_length_bound_has_one_name(self):
+        """``MAX_PARTITION_KEY_LENGTH`` was an alias of ``MAX_KEY_LENGTH``.
+
+        One bound for all four caller-chosen keys, and therefore one name for
+        it. A second name for the same number is a second thing to find when
+        the number changes, and the alias existed only because
+        ``partition_key`` documented the reasoning first.
+        """
+        from pyjobby import enqueue_rules
+
+        assert enqueue_rules.MAX_KEY_LENGTH == 256
+        assert not hasattr(enqueue_rules, "MAX_PARTITION_KEY_LENGTH")
+
+    def test_no_module_in_the_package_reaches_the_rules_through_client(self):
+        """The sweep, so the next importer cannot reintroduce the second path.
+
+        Read out of the source rather than from ``sys.modules``: what is under
+        test is what the files SAY, not what happens to be importable.
+        """
+        import ast
+
+        from pyjobby import enqueue_rules
+
+        owned = {
+            name
+            for name in dir(enqueue_rules)
+            if not name.startswith("__") and name != "annotations"
+        }
+        package = pathlib.Path(pyjobby.__file__).parent
+        offenders = []
+        for source in sorted(package.rglob("*.py")):
+            tree = ast.parse(source.read_text())
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ImportFrom):
+                    continue
+                if node.module not in ("client", "pyjobby.client"):
+                    continue
+                for alias in node.names:
+                    if alias.name in owned:
+                        offenders.append(
+                            f"{source.relative_to(package)}:{node.lineno}: {alias.name}"
+                        )
+        assert not offenders, (
+            "these import an enqueue rule through pyjobby.client; the one "
+            "path is pyjobby.enqueue_rules:\n" + "\n".join(offenders)
+        )
 
     def test_the_rules_module_imports_nothing_from_the_package(self):
         """The whole reason it can be imported at the top of db.py and dag.py.

@@ -28,8 +28,9 @@ from aiohttp.typedefs import Handler
 
 from . import db
 from .admin_api import AdminAPI
-from .client import DEFAULT_PRIO_CEILING
-from .monitor import DEFAULT_LIVENESS_GRACE_SECONDS
+from .db import DEFAULT_LIVENESS_GRACE_SECONDS
+from .enqueue_rules import DEFAULT_PRIO_CEILING
+from .lifecycle import IN_FLIGHT_STATES_SQL
 
 # =============================================================================
 # Request parsing
@@ -127,7 +128,7 @@ PROM_RATE_WINDOW_SECONDS = 300
 # db.QUEUE_STATS_SQL is the semantic contract for those names and for the
 # windowed terminal counts below; these strings stay separate only because
 # their plans are pinned per scrape arm.
-PROM_SQL_LIVE_STATES = """
+PROM_SQL_LIVE_STATES = f"""
     SELECT queue, 'queued' AS state, COUNT(*) AS n
       FROM jorb WHERE state = 'queued' AND run_after <= now() GROUP BY queue
     UNION ALL
@@ -135,7 +136,7 @@ PROM_SQL_LIVE_STATES = """
       FROM jorb WHERE state = 'queued' AND run_after > now() GROUP BY queue
     UNION ALL
     SELECT queue, state::text, COUNT(*)
-      FROM jorb WHERE state IN ('claimed', 'running')
+      FROM jorb WHERE state IN ({IN_FLIGHT_STATES_SQL})
      GROUP BY queue, state
     UNION ALL
     SELECT queue, 'waiting', COUNT(*)
@@ -201,13 +202,21 @@ PROM_SQL_ENQUEUED_TOTAL = """
 
 PROM_SQL_QUEUE_PAUSED = "SELECT name, paused FROM jorb_queue ORDER BY name"
 
-# liveness judged by THE threshold (monitor.DEFAULT_LIVENESS_GRACE_SECONDS),
-# interpolated once at import — a literal here drifted from the monitor's
-# flag and called live workers dead
-PROM_SQL_WORKERS_LIVE = f"""
+# Liveness judged by THE threshold, BOUND ($1 seconds) rather than
+# interpolated: it is the deployment's `liveness_grace_seconds`, not a
+# constant, and a literal baked in at import cannot be the value this server
+# was constructed with. A literal here drifted from the monitor's flag once
+# already and called live workers dead.
+#
+# Binding is safe for the plan, unlike the partial-index predicates elsewhere
+# in this file: `jorb_worker_live_idx` is PARTIAL on `shutdown_at IS NULL` --
+# spelled out below, as it must be -- and ordered on `last_seen`, so the
+# threshold is a range CONDITION on the index key, which a parameter serves
+# exactly as well as a constant.
+PROM_SQL_WORKERS_LIVE = """
     SELECT COUNT(*) FROM jorb_worker
      WHERE shutdown_at IS NULL
-       AND last_seen > now() - interval '{int(DEFAULT_LIVENESS_GRACE_SECONDS)} seconds'
+       AND last_seen > now() - make_interval(secs => $1)
 """
 
 # The 'scheduled' split of the arrival cohort lives in
@@ -607,6 +616,7 @@ class WebAdminServer:
         host: str = "127.0.0.1",
         port: int = 8081,
         prio_ceiling: int = DEFAULT_PRIO_CEILING,
+        liveness_grace_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS,
     ):
         """
         Initialize web admin server.
@@ -619,11 +629,20 @@ class WebAdminServer:
                 (`pj --max-prio`, default 1000). Handed to every AdminAPI
                 this server builds, so the schedule form cannot create a
                 schedule whose every firing mints an unclaimable job.
+            liveness_grace_seconds: seconds without a heartbeat before this
+                server calls a worker dead (`liveness_grace_seconds` in
+                pyjobby.toml, default 60). Reaches BOTH readers of it here:
+                every AdminAPI this server builds (the workers page) and
+                /metrics' own live-worker gauge, which runs its own SQL. This
+                page is where an operator looks to decide whether a worker is
+                gone, so it has to be judging by the number `pj-monitor` is
+                about to requeue that worker's jobs on.
         """
         self.db_params = db_params
         self.host = host
         self.port = port
         self.prio_ceiling = prio_ceiling
+        self.liveness_grace_seconds = liveness_grace_seconds
         self.pool: asyncpg.Pool | None = None
         self._pool_lock = asyncio.Lock()
         # Built once and cached on the instance: compiling a template is not
@@ -713,7 +732,11 @@ class WebAdminServer:
         """Acquire a pooled connection wrapped in an AdminAPI for one request."""
         pool = await self._get_pool()
         async with pool.acquire() as conn:
-            yield AdminAPI(conn, prio_ceiling=self.prio_ceiling)
+            yield AdminAPI(
+                conn,
+                prio_ceiling=self.prio_ceiling,
+                liveness_grace_seconds=self.liveness_grace_seconds,
+            )
 
     @staticmethod
     async def _job_or_404(api: AdminAPI, job_id: int) -> dict[str, Any]:
@@ -949,7 +972,9 @@ class WebAdminServer:
                     f" {1 if r['paused'] else 0}"
                 )
 
-            workers_live = await conn.fetchval(PROM_SQL_WORKERS_LIVE)
+            workers_live = await conn.fetchval(
+                PROM_SQL_WORKERS_LIVE, self.liveness_grace_seconds
+            )
             lines.append(
                 "# HELP pyjobby_workers_live Live workers "
                 "(registered, not shut down, recent heartbeat)."
@@ -1542,19 +1567,7 @@ class WebAdminServer:
         schedule_id = _path_id(request, "schedule_id")
         limit = _query_int(request, "limit", 50, maximum=MAX_PAGE_LIMIT)
         async with self.api() as api:
-            # Query directly: jorb_schedule_log is ordered by id (schema v1
-            # has actual_time, not a 'created' column)
-            records = await api.conn.fetch(
-                """
-                SELECT * FROM jorb_schedule_log
-                WHERE schedule_id = $1
-                ORDER BY id DESC
-                LIMIT $2
-                """,
-                schedule_id,
-                limit,
-            )
-            history = [dict(r) for r in records]
+            history = await api.get_schedule_history(schedule_id, limit=limit)
             return web.json_response(
                 history, dumps=lambda x: json.dumps(x, default=str)
             )
@@ -1589,9 +1602,16 @@ async def serve(
     host: str,
     port: int,
     prio_ceiling: int = DEFAULT_PRIO_CEILING,
+    liveness_grace_seconds: float = DEFAULT_LIVENESS_GRACE_SECONDS,
 ) -> None:
     """Create and run a WebAdminServer until interrupted."""
-    server = WebAdminServer(db_params, host=host, port=port, prio_ceiling=prio_ceiling)
+    server = WebAdminServer(
+        db_params,
+        host=host,
+        port=port,
+        prio_ceiling=prio_ceiling,
+        liveness_grace_seconds=liveness_grace_seconds,
+    )
     await server.start()
 
 
@@ -1610,8 +1630,9 @@ def main() -> None:
         # that claimed uniformity sent operators to write `pj-monitor -c ...`
         # and get "no such option".
         help="Config file path (must define db_params; may define "
-        "prio_ceiling) — the same -c/--config pj, pj-admin, pj-scheduler, "
-        "pj-ws and pj-bench take (pj-monitor takes --config only)",
+        "prio_ceiling and liveness_grace_seconds) — the same -c/--config pj, "
+        "pj-admin, pj-scheduler, pj-ws and pj-bench take (pj-monitor takes "
+        "--config only)",
     )
     @click.option(
         "--host",
@@ -1633,7 +1654,9 @@ def main() -> None:
         """Run the pyjobby web admin interface."""
         from .configloader import load_config_from_file
 
-        cfg = load_config_from_file(config, keys=["db_params", "prio_ceiling"])
+        cfg = load_config_from_file(
+            config, keys=["db_params", "prio_ceiling", "liveness_grace_seconds"]
+        )
         db_params = cfg.get("db_params")
         if not db_params:
             raise click.ClickException(f"No db_params found in config: {config}")
@@ -1643,7 +1666,12 @@ def main() -> None:
             configured = cfg.get("prio_ceiling")
             max_prio = DEFAULT_PRIO_CEILING if configured is None else configured
 
-        asyncio.run(serve(db_params, host, port, max_prio))
+        # No flag for this one on purpose: this server REPORTS liveness, it
+        # does not act on it, so the only useful value is the one pj-monitor
+        # sweeps with -- which the file is the only place to say once.
+        grace = db.resolve_liveness_grace(None, cfg.get("liveness_grace_seconds"))
+
+        asyncio.run(serve(db_params, host, port, max_prio, grace))
 
     cli()
 

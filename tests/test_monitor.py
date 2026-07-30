@@ -2720,11 +2720,12 @@ class TestMonitorPreflight:
     healthy daemon. Nothing in that picture says "migrate". The in-loop
     resilience is for TRANSIENT failures and is deliberately untouched; this
     is the startup precondition, and it is an exit code.
-    """
 
-    async def test_a_usable_database_has_no_problem(self, db_params):
-        assert await monitor_module._preflight_problem(db_params) is None
-        assert await monitor_module._preflight_problem(dsn_from(db_params)) is None
+    The check itself is ``migrations.preflight_problem``, shared with pj and
+    pj-scheduler and unit-tested once in tests/test_migrations.py. What is
+    left here is the WIRING, which is per-daemon: that pj-monitor calls it,
+    before the loop, and turns the answer into an exit code.
+    """
 
     async def test_pj_monitor_exits_2_on_a_database_without_the_schema(self, db_params):
         """The wiring, end to end: the daemon must EXIT, not settle into a
@@ -2744,34 +2745,6 @@ class TestMonitorPreflight:
 
         assert proc.returncode == 2, proc.stdout + proc.stderr
         assert migrations.MIGRATE_REMEDY in proc.stderr
-
-    async def test_a_database_without_the_schema_names_the_remedy(self, db_params):
-        factory = ScratchDatabases(db_params)
-        try:
-            params = await factory.create(install=None)
-            problem = await monitor_module._preflight_problem(params)
-        finally:
-            await factory.close()
-
-        assert problem is not None
-        assert params["database"] in problem
-        assert migrations.MIGRATE_REMEDY in problem
-
-    async def test_an_unreachable_database_names_the_target_not_the_password(self):
-        problem = await monitor_module._preflight_problem(
-            {
-                "host": "127.0.0.1",
-                # privileged and unbound: connection refused, now
-                "port": 1,
-                "database": "pyjobby",
-                "user": "nobody",
-                "password": "hunter2-must-not-be-logged",
-            }
-        )
-
-        assert problem is not None
-        assert "127.0.0.1:1/pyjobby" in problem
-        assert "hunter2" not in problem
 
 
 class TestMonitorPoolSizing:

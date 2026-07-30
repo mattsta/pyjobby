@@ -32,7 +32,7 @@ from click.testing import CliRunner
 from pyjobby import db
 from pyjobby.admin_api import AdminAPI
 from pyjobby.cli import cli
-from pyjobby.client import DEFAULT_PRIO_CEILING
+from pyjobby.enqueue_rules import DEFAULT_PRIO_CEILING
 from pyjobby.pj import Job
 
 from .conftest import wait_for_job_state

@@ -101,7 +101,7 @@ for readers working from a checkout.)
 
 - `pyjobby/pj.py` - the worker: claiming, execution, state transitions
 - `pyjobby/client.py` - `JobClient`, the enqueue side
-- `pyjobby/enqueue_rules.py` - what an enqueue will and will not accept: the bounds, the validators and the refusal messages, in one import-free module every writer reaches (`client` re-exports all of it at its old path)
+- `pyjobby/enqueue_rules.py` - what an enqueue will and will not accept: the bounds, the validators and the refusal messages, in one import-free module every writer reaches — and the one import path for them (`from pyjobby.enqueue_rules import ...`)
 - `pyjobby/lifecycle.py` - the job state machine, declared: the states, the legal transitions, and the state sets the SQL guards are built from
 - `pyjobby/sql/schema/` - the canonical base schema as ordered purpose files (`00_core.sql` ... `92_history_trigger.sql`), shipped in the wheel; `pj-admin db migrate` executes their concatenation on a fresh database
 - `pyjobby/migrations.py` - the migration runner (numbered files in `pyjobby/sql/migrations/`, none shipped until there are live deployments to upgrade), plus the required-shape manifest `pj-admin doctor` checks a database against

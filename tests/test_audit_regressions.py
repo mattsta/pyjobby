@@ -42,8 +42,9 @@ import asyncpg
 import pytest
 
 from pyjobby import db
-from pyjobby.client import MAX_KEY_LENGTH, JobClient
+from pyjobby.client import JobClient
 from pyjobby.dag import DAGBuilder
+from pyjobby.enqueue_rules import MAX_KEY_LENGTH
 from pyjobby.monitor import (
     RETRY_TIMED_OUT_SQL,
     SWEEP_DEAD_WORKER_JOBS_SQL,

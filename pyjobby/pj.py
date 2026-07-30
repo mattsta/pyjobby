@@ -53,8 +53,8 @@ import click
 from aiohttp import web
 from loguru import logger
 
-from . import db, dxe, enqueue_rules, migrations
-from .configloader import describe_db_target, load_config_from_file
+from . import db, dxe, enqueue_rules, lifecycle, migrations
+from .configloader import load_config_from_file
 from .enqueue_rules import DEFAULT_PRIO_CEILING
 from .retry_strategies import DEFAULT_MAX_RETRIES
 
@@ -92,7 +92,10 @@ logger = logger.patch(cleanupLogLengths)  # type: ignore[arg-type]
 
 STMTS: dict[str, str] = {}
 
-# Claim the single most-urgent runnable job in our queue, honoring the
+# Claim the single most-urgent runnable job in our queue that this worker is
+# eligible for: at or below its priority ceiling, matching its capabilities
+# and its advertised app_version, and admitted by the queue's own controls.
+#
 # Claiming lives in claim_jorb() (see sql/schema/30_claim.sql), so the queue control
 # plane -- paused / max_concurrency / rate_limit -- is enforced for every
 # claimer rather than re-implemented by each one. Enforcing it there is also
@@ -186,14 +189,14 @@ STMTS["now"] = """SELECT now() AS now"""
 # how the worker delivers a cancel that arrived in the claim->run window,
 # instead of running the job to completion and then misreporting the
 # undelivered cancel as "the task never yielded".
-STMTS["run"] = """UPDATE jorb
+STMTS["run"] = f"""UPDATE jorb
               SET state = 'running',
                   started = now(),
                   timeout_at = CASE WHEN $3::interval IS NULL THEN NULL
                                     ELSE now() + $3::interval END,
                   updated = now()
               WHERE id = $1
-                AND state IN ('claimed', 'running')
+                AND state IN ({lifecycle.IN_FLIGHT_STATES_SQL})
                 AND run_epoch = $2
           RETURNING id, cancel_requested"""
 
@@ -211,7 +214,7 @@ STMTS["run"] = """UPDATE jorb
 # cancel still pending means the task never yielded at an await point for
 # the cancellation to be delivered — the operator's cancel silently did
 # nothing, and the caller logs that instead of recording plain success.
-STMTS["finished"] = """UPDATE jorb
+STMTS["finished"] = f"""UPDATE jorb
               SET state = 'finished',
                   result = $2,
                   run_epoch = run_epoch + 1,
@@ -219,7 +222,7 @@ STMTS["finished"] = """UPDATE jorb
                   timeout_at = NULL,
                   updated = now()
               WHERE id = $1
-                AND state IN ('claimed', 'running')
+                AND state IN ({lifecycle.IN_FLIGHT_STATES_SQL})
                 AND run_epoch = $3
           RETURNING id, cancel_requested"""
 
@@ -245,14 +248,14 @@ STMTS["retry"] = f"""UPDATE jorb
                   {db.REQUEUE_CLEARS_KEYS}
                   updated = now()
               WHERE id = $1
-                AND state IN ('claimed', 'running')
+                AND state IN ({lifecycle.IN_FLIGHT_STATES_SQL})
                 AND run_epoch = $5
           RETURNING id"""
 
 # Terminal failure: retries exhausted (or on_timeout='fail'). state='crashed'
 # IS the dead letter queue. Bumps run_epoch (see STMTS["finished"]): the
 # execution being dead-lettered may still be alive in a thread.
-STMTS["crashed"] = """UPDATE jorb
+STMTS["crashed"] = f"""UPDATE jorb
               SET state = 'crashed',
                   error_message = $2,
                   error_backtrace = $3,
@@ -262,7 +265,7 @@ STMTS["crashed"] = """UPDATE jorb
                   timeout_at = NULL,
                   updated = now()
               WHERE id = $1
-                AND state IN ('claimed', 'running')
+                AND state IN ({lifecycle.IN_FLIGHT_STATES_SQL})
                 AND run_epoch = $4
           RETURNING id"""
 
@@ -270,14 +273,14 @@ STMTS["crashed"] = """UPDATE jorb
 # run_epoch (see STMTS["finished"]): "honored" is the worker's view — a
 # synchronous task that ignored the cancellation is still running in its
 # thread, and this is what fences its writes out.
-STMTS["cancelled"] = """UPDATE jorb
+STMTS["cancelled"] = f"""UPDATE jorb
               SET state = 'cancelled',
                   run_epoch = run_epoch + 1,
                   finished = now(),
                   timeout_at = NULL,
                   updated = now()
               WHERE id = $1
-                AND state IN ('claimed', 'running')
+                AND state IN ({lifecycle.IN_FLIGHT_STATES_SQL})
                 AND run_epoch = $2
           RETURNING id"""
 
@@ -304,7 +307,7 @@ STMTS["reschedule"] = f"""UPDATE jorb
                   {db.REQUEUE_CLEARS_KEYS}
                   updated = now()
               WHERE id = $1
-                AND state IN ('claimed', 'running')
+                AND state IN ({lifecycle.IN_FLIGHT_STATES_SQL})
                 AND run_epoch = $3
           RETURNING id"""
 
@@ -456,6 +459,13 @@ class JobSystem:
     stop: bool = False
     pid: int = field(default_factory=lambda: os.getpid())
     node: str = field(default_factory=lambda: platform.node())
+    # Scratch space for JOB CODE, untouched by the platform: a plain dict per
+    # worker process, for objects a job wants to build once and reuse across
+    # runs (an HTTP session, a warmed client, a compiled model). Reached as
+    # `self.s.cache` from inside a task -- see docs/writing-jobs.md. It is
+    # never read here, and nothing clears it: a worker process owns it for its
+    # whole life, so anything with a close() belongs to the job code that put
+    # it there.
     cache: dict[str, Any] = field(default_factory=dict)
     # Maximum attempts before terminal 'crashed' (one home: retry_strategies)
     max_retries: int = DEFAULT_MAX_RETRIES
@@ -2287,8 +2297,12 @@ class Job:
         SENDER's epoch, so a superseded execution delivers nothing."""
 
         async def _do_send(conn: asyncpg.Connection) -> int:
-            rows = await conn.fetch(
-                dxe.SEND_SQL,
+            # The PREPARED statement, like every sibling that runs inside
+            # transaction() (compact-fence, set-event, compact-steps): `conn`
+            # IS self.s.cxn, which is where STMTS was prepared, so executing
+            # the raw string here re-parsed and re-planned it on every send
+            # while its prepared twin sat unused in the dict.
+            rows = await self.s.stmts["send"].fetch(
                 dest_job_id,
                 topic,
                 message,
@@ -2400,8 +2414,10 @@ class Job:
         """
 
         async def _do_append(conn: asyncpg.Connection) -> int:
-            row = await conn.fetchrow(
-                dxe.STREAM_APPEND_SQL,
+            # The PREPARED statement, for the reason send() gives above: this
+            # runs on self.s.cxn, which is where STMTS["stream-append"] was
+            # prepared.
+            row = await self.s.stmts["stream-append"].fetchrow(
                 self.job["id"],
                 key,
                 value,
@@ -2538,41 +2554,6 @@ class Job:
         await self._reschedule(interval)
 
         return interval
-
-
-async def _preflight_problem(db_params: dict[str, Any]) -> str | None:
-    """Connect once and check the schema is there. Returns the operator-facing
-    problem, or None when the database is usable.
-
-    Run BEFORE any worker is forked. A worker that cannot reach the database
-    or finds no schema is a worker that logs from inside a retry loop in one
-    of N child processes, N times a second, while the launcher sits there
-    looking healthy — so the launcher asks the question once, itself, and can
-    then answer it as an exit code.
-    """
-    target = describe_db_target(db_params)
-    try:
-        conn = await db.connect(**db_params)
-    except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as e:
-        hint = migrations.schema_error_hint(e)
-        return f"Cannot connect to the database at {target}: {e}" + (
-            f" {hint}" if hint else ""
-        )
-    try:
-        if not await conn.fetchval("SELECT to_regclass('public.jorb')"):
-            return (
-                f"No pyjobby schema in the database at {target}: "
-                f"{migrations.SCHEMA_REMEDY}"
-            )
-    except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as e:
-        hint = migrations.schema_error_hint(e)
-        return f"Cannot query the database at {target}: {e}" + (
-            f" {hint}" if hint else ""
-        )
-    finally:
-        with contextlib.suppress(Exception):
-            await conn.close()
-    return None
 
 
 def resolve_app_version(flag: str | None, configured: Any) -> str | None:
@@ -2855,7 +2836,7 @@ def workit(
     # Ask the one question every worker is about to ask, before forking any of
     # them: exit code 2 (a startup precondition) rather than N children in
     # retry loops behind a launcher that reports success.
-    problem = asyncio.run(_preflight_problem(loadedConfig["db_params"]))
+    problem = asyncio.run(migrations.preflight_problem(loadedConfig["db_params"]))
     if problem is not None:
         logger.error(problem)
         sys.exit(2)
