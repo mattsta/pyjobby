@@ -53,9 +53,9 @@ import click
 from aiohttp import web
 from loguru import logger
 
-from . import db, dxe, migrations
-from .client import DEFAULT_PRIO_CEILING
+from . import db, dxe, enqueue_rules, migrations
 from .configloader import describe_db_target, load_config_from_file
+from .enqueue_rules import DEFAULT_PRIO_CEILING
 from .retry_strategies import DEFAULT_MAX_RETRIES
 
 fmt = (
@@ -290,10 +290,18 @@ STMTS["cancelled"] = """UPDATE jorb
 # moment this commits, so the execution that asked to be rescheduled is no
 # longer entitled to write — "run me again later, from the top" abandons
 # the current attempt by definition.
-STMTS["reschedule"] = """UPDATE jorb
+# Clears the dedupe keys for the reason STMTS["retry"] does, and it is the
+# same reason word for word: this statement puts the row back into 'queued',
+# so a deadline_key whose duty ended at the first claim would re-enter
+# jorb_deadline_idx on the way -- and a duplicate enqueued while the job ran
+# is sitting in that index already. Unfenced, a durable sleep() inside a
+# job whose key was re-armed mid-run raised a unique violation from the
+# SLEEP, which is the one place a job has no failure handler for it.
+STMTS["reschedule"] = f"""UPDATE jorb
               SET state = 'queued',
                   run_epoch = run_epoch + 1,
                   run_after = now() + $2::interval,
+                  {db.REQUEUE_CLEARS_KEYS}
                   updated = now()
               WHERE id = $1
                 AND state IN ('claimed', 'running')
@@ -1994,7 +2002,11 @@ class Job:
         job, so a superseded attempt's checkpoint matches zero rows, raises
         StaleExecutionError *inside* the transaction, and takes the
         application write down with it. A zombie worker cannot commit
-        application data for a job another worker has taken over.
+        application data for a job another worker has taken over — and the
+        fence is a LOCK on the job row (``FOR SHARE``), not a read of it, so
+        that holds even when the takeover commits while this transaction is
+        already open: the checkpoint blocks on the requeue, then re-evaluates
+        against the bumped epoch and matches nothing.
 
         Failure path: when ``fn`` raises, the transaction (including the
         checkpoint) is rolled back, and the error checkpoint is then
@@ -2500,21 +2512,35 @@ def resolve_app_version(flag: str | None, configured: Any) -> str | None:
     caller, and refusing to boot would take a whole fleet down over a blank
     template variable, so this warns and carries on unpinned.
 
+    EVERY WAY THE ENQUEUE SIDE REFUSES A VERSION, THIS SIDE WARNS AND
+    ADVERTISES NONE -- the same three rules, the same
+    ``client.validate_app_version`` bounds, and never a version the enqueue
+    side could not have written. A worker advertising something no job can
+    carry claims nothing, silently, which is the failure the empty case
+    already documented; a version above ``MAX_APP_VERSION_LENGTH`` and a
+    version that is not a string are the same failure by two other routes.
+    Not coerced with ``str()``: ``app_version = 20260728`` in the config file
+    is an unquoted integer, the client REFUSES it, and a fleet that coerced it
+    to ``"20260728"`` would advertise a version no enqueue can ever stamp --
+    the two halves of one pin disagreeing is precisely what sharing the config
+    key exists to prevent.
+
     A function rather than four lines inside ``workit`` so the rule can be
     tested without spawning a fleet to observe it.
     """
     version = flag if flag is not None else configured
     if version is None:
         return None
-    version = str(version)
-    if not version.strip():
+    try:
+        return enqueue_rules.validate_app_version(version)
+    except ValueError as refused:
         logger.warning(
-            "The app version this fleet was given is empty (an unset build "
-            "variable?); it will advertise NO app version and claim only "
-            "unpinned jobs"
+            "The app version this fleet was given is not one any enqueue "
+            "could write (%s); it will advertise NO app version and claim "
+            "only unpinned jobs",
+            refused,
         )
         return None
-    return version
 
 
 def runAndDone(

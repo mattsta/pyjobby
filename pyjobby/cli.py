@@ -17,6 +17,7 @@ from typing import Any
 
 import asyncpg  # type: ignore[import-untyped]
 import click
+from click.core import ParameterSource
 
 from . import db, migrations
 from .admin_api import CLEAR_QUEUE_STATES, UNSET, AdminAPI, Unset
@@ -202,7 +203,7 @@ async def get_connection(
         fail(f"Failed to connect to database: {e}", problem=DatabaseProblem)
 
 
-def load_prio_ceiling(config_path: str) -> int:
+def load_prio_ceiling(config_path: str, *, named: bool = False) -> int:
     """This fleet's worker priority ceiling, from the config file.
 
     The ceiling belongs to the worker fleet (`pj --max-prio`) and nothing
@@ -211,14 +212,31 @@ def load_prio_ceiling(config_path: str) -> int:
     priority has to read the same declaration, or the CLI refuses priorities
     the fleet's own workers claim happily.
 
-    A config that cannot be loaded is NOT reported here: this is a lookup
-    every command does, including the ones running on --dsn with no config
-    file at all, and get_connection reports config problems properly the
-    moment it needs db_params from the same file.
+    A config that cannot be loaded is not FATAL here: this is a lookup every
+    command does, including the ones running on --dsn with no config file at
+    all, and get_connection reports config problems properly the moment it
+    needs db_params from the same file.
+
+    ``named`` says the operator typed -c/--config rather than letting the
+    default path stand. On --dsn nothing else ever opens that file, so an
+    explicitly named config that cannot be read used to leave the ceiling
+    silently at the default: `pj-admin -c /etc/pyjobby/pyjobby.toml --dsn ...
+    schedule add --priority 3000` refused a priority the fleet claims happily,
+    and blamed the priority. Warn instead of failing, because a ceiling is not
+    what --dsn was invoked to reach and the command may not write a priority
+    at all; stderr, so scripted stdout still parses.
     """
     try:
         config = load_config_from_file(config_path, keys=["prio_ceiling"])
-    except RuntimeError:  # ConfigError: missing, unreadable, or bad
+    except RuntimeError as e:  # ConfigError: missing, unreadable, or bad
+        if named:
+            print_warning(
+                f"Could not read {config_path} ({e}); this fleet's priority "
+                f"ceiling defaults to {DEFAULT_PRIO_CEILING} instead of the "
+                f"prio_ceiling declared there. Pass --max-prio to say what it "
+                f"really is.",
+                err=True,
+            )
         return DEFAULT_PRIO_CEILING
     ceiling = config.get("prio_ceiling")
     return int(ceiling) if ceiling is not None else DEFAULT_PRIO_CEILING
@@ -261,7 +279,9 @@ async def get_api(
     """
     conn = await get_connection(ctx.obj["config"], ctx.obj.get("dsn"))
     if prio_ceiling is None:
-        prio_ceiling = load_prio_ceiling(ctx.obj["config"])
+        prio_ceiling = load_prio_ceiling(
+            ctx.obj["config"], named=ctx.obj.get("config_named", False)
+        )
     return conn, AdminAPI(conn, prio_ceiling=prio_ceiling)
 
 
@@ -284,6 +304,14 @@ def cli(ctx: click.Context, config: str, dsn: str | None) -> None:
     ctx.ensure_object(dict)
     ctx.obj["config"] = config
     ctx.obj["dsn"] = dsn
+    # "the operator named a config file" is not the same question as "a config
+    # path is set": --config always has a value, so an unreadable ./pyjobby.toml
+    # on a --dsn run is the ordinary case and must stay silent, while an
+    # unreadable path the operator TYPED is a mistake worth saying out loud
+    # (see load_prio_ceiling).
+    ctx.obj["config_named"] = (
+        ctx.get_parameter_source("config") is not ParameterSource.DEFAULT
+    )
 
 
 # =========================================================================
@@ -475,6 +503,16 @@ def jobs_inspect(ctx: click.Context, job_id: int, output_json: bool) -> None:
                 # queued job may be claimable by nobody.
                 if job["app_version"]:
                     click.echo(f"App Version:     {job['app_version']}")
+                # The fair-share lane this job counts against: on a queue with
+                # partition_limits, max_concurrency and rate_limit are counted
+                # per distinct partition_key, so this string is what decides
+                # WHICH cap holds the job back. Invisible everywhere else on a
+                # per-job basis -- `queues show` names the scope but not the
+                # lanes -- which left the one command whose job is to show
+                # everything about a job unable to answer "why is this tenant's
+                # work waiting while that tenant's runs".
+                if job["partition_key"]:
+                    click.echo(f"Lane:            {job['partition_key']}")
                 if job["uid"]:
                     click.echo(f"User ID:         {job['uid']}")
                 if job["tags"]:
@@ -699,8 +737,18 @@ def jobs_set_priority(
 @click.option(
     "--clear",
     is_flag=True,
+    # A flag here, a 'none' string over in `queues limits` -- the divergence is
+    # DELIBERATE and is spelled out so the next reader does not "fix" one to
+    # match the other. An app version's value space is every string a build can
+    # be called, so a sentinel value could collide with a legitimate pin and a
+    # flag cannot be mistaken for one; a limit's value space is the integers,
+    # which has no room for a flag, so `--max-concurrency none` says "unset" in
+    # the one place the value already had to be parsed.
     help="UNPIN the job: any live worker may then claim it. The remedy for "
-    "work stranded by a deploy that moved on",
+    "work stranded by a deploy that moved on. A flag, deliberately, where "
+    "`queues limits` unsets with the string 'none': a version pin is an "
+    "arbitrary string, so no sentinel VALUE could be safely reserved, while a "
+    "limit is an integer with no room for a flag",
 )
 @click.pass_context
 def jobs_set_app_version(
@@ -1039,13 +1087,17 @@ def jobs_fork(
 
     Streams, events and mail are the SOURCE's output and are not copied.
     """
+    # Checked before the async body, like `jobs set-app-version` checks its
+    # own VERSION/--clear pair: this failure is about the operator's arguments
+    # and nothing else, so it must not cost a database connection (and must
+    # not depend on one being reachable) to be reported.
+    if from_failure and from_step is not None:
+        fail(
+            "--from-step and --from-failure both name where to start; pass one",
+            code=2,
+        )
 
     async def _fork() -> None:
-        if from_failure and from_step is not None:
-            fail(
-                "--from-step and --from-failure both name where to start; pass one",
-                code=2,
-            )
         conn, api = await get_api(ctx, prio_ceiling=max_prio)
         try:
             try:
@@ -1104,6 +1156,26 @@ def _fmt_limit(value: int | None) -> str:
     return str(value) if value is not None else "-"
 
 
+def _fmt_scoped_limit(value: int | None, partitioned: bool) -> str:
+    """A queue limit with the "/lane" scope marker its queue earns.
+
+    THE SUFFIX IS LOAD-BEARING. On a queue with partition_limits both limits
+    are counted PER jorb.partition_key, so a bare "5" against a queue running
+    40 jobs reads as a limit that has stopped working -- it is 5 per lane
+    across eight lanes, doing exactly what it was set to do. Printed ON the
+    number and not as a Partitioned column of its own for the reason
+    `_echo_queue_control` prints the scope on each limit and the web queues
+    table repeats it: an operator reading one number must never have to look
+    elsewhere on the row to learn which of the two things it means.
+
+    Unlimited ('-') carries no marker: there is no cap for the lane scope to
+    apply to, and "- /lane" reads as a limit that exists.
+    """
+    if value is None:
+        return "-"
+    return f"{value} /lane" if partitioned else str(value)
+
+
 @queues.command("list")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.pass_context
@@ -1126,12 +1198,16 @@ def queues_list(ctx: click.Context, output_json: bool) -> None:
             headers = ["Queue", "Paused", "Max Conc", "Rate Limit", "Rate Period"]
             rows = []
             for q in queues:
+                # `/lane` on both limits when this queue counts them per
+                # partition_key -- see _fmt_scoped_limit for why the scope
+                # travels with the number rather than living in a column.
+                partitioned = q["partition_limits"]
                 rows.append(
                     [
                         q["name"],
                         "yes" if q["paused"] else "no",
-                        _fmt_limit(q["max_concurrency"]),
-                        _fmt_limit(q["rate_limit"]),
+                        _fmt_scoped_limit(q["max_concurrency"], partitioned),
+                        _fmt_scoped_limit(q["rate_limit"], partitioned),
                         f"{q['rate_period_seconds']:g}s",
                     ]
                 )
@@ -2133,7 +2209,13 @@ def schedule_add(
         pj-admin schedule add sync SyncJob "*/5 * * * *" --jitter 60 --max-concurrent 3
         pj-admin schedule add roll RollupJob "0 * * * *" --backfill-limit 3
     """
-    ceiling = max_prio if max_prio is not None else load_prio_ceiling(ctx.obj["config"])
+    ceiling = (
+        max_prio
+        if max_prio is not None
+        else load_prio_ceiling(
+            ctx.obj["config"], named=ctx.obj.get("config_named", False)
+        )
+    )
 
     # Checked before a connection is opened, because this failure is about
     # the operator's arguments and not the database. The predicate and the
@@ -3437,8 +3519,8 @@ def doctor(
     Checks: database reachability, schema/migrations, NOTIFY triggers,
     NOTIFY queue saturation, live workers, workers that are alive but
     claiming nothing, queue backlogs, queues whose partition_limits scope
-    nothing, jobs no live worker can claim, blocked waiters, unread mail, the
-    DLQ, and overdue schedules.
+    nothing, schedules whose backfill cannot land, jobs no live worker can
+    claim, blocked waiters, unread mail, the DLQ, and overdue schedules.
 
     With --json the same checks come out as [{check, status, message}] and
     the exit code is unchanged, so a CI job can scrape them.
@@ -3649,6 +3731,52 @@ def doctor(
                 f"the two limits count per partition_key instead of per queue. "
                 f"Set one (pj-admin queues limits NAME --max-concurrency N), or "
                 f"clear the flag (--no-partition-limits)",
+            )
+
+            # A schedule whose own concurrency cap swallows its backfill
+            # allowance. Sits here beside partition-limits because it is the
+            # same species of defect: a feature switched ON, believed to be
+            # protecting the deployment, doing nothing. A backfilled tick
+            # fires through the SAME path an on-time one does, so
+            # max_concurrent_jobs refuses it identically, and the
+            # currently-due tick has already taken a slot -- landing N
+            # backfilled ticks needs max_concurrent_jobs of N + 1. At the
+            # default cap of 1, ANY backfill_limit catches up on nothing.
+            #
+            # `pj-admin schedule add` warns about this at creation, but that
+            # is the only door that does: a schedule created through the web
+            # admin form, through AdminAPI.create_schedule or through
+            # Scheduler.create_schedule never passes that code and is never
+            # told. Disabled schedules are excluded for the same reason
+            # overdue schedules are counted only when enabled -- a schedule
+            # that is not firing is not misconfigured yet.
+            inert_backfill = await conn.fetch("""
+                SELECT name, backfill_limit, max_concurrent_jobs
+                FROM jorb_schedule
+                WHERE enabled
+                  AND backfill_limit > 0
+                  AND backfill_limit + 1 > max_concurrent_jobs
+                ORDER BY name
+            """)
+            doc.warn_if(
+                bool(inert_backfill),
+                "backfill",
+                "every enabled schedule's backfill_limit fits its max_concurrent_jobs",
+                f"{len(inert_backfill)} enabled schedule(s) whose backfill "
+                f"cannot land in full: "
+                + ", ".join(
+                    f"{s['name']} (backfill_limit {s['backfill_limit']} needs "
+                    f"max_concurrent_jobs {s['backfill_limit'] + 1}, has "
+                    f"{s['max_concurrent_jobs']}: "
+                    f"{max(s['max_concurrent_jobs'] - 1, 0)} tick(s) can fire)"
+                    for s in inert_backfill
+                )
+                + ". A backfilled tick is refused by max_concurrent_jobs "
+                "exactly like an on-time one, and the currently-due tick "
+                "already occupies one slot, so the rest are recorded as "
+                "`max_concurrent` skips. Fires go newest-first, so the ticks "
+                "lost are the oldest. Raise max_concurrent_jobs to "
+                "backfill_limit + 1, or lower backfill_limit",
             )
 
             # Work no live worker on its queue could ever claim. Checked

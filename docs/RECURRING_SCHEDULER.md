@@ -289,6 +289,19 @@ which is unique across queued rows. Two scheduler instances firing the same
 schedule at the same instant produce one job; the loser records a `duplicate`
 skip. Nothing to configure.
 
+The window this narrows is not zero, and it is worth knowing its exact shape:
+a `deadline_key` is unique across **queued** rows, so it stops a second job
+only while the first is still queued. Two instances whose passes overlap
+mid-flight, or one instance retrying a tick inside a single poll interval,
+can therefore fire the same tick twice if a worker claimed the first job in
+between — the key re-armed at that claim, and the second enqueue is a
+legitimately new job as far as the index is concerned. It is a small window
+and it is **recorded**: both fires appear in `jorb_schedule_log` against the
+same `scheduled_time`, so `schedules history` shows it rather than hiding it.
+Work that must not run twice regardless should be idempotent, or should carry
+its own `identity_key` (which has no state predicate and holds for the life of
+the row).
+
 The created job also carries `schedule_id` — a **column** on `jorb`, not an
 `admin_data` key — plus `admin_data.schedule_name` and
 `admin_data.scheduled_time`. `schedule_id` is how the concurrency check finds

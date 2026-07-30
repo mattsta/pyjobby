@@ -37,6 +37,17 @@ EXPECTED_TEMPLATES = {
 }
 
 
+def _table_rows(html: str) -> list[str]:
+    """Split a rendered fragment into one string per ``<tr>``.
+
+    An assertion against the whole page passes when the value it is looking
+    for belongs to a different row -- and these fragments render every queue
+    (or schedule) in the database, including the ones other tests left
+    behind. Per-row is the only way to say "this queue shows that".
+    """
+    return html.split("<tr>")[1:]
+
+
 class TestWebAdminServerInit:
     """Test WebAdminServer initialization - covers lines 27-84."""
 
@@ -426,6 +437,308 @@ class TestJobsAPI:
         assert data["status"] == "deleted"
 
 
+class TestJobsListFilters:
+    """The filters `/api/jobs` exposes, and the ones it refuses to fake.
+
+    `AdminAPI.list_jobs` has answered identity_key and tags with an index for
+    as long as `pj-admin jobs list` has taken --identity and --tag; the HTTP
+    surface simply never passed them through, so the two incident questions
+    ("did this identity ever run", "show me this customer's jobs") were
+    CLI-only. The rejection tests below pin the worse half: an unknown
+    parameter was DROPPED, so a mistyped filter answered with the whole queue
+    and looked like a filter that matched everything.
+    """
+
+    @pytest_asyncio.fixture
+    async def tagged_jobs(self, db_pool):
+        """Two jobs on one queue: one tagged+identified, one bare."""
+        queue = unique_name("filters")
+        identity = unique_name("ident")
+        async with db_pool.acquire() as conn:
+            match_id = await conn.fetchval(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state,
+                                  identity_key, tags)
+                VALUES ('FilterJob', '{}', $1, 100, 'queued', $2,
+                        '{"customer": "acme", "batch": 7}')
+                RETURNING id
+                """,
+                queue,
+                identity,
+            )
+            other_id = await conn.fetchval(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state, tags)
+                VALUES ('FilterJob', '{}', $1, 100, 'queued',
+                        '{"customer": "globex"}')
+                RETURNING id
+                """,
+                queue,
+            )
+        return {
+            "queue": queue,
+            "identity": identity,
+            "match": match_id,
+            "other": other_id,
+        }
+
+    @pytest.mark.asyncio
+    async def test_identity_key_filter_reaches_list_jobs(
+        self, web_admin_client, tagged_jobs
+    ):
+        """?identity_key= returns the one row holding that key, not the queue."""
+        resp = await web_admin_client.get(
+            f"/api/jobs?identity_key={tagged_jobs['identity']}"
+        )
+        assert resp.status == 200
+        assert [j["id"] for j in await resp.json()] == [tagged_jobs["match"]]
+
+    @pytest.mark.asyncio
+    async def test_empty_identity_key_is_not_a_filter(
+        self, web_admin_client, tagged_jobs
+    ):
+        """An unfilled form field must not search for the empty identity."""
+        resp = await web_admin_client.get(
+            f"/api/jobs?queue={tagged_jobs['queue']}&identity_key="
+        )
+        assert resp.status == 200
+        assert {j["id"] for j in await resp.json()} == {
+            tagged_jobs["match"],
+            tagged_jobs["other"],
+        }
+
+    @pytest.mark.asyncio
+    async def test_tag_filter_is_repeated_key_equals_value(
+        self, web_admin_client, tagged_jobs
+    ):
+        """?tag=k%3Dv is the URL spelling of `--tag k=v`, and repeats AND."""
+        resp = await web_admin_client.get(
+            f"/api/jobs?queue={tagged_jobs['queue']}"
+            f"&tag={urllib.parse.quote('customer=acme', safe='')}"
+        )
+        assert resp.status == 200
+        assert [j["id"] for j in await resp.json()] == [tagged_jobs["match"]]
+
+        # Both pairs must hold: the second one nothing carries empties it.
+        resp = await web_admin_client.get(
+            f"/api/jobs?queue={tagged_jobs['queue']}"
+            f"&tag={urllib.parse.quote('customer=acme', safe='')}"
+            f"&tag={urllib.parse.quote('region=eu', safe='')}"
+        )
+        assert resp.status == 200
+        assert await resp.json() == []
+
+    @pytest.mark.asyncio
+    async def test_tag_value_is_read_as_json_like_the_cli(
+        self, web_admin_client, tagged_jobs
+    ):
+        """batch=7 matches the NUMBER 7; the string "7" is written as JSON.
+
+        The stored tag is a JSON number, and a filter that sent the string
+        would silently match nothing -- the same trap `cli.parse_tags` reads
+        values as JSON to avoid.
+        """
+        resp = await web_admin_client.get(
+            f"/api/jobs?queue={tagged_jobs['queue']}"
+            f"&tag={urllib.parse.quote('batch=7', safe='')}"
+        )
+        assert resp.status == 200
+        assert [j["id"] for j in await resp.json()] == [tagged_jobs["match"]]
+
+        resp = await web_admin_client.get(
+            f"/api/jobs?queue={tagged_jobs['queue']}"
+            f"&tag={urllib.parse.quote('batch="7"', safe='')}"
+        )
+        assert resp.status == 200
+        assert await resp.json() == []
+
+    @pytest.mark.parametrize("bad", ["customer", "=acme", "a=[1,2]", 'a={"b": 1}'])
+    @pytest.mark.asyncio
+    async def test_malformed_tag_is_400_not_a_500_or_a_wider_search(
+        self, web_admin_client, bad
+    ):
+        """A tag that is not key=value with a scalar value is refused."""
+        resp = await web_admin_client.get(
+            f"/api/jobs?tag={urllib.parse.quote(bad, safe='')}"
+        )
+        assert resp.status == 400
+        assert "tag" in (await resp.json())["error"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_query_parameter_is_rejected(self, web_admin_client):
+        """`?identity_ke=x` returned every job; now it is a 400 naming it."""
+        resp = await web_admin_client.get("/api/jobs?identity_ke=x")
+        assert resp.status == 400
+        body = (await resp.json())["error"]
+        assert "identity_ke" in body
+        # ...and the message says what the route does read.
+        assert "identity_key" in body
+
+    @pytest.mark.asyncio
+    async def test_unknown_parameter_list_is_bounded(self, web_admin_client):
+        """The echoed names are capped: the body is not the client's to size."""
+        query = "&".join(f"junk{i}=1" for i in range(50))
+        resp = await web_admin_client.get(f"/api/jobs?{query}")
+        assert resp.status == 400
+        body = (await resp.json())["error"]
+        assert "and 45 more" in body
+        assert "junk49" not in body
+
+    @pytest.mark.asyncio
+    async def test_known_parameters_all_pass(self, web_admin_client, tagged_jobs):
+        """Every documented parameter together is a 200, not a 400."""
+        resp = await web_admin_client.get(
+            f"/api/jobs?queue={tagged_jobs['queue']}&state=queued&limit=10"
+            f"&offset=0&format=json&identity_key={tagged_jobs['identity']}"
+            f"&tag={urllib.parse.quote('customer=acme', safe='')}"
+        )
+        assert resp.status == 200
+        assert [j["id"] for j in await resp.json()] == [tagged_jobs["match"]]
+
+
+class TestScheduledVocabulary:
+    """A queued job with run_after in the future is 'scheduled' everywhere.
+
+    db.QUEUE_STATS_SQL is the contract: `pj-admin queues`, the queues table
+    and the /metrics scrape all split those rows out of queued, because
+    deferred work is not backlog. The jobs table and /api/metrics were the
+    two surfaces that still folded them in, so the same rows read as a
+    backlog on one page and as deferred work on the next.
+    """
+
+    @pytest.mark.asyncio
+    async def test_jobs_table_badges_a_deferred_job_scheduled(
+        self, web_admin_client, db_pool
+    ):
+        """A future run_after gets a scheduled badge, not a queued one."""
+        queue = unique_name("sched_badge")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state, run_after)
+                VALUES ('DeferredJob', '{}', $1, 100, 'queued',
+                        now() + interval '1 hour')
+                """,
+                queue,
+            )
+
+        resp = await web_admin_client.get(f"/api/jobs?format=html&queue={queue}")
+        assert resp.status == 200
+        text = await resp.text()
+        assert '<span class="badge scheduled">scheduled</span>' in text
+        assert "badge queued" not in text
+
+    @pytest.mark.asyncio
+    async def test_jobs_table_still_badges_claimable_work_queued(
+        self, web_admin_client, db_pool
+    ):
+        """The split is run_after, not the state: due work stays queued."""
+        queue = unique_name("due_badge")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state, run_after)
+                VALUES ('DueJob', '{}', $1, 100, 'queued', now() - interval '1 minute')
+                """,
+                queue,
+            )
+
+        resp = await web_admin_client.get(f"/api/jobs?format=html&queue={queue}")
+        assert resp.status == 200
+        text = await resp.text()
+        assert '<span class="badge queued">queued</span>' in text
+        assert "scheduled" not in text
+
+    @pytest.mark.asyncio
+    async def test_json_jobs_keep_the_stored_state(self, web_admin_client, db_pool):
+        """`display_state` is a rendering concern: the JSON row is untouched."""
+        queue = unique_name("json_state")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state, run_after)
+                VALUES ('JsonDeferredJob', '{}', $1, 100, 'queued',
+                        now() + interval '1 hour')
+                """,
+                queue,
+            )
+
+        resp = await web_admin_client.get(f"/api/jobs?queue={queue}")
+        assert resp.status == 200
+        rows = await resp.json()
+        assert [r["state"] for r in rows] == ["queued"]
+        assert "display_state" not in rows[0]
+
+    @pytest.mark.asyncio
+    async def test_api_metrics_splits_scheduled_out_of_queued(
+        self, web_admin_client, db_pool
+    ):
+        """state_counts reports the deferred row as scheduled, not queued."""
+        queue = unique_name("metrics_sched")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state, run_after)
+                VALUES ('DueJob', '{}', $1, 100, 'queued', now()),
+                       ('DeferredJob', '{}', $1, 100, 'queued',
+                        now() + interval '1 hour'),
+                       ('DeferredJob', '{}', $1, 100, 'queued',
+                        now() + interval '2 hours')
+                """,
+                queue,
+            )
+
+        resp = await web_admin_client.get(f"/api/metrics?queue={queue}")
+        assert resp.status == 200
+        counts = (await resp.json())["state_counts"]
+        assert counts == {"queued": 1, "scheduled": 2}
+
+    @pytest.mark.asyncio
+    async def test_api_metrics_drops_queued_when_all_of_it_is_deferred(
+        self, web_admin_client, db_pool
+    ):
+        """A GROUP BY has no zero rows, so the split must not leave one.
+
+        Every state in state_counts is present because it has rows; a
+        `queued: 0` left behind by the subtraction would be the only key in
+        the dict that means "none".
+        """
+        queue = unique_name("metrics_all_sched")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state, run_after)
+                VALUES ('DeferredJob', '{}', $1, 100, 'queued',
+                        now() + interval '1 hour')
+                """,
+                queue,
+            )
+
+        resp = await web_admin_client.get(f"/api/metrics?queue={queue}")
+        assert resp.status == 200
+        assert (await resp.json())["state_counts"] == {"scheduled": 1}
+
+    @pytest.mark.asyncio
+    async def test_api_metrics_without_a_queue_filter_still_splits(
+        self, web_admin_client, db_pool
+    ):
+        """The fleet-wide call must not read `?queue=` as a queue named ''."""
+        queue = unique_name("metrics_global")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state, run_after)
+                VALUES ('DeferredJob', '{}', $1, 100, 'queued',
+                        now() + interval '1 hour')
+                """,
+                queue,
+            )
+
+        resp = await web_admin_client.get("/api/metrics?queue=")
+        assert resp.status == 200
+        assert (await resp.json())["state_counts"].get("scheduled", 0) >= 1
+
+
 class TestQueuesAPI:
     """Test Queues API endpoints - covers api_queues_* methods."""
 
@@ -555,6 +868,59 @@ class TestQueueControls:
         assert "Max Concurrency" in text
         assert "Rate Limit" in text
         assert f"/api/queues/{queue}/resume" in text
+
+    @pytest.mark.asyncio
+    async def test_partitioned_limits_are_marked_per_lane(
+        self, web_admin_client, db_pool
+    ):
+        """A per-lane limit rendered bare reads as a queue-wide one.
+
+        `max_concurrency` 5 on a queue with partition_limits is 5 PER
+        partition_key, so an operator seeing "5" beside 40 running jobs
+        concludes the limit is broken. The scope travels with the number,
+        exactly as `pj-admin queues show` prints it.
+        """
+        queue = unique_name("partlimits_html")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb_queue
+                    (name, max_concurrency, rate_limit, partition_limits)
+                VALUES ($1, 5, 100, TRUE)
+                """,
+                queue,
+            )
+
+        resp = await web_admin_client.get("/api/queues?format=html")
+        assert resp.status == 200
+        row = next(
+            ln for ln in _table_rows(await resp.text()) if f"<strong>{queue}<" in ln
+        )
+        assert '5<span class="scope"' in row
+        assert row.count("/lane") == 2, "both limits carry the scope, or neither"
+
+    @pytest.mark.asyncio
+    async def test_queue_wide_limits_carry_no_lane_marker(
+        self, web_admin_client, db_pool
+    ):
+        """The marker means something, so it is absent when limits are not
+        partitioned -- otherwise it is decoration nobody reads."""
+        queue = unique_name("queuewide_html")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb_queue (name, max_concurrency, rate_limit)
+                VALUES ($1, 5, 100)
+                """,
+                queue,
+            )
+
+        resp = await web_admin_client.get("/api/queues?format=html")
+        assert resp.status == 200
+        row = next(
+            ln for ln in _table_rows(await resp.text()) if f"<strong>{queue}<" in ln
+        )
+        assert "/lane" not in row
 
     @pytest.mark.asyncio
     async def test_queues_json_includes_control_fields(self, web_admin_client, db_pool):
@@ -842,6 +1208,86 @@ class TestPrometheusMetrics:
             assert float(line.rsplit(" ", 1)[1]) == pytest.approx(60.0, abs=1.0)
 
     @pytest.mark.asyncio
+    async def test_unclaimable_gauge_is_the_only_signal_for_stranded_work(
+        self, web_admin_client, db_pool
+    ):
+        """Work the live fleet can never claim reaches the scrape, by cause.
+
+        A job above every live worker's ceiling stays 'queued' forever: it
+        never fails, never retries, never reaches the DLQ, and every other
+        series in this exposition reads healthy while it sits there. Without
+        this gauge nothing an alert can be written against ever moves.
+        """
+        queue = unique_name("prom_unclaimable")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb_worker (host, pid, queue, max_prio)
+                VALUES ('unclaimable_host', 5150, $1, 100)
+                """,
+                queue,
+            )
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                VALUES ('CeilingJob', '{}', $1, 500, 'queued'),
+                       ('CeilingJob', '{}', $1, 900, 'queued'),
+                       ('ClaimableJob', '{}', $1, 50, 'queued')
+                """,
+                queue,
+            )
+
+        resp = await web_admin_client.get("/metrics")
+        text = await resp.text()
+
+        assert "# TYPE pyjobby_jobs_unclaimable gauge" in text
+        assert (
+            f'pyjobby_jobs_unclaimable{{queue="{queue}",'
+            f'reason="above_worker_ceiling"}} 2' in text
+        )
+        # The claimable job is backlog, not stranded work, and the causes are
+        # disjoint -- it must not appear under any reason.
+        assert f'pyjobby_jobs_unclaimable{{queue="{queue}",reason="capability' not in (
+            text
+        )
+
+    @pytest.mark.asyncio
+    async def test_unclaimable_gauge_silent_when_the_fleet_can_claim(
+        self, web_admin_client, db_pool
+    ):
+        """A queue whose work its workers CAN claim reports no series.
+
+        The gauge is alerted on above 0, so a queue that is merely busy must
+        not emit a row for it -- and a queue with no live workers at all is
+        pyjobby_workers_live's business, not this one's.
+        """
+        served = unique_name("prom_claimable")
+        unmanned = unique_name("prom_no_workers")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb_worker (host, pid, queue, max_prio)
+                VALUES ('claimable_host', 5151, $1, 1000)
+                """,
+                served,
+            )
+            await conn.execute(
+                """
+                INSERT INTO jorb (job_class, kwargs, queue, prio, state)
+                VALUES ('FineJob', '{}', $1, 100, 'queued'),
+                       ('StrandedButUnmanned', '{}', $2, 5000, 'queued')
+                """,
+                served,
+                unmanned,
+            )
+
+        resp = await web_admin_client.get("/metrics")
+        text = await resp.text()
+
+        assert f'pyjobby_jobs_unclaimable{{queue="{served}"' not in text
+        assert f'pyjobby_jobs_unclaimable{{queue="{unmanned}"' not in text
+
+    @pytest.mark.asyncio
     async def test_label_escaping(self, web_admin_client, db_pool):
         """Queue names with quotes/backslashes/newlines are escaped."""
         nasty = f'esc_{uuid.uuid4().hex[:8]}"q\\b\nnl'
@@ -1090,6 +1536,43 @@ class TestSchedulesAPI:
 
         text = await resp.text()
         assert "<table>" in text
+
+    @pytest.mark.asyncio
+    async def test_schedules_html_shows_backfill(self, web_admin_client, db_pool):
+        """Backfill is a column: it decides what a recovery does.
+
+        A scheduler that was down either drops the missed ticks or fires N of
+        them at once, and both look like a bug to an operator who cannot see
+        which was configured. Worded rather than a bare integer, because 0
+        reads as "off" and the number alone does not say whether it counts
+        ticks fired or ticks dropped.
+        """
+        skipping = unique_name("backfill_off")
+        catching_up = unique_name("backfill_on")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO jorb_schedule
+                    (name, job_class, cron_expr, queue, backfill_limit, next_run)
+                VALUES ($1, 'SkipJob', '0 * * * *', 'test', 0,
+                        NOW() + INTERVAL '1 hour'),
+                       ($2, 'CatchUpJob', '0 * * * *', 'test', 3,
+                        NOW() + INTERVAL '1 hour')
+                """,
+                skipping,
+                catching_up,
+            )
+
+        resp = await web_admin_client.get("/api/schedules?format=html")
+        assert resp.status == 200
+        text = await resp.text()
+        assert "<th>Backfill</th>" in text
+
+        rows = _table_rows(text)
+        off = next(r for r in rows if f"<strong>{skipping}<" in r)
+        on = next(r for r in rows if f"<strong>{catching_up}<" in r)
+        assert "skipped" in off
+        assert "3 missed tick(s)" in on
 
     @pytest.mark.asyncio
     async def test_api_schedule_get(self, web_admin_client, db_pool):

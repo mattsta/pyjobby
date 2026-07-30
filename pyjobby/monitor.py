@@ -11,7 +11,10 @@ recovery:
    (``jorb_worker.last_seen``) went stale are requeued, on any host. Workers
    heartbeat on a dedicated connection, so a stale heartbeat means the
    process is gone (or partitioned — in which case run_epoch fencing keeps
-   the zombie from writing results after the job is requeued).
+   the zombie from writing results after the job is requeued, and because
+   every durable write LOCKS the job row to read its epoch, that holds for a
+   write already in flight when the requeue commits, not only for one that
+   starts afterwards).
 3. **Unregistered-claim reclaim**: jobs stuck in 'claimed' with no registry
    reference past a grace period (a worker died between claim and register,
    or the registry was unavailable).

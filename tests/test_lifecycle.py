@@ -32,7 +32,11 @@ import re
 
 import pytest
 
-from pyjobby.db import build_requeue_sql
+from pyjobby.db import (
+    REQUEUE_CLEARS_KEYS,
+    WAKE_CLEARS_KEYS,
+    build_requeue_sql,
+)
 from pyjobby.lifecycle import (
     JOB_STATES,
     LEGAL_TRANSITIONS,
@@ -41,7 +45,13 @@ from pyjobby.lifecycle import (
     illegal_transitions,
     is_legal,
 )
-from pyjobby.monitor import DEADLETTER_TIMED_OUT_SQL, RETRY_TIMED_OUT_SQL
+from pyjobby.monitor import (
+    DEADLETTER_TIMED_OUT_SQL,
+    RETRY_TIMED_OUT_SQL,
+    SWEEP_DEAD_WORKER_JOBS_SQL,
+    SWEEP_STUCK_CLAIMS_SQL,
+    WAKE_WAITERS_SQL,
+)
 from pyjobby.pj import STMTS
 
 #: `SET state = 'x'` — what a statement moves a job TO.
@@ -142,6 +152,101 @@ def test_every_statement_leaving_an_attempt_bumps_the_fence():
         build_requeue_sql(("crashed",)),
     ):
         assert "run_epoch = run_epoch + 1" in sql
+
+
+def _statements_that_return_a_job_to_queued() -> tuple[dict[str, str], dict[str, str]]:
+    """(requeues, wakes) -- every statement in the platform that writes
+    ``state = 'queued'``, split by which key-release fragment it owes.
+
+    The ``STMTS`` half is DERIVED from the same parse the transition checks
+    use, so the statement nobody remembers to add is added by existing. A
+    statement whose only source state is 'waiting' is a waiter's WAKE and owes
+    the smaller ``WAKE_CLEARS_KEYS`` (a waiting row can hold a deadline_key --
+    'waiting' is outside jorb_deadline_idx, which is exactly why two waiters
+    may share one -- but never a debounce_key, which is refused at the door).
+    Everything else is a REQUEUE out of an attempt or a terminal state and
+    owes all three columns.
+
+    The statements that do not live in ``STMTS`` cannot be derived and are
+    named here instead; the guard-the-guard assertions below make a rename
+    that silently empties either half fail.
+    """
+    requeues: dict[str, str] = {}
+    wakes: dict[str, str] = {}
+    for name, (sources, target) in statement_transitions().items():
+        if target != "queued":
+            continue
+        bucket = wakes if sources <= {"waiting"} else requeues
+        bucket[f"pj.STMTS[{name}]"] = STMTS[name]
+
+    requeues.update(
+        {
+            "db.build_requeue_sql": build_requeue_sql(("crashed",)),
+            "db.build_requeue_sql/bulk": build_requeue_sql(("crashed",), many=True),
+            "monitor.RETRY_TIMED_OUT_SQL": RETRY_TIMED_OUT_SQL,
+            "monitor.SWEEP_DEAD_WORKER_JOBS_SQL": SWEEP_DEAD_WORKER_JOBS_SQL,
+            "monitor.SWEEP_STUCK_CLAIMS_SQL": SWEEP_STUCK_CLAIMS_SQL,
+        }
+    )
+    wakes["monitor.WAKE_WAITERS_SQL"] = WAKE_WAITERS_SQL
+    return requeues, wakes
+
+
+def test_the_queued_target_split_is_not_vacuous():
+    """Guard the guard: a parse that found nothing, or that mis-bucketed the
+    wakes, would make the binding test below pass over an empty set."""
+    requeues, wakes = _statements_that_return_a_job_to_queued()
+    derived = {name for name in requeues | wakes if name.startswith("pj.STMTS[")}
+    assert derived, "nothing in STMTS was parsed as writing state = 'queued'"
+    assert "pj.STMTS[retry]" in requeues
+    assert "pj.STMTS[reschedule]" in requeues, (
+        "a durable sleep parks the row back in 'queued' and owes the release "
+        "like every other requeue; it was the statement that did not"
+    )
+    assert "pj.STMTS[enqueue-next-self-finished]" in wakes
+    assert "pj.STMTS[enqueue-next-if-peer-group-is-finished]" in wakes
+
+
+def test_every_statement_returning_a_job_to_queued_releases_its_dedupe_keys():
+    """A dedupe key's collapse duty ends the first time its row leaves
+    'queued', so the statement that puts it BACK must not carry the key in.
+
+    ``jorb_deadline_idx`` and ``jorb_debounce_idx`` are partial UNIQUE indexes
+    on ``state = 'queued'``. A row that re-enters them while a later burst
+    holds the same key makes the requeue itself raise -- inside a worker's
+    failure handler, inside a durable ``sleep()``, or in the middle of a batch
+    sweep whose every OTHER row then requeues nothing either.
+
+    Bound to the fragments rather than to the column names so the rule stays
+    ONE rule: a statement that spelled the release out by hand would pass a
+    substring check and then drift from ``db.REQUEUE_CLEARS_KEYS`` the day it
+    changes.
+    """
+    requeues, wakes = _statements_that_return_a_job_to_queued()
+    for name, sql in requeues.items():
+        assert REQUEUE_CLEARS_KEYS in sql, (
+            f"{name} returns a job to 'queued' without db.REQUEUE_CLEARS_KEYS: "
+            f"the row re-enters partial unique indexes its key was already "
+            f"released from, and the statement raises when a later burst "
+            f"holds that key"
+        )
+    for name, sql in wakes.items():
+        assert WAKE_CLEARS_KEYS in sql, (
+            f"{name} wakes a waiter into 'queued' without "
+            f"db.WAKE_CLEARS_KEYS: two waiters of one upstream may legally "
+            f"hold the same deadline_key, and this is ONE update over all of "
+            f"them, so the collision rolls back the wake of every other waiter"
+        )
+        assert "debounce_key" not in sql, (
+            f"{name} clears debounce columns a 'waiting' row can never hold "
+            f"(a debounced enqueue with waitfor_* is refused at the door); "
+            f"the wake's release is deliberately the smaller one"
+        )
+    for name, sql in (requeues | wakes).items():
+        assert "identity_key" not in sql, (
+            f"{name} must NOT clear identity_key: jorb_identity_idx has no "
+            f"state predicate and the row holds that key for life"
+        )
 
 
 def test_every_declared_state_is_reachable_and_leaves_somewhere():

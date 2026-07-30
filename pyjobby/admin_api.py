@@ -22,7 +22,6 @@ from . import db
 from .client import (
     DEFAULT_PRIO_CEILING,
     tags_filter_sql,
-    validate_app_version,
     validate_priority,
     validate_tags,
 )
@@ -359,22 +358,21 @@ class JobInfo:
         return cls(**{k: v for k, v in record.items() if k in known})
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary with datetime serialization"""
-        data = asdict(self)
-        # Convert datetimes to ISO strings for JSON serialization
-        for key in [
-            "claimed_at",
-            "run_after",
-            "created",
-            "updated",
-            "started",
-            "finished",
-            "timeout_at",
-            "debounce_deadline",
-        ]:
-            if data.get(key):
-                data[key] = data[key].isoformat()
-        return data
+        """This job as JSON-serialisable data: every datetime as ISO 8601.
+
+        DRIVEN BY THE VALUE'S TYPE, not by a list of which fields are
+        timestamps. The list was hand-kept beside a dataclass that gains a
+        field whenever ``jorb`` gains a column, and the two drifted the way a
+        hand-kept list always does: a new timestamp column serialised as a
+        ``datetime`` object, which every JSON response then died on -- at
+        runtime, in the endpoint, far from the field that was added.
+        ``from_record`` above already refuses to be hand-kept for the same
+        reason; this is the other half of it.
+        """
+        return {
+            key: value.isoformat() if isinstance(value, datetime) else value
+            for key, value in asdict(self).items()
+        }
 
 
 @dataclass
@@ -925,6 +923,15 @@ class AdminAPI:
             # debounced job is queued and deferred by BACKOFF, not by a
             # collapse window that closed at its first claim, and telling an
             # operator that producers are pushing it out would be a lie.
+            #
+            # DEFENCE IN DEPTH now rather than the only thing standing between
+            # the operator and that lie: every statement that returns a row to
+            # 'queued' NULLs debounce_key with it (db.REQUEUE_CLEARS_KEYS), so
+            # a requeued row does not carry the key here to be misread in the
+            # first place. Kept because this reads a row, not a statement --
+            # a hand-written UPDATE, a row from before that rule, or a fifth
+            # requeue path that forgets it all arrive here looking exactly the
+            # same, and the cost of the guard is one comparison.
             if row["debounce_key"] and row["run_count"] == 0:
                 capped = _iso(row["debounce_deadline"])
                 details["debounce_key"] = row["debounce_key"]
@@ -1590,12 +1597,7 @@ class AdminAPI:
         """
         validate_priority(new_priority, self.prio_ceiling)
         result: str = await self.conn.execute(
-            """
-            UPDATE jorb SET prio = $2
-             WHERE id = $1 AND state IN ('queued', 'waiting')
-            """,
-            job_id,
-            new_priority,
+            db.UPDATE_PRIORITY_SQL, job_id, new_priority
         )
         return result != "UPDATE 0"
 
@@ -1605,36 +1607,17 @@ class AdminAPI:
         """Re-pin (or unpin) a job that has not been claimed yet.
 
         The twin of `update_job_priority`, refusing the same states for the
-        same reason: the version is a claim gate, and a job that has already
-        been claimed has already passed through it. `None` CLEARS the pin,
-        which is the remedy for a job stranded by a deploy that moved on --
-        cleared, it is claimable by every live worker again.
+        same reason (`lifecycle.PRE_CLAIM_STATES`): the version is a claim
+        gate, and a job that has already been claimed has already passed
+        through it. `None` CLEARS the pin, which is the remedy for a job
+        stranded by a deploy that moved on.
 
-        Unlike the priority twin there is no ceiling to check against: nothing
-        the platform can read says which builds a fleet is ABOUT to run, so a
-        version no worker advertises yet is a legitimate pin (that is what a
-        deploy in progress looks like). What makes it safe is that the
-        stranding is loud -- doctor's unclaimable sweep, `jobs why`, and every
-        idle worker's log all name it.
-
-        Returns True if the row was updated, False if the job does not exist
-        or has already left the queue.
+        A thin wrapper over `db.update_job_app_version`, which is THE verb --
+        the same one `JobClient` calls -- so the two surfaces cannot validate
+        differently or guard on different states. Read its docstring for why
+        there is no ceiling to check against here.
         """
-        # The RETURN VALUE is what gets written, exactly as in the client twin
-        # (client.update_job_app_version): the validator is the one place that
-        # decides what a version pin may be, and discarding what it hands back
-        # would let this path drift from every other the day it normalises
-        # anything.
-        app_version = validate_app_version(app_version)
-        result: str = await self.conn.execute(
-            """
-            UPDATE jorb SET app_version = $2
-             WHERE id = $1 AND state IN ('queued', 'waiting')
-            """,
-            job_id,
-            app_version,
-        )
-        return result != "UPDATE 0"
+        return await db.update_job_app_version(self.conn, job_id, app_version)
 
     async def delete_jobs(
         self,
@@ -2442,12 +2425,30 @@ class AdminAPI:
         # counts actionable at a scrape interval ("of the million that
         # arrived this hour, 40k are still queued") rather than a census of
         # all history.
+        #
+        # `scheduled` IS SPLIT OUT OF `queued`, exactly as db.QUEUE_STATS_SQL
+        # splits it, because they are the same word everywhere else in the
+        # platform and mean opposite things to an operator. A `queued` row with
+        # `run_after` in the future is PARKED -- it is retry backoff, an
+        # `enqueue_at`, a durable sleep -- and nothing is wrong with it; a
+        # `queued` row that is due and unclaimed is BACKLOG, and something may
+        # be. Folded together, "40k queued" made a fleet with 40k timers look
+        # like a fleet 40k jobs behind, and this endpoint was the only surface
+        # that did it: `pj-admin queues`, the web queues table and QUEUE_STATS
+        # all reported them apart.
+        #
+        # In the GROUP BY rather than as a second statement, so the split and
+        # the counts come from ONE snapshot -- two statements can disagree by a
+        # row that moved between them, and a `queued` count arithmetic'd down
+        # by a number from a later snapshot can go negative.
         state_counts = await self.conn.fetch(
             f"""
-            SELECT state, COUNT(*) as count
+            SELECT CASE WHEN state = 'queued' AND run_after > now()
+                        THEN 'scheduled' ELSE state::text END AS state,
+                   COUNT(*) as count
             FROM jorb
             WHERE created >= $1 {queue_sql}
-            GROUP BY state
+            GROUP BY 1
         """,
             *params,
         )

@@ -174,8 +174,10 @@ async def wait_until_blocked_on_a_transaction(
     PROVABLY stuck on it, so the test pins the ordering it means rather than
     the ordering the box happened to produce. Used by the debounce races (a
     bounce waiting out a concurrent updater, a speculative insert waiting out
-    a conflicting key) and by the stream-append fence (a zombie's append
-    waiting out the requeue that is bumping its epoch).
+    a conflicting key), by the durable-write fences (a zombie's checkpoint,
+    event or stream append waiting out the requeue that is bumping its epoch)
+    and by the wipe-vs-inflight-writer proof (a rerun waiting out an append
+    that is holding the job row).
 
     Each xdist worker owns its own database (conftest.db_params), so
     ``current_database()`` scopes this to this test's own traffic.

@@ -281,6 +281,20 @@ stop that happening quietly:
   blocked behind it, and example ids for `pj-admin jobs why ID`. It is the
   only check that finds these without being handed a job id.
 
+- **The scrape carries it.** `pyjobby_jobs_unclaimable{queue,reason}` is the
+  same sweep as a gauge, labelled by cause
+  (`above_worker_ceiling`, `capability_unmet`, `app_version_unmet`):
+
+  ```
+  pyjobby_jobs_unclaimable{queue="reports",reason="above_worker_ceiling"} 3
+  ```
+
+  Alert on it above 0. Nothing else in the exposition moves for these jobs —
+  they never fail, never retry and never reach the DLQ — and a queue with no
+  live workers at all is deliberately absent, because that is
+  `pyjobby_workers_live` and a different remedy. Counts saturate per queue
+  per cause; "at least this many" is all an alert needs.
+
 - **The client refuses the enqueue.** `client.enqueue(..., priority=5000)`
   raises `ValueError` naming the ceiling — at the caller, where it can still
   be fixed. The ceiling is a _worker_ setting the client cannot observe, so a
@@ -483,7 +497,7 @@ automatically and re-prepare their statements; nothing needs a restart.
 | ----------------------------------- | ----------------------------------------------------------------- |
 | Fleet health                        | `pj-admin doctor`, `pj-admin workers list`                        |
 | A worker is alive but doing nothing | `pyjobby_workers_not_claiming`, `doctor`'s `job-threads` check    |
-| Queued work nothing can ever claim  | `doctor`'s `unclaimable` check, then `pj-admin jobs why ID`       |
+| Queued work nothing can ever claim  | `pyjobby_jobs_unclaimable`, `doctor`'s `unclaimable` check, then `pj-admin jobs why ID` |
 | Queue depths/ages                   | `pj-admin queues list`, `/metrics` gauges                         |
 | What happened to job N              | `pj-admin jobs history N`, `jobs steps N`                         |
 | Throughput/error rates              | `/metrics` counters + duration quantiles                          |

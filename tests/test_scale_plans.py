@@ -1359,3 +1359,89 @@ class TestCompactionPlan:
         assert "Seq Scan on jorb_step" not in plan, plan
         assert "jorb_step_pkey" in plan, plan
         await assert_reads_far_less_than_a_scan(db_pool, plan, "jorb_step")
+
+
+class TestStreamAppendPlan:
+    """Every ``stream_write`` asks "is this stream closed?" before it writes.
+
+    The question is answered against ``jorb_stream``, which for a streaming job
+    is the table that grows with the job's OWN output — so an answer that costs
+    O(rows already written) makes the Nth append cost N and the whole stream
+    cost N². That is the one growth curve a durable stream must not have, and
+    it is paid on the append path rather than by a sweep, so nothing amortises
+    it.
+
+    Runs ``dxe.STREAM_APPEND_SQL`` itself, rolled back.
+    """
+
+    #: Deep enough that a walk of the key's range is unmistakable against a
+    #: probe, and that the seq-scan gate is not passed by a small-table plan.
+    ROWS_IN_ONE_STREAM = 20_000
+
+    async def seed(self, pool, queue: str) -> tuple[int, int]:
+        """One job with a very long OPEN stream; returns (job id, epoch)."""
+        job_id = await pool.fetchval(
+            """INSERT INTO jorb (job_class, kwargs, queue, state)
+               VALUES ('scale.Job', '{}', $1, 'running') RETURNING id""",
+            queue,
+        )
+        epoch = await pool.fetchval("SELECT run_epoch FROM jorb WHERE id = $1", job_id)
+        await pool.execute(
+            """INSERT INTO jorb_stream (job_id, key, seq, value, run_epoch)
+               SELECT $1, 'rows', i - 1, '{}'::jsonb, $3
+                 FROM generate_series(1, $2::int) i""",
+            job_id,
+            self.ROWS_IN_ONE_STREAM,
+            epoch,
+        )
+        await settle(pool)
+        await pool.execute("VACUUM (ANALYZE) jorb_stream")
+        return int(job_id), int(epoch)
+
+    async def test_the_closed_probe_is_a_lookup_not_a_walk_of_the_stream(
+        self, db_pool, unique_queue
+    ):
+        """The regression this index closes, stated as a discard budget.
+
+        Without ``jorb_stream_closed_idx`` the probe rides the primary key,
+        reads every row the key holds and throws each one away for not being
+        the marker — no sequential scan, no wrong answer, and O(stream length)
+        per append. The tell is the discards, so that is what is asserted;
+        `assert_no_seq_scan` alone would have passed the broken plan.
+        """
+        job_id, epoch = await self.seed(db_pool, unique_queue)
+
+        plan = await explain_rolled_back(
+            db_pool, dxe.STREAM_APPEND_SQL, job_id, "rows", {"i": 0}, False, epoch
+        )
+
+        assert "jorb_stream_closed_idx" in plan, plan
+        assert_no_seq_scan(plan, "jorb_stream")
+        removed = rows_removed_by_filter(plan)
+        assert removed * 100 < self.ROWS_IN_ONE_STREAM, (
+            f"the append read and discarded {removed} rows against a "
+            f"{self.ROWS_IN_ONE_STREAM}-row stream: the closed probe is "
+            f"walking the key's whole range instead of probing "
+            f"jorb_stream_closed_idx\n{plan}"
+        )
+        await assert_reads_far_less_than_a_scan(db_pool, plan, "jorb_stream")
+
+    async def test_the_next_position_comes_off_the_tail_of_the_key(
+        self, db_pool, unique_queue
+    ):
+        """The other O(N) candidate in the same statement.
+
+        ``COALESCE(max(seq), -1) + 1`` is an aggregate over the key's whole
+        range as written; it stays cheap only because the primary key lets the
+        planner walk it BACKWARD and stop on the first row. Asserted here
+        because the closed-probe index is a new second index on this table and
+        the planner is free to change its mind about the other node.
+        """
+        job_id, epoch = await self.seed(db_pool, unique_queue)
+
+        plan = await explain_rolled_back(
+            db_pool, dxe.STREAM_APPEND_SQL, job_id, "rows", {"i": 0}, False, epoch
+        )
+
+        assert "jorb_stream_pkey" in plan, plan
+        assert "Backward" in plan, plan

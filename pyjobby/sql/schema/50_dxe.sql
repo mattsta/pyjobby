@@ -72,10 +72,25 @@ CREATE INDEX jorb_mailbox_consumed_idx ON jorb_mailbox (consumed_at)
 -- never a read filter: a resumed job's later rows continue the same stream,
 -- and a reader that filtered by epoch would tear the stream at every retry.
 --
--- NO INDEX BUT THE PRIMARY KEY, deliberately. Both queries lead with job_id:
--- the reader ranges over (job_id, key, seq >= offset) and the retention sweep
--- probes (job_id) for existence. A second index would be write amplification
--- on an append-only table for a question the key already answers.
+-- THE PRIMARY KEY ANSWERS EVERY QUESTION BUT ONE. The reader ranges over
+-- (job_id, key, seq >= offset), the retention sweep probes (job_id) for
+-- existence, and the appender takes max(seq) off the tail of the key's range --
+-- all three are the key, and none of them would be improved by a second index.
+--
+-- The exception is "is this stream CLOSED?", which every append asks first and
+-- which the primary key answers by READING THE WHOLE KEY'S RANGE: `closed` is
+-- not in the index, so the probe scans every row of the stream and discards
+-- them one at a time to conclude the marker is not there. That is O(stream
+-- length) PER APPEND, so a job writing N rows pays O(N^2) over its life -- and
+-- it is paid by the append path, not by a sweep. Measured at 468 buffers for
+-- one append onto a 50k-row stream.
+--
+-- jorb_stream_closed_idx makes it O(1): partial on `closed`, so the index holds
+-- at most ONE ENTRY PER STREAM (a closing append is the last one that can
+-- succeed) and the probe is an equality lookup that finds either that entry or
+-- nothing. Write amplification is the same shape -- an append with closed =
+-- FALSE fails the predicate and never touches the index, so the ordinary write
+-- path pays nothing at all for it.
 --
 -- LIFETIME: rows die with the job through the cascade, and the stream of a
 -- FINISHED job is reaped early on --checkpoint-retention-days, beside the
@@ -92,6 +107,12 @@ CREATE TABLE jorb_stream (
     created   TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (job_id, key, seq)
 );
+
+-- The end-of-stream probe every append runs before it writes. Partial, so it
+-- holds one entry per CLOSED stream and nothing for an open one: the probe is
+-- an equality lookup instead of a walk of the key's whole range, and an
+-- ordinary (closed = FALSE) append never touches the index at all.
+CREATE INDEX jorb_stream_closed_idx ON jorb_stream (job_id, key) WHERE closed;
 
 COMMENT ON TABLE jorb_stream IS 'DXE streams: ordered, durable, per-(job,key) output a client reads incrementally; end of stream is the closed column, never a value.';
 

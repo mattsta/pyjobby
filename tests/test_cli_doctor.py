@@ -740,6 +740,133 @@ class TestDoctorPartitionLimits:
         assert parse_checks(result.output)["partition-limits"][0] == "PASS"
 
 
+class TestDoctorBackfill:
+    """A schedule's own concurrency cap silently swallowing its backfill.
+
+    `backfill_limit` and `max_concurrent_jobs` interact invisibly: a
+    backfilled tick fires through the SAME path an on-time one does, so the
+    cap refuses it identically, and the currently-due tick has already taken
+    a slot -- landing N backfilled ticks needs `max_concurrent_jobs` of N + 1.
+    At the default cap of 1, ANY `backfill_limit` catches up on nothing and
+    the feature is a no-op nobody is told about.
+
+    `pj-admin schedule add` warns at creation, but it is the only door that
+    does: the web admin form, `AdminAPI.create_schedule` and
+    `Scheduler.create_schedule` all reach the same table without passing that
+    code, so for those schedules this check is the ONLY warning there is.
+    """
+
+    async def _schedule(
+        self,
+        pool,
+        name: str,
+        *,
+        backfill_limit: int,
+        max_concurrent_jobs: int,
+        enabled: bool = True,
+    ) -> None:
+        await pool.execute(
+            """INSERT INTO jorb_schedule
+                   (name, job_class, cron_expr, next_run, enabled,
+                    backfill_limit, max_concurrent_jobs)
+               VALUES ($1, 'tests.dxe_jobs.OkJob', '*/5 * * * *',
+                       now() + interval '1 hour', $2, $3, $4)""",
+            name,
+            enabled,
+            backfill_limit,
+            max_concurrent_jobs,
+        )
+
+    async def test_the_default_cap_makes_any_backfill_inert(
+        self, dsn, db_pool, test_id
+    ):
+        """The demonstrated no-op: max_concurrent_jobs 1 is the default, so a
+        schedule asking for backfill out of the box catches up on nothing."""
+        await self._schedule(db_pool, test_id, backfill_limit=3, max_concurrent_jobs=1)
+
+        result = await run_doctor(dsn)
+
+        assert result.exit_code == 0, result.output  # a config problem, not a FAIL
+        status, message = parse_checks(result.output)["backfill"]
+        assert status == "WARN"
+        assert (
+            f"1 enabled schedule(s) whose backfill cannot land in full: "
+            f"{test_id} (backfill_limit 3 needs max_concurrent_jobs 4, has 1: "
+            f"0 tick(s) can fire)." in message
+        )
+        # the arithmetic, and both ways out
+        assert "the currently-due tick already occupies one slot" in message
+        assert "Raise max_concurrent_jobs to backfill_limit + 1" in message
+
+    async def test_a_cap_that_lands_only_part_of_the_backfill_still_warns(
+        self, dsn, db_pool, test_id
+    ):
+        """Partly inert is still inert: the operator asked for 3 and gets 1,
+        and the message says which number is real."""
+        await self._schedule(db_pool, test_id, backfill_limit=3, max_concurrent_jobs=2)
+
+        result = await run_doctor(dsn)
+
+        status, message = parse_checks(result.output)["backfill"]
+        assert status == "WARN"
+        assert "backfill_limit 3 needs max_concurrent_jobs 4, has 2: 1 tick(s)" in (
+            message
+        )
+        # what survives the cap is the freshest, so the operator knows what was lost
+        assert "Fires go newest-first, so the ticks lost are the oldest" in message
+
+    async def test_a_cap_with_room_for_the_whole_backfill_passes(
+        self, dsn, db_pool, test_id
+    ):
+        """backfill_limit + 1 is the exact requirement, not a margin: 3 + the
+        currently-due tick is 4, and 4 is enough."""
+        await self._schedule(db_pool, test_id, backfill_limit=3, max_concurrent_jobs=4)
+
+        result = await run_doctor(dsn)
+
+        assert parse_checks(result.output)["backfill"] == (
+            "PASS",
+            "every enabled schedule's backfill_limit fits its max_concurrent_jobs",
+        )
+
+    async def test_a_schedule_that_never_backfills_is_not_this_checks_business(
+        self, dsn, db_pool, test_id
+    ):
+        """backfill_limit 0 is the default and means "skip what you missed".
+        Nothing is inert, because nothing was asked for."""
+        await self._schedule(db_pool, test_id, backfill_limit=0, max_concurrent_jobs=1)
+
+        result = await run_doctor(dsn)
+
+        assert parse_checks(result.output)["backfill"][0] == "PASS"
+
+    async def test_a_disabled_schedule_is_ignored(self, dsn, db_pool, test_id):
+        """A schedule that is not firing is not misconfigured yet -- the same
+        rule the overdue-schedules check applies."""
+        await self._schedule(
+            db_pool,
+            test_id,
+            backfill_limit=5,
+            max_concurrent_jobs=1,
+            enabled=False,
+        )
+
+        result = await run_doctor(dsn)
+
+        assert parse_checks(result.output)["backfill"][0] == "PASS"
+
+    async def test_the_check_reaches_json_like_every_other(self, dsn, db_pool, test_id):
+        """A schedule created through the web or the API is exactly the case
+        this check exists for, and a CI scrape must see it."""
+        await self._schedule(db_pool, test_id, backfill_limit=2, max_concurrent_jobs=1)
+
+        result = await run_doctor(dsn, "--json")
+
+        record = next(r for r in json.loads(result.stdout) if r["check"] == "backfill")
+        assert record["status"] == "WARN"
+        assert test_id in record["message"]
+
+
 # ============================================================================
 # Work no live worker can claim
 # ============================================================================

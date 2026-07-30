@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import time
 from typing import Any
 
 import asyncpg
@@ -37,6 +36,7 @@ from pyjobby.cli import cli
 from pyjobby.client import JobClient
 
 from .conftest import wait_for_job_state
+from .utils.faults import wait_until_blocked_on_a_transaction
 
 pytestmark = pytest.mark.asyncio
 
@@ -68,34 +68,13 @@ async def rows_holding(pool: asyncpg.Pool, key: str) -> list[dict[str, Any]]:
     ]
 
 
-async def wait_until_blocked_on_a_transaction(
-    pool: asyncpg.Pool, timeout: float = 20.0
-) -> None:
-    """Poll until some backend here is waiting on another's transaction lock.
-
-    That wait is what ON CONFLICT does when the identity it wants belongs to
-    an uncommitted transaction: it blocks on the conflicting tuple's xact
-    rather than skipping it. Observing the wait — instead of sleeping for a
-    duration and hoping — is what makes the tests below deterministic: they
-    release the holder only once the joiner is provably stuck on it.
-
-    Each xdist worker owns its own database (conftest.db_params), so
-    `current_database()` scopes this to this test's own traffic.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        blocked = await pool.fetchval(
-            "SELECT count(*) FROM pg_stat_activity "
-            " WHERE datname = current_database() "
-            "   AND wait_event_type = 'Lock' AND wait_event = 'transactionid'"
-        )
-        if blocked:
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError(
-        f"no backend blocked on the holder's transaction within {timeout}s: "
-        f"the second enqueue resolved without waiting, which it must not"
-    )
+# ``wait_until_blocked_on_a_transaction`` is imported from tests/utils/faults
+# rather than forked here. What these tests need is exactly what the fence and
+# debounce suites need -- release the holder only once the other side is
+# PROVABLY stuck on it -- and the fork had already drifted: it watched only
+# `transactionid` waits, so a joiner blocked on `tuple` (which is what ON
+# CONFLICT does while another backend's speculative insertion is in flight)
+# would have timed out here while passing there.
 
 
 async def put_in_state(pool: asyncpg.Pool, job_id: int, state: str) -> None:
@@ -489,16 +468,23 @@ class TestTheRace:
         ids = {r for r in results if isinstance(r, int)}
         errors = [r for r in results if isinstance(r, ValueError)]
         assert len(ids) == 1
-        assert errors, "every caller of the losing class must be told"
+        # EXACTLY four, not "at least one": the eight callers alternate classes,
+        # so whichever class won, the other four must every one of them be
+        # told. `assert errors` passed while seven callers were answered and
+        # one was raised at, which is the shape of a check that can be dodged
+        # by arriving second -- the thing this test exists to rule out.
+        assert len(errors) == 4, (
+            f"{len(errors)} of the 4 callers of the losing class were told; "
+            f"the mismatch check must read the row that WON, so arriving "
+            f"second cannot dodge it"
+        )
         assert all(key in str(e) for e in errors)
 
 
 class TestTheSameRowVerbs:
     """retry, rerun and dlq retry requeue ONE row, so identity rides along."""
 
-    async def test_rerun_keeps_the_identity(
-        self, job_client, db_pool, unique_queue, dsn
-    ):
+    async def test_rerun_keeps_the_identity(self, job_client, db_pool, unique_queue):
         key = f"identity:{unique_queue}:rerun"
         job_id = await job_client.enqueue(OK, queue=unique_queue, identity_key=key)
         await put_in_state(db_pool, job_id, "finished")

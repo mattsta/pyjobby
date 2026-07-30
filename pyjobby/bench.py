@@ -152,6 +152,14 @@ PLAN_DAG_EVERY = 3
 PLAN_STREAM_EVERY = 3
 PLAN_STREAM_ROWS_PER_JOB = 3
 
+#: One DEEP stream, on the anchor, beside the shallow ones above. The append
+#: gate needs a job whose own stream is long, because the cost it exists to
+#: catch is O(rows this key already holds) per append -- against three rows
+#: every plan looks fine, and the plan that walks the range is the one that
+#: makes a streaming job quadratic in its own output.
+PLAN_STREAM_DEEP_ROWS = 20_000
+PLAN_STREAM_DEEP_KEY = "bench-deep"
+
 #: Schedules the plan seed creates, sharing the seeded log between them. The
 #: schedule-log sweep refuses to delete each schedule's newest execution, so
 #: this is also the bound on what that sweep may read and discard.
@@ -2319,6 +2327,11 @@ def hot_queries() -> tuple[HotQuery, ...]:
         # (seeded jobs sit at 0, so the fence passes), $6 started.
         return [seed["anchor"], 1, "bench", "recv", 0, db.utcnow()]
 
+    def stream_append_args(_queue: str, seed: dict[str, Any]) -> list[Any]:
+        # $1 job_id (the anchor, the one job with a DEEP stream), $2 key,
+        # $3 value, $4 closed, $5 run_epoch (seeded jobs sit at 0).
+        return [seed["anchor"], PLAN_STREAM_DEEP_KEY, {}, False, 0]
+
     return (
         HotQuery(
             "claim",
@@ -2333,6 +2346,25 @@ def hot_queries() -> tuple[HotQuery, ...]:
             recv_args,
             tables=("jorb_mailbox", "jorb_step", "jorb"),
             mutating=True,
+        ),
+        HotQuery(
+            "stream_append",
+            "Job.stream_write() append onto a long stream — the one DXE "
+            "statement whose cost could grow with the job's OWN output",
+            dxe.STREAM_APPEND_SQL,
+            stream_append_args,
+            tables=("jorb_stream", "jorb"),
+            mutating=True,
+            # Zero, and the deep seed is what makes that mean something. The
+            # closed-check has no LIMIT and no ORDER BY, so on the primary key
+            # alone it reads every row this key holds and discards each one for
+            # not being the marker -- O(stream length) per append, O(N^2) over
+            # a job's life, paid on the write path where nothing amortises it.
+            # jorb_stream_closed_idx is partial on `closed`, so it holds at most
+            # one entry per stream and the probe finds it or nothing. A
+            # regression shows up here as PLAN_STREAM_DEEP_ROWS discards, not as
+            # a seq scan.
+            max_rows_removed=0,
         ),
         HotQuery(
             "concurrency_cap",
@@ -2764,6 +2796,26 @@ async def seed_plan_data(
             queue,
             PLAN_STREAM_ROWS_PER_JOB,
             PLAN_STREAM_EVERY,
+        )
+    )
+    # ...and ONE long stream on the anchor, which is what the append gate is
+    # explained against. Left OPEN (no closed row), because that is the state
+    # every append but the last one runs in and the state whose probe used to
+    # read the whole range to conclude nothing.
+    stream_rows += int(
+        await conn.fetchval(
+            """
+            WITH inserted AS (
+                INSERT INTO jorb_stream (job_id, key, seq, value, run_epoch)
+                SELECT $1, $3, i - 1, '{}'::jsonb, 0
+                  FROM generate_series(1, $2::int) i
+                RETURNING 1
+            )
+            SELECT count(*) FROM inserted
+            """,
+            anchor,
+            PLAN_STREAM_DEEP_ROWS,
+            PLAN_STREAM_DEEP_KEY,
         )
     )
     mailbox = min(rows, 20000)

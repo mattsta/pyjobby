@@ -111,6 +111,7 @@ def mock_admin_api():
         "identity_key": None,
         "debounce_key": None,
         "debounce_deadline": None,
+        "partition_key": None,
         "worker_pid": None,
         "worker_host": None,
         "result": None,
@@ -552,6 +553,43 @@ class TestJobsCommands:
             assert payload["kwargs"] == {"key": "value"}
             assert payload["admin_data"] == {"timeout_seconds": 60}
 
+    def test_jobs_inspect_prints_the_lane_when_the_job_has_one(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        """`inspect` used to be the one command that could not show a job's
+        fair-share lane.
+
+        On a queue with partition_limits the queue's max_concurrency and
+        rate_limit are counted per `partition_key`, so this string decides
+        which cap holds the job back -- and the command whose whole job is to
+        show everything about a job printed nothing about it.
+        """
+        mock_admin_api.get_job.return_value = {
+            **mock_admin_api.get_job.return_value,
+            "partition_key": "tenant-acme",
+        }
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "jobs", "inspect", "1"]
+            )
+
+            assert result.exit_code == 0, result.output
+            assert "Lane:            tenant-acme" in result.output
+
+    def test_jobs_inspect_omits_the_lane_when_the_job_has_none(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        """Unset optional fields stay off the screen, like Identity and Tags:
+        an unpartitioned job has no lane to name, and a blank line would read
+        as one."""
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(
+                cli, ["--config", "test.py", "jobs", "inspect", "1"]
+            )
+
+            assert result.exit_code == 0, result.output
+            assert "Lane:" not in result.output
+
     def test_jobs_retry(self, cli_runner, mock_admin_api, mock_db_params):
         """Test jobs retry command."""
         with mock_cli_context(mock_admin_api, mock_db_params):
@@ -743,6 +781,68 @@ class TestQueuesCommands:
             assert "default" in result.output
             assert "high" in result.output
             mock_admin_api.list_queues.assert_called_once()
+
+    def test_queues_list_marks_a_partitioned_queues_limits_per_lane(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        """A bare number in the limit column read as a queue-wide cap.
+
+        With partition_limits both limits count PER partition_key, so "4"
+        against a queue running forty jobs reads as a limit that has stopped
+        working -- and the operator goes debugging the claim path instead of
+        counting lanes. The scope travels ON the number, the same "/lane"
+        vocabulary the web queues table prints.
+        """
+        mock_admin_api.list_queues.return_value = [
+            {
+                "name": "ingest",
+                "paused": False,
+                "max_concurrency": 4,
+                "rate_limit": 10,
+                "rate_period_seconds": 60.0,
+                "partition_limits": True,
+            },
+        ]
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(cli, ["--config", "test.py", "queues", "list"])
+
+            assert result.exit_code == 0, result.output
+            assert "4 /lane" in result.output
+            assert "10 /lane" in result.output
+
+    def test_queues_list_leaves_a_queue_wide_limit_unmarked(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        """The default scope is queue-wide, and marking it would make the
+        marker noise instead of news: the fixture's 'high' queue caps at 4
+        without partition_limits."""
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(cli, ["--config", "test.py", "queues", "list"])
+
+            assert result.exit_code == 0, result.output
+            assert "/lane" not in result.output
+
+    def test_queues_list_does_not_scope_an_unlimited_limit(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        """'-' is the absence of a cap, and "- /lane" would read as a cap that
+        exists. Only a real number carries the scope."""
+        mock_admin_api.list_queues.return_value = [
+            {
+                "name": "ingest",
+                "paused": False,
+                "max_concurrency": 4,
+                "rate_limit": None,
+                "rate_period_seconds": 60.0,
+                "partition_limits": True,
+            },
+        ]
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(cli, ["--config", "test.py", "queues", "list"])
+
+            assert result.exit_code == 0, result.output
+            assert "4 /lane" in result.output
+            assert "- /lane" not in result.output
 
     def test_queues_stats(self, cli_runner, mock_admin_api, mock_db_params):
         """Test queues stats command."""
@@ -1312,6 +1412,56 @@ class TestHelperFunctions:
         print_warning("Test warning")
         captured = capsys.readouterr()
         assert "Test warning" in captured.out + captured.err
+
+    def test_an_unreadable_named_config_says_the_ceiling_defaulted(
+        self, tmp_path, capsys
+    ):
+        """The ceiling used to default in total silence.
+
+        On --dsn nothing else ever opens the config file, so a `-c` pointing
+        at a path that cannot be read left the fleet's ceiling at 1000 with no
+        indication -- and the next `set-priority 3000` was refused, blaming
+        the priority for a config the operator had already named.
+        """
+        from pyjobby.cli import DEFAULT_PRIO_CEILING, load_prio_ceiling
+
+        missing = tmp_path / "absent.toml"
+
+        ceiling = load_prio_ceiling(str(missing), named=True)
+
+        assert ceiling == DEFAULT_PRIO_CEILING
+        captured = capsys.readouterr()
+        assert str(missing) in captured.err
+        assert f"ceiling defaults to {DEFAULT_PRIO_CEILING}" in captured.err
+        # stderr, not stdout: a scripted command's result must stay parseable
+        assert captured.out == ""
+
+    def test_an_unreadable_default_config_is_silent(self, tmp_path, capsys):
+        """The ordinary --dsn run names no config file at all, and the
+        default ./pyjobby.toml is not expected to exist. Warning there would
+        put a line on every single command."""
+        from pyjobby.cli import DEFAULT_PRIO_CEILING, load_prio_ceiling
+
+        ceiling = load_prio_ceiling(str(tmp_path / "absent.toml"))
+
+        assert ceiling == DEFAULT_PRIO_CEILING
+        captured = capsys.readouterr()
+        assert (captured.out, captured.err) == ("", "")
+
+    def test_a_readable_named_config_warns_about_nothing(self, tmp_path, capsys):
+        """The warning is about a config that could not be READ, not about
+        one that simply declares no ceiling: a file without `prio_ceiling` is
+        an ordinary deployment taking the default on purpose."""
+        from pyjobby.cli import DEFAULT_PRIO_CEILING, load_prio_ceiling
+
+        conf = tmp_path / "pyjobby.toml"
+        conf.write_text('[db_params]\ndatabase = "x"\n')
+
+        ceiling = load_prio_ceiling(str(conf), named=True)
+
+        assert ceiling == DEFAULT_PRIO_CEILING
+        captured = capsys.readouterr()
+        assert (captured.out, captured.err) == ("", "")
 
     def test_print_table(self, capsys):
         """The table renders its headers and every row's cells."""

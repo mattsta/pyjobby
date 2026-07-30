@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 
 from pyjobby.configloader import (
+    ASYNCPG_CONNECT_KEYS,
     KNOWN_TOP_LEVEL_KEYS,
     ConfigError,
     describe_db_target,
@@ -107,16 +108,82 @@ class TestUnknownKeys:
 
         assert cfg == {"db_params": {"host": "h"}, "prio_ceiling": 7}
 
-    def test_the_shipped_config_uses_only_known_keys(self):
-        """The repo's own pyjobby.toml is the file operators copy."""
-        import tomllib
+    def test_the_shipped_config_loads_through_the_real_loader(self, monkeypatch):
+        """The repo's own pyjobby.toml is the file operators copy, so it is
+        checked the way a daemon checks it -- not by re-parsing it here.
+
+        A bare ``tomllib.load`` plus ``set(raw) <= KNOWN_TOP_LEVEL_KEYS``
+        passed while the shipped file had ``prio_ceiling`` written UNDER
+        ``[db_params]``: TOML puts it inside the table, so the top-level key
+        set was ``{"db_params"}`` and the assertion was about nothing. Loading
+        it through the loader and asserting WHERE each setting landed is the
+        check that would have caught it.
+        """
         from pathlib import Path
 
         shipped = Path(__file__).resolve().parent.parent / "pyjobby.toml"
-        with shipped.open("rb") as fh:
-            raw = tomllib.load(fh)
+        monkeypatch.setenv("PYJOBBY_DB_PASSWORD", "from-the-environment")
 
-        assert set(raw) <= KNOWN_TOP_LEVEL_KEYS
+        cfg = load_config_from_file(
+            str(shipped), ["db_params", "prio_ceiling", "app_version", "web_listen"]
+        )
+
+        assert cfg["prio_ceiling"] == 1000, (
+            "prio_ceiling must be a TOP-LEVEL key; written after the "
+            "[db_params] header it belongs to that table and no enqueue "
+            "surface ever reads it"
+        )
+        assert "prio_ceiling" not in cfg["db_params"]
+        assert cfg["db_params"]["database"] == "pyjobby"
+        # the secret really is substituted, not left as the literal reference
+        assert cfg["db_params"]["password"] == "from-the-environment"
+
+    def test_a_top_level_setting_written_under_db_params_is_refused(self, tmp_path):
+        """The misplacement the shipped file itself had.
+
+        Not a typo -- the key is spelled correctly and reads naturally where
+        it sits. TOML has no way back out to the root, so it is a db_params
+        key, an asyncpg.connect() keyword that does not exist, and the
+        deployment silently runs on the default ceiling.
+        """
+        path = write(tmp_path, '[db_params]\nhost = "h"\nprio_ceiling = 100\n')
+
+        with pytest.raises(ConfigError) as excinfo:
+            load_config_from_file(path, ["db_params"])
+
+        message = str(excinfo.value)
+        assert "prio_ceiling" in message, "the message must name the key"
+        assert "ABOVE the [db_params] header" in message, (
+            "the message must say where the key belongs, not merely that it "
+            "is wrong here"
+        )
+
+    def test_a_non_connect_keyword_under_db_params_is_refused_too(self, tmp_path):
+        """The plain typo arm: not a top-level setting either, so the message
+        says what the table IS rather than where to move the key."""
+        path = write(tmp_path, '[db_params]\nhost = "h"\nhostt = "typo"\n')
+
+        with pytest.raises(ConfigError, match="asyncpg.connect"):
+            load_config_from_file(path, ["db_params"])
+
+    def test_the_connect_keywords_this_table_accepts_are_really_asyncpgs(self):
+        """The allow-list is a copy of another library's signature, so it is
+        bound to that signature rather than to a reviewer's memory of it."""
+        import inspect
+
+        import asyncpg
+
+        accepted = {
+            name
+            for name, p in inspect.signature(asyncpg.connect).parameters.items()
+            if p.kind is not inspect.Parameter.VAR_KEYWORD
+        }
+        unknown = ASYNCPG_CONNECT_KEYS - accepted
+        assert not unknown, (
+            f"[db_params] would accept {sorted(unknown)}, which "
+            f"asyncpg.connect() does not take: the table is passed to it "
+            f"verbatim, so these would be a TypeError at connect time"
+        )
 
 
 class TestDescribeDbTarget:

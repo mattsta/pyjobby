@@ -30,7 +30,15 @@ would fail later, further from the cause.
     sites = [{ host = "127.0.0.1", port = 8080 }]
     paths = []
 
-``db_params`` is asyncpg.connect() keyword arguments and only those.
+Note the ORDER: ``prio_ceiling`` and ``app_version`` come BEFORE the first
+table header, and they have to. TOML has no way back out to the root, so a
+bare key written after ``[db_params]`` is a db_params key -- which is how a
+deployment ends up with a priority ceiling that is silently an asyncpg
+connect() keyword nobody passes. ``load_config_from_file`` refuses that
+arrangement by name rather than letting it load.
+
+``db_params`` is asyncpg.connect() keyword arguments and only those
+(``ASYNCPG_CONNECT_KEYS``).
 Optional keys are simply omitted (TOML has no null): a missing
 ``web_listen`` table means no web listener, a missing ``prio_ceiling``
 means the platform default, and a missing ``app_version`` means this
@@ -79,6 +87,49 @@ _MAX_CONFIG_BYTES = 1024 * 1024
 #: sitting there looking like it said otherwise.
 KNOWN_TOP_LEVEL_KEYS = frozenset(
     {"app_version", "db_params", "prio_ceiling", "web_listen"}
+)
+
+#: Every key ``[db_params]`` may hold: the ``asyncpg.connect()`` keyword
+#: arguments, and nothing else -- the table is passed to it verbatim.
+#:
+#: Checked for the same reason the top-level set is, and against a failure that
+#: is easier to write than a typo. TOML HAS NO WAY BACK OUT TO THE ROOT: a bare
+#: key written after the ``[db_params]`` header belongs to db_params, so
+#: ``prio_ceiling = 1000`` placed under the connection table -- the natural
+#: reading order, and what this project's own shipped example did -- is not the
+#: deployment's priority ceiling. It is a connect() keyword that does not exist,
+#: every enqueue silently keeps the default ceiling, and the file sits there
+#: looking like it said otherwise. Refused with the key named and its real home
+#: named beside it.
+#:
+#: Deliberately generous: ``dsn`` and the pooling/TLS/statement-cache knobs are
+#: in, because an operator who needs one of them should not have to patch this
+#: list. ``loop`` is not: a config file cannot name an event loop.
+ASYNCPG_CONNECT_KEYS = frozenset(
+    {
+        "command_timeout",
+        "connection_class",
+        "database",
+        "direct_tls",
+        "dsn",
+        "gsslib",
+        "host",
+        "krbsrvname",
+        "max_cacheable_statement_size",
+        "max_cached_statement_lifetime",
+        "passfile",
+        "password",
+        "port",
+        "record_class",
+        "server_settings",
+        "service",
+        "servicefile",
+        "ssl",
+        "statement_cache_size",
+        "target_session_attrs",
+        "timeout",
+        "user",
+    }
 )
 
 
@@ -174,6 +225,26 @@ def load_config_from_file(filename: str, keys: Iterable[str]) -> dict[str, Any]:
             f"{known}. A typo here silently disables the setting, so it is "
             f"refused rather than skipped."
         )
+
+    db_params = raw.get("db_params")
+    if isinstance(db_params, dict):
+        misplaced = sorted(
+            k for k in db_params if k.lower() not in ASYNCPG_CONNECT_KEYS
+        )
+        if misplaced:
+            key = misplaced[0]
+            home = (
+                "a TOP-LEVEL setting: move it ABOVE the [db_params] header"
+                if key.lower() in KNOWN_TOP_LEVEL_KEYS
+                else "not an asyncpg.connect() keyword"
+            )
+            raise ConfigError(
+                f"{key!r} is inside [db_params] in {filename}, and it is {home}. "
+                f"TOML has no way back out to the root, so every bare key after "
+                f"a table header belongs to that table -- which is why a "
+                f"setting written under the connection block is silently not "
+                f"the setting it looks like."
+            )
 
     wanted = {k.lower() for k in keys}
     try:

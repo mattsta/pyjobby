@@ -50,12 +50,66 @@ import asyncpg  # type: ignore[import-untyped]
 from loguru import logger
 
 from . import db, fsm, lifecycle
+from .enqueue_rules import (
+    _EMPTY_APP_VERSION,
+    _IDENTITY_AND_DEADLINE,
+    _KEYS_CONTRADICT,
+    _NO_BATCH_DEBOUNCE,
+    _NO_BATCH_IDENTITY,
+    _NO_DAG_IDENTITY,
+    _NO_DEADLINE_WAITFOR,
+    _NO_DEBOUNCE_WAITFOR,
+    _NO_IDENTITY_WAITFOR,
+    _NO_OUTBOX_DEBOUNCE,
+    _ON_TIMEOUT_POLICIES,
+    _TAG_VALUE_TYPES,
+    DEFAULT_PRIO_CEILING,
+    MAX_APP_VERSION_LENGTH,
+    MAX_KEY_LENGTH,
+    MAX_PARTITION_KEY_LENGTH,
+    SpeculativeEnqueueExhausted,
+    validate_app_version,
+    validate_key,
+    validate_priority,
+    validate_tags,
+)
 from .retry_strategies import (
     DEFAULT_INITIAL_RETRY_DELAY,
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_RETRY_DELAY,
     DEFAULT_RETRY_STRATEGY,
     RetryStrategy,
+)
+
+#: EVERY RULE ``enqueue_rules`` OWNS IS RE-EXPORTED AT ITS OLD PATH HERE.
+#: These names were ``pyjobby.client`` names for the whole life of the project
+#: -- imported by ``pj``, the CLI, the admin API, the websocket server, the
+#: scheduler and by applications -- and the module split is an internal
+#: layering change, not an API break. Named in ``__all__``-style explicitly so
+#: the re-export is a decision a reader can see rather than a side effect of an
+#: import that could be tidied away by a linter.
+_RE_EXPORTED_ENQUEUE_RULES: Final = (
+    DEFAULT_PRIO_CEILING,
+    MAX_APP_VERSION_LENGTH,
+    MAX_KEY_LENGTH,
+    MAX_PARTITION_KEY_LENGTH,
+    _EMPTY_APP_VERSION,
+    _IDENTITY_AND_DEADLINE,
+    _KEYS_CONTRADICT,
+    _NO_BATCH_DEBOUNCE,
+    _NO_BATCH_IDENTITY,
+    _NO_DAG_IDENTITY,
+    _NO_DEADLINE_WAITFOR,
+    _NO_DEBOUNCE_WAITFOR,
+    _NO_IDENTITY_WAITFOR,
+    _NO_OUTBOX_DEBOUNCE,
+    _ON_TIMEOUT_POLICIES,
+    _TAG_VALUE_TYPES,
+    SpeculativeEnqueueExhausted,
+    validate_app_version,
+    validate_key,
+    validate_priority,
+    validate_tags,
 )
 
 if TYPE_CHECKING:
@@ -305,34 +359,11 @@ ENQUEUE_BATCH_SQL = """
     RETURNING id
 """
 
-# What a tag value may be. Tags exist to be FILTERED on, and filtering goes
-# through `tags @> '{"key": value}'` against a GIN index, so a value has to be
-# something a caller can write down in a query -- and, one layer out, in a
-# `pj-admin jobs list --tag key=value` argument. Containment against a nested
-# object or an array is a different question with different (surprising)
-# semantics, so those are refused at the door instead of being accepted and
-# then silently unfilterable.
-_TAG_VALUE_TYPES = (str, int, float, bool, type(None))
-
-# What `on_timeout` may say. The worker asks `on_timeout == 'retry'` and
-# treats everything else as terminal (pj.py `_handle_failure`), so an
-# unrecognized value is not ignored -- it dead-letters the job on its first
-# overrun. Checked at enqueue, where the caller is still there to be told.
-_ON_TIMEOUT_POLICIES = frozenset({"retry", "fail"})
 
 #: The retry strategies enqueue accepts, derived from the enum so a strategy
 #: added to retry_strategies.py is accepted here the moment it exists.
 _RETRY_STRATEGIES = frozenset(RetryStrategy)
 
-# The priority ceiling a worker claims under, and the default for `pj
-# --max-prio`. `claim_jorb()` takes only jobs whose `prio <= the claiming
-# worker's ceiling`, so a job above every live worker's ceiling is never
-# claimed, never fails, never reaches the DLQ and never shows up in
-# `doctor`: it is simply `queued` forever. The number lives HERE, on the
-# enqueue side, because this is the only place a caller can still be told --
-# and `pj` imports it for `JobSystem.prio` and its own flag default, so the
-# two halves of the contract cannot drift apart.
-DEFAULT_PRIO_CEILING: Final = 1000
 
 #: Where `start_machine()` puts a machine unless told otherwise. Machines park
 #: on `recv()` waiting for events, so a machine on the default queue is a
@@ -372,311 +403,6 @@ _SPECULATIVE_ATTEMPTS: Final = 5
 #: writers is not spun on, and tiny because there is nothing to wait for:
 #: the commit we lost to has already happened.
 _SPECULATIVE_BACKOFF: Final = 0.01
-
-#: Why a batch cannot carry identity keys. A batch is ONE multi-row INSERT
-#: whose contract is "the ids, in the order given" -- and the identified
-#: write resolves each conflict into an id to hand back, which a single
-#: RETURNING cannot do for the rows it did not insert. Accepting the option
-#: and silently dropping collided rows would break that contract in the way
-#: hardest to notice: a shorter list, misaligned with the input. So it is
-#: refused at the door, and the caller loops enqueue_identified().
-_NO_BATCH_IDENTITY: Final = (
-    "identity_key is not a batch option: a batch is one INSERT returning one "
-    "id per row IN ORDER, and an identity that already exists has no row in "
-    "it to return. Enqueue identified jobs one at a time with "
-    "enqueue_identified(), which tells you which ones were already there."
-)
-
-#: Why a batch cannot carry debounce keys either, and it is a different
-#: reason. A batch is a plain multi-row INSERT: it has no bounce statement in
-#: front of it, so a key already held would not collapse -- the row would
-#: simply violate jorb_debounce_idx and take the whole batch down with it.
-#: Every guarantee debounce makes lives in JobClient.debounce()'s
-#: bounce-or-insert pair, so the option is refused where it would silently
-#: mean nothing.
-_NO_BATCH_DEBOUNCE: Final = (
-    "debounce_key is not a batch option: collapsing a burst is a "
-    "bounce-or-insert pair of statements, and a batch is one INSERT with no "
-    "bounce in front of it -- a key already held would fail the batch rather "
-    "than collapse into the job holding it. Call debounce() per key."
-)
-
-#: Why the three enqueue-side keys cannot be combined. Each one answers "what
-#: happens to a DUPLICATE enqueue?" and they answer it differently: an
-#: identity_key hands back the existing job untouched, a deadline_key raises
-#: and leaves it untouched, a debounce_key moves it later and rewrites its
-#: arguments. A row carrying two of them would have to do two of those at
-#: once, so the combination is a design error in the caller and is refused
-#: loudly rather than resolved by whichever statement happens to run.
-_KEYS_CONTRADICT: Final = (
-    "debounce_key cannot be combined with {other}: they promise different "
-    "things about a duplicate enqueue -- debounce_key defers the existing "
-    "job and replaces its kwargs, identity_key returns it untouched, and "
-    "deadline_key refuses the duplicate outright. Pick the one whose "
-    "promise you want (docs/writing-jobs.md, 'Choosing your dedupe "
-    "primitive')."
-)
-
-#: The same contradiction between the OTHER two keys, which the comment above
-#: promised was mutually exclusive and which nothing enforced. A row carrying
-#: both would have the identified statement resolve the conflict by handing the
-#: existing job back while jorb_deadline_idx was meanwhile refusing duplicates
-#: of the same work outright -- so which promise a caller got depended on which
-#: index the row happened to collide with first.
-_IDENTITY_AND_DEADLINE: Final = (
-    "identity_key cannot be combined with deadline_key: they promise opposite "
-    "things about a duplicate enqueue -- identity_key hands back the existing "
-    "job (at most once, for the life of the row), deadline_key raises and then "
-    "RE-ARMS the moment the job is claimed, so tomorrow's submission is a new "
-    "job. Those cannot both be true of one row. Pick the one whose promise you "
-    "want (docs/writing-jobs.md, 'Choosing your dedupe primitive')."
-)
-
-#: Why an identified enqueue cannot also carry a dependency edge.
-#:
-#: An identified enqueue's whole contract is that it may return a job it did
-#: NOT create. That job has whatever dependency the enqueue which really made
-#: it asked for -- a different upstream, a different group, or none at all, and
-#: it may have finished months ago. So the caller's `waitfor_job=X` is silently
-#: not applied: nothing raises, nothing waits, and the ordering the caller
-#: asked for simply does not exist. Refused, because the failure is invisible
-#: at the call site and shows up as work that ran too early.
-_NO_IDENTITY_WAITFOR: Final = (
-    "identity_key cannot be combined with waitfor_job/waitfor_group: an "
-    "identified enqueue may return a job it did not create, and that job "
-    "already has whatever dependency (or none) the enqueue that really made it "
-    "asked for -- so this dependency would silently not be applied and the "
-    "work would run unordered. Give the identity to the job that does the "
-    "work and let an unidentified waiter depend on it, or key the identity to "
-    "include the upstream."
-)
-
-#: Why a DAG node cannot carry an identity_key.
-#:
-#: A DAG node is enqueued and then WIRED: `execute()` rewrites dag_id and
-#: run_group on the ids it just got back. An identity that already existed
-#: hands back somebody else's job, so the wiring rewrites a PRE-EXISTING row --
-#: taking it out of the DAG it belongs to and into this one, mid-flight, with
-#: its old DAG left reporting a member it no longer has. Observed, not
-#: theorised. There is nothing to resolve here: a graph is a set of jobs
-#: created together, and a node that might already exist is not one of them.
-_NO_DAG_IDENTITY: Final = (
-    "identity_key is not a DAG node option: a DAG enqueues its nodes and then "
-    "stamps dag_id and run_group onto the ids it got back, and an identity "
-    "that already exists hands back a job this DAG did not create -- so the "
-    "stamp would STEAL a live job out of its own DAG and rewire it into this "
-    "one. Enqueue the identified job on its own and have the DAG depend on it."
-)
-
-#: Why the plain enqueue paths refuse a debounce_key, and it is the batch's
-#: reason (see _NO_BATCH_DEBOUNCE) reached by a different door: enqueue() and
-#: enqueue_in_transaction() run the plain INSERT, with no bounce statement in
-#: front of it. A key already held therefore does not collapse -- it raises a
-#: unique violation, which in the outbox case aborts the CALLER's transaction
-#: and takes their application write with it -- and a key not yet held silently
-#: writes a row with no ``debounce_deadline``, an uncapped collapse window that
-#: nothing will ever clamp and that later bounces will defer forever.
-#:
-#: One constant for both because they are one statement: enqueue() IS
-#: enqueue_in_transaction() on a pooled connection. Every guarantee the option
-#: implies lives in JobClient.debounce()'s bounce-or-insert pair, which is what
-#: the schema's own COMMENT on jorb.debounce_key has always said ("Set only by
-#: JobClient.debounce()").
-_NO_OUTBOX_DEBOUNCE: Final = (
-    "debounce_key is not an enqueue() / enqueue_in_transaction() option: "
-    "collapsing a burst is a bounce-or-insert pair of statements and these "
-    "paths run the plain INSERT -- a key already held would raise instead of "
-    "collapsing (aborting the caller's transaction, in the outbox case), and a "
-    "key not yet held would open a collapse window with no cap to clamp it. "
-    "Call debounce(key=..., period=..., cap=...), which owns that pair."
-)
-
-#: Longest ``app_version`` an enqueue accepts.
-#:
-#: A version string is a build identifier -- a tag, a git sha, a release date,
-#: at worst all three -- and it is compared for EQUALITY by every claim on the
-#: queue and carried in operator-facing messages that have to stay one line.
-#: 128 characters is past every real one and short enough that neither is a
-#: problem. Bounded at the door for the same reason ``partition_key`` is: past
-#: the enqueue there is no caller left to tell.
-MAX_APP_VERSION_LENGTH: Final = 128
-
-#: Why an empty ``app_version`` is refused rather than stored.
-#:
-#: NULL is how a job says "not pinned", and it is the default. An empty string
-#: is a DIFFERENT value that no worker can ever advertise (`pj --app-version
-#: ""` is the same as passing nothing), so a row carrying one is pinned to a
-#: version that cannot exist -- unclaimable forever, and reported as wanting
-#: version ''. It is almost always a variable that came back empty: an unset
-#: ``$GIT_SHA``, a build stamp the CI step did not write. Refused here, where
-#: the caller is still around to hear about it.
-_EMPTY_APP_VERSION: Final = (
-    "app_version is empty: NULL/None is how a job says it is not pinned to a "
-    "code version (and is the default), while '' would pin it to a version no "
-    "worker can advertise -- the job would sit 'queued' forever. This is "
-    "usually an unset build variable; omit the argument to enqueue unpinned "
-    "work."
-)
-
-
-def validate_app_version(app_version: str | None) -> str | None:
-    """Check an ``app_version`` and return it, or None for unpinned work.
-
-    One home for the two ways a version pin goes wrong before it is written --
-    empty (a build variable that came back blank, pinning the job to a version
-    nothing can advertise) and unbounded (a string in the claim's equality
-    test and in every message about the job) -- so the enqueue paths and
-    ``update_job_app_version`` refuse the same values with the same words.
-    """
-    if app_version is None:
-        return None
-    if not app_version.strip():
-        raise ValueError(_EMPTY_APP_VERSION)
-    if len(app_version) > MAX_APP_VERSION_LENGTH:
-        raise ValueError(
-            f"app_version is {len(app_version)} characters, above the "
-            f"{MAX_APP_VERSION_LENGTH} the platform accepts: it names a BUILD "
-            f"(a tag, a sha, a release stamp), is compared for equality by "
-            f"every claim on the queue, and is printed in the messages that "
-            f"say why a job is not running"
-        )
-    return app_version
-
-
-#: Longest any caller-chosen key an enqueue accepts may be, and the shortest.
-#:
-#: One bound for all four (deadline_key, identity_key, debounce_key,
-#: partition_key) because they are the same KIND of thing: a name the caller
-#: chose, stored in a column something INDEXES or GROUPS BY, never a payload.
-#: partition_key documented the reasoning first (MAX_PARTITION_KEY_LENGTH,
-#: which this unifies) and the argument transfers unchanged: an unbounded key
-#: is an unbounded string in a btree the enqueue path writes and the claim path
-#: reads. 256 characters is far past every real one -- an order id, a tenant, a
-#: date-stamped digest name, a ULID -- and short enough that a saturated queue's
-#: worth of them is still small.
-MAX_KEY_LENGTH: Final = 256
-
-#: Longest ``partition_key`` an enqueue accepts.
-#:
-#: A partition key is a GROUPING KEY read inside the serialised claim
-#: section, not a payload: on a queue with ``partition_limits`` every
-#: saturated lane's key is carried in an array that the claim's per-row test
-#: probes, so an unbounded key would put an unbounded string into the one
-#: critical section that sets a capped queue's whole ceiling. Refused at the
-#: door, where the caller can still be told, rather than accepted and paid for
-#: on every claim forever.
-#:
-#: The SAME bound as every other caller-chosen key, and named separately only
-#: because the name is public API; :data:`MAX_KEY_LENGTH` is where the number
-#: and the reasoning live.
-MAX_PARTITION_KEY_LENGTH: Final = MAX_KEY_LENGTH
-
-
-def validate_key(name: str, value: str | None) -> str | None:
-    """Check one caller-chosen key column and return it, or None if unset.
-
-    THE one validator for deadline_key, identity_key, debounce_key and
-    partition_key, so no key can be refused on one path and accepted on
-    another. None means "not using this feature" and is always fine; anything
-    else has to be a name, which means non-empty and bounded.
-
-    An EMPTY key is refused rather than stored because it is not the same thing
-    as no key at all and behaves nothing like it: `''` is a real value, so it
-    takes a slot in that column's unique index and every OTHER caller who
-    passed an empty key collides with it -- unrelated jobs deduplicating
-    against each other, or (for partition_key) sharing one fair-share lane
-    while the NULL lane sits beside them. It is almost always a variable that
-    came back blank: an f-string over a missing id, a config value the
-    deployment did not set. Refused here, where the caller is still around to
-    hear about it.
-    """
-    if value is None:
-        return None
-    if not value.strip():
-        raise ValueError(
-            f"{name} is empty: None is how a job says it is not using this "
-            f"feature (and is the default), while '' is a real key -- it takes "
-            f"a slot in that column's index, so every other caller who passed "
-            f"an empty {name} would collide with this job. This is usually an "
-            f"f-string over a value that was missing; omit the argument "
-            f"instead."
-        )
-    if len(value) > MAX_KEY_LENGTH:
-        raise ValueError(
-            f"{name} is {len(value)} characters, above the {MAX_KEY_LENGTH} the "
-            f"platform accepts: it is a NAME the caller chose, stored in a "
-            f"column the enqueue path indexes and the claim path reads, not a "
-            f"payload — key it to an id, a tenant or a date stamp rather than "
-            f"to the data itself"
-        )
-    return value
-
-
-#: Why a debounced job cannot also wait on something. `waitfor_job` /
-#: `waitfor_group` insert the row as 'waiting', and jorb_debounce_idx covers
-#: QUEUED rows only -- so the key would not be held, no duplicate would ever
-#: find the row to collapse onto, and every call in the burst would write
-#: another job. Refused rather than silently degrading to no debouncing at all.
-_NO_DEBOUNCE_WAITFOR: Final = (
-    "debounce_key cannot be combined with waitfor_job/waitfor_group: a "
-    "dependent job is inserted 'waiting', and the collapse window is held by "
-    "a QUEUED row -- so nothing would ever collapse and every call would "
-    "write another job. Debounce the work that runs after the wait instead."
-)
-
-
-def validate_priority(priority: int, ceiling: int = DEFAULT_PRIO_CEILING) -> int:
-    """Refuse a priority no worker at `ceiling` could ever claim.
-
-    The ordering is inverted from the intuition -- LOWER is MORE urgent --
-    so "low priority, whenever you get to it" is written as a big number by
-    everyone who has not read the schema, and a big number is not slow: it
-    is *unclaimable*, permanently, with no signal anywhere.
-
-    This is deliberately checked against a number the client was TOLD rather
-    than one it can observe: the ceiling belongs to the worker fleet
-    (``pj --max-prio``) and nothing about it is visible from a connection.
-    A deployment that raises it says so once, when it builds the client
-    (``JobClient(pool, prio_ceiling=N)``), which is where deployment facts
-    already live. The asymmetry is what settles it: a wrong refusal is loud,
-    immediate and a one-line fix at the call site, while a wrong acceptance
-    is a job that is silently never run.
-    """
-    if priority > ceiling:
-        raise ValueError(
-            f"priority {priority} is above the worker priority ceiling "
-            f"({ceiling}): workers claim only jobs with prio <= their "
-            f"ceiling, so this job would sit 'queued' forever -- no error, "
-            f"no retry, no DLQ. LOWER numbers are MORE urgent, so "
-            f"least-urgent work wants a priority just UNDER the ceiling "
-            f"(e.g. {ceiling - 100}), not a large one. If this deployment "
-            f"really runs its workers with `pj --max-prio {priority}` (or "
-            f"higher), declare it once: JobClient(pool, "
-            f"prio_ceiling={priority})."
-        )
-    return priority
-
-
-def validate_tags(tags: dict[str, Any] | None) -> dict[str, Any]:
-    """Check caller-supplied tags and return a copy safe to store.
-
-    Copied rather than used in place for the same reason admin_data is: the
-    row we build must not be a live view of a dict the caller still holds.
-    """
-    if not tags:
-        return {}
-    if not isinstance(tags, dict):
-        raise ValueError(f"tags must be a dict, got {type(tags).__name__}")
-    for key, value in tags.items():
-        if not isinstance(key, str) or not key:
-            raise ValueError(f"tag keys must be non-empty strings, got {key!r}")
-        if not isinstance(value, _TAG_VALUE_TYPES):
-            raise ValueError(
-                f"tag {key!r} has value of type {type(value).__name__}; tag "
-                "values must be a string, number, boolean or None (nested "
-                "objects and arrays cannot be filtered with --tag key=value)"
-            )
-    return dict(tags)
 
 
 def tags_filter_sql(param: int) -> str:
@@ -1705,14 +1431,17 @@ class JobClient:
                 return created["id"], True
             await asyncio.sleep(_SPECULATIVE_BACKOFF * (attempt + 1))
 
-        raise RuntimeError(
+        raise SpeculativeEnqueueExhausted(
+            "debounce_key",
+            key,
+            _SPECULATIVE_ATTEMPTS,
             f"debounce key {key!r} was claimed by another transaction after "
             f"each of {_SPECULATIVE_ATTEMPTS} attempts' snapshots, so this "
             f"call could neither bounce the collapse window nor open one. "
             f"Nothing was written. Either an unbroken stream of writers is "
             f"opening and claiming this one window, or this call is running "
             f"at REPEATABLE READ or higher, where a retry reuses the "
-            f"transaction's snapshot and can never see the row."
+            f"transaction's snapshot and can never see the row.",
         )
 
     async def enqueue_handle(self, job_class: str, **options: Any) -> JobHandle:
@@ -1934,14 +1663,17 @@ class JobClient:
                     )
                 return row["id"], row["created"]
             await asyncio.sleep(_SPECULATIVE_BACKOFF * (attempt + 1))
-        raise RuntimeError(
+        raise SpeculativeEnqueueExhausted(
+            "identity_key",
+            identity_key,
+            _SPECULATIVE_ATTEMPTS,
             f"identity_key {identity_key!r} was claimed by another "
             f"transaction after each of {_SPECULATIVE_ATTEMPTS} attempts' "
             f"snapshots, so this call can neither create the job nor name the "
             f"one that holds it. Nothing was written. Either an unbroken "
             f"stream of writers is claiming this one identity, or this "
             f"enqueue is running at REPEATABLE READ or higher, where a retry "
-            f"reuses the transaction's snapshot and can never see the row."
+            f"reuses the transaction's snapshot and can never see the row.",
         )
 
     @staticmethod
@@ -2041,6 +1773,13 @@ class JobClient:
                 raise ValueError(_IDENTITY_AND_DEADLINE)
             if waitfor_job or waitfor_group:
                 raise ValueError(_NO_IDENTITY_WAITFOR)
+
+        # ...and the third key's dependency arm, which is the debounce arm's
+        # argument one index over: a 'waiting' row is outside
+        # jorb_deadline_idx too, and the wake clears the column on the way in,
+        # so the window never opens at any point in the row's life.
+        if deadline_key is not None and (waitfor_job or waitfor_group):
+            raise ValueError(_NO_DEADLINE_WAITFOR)
 
         # Every caller-chosen key, bounded and non-empty by ONE rule. Here
         # because here is the last place a caller exists to be told: past this
@@ -3512,14 +3251,7 @@ class JobClient:
 
         async with self.pool.acquire() as conn:
             result: str = await conn.execute(
-                """
-                UPDATE jorb
-                SET prio = $2
-                WHERE id = $1
-                  AND state IN ('queued', 'waiting')
-            """,
-                job_id,
-                new_priority,
+                db.UPDATE_PRIORITY_SQL, job_id, new_priority
             )
 
         return result != "UPDATE 0"
@@ -3553,21 +3285,8 @@ class JobClient:
             if await client.update_job_app_version(12345, None):
                 print("unpinned; any worker may run it now")
         """
-        app_version = validate_app_version(app_version)
-
         async with self.pool.acquire() as conn:
-            result: str = await conn.execute(
-                """
-                UPDATE jorb
-                SET app_version = $2
-                WHERE id = $1
-                  AND state IN ('queued', 'waiting')
-            """,
-                job_id,
-                app_version,
-            )
-
-        return result != "UPDATE 0"
+            return await db.update_job_app_version(conn, job_id, app_version)
 
     async def get_jobs(
         self,

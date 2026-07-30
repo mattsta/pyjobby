@@ -358,6 +358,7 @@ class TestSubcommandsEmitDocumentedJson:
         assert set(payload["queries"]) == {
             "claim",
             "recv",
+            "stream_append",
             "concurrency_cap",
             # the partitioned claim path: the per-lane count that replaces
             # concurrency_cap inside the lock, and the candidate probe in
@@ -410,6 +411,12 @@ class TestSubcommandsEmitDocumentedJson:
         assert "jorb_mailbox_pending_idx" in payload["queries"]["recv"]["indexes"], (
             payload["queries"]["recv"]
         )
+        # the append's closed-check must probe its partial index rather than
+        # read the key's whole range: the discard budget above is 0, and this
+        # names the index that has to be the reason.
+        assert (
+            "jorb_stream_closed_idx" in (payload["queries"]["stream_append"]["indexes"])
+        ), payload["queries"]["stream_append"]
         # Each sweep must reach the index its own table was given for it --
         # "no seq scan" alone would be satisfied by the wrong index.
         for key, index in (

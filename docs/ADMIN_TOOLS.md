@@ -156,9 +156,9 @@ Usage: pj-admin doctor [OPTIONS]
 
   Checks: database reachability, schema/migrations, NOTIFY triggers, NOTIFY
   queue saturation, live workers, workers that are alive but claiming nothing,
-  queue backlogs, queues whose partition_limits scope nothing, jobs no live
-  worker can claim, blocked waiters, unread mail, the DLQ, and overdue
-  schedules.
+  queue backlogs, queues whose partition_limits scope nothing, schedules whose
+  backfill cannot land, jobs no live worker can claim, blocked waiters, unread
+  mail, the DLQ, and overdue schedules.
 
   With --json the same checks come out as [{check, status, message}] and the
   exit code is unchanged, so a CI job can scrape them.
@@ -184,6 +184,7 @@ WARN workers: no live workers seen in last 60s
 PASS job-threads: 0 live worker(s) claiming
 PASS queues: no queued jobs
 PASS partition-limits: every queue with partition_limits has a limit to scope
+PASS backfill: every enabled schedule's backfill_limit fits its max_concurrent_jobs
 PASS unclaimable: no queued job is invisible to its queue's live workers
 PASS blocked-waiters: no waiting jobs blocked on failed upstreams
 PASS mailbox: no unread mail older than a day
@@ -795,6 +796,12 @@ see
 `queues list` and `queues stats` are the fleet-wide views:
 
 ```console
+$ pj-admin queues list
+Queue        Paused  Max Conc  Rate Limit  Rate Period
+------------------------------------------------------
+ingest       no      4 /lane   -           60s
+maintenance  no      8         100         60s
+
 $ pj-admin queues stats
 Queue        Paused  Queued  Scheduled  Claimed  Running  Waiting  Finished  Crashed  Cancelled  Total  Limits
 -----------------------------------------------------------------------------------------------------------------------
@@ -804,6 +811,15 @@ maintenance  no      0       0          0        0        0        0         0  
 Every state the `Total` sums has a column, so the row adds up: `Queued` is
 work claimable **now** and `Scheduled` is queued-but-deferred, the same split
 `/metrics` and the websocket dashboard report.
+
+The **`/lane` suffix in `queues list` is the scope**, and it is load-bearing.
+A queue with `--partition-limits` counts both limits per `partition_key`, so
+a bare `4` against a queue running forty jobs reads as a limit that has
+stopped working — it is 4 per lane across ten lanes, doing exactly what it
+was set to do. It is printed on the number itself, the same way the web
+dashboard's queue table prints it and for the same reason `queues show`
+spells it out as `PER partition_key`: a limit must never be read out of
+scope.
 
 `queues clear QUEUE` deletes **queued and waiting** jobs — work that has not
 started — and prompts unless `-f/--force`, naming the states it is about to

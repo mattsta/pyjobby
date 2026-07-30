@@ -54,6 +54,14 @@ MAX_QUEUE_NAME_LENGTH = 255
 # dashboard has ever needed more than a thousand rows in a single fragment.
 # Paging past it is what `offset` is for.
 MAX_PAGE_LIMIT = 1000
+# Most unknown query parameter names one 400 will name. The list is echoed
+# back out of the request, so it is bounded like everything else here: a
+# client that sends a thousand junk parameters must not be handed a
+# thousand-line error body it wrote itself.
+MAX_REPORTED_UNKNOWN_PARAMS = 5
+# Longest parameter name or tag pair quoted back in an error message. Same
+# reason, one value at a time.
+MAX_ECHOED_PARAM_LENGTH = 64
 # The widest metrics window. This is a *cost* bound, not a datetime bound: the
 # windowed statements are index-backed only while the window is small, because
 # they ride time-ordered indexes whose whole value is that they stop early.
@@ -202,6 +210,15 @@ PROM_SQL_WORKERS_LIVE = f"""
        AND last_seen > now() - interval '{int(DEFAULT_LIVENESS_GRACE_SECONDS)} seconds'
 """
 
+# The 'scheduled' split of the arrival cohort lives in
+# AdminAPI.get_metrics' own GROUP BY, not here. It was a second statement in
+# this handler first, which fixed /api/metrics and left `pj-admin metrics`
+# -- the same get_metrics call, printing the same dict -- still folding
+# deferred work into `queued`. One surface disagreeing with the rest was the
+# defect; two surfaces disagreeing with each other is not an improvement on
+# it. In the GROUP BY it is also ONE snapshot, so the split can never be
+# arithmetic against a count taken a moment earlier.
+
 _ID_RE = re.compile(r"^[0-9]+$")
 _INT_RE = re.compile(r"^[+-]?[0-9]+$")
 
@@ -281,6 +298,94 @@ def _query_job_state(request: web.Request) -> str | None:
         raise _api_error(
             web.HTTPBadRequest, f"Invalid state: {raw!r} (expected one of: {valid})"
         ) from None
+
+
+#: Every query parameter ``/api/jobs`` reads. Anything else is a 400 -- see
+#: _reject_unknown_query for what silence cost. `tag` is repeatable.
+JOBS_QUERY_PARAMS = frozenset(
+    {"queue", "state", "identity_key", "tag", "limit", "offset", "format"}
+)
+
+
+def _reject_unknown_query(request: web.Request, allowed: frozenset[str]) -> None:
+    """Raise 400 for any query parameter the route does not read.
+
+    A parameter nobody reads used to be dropped in silence, and a dropped
+    FILTER is not a no-op: ``/api/jobs?identity_ke=x`` answered with every
+    job in the queue, which reads exactly like a filter that matched
+    everything. The operator's conclusion ("this identity is on every job")
+    is the opposite of the truth, and nothing in the response says the
+    parameter was never applied. Same judgment as the ``state`` rejection
+    above -- malformed input is a 400 naming the parameter, never a quietly
+    different query.
+    """
+    unknown = sorted(set(request.query) - allowed)
+    if not unknown:
+        return
+    shown = ", ".join(
+        repr(name[:MAX_ECHOED_PARAM_LENGTH])
+        for name in unknown[:MAX_REPORTED_UNKNOWN_PARAMS]
+    )
+    if len(unknown) > MAX_REPORTED_UNKNOWN_PARAMS:
+        shown += f", and {len(unknown) - MAX_REPORTED_UNKNOWN_PARAMS} more"
+    raise _api_error(
+        web.HTTPBadRequest,
+        f"Unknown query parameter(s): {shown} "
+        f"(this route reads: {', '.join(sorted(allowed))})",
+    )
+
+
+def _query_tags(request: web.Request) -> dict[str, Any] | None:
+    """Parse repeated ``tag=key=value`` parameters into a tags filter, or 400.
+
+    THE ENCODING IS THE CLI's, written for a URL. ``pj-admin jobs list --tag
+    customer=acme --tag region=eu`` is ``?tag=customer%3Dacme&tag=region%3Deu``
+    -- one parameter per pair, repeated, because that is what `--tag`
+    repeated means and because a single packed parameter would need a
+    separator that cannot appear in a tag value. Repetition ANDs: the filter
+    matches jobs CONTAINING every pair, so extra tags on the job are fine.
+
+    Values go through JSON first, exactly as `cli.parse_tags` does, so a tag
+    stored as a number or a boolean is reachable (``tag=batch%3D7`` finds the
+    number 7) and anything JSON does not recognise stays the plain string it
+    looked like. A value that must be the *string* "7" is written the way
+    JSON writes it: ``tag=batch%3D%227%22``.
+
+    Not shared with `cli.parse_tags` on purpose: that one reports a malformed
+    pair through `fail()`, which exits the process -- right for a command,
+    fatal for a server that has to answer 400 and stay up. The syntax it
+    accepts is deliberately identical, so an operator moving a filter from
+    the shell into the dashboard is not learning a second one.
+    """
+    pairs = request.query.getall("tag", [])
+    if not pairs:
+        return None
+
+    tags: dict[str, Any] = {}
+    for pair in pairs:
+        key, sep, raw = pair.partition("=")
+        if not sep or not key:
+            raise _api_error(
+                web.HTTPBadRequest,
+                f"Malformed tag {pair[:MAX_ECHOED_PARAM_LENGTH]!r}: expected "
+                f"key=value, url-encoded (tag=customer%3Dacme)",
+            )
+        try:
+            value: Any = json.loads(raw)
+        except ValueError:
+            value = raw  # a bare word, which is the common case
+        if isinstance(value, dict | list):
+            # The same shape enqueue_rules.validate_tags refuses downstream,
+            # refused here so it is a 400 naming the pair rather than a
+            # ValueError escaping list_jobs as a 500.
+            raise _api_error(
+                web.HTTPBadRequest,
+                f"Malformed tag {pair[:MAX_ECHOED_PARAM_LENGTH]!r}: tag values "
+                f"must be a string, number, boolean or null, not an object or "
+                f"an array",
+            )
+        tags[key] = value
+    return tags
 
 
 def _path_queue_name(request: web.Request) -> str:
@@ -623,6 +728,38 @@ class WebAdminServer:
         return job
 
     @staticmethod
+    async def _with_display_state(
+        api: AdminAPI, jobs: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Add the state name the platform actually uses to each job row.
+
+        `jorb.state` has no 'scheduled' value: a job parked in the future --
+        retry backoff, enqueue-at -- is stored as `queued` with `run_after`
+        ahead of now. Rendering that enum raw put a `queued` badge on work
+        nothing will claim for an hour, so a table of deferred retries read
+        as a backlog, and it disagreed with the queues table one page over,
+        which counts those rows as `scheduled` (db.QUEUE_STATS_SQL) like
+        `pj-admin queues` and the /metrics scrape do.
+
+        The cutoff is the DATABASE's clock, one `SELECT now()`, and not this
+        process's: `run_after` was written by the database, every other
+        surface compares it against `now()` there, and a web host a few
+        seconds adrift would otherwise badge boundary rows differently from
+        the queues table beside it. Only asked when there are rows to badge.
+        """
+        if not jobs:
+            return jobs
+        now = await api.conn.fetchval("SELECT now()")
+        for job in jobs:
+            job["display_state"] = (
+                "scheduled"
+                if job["state"] == "queued"
+                and datetime.fromisoformat(job["run_after"]) > now
+                else job["state"]
+            )
+        return jobs
+
+    @staticmethod
     async def _schedule_or_404(api: AdminAPI, schedule_id: int) -> dict[str, Any]:
         """Return the schedule row, or raise 404."""
         schedule = await api.get_schedule(schedule_id=schedule_id)
@@ -922,6 +1059,46 @@ class WebAdminServer:
                 lines.append(f"# TYPE {metric} gauge")
                 lines.append(f"{metric} {value}")
 
+            # The other silent failure, and like pyjobby_workers_not_claiming
+            # the only signal that names it. A job above every live worker's
+            # priority ceiling, wanting a capability none of them advertises,
+            # or pinned to an app_version nobody runs is simply 'queued'
+            # forever: it never fails, never retries, never reaches the DLQ,
+            # and never appears in any other counter here -- the fleet is up,
+            # the queue drains, and this work is invisible to it. Alert on it
+            # above 0.
+            #
+            # Labelled by cause because the causes have different remedies
+            # (raise the fleet's ceiling, start a worker advertising the
+            # capability, run the version the job wants) and the reasons are
+            # admin_api.UNCLAIMABLE_REASONS, the same strings `pj-admin
+            # doctor` and `pj-admin jobs why` report.
+            #
+            # Affordable at scrape cadence for the reason the whole section
+            # requires: its cost is bounded by the live fleet and by
+            # UNCLAIMABLE_SCAN_LIMIT rows per queue per cause, never by how
+            # much the installation has run. The same bound is why the value
+            # saturates -- past the limit it reads "at least this many",
+            # which an alert on > 0 does not care about.
+            unclaimable = await api.unclaimable_jobs()
+            lines.append(
+                "# HELP pyjobby_jobs_unclaimable Queued, runnable jobs that "
+                "no live worker on their queue could ever claim, by cause "
+                "(above_worker_ceiling, capability_unmet, app_version_unmet). "
+                "They never fail, never retry and never reach the DLQ, so no "
+                "other series here goes non-zero for them; alert on it above "
+                "0 and read the cause with `pj-admin doctor` or `pj-admin "
+                "jobs why ID`. A queue with NO live workers is deliberately "
+                "not reported: that is pyjobby_workers_live, and a different "
+                "remedy. Counts saturate per queue per cause."
+            )
+            lines.append("# TYPE pyjobby_jobs_unclaimable gauge")
+            for r in unclaimable:
+                lines.append(
+                    f'pyjobby_jobs_unclaimable{{queue="{esc(r["queue"])}",'
+                    f'reason="{esc(r["reason"])}"}} {r["count"]}'
+                )
+
             # Footprint. At ~4M dead tuples an hour, whether autovacuum is
             # keeping up is a survival question rather than a curiosity.
             for metric, help_text, key in (
@@ -973,20 +1150,42 @@ class WebAdminServer:
     # =========================================================================
 
     async def api_jobs_list(self, request: web.Request) -> web.Response:
-        """List jobs (JSON or HTML)"""
+        """List jobs (JSON or HTML).
+
+        Every filter `AdminAPI.list_jobs` answers with an index is reachable
+        from here: queue, state, the at-most-once `identity_key`, and `tag`
+        pairs. The two searches an operator reaches for during an incident
+        ("did this identity ever run, and what became of it", "show me this
+        customer's jobs") were CLI-only, so the answer to a dashboard
+        question was to leave the dashboard.
+        """
+        _reject_unknown_query(request, JOBS_QUERY_PARAMS)
         queue = request.query.get("queue")
         state = _query_job_state(request)
+        # An empty value is "not filtering", the same reading _query_int
+        # gives an empty limit: `?identity_key=` is a form field nobody
+        # filled in, and no job holds the empty string as its identity.
+        identity_key = request.query.get("identity_key") or None
+        tags = _query_tags(request)
         limit = _query_int(request, "limit", 50, maximum=MAX_PAGE_LIMIT)
         offset = _query_int(request, "offset", 0)
         async with self.api() as api:
             format_type = request.query.get("format", "json")
 
             jobs = await api.list_jobs(
-                queue=queue, state=state, limit=limit, offset=offset
+                queue=queue,
+                state=state,
+                identity_key=identity_key,
+                tags=tags,
+                limit=limit,
+                offset=offset,
             )
 
             if format_type == "html":
-                return self.render("fragments/jobs_table.html", jobs=jobs)
+                return self.render(
+                    "fragments/jobs_table.html",
+                    jobs=await self._with_display_state(api, jobs),
+                )
             else:
                 return web.json_response(jobs)
 
@@ -1194,6 +1393,9 @@ class WebAdminServer:
 
             # jorb timestamps are naive-UTC, so compare with a naive-UTC value
             since = datetime.now(UTC) - timedelta(hours=since_hours)
+            # `state_counts` already reports deferred rows as 'scheduled'
+            # rather than 'queued' -- the split is in get_metrics' GROUP BY, so
+            # every surface that calls it agrees.
             metrics = await api.get_metrics(since=since, queue=queue)
 
             if format_type == "html":
@@ -1394,8 +1596,13 @@ def main() -> None:
         "-c",
         default="./pyjobby.toml",
         show_default=True,
+        # Spelled out rather than "the same as every other daemon": pj-monitor
+        # is not, it takes --config with no -c and no default, so the sentence
+        # that claimed uniformity sent operators to write `pj-monitor -c ...`
+        # and get "no such option".
         help="Config file path (must define db_params; may define "
-        "prio_ceiling) — the same -c/--config every other pyjobby daemon takes",
+        "prio_ceiling) — the same -c/--config pj, pj-admin, pj-scheduler, "
+        "pj-ws and pj-bench take (pj-monitor takes --config only)",
     )
     @click.option(
         "--host",

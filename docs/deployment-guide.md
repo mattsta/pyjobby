@@ -150,9 +150,11 @@ pj-admin -c ./pyjobby.toml doctor
 (add `user`/`password` keys if your server requires them.)
 
 `prio_ceiling` (an int) is the worker fleet's priority ceiling, read by
-`pj`, `pj-scheduler`, `pj-web` and `pj-ws` when their `--max-prio` flag is
-not given — one declaration instead of the same number repeated on four
-command lines. An explicit flag always wins.
+`pj`, `pj-admin`, `pj-scheduler`, `pj-web` and `pj-ws` when their
+`--max-prio` flag is not given, and by `JobClient.from_config()` /
+`SyncJobClient.from_config()` when `prio_ceiling=` is not passed — one
+declaration instead of the same number repeated on every command line and in
+every producer. An explicit flag or argument always wins.
 
 `app_version` (a string, optional) is this deployment's application code
 version. It is read by BOTH halves of a version pin — `pj` advertises it when

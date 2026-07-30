@@ -11,14 +11,17 @@ connection behavior is uniform everywhere:
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import enum
+from collections.abc import AsyncIterator
 from typing import Any, Final
 
 import asyncpg  # type: ignore[import-untyped]
 import orjson
 
 from . import lifecycle
+from .enqueue_rules import validate_app_version
 
 
 class JobState(enum.StrEnum):
@@ -124,6 +127,12 @@ def utcnow() -> datetime.datetime:
 #: bulk `jobs retry` failed for every OTHER job in the batch too, every cycle,
 #: forever.
 #:
+#: Carried by: the operator requeue (retry, rerun, DLQ retry), the worker's
+#: same-row retry, the worker's RESCHEDULE (Job.reschedule() and durable
+#: sleep -- a sleeping job is a queued job), and the monitor's timeout-retry,
+#: dead-worker and stuck-claim sweeps. A waiter's wake carries the smaller
+#: WAKE_CLEARS_KEYS below.
+#:
 #: Kept out of it: identity_key (jorb_identity_idx has no state predicate; the
 #: row holds that key for life, which is the promise) and partition_key (a lane
 #: label, not a dedupe key). Statements that requeue from an ATTEMPT rather
@@ -149,11 +158,62 @@ REQUEUE_CLEARS_KEYS: Final = """deadline_key = NULL,
 WAKE_CLEARS_KEYS: Final = "deadline_key = NULL,"
 
 
+@contextlib.asynccontextmanager
+async def _transaction(
+    conn: asyncpg.Connection | asyncpg.Pool,
+) -> AsyncIterator[asyncpg.Connection]:
+    """Run a block on ONE connection inside ONE transaction, pool or not.
+
+    Every ``db`` verb takes ``asyncpg.Connection | asyncpg.Pool`` because its
+    callers are a mix (the client holds a pool, the admin API and the worker
+    hold a connection, and a caller inside its own transaction hands that
+    connection in). A pool has no ``transaction()``, and acquiring one per
+    statement would put a multi-statement verb on two different connections --
+    which is exactly the atomicity a transaction is for.
+
+    A connection ALREADY inside a transaction gets a savepoint from asyncpg's
+    nested ``transaction()``, so the block still commits or rolls back as a
+    unit and still joins the caller's outer transaction. That is the behaviour
+    an ``enqueue_in_transaction``-style caller wants: their commit is the one
+    that decides.
+    """
+    if isinstance(conn, asyncpg.Pool):
+        async with conn.acquire() as acquired, acquired.transaction():
+            yield acquired
+    else:
+        async with conn.transaction():
+            yield conn
+
+
+#: Discard the durable state of the jobs whose ids statement 1 returned.
+#:
+#: A SEPARATE STATEMENT from the requeue, and the pair runs inside one explicit
+#: transaction (``requeue_job``). It used to be a CTE hanging off the requeue --
+#: one statement, so "the wipes and the requeue commit together and no re-claim
+#: can land between them" -- and that reasoning was right about the re-claim and
+#: wrong about the writer already in flight. Every CTE of a statement reads ONE
+#: snapshot, taken when the statement began. A rerun that has to WAIT on the row
+#: lock (an append is mid-transaction, holding the job row ``FOR SHARE``) still
+#: deletes against the snapshot it took before the wait, so the rows that writer
+#: commits while the UPDATE blocks survive the wipe -- and the "fresh" run then
+#: appends after them, which is exactly the concatenated-stream failure the wipe
+#: exists to prevent. Reproduced.
+#:
+#: Two statements in one transaction fixes it without giving anything up. The
+#: requeue's row lock is held until COMMIT, so no re-claim can land between them
+#: -- that guarantee came from the lock, never from the statement count. And
+#: statement 2 takes a FRESH READ COMMITTED snapshot, so it sees every write that
+#: committed while statement 1 was waiting for the lock those writers held.
+WIPE_DURABLE_STATE_SQL: Final = (
+    "DELETE FROM jorb_step WHERE job_id = ANY($1::bigint[])",
+    "DELETE FROM jorb_stream WHERE job_id = ANY($1::bigint[])",
+)
+
+
 def build_requeue_sql(
     allowed_states: tuple[str, ...] = ("crashed",),
     *,
     many: bool = False,
-    wipe_checkpoints: bool = False,
 ) -> str:
     """SQL that puts a terminal/in-flight job back in the queue.
 
@@ -171,19 +231,19 @@ def build_requeue_sql(
     also guard on state IN ('claimed','running'). Checkpoints are loaded
     without an epoch filter, so bumping costs no resume capability.
 
-    ``wipe_checkpoints`` deletes the job's jorb_step rows AND its jorb_stream
-    rows in the same statement: a resume replays checkpoints regardless of
-    epoch, so a re-RUN ("do it again anyway", repeating side effects) must
-    discard them or the durable job would fast-forward over the very work it
-    was asked to redo. The streams go with them because a stream position is
-    assigned as "one past the highest this key holds": keeping the old rows
-    would have the fresh run's first ``stream_write`` land at seq N instead of
-    0, so every reader of the re-run would be handed the previous run's output
-    with the new run appended to it -- one stream claiming to be two runs.
-    Retry and ``rerun --resume`` leave both (that IS resume: the fast-forwarded
-    ``stream_write`` checkpoints append nothing, so the rows the first attempt
-    wrote are the only copy there will ever be). One statement, so the wipes and
-    the requeue commit together and no re-claim can land between them.
+    THIS IS STATEMENT 1 OF THE "FRESH" RERUN, whose second statement is
+    ``WIPE_DURABLE_STATE_SQL`` and whose transaction is opened by
+    ``requeue_job``. A resume replays checkpoints regardless of epoch, so a
+    re-RUN ("do it again anyway", repeating side effects) must discard them or
+    the durable job would fast-forward over the very work it was asked to redo.
+    The streams go with them because a stream position is assigned as "one past
+    the highest this key holds": keeping the old rows would have the fresh run's
+    first ``stream_write`` land at seq N instead of 0, so every reader of the
+    re-run would be handed the previous run's output with the new run appended
+    to it -- one stream claiming to be two runs. Retry and ``rerun --resume``
+    leave both (that IS resume: the fast-forwarded ``stream_write`` checkpoints
+    append nothing, so the rows the first attempt wrote are the only copy there
+    will ever be).
 
     THE DEDUPE KEYS ARE CLEARED, always. A deadline_key and a debounce_key are
     held by a QUEUED row and their collapse duty is over the first time the row
@@ -217,16 +277,7 @@ def build_requeue_sql(
             WHERE {target}
               AND state IN ({states})
             RETURNING id"""
-    if not wipe_checkpoints:
-        return requeue
-    return f"""WITH bumped AS (
-            {requeue}
-        ), wiped AS (
-            DELETE FROM jorb_step WHERE job_id IN (SELECT id FROM bumped)
-        ), unstreamed AS (
-            DELETE FROM jorb_stream WHERE job_id IN (SELECT id FROM bumped)
-        )
-        SELECT id FROM bumped"""
+    return requeue
 
 
 #: States a RETRY may start from. Retry means "this job did not succeed;
@@ -238,6 +289,60 @@ RETRYABLE_STATES: tuple[str, ...] = ("crashed", "cancelled")
 #: States a RE-RUN may start from: any terminal state, including success.
 #: This is the operator's "do it again anyway" verb.
 RERUNNABLE_STATES: tuple[str, ...] = ("crashed", "cancelled", "finished")
+
+
+#: Re-prioritise a job that has not been matched to a worker yet.
+#:
+#: NOT wrapped in a verb the way the app_version twin below it is, and the
+#: asymmetry is the point: a priority is checked against the CALLER's
+#: deployment ceiling (a client's declared ``prio_ceiling``, an AdminAPI's,
+#: the CLI's), and this module is handed a connection and no deployment. So
+#: the SQL is shared -- the state guard is the part that must not drift -- and
+#: the validation stays with whoever knows the ceiling.
+UPDATE_PRIORITY_SQL: Final = f"""UPDATE jorb SET prio = $2
+             WHERE id = $1 AND state IN ({lifecycle.PRE_CLAIM_STATES_SQL})"""
+
+#: Re-pin (or unpin) a job that has not been matched to a worker yet. The
+#: state guard is ``lifecycle.PRE_CLAIM_STATES``, which is where the argument
+#: for it lives -- ``app_version`` is a CLAIM GATE, so editing it after the
+#: claim decides nothing and editing a terminal job's rewrites history.
+UPDATE_APP_VERSION_SQL: Final = f"""UPDATE jorb SET app_version = $2
+             WHERE id = $1 AND state IN ({lifecycle.PRE_CLAIM_STATES_SQL})"""
+
+
+async def update_job_app_version(
+    conn: asyncpg.Connection | asyncpg.Pool,
+    job_id: int,
+    app_version: str | None,
+) -> bool:
+    """Re-pin (or unpin) a job that has not been claimed yet.
+
+    THE re-pin verb for every surface -- ``JobClient``, ``AdminAPI``, the CLI
+    -- so no surface can validate differently or guard on different states,
+    which is the model ``retry_job`` sets for the requeue verbs. ``None``
+    CLEARS the pin, making the job claimable by every live worker again: the
+    remedy for a job stranded by a deploy that has moved on.
+
+    THE VALIDATOR'S RETURN VALUE IS WHAT GETS WRITTEN, not the argument. The
+    validator is the one place that decides what a version pin may be, and a
+    caller that passed the argument through instead would drift from every
+    other surface the day it normalises anything.
+
+    Unlike the priority twin there is no ceiling to check against: nothing the
+    platform can read says which builds a fleet is ABOUT to run, so a version
+    no worker advertises yet is a legitimate pin -- that is what a deploy in
+    progress looks like. What makes it safe is that the stranding is loud:
+    doctor's unclaimable sweep, ``jobs why`` and every idle worker's log all
+    name it.
+
+    Returns True if the row was updated, False if the job does not exist or
+    has already left the queue. Raises ValueError for a version an enqueue
+    would also refuse (see ``enqueue_rules.validate_app_version``).
+    """
+    result: str = await conn.execute(
+        UPDATE_APP_VERSION_SQL, job_id, validate_app_version(app_version)
+    )
+    return result != "UPDATE 0"
 
 
 async def retry_job(
@@ -311,6 +416,10 @@ async def rerun_job(
     both, i.e. RESUME an interrupted durable job from where it stopped rather
     than restart it -- the completed ``stream_write`` checkpoints fast-forward
     and append nothing, so the first attempt's rows are the run's only copy.
+
+    The requeue and the wipe run as two statements in ONE transaction, so a
+    writer that was mid-append when the rerun started is waited out and then
+    wiped along with everything else (``WIPE_DURABLE_STATE_SQL``).
     """
     return await requeue_job(
         conn,
@@ -337,18 +446,32 @@ async def requeue_job(
 
     ``wipe_checkpoints`` discards the job's DXE checkpoint log and its durable
     streams so the next attempt re-executes from the start and streams from
-    seq 0; retry leaves both to resume.
+    seq 0; retry leaves both to resume. The requeue and the wipe are TWO
+    statements in ONE transaction -- ``WIPE_DURABLE_STATE_SQL`` says why that
+    is stronger than the single CTE it replaced.
+
+    ``allowed_states`` IS A BOUNDARY, not a preference. Every state in it must
+    be one a requeue may legally leave (``lifecycle.LEGAL_TRANSITIONS``), and a
+    caller that widens it to an in-flight state is asserting that the execution
+    it is stepping on is genuinely gone -- the epoch bump fences that execution
+    out of writing, but nothing here waits for it to notice. The monitor's
+    sweeps pass in-flight states on exactly that basis (a dead heartbeat, an
+    expired grace period); an operator surface should not.
 
     Returns the job id, or None if it wasn't in an allowed state."""
     if delay is None:
         delay = datetime.timedelta(0)
-    requeued: int | None = await conn.fetchval(
-        build_requeue_sql(allowed_states, wipe_checkpoints=wipe_checkpoints),
-        job_id,
-        delay,
-        reset_errors,
-    )
-    return requeued
+    sql = build_requeue_sql(allowed_states)
+    if not wipe_checkpoints:
+        plain: int | None = await conn.fetchval(sql, job_id, delay, reset_errors)
+        return plain
+    async with _transaction(conn) as cxn:
+        requeued: int | None = await cxn.fetchval(sql, job_id, delay, reset_errors)
+        if requeued is None:
+            return None
+        for wipe in WIPE_DURABLE_STATE_SQL:
+            await cxn.execute(wipe, [requeued])
+        return requeued
 
 
 # =========================================================================
@@ -503,8 +626,8 @@ async def fork_job(
     * ENFORCED HERE, for every surface: ``from_step >= 1``, the source existing,
       ``from_step`` within the source's recorded steps + 1, the source not being
       deleted underneath the fork, and ``app_version`` (empty and over-long,
-      via :func:`client.validate_app_version` -- one call, here, rather than one
-      per wrapper).
+      via :func:`enqueue_rules.validate_app_version` -- one call, here, rather
+      than one per wrapper).
     * LEFT TO THE WRAPPERS: ``priority``. The ceiling a priority is checked
       against is a property of the CALLER's deployment (a client's declared
       ``prio_ceiling``, an AdminAPI's, the CLI's ``--max-prio`` or config), and
@@ -553,8 +676,6 @@ async def fork_job(
     when the source is DELETED while the fork is being written. Raises
     ValueError for an empty or over-long ``app_version``.
     """
-    from .client import validate_app_version
-
     if from_step < 1:
         raise ForkRefused(
             f"from_step must be at least 1 (steps are numbered from 1); got {from_step}"

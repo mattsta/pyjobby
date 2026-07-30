@@ -177,8 +177,10 @@ cart changed, schedule a reminder" job. Tomorrow's is a legitimately new
 job, and the key must not stop it.
 
 Once released, the key is not taken back: a **retry, re-run or DLQ retry
-clears `deadline_key` from the row it requeues** (as does the monitor when it
-reclaims a job from a dead worker, and a waiter's wake). So a job that failed
+clears `deadline_key` from the row it requeues** (as does a job's own
+`reschedule()` or durable `sleep()`, which park it back in `queued` for the
+nap; the monitor when it reclaims a job from a dead worker; and a waiter's
+wake). So a job that failed
 and was retried no longer collapses anything — it just runs, and a duplicate
 submitted while it was out of the queue is a job of its own. That is the only
 answer that works: the duplicate may already hold the key, and a requeue that
@@ -195,6 +197,14 @@ try:
 except asyncpg.UniqueViolationError:
     pass  # a reminder is already queued for this cart
 ```
+
+That "queued rows only" predicate is also why **`deadline_key` cannot be
+combined with `waitfor_job` / `waitfor_group`** (a `ValueError` at the door,
+beside the identical refusal for `debounce()`). A dependent job is inserted
+`waiting`, which is outside the index, and the wake clears `deadline_key` on
+its way into `queued` — so the key would collapse nothing at any point in the
+row's life and every duplicate would run, silently. Put the key on the job
+that does the work, and let an unkeyed waiter depend on that job.
 
 **`identity_key` holds, and does not re-arm.** The unique index has no state
 predicate, so the row holds the key for its whole life — queued, running,

@@ -349,6 +349,21 @@ rather than change what the running ones accept). Alert on it the same way
 you alert on the DLQ: it is a condition nothing else in the system will ever
 tell you about.
 
+From Prometheus, that alert is `pyjobby_jobs_unclaimable > 0` — the same
+sweep, labelled by queue and by cause:
+
+```
+pyjobby_jobs_unclaimable{queue="reports",reason="above_worker_ceiling"} 3
+pyjobby_jobs_unclaimable{queue="reports",reason="capability_unmet"} 1
+pyjobby_jobs_unclaimable{queue="reports",reason="app_version_unmet"} 1
+```
+
+It sits beside `pyjobby_workers_not_claiming` for the same reason: both name
+a fleet that looks healthy on every other series. Backlog depth, throughput,
+worker liveness and the DLQ all read normal while these jobs sit there, so
+an alert built on them alone never fires. The label says which remedy above
+applies; take an id from `doctor` or `pj-admin jobs why ID` for the detail.
+
 ## One partition is backed up and the rest of the queue is fine
 
 The queue drains, throughput looks normal, `doctor` is clean — and one

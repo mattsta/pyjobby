@@ -59,6 +59,30 @@ LIVE_STATES: tuple[str, ...] = tuple(
     state for state in JOB_STATES if state not in TERMINAL_STATES
 )
 
+#: The states in which a job has NOT YET BEEN MATCHED TO A WORKER, and the
+#: only ones whose CLAIM GATES an operator may still change.
+#:
+#: ``prio`` and ``app_version`` are both read by ``claim_jorb`` to decide who
+#: may take the row (``prio <= the worker's ceiling``, ``app_version`` equal to
+#: what the worker advertises or NULL). Editing either one after the claim
+#: decides nothing -- the gate has already been passed -- and editing a
+#: terminal job's is rewriting history. So the four surfaces that offer those
+#: edits (``JobClient`` and ``AdminAPI``, priority and version) all guard on
+#: exactly this pair, and they name it here rather than each spelling
+#: ``state IN ('queued', 'waiting')`` into its own SQL. A fifth editable gate
+#: would otherwise be a fifth literal, and the first one to be written wrong.
+#:
+#: ``waiting`` is in it: a blocked job is not claimable YET, but it will be,
+#: and it will be claimed under whatever gates it carries at that moment.
+#:
+#: Interpolated into SQL through ``PRE_CLAIM_STATES_SQL`` for the reason
+#: ``TERMINAL_STATES_SQL`` is: the values are literals chosen here, and there
+#: is nothing to inject.
+PRE_CLAIM_STATES: tuple[str, ...] = ("queued", "waiting")
+
+#: ``PRE_CLAIM_STATES`` as a SQL ``IN`` list.
+PRE_CLAIM_STATES_SQL: str = ", ".join(f"'{state}'" for state in PRE_CLAIM_STATES)
+
 #: The pseudo-state a job's history starts from. Not a ``jorbstate`` value:
 #: ``jorb_history`` records the INSERT as an ``enqueued`` event so that every
 #: job's audit trail has an origin, and a walk over that trail needs somewhere

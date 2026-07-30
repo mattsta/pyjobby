@@ -27,6 +27,8 @@ from typing import TYPE_CHECKING, Any
 import asyncpg  # type: ignore[import-untyped]
 from loguru import logger
 
+from .enqueue_rules import _NO_DAG_IDENTITY
+
 if TYPE_CHECKING:
     from .client import JobClient
 
@@ -49,8 +51,6 @@ def _refuse_identity(node: DAGNode) -> None:
     reaches the wiring with one.
     """
     if node._job_options.get("identity_key") is not None:
-        from .client import _NO_DAG_IDENTITY
-
         raise ValueError(f"{node.job_class}: {_NO_DAG_IDENTITY}")
 
 

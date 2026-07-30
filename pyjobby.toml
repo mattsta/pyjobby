@@ -1,18 +1,17 @@
 # pyjobby configuration (TOML, read as data — never executed).
 #
-# Every pyjobby process takes this file with -c/--config — pj, pj-admin,
-# pj-monitor, pj-scheduler, pj-web, pj-ws — and JobClient.from_config()
-# reads the same file from application code.
+# pj, pj-admin, pj-scheduler, pj-web, pj-ws and pj-bench take this file with
+# -c/--config; pj-monitor takes --config ONLY, with no short form and no
+# default, so `pj-monitor -c ./pyjobby.toml` is "no such option". And
+# JobClient.from_config() reads the same file from application code.
 #
 # Secrets: any string of the exact form "${ENV_VAR}" is replaced from the
 # environment at load time; an unset variable is a loud startup error.
 
-[db_params]
-database = "pyjobby"
-user = "postgres"
-password = "${PYJOBBY_DB_PASSWORD}"
-host = "localhost"
-port = 5432
+# EVERY TOP-LEVEL SETTING COMES FIRST, before the first [table] header. TOML
+# has no way back out to the root: a bare key written after `[db_params]`
+# belongs to db_params, so `prio_ceiling` down there is not the deployment's
+# ceiling, it is an asyncpg.connect() keyword that does not exist.
 
 # The priority ceiling this deployment's workers run with (`pj --max-prio`).
 # Declared once here so every enqueuing surface refuses a job no worker
@@ -26,6 +25,13 @@ prio_ceiling = 1000
 # out = nothing is pinned, which is the default and what most deployments
 # want; a job with no app_version is claimed by every worker.
 # app_version = "2026.07.28+a1b2c3d"
+
+[db_params]
+database = "pyjobby"
+user = "postgres"
+password = "${PYJOBBY_DB_PASSWORD}"
+host = "localhost"
+port = 5432
 
 # Experimental per-worker HTTP endpoints (pj workers only). Off by default —
 # uncomment to enable; there is no authentication.

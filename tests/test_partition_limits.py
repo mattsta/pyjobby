@@ -392,8 +392,13 @@ class TestPartitionedRateLimit:
         rated = await enqueue_lane(db_pool, unique_queue, "rate", 2)
         free = await enqueue_lane(db_pool, unique_queue, "free", 1)
 
-        # 'conc' takes its one concurrency slot.
-        assert (await claim_once(db_pool, unique_queue))["id"] is not None
+        # 'conc' takes its one concurrency slot. Asserted as the LANE: an `id
+        # is not None` on a claimed row is true of every claim ever made, so
+        # it certified nothing about which lane the claim came from -- which
+        # is the entire subject of this test.
+        took_the_slot = await claim_once(db_pool, unique_queue)
+        assert took_the_slot is not None
+        assert took_the_slot["partition_key"] == "conc"
         # 'rate' has already spent its window (5 admissions), in flight or not.
         await db_pool.execute(
             """UPDATE jorb SET claimed_at = now(), state = 'finished',
@@ -414,14 +419,16 @@ class TestPartitionedRateLimit:
         assert admitted is not None and admitted["id"] == free[0], (
             "the only lane blocked by neither limit is 'free'"
         )
+        assert admitted["partition_key"] == "free"
         assert await claim_once(db_pool, unique_queue) is None
-        assert rate_again  # the rate-limited row is still queued, not lost
-        assert (
-            await db_pool.fetchval(
-                "SELECT state::text FROM jorb WHERE id = $1", rate_again[0]
-            )
-            == "queued"
+        # the rate-limited row is HELD BACK, not lost -- named by its lane,
+        # because "a non-empty list is truthy" was the whole of what the
+        # previous assertion here established
+        held_back = await db_pool.fetchrow(
+            "SELECT state::text AS state, partition_key FROM jorb WHERE id = $1",
+            rate_again[0],
         )
+        assert (held_back["state"], held_back["partition_key"]) == ("queued", "rate")
 
 
 # ============================================================================

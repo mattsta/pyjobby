@@ -577,15 +577,19 @@ class SendEmailJob(Job):
 ```toml
 # pyjobby.toml — data, never code. Secrets: "${ENV_VAR}" values are
 # substituted from the environment at load time.
+
+# Top-level settings come BEFORE the first [table]: TOML has no way back out
+# to the root, so a bare key after [db_params] belongs to db_params.
+
+# The priority ceiling this deployment's workers run with (`pj --max-prio`).
+prio_ceiling = 1000
+
 [db_params]
 database = "pyjobby"
 user = "postgres"
 password = "${PYJOBBY_DB_PASSWORD}"
 host = "localhost"
 port = 5432
-
-# The priority ceiling this deployment's workers run with (`pj --max-prio`).
-prio_ceiling = 1000
 ```
 
 (See [`pyjobby.toml`](pyjobby.toml) in the repository root for the annotated

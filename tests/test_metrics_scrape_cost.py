@@ -412,6 +412,11 @@ EXPECTED_TYPES = {
     # the live workers that are nonetheless claiming nothing, and the
     # approach to that state -- bounded by the fleet, not the job table
     "pyjobby_workers_not_claiming": "gauge",
+    # the other half of that story, from the job side: work a live fleet
+    # cannot see (above every ceiling, an unadvertised capability, a build
+    # nobody runs). The only alertable signal for stranded work -- it never
+    # fails, never retries and never reaches the DLQ.
+    "pyjobby_jobs_unclaimable": "gauge",
     "pyjobby_worker_job_threads_abandoned_max": "gauge",
     "pyjobby_jobs_inflight": "gauge",
     "pyjobby_jobs_stuck": "gauge",
@@ -477,6 +482,25 @@ async def scrape_body(client, db_pool, queue: str) -> str:
         await conn.execute(
             "INSERT INTO jorb_queue (name, paused) VALUES ($1, TRUE)", queue
         )
+        # A LIVE WORKER, and a job it cannot claim. `pyjobby_jobs_unclaimable`
+        # is labelled per (queue, reason), so with nothing stranded it emits
+        # HELP and TYPE and no samples at all -- and the contract assertion
+        # below compares SAMPLE names, so the series would silently sit outside
+        # the table that is meant to enumerate every series this endpoint may
+        # emit. The condition also needs the fleet to be UP: a queue with no
+        # live workers is deliberately not reported (see
+        # AdminAPI.unclaimable_jobs), because "nothing is running" is a
+        # different remedy from "workers are running and blind to this work".
+        await conn.execute(
+            """INSERT INTO jorb_worker (host, pid, queue, max_prio, last_seen)
+               VALUES ('metrics-contract', 1, $1, 100, now())""",
+            queue,
+        )
+        await conn.execute(
+            """INSERT INTO jorb (job_class, kwargs, queue, state, prio)
+               VALUES ('contract.Job', '{}', $1, 'queued', 9000)""",
+            queue,
+        )
     resp = await client.get("/metrics")
     assert resp.status == 200
     return await resp.text()
@@ -540,7 +564,11 @@ class TestExpositionContract:
         samples = parse_samples(body)
         q = unique_queue
 
-        assert samples[f'pyjobby_jobs_by_state{{queue="{q}",state="queued"}}'] == 1
+        # two queued: the ordinary one, and the above-the-ceiling one the
+        # unclaimable gauge needs (see scrape_body). Both are genuinely queued,
+        # which is the point of that gauge -- stranded work is invisible in
+        # every count but its own.
+        assert samples[f'pyjobby_jobs_by_state{{queue="{q}",state="queued"}}'] == 2
         assert samples[f'pyjobby_jobs_by_state{{queue="{q}",state="waiting"}}'] == 1
         for terminal in ("finished", "crashed", "cancelled"):
             assert (

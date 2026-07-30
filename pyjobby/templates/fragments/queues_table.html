@@ -1,4 +1,15 @@
-{# htmx target #queues-table: queue depths plus the pause/resume controls. #}
+{#
+  htmx target #queues-table: queue depths plus the pause/resume controls.
+
+  THE "/lane" SUFFIX IS LOAD-BEARING. On a queue with partition_limits both
+  limits are counted PER jorb.partition_key, so a bare "5" against a queue
+  running 40 jobs reads as a broken limit -- it is 5 per lane across eight
+  lanes, working exactly as configured. The scope is printed ON each limit
+  and not as a column of its own for the reason `pj-admin queues show` prints
+  it that way (see _echo_queue_control in cli.py): an operator reading one
+  number must never have to look elsewhere on the screen to learn which of
+  the two things it means.
+#}
 {% if not stats %}
 <p class="empty">No queue data</p>
 {% else %}
@@ -20,6 +31,12 @@
 {% set paused = s.get("paused") | default(false, true) %}
 {% set max_concurrency = s.get("max_concurrency") %}
 {% set rate_limit = s.get("rate_limit") %}
+{% set partitioned = s.get("partition_limits") | default(false, true) %}
+{# Captured as a block so the markup is written once and both limit cells
+   carry the identical marker; empty on a queue whose limits are queue-wide. #}
+{% set scope %}
+{%- if partitioned %}<span class="scope" title="counted per jorb.partition_key -- one lane per tenant, not per queue"> /lane</span>{% endif -%}
+{% endset %}
         <tr>
             <td><strong>{{ s["queue"] }}</strong></td>
             <td>{{ s["queued"] | int }}</td>
@@ -32,10 +49,16 @@
                 <span class="badge running">active</span>
 {% endif %}
             </td>
-            <td>{{ max_concurrency | int if max_concurrency is not none else "unlimited" }}</td>
+            <td>
+{% if max_concurrency is not none %}
+                {{ max_concurrency | int }}{{ scope }}
+{% else %}
+                unlimited
+{% endif %}
+            </td>
             <td>
 {% if rate_limit is not none %}
-                {{ rate_limit | int }}/{{ "%g" | format(s.get("rate_period_seconds") or 60) }}s
+                {{ rate_limit | int }}/{{ "%g" | format(s.get("rate_period_seconds") or 60) }}s{{ scope }}
 {% else %}
                 unlimited
 {% endif %}

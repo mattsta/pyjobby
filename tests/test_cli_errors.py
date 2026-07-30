@@ -664,6 +664,34 @@ class TestJobsInvalidFilters:
         assert result.exit_code == 2
         assert "both name where to start; pass one" in result.stderr
 
+    async def test_fork_refuses_the_pair_without_opening_a_connection(self, db_params):
+        """The refusal is about the operator's arguments, so it must not need
+        a reachable database to be made -- and must not blame one.
+
+        The check used to live INSIDE the async body, after get_api: pointed
+        at a database that is down, `jobs fork ID --from-step 2
+        --from-failure` reported a connection failure for a command that was
+        never going to run. `jobs set-app-version` checks its own
+        VERSION/--clear pair before the async body for this reason.
+        """
+        with reserved_unused_port() as port:
+            unreachable = dsn_for({**db_params, "port": port})
+
+            result = await run_cli(
+                "--dsn",
+                unreachable,
+                "jobs",
+                "fork",
+                "1",
+                "--from-step",
+                "2",
+                "--from-failure",
+            )
+
+        assert result.exit_code == 2
+        assert "both name where to start; pass one" in result.stderr
+        assert "Failed to connect to database" not in result.stderr
+
     async def test_fork_past_the_recorded_steps_names_the_count(
         self, dsn, db_pool, unique_queue
     ):
@@ -1513,6 +1541,80 @@ class TestPriorityCeilingFromConfig:
             f"above the worker priority ceiling ({DEFAULT_PRIO_CEILING})"
             in result.stderr
         )
+
+    async def test_an_unreadable_named_config_warns_before_refusing(
+        self, tmp_path, dsn, db_pool, unique_queue
+    ):
+        """The whole failure, end to end.
+
+        On --dsn nothing else opens the config file, so a `-c` at a path that
+        cannot be read left the ceiling silently at the default and the very
+        next line refused a priority the fleet claims happily -- blaming the
+        priority for a file the operator had already named. Both lines now
+        print, and the refusal is no longer the only clue.
+        """
+        job_id = await make_job(db_pool, unique_queue, "queued")
+        missing = tmp_path / "absent.toml"
+
+        result = await run_cli(
+            "--config",
+            str(missing),
+            "--dsn",
+            dsn,
+            "jobs",
+            "set-priority",
+            str(job_id),
+            "5000",
+        )
+
+        assert result.exit_code == 2
+        assert f"Could not read {missing}" in result.stderr
+        assert f"ceiling defaults to {DEFAULT_PRIO_CEILING}" in result.stderr
+        assert "above the worker priority ceiling" in result.stderr
+
+    async def test_schedule_add_warns_about_the_defaulted_ceiling_too(
+        self, tmp_path, dsn, db_pool
+    ):
+        """`schedule add` reads the ceiling before it opens a connection, so
+        it takes its own path through load_prio_ceiling and needs its own
+        proof that the path warns."""
+        missing = tmp_path / "absent.toml"
+
+        result = await run_cli(
+            "--config",
+            str(missing),
+            "--dsn",
+            dsn,
+            "schedule",
+            "add",
+            "ceiling_warned_schedule",
+            "tests.dxe_jobs.OkJob",
+            "0 2 * * *",
+            "--priority",
+            "5000",
+        )
+
+        assert result.exit_code == 2
+        assert f"ceiling defaults to {DEFAULT_PRIO_CEILING}" in result.stderr
+        assert not await db_pool.fetchval(
+            "SELECT COUNT(*) FROM jorb_schedule WHERE name = $1",
+            "ceiling_warned_schedule",
+        )
+
+    async def test_a_readable_config_warns_about_nothing(
+        self, tmp_path, db_params, db_pool, unique_queue
+    ):
+        """Control: the warning fires on an UNREADABLE named config, not on
+        every named one."""
+        job_id = await make_job(db_pool, unique_queue, "queued")
+        config = self._config(tmp_path, db_params, 5000)
+
+        result = await run_cli(
+            "--config", config, "jobs", "set-priority", str(job_id), "5000"
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "ceiling defaults to" not in result.stderr
 
     async def test_list_enabled_requires_a_boolean(self, dsn):
         result = await run_cli("--dsn", dsn, "schedule", "list", "--enabled", "maybe")

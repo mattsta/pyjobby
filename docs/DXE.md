@@ -431,9 +431,27 @@ fast-forwards on every replay), so a second close is never a retry — it is two
 call sites that both believe they own the end of the stream, which is precisely
 the state that produces writes past the marker.
 
-`StreamClosedError` is not a `DXEError`: like `StepTimeoutError` it is an
-ordinary step **failure**, recorded as that step's error and taking the job's
-normal retry path, so `pj-admin jobs steps <id>` names the call that did it.
+`StreamClosedError` is not a `DXEError`. It is a **`StepFailure`**, and that
+is the distinction the whole error taxonomy turns on:
+
+| Base                       | Members                                                | What the platform does with it                                                                                                       |
+| -------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `DXEError` (`RuntimeError`) | `StaleExecutionError`, `NondeterminismError`           | **Control-flow signal.** Bypasses checkpoint recording — there is nothing about a superseded epoch worth writing against a step.      |
+| `StepFailure` (`Exception`) | `StepTimeoutError`, `StreamClosedError`, `JobTimeout`  | **Recorded.** Written to the step's `error` column, named by `pj-admin jobs steps <id>`, and subject to the job's ordinary retry budget exactly like a step that raised on its own account. |
+
+The three `StepFailure`s are different mistakes — a blown step budget, a write
+past a closed stream, an expired job deadline — and identical in the only
+respect a handler cares about, so `except StepFailure:` is one clause instead
+of three and stays right when a fourth is added.
+
+```python
+from pyjobby import StepFailure
+
+try:
+    await job.step("render", render_report)
+except StepFailure as failed:      # timed out, closed stream, or job deadline
+    ...                            # it is already recorded; this is your reaction
+```
 
 ### The closing marker is a column, never a value
 

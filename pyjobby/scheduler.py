@@ -26,6 +26,7 @@ from loguru import logger
 from .client import ENQUEUE_SQL, JobClient
 from .cron import missed_cron_runs, next_cron_run
 from .db import utcnow
+from .enqueue_rules import DEFAULT_PRIO_CEILING
 
 #: "How many of this schedule's jobs are still in flight?", asked once per
 #: firing of every schedule by ``ScheduleSafetyManager.check_concurrency``.
@@ -488,8 +489,6 @@ class SchedulerWorker:
         #: claimed — one bad number becomes an unbounded stream of jobs
         #: nobody runs. A firing refused by the ceiling DISABLES the
         #: schedule with the reason, exactly like an unevaluatable cron.
-        from .client import DEFAULT_PRIO_CEILING
-
         self.prio_ceiling = (
             DEFAULT_PRIO_CEILING if prio_ceiling is None else prio_ceiling
         )
@@ -954,11 +953,18 @@ class SchedulerWorker:
         # recovery pass and inflate skip_count by the same dropped count again,
         # every time -- a counter that grew with the number of crashes rather
         # than with the number of dropped ticks, which is the one thing it is
-        # read for. After the move, a crash mid-burst loses at most this one
-        # summary row (the fires that DID happen are each logged as they
-        # happen), and losing the row is strictly better than double-counting
-        # it: the fires it describes are absent from the log too, so the
-        # history stays consistent with itself.
+        # read for.
+        #
+        # What makes the move sufficient is the CALL PATH: `run()` drives this
+        # whole backfill inside one `self.conn.transaction()`, together with
+        # the enqueues, their log rows and the `next_run` advance. So a crash
+        # mid-burst does not leave a partial burst behind to be reconciled --
+        # every fire, every log row and this summary roll back as one, and the
+        # next pass finds `next_run` unmoved and redoes the burst from the same
+        # starting point. Written first, this row was the one statement whose
+        # effect the recovery pass would then have written TWICE within one
+        # consistent history; written last, there is nothing about the
+        # abandoned attempt left anywhere for the retry to duplicate.
         if missed.dropped_window is not None:
             oldest, newest = missed.dropped_window
             detail = (

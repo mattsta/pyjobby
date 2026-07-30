@@ -657,8 +657,10 @@ handler.
 The other half of that rule is in the statements rather than in the indexes:
 **every statement that puts a row back into `queued` clears `deadline_key`,
 `debounce_key` and `debounce_deadline`** (`db.REQUEUE_CLEARS_KEYS` — retry,
-rerun, DLQ retry, the monitor's timeout retry and its dead-worker and
-stuck-claim sweeps; a waiter's wake clears `deadline_key`, which is the only
+rerun, DLQ retry, a job's own **reschedule** (`Job.reschedule()` and durable
+`sleep()`, which park the row back in `queued` for the rest of the nap), and
+the monitor's timeout retry and its dead-worker and stuck-claim sweeps; a
+waiter's wake clears `deadline_key`, which is the only
 one a `waiting` row can hold). A key's collapse duty ends the first time its
 row leaves `queued`, so a requeue must not carry it back into an index the
 row was already released from. `run_count` alone does not cover the row that

@@ -188,17 +188,30 @@ class TestTheClaimGate:
         claimed = await claim_as(db_connection, unique_queue, app_version="v2")
         assert claimed is not None and claimed["id"] == pinned
 
-    async def test_an_empty_string_pin_is_claimable_by_nobody(
+    async def test_an_empty_string_pin_waits_for_a_worker_that_cannot_exist(
         self, db_connection, unique_queue
     ):
         """Why validate_app_version refuses '': it is a value, not the absence
-        of one, and no worker can advertise it (`--app-version ""` is the same
-        as passing nothing). Written here through raw SQL, because the client
-        will not let a caller create this row."""
+        of one.
+
+        The claim gate treats it like any other version -- a worker
+        advertising exactly '' takes the job, which is the second assertion
+        and is what makes this a real pin rather than a broken one. The
+        problem is the other half: NO SUCH WORKER CAN BE STARTED.
+        ``pj --app-version ""`` resolves to None (resolve_app_version warns
+        and advertises nothing), so the row is pinned to a version that exists
+        only in the job table -- queued forever, never failing.
+
+        Named for that, not for "claimable by nobody", which the second
+        assertion here contradicts. Written through raw SQL because the client
+        will not let a caller create this row.
+        """
         await pinned_job(db_connection, unique_queue, "")
 
         assert await claim_as(db_connection, unique_queue) is None
         assert await claim_as(db_connection, unique_queue, app_version="") is not None
+        # ...and the launcher cannot produce that worker
+        assert resolve_app_version("", None) is None
 
 
 # ============================================================================
@@ -238,8 +251,7 @@ class TestLiveWorkers:
             "tests.dxe_jobs.OkJob", queue=unique_queue, app_version="v2", x=1
         )
 
-        # Long enough for many poll intervals (checkInterval is 0.2s here).
-        await _still_queued(db_pool, job_id, seconds=2.0)
+        await _the_fleet_looked_and_left_it(db_pool, unique_queue, job_id)
 
         await live_worker(app_version="v2")
         row = await wait_for_job_state(db_pool, job_id, ("finished",), timeout=30)
@@ -256,29 +268,54 @@ class TestLiveWorkers:
         job_id = await client.enqueue(
             "tests.dxe_jobs.OkJob", queue=unique_queue, app_version="v2", x=1
         )
-        await _still_queued(db_pool, job_id, seconds=1.0)
-
+        # No "did it stay queued?" wait here: that the v1 worker refuses a v2
+        # job is the test above's subject, and repeating it costs a second of
+        # wall clock to re-establish a premise. What THIS test is for is that
+        # clearing the pin frees the job for a fleet nothing else changed
+        # about -- and the fleet is already up.
         assert await client.update_job_app_version(job_id, None) is True
 
         await wait_for_job_state(db_pool, job_id, ("finished",), timeout=30)
 
 
-async def _still_queued(pool, job_id: int, seconds: float) -> None:
-    """Assert the job stays 'queued' for `seconds`, sampling throughout.
+async def _the_fleet_looked_and_left_it(pool, queue: str, job_id: int) -> None:
+    """Wait until a live worker on `queue` has DEMONSTRABLY claimed nothing,
+    then assert the job is still 'queued'.
 
-    A single check after a sleep proves only that it was queued at one instant;
-    the claim being refused is a claim that keeps being refused.
+    Evidence, not elapsed time. The previous version of this helper polled the
+    job's state for a fixed two seconds and concluded the pin held -- which
+    proves nothing on a loaded box, where two seconds can pass before the
+    worker's first poll, and which spends two seconds on every run of a test
+    that has an answer in milliseconds.
+
+    ``jorb_worker.idle`` is the worker's OWN statement that it looked. The run
+    loop sets it only after a claim returned no rows (and then claims once
+    more under it, clearing it again if anything turns up), so a committed
+    ``idle = TRUE`` beside a still-queued job is the claim path refusing this
+    job, observed rather than inferred. See ``JobSystem._set_idle``.
     """
     import asyncio
     import time
 
-    deadline = time.monotonic() + seconds
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
+        parked = await pool.fetchval(
+            """SELECT bool_or(idle) FROM jorb_worker
+                WHERE queue = $1 AND shutdown_at IS NULL""",
+            queue,
+        )
         state = await pool.fetchval("SELECT state FROM jorb WHERE id = $1", job_id)
         assert state == "queued", (
             f"a pinned job was claimed by a worker on another version (state {state!r})"
         )
-        await asyncio.sleep(0.05)
+        if parked:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(
+        f"no live worker on {queue!r} published idle within 30s: the test "
+        f"never observed a poll, so 'the job stayed queued' is not evidence "
+        f"that the claim refused it"
+    )
 
 
 # ============================================================================
@@ -616,6 +653,29 @@ class TestValidation:
             await AdminAPI(db_connection).update_job_app_version(job, "")
         assert await version_of(db_connection, job) == "v2"
 
+    @pytest.mark.parametrize(
+        "not_a_string",
+        [20260728, 1.5, True, ["v1"]],
+        ids=str,  # noqa: FBT003
+    )
+    async def test_a_version_that_is_not_a_string_is_REFUSED_not_coerced(
+        self, not_a_string
+    ):
+        """``app_version = 20260728`` in a TOML file is an integer, and it is
+        the natural way to write a date-stamped version without thinking about
+        quotes.
+
+        Coerced with ``str()`` it becomes a pin whose only claim of being right
+        is that ``str()`` happened to produce it -- and the two halves of the
+        pin have to agree EXACTLY, because the claim compares them for
+        equality. Refused, the caller sees the missing quotes at the one moment
+        they can fix them. Before this the client AttributeError'd on ``.strip``
+        (a traceback, not a refusal) while ``pj`` coerced -- so the two
+        surfaces disagreed about the same config value.
+        """
+        with pytest.raises(ValueError, match="must be a string"):
+            validate_app_version(not_a_string)
+
 
 # ============================================================================
 # The config file declares it once, for both halves
@@ -657,6 +717,36 @@ class TestConfigDeclaration:
         instead of refusing to boot over a blank template variable."""
         assert resolve_app_version(empty, None) is None
         assert resolve_app_version(None, empty) is None
+
+    @pytest.mark.parametrize(
+        "unusable",
+        ["v" * (MAX_APP_VERSION_LENGTH + 1), 20260728, 1.5],
+        ids=["too-long", "unquoted-int", "float"],
+    )
+    async def test_a_version_no_enqueue_could_write_advertises_none(self, unusable):
+        """The launcher side refuses EXACTLY what the enqueue side refuses, and
+        it advertises nothing rather than advertising it anyway.
+
+        The enqueue side is the definition of what a pin may be, so a fleet
+        advertising a version outside it is advertising something no job can
+        ever carry: every worker comes up healthy, matches nothing, and claims
+        only unpinned work -- silently, forever. The over-long case and the
+        unquoted-integer case both reached that state, one by escaping the
+        bound and one by being coerced with ``str()`` into a version the client
+        would have refused. A flag has no caller to raise at and refusing to
+        boot would take a whole fleet down over a bad template variable, so it
+        warns and runs unpinned -- which is the state an operator can see.
+        """
+        assert resolve_app_version(unusable, None) is None
+        assert resolve_app_version(None, unusable) is None
+
+    async def test_a_usable_version_is_still_advertised_verbatim(self):
+        """The positive control: the refusals above must not have turned into
+        a launcher that advertises nothing at all."""
+        assert resolve_app_version("2026.07.29+a1b2c3d", None) == "2026.07.29+a1b2c3d"
+        assert resolve_app_version(None, "v" * MAX_APP_VERSION_LENGTH) == (
+            "v" * MAX_APP_VERSION_LENGTH
+        )
 
     async def test_app_version_is_a_known_config_key(self):
         """A key outside KNOWN_TOP_LEVEL_KEYS is refused rather than skipped,

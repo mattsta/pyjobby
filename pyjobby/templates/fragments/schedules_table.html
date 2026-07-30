@@ -1,4 +1,14 @@
-{# htmx target #schedules-table: the recurring schedule registry. #}
+{#
+  htmx target #schedules-table: the recurring schedule registry.
+
+  BACKFILL IS A COLUMN, not a detail behind a click: it is the setting that
+  decides what a schedule does after the scheduler was down, and the two
+  answers ("nothing came back" and "N ticks came back at once") look like
+  bugs to whoever did not know which one was configured. Worded rather than
+  printed as a bare integer, for the reason `pj-admin schedule show` words it
+  (cli.py): 0 is the default and reads as "off", and the number alone does
+  not say whether it counts ticks that WILL be fired or ticks dropped.
+#}
 <table>
     <thead>
         <tr>
@@ -7,6 +17,7 @@
             <th>Cron</th>
             <th>Queue</th>
             <th>Next Run</th>
+            <th>Backfill</th>
             <th>Stats</th>
             <th>Actions</th>
         </tr>
@@ -26,6 +37,14 @@
             <td><code>{{ s["cron_expr"] }}</code></td>
             <td>{{ s["queue"] }}</td>
             <td>{{ s["next_run"].strftime("%Y-%m-%d %H:%M") if s.get("next_run") else "-" }}</td>
+{% set backfill = s.get("backfill_limit") | default(0, true) | int %}
+            <td title="what this schedule does with ticks missed while the scheduler was down">
+{% if backfill > 0 %}
+                {{ backfill }} missed tick(s)
+{% else %}
+                skipped
+{% endif %}
+            </td>
             <td>
                 {{ s["run_count"] | int }} runs<br>
 {% if attempts > 0 %}

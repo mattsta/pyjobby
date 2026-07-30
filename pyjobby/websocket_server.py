@@ -1544,8 +1544,13 @@ def main() -> None:
         "-c",
         default="./pyjobby.toml",
         show_default=True,
+        # Spelled out rather than "the same as every other daemon": pj-monitor
+        # is not, it takes --config with no -c and no default, so the sentence
+        # that claimed uniformity sent operators to write `pj-monitor -c ...`
+        # and get "no such option".
         help="Config file path (must define db_params; may define "
-        "prio_ceiling) — the same -c/--config every other pyjobby daemon takes",
+        "prio_ceiling) — the same -c/--config pj, pj-admin, pj-scheduler, "
+        "pj-web and pj-bench take (pj-monitor takes --config only)",
     )
     @click.option(
         "--host",

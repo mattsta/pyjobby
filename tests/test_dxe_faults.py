@@ -695,6 +695,23 @@ async def test_every_state_changing_statement_carries_the_fence():
     # live attempt's in a stream whose reader cannot tell the two apart.
     assert "run_epoch = $5" in STMTS["stream-append"]
 
+    # ...and each of those fences LOCKS the job row rather than reading it.
+    # A snapshot EXISTS is passed by a zombie whose statement began before the
+    # requeue committed, so the write lands after the supersession -- see
+    # section 13, which drives that interleave for real. The lock is what makes
+    # "the fence matched nothing" a fact about commit time.
+    for name in ("record-step", "set-event", "send", "recv", "compact-steps"):
+        assert "FOR SHARE" in STMTS[name] or "FOR UPDATE" in STMTS[name], (
+            f"STMTS[{name!r}] fences on run_epoch without locking the job row: "
+            f"a write already in flight when the requeue commits passes the "
+            f"snapshot test and commits anyway"
+        )
+    assert "FOR SHARE" in STMTS["stream-append"]
+    # compact-steps takes the EXCLUSIVE lock, deliberately: it also UPDATEs
+    # the row (the `awaited` latch), and a share lock upgraded mid-statement
+    # is how two concurrent compactions would deadlock each other.
+    assert "FOR UPDATE" in STMTS["compact-steps"]
+
 
 @pytest.mark.parametrize("statement", STALE_WRITE_CASES)
 async def test_stale_epoch_write_is_a_noop(db_pool, unique_queue, statement):
@@ -1198,31 +1215,92 @@ async def test_dead_lettering_fences_the_execution_it_abandons(db_pool, unique_q
 
 
 # ============================================================================
-# 13. the append fence is a LOCK, not a snapshot read
+# 13. every durable write's fence is a LOCK, not a snapshot read
 # ============================================================================
+#
+# An unlocked `EXISTS (SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $n)` is
+# evaluated against the writing statement's OWN snapshot, so a requeue already
+# in flight but not yet committed is invisible to it: the zombie reads the old
+# epoch, passes the test, and commits its write AFTER the supersession. It was
+# reproduced for the stream append, for the step checkpoint and for the event.
+#
+# `FOR SHARE` closes it because the epoch bump is an UPDATE and holds the row's
+# exclusive lock: the write BLOCKS, and when the requeue commits, READ COMMITTED
+# re-evaluates the clause against the new row version (EvalPlanQual) and finds
+# the bumped epoch. Each case below drives that as TWO REAL TRANSACTIONS, made
+# deterministic by waiting until the writer is provably stuck on the holder's
+# lock -- so the test pins the ordering it means rather than whichever one the
+# box happened to produce.
 
 
-async def test_a_zombies_append_cannot_commit_after_the_requeue_that_fenced_it(
-    db_pool, db_params, unique_queue
+def _fires_record_step(conn, job_id: int, epoch: int):
+    return conn.fetch(
+        dxe.RECORD_STEP_SQL,
+        job_id,
+        1,
+        "zombie-step",
+        {"i": 0},
+        None,
+        epoch,
+        db.utcnow(),
+    )
+
+
+def _fires_set_event(conn, job_id: int, epoch: int):
+    return conn.fetch(dxe.SET_EVENT_SQL, job_id, "zombie-key", {"i": 0}, epoch)
+
+
+def _fires_stream_append(conn, job_id: int, epoch: int):
+    return conn.fetch(dxe.STREAM_APPEND_SQL, job_id, "rows", {"i": 0}, False, epoch)
+
+
+#: (statement fired at the stale epoch, the rows it would have left behind,
+#: the caller-level primitive that must report the refusal as
+#: StaleExecutionError). The stream case's statement always returns one row
+#: -- it has to say "superseded" and "already closed" separately -- so its
+#: refusal is read off the `fenced` column instead of the row count, which is
+#: why `wrote` is a callable rather than ``len``.
+LOCKED_FENCE_CASES = {
+    "record-step": (
+        _fires_record_step,
+        lambda rows: len(rows),
+        "SELECT count(*) FROM jorb_step WHERE job_id = $1",
+        lambda job: job.step("zombie-step", _returns_a_value),
+    ),
+    "set-event": (
+        _fires_set_event,
+        lambda rows: len(rows),
+        "SELECT count(*) FROM jorb_event WHERE job_id = $1",
+        lambda job: job.set_event("zombie-key", {"i": 0}),
+    ),
+    "stream-append": (
+        _fires_stream_append,
+        lambda rows: int(rows[0]["fenced"]),
+        "SELECT count(*) FROM jorb_stream WHERE job_id = $1",
+        lambda job: job.stream_write("rows", {"i": 0}),
+    ),
+}
+
+
+async def _returns_a_value() -> dict[str, int]:
+    return {"i": 0}
+
+
+@pytest.mark.parametrize("statement", sorted(LOCKED_FENCE_CASES))
+async def test_a_zombies_write_cannot_commit_after_the_requeue_that_fenced_it(
+    db_pool, db_params, unique_queue, statement
 ):
     """The window an unlocked epoch test leaves open, driven as two real
-    transactions.
+    transactions, for every durable write that has one.
 
-    ``STREAM_APPEND_SQL`` used to fence with a bare
-    ``EXISTS (SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $5)``. That is
-    evaluated against the appending statement's OWN snapshot, so a requeue
-    already in flight but not yet committed is invisible to it: the zombie
-    read the old epoch, passed the test, and appended. The row then sat in the
-    stream forever, and a reader has no way to tell it from the live attempt's
-    output -- which is the entire reason the fence exists.
-
-    ``FOR SHARE`` closes it because the epoch bump is an UPDATE and holds the
-    row's exclusive lock: the append BLOCKS, and when the requeue commits,
-    READ COMMITTED re-evaluates the clause against the new row version and
-    finds the bumped epoch. The interleave is made deterministic by waiting
-    until the appender is provably stuck on the holder's lock, so this pins
-    the ordering rather than observing whichever one the box produced.
+    The blast radius differs per statement and none of it stays inside the
+    zombie: a stream row a reader cannot tell from the live attempt's output;
+    a step checkpoint that makes the live attempt fast-forward over work it
+    never did (or clobbers the checkpoint it did write); an event that other
+    jobs and every client read.
     """
+    fire, wrote, survivors, primitive = LOCKED_FENCE_CASES[statement]
+
     job_id = await enqueue(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {"x": 1})
     claimed = await claim_once(db_pool, unique_queue)
     epoch = claimed["run_epoch"]
@@ -1246,36 +1324,28 @@ async def test_a_zombies_append_cannot_commit_after_the_requeue_that_fenced_it(
             == job_id
         )
 
-        # ...and the abandoned execution tries to append at its old epoch
-        appending = asyncio.create_task(
-            zombie.fetchrow(
-                dxe.STREAM_APPEND_SQL, job_id, "rows", {"i": 0}, False, epoch
-            )
-        )
+        # ...and the abandoned execution tries to write at its old epoch
+        writing = asyncio.create_task(fire(zombie, job_id, epoch))
         await wait_until_blocked_on_a_transaction(db_pool)
-        assert not appending.done(), "the append must WAIT for the requeue, not race it"
+        assert not writing.done(), "the write must WAIT for the requeue, not race it"
 
         await requeue.commit()
-        appended = await asyncio.wait_for(appending, timeout=20)
+        rows = await asyncio.wait_for(writing, timeout=20)
     finally:
         await zombie.close()
         await holder.close()
 
-    assert appended["fenced"] == 0, "the zombie must observe the BUMPED epoch"
-    assert appended["seq"] is None
-    assert (
-        await db_pool.fetchval(
-            "SELECT count(*) FROM jorb_stream WHERE job_id = $1", job_id
-        )
-        == 0
-    ), "a superseded execution left a row in a stream readers cannot filter"
+    assert wrote(rows) == 0, "the zombie must observe the BUMPED epoch"
+    assert await db_pool.fetchval(survivors, job_id) == 0, (
+        "a superseded execution's write reached a table a live attempt owns"
+    )
 
     # and the caller sees the refusal as StaleExecutionError, not as silence.
-    # On a real CONNECTION, not the pool: stream_write runs through
+    # On a real CONNECTION, not the pool: these primitives run through
     # transaction(), whose scope is the worker's own connection -- handed a
-    # pool it would raise AttributeError, and transaction()'s error path would
-    # convert that into a StaleExecutionError this assertion could not tell
-    # from the real one.
+    # pool they would raise AttributeError, and transaction()'s error path
+    # would convert that into a StaleExecutionError this assertion could not
+    # tell from the real one.
     live = await db_pool.fetchval("SELECT run_epoch FROM jorb WHERE id = $1", job_id)
     assert live > epoch
     caller = await db.connect(**db_params)
@@ -1284,6 +1354,102 @@ async def test_a_zombies_append_cannot_commit_after_the_requeue_that_fenced_it(
             caller, {"id": job_id, "run_epoch": epoch}, epoch
         )
         with pytest.raises(dxe.StaleExecutionError):
-            await job.stream_write("rows", {"i": 0})
+            await primitive(job)
     finally:
         await caller.close()
+
+
+# ============================================================================
+# 14. the "fresh" wipe cannot miss a writer it waited for
+# ============================================================================
+
+
+async def test_a_fresh_requeue_wipes_the_rows_committed_while_it_waited(
+    db_pool, db_params, unique_queue
+):
+    """The other side of the lock the fences above take.
+
+    A ``fresh`` requeue used to be ONE statement: the ``UPDATE`` in a CTE, the
+    two ``DELETE``s hanging off its ``RETURNING``. One statement reads ONE
+    snapshot, taken when the statement begins -- and this statement can WAIT
+    for a long time before it does anything, because a durable write in flight
+    holds the job row ``FOR SHARE`` and the requeue needs it exclusively. Rows
+    that writer committed during the wait were therefore invisible to the
+    DELETEs and SURVIVED the wipe. The fresh run then appended after them, so
+    every reader was handed the two runs concatenated as one stream -- the
+    exact failure the wipe exists to prevent, reintroduced by the wipe's own
+    race. Reproduced.
+
+    Two statements in one transaction fixes it. Statement 1 holds the row lock
+    until COMMIT, so "no re-claim can land between them" survives intact -- it
+    was always the lock's guarantee, never the statement count's. Statement 2
+    takes a FRESH READ COMMITTED snapshot and therefore sees exactly the writes
+    statement 1 waited out.
+
+    Driven through ``requeue_job`` with in-flight ``allowed_states`` because
+    that is the reachable shape: with the fences locking the job row, a
+    TERMINAL job can have no same-epoch writer still open (the terminal write
+    would have had to wait for it), so ``rerun_job``'s own guard cannot reach
+    this window. ``requeue_job``'s can, which is why its docstring calls
+    ``allowed_states`` a boundary.
+    """
+    job_id = await enqueue(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {"x": 1})
+    claimed = await claim_once(db_pool, unique_queue)
+    epoch = claimed["run_epoch"]
+    assert [
+        r["id"] for r in await db_pool.fetch(STMTS["run"], job_id, epoch, None)
+    ] == [job_id]
+
+    writer = await db.connect(**db_params)
+    rerunner = await db.connect(**db_params)
+    try:
+        # a legitimate durable write is in flight: it holds the job row FOR
+        # SHARE, and its rows are not committed yet
+        inflight = writer.transaction()
+        await inflight.start()
+        appended = await writer.fetchrow(
+            dxe.STREAM_APPEND_SQL, job_id, "rows", {"i": 0}, False, epoch
+        )
+        assert (appended["fenced"], appended["seq"]) == (1, 0)
+        assert await writer.fetch(
+            dxe.RECORD_STEP_SQL,
+            job_id,
+            1,
+            "mid-flight",
+            {"i": 0},
+            None,
+            epoch,
+            db.utcnow(),
+        )
+
+        # ...and the requeue-with-wipe arrives while it is still open
+        wiping = asyncio.create_task(
+            db.requeue_job(
+                rerunner,
+                job_id,
+                allowed_states=("claimed", "running"),
+                wipe_checkpoints=True,
+            )
+        )
+        await wait_until_blocked_on_a_transaction(db_pool)
+        assert not wiping.done(), "the requeue must WAIT for the writer's row lock"
+
+        await inflight.commit()
+        requeued = await asyncio.wait_for(wiping, timeout=20)
+    finally:
+        await rerunner.close()
+        await writer.close()
+
+    assert requeued == job_id
+    assert (
+        await db_pool.fetchval(
+            "SELECT count(*) FROM jorb_stream WHERE job_id = $1", job_id
+        )
+        == 0
+    ), "a stream row survived the wipe; the fresh run would append after it"
+    assert (
+        await db_pool.fetchval(
+            "SELECT count(*) FROM jorb_step WHERE job_id = $1", job_id
+        )
+        == 0
+    ), "a checkpoint survived the wipe; the fresh run would fast-forward over it"

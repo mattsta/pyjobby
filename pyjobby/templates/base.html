@@ -108,6 +108,9 @@
         th, td { padding: 0.75rem; border-bottom: 1px solid #eee; text-align: left; }
         th { font-weight: 600; }
 
+        {# the "/lane" scope marker on a partitioned queue's limits #}
+        .scope { color: #78909c; font-weight: 600; cursor: help; }
+
         .badge {
             display: inline-block;
             padding: 0.25rem 0.75rem;
@@ -117,6 +120,10 @@
         }
 
         .badge.queued { background: #e3f2fd; color: #1976d2; }
+        {# 'scheduled' is queued-with-a-future-run_after, and it is coloured
+           APART from queued on purpose: it is not backlog, and a page of
+           deferred retries wearing the backlog colour is read as one. #}
+        .badge.scheduled { background: #e0f2f1; color: #00796b; }
         .badge.running { background: #fff3e0; color: #f57c00; }
         .badge.finished { background: #e8f5e9; color: #388e3c; }
         .badge.crashed { background: #ffebee; color: #d32f2f; }

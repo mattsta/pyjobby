@@ -1,4 +1,11 @@
-{# htmx target: the jobs listing on / and /jobs. #}
+{#
+  htmx target: the jobs listing on / and /jobs.
+
+  The State column shows `display_state`, not `job["state"]`: the enum has no
+  'scheduled' value, so a job parked in the future is stored as queued and
+  badging it that way made deferred retries read as backlog. The handler
+  derives it against the database's clock (WebAdminServer._with_display_state).
+#}
 {% if not jobs %}
 <p class="empty">No jobs found</p>
 {% else %}
@@ -17,7 +24,7 @@
 {% for job in jobs %}
         <tr>
             <td>{{ job["id"] | int }}</td>
-            <td><span class="badge {{ job["state"] }}">{{ job["state"] }}</span></td>
+            <td><span class="badge {{ job["display_state"] }}">{{ job["display_state"] }}</span></td>
             <td>{{ job["queue"] }}</td>
             <td>{{ job["job_class"] }}</td>
             <td>{{ (job["created"] or "")[:19] }}</td>

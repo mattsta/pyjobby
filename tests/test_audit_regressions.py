@@ -42,7 +42,7 @@ import asyncpg
 import pytest
 
 from pyjobby import db
-from pyjobby.client import JobClient
+from pyjobby.client import MAX_KEY_LENGTH, JobClient
 from pyjobby.dag import DAGBuilder
 from pyjobby.monitor import (
     RETRY_TIMED_OUT_SQL,
@@ -195,6 +195,44 @@ class TestRequeueReleasesTheDedupeKeys:
         assert after["deadline_key"] is None
         assert (await row(db_pool, duplicate))["deadline_key"] == key
 
+    async def test_a_durable_sleep_survives_a_re_armed_deadline_key(
+        self, db_pool, unique_queue
+    ):
+        """``STMTS['reschedule']`` -- the statement behind ``Job.reschedule()``
+        and durable ``sleep()``.
+
+        It parks the row back in 'queued' for the duration of the nap, so it is
+        subject to the same rule as retry and was the one requeue statement that
+        did not carry it. The failure is worse than retry's: a job that sleeps
+        raises the unique violation from inside ``sleep()`` -- ordinary
+        control flow in the middle of a durable workflow, with no failure
+        handler anywhere near it.
+        """
+        client = JobClient(pool=db_pool)
+        key = f"{unique_queue}:sleep"
+
+        job_id = await client.enqueue(OK, queue=unique_queue, deadline_key=key)
+        claimed = await claim_once(db_pool, unique_queue)
+        assert claimed["id"] == job_id
+
+        # legal: the key re-armed at the claim above
+        duplicate = await client.enqueue(OK, queue=unique_queue, deadline_key=key)
+
+        slept = await db_pool.fetchval(
+            STMTS["reschedule"],
+            job_id,
+            datetime.timedelta(seconds=60),
+            claimed["run_epoch"],
+        )
+
+        assert slept == job_id
+        after = await row(db_pool, job_id)
+        assert after["state"] == "queued"
+        assert after["deadline_key"] is None
+        assert after["debounce_key"] is None
+        assert after["debounce_deadline"] is None
+        assert (await row(db_pool, duplicate))["deadline_key"] == key
+
     @pytest.mark.parametrize(
         "sweep",
         [SWEEP_DEAD_WORKER_JOBS_SQL, SWEEP_STUCK_CLAIMS_SQL],
@@ -263,20 +301,36 @@ class TestRequeueReleasesTheDedupeKeys:
 
 class TestWakingWaitersReleasesTheDeadlineKey:
     """'waiting' is outside jorb_deadline_idx, so two waiters may legally hold
-    the same key -- and both wake paths wake a whole BATCH in one UPDATE."""
+    the same key -- and both wake paths wake a whole BATCH in one UPDATE.
+
+    The rows are INSERTed directly, and that is now the only way to make them:
+    ``build_enqueue_row`` refuses ``deadline_key`` together with a dependency
+    edge (``_NO_DEADLINE_WAITFOR``), because the key such a row carries never
+    collapses anything -- the wake below is what drops it. The statement-level
+    release therefore stays as defence for rows the client did not write: a
+    direct INSERT like this one, a row from before the refusal existed, an
+    operator's UPDATE. Removing it because the door is now shut would make the
+    day somebody opens a second door a batch-poisoning outage.
+    """
 
     async def _two_waiters(self, pool, queue: str) -> tuple[int, int, int]:
         client = JobClient(pool=pool)
         upstream = await client.enqueue(OK, queue=queue)
         key = f"{queue}:waiters"
-        # legal: a waiting row is not in the index, so both may hold the key
-        waiters = []
-        for _ in range(2):
-            waiter = await client.enqueue(
-                OK, queue=queue, waitfor_job=upstream, deadline_key=key
+        # legal at the schema level: a waiting row is not in the index, so
+        # both may hold the key
+        waiters = [
+            await pool.fetchval(
+                """INSERT INTO jorb (job_class, kwargs, queue, state,
+                                     waitfor_job, deadline_key)
+                   VALUES ($1, '{}', $2, 'waiting', $3, $4) RETURNING id""",
+                OK,
+                queue,
+                upstream,
+                key,
             )
-            assert (await row(pool, waiter))["state"] == "waiting"
-            waiters.append(waiter)
+            for _ in range(2)
+        ]
         return upstream, waiters[0], waiters[1]
 
     async def test_the_workers_wake_queues_both(self, db_pool, unique_queue):
@@ -317,6 +371,32 @@ class TestWakingWaitersReleasesTheDeadlineKey:
             assert after["state"] == "queued"
             assert after["deadline_key"] is None
 
+    @pytest.mark.parametrize("edge", ["waitfor_job", "waitfor_group"])
+    async def test_the_client_refuses_to_write_one_in_the_first_place(
+        self, db_pool, unique_queue, edge
+    ):
+        """The silence the wake above exposes, closed at the door.
+
+        A ``deadline_key`` on a dependent job was accepted and did nothing at
+        any point in the row's life: 'waiting' is outside jorb_deadline_idx, so
+        it refuses no duplicate there, and the wake NULLs the column on the way
+        into 'queued', so it refuses none afterwards either. The caller asked
+        for at-most-one-pending and got every duplicate, with no error --
+        exactly the shape ``_NO_DEBOUNCE_WAITFOR`` was already refusing beside
+        it.
+        """
+        client = JobClient(pool=db_pool)
+        with pytest.raises(ValueError, match="waitfor_job/waitfor_group"):
+            await client.enqueue(
+                OK, queue=unique_queue, deadline_key="d", **{edge: "x"}
+            )
+        assert (
+            await db_pool.fetchval(
+                "SELECT count(*) FROM jorb WHERE queue = $1", unique_queue
+            )
+            == 0
+        )
+
     async def test_the_wake_statement_leaves_the_debounce_columns_alone(self):
         """A waiting row can never hold a debounce_key (a debounced enqueue
         with waitfor_* is refused at the door), so the wake clears the ONE
@@ -331,14 +411,11 @@ class TestWakingWaitersReleasesTheDeadlineKey:
 
 
 class TestIdentityRefusesWhatItCannotHonour:
-    async def test_identity_and_deadline_together_are_refused(
-        self, db_pool, unique_queue
-    ):
-        client = JobClient(pool=db_pool)
-        with pytest.raises(ValueError, match="cannot be combined with deadline_key"):
-            await client.enqueue(
-                OK, queue=unique_queue, identity_key="i", deadline_key="d"
-            )
+    # "identity_key + deadline_key is refused" is asserted in
+    # test_job_identity.py, which also proves NOTHING WAS WRITTEN and states
+    # the contrast between the two promises -- a strict superset of what the
+    # test that used to sit here checked. Two tests of one refusal is two
+    # places to update and one of them will be missed.
 
     @pytest.mark.parametrize("edge", ["waitfor_job", "waitfor_group"])
     async def test_identity_with_a_dependency_edge_is_refused(
@@ -442,15 +519,19 @@ class TestKeyValidation:
 
     @pytest.mark.parametrize("option", KEY_OPTIONS)
     async def test_an_oversized_key_is_refused(self, unique_queue, option):
-        with pytest.raises(ValueError, match=f"{option} is 257 characters"):
-            JobClient.build_enqueue_row(OK, queue=unique_queue, **{option: "k" * 257})
+        # derived from the constant, never a literal 257: a bound written twice
+        # is a test that keeps passing against the number it was written for
+        # while the platform accepts a different one
+        over = MAX_KEY_LENGTH + 1
+        with pytest.raises(ValueError, match=f"{option} is {over} characters"):
+            JobClient.build_enqueue_row(OK, queue=unique_queue, **{option: "k" * over})
 
     @pytest.mark.parametrize("option", KEY_OPTIONS)
     async def test_the_bound_itself_is_accepted(self, unique_queue, option):
-        """256 is the limit, not the first refusal: an off-by-one here would
-        reject a key the documentation promises."""
+        """The bound is the limit, not the first refusal: an off-by-one here
+        would reject a key the documentation promises."""
         assert JobClient.build_enqueue_row(
-            OK, queue=unique_queue, **{option: "k" * 256}
+            OK, queue=unique_queue, **{option: "k" * MAX_KEY_LENGTH}
         )
 
     async def test_the_enqueue_verb_refuses_before_writing(self, db_pool, unique_queue):
@@ -509,38 +590,12 @@ async def test_update_job_app_version_writes_the_validated_value(
 # ===========================================================================
 # structural: the rule is one rule, spelled once
 # ===========================================================================
-
-
-async def test_every_requeue_statement_carries_the_key_release():
-    """A new statement that puts a job back into 'queued' must clear the keys.
-
-    Reflective rather than a hand-kept list, for the reason
-    test_dxe_faults.py's fence sweep is: the next statement to be written is
-    the one that will forget, and it should fail here rather than as an
-    aborted sweep in production.
-    """
-    requeues = {
-        "db.build_requeue_sql": db.build_requeue_sql(("crashed",)),
-        "db.build_requeue_sql/bulk": db.build_requeue_sql(("crashed",), many=True),
-        "db.build_requeue_sql/fresh": db.build_requeue_sql(
-            ("crashed",), wipe_checkpoints=True
-        ),
-        "pj.STMTS[retry]": STMTS["retry"],
-        "monitor.RETRY_TIMED_OUT_SQL": RETRY_TIMED_OUT_SQL,
-        "monitor.SWEEP_DEAD_WORKER_JOBS_SQL": SWEEP_DEAD_WORKER_JOBS_SQL,
-        "monitor.SWEEP_STUCK_CLAIMS_SQL": SWEEP_STUCK_CLAIMS_SQL,
-    }
-    for name, sql in requeues.items():
-        for column in ("deadline_key", "debounce_key", "debounce_deadline"):
-            assert f"{column} = NULL" in sql, (
-                f"{name} returns a job to 'queued' without releasing {column}: "
-                f"it would re-enter a partial unique index it was already "
-                f"released from, and raise when a later burst holds the key"
-            )
-        assert "identity_key" not in sql, (
-            f"{name} must NOT clear identity_key: jorb_identity_idx has no "
-            f"state predicate and the row holds that key for life"
-        )
+#
+# "every statement that returns a job to 'queued' carries the release" is
+# asserted in test_lifecycle.py, which already PARSES ``STMTS`` for the
+# transitions it declares and can therefore derive the set instead of listing
+# it. The negative control for the whole family stays here, beside the
+# failures it controls for.
 
 
 async def test_asyncpg_still_reports_the_violation_this_batch_removed(

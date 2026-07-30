@@ -211,16 +211,25 @@ Enqueue a single job.
   of work that has **not started** — one _queued_ row per
   `(deadline_key, queue)`, so a second enqueue while the first is still
   queued raises `asyncpg.UniqueViolationError`, and the key re-arms once a
-  worker claims the job (default: None). See
+  worker claims the job (default: None). Refused in combination with
+  `identity_key` and with `waitfor_job`/`waitfor_group` (`ValueError`): a
+  dependent job is inserted `waiting`, which is outside the unique index, and
+  the wake clears `deadline_key` on the way into `queued` — so the key would
+  never collapse anything at any point in the row's life. Put it on the job
+  that does the work and let an unidentified waiter depend on that job. See
   [Idempotent jobs](#4-idempotent-jobs-deadline-keys).
 - `identity_key` (str): This exact work happens **at most once**. Unique
   across _every_ state, so if a job with this key already exists — queued,
   running, finished, crashed — the enqueue returns **that job's id** instead
   of writing a second row (default: None). It does not raise on the DUPLICATE,
   which is the point; it does raise `ValueError` when the existing job is a
-  different `job_class` than the one you asked for, and `RuntimeError` in the
-  pathological case where a stream of other writers claims the key past the
-  speculative retry budget. Refused in combination with `deadline_key`,
+  different `job_class` than the one you asked for, and
+  `SpeculativeEnqueueExhausted` (a `RuntimeError`, exported from `pyjobby`,
+  carrying `.kind` and `.key`) in the pathological case where a stream of
+  other writers claims the key past the speculative retry budget — the other
+  cause of which is calling from a REPEATABLE READ transaction, where a retry
+  reuses the snapshot and can never see the row. `debounce()` raises the same
+  type for the same reason. Refused in combination with `deadline_key`,
   `debounce_key`, `waitfor_job`/`waitfor_group` and DAG nodes — see
   [At-most-once work](#4b-at-most-once-work-identity-keys) for why each.
   Bounded by retention.
@@ -865,6 +874,16 @@ covers only `queued` rows, so the key is released the moment a worker claims
 the job and the next enqueue is a legitimately new one. That is what you
 want for "one pending digest at a time"; it is not what you want for "this
 shipment happens once".
+
+That predicate is also why a `deadline_key` may not be combined with
+`waitfor_job` / `waitfor_group`, and it is refused with `ValueError` at the
+door. A dependent job is inserted `waiting` — outside the index, so it
+refuses no duplicate there — and the wake **clears** `deadline_key` on the way
+into `queued`, because several waiters of one upstream may legally hold the
+same key and the wake is one statement over all of them. The window would
+therefore never open at any point in the row's life: the caller asks for
+at-most-one-pending and silently gets every duplicate. `debounce_key` is
+refused with the dependency edge for the same reason one index over.
 
 ### 4b. At-most-once work (Identity Keys)
 

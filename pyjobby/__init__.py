@@ -45,11 +45,14 @@ from .dag import DAGBuilder
 from .db import ForkRefused, JobState
 from .dxe import (
     DXEError,
+    JobTimeout,
     NondeterminismError,
     StaleExecutionError,
+    StepFailure,
     StepTimeoutError,
     StreamClosedError,
 )
+from .enqueue_rules import SpeculativeEnqueueExhausted
 
 # MachineDefinitionError comes from .fsm, not .statemachine: the declaration
 # format has no imports of its own, so exporting the error a bad machine
@@ -96,12 +99,15 @@ __all__ = [
     "JobRegistry",
     "JobState",
     "JobSystem",
+    "JobTimeout",
     "MachineDefinitionError",
     "MachineHandle",
     "NondeterminismError",
     "RetryStrategy",
+    "SpeculativeEnqueueExhausted",
     "StaleExecutionError",
     "StateMachineJob",
+    "StepFailure",
     "StepTimeoutError",
     "StreamClosedError",
     "SyncJobClient",

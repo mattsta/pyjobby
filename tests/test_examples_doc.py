@@ -19,6 +19,7 @@ to the schema, and are created on demand.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from typing import Any
 
@@ -786,7 +787,25 @@ async def test_a_schedule_creates_and_runs_its_job(
 
         worker = SchedulerWorker(conn, poll_interval=0.05)
         task = asyncio.create_task(worker.run())
-        await asyncio.sleep(0.5)
+        # Polled to the OUTCOME, not slept for a duration. Half a second is
+        # ten poll intervals on an idle box and can be zero on a loaded CI
+        # runner, so the sleep was a flake that would present as "the
+        # scheduler did not fire" -- the one failure this test is supposed to
+        # be able to report honestly. The deadline is generous because it is
+        # never reached when the code works.
+        #
+        # On a SECOND connection from the pool: `conn` belongs to the running
+        # scheduler, and asyncpg refuses a second concurrent operation on one
+        # connection ("another operation is in progress"), which is the
+        # scheduler's own loop, not a test bug.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if await client.pool.fetchval(
+                "SELECT success_count FROM jorb_schedule WHERE id = $1",
+                schedule["id"],
+            ):
+                break
+            await asyncio.sleep(0.02)
         worker.stop()
         await asyncio.wait_for(task, timeout=5)
 

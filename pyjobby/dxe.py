@@ -55,13 +55,34 @@ class StaleExecutionError(DXEError):
     attempt owns the row now."""
 
 
-class StreamClosedError(Exception):
+class StepFailure(Exception):  # noqa: N818 - a family, not one fault
+    """Base class for the durable failures that are RECORDED, not signalled.
+
+    Deliberately **not** a ``DXEError``. That hierarchy is the platform's
+    control-flow signals -- a superseded epoch, a nondeterministic replay --
+    and they bypass checkpoint recording because there is nothing about them
+    worth recording against the step. Everything under THIS class is the
+    opposite: an ordinary step FAILURE, written to the step's ``error``
+    column, named in ``pj-admin jobs steps``, and subject to the job's retry
+    budget exactly like a step that raised on its own account. Naming which
+    step failed and why is half the point of having per-step budgets and
+    per-key streams at all.
+
+    The class exists so that a caller can say "this is a durable failure the
+    platform diagnosed" in one ``except``, instead of enumerating three
+    unrelated-looking types and being wrong the day a fourth is added. The
+    three are unrelated-looking on purpose -- a blown step budget, a write
+    past a closed stream and an expired job deadline are different mistakes --
+    and identical in the only respect a handler cares about.
+    """
+
+
+class StreamClosedError(StepFailure):
     """A job appended to a stream it had already closed.
 
-    Deliberately **not** a ``DXEError``: those are control-flow signals that
-    bypass checkpoint recording, and this is an ordinary step FAILURE that must
-    be recorded like any other -- naming the key and the job is the whole point,
-    and the job's retry budget applies to it exactly as to a step that raised.
+    Recorded as a step failure (see ``StepFailure``): naming the key and the
+    job is the whole point, and the job's retry budget applies to it exactly
+    as to a step that raised.
 
     Raised by BOTH ``stream_write`` after ``stream_close`` and a second
     ``stream_close`` of the same key. A silently-idempotent close would be the
@@ -94,15 +115,13 @@ class StreamClosedError(Exception):
         self.closing = closing
 
 
-class StepTimeoutError(Exception):
+class StepTimeoutError(StepFailure):
     """A durable step ran longer than its per-step budget.
 
-    Deliberately **not** a ``DXEError``: those are control-flow signals that
-    bypass checkpoint recording, and a blown budget is a step *failure* that
-    must be recorded — naming the step that hung is half the point of having
-    per-step budgets at all.
+    Recorded as a step failure (see ``StepFailure``) rather than signalled:
+    naming the step that hung is half the point of having per-step budgets.
 
-    Deliberately **not** a ``TimeoutError`` either, and distinct from
+    Deliberately **not** a ``TimeoutError``, and distinct from
     ``JobTimeout``: a step that blew its own budget is an ordinary step
     failure taking the ordinary retry path, not the job running out of the
     time its operator configured.
@@ -114,7 +133,7 @@ class StepTimeoutError(Exception):
         self.timeout = timeout
 
 
-class JobTimeout(Exception):  # noqa: N818 - names the deadline, not a fault kind
+class JobTimeout(StepFailure):  # noqa: N818 - names the deadline, not a fault kind
     """The job's own in-process deadline expired.
 
     Raised only by the worker, from the single ``asyncio.timeout`` scope that
@@ -148,12 +167,55 @@ class DurableSleep(Exception):  # noqa: N818 - control-flow signal, not an error
 # SQL used by the primitives (executed through the worker's connection)
 # ---------------------------------------------------------------------------
 
+# THE EPOCH FENCE IS A LOCK, NOT A SNAPSHOT READ, in every fenced statement
+# below. Each one opens with a CTE that reads the job row `FOR SHARE` and
+# selects its write FROM that CTE, so "the fence matched nothing" and "this
+# execution is superseded" are the same fact at commit time rather than as of
+# the statement's snapshot. (The two unfenced statements here, LOAD_STEPS_SQL
+# and GET_EVENT_SQL, are pure reads and deliberately have no epoch filter at
+# all: a resume replays checkpoints written by every previous attempt, which is
+# what makes it a resume.)
+#
+# An unlocked `EXISTS (SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $n)` is
+# evaluated against the writing statement's OWN snapshot. A zombie whose
+# statement began before the requeue committed reads the OLD epoch, passes the
+# test, and commits AFTER the supersession -- a checkpoint, an event, a mailbox
+# delivery or a stream row that a live attempt cannot distinguish from its own.
+# The window is real: it was reproduced for the step checkpoint and for the
+# event before these fences were locks.
+#
+# `FOR SHARE` closes it because the epoch bump is an UPDATE and therefore takes
+# the row's exclusive lock. The zombie's write BLOCKS instead of proceeding, and
+# when the requeue commits, READ COMMITTED re-evaluates the locking clause
+# against the NEW row version (EvalPlanQual), finds the bumped epoch, matches
+# nothing and writes nothing. In the other order the requeue is the one that
+# waits -- for as long as one durable write takes -- and the write it waited for
+# was legitimate.
+#
+# SHARE and not UPDATE: concurrent durable writes by ONE live execution must not
+# serialize against each other, and they don't -- a share lock conflicts only
+# with the exclusive lock a requeue takes. `COMPACT_STEPS_SQL` is the exception
+# and says why on itself.
+#
+# LOCK ORDER IS PARENT ROW FIRST, everywhere: the jorb row, then the child table
+# (jorb_step / jorb_event / jorb_mailbox / jorb_stream). No statement here takes
+# them the other way round, so there is no cycle to deadlock on. A child insert
+# does take `FOR KEY SHARE` on its parent through the foreign key, which is
+# compatible with the `FOR SHARE` above it (and with another sender's), so two
+# jobs messaging each other cannot deadlock either.
+#
+# The lock cannot live in an EXISTS subquery -- a locking clause needs rows it
+# can identify with individual table rows -- so it is a CTE the write selects
+# FROM. MATERIALIZED so the lock is taken once, before the write, and not folded
+# into it.
+
 LOAD_STEPS_SQL = """SELECT step_seq, name, output, error
         FROM jorb_step WHERE job_id = $1 ORDER BY step_seq"""
 
 # Success and failure both record the attempt; only rows with error IS NULL
-# fast-forward on replay. Fenced: the insert-select no-ops unless our epoch
-# still owns the job.
+# fast-forward on replay. Fenced with the locked CTE above: the insert-select
+# no-ops unless our epoch still owns the job AT COMMIT TIME, not merely as of
+# this statement's snapshot.
 #
 # The fence is also what makes ``transaction()`` atomic: run inside the
 # caller's transaction, "wrote nothing" means "superseded", the raise rolls
@@ -177,10 +239,12 @@ LOAD_STEPS_SQL = """SELECT step_seq, name, output, error
 # error, every column keeps its existing value: the success stands and the
 # retry fast-forwards it. Every other case (error->error re-record,
 # error->success, first write) takes the incoming value.
-RECORD_STEP_SQL = """INSERT INTO jorb_step
+RECORD_STEP_SQL = """WITH locked AS MATERIALIZED (
+            SELECT id FROM jorb WHERE id = $1 AND run_epoch = $6 FOR SHARE
+        )
+        INSERT INTO jorb_step
             (job_id, step_seq, name, output, error, run_epoch, started, finished)
-        SELECT $1, $2, $3, $4, $5, $6, $7, now()
-        WHERE EXISTS (SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $6)
+        SELECT $1, $2, $3, $4, $5, $6, $7, now() FROM locked
         ON CONFLICT (job_id, step_seq) DO UPDATE
             SET name = CASE WHEN jorb_step.error IS NULL AND EXCLUDED.error IS NOT NULL
                             THEN jorb_step.name ELSE EXCLUDED.name END,
@@ -196,13 +260,16 @@ RECORD_STEP_SQL = """INSERT INTO jorb_step
                             THEN jorb_step.finished ELSE EXCLUDED.finished END
         RETURNING step_seq"""
 
-# Fenced like every other state-changing write. Without this a superseded
-# execution could overwrite the events a live attempt has published -- and an
-# event is read by other jobs and by clients, so the stale value does not stay
-# inside the zombie.
-SET_EVENT_SQL = """INSERT INTO jorb_event (job_id, key, value)
-        SELECT $1, $2, $3
-        WHERE EXISTS (SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $4)
+# Fenced like every other state-changing write, and with the same LOCK the
+# others take. Without it a superseded execution could overwrite the events a
+# live attempt has published -- and an event is read by other jobs and by
+# clients, so the stale value does not stay inside the zombie. The unlocked
+# version was reproduced committing exactly that.
+SET_EVENT_SQL = """WITH locked AS MATERIALIZED (
+            SELECT id FROM jorb WHERE id = $1 AND run_epoch = $4 FOR SHARE
+        )
+        INSERT INTO jorb_event (job_id, key, value)
+        SELECT $1, $2, $3 FROM locked
         ON CONFLICT (job_id, key) DO UPDATE
             SET value = EXCLUDED.value, updated = now()
         RETURNING key"""
@@ -226,22 +293,10 @@ GET_EVENT_SQL = """SELECT value FROM jorb_event WHERE job_id = $1 AND key = $2""
 # writing, because a reader cannot tell the two writers apart.
 #
 # THE FENCE TAKES THE JOB ROW'S LOCK, which is what makes it a fence rather
-# than a hint. An unlocked `EXISTS (SELECT ... run_epoch = $5)` is evaluated
-# against this statement's own snapshot, so a zombie whose statement started
-# before the requeue committed reads the OLD epoch, passes, and appends -- and
-# the row then sits in the stream forever, indistinguishable to a reader from
-# the live attempt's output. The window is real and was reproduced. `FOR SHARE`
-# closes it because the epoch bump is an UPDATE and therefore takes the row's
-# exclusive lock: the zombie's append blocks instead of proceeding, and when the
-# requeue commits, READ COMMITTED re-evaluates this clause against the NEW row
-# version (EvalPlanQual), finds the bumped epoch, matches nothing and appends
-# nothing. In the other order the requeue is the one that waits, for as long as
-# one append transaction takes, and the append it waited for was legitimate.
-#
-# The lock cannot live in an EXISTS subquery -- a locking clause needs rows it
-# can identify with individual table rows -- so the fence is a CTE the INSERT
-# selects FROM. MATERIALIZED so the lock is taken once, before the insert, and
-# not folded into it.
+# than a hint -- the shared argument is at the top of this section. A row a
+# zombie appended after its supersession sits in the stream forever,
+# indistinguishable to a reader from the live attempt's output, which is the
+# entire reason the fence exists.
 #
 # A CLOSED STREAM REFUSES FURTHER ROWS, loudly. The closing marker is where
 # every reader stops, so a row appended after it is a row nothing will ever
@@ -295,8 +350,17 @@ STREAM_APPEND_SQL = """WITH locked AS MATERIALIZED (
 # before its first check. (Deliberately no waiter-side re-arm: that would
 # be a write to the hottest row per fallback beat — the polling the
 # demand-gated design exists to avoid.)
-COMPACT_STEPS_SQL = """WITH fence AS (
-            SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $2
+#
+# THE ONE STATEMENT HERE THAT LOCKS `FOR UPDATE` rather than `FOR SHARE`, and
+# the reason is `unlatched`: this statement also UPDATEs the job row. Two
+# concurrent compactions holding a share lock each and then both reaching for
+# the exclusive one is a textbook lock upgrade deadlock, so the exclusive lock
+# is taken up front instead. It costs nothing a share lock was buying --
+# compaction happens at a turn boundary, not on the hot path, and it is
+# serializing against the only other writer that would take the row exclusively
+# anyway.
+COMPACT_STEPS_SQL = """WITH fence AS MATERIALIZED (
+            SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $2 FOR UPDATE
         ), gone AS (
             DELETE FROM jorb_step
             WHERE job_id = $1 AND EXISTS (SELECT 1 FROM fence)
@@ -313,10 +377,15 @@ COMPACT_STEPS_SQL = """WITH fence AS (
 # execution is still entitled to act. Unfenced, a zombie delivered the message
 # and only then raised on its own checkpoint -- the effect escaping while the
 # record of it was refused, which is the one ordering a durable mailbox must
-# not have.
-SEND_SQL = """INSERT INTO jorb_mailbox (dest_job_id, topic, message)
-        SELECT $1, $2, $3
-        WHERE EXISTS (SELECT 1 FROM jorb WHERE id = $4 AND run_epoch = $5)
+# not have. The lock is on the SENDER's row for the same reason, and the
+# destination row is only touched through the FK's FOR KEY SHARE, which is
+# compatible with it -- so two jobs sending to each other take two share-class
+# locks in each direction and cannot deadlock.
+SEND_SQL = """WITH locked AS MATERIALIZED (
+            SELECT id FROM jorb WHERE id = $4 AND run_epoch = $5 FOR SHARE
+        )
+        INSERT INTO jorb_mailbox (dest_job_id, topic, message)
+        SELECT $1, $2, $3 FROM locked
         RETURNING id"""
 
 # Consume one pending message (oldest first) AND checkpoint it, atomically.
@@ -327,9 +396,11 @@ SEND_SQL = """INSERT INTO jorb_mailbox (dest_job_id, topic, message)
 # statement has none.
 #
 # Fenced on the consumer's own epoch, exactly like SEND_SQL is fenced on the
-# sender's: a superseded execution must not eat a message the live attempt
-# is entitled to. `fenced` is returned separately so the caller can tell
-# "superseded" from "mailbox empty" — those need opposite responses.
+# sender's, and with the same lock: a superseded execution must not eat a
+# message the live attempt is entitled to -- and "eaten by a zombie" is
+# unrecoverable, because the consume stamps the only copy. `fenced` is returned
+# separately so the caller can tell "superseded" from "mailbox empty" — those
+# need opposite responses.
 #
 # The `prior` guard makes the statement idempotent: if this (job, seq)
 # already has a successful checkpoint — a replay after a commit raced a lost
@@ -342,8 +413,8 @@ SEND_SQL = """INSERT INTO jorb_mailbox (dest_job_id, topic, message)
 RECV_SQL = """WITH prior AS (
             SELECT output FROM jorb_step
             WHERE job_id = $1 AND step_seq = $2 AND error IS NULL
-        ), fence AS (
-            SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $5
+        ), fence AS MATERIALIZED (
+            SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $5 FOR SHARE
         ), msg AS (
             UPDATE jorb_mailbox
             SET consumed_at = now()

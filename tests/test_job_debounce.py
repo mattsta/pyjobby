@@ -190,9 +190,18 @@ class TestABounceMovesTheJob:
         moved = await row(db_pool, job_id)
         assert moved["run_after"] > first_fire
 
-    async def test_last_writer_wins_on_the_arguments(self, db_pool, unique_queue):
-        """The collapsed job runs with the FRESHEST arguments -- which is why
-        debounce is only for work whose latest arguments are the right ones."""
+    async def test_the_last_call_REPLACES_the_arguments_rather_than_merging(
+        self, db_pool, unique_queue
+    ):
+        """The collapsed job runs with the FRESHEST arguments, and only those.
+
+        Two halves of one rule, so one test: the latest call's values win
+        (which is why debounce is only for work whose latest arguments are the
+        right ones), AND a key the latest call omits is GONE -- the row's
+        arguments are this call's arguments, not an accumulation of the burst.
+        Asserted with a single equality over the whole dict, which is what
+        makes the second half provable at all.
+        """
         client = JobClient(pool=db_pool)
         key = f"{unique_queue}:doc"
         job_id, _ = await client.debounce(
@@ -201,23 +210,10 @@ class TestABounceMovesTheJob:
         await client.debounce(
             OK, key=key, period=30.0, queue=unique_queue, x=2, revision="b"
         )
-        await client.debounce(
-            OK, key=key, period=30.0, queue=unique_queue, x=3, revision="c"
-        )
+        # the third call drops `revision` entirely
+        await client.debounce(OK, key=key, period=30.0, queue=unique_queue, x=3)
 
-        assert (await row(db_pool, job_id))["kwargs"] == {"x": 3, "revision": "c"}
-
-    async def test_kwargs_are_replaced_not_merged(self, db_pool, unique_queue):
-        """A key the latest call omits is GONE, because the row's arguments
-        are this call's arguments and not an accumulation of the burst."""
-        client = JobClient(pool=db_pool)
-        key = f"{unique_queue}:doc"
-        job_id, _ = await client.debounce(
-            OK, key=key, period=30.0, queue=unique_queue, x=1, extra="dropped"
-        )
-        await client.debounce(OK, key=key, period=30.0, queue=unique_queue, x=2)
-
-        assert (await row(db_pool, job_id))["kwargs"] == {"x": 2}
+        assert (await row(db_pool, job_id))["kwargs"] == {"x": 3}
 
     async def test_a_bounce_can_also_shorten_the_wait(self, db_pool, unique_queue):
         """`period` RESTATES the wait rather than extending it: it is the
@@ -355,17 +351,30 @@ class TestTheKeyIsReleasedAtTheClaim:
     jorb_debounce_idx says -- so the release is at the claim, not at the
     enqueue and not at the completion."""
 
-    async def test_a_burst_after_the_claim_opens_a_new_window(
-        self, db_pool, unique_queue
+    @pytest.mark.parametrize("state", ["claimed", "running", "finished", "crashed"])
+    async def test_no_non_queued_state_holds_the_key(
+        self, db_pool, unique_queue, state
     ):
+        """A burst arriving after the row left 'queued' opens a NEW window,
+        and the two rows coexist.
+
+        Parametrised over every non-queued state rather than tested once for
+        'running': the release is jorb_debounce_idx's predicate, so it is a
+        property of LEAVING 'queued' and not of the particular state reached.
+        The coexistence assertions are what make it more than "the second call
+        got a different id" -- the first row keeps its own arguments and its
+        own state, so the new window collapsed onto nothing that belonged to
+        the old one.
+        """
         client = JobClient(pool=db_pool)
-        key = f"{unique_queue}:doc"
+        key = f"{unique_queue}:{state}"
         first, _ = await client.debounce(
             OK, key=key, period=30.0, queue=unique_queue, x=1
         )
-        # a worker takes it; the row leaves the index and the key is free
         await db_pool.execute(
-            "UPDATE jorb SET state = 'running', updated = now() WHERE id = $1", first
+            "UPDATE jorb SET state = $2::jorbstate, updated = now() WHERE id = $1",
+            first,
+            state,
         )
 
         second, created = await client.debounce(
@@ -375,26 +384,8 @@ class TestTheKeyIsReleasedAtTheClaim:
         assert second != first
         assert created is True
         rows = await rows_for(db_pool, unique_queue)
-        assert [r["state"] for r in rows] == ["running", "queued"]
+        assert [r["state"] for r in rows] == [state, "queued"]
         assert [r["kwargs"] for r in rows] == [{"x": 1}, {"x": 2}]
-
-    @pytest.mark.parametrize("state", ["claimed", "running", "finished", "crashed"])
-    async def test_no_non_queued_state_holds_the_key(
-        self, db_pool, unique_queue, state
-    ):
-        client = JobClient(pool=db_pool)
-        key = f"{unique_queue}:{state}"
-        first, _ = await client.debounce(OK, key=key, period=30.0, queue=unique_queue)
-        await db_pool.execute(
-            "UPDATE jorb SET state = $2::jorbstate, updated = now() WHERE id = $1",
-            first,
-            state,
-        )
-
-        second, created = await client.debounce(
-            OK, key=key, period=30.0, queue=unique_queue
-        )
-        assert (second != first, created) == (True, True)
 
     async def test_a_retried_job_does_not_take_the_key_back(
         self, db_pool, unique_queue
@@ -812,8 +803,15 @@ class TestAgainstARealWorker:
     async def test_the_burst_runs_once_with_the_last_arguments(
         self, live_worker, db_pool, unique_queue
     ):
-        """The whole feature in one story: five enqueues over a second, one
-        job, and it executes the arguments of the fifth."""
+        """The whole feature in one story: five enqueues, one job, and it
+        executes the arguments of the fifth.
+
+        The bounces are back to back rather than spaced out. The spacing was
+        decorative -- what makes a bounce a bounce is the key, not the gap --
+        and it was working AGAINST the test: every 0.15s slept was 0.15s of
+        the 2s window spent, so a slow box could let the worker claim the job
+        mid-burst and turn a real collapse into a flake.
+        """
         await live_worker()
         client = JobClient(pool=db_pool)
         key = f"{unique_queue}:live"
@@ -823,7 +821,6 @@ class TestAgainstARealWorker:
         )
         assert created is True
         for x in (2, 3, 4, 21):
-            await asyncio.sleep(0.15)
             bounced, was_created = await client.debounce(
                 OK, key=key, period=2.0, queue=unique_queue, x=x
             )
