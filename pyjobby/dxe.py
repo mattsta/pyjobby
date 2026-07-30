@@ -189,12 +189,14 @@ class DurableSleep(Exception):  # noqa: N818 - control-flow signal, not an error
 # when the requeue commits, READ COMMITTED re-evaluates the locking clause
 # against the NEW row version (EvalPlanQual), finds the bumped epoch, matches
 # nothing and writes nothing. In the other order the requeue is the one that
-# waits -- for as long as one durable write takes -- and the write it waited for
-# was legitimate.
+# waits -- for as long as one durable TRANSACTION takes, which is not the same
+# as one statement: the lock is held to COMMIT, so under `transaction()` it is
+# held for the length of the user's function -- and the write it waited for was
+# legitimate.
 #
 # SHARE and not UPDATE: concurrent durable writes by ONE live execution must not
 # serialize against each other, and they don't -- a share lock conflicts only
-# with the exclusive lock a requeue takes. `COMPACT_STEPS_SQL` is the exception
+# with the exclusive lock a requeue takes. `COMPACT_FENCE_SQL` is the exception
 # and says why on itself.
 #
 # LOCK ORDER IS PARENT ROW FIRST, everywhere: the jorb row, then the child table
@@ -336,42 +338,66 @@ STREAM_APPEND_SQL = """WITH locked AS MATERIALIZED (
 # machine that wakes, finds no mail and sleeps, forever -- gets there on a
 # schedule. This is what bounds it.
 #
-# Written as one statement returning exactly one row because a bare DELETE
-# cannot distinguish "nothing to remove" from "superseded", and those need
-# opposite responses. `fenced` answers the second question; `removed` the
-# first.
-# Also drops the `awaited` notification latch. The latch's design ("set
-# once, dies with the row") assumes rows die; a compacting job is exactly
-# the one that never does, so one wait_for_state ever would make every
-# future publish a NOTIFY-bearing commit forever. Clearing it at the turn
-# boundary bounds that the same way compaction bounds replay. A wait that
-# is IN FLIGHT across the clearing is degraded, not broken: its 2-second
-# fallback poll still answers, and every NEW wait registers demand afresh
-# before its first check. (Deliberately no waiter-side re-arm: that would
-# be a write to the hottest row per fallback beat — the polling the
-# demand-gated design exists to avoid.)
+# TWO STATEMENTS IN ONE TRANSACTION, and the split is the same argument
+# ``db.WIPE_DURABLE_STATE_SQL`` makes for the "fresh" rerun's wipe. It used to
+# be one statement -- a `FOR UPDATE` fence CTE with the DELETE hanging off it --
+# and the flaw is that every CTE of a statement reads ONE snapshot, taken when
+# the statement began. This statement can WAIT a long time before it does
+# anything: any durable write in flight holds the job row `FOR SHARE` and the
+# fence needs it exclusively. Rows that writer committed during the wait were
+# therefore invisible to the DELETE and SURVIVED the compaction -- and a
+# surviving checkpoint at a sequence the restarted log is about to reuse is the
+# one thing compaction must not leave behind, because the next `step()` at that
+# seq replays the OLD attempt's output instead of running.
 #
-# THE ONE STATEMENT HERE THAT LOCKS `FOR UPDATE` rather than `FOR SHARE`, and
-# the reason is `unlatched`: this statement also UPDATEs the job row. Two
-# concurrent compactions holding a share lock each and then both reaching for
-# the exclusive one is a textbook lock upgrade deadlock, so the exclusive lock
-# is taken up front instead. It costs nothing a share lock was buying --
-# compaction happens at a turn boundary, not on the hot path, and it is
-# serializing against the only other writer that would take the row exclusively
-# anyway.
-COMPACT_STEPS_SQL = """WITH fence AS MATERIALIZED (
-            SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $2 FOR UPDATE
-        ), gone AS (
-            DELETE FROM jorb_step
-            WHERE job_id = $1 AND EXISTS (SELECT 1 FROM fence)
-            RETURNING 1
-        ), unlatched AS (
-            UPDATE jorb SET awaited = FALSE
-            WHERE id = $1 AND run_epoch = $2 AND awaited
-            RETURNING 1
+# Nothing is given up. Statement 1 holds the row lock until COMMIT, so no
+# supersession can land between the two -- that guarantee came from the lock,
+# never from the statement count -- and statement 2 takes a FRESH READ
+# COMMITTED snapshot, so it sees exactly the writes statement 1 waited out.
+# Statement 2 carries no epoch filter of its own for the same reason the
+# requeue's DELETEs carry none: it is unreachable except behind statement 1's
+# match, on a connection that holds the lock.
+#
+# THE FENCE IS AN UPDATE, which is what makes it the lock (`FOR UPDATE` would
+# do as much, and this has to write anyway). It drops the `awaited`
+# notification latch: that latch's design ("set once, dies with the row")
+# assumes rows die, and a compacting job is exactly the one that never does, so
+# one wait_for_state ever would make every future publish a NOTIFY-bearing
+# commit forever. Clearing it at the turn boundary bounds that the same way
+# compaction bounds replay. A wait that is IN FLIGHT across the clearing is
+# degraded, not broken: its 2-second fallback poll still answers, and every NEW
+# wait registers demand afresh before its first check. (Deliberately no
+# waiter-side re-arm: that would be a write to the hottest row per fallback
+# beat -- the polling the demand-gated design exists to avoid.)
+#
+# Written without an `AND awaited` guard, so the UPDATE matches whenever the
+# epoch does: the row it returns IS the fence answer, and a guard that skipped
+# the write on an unlatched job would report a live execution as superseded.
+# The cost is one row version per compaction, at a turn boundary rather than on
+# the hot path, and it wakes no trigger -- every trigger on jorb is `UPDATE OF
+# state` or `UPDATE OF cancel_requested`.
+#
+# THE EXCLUSIVE LOCK is deliberate where every other fence here takes `FOR
+# SHARE`: two concurrent compactions holding a share lock each and then both
+# reaching for the exclusive one is a textbook lock-upgrade deadlock. It costs
+# nothing a share lock was buying, and it serializes only against the writers
+# that would take the row exclusively anyway.
+#
+# Params: $1 job_id, $2 run_epoch. Returns one row when this execution still
+# owns the job, none when it has been superseded.
+COMPACT_FENCE_SQL = """UPDATE jorb SET awaited = FALSE
+        WHERE id = $1 AND run_epoch = $2
+        RETURNING 1 AS fenced"""
+
+# Statement 2: the delete, under a snapshot taken AFTER the fence's lock was
+# granted. Returns the count rather than the rows -- a compacting job can hold
+# a hundred thousand checkpoints, and `removed` is a log line, not a result.
+#
+# Params: $1 job_id.
+COMPACT_STEPS_SQL = """WITH gone AS (
+            DELETE FROM jorb_step WHERE job_id = $1 RETURNING 1
         )
-        SELECT (SELECT count(*) FROM fence) AS fenced,
-               (SELECT count(*) FROM gone) AS removed"""
+        SELECT count(*)::int AS removed FROM gone"""
 
 # Fenced on the SENDER, not the destination: the question is whether this
 # execution is still entitled to act. Unfenced, a zombie delivered the message

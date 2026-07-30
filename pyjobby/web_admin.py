@@ -1075,11 +1075,17 @@ class WebAdminServer:
             # doctor` and `pj-admin jobs why` report.
             #
             # Affordable at scrape cadence for the reason the whole section
-            # requires: its cost is bounded by the live fleet and by
-            # UNCLAIMABLE_SCAN_LIMIT rows per queue per cause, never by how
-            # much the installation has run. The same bound is why the value
-            # saturates -- past the limit it reads "at least this many",
-            # which an alert on > 0 does not care about.
+            # requires: EVERY ARM IS ANSWERED FROM AN INDEX, so its cost is
+            # bounded by the live fleet and by the rows each arm actually
+            # returns, never by how much the installation has run. That is a
+            # statement about the indexes (jorb_claim_idx,
+            # jorb_capability_idx, jorb_app_version_idx) and NOT about
+            # UNCLAIMABLE_SCAN_LIMIT: a LIMIT bounds rows RETURNED, not rows
+            # read, and the capability arm used to read 300k of them to
+            # return none. tests/test_metrics_scrape_cost.py plans all three
+            # so that stays true. The LIMIT is why the VALUE saturates --
+            # past it the count reads "at least this many", which an alert on
+            # > 0 does not care about.
             unclaimable = await api.unclaimable_jobs()
             lines.append(
                 "# HELP pyjobby_jobs_unclaimable Queued, runnable jobs that "

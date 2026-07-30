@@ -544,14 +544,32 @@ returns, and it tries to write results for a job another worker has taken over.
   issued by a superseded execution matches zero rows and does nothing.
 
 The checkpoint write is fenced the same way — the insert is conditional on the
-job still being at the writer's epoch:
+job still being at the writer's epoch, and it takes that epoch by **locking**
+the job row rather than reading it:
 
 ```sql
+WITH locked AS MATERIALIZED (
+    SELECT id FROM jorb WHERE id = $1 AND run_epoch = $6 FOR SHARE
+)
 INSERT INTO jorb_step (...)
-SELECT $1, $2, $3, $4, $5, $6, $7, now()
- WHERE EXISTS (SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $6)
+SELECT $1, $2, $3, $4, $5, $6, $7, now() FROM locked
     ON CONFLICT (job_id, step_seq) DO UPDATE SET ...
 ```
+
+The lock is the whole of it. An unlocked `EXISTS (SELECT 1 FROM jorb WHERE id
+= $1 AND run_epoch = $6)` is evaluated against the WRITING statement's own
+snapshot, so a requeue that is already in flight but not yet committed is
+invisible to it: the superseded execution reads the old epoch, passes the
+test, and commits its checkpoint **after** the supersession. `FOR SHARE`
+closes that window because the epoch bump is an `UPDATE` and holds the row's
+exclusive lock — the zombie's write blocks, and when the requeue commits READ
+COMMITTED re-evaluates the locking clause against the new row version, finds
+the bumped epoch, and matches nothing. So "the fence matched nothing" is a
+fact about **commit** time rather than about snapshot time. Every fenced
+statement in `pyjobby/dxe.py` is shaped this way, and the comment at the head
+of that file's SQL section is the full argument (including why the lock is
+`FOR SHARE` and not `FOR UPDATE`, and the one statement where it is the other
+way round — see [`compact()`](#bounding-replay-compact)).
 
 When that write applies nothing, the worker raises `StaleExecutionError` and
 abandons the attempt — a superseded execution stops as soon as it notices,
@@ -649,7 +667,21 @@ pj-admin jobs rerun <id>       # restart: deletes checkpoints AND streams,
 
 Fresh is the default — a plain `rerun` (no flag; there is no `--fresh`,
 `fresh=` is the `AdminAPI.rerun_job` keyword) discards the checkpoints **and
-the job's `jorb_stream` rows**, in the same statement that requeues the row.
+the job's `jorb_stream` rows**, in the same **transaction** that requeues the
+row: the requeue is statement one, the two deletes are statement two, and
+they commit together. It was one statement once, with the deletes hanging off
+the requeue's `RETURNING`, and that is subtly wrong — every CTE of a statement
+reads ONE snapshot, taken when the statement begins, and this statement can
+WAIT a long time before it does anything, because a durable write in flight
+holds the job row `FOR SHARE` and the requeue needs it exclusively. Rows the
+writer committed during that wait were invisible to the deletes and survived
+the wipe; the fresh run then appended after them, which is exactly the
+concatenated-stream failure the wipe exists to prevent. Splitting it gives up
+nothing: statement one holds the row lock until COMMIT, so no re-claim can
+land between the two — that was always the lock's guarantee and never the
+statement count's — and statement two takes a fresh READ COMMITTED snapshot,
+so it sees precisely the writes statement one waited out.
+
 Use it when the recorded results are _wrong_ rather than merely incomplete —
 after fixing a bug in a step, for instance. It is the operator's way to
 discard checkpoints for a job that is going to run again.
@@ -729,10 +761,11 @@ copied and everything re-runs.
 | Copied                                 | Not copied                                         |
 | -------------------------------------- | -------------------------------------------------- |
 | `job_class`, `kwargs` (or an override) | `deadline_key`, `identity_key`, `debounce_key`     |
-| `queue`, `prio` (or overrides)         | `schedule_id`                                      |
-| `capability`, `tags`                   | `dag_id`, `run_group`, `waitfor_*`                 |
-| `uid`, `partition_key`                 | `app_version` (pass one to pin the fork)           |
-| `admin_data` (retry/timeout policy)    | `result`, error fields, `run_count`, `error_count` |
+| `queue`, `prio` (or overrides)         | `debounce_deadline`                                |
+| `capability`, `tags`                   | `schedule_id`                                      |
+| `uid`, `partition_key`                 | `dag_id`, `run_group`, `waitfor_*`                 |
+| `admin_data` (retry/timeout policy)    | `app_version` (pass one to pin the fork)           |
+|                                        | `result`, error fields, `run_count`, `error_count` |
 
 The split is identity: everything that describes the **work**, or says
 **whose** it is, comes across — and nothing that names **this particular
@@ -742,7 +775,10 @@ job and still counts against that tenant's fair-share lane, exactly as
 `tags` does. Two live rows sharing a `deadline_key` would make idempotent
 enqueue meaningless, an `identity_key` promises there is exactly one row
 holding it (its unique index would refuse the second), and a fork is
-nobody's DAG member.
+nobody's DAG member. `debounce_deadline` goes with `debounce_key` because it
+is half of one thing: it is the ceiling a bounce may not push that key's
+`run_after` past, so a fork carrying it without the key would hold a deadline
+for a collapse window it is not in.
 
 `app_version` is the one routing column that is deliberately **not**
 inherited, and the contrast with `partition_key` is the reason: a
@@ -800,8 +836,25 @@ attempt has not yet caught up to. That is what makes a loop boundary the right
 call site: call it every time round, and it takes effect on the first pass that
 owes nothing to a previous attempt.
 
-Fenced like every other durable write — a superseded execution cannot delete a
-live one's checkpoints.
+Fenced, so a superseded execution cannot delete a live one's checkpoints —
+but it is the one durable write in the engine whose fence takes the job row's
+**exclusive** lock rather than the shared one every other fence takes.
+Compaction also has to write the row (it clears the `awaited` notification
+latch, which a job that never terminates would otherwise hold forever), and
+two concurrent compactions each holding a share lock and then reaching for
+the exclusive one is a lock-upgrade deadlock. Taking it exclusively up front
+costs nothing a share lock was buying: compaction happens at a turn boundary,
+not on the hot path.
+
+It is also **two statements in one transaction**, for the same reason a fresh
+`rerun`'s wipe is (see [above](#resuming-an-interrupted-job)): the fence — an
+`UPDATE` on the job row, which both clears the latch and IS the lock — and
+then the `DELETE`, under a snapshot taken after the lock was granted. Written
+as one statement, the `DELETE` ran against the snapshot the statement began
+with, which is before it waited out any durable write in flight; a checkpoint
+that writer committed during the wait survived the compaction, at a sequence
+the restarted log was about to reuse. The next `step()` at that sequence would
+then replay the previous turn's output instead of running.
 
 [`StateMachineJob`](../pyjobby/statemachine.py) does all of this for you; see
 [STATECHARTS.md](STATECHARTS.md).

@@ -1283,6 +1283,12 @@ class TestCompactionPlan:
     Runs `dxe.COMPACT_STEPS_SQL` itself, rolled back, rather than a copy —
     a gate reading a duplicate certifies a statement nobody executes as soon
     as the two drift.
+
+    That statement is compaction's SECOND half. The first,
+    `dxe.COMPACT_FENCE_SQL`, is a single-row UPDATE on `jorb` by primary key
+    and has no plan worth gating; the delete is where the cost lives, and it
+    carries no epoch of its own because it runs behind that fence in the same
+    transaction (see COMPACT_FENCE_SQL for why the pair beats one statement).
     """
 
     STEP_EVERY = 3
@@ -1316,15 +1322,15 @@ class TestCompactionPlan:
     ):
         """It must reach this job's rows through `jorb_step_pkey`.
 
-        The epoch passed is the job's real one, or the fence matches nothing,
-        the DELETE is never executed, and the plan being asserted on is one
-        that did no work — which would pass every check while proving nothing.
+        The job chosen is one that really has checkpoints, so the DELETE
+        really removes rows: a plan asserted on a statement that did no work
+        passes every check while proving nothing.
         """
-        job_id, epoch = await self.seed(db_pool, unique_queue)
+        job_id, _epoch = await self.seed(db_pool, unique_queue)
         total = await db_pool.fetchval("SELECT count(*) FROM jorb_step")
         assert total > 1000, f"only {total} steps seeded; a scan would be cheap"
 
-        plan = await explain_rolled_back(db_pool, dxe.COMPACT_STEPS_SQL, job_id, epoch)
+        plan = await explain_rolled_back(db_pool, dxe.COMPACT_STEPS_SQL, job_id)
 
         assert "Seq Scan on jorb_step" not in plan, plan
         assert "jorb_step_pkey" in plan, plan
@@ -1352,9 +1358,7 @@ class TestCompactionPlan:
         )
         assert row is not None
 
-        plan = await explain_rolled_back(
-            db_pool, dxe.COMPACT_STEPS_SQL, row["id"], row["run_epoch"]
-        )
+        plan = await explain_rolled_back(db_pool, dxe.COMPACT_STEPS_SQL, row["id"])
 
         assert "Seq Scan on jorb_step" not in plan, plan
         assert "jorb_step_pkey" in plan, plan

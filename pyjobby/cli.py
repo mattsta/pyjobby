@@ -1156,6 +1156,17 @@ def _fmt_limit(value: int | None) -> str:
     return str(value) if value is not None else "-"
 
 
+#: The scope marker a limit carries on a queue with jorb_queue.partition_limits.
+#:
+#: ONE string, used by every table-cell renderer that prints a limit, because
+#: two surfaces printing the same number with different scope wording (or with
+#: the scope on one and not the other) is how an operator learns to distrust
+#: both. `queues list` and `queues stats` render it from here; `queues show`
+#: has room for the longer "PER partition_key" and says that instead (see
+#: `_echo_queue_control`).
+LANE_SCOPE = " /lane"
+
+
 def _fmt_scoped_limit(value: int | None, partitioned: bool) -> str:
     """A queue limit with the "/lane" scope marker its queue earns.
 
@@ -1173,7 +1184,7 @@ def _fmt_scoped_limit(value: int | None, partitioned: bool) -> str:
     """
     if value is None:
         return "-"
-    return f"{value} /lane" if partitioned else str(value)
+    return f"{value}{LANE_SCOPE}" if partitioned else str(value)
 
 
 @queues.command("list")
@@ -1260,12 +1271,19 @@ def queues_stats(ctx: click.Context, output_json: bool) -> None:
                 ]
                 rows = []
                 for s in stats:
+                    # The lane scope travels with the numbers here exactly as
+                    # it does in `queues list` (see _fmt_scoped_limit): this
+                    # row prints Running beside Limits, and "conc=5" next to
+                    # "Running 40" reads as a limit that has stopped working
+                    # when it is 5 per lane across eight lanes.
+                    scope = LANE_SCOPE if s["partition_limits"] else ""
                     limits = []
                     if s["max_concurrency"] is not None:
-                        limits.append(f"conc={s['max_concurrency']}")
+                        limits.append(f"conc={s['max_concurrency']}{scope}")
                     if s["rate_limit"] is not None:
                         limits.append(
-                            f"rate={s['rate_limit']}/{s['rate_period_seconds']:g}s"
+                            f"rate={s['rate_limit']}/"
+                            f"{s['rate_period_seconds']:g}s{scope}"
                         )
                     rows.append(
                         [

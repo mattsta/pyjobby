@@ -33,6 +33,13 @@ from datetime import timedelta
 
 import pytest
 
+from pyjobby.admin_api import (
+    DEFAULT_LIVENESS_GRACE_SECONDS,
+    UNCLAIMABLE_JOBS_SQL,
+    UNCLAIMABLE_REASONS,
+    UNCLAIMABLE_SAMPLE_LIMIT,
+    UNCLAIMABLE_SCAN_LIMIT,
+)
 from pyjobby.web_admin import (
     PROM_RATE_WINDOW_SECONDS,
     PROM_SQL_DURATION_QUANTILES,
@@ -41,7 +48,12 @@ from pyjobby.web_admin import (
     PROM_SQL_STARTED_RECENT,
     PROM_SQL_TERMINAL_RECENT,
 )
-from tests.utils.plans import plan_for, seed_for_plans
+from tests.utils.plans import (
+    plan_for,
+    rows_removed_by_filter,
+    seed_for_plans,
+    seed_live_fleet,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -88,6 +100,15 @@ def parse_samples(body: str) -> dict[str, float]:
 # The window every scrape query is asked for, as the handler passes it.
 WINDOW = timedelta(seconds=PROM_RATE_WINDOW_SECONDS)
 
+# The args /metrics binds into the unclaimable sweep: it calls
+# `api.unclaimable_jobs()` with no arguments, so these are the defaults.
+UNCLAIMABLE_ARGS = (
+    float(DEFAULT_LIVENESS_GRACE_SECONDS),
+    UNCLAIMABLE_SCAN_LIMIT,
+    UNCLAIMABLE_SAMPLE_LIMIT,
+    list(UNCLAIMABLE_REASONS),
+)
+
 # Every statement /metrics runs against the job tables, paired with the args
 # the handler binds. These are the SAME string objects the handler executes --
 # imported, not copied -- so a plan certified here is a plan the scrape gets.
@@ -97,7 +118,24 @@ SCRAPE_STATEMENTS = (
     ("started recent", PROM_SQL_STARTED_RECENT, (WINDOW,)),
     ("duration quantiles", PROM_SQL_DURATION_QUANTILES, (WINDOW,)),
     ("enqueued total", PROM_SQL_ENQUEUED_TOTAL, ()),
+    # pyjobby_jobs_unclaimable. It reaches the endpoint through
+    # AdminAPI.unclaimable_jobs rather than a PROM_SQL_* constant, which is
+    # exactly why it sat outside this charter while its capability arm read
+    # 300k rows per scrape to return zero.
+    ("unclaimable jobs", UNCLAIMABLE_JOBS_SQL, UNCLAIMABLE_ARGS),
 )
+
+
+async def seed_scrape_fixture(pool) -> None:
+    """The database every scrape plan below is measured against.
+
+    ``seed_for_plans`` alone is not enough for the whole scrape: the
+    unclaimable sweep starts from ``jorb_worker`` and a queue with no live
+    worker produces no group at all, so against a workerless database its
+    plan touches the job table zero times and certifies nothing.
+    """
+    await seed_for_plans(pool)
+    await seed_live_fleet(pool)
 
 
 class TestScrapeQueryPlans:
@@ -122,6 +160,12 @@ class TestScrapeQueryPlans:
     Only the first two lines grow when the installation gets older. That is
     the whole point, and it is what the assertions below pin down -- as
     access methods and page counts relative to the table, never as durations.
+
+    The unclaimable sweep joined this table later, and it is the reason the
+    charter has to be enforced by a list rather than by intent: it reaches
+    /metrics through ``AdminAPI.unclaimable_jobs`` instead of a ``PROM_SQL_*``
+    constant, so it was simply not in the list, and one of its three arms had
+    been walking the whole claimable backlog to report zero.
     """
 
     @pytest.mark.parametrize(
@@ -137,12 +181,19 @@ class TestScrapeQueryPlans:
         A sequential scan of jorb is the failure this whole file is about, and
         ANY node reading jorb_history is worse: history holds ~4 rows per job
         and has no index on time, so there is no cheap way to read it at all.
+
+        The rule names ``jorb`` EXACTLY -- with the trailing space EXPLAIN
+        always prints before the cost -- rather than by prefix. Scanning
+        ``jorb_worker`` is not this failure and never becomes it: that table
+        holds one row per live process, so it is bounded by the FLEET, and the
+        planner is right to read five rows without an index. ``jorb`` is
+        bounded by nothing.
         """
-        await seed_for_plans(db_pool)
+        await seed_scrape_fixture(db_pool)
 
         plan = await plan_for(db_pool, sql, *args)
 
-        assert "Seq Scan on jorb" not in plan, f"{label}:\n{plan}"
+        assert "Seq Scan on jorb " not in plan, f"{label}:\n{plan}"
         assert "jorb_history" not in plan, f"{label}:\n{plan}"
 
     @pytest.mark.parametrize(
@@ -160,7 +211,7 @@ class TestScrapeQueryPlans:
         seed produced and cannot flake on page-size or fillfactor differences.
         Reading as many pages as the table has IS reading the table.
         """
-        await seed_for_plans(db_pool)
+        await seed_scrape_fixture(db_pool)
         heap_pages = await db_pool.fetchval(
             "SELECT pg_relation_size('jorb') / current_setting('block_size')::int"
         )
@@ -181,7 +232,7 @@ class TestScrapeQueryPlans:
         predicate spanning four states matches no partial index and collapses
         straight back into the sequential scan this replaced.
         """
-        await seed_for_plans(db_pool)
+        await seed_scrape_fixture(db_pool)
 
         plan = await plan_for(db_pool, PROM_SQL_LIVE_STATES)
 
@@ -195,14 +246,14 @@ class TestScrapeQueryPlans:
         """The terminal states are the unbounded ones, so they are only ever
         reported over a window -- and that window is written as exactly the
         expression `jorb_retention_idx` is built on."""
-        await seed_for_plans(db_pool)
+        await seed_scrape_fixture(db_pool)
 
         plan = await plan_for(db_pool, PROM_SQL_TERMINAL_RECENT, WINDOW)
 
         assert "jorb_retention_idx" in plan, plan
 
     async def test_started_gauge_rides_the_started_index(self, db_pool):
-        await seed_for_plans(db_pool)
+        await seed_scrape_fixture(db_pool)
 
         plan = await plan_for(db_pool, PROM_SQL_STARTED_RECENT, WINDOW)
 
@@ -213,7 +264,7 @@ class TestScrapeQueryPlans:
         the FINISHED-only partial index covers exactly (and more tightly than
         the all-terminal jorb_retention_idx the planner used before that index
         existed) -- COALESCE(finished, updated) is the finished instant."""
-        await seed_for_plans(db_pool)
+        await seed_scrape_fixture(db_pool)
 
         plan = await plan_for(db_pool, PROM_SQL_DURATION_QUANTILES, WINDOW)
 
@@ -223,12 +274,93 @@ class TestScrapeQueryPlans:
         """The cumulative counter comes from the sequence, so it costs the
         same at twenty thousand rows and at a billion -- and, crucially, it
         cannot be moved by a retention delete."""
-        await seed_for_plans(db_pool)
+        await seed_scrape_fixture(db_pool)
 
         plan = await plan_for(db_pool, PROM_SQL_ENQUEUED_TOTAL)
 
         assert "Scan on jorb" not in plan, plan
         assert plan.startswith("Result"), plan
+
+    async def test_every_arm_of_the_unclaimable_sweep_rides_its_own_index(
+        self, db_pool
+    ):
+        """pyjobby_jobs_unclaimable reads only rows that carry the column.
+
+        Three arms, three predicates, three indexes -- and until this test
+        existed only two of them were real. The ceiling arm rides
+        ``jorb_claim_idx`` (prio is its second column, so ``prio > ceiling``
+        is a range) and the app_version arm rides ``jorb_app_version_idx``,
+        but the capability arm had nothing: it walked the queue's whole
+        claimable slice, heap-fetching every row, and reported zero. Measured
+        at 300k rows read to return an empty list, every fifteen seconds,
+        growing with the backlog forever.
+
+        THE SEED IS THE HEALTHY INSTALL, deliberately: no job here carries a
+        capability or an app_version, so all three arms must report nothing.
+        "How much does the answer 'everything is fine' cost?" is the question,
+        because that is the answer 5,700 scrapes a day get.
+        """
+        await seed_scrape_fixture(db_pool)
+
+        plan = await plan_for(db_pool, UNCLAIMABLE_JOBS_SQL, *UNCLAIMABLE_ARGS)
+
+        assert "jorb_claim_idx" in plan, plan
+        assert "jorb_capability_idx" in plan, plan
+        assert "jorb_app_version_idx" in plan, plan
+        # The whole point, in the unit that catches an index scan doing a
+        # table's worth of work: a discarded row costs the same as a scanned
+        # one, and the arm this test was written for discarded every row it
+        # read.
+        assert rows_removed_by_filter(plan) == 0, plan
+
+    async def test_the_capability_arm_without_its_index_walks_the_backlog(
+        self, db_pool
+    ):
+        """What ``jorb_capability_idx`` buys, measured against its absence.
+
+        The REAL statement, planned with the index dropped inside a
+        transaction that is then rolled back -- so the regression is
+        documented as a plan rather than remembered as a story, and it is the
+        same plan that returns the day someone decides the index is not
+        earning its keep. Without it the planner falls back to
+        ``jorb_claim_idx``, which knows nothing about ``capability``: it hands
+        over every claimable row on every queue with a live worker, and the
+        filter discards all of them.
+
+        Counted PER QUEUE because that is the unit EXPLAIN reports in: the arm
+        is a LATERAL, one loop per queue with a live fleet, and the row counts
+        on a looped node are per-loop averages. The fleet-wide cost is this
+        number times the number of queues.
+        """
+        await seed_scrape_fixture(db_pool)
+        claimable = await db_pool.fetchval(
+            """
+            SELECT min(n) FROM (
+                SELECT count(*) AS n FROM jorb j
+                 WHERE j.state = 'queued' AND j.run_after <= now()
+                   AND EXISTS (SELECT 1 FROM jorb_worker w
+                                WHERE w.queue = j.queue)
+                 GROUP BY j.queue
+            ) per_queue
+            """
+        )
+        assert claimable > 0, "seed produced no claimable rows to walk"
+
+        async with db_pool.acquire() as conn:
+            tx = conn.transaction()
+            await tx.start()
+            try:
+                await conn.execute("DROP INDEX jorb_capability_idx")
+                rows = await conn.fetch(
+                    "EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) " + UNCLAIMABLE_JOBS_SQL,
+                    *UNCLAIMABLE_ARGS,
+                )
+                plan = "\n".join(r["QUERY PLAN"] for r in rows)
+            finally:
+                await tx.rollback()
+
+        assert "jorb_capability_idx" not in plan, plan
+        assert rows_removed_by_filter(plan) >= claimable, plan
 
     async def test_the_old_state_census_read_the_whole_job_table(self, db_pool):
         """The removed pyjobby_jobs_by_state query, planned.
@@ -237,7 +369,7 @@ class TestScrapeQueryPlans:
         (queue, state) can only be answered by reading every row. It cost
         more buffers than the table has pages, on every scrape, forever.
         """
-        await seed_for_plans(db_pool)
+        await seed_scrape_fixture(db_pool)
         heap_pages = await db_pool.fetchval(
             "SELECT pg_relation_size('jorb') / current_setting('block_size')::int"
         )
@@ -265,7 +397,7 @@ class TestScrapeQueryPlans:
         reference workload (a million jobs an hour, 30-day retention) that is
         ~2.9 billion history rows, every 15 seconds.
         """
-        await seed_for_plans(db_pool)
+        await seed_scrape_fixture(db_pool)
 
         plan = await plan_for(
             db_pool,

@@ -88,6 +88,32 @@ async def seed_for_plans(
     await settle(pool)
 
 
+async def seed_live_fleet(
+    pool: asyncpg.Pool, queue_prefix: str = "plan_q", queues: int = 5
+) -> None:
+    """One live worker per queue `seed_for_plans` filled.
+
+    Separate from the seed because only one plan under test needs it, and it
+    is not free to add everywhere: several suites count ``jorb_worker`` rows.
+    ``AdminAPI.unclaimable_jobs`` starts from the fleet -- a queue with no live
+    worker produces no group and never reaches the job table at all -- so
+    planning it against a workerless database measures nothing.
+
+    The worker advertises no capability and no app_version, which is the
+    ordinary fleet and the case the sweep must be cheap in: every arm has to
+    report zero, and the question is how many rows it reads to do it.
+    """
+    await pool.execute(
+        """
+        INSERT INTO jorb_worker (host, pid, queue, max_prio, last_seen)
+        SELECT 'plan-fleet', 6000 + i, $1 || i, 1000, now()
+        FROM generate_series(0, $2 - 1) i
+        """,
+        queue_prefix,
+        queues,
+    )
+
+
 async def reset_job_tables(pool: asyncpg.Pool) -> None:
     """Start from an empty, UNBLOATED job table.
 

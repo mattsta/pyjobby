@@ -10,6 +10,13 @@ machines parked mid-sleep) and then asserts the accumulation claims:
 * retention keeps up AT RATE: the job table reaches a bounded steady
   state instead of growing with total throughput, and the monitor logs
   "caught up" rather than only budget exhaustion;
+* durable STREAMS reach a steady state on their own (shorter) checkpoint
+  window: jorb_stream's row count is set by what the jobs WRITE rather
+  than by how many of them ran, so it is the child table most able to
+  keep growing while every other number looks bounded;
+* the retention horizon really IS the bound on ``identity_key``: keys
+  recycled faster than the window come back and create new jobs, which
+  is the promise "at most once, until the row ages out" made observable;
 * the NOTIFY queue stays near empty under sustained enqueue/complete;
 * a parked durable machine costs nothing while parked: no history, no
   claims, no worker;
@@ -60,13 +67,37 @@ CHECKPOINT_RETENTION_DAYS = 30 / 86400
 
 #: The workload mix per 100 jobs: mostly instant successes, some
 #: checkpointed pipelines (jorb_step churn + one same-row retry each),
-#: some short durable sleeps (requeue churn), a trickle of dead letters.
+#: some short durable sleeps (requeue churn), some durable STREAMS (twenty
+#: jorb_stream rows apiece -- the one child table that grows faster than the
+#: jobs that write it), a trickle of dead letters.
 MIX = [
-    ("tests.dxe_jobs.OkJob", 90, {"x": 2}),
+    ("tests.dxe_jobs.OkJob", 86, {"x": 2}),
     ("tests.dxe_jobs.StepPipelineJob", 4, {}),
     ("tests.dxe_jobs.SleeperJob", 4, {"seconds": 1}),
+    ("tests.dxe_jobs.StreamProducerJob", 4, {"n": 20}),
     ("tests.dxe_jobs.FailJob", 2, {"max_retries": 1, "initial_retry_delay": 1}),
 ]
+
+#: How many DISTINCT identity keys the identity slice of the drive recycles
+#: through. Sized so the whole ring is reused many times over inside the run
+#: and, crucially, faster than the compressed 60-second retention window --
+#: the point of the assertion at the end is that a key comes BACK when the row
+#: holding it is reaped, which is unobservable if the ring is longer than the
+#: window's worth of enqueues.
+IDENTITY_RING = 32
+
+#: How often an enqueue carries an identity_key at all. A slice, not the whole
+#: drive: the rest of the mix has to keep arriving at rate, and an identity
+#: enqueue that COLLAPSES onto a live row is not an arrival.
+IDENTITY_EVERY = 10
+
+#: The one job class the identity slice enqueues, and it has to be ONE:
+#: an identity names a piece of WORK, so the platform refuses to hand back a
+#: job of a different class under a key that is already taken (see
+#: JobClient._enqueue_identity). Drawing this slice from the rotating MIX
+#: would therefore raise the moment the ring came round onto a different
+#: class -- which is the rule working, not a soak failure.
+IDENTITY_JOB = ("tests.dxe_jobs.OkJob", {"x": 2})
 
 
 class Sample:
@@ -83,7 +114,12 @@ async def take_sample(db_pool, started: float, queue: str) -> Sample:
     sizes = await db_pool.fetchrow(
         "SELECT pg_total_relation_size('jorb') AS jorb_bytes, "
         "pg_total_relation_size('jorb_history') AS history_bytes, "
-        "pg_total_relation_size('jorb_step') AS step_bytes"
+        "pg_total_relation_size('jorb_step') AS step_bytes, "
+        # jorb_stream is the child table whose size is set by the JOBS' output
+        # rather than by the job count -- twenty rows per producer here, and
+        # unbounded per job in principle -- so it is the one most able to grow
+        # while every other number looks like a steady state.
+        "pg_total_relation_size('jorb_stream') AS stream_bytes"
     )
     tuples = await db_pool.fetchrow(
         "SELECT coalesce(sum(n_live_tup), 0) AS live, "
@@ -104,6 +140,7 @@ async def take_sample(db_pool, started: float, queue: str) -> Sample:
         jorb_mb=sizes["jorb_bytes"] / 1e6,
         history_mb=sizes["history_bytes"] / 1e6,
         step_mb=sizes["step_bytes"] / 1e6,
+        stream_mb=sizes["stream_bytes"] / 1e6,
         live_tup=tuples["live"],
         dead_tup=tuples["dead"],
         notify_pct=float(notify) * 100,
@@ -169,12 +206,31 @@ class TestSoak:
         for job_class, weight, kwargs in MIX:
             mix += [(job_class, kwargs)] * weight
 
+        # Every identity enqueue's answer, in order, so the recycle claim can
+        # be read off the run afterwards: (key, whether a row was created).
+        identity_results: list[tuple[str, bool]] = []
+
         next_sample = 15.0
         while (elapsed := time.monotonic() - started) < SOAK_SECONDS:
             batch_deadline = time.monotonic() + 1.0
             for _ in range(int(SOAK_RATE)):
                 job_class, kwargs = mix[enqueued % len(mix)]
-                await client.enqueue(job_class, queue=unique_queue, **kwargs)
+                if enqueued % IDENTITY_EVERY == 0:
+                    # THE RETENTION HORIZON IS THE BOUND (OPERATIONS.md), made
+                    # executable: an identity_key is held by its row in every
+                    # state, so the ring below can only come back around
+                    # because the sweep reaped the row that held it.
+                    key = f"soak-{(enqueued // IDENTITY_EVERY) % IDENTITY_RING}"
+                    identity_class, identity_kwargs = IDENTITY_JOB
+                    _job_id, created = await client.enqueue_identified(
+                        identity_class,
+                        identity_key=key,
+                        queue=unique_queue,
+                        **identity_kwargs,
+                    )
+                    identity_results.append((key, created))
+                else:
+                    await client.enqueue(job_class, queue=unique_queue, **kwargs)
                 enqueued += 1
             if elapsed >= next_sample:
                 samples.append(await take_sample(db_pool, started, unique_queue))
@@ -200,6 +256,50 @@ class TestSoak:
         )
         # And the monitor itself says so: caught up, not stuck on budget.
         assert "caught up" in monitor.log_text()
+
+        # jorb_stream reaches a steady state too, on the SEPARATE and shorter
+        # checkpoint window. It is bounded here the same way jorb_rows is --
+        # by rate x window rather than by throughput -- but per STREAM ROW:
+        # 4 producers per 100 jobs, twenty rows each, so the arrival rate of
+        # stream rows is 0.8 x the job rate. ~200 bytes a row with its index,
+        # three windows of slack, and a floor because an empty table is still
+        # a few pages.
+        stream_bound = 2 + (SOAK_RATE * 0.8 * 20 * 60 * 3 * 200) / 1e6
+        assert final.numbers["stream_mb"] < stream_bound, (
+            f"jorb_stream is {final.numbers['stream_mb']:,.1f} MB against a "
+            f"{stream_bound:,.1f} MB bound: the checkpoint sweep is not "
+            f"keeping up with the streams, and a stream's row count is set by "
+            f"the job's OUTPUT rather than by the job count"
+        )
+
+        # THE RETENTION HORIZON IS THE BOUND ON "AT MOST ONCE", executable.
+        # An identity_key is held by its row in EVERY state and never
+        # re-arms, so a key that produced a new job again can only have done
+        # so because the sweep reaped the row that was holding it. That is the
+        # honest reading of the promise (see the COMMENT on jorb.identity_key
+        # and OPERATIONS.md), and it is a property no short test can observe:
+        # it needs the window to actually pass under load.
+        assert len(identity_results) > IDENTITY_RING, (
+            f"only {len(identity_results)} identity enqueues; the ring never "
+            f"came round, so this run cannot say anything about recycling"
+        )
+        first_use = {}
+        recycled = []
+        for index, (key, created) in enumerate(identity_results):
+            if key not in first_use:
+                first_use[key] = index
+            elif created:
+                recycled.append((key, index))
+        assert recycled, (
+            f"{len(identity_results)} identity enqueues over "
+            f"{len(first_use)} keys and not one key ever came back: either "
+            f"retention never reaped a terminal identified job, or the key "
+            f"outlived its row -- both break the documented horizon"
+        )
+        print(
+            f"identity: {len(recycled)} of {len(identity_results)} enqueues "
+            f"created a job on a previously-used key (retention freed it)"
+        )
 
         # The cliff stayed far away under sustained NOTIFY traffic.
         assert final.numbers["notify_pct"] < 1.0

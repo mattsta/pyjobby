@@ -361,6 +361,7 @@ STMTS["enqueue-next-self-finished"] = f""" UPDATE jorb
 # DXE primitives (see pyjobby/dxe.py for semantics)
 STMTS["load-steps"] = dxe.LOAD_STEPS_SQL
 STMTS["record-step"] = dxe.RECORD_STEP_SQL
+STMTS["compact-fence"] = dxe.COMPACT_FENCE_SQL
 STMTS["compact-steps"] = dxe.COMPACT_STEPS_SQL
 STMTS["set-event"] = dxe.SET_EVENT_SQL
 STMTS["get-event"] = dxe.GET_EVENT_SQL
@@ -2135,16 +2136,25 @@ class Job:
         nothing to a previous attempt.
 
         Fenced like every other durable write: a superseded execution cannot
-        delete a live one's checkpoints.
+        delete a live one's checkpoints. Two statements in one transaction --
+        the fence (which is also what clears the ``awaited`` latch, and takes
+        the row's EXCLUSIVE lock rather than the shared one every other fence
+        takes), then the delete under a fresh snapshot. ``COMPACT_FENCE_SQL``
+        says why the pair beats the single statement it replaced.
         """
         if self._dxe_steps and self._dxe_seq < max(self._dxe_steps):
             return False
-        rows = await self.s.ex("compact-steps", self.job["id"], self._dxe_epoch)
-        if not rows or not rows[0]["fenced"]:
-            raise dxe.StaleExecutionError(
-                f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
-            )
-        removed = int(rows[0]["removed"])
+        async with self.s.cxn.transaction():  # type: ignore[union-attr]
+            fenced = await self.s.ex("compact-fence", self.job["id"], self._dxe_epoch)
+            if not fenced:
+                raise dxe.StaleExecutionError(
+                    f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
+                )
+            # No epoch filter on this one: it is unreachable except behind the
+            # fence above, in this transaction, on the connection holding the
+            # lock that fence took.
+            gone = await self.s.ex("compact-steps", self.job["id"])
+        removed = int(gone[0]["removed"])
         self._dxe_steps.clear()
         self._dxe_seq = 0
         if removed:
@@ -2534,11 +2544,13 @@ def resolve_app_version(flag: str | None, configured: Any) -> str | None:
     try:
         return enqueue_rules.validate_app_version(version)
     except ValueError as refused:
+        # An f-string, not printf: loguru formats with str.format, so "%s"
+        # renders literally and the refusal reason -- the only part of this
+        # line an operator can act on -- never reaches the log at all.
         logger.warning(
-            "The app version this fleet was given is not one any enqueue "
-            "could write (%s); it will advertise NO app version and claim "
-            "only unpinned jobs",
-            refused,
+            f"The app version this fleet was given is not one any enqueue "
+            f"could write ({refused}); it will advertise NO app version and "
+            f"claim only unpinned jobs"
         )
         return None
 

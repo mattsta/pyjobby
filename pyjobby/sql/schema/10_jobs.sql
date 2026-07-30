@@ -136,12 +136,32 @@ CREATE INDEX jorb_partition_inflight_idx ON jorb (queue, partition_key)
 -- deployment that never stamps a job and the hot write never touches it. A
 -- deployment that does stamp gets one entry per PINNED queued row, dropped
 -- again at the claim (the row leaves 'queued'), so it is bounded by the
--- pinned backlog and never by the table. Contrast capability, which has no
--- such index and whose sweep arm therefore walks: the difference is that this
--- is also read on a timer by every idle worker, not only on demand by an
--- operator running doctor.
+-- pinned backlog and never by the table.
 CREATE INDEX jorb_app_version_idx ON jorb (queue, app_version)
     WHERE state = 'queued' AND app_version IS NOT NULL;
+-- "is any runnable job on this queue asking for a capability nobody
+-- advertises?" -- the capability twin of the index above, and it exists for
+-- the same reason in a louder register: the sweep that asks it
+-- (AdminAPI.unclaimable_jobs) is ALSO the /metrics gauge
+-- pyjobby_jobs_unclaimable, so it runs on the scrape timer rather than only
+-- when an operator types `doctor`. Without this the capability arm had no
+-- index for its predicate and walked the queue's whole claimable slice,
+-- heap-fetching every row, to report the healthy answer of zero -- measured
+-- at 300k rows read per scrape, growing with the backlog forever. The claim
+-- itself still needs no index here: it filters `capability = ANY($2)` on rows
+-- jorb_claim_idx has already handed it. This is the INVERSE question.
+--
+-- SAME PARTIAL BARGAIN as jorb_app_version_idx: `capability IS NOT NULL`
+-- means an ordinary enqueue -- almost every enqueue -- writes no entry, so
+-- the index is physically empty on an install that never sets a capability,
+-- and `state = 'queued'` drops the entry again at the claim, so it is bounded
+-- by the capability-bearing BACKLOG and never by the table. Keyed
+-- (queue, prio, run_after) rather than (queue, capability) because that is
+-- jorb_claim_idx's key restricted to these rows: it is the arm's own
+-- ORDER BY, so the LIMIT stops the scan early instead of sorting the queue's
+-- capability rows to take five of them.
+CREATE INDEX jorb_capability_idx ON jorb (queue, prio, run_after)
+    WHERE state = 'queued' AND capability IS NOT NULL;
 -- retention: the sweep asks "which terminal jobs aged out?" every cycle, and
 -- once it has caught up the honest answer is usually "none". Without this it
 -- reads the whole terminal backlog to say so -- measured at 300k rows that is

@@ -13,7 +13,7 @@ is where its replacement lives. Two independent reasons killed it:
 * **Cost.** Committing a transaction that issued a NOTIFY takes a GLOBAL
   exclusive lock held through fsync, so notifying commits serialise against
   each other. The lock is per COMMIT, so ONE ungated channel costs as much as
-  seven -- every other channel in the schema is demand-gated, which made this
+  six -- every other channel in the schema is demand-gated, which made this
   one the entire remaining bill. Deleting it is worth 2.6-2.9x on the
   completion path (measured across runs; tests/test_notify_gating.py rebuilds
   the deleted trigger so the "before" number stays measurable).

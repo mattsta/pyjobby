@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 
 from pyjobby.configloader import (
+    _ASYNCPG_CONNECT_KEYS_FALLBACK,
     ASYNCPG_CONNECT_KEYS,
     KNOWN_TOP_LEVEL_KEYS,
     ConfigError,
@@ -166,9 +167,36 @@ class TestUnknownKeys:
         with pytest.raises(ConfigError, match="asyncpg.connect"):
             load_config_from_file(path, ["db_params"])
 
+    def test_a_connect_keyword_in_the_wrong_case_is_refused(self, tmp_path):
+        """`Host` is not a spelling of `host`.
+
+        The table is handed to ``asyncpg.connect(**db_params)``, and keyword
+        arguments are case-sensitive: a capitalised key is a keyword that does
+        not exist. The check used to fold case, so this file loaded cleanly and
+        then raised ``TypeError: connect() got an unexpected keyword argument
+        'Host'`` from inside a daemon's startup, naming no file and no line.
+        """
+        path = write(tmp_path, '[db_params]\nHost = "h"\n')
+
+        with pytest.raises(ConfigError) as excinfo:
+            load_config_from_file(path, ["db_params"])
+
+        message = str(excinfo.value)
+        assert "'Host'" in message, "the message must name the key as written"
+        assert "lowercase" in message, (
+            "the operator has to be told the rule, not merely that the key is wrong"
+        )
+        assert "'host'" in message, "the message must name the fix"
+
     def test_the_connect_keywords_this_table_accepts_are_really_asyncpgs(self):
-        """The allow-list is a copy of another library's signature, so it is
-        bound to that signature rather than to a reviewer's memory of it."""
+        """The allow-list IS another library's signature, read at import.
+
+        Derived rather than transcribed because this project pins no upper
+        bound on asyncpg: a hand-kept list starts refusing a keyword the day a
+        release adds one, and refuses it by blaming the operator's config file.
+        Both directions are asserted -- nothing accepted that connect() would
+        reject, and nothing rejected that connect() would accept.
+        """
         import inspect
 
         import asyncpg
@@ -183,6 +211,29 @@ class TestUnknownKeys:
             f"[db_params] would accept {sorted(unknown)}, which "
             f"asyncpg.connect() does not take: the table is passed to it "
             f"verbatim, so these would be a TypeError at connect time"
+        )
+        # `loop` is the one deliberate omission: a TOML file cannot name an
+        # event loop, so a string there would reach asyncpg as one.
+        assert accepted - ASYNCPG_CONNECT_KEYS == {"loop"}, (
+            f"[db_params] refuses {sorted(accepted - ASYNCPG_CONNECT_KEYS)}, "
+            f"which asyncpg.connect() accepts: an operator who needs one of "
+            f"these would be told their config file is wrong when it is not"
+        )
+
+    def test_the_shipped_fallback_is_not_narrower_than_the_derived_set(self):
+        """What a deployment gets when the signature cannot be introspected.
+
+        The literal exists only for that case, so the one way it can do harm
+        is by being SMALLER than the real signature -- every key it is missing
+        becomes a ConfigError against a config file that is correct.
+        """
+        assert _ASYNCPG_CONNECT_KEYS_FALLBACK <= ASYNCPG_CONNECT_KEYS, (
+            f"the fallback names keys the derived set does not: "
+            f"{sorted(_ASYNCPG_CONNECT_KEYS_FALLBACK - ASYNCPG_CONNECT_KEYS)}"
+        )
+        # and it is a real list, not an empty set that would accept nothing
+        assert {"host", "port", "database", "user", "password", "dsn"} <= (
+            _ASYNCPG_CONNECT_KEYS_FALLBACK
         )
 
 

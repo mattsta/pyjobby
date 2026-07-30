@@ -52,12 +52,15 @@ stamps). Two places to write the same string is one place to forget it.
 
 from __future__ import annotations
 
+import inspect
 import os
 import re
 import tomllib
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
+
+import asyncpg  # type: ignore[import-untyped]
 
 
 class ConfigError(RuntimeError):
@@ -105,7 +108,22 @@ KNOWN_TOP_LEVEL_KEYS = frozenset(
 #: Deliberately generous: ``dsn`` and the pooling/TLS/statement-cache knobs are
 #: in, because an operator who needs one of them should not have to patch this
 #: list. ``loop`` is not: a config file cannot name an event loop.
-ASYNCPG_CONNECT_KEYS = frozenset(
+#:
+#: THE KEYS ARE LOWERCASE and the check is case-SENSITIVE, because
+#: ``asyncpg.connect(**db_params)`` is: ``Host = "..."`` is not a spelling of
+#: ``host``, it is a keyword argument that does not exist. Folding case here
+#: only moved the failure -- validation passed and connect() raised TypeError
+#: from inside a daemon's startup instead of the loader naming the key.
+#:
+#: DERIVED FROM THE FUNCTION rather than transcribed from its docs, because
+#: this project pins no upper bound on asyncpg (see pyproject): a hand-written
+#: allow-list is a list that starts REFUSING a keyword the day a new release
+#: adds one, and the refusal arrives as a ConfigError blaming the operator's
+#: file. The literal below is the fallback for an asyncpg whose signature
+#: cannot be introspected (a C accelerator, a decorator that drops the
+#: metadata), and tests/test_configloader.py binds it to the derived set so it
+#: cannot rot into a narrower list than the one that ships.
+_ASYNCPG_CONNECT_KEYS_FALLBACK: frozenset[str] = frozenset(
     {
         "command_timeout",
         "connection_class",
@@ -131,6 +149,33 @@ ASYNCPG_CONNECT_KEYS = frozenset(
         "user",
     }
 )
+
+#: ``loop`` is a parameter of ``asyncpg.connect`` and is deliberately NOT a
+#: config key: a TOML file cannot name an event loop, and a string there would
+#: reach asyncpg as one.
+_NOT_A_CONFIG_KEY: frozenset[str] = frozenset({"loop"})
+
+
+def _derive_asyncpg_connect_keys() -> frozenset[str]:
+    """Every keyword ``asyncpg.connect`` accepts, minus the ones a file cannot
+    hold. Falls back to the shipped literal if the signature is unreadable."""
+    try:
+        parameters = inspect.signature(asyncpg.connect).parameters
+    except TypeError, ValueError:  # pragma: no cover - defensive
+        return _ASYNCPG_CONNECT_KEYS_FALLBACK
+    derived = (
+        frozenset(
+            name
+            for name, p in parameters.items()
+            if p.kind
+            in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        )
+        - _NOT_A_CONFIG_KEY
+    )
+    return derived or _ASYNCPG_CONNECT_KEYS_FALLBACK
+
+
+ASYNCPG_CONNECT_KEYS: frozenset[str] = _derive_asyncpg_connect_keys()
 
 
 def describe_db_target(target: Mapping[str, Any] | str | None) -> str:
@@ -228,16 +273,24 @@ def load_config_from_file(filename: str, keys: Iterable[str]) -> dict[str, Any]:
 
     db_params = raw.get("db_params")
     if isinstance(db_params, dict):
-        misplaced = sorted(
-            k for k in db_params if k.lower() not in ASYNCPG_CONNECT_KEYS
-        )
+        # Case-SENSITIVE, unlike the top-level check above: this table is
+        # passed to asyncpg.connect() verbatim as **kwargs, and `Host` is not
+        # a spelling of `host` there -- it is a keyword that does not exist.
+        # Folded, `Host = "db"` passed validation here and then raised
+        # TypeError from inside connect(), in a daemon's startup, with no
+        # mention of the config file.
+        misplaced = sorted(k for k in db_params if k not in ASYNCPG_CONNECT_KEYS)
         if misplaced:
             key = misplaced[0]
-            home = (
-                "a TOP-LEVEL setting: move it ABOVE the [db_params] header"
-                if key.lower() in KNOWN_TOP_LEVEL_KEYS
-                else "not an asyncpg.connect() keyword"
-            )
+            if key.lower() in KNOWN_TOP_LEVEL_KEYS:
+                home = "a TOP-LEVEL setting: move it ABOVE the [db_params] header"
+            elif key.lower() in ASYNCPG_CONNECT_KEYS:
+                home = (
+                    f"the wrong case for one: asyncpg.connect() keywords are "
+                    f"lowercase, so write {key.lower()!r}"
+                )
+            else:
+                home = "not an asyncpg.connect() keyword"
             raise ConfigError(
                 f"{key!r} is inside [db_params] in {filename}, and it is {home}. "
                 f"TOML has no way back out to the root, so every bare key after "

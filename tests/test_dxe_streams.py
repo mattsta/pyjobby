@@ -493,7 +493,10 @@ async def test_a_fresh_rerun_starts_the_stream_over_at_seq_zero(
     assert first == {"values": [{"i": i} for i in range(3)], "closed": True}
 
     assert await rerun_job(db_pool, job_id) == job_id
-    # nothing survives the requeue: the wipe and the requeue are one statement
+    # nothing survives the requeue: the wipe and the requeue are two
+    # statements in ONE transaction, so they commit together and no re-claim
+    # can land between them (see db.WIPE_DURABLE_STATE_SQL for why that is
+    # the lock's guarantee rather than the statement count's)
     assert await stream_rows(db_pool, job_id) == []
 
     await wait_for_job_state(db_pool, job_id, ("finished",), timeout=30)

@@ -1191,13 +1191,15 @@ re-run under _new_ code and inheriting the old pin would strand it. Jobs minted
 by a recurring schedule are never pinned: a schedule describes recurring work,
 not a deployment.
 
-**Stranding is loud, in three places.** Nothing can refuse a pin at enqueue
+**Stranding is loud, in four places.** Nothing can refuse a pin at enqueue
 time — the fleet it has to match is whatever is running when the job is finally
 claimed — so a job pinned to a build nobody runs is reported by `pj-admin
 doctor`'s `unclaimable` check, explained by `pj-admin jobs why ID` as
-`app_version_unmet` with the versions the fleet _does_ run, and logged once a
-minute by every idle worker on that queue. Two remedies, either of which frees
-it:
+`app_version_unmet` with the versions the fleet _does_ run, logged once a
+minute by every idle worker on that queue, and counted by
+`pyjobby_jobs_unclaimable{queue,reason}` on `GET /metrics` — that same sweep as
+a gauge, and the only series that moves for a stranded job, so alert on it
+above 0. Two remedies, either of which frees it:
 
 ```console
 $ pj --queue default --app-version 2026.07.01          # run what it asked for

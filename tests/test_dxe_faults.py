@@ -38,7 +38,7 @@ from pyjobby.pj import STMTS, Job
 from pyjobby.procs import spawn, terminate, wait_until
 
 from .conftest import wait_for_job_state
-from .utils.dxe import bound_job, connection_bound_job
+from .utils.dxe import connection_bound_job
 from .utils.faults import (
     age_claim,
     age_worker_heartbeats,
@@ -698,19 +698,33 @@ async def test_every_state_changing_statement_carries_the_fence():
     # ...and each of those fences LOCKS the job row rather than reading it.
     # A snapshot EXISTS is passed by a zombie whose statement began before the
     # requeue committed, so the write lands after the supersession -- see
-    # section 13, which drives that interleave for real. The lock is what makes
-    # "the fence matched nothing" a fact about commit time.
-    for name in ("record-step", "set-event", "send", "recv", "compact-steps"):
+    # SECTION 14, which drives that interleave for real, as two real
+    # transactions, for the three statements a caller can fire directly
+    # (record-step, set-event, stream-append). `send`, `recv` and the
+    # compaction fence are covered HERE, reflectively: their locking clause is
+    # asserted rather than raced, because driving each of them to the same
+    # deterministic block needs a second job, a pending message, or a turn
+    # boundary, and the clause is the whole of what the interleave proves.
+    # The lock is what makes "the fence matched nothing" a fact about commit
+    # time.
+    for name in ("record-step", "set-event", "send", "recv"):
         assert "FOR SHARE" in STMTS[name] or "FOR UPDATE" in STMTS[name], (
             f"STMTS[{name!r}] fences on run_epoch without locking the job row: "
             f"a write already in flight when the requeue commits passes the "
             f"snapshot test and commits anyway"
         )
     assert "FOR SHARE" in STMTS["stream-append"]
-    # compact-steps takes the EXCLUSIVE lock, deliberately: it also UPDATEs
-    # the row (the `awaited` latch), and a share lock upgraded mid-statement
-    # is how two concurrent compactions would deadlock each other.
-    assert "FOR UPDATE" in STMTS["compact-steps"]
+    # Compaction fences with an UPDATE, which takes the EXCLUSIVE lock -- the
+    # deliberate exception (see dxe.COMPACT_FENCE_SQL): it has to write the
+    # `awaited` latch anyway, and two concurrent compactions each holding a
+    # share lock and then reaching for the exclusive one is a lock-upgrade
+    # deadlock. The DELETE it fences is a SEPARATE statement in the same
+    # transaction, and carries no epoch of its own on purpose: a fresh
+    # snapshot is the point, and it is unreachable except behind the fence.
+    assert "UPDATE jorb" in STMTS["compact-fence"]
+    assert "run_epoch = $2" in STMTS["compact-fence"]
+    assert "run_epoch" not in STMTS["compact-steps"]
+    assert "jorb_step" in STMTS["compact-steps"]
 
 
 @pytest.mark.parametrize("statement", STALE_WRITE_CASES)
@@ -747,10 +761,12 @@ async def test_a_superseded_attempt_cannot_compact_a_live_ones_checkpoints(
 ):
     """Compaction DELETES checkpoints, so it is the fence's sharpest test.
 
-    It cannot join STALE_WRITE_CASES because the statement returns exactly
-    one row either way, by design: a bare DELETE cannot distinguish "nothing
-    to remove" from "superseded", and those need opposite responses. The
-    `fenced` column is what carries the answer, so that is what is asserted.
+    It cannot join STALE_WRITE_CASES because the fence is a statement of its
+    own: compaction is a PAIR (`compact-fence`, then `compact-steps` under a
+    fresh snapshot in the same transaction -- see dxe.COMPACT_FENCE_SQL), and
+    the whole refusal has to happen in the first of them. A stale epoch must
+    match nothing there, so the delete is never reached and the live attempt's
+    log is untouched.
     """
     job_id, stale, current = await superseded_job(db_pool, unique_queue)
 
@@ -766,17 +782,17 @@ async def test_a_superseded_attempt_cannot_compact_a_live_ones_checkpoints(
             db.utcnow(),
         )
 
-    zombie = await db_pool.fetchrow(STMTS["compact-steps"], job_id, stale)
-    assert zombie["fenced"] == 0, "a stale epoch must not own the job"
-    assert zombie["removed"] == 0
+    assert await db_pool.fetch(STMTS["compact-fence"], job_id, stale) == [], (
+        "a stale epoch must not own the job"
+    )
     surviving = await db_pool.fetchval(
         "SELECT count(*) FROM jorb_step WHERE job_id = $1", job_id
     )
     assert surviving == 3, "the zombie deleted the live attempt's checkpoints"
 
     # positive control: the live attempt's own compaction does the work
-    live = await db_pool.fetchrow(STMTS["compact-steps"], job_id, current)
-    assert (live["fenced"], live["removed"]) == (1, 3)
+    assert len(await db_pool.fetch(STMTS["compact-fence"], job_id, current)) == 1
+    assert await db_pool.fetchval(STMTS["compact-steps"], job_id) == 3
     assert (
         await db_pool.fetchval(
             "SELECT count(*) FROM jorb_step WHERE job_id = $1", job_id
@@ -786,7 +802,7 @@ async def test_a_superseded_attempt_cannot_compact_a_live_ones_checkpoints(
 
 
 async def test_compact_refuses_while_a_previous_attempts_log_is_unreplayed(
-    db_pool, unique_queue
+    db_pool, db_params, unique_queue
 ):
     """Compacting mid-replay would silently re-execute completed work.
 
@@ -794,6 +810,10 @@ async def test_compact_refuses_while_a_previous_attempts_log_is_unreplayed(
     statement about THIS attempt's progress, which the database cannot see:
     the rows exist either way, and what matters is whether this execution has
     caught up to them yet.
+
+    On a real CONNECTION, not the pool: compaction is a fenced UPDATE and a
+    DELETE in ONE transaction (see dxe.COMPACT_FENCE_SQL), and a transaction
+    is scoped to a connection.
     """
     job_id = await enqueue(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {"x": 1})
     claimed = await claim_once(db_pool, unique_queue)
@@ -810,20 +830,25 @@ async def test_compact_refuses_while_a_previous_attempts_log_is_unreplayed(
             db.utcnow(),
         )
 
-    job = await bound_job(db_pool, claimed, epoch)
+    caller = await db.connect(**db_params)
+    try:
+        job = await connection_bound_job(caller, claimed, epoch)
 
-    # Sequence is at 0; three steps are recorded. Nothing has been replayed.
-    assert await job.compact() is False
-    assert (
-        await db_pool.fetchval(
-            "SELECT count(*) FROM jorb_step WHERE job_id = $1", job_id
+        # Sequence is at 0; three steps are recorded. Nothing has been replayed.
+        assert await job.compact() is False
+        assert (
+            await db_pool.fetchval(
+                "SELECT count(*) FROM jorb_step WHERE job_id = $1", job_id
+            )
+            == 3
         )
-        == 3
-    )
 
-    # Catch up to the last recorded step, and it becomes safe.
-    job._dxe_seq = 3
-    assert await job.compact() is True
+        # Catch up to the last recorded step, and it becomes safe.
+        job._dxe_seq = 3
+        assert await job.compact() is True
+    finally:
+        await caller.close()
+
     assert (
         await db_pool.fetchval(
             "SELECT count(*) FROM jorb_step WHERE job_id = $1", job_id
@@ -1026,7 +1051,9 @@ async def test_live_attempt_can_still_reschedule_itself(db_pool, unique_queue):
     assert row["run_after"] > row["started"]
 
 
-async def test_compaction_drops_the_notification_latch(db_pool, unique_queue):
+async def test_compaction_drops_the_notification_latch(
+    db_pool, db_params, unique_queue
+):
     """compact() clears jorb.awaited alongside the checkpoint log.
 
     The latch's design ("set once, dies with the row") assumes rows die; a
@@ -1034,24 +1061,35 @@ async def test_compaction_drops_the_notification_latch(db_pool, unique_queue):
     would make every future publish a NOTIFY-bearing commit forever. An
     ACTIVE waiter re-arms from its fallback poll (client._poll_until), so
     clearing costs at most one fallback interval of latency, once per turn.
+
+    The clearing IS the fence now: `compact-fence` is the UPDATE that writes
+    it, so a compaction that reports success has necessarily cleared the latch
+    and one that reports supersession has necessarily left it alone.
     """
     job_id = await enqueue(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {"x": 1})
     claimed = await claim_once(db_pool, unique_queue)
     await db_pool.execute("UPDATE jorb SET awaited = TRUE WHERE id = $1", job_id)
 
-    job = await bound_job(db_pool, claimed)
-    assert await job.compact() is True
+    caller = await db.connect(**db_params)
+    try:
+        job = await connection_bound_job(caller, claimed)
+        assert await job.compact() is True
 
-    assert (
-        await db_pool.fetchval("SELECT awaited FROM jorb WHERE id = $1", job_id)
-        is False
-    )
+        assert (
+            await db_pool.fetchval("SELECT awaited FROM jorb WHERE id = $1", job_id)
+            is False
+        )
 
-    # a zombie's compact must not drop a live attempt's latch
-    await db_pool.execute("UPDATE jorb SET awaited = TRUE WHERE id = $1", job_id)
-    zombie = await bound_job(db_pool, claimed, epoch=claimed["run_epoch"] - 1)
-    with pytest.raises(dxe.StaleExecutionError):
-        await zombie.compact()
+        # a zombie's compact must not drop a live attempt's latch
+        await db_pool.execute("UPDATE jorb SET awaited = TRUE WHERE id = $1", job_id)
+        zombie = await connection_bound_job(
+            caller, claimed, epoch=claimed["run_epoch"] - 1
+        )
+        with pytest.raises(dxe.StaleExecutionError):
+            await zombie.compact()
+    finally:
+        await caller.close()
+
     assert (
         await db_pool.fetchval("SELECT awaited FROM jorb WHERE id = $1", job_id) is True
     )
@@ -1215,7 +1253,7 @@ async def test_dead_lettering_fences_the_execution_it_abandons(db_pool, unique_q
 
 
 # ============================================================================
-# 13. every durable write's fence is a LOCK, not a snapshot read
+# 14. every durable write's fence is a LOCK, not a snapshot read
 # ============================================================================
 #
 # An unlocked `EXISTS (SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $n)` is
@@ -1360,8 +1398,19 @@ async def test_a_zombies_write_cannot_commit_after_the_requeue_that_fenced_it(
 
 
 # ============================================================================
-# 14. the "fresh" wipe cannot miss a writer it waited for
+# 15. a DELETE that WAITED must see what committed while it waited
 # ============================================================================
+#
+# Two statements in the platform take the job row exclusively and then delete
+# the job's durable state: the "fresh" rerun's wipe, and compaction. Both used
+# to be ONE statement with the delete hanging off a CTE, and one statement
+# reads ONE snapshot -- taken when the statement began, which for these two is
+# BEFORE a wait that can last as long as the durable write in flight. Rows the
+# blocked-on writer committed during the wait survived the delete.
+#
+# Both are now two statements in one transaction: the lock is held to COMMIT
+# (so nothing lands between them) and the delete takes a FRESH READ COMMITTED
+# snapshot (so it sees exactly what it waited out).
 
 
 async def test_a_fresh_requeue_wipes_the_rows_committed_while_it_waited(
@@ -1453,3 +1502,73 @@ async def test_a_fresh_requeue_wipes_the_rows_committed_while_it_waited(
         )
         == 0
     ), "a checkpoint survived the wipe; the fresh run would fast-forward over it"
+
+
+async def test_compaction_discards_the_checkpoint_committed_while_it_waited(
+    db_pool, db_params, unique_queue
+):
+    """The same window, in compaction, where it is worse.
+
+    ``compact()`` promises the log is empty and the next ``step()`` is
+    sequence 1 again. A checkpoint that survived it is a checkpoint sitting at
+    a sequence the restarted log is about to REUSE -- so the next ``step()``
+    does not run at all: it replays the previous turn's recorded output and
+    returns it as this turn's answer. Silent, wrong, and indistinguishable
+    from the work having been done.
+
+    The interleave is the one that produced it: a durable write in flight
+    holds the job row ``FOR SHARE``, compaction needs it exclusively and
+    blocks, and the writer commits its checkpoint during the wait. Written as
+    one statement, compaction's DELETE ran against the snapshot it took before
+    the wait and could not see that row. Driven here as two real transactions,
+    made deterministic by waiting until the compactor is provably stuck.
+    """
+    job_id = await enqueue(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {"x": 1})
+    claimed = await claim_once(db_pool, unique_queue)
+    epoch = claimed["run_epoch"]
+    assert [
+        r["id"] for r in await db_pool.fetch(STMTS["run"], job_id, epoch, None)
+    ] == [job_id]
+
+    writer = await db.connect(**db_params)
+    compactor = await db.connect(**db_params)
+    try:
+        # a legitimate durable write is in flight: it holds the job row FOR
+        # SHARE, and its checkpoint is not committed yet
+        inflight = writer.transaction()
+        await inflight.start()
+        assert await writer.fetch(
+            dxe.RECORD_STEP_SQL,
+            job_id,
+            1,
+            "mid-flight",
+            {"i": 0},
+            None,
+            epoch,
+            db.utcnow(),
+        )
+
+        # ...and the turn boundary arrives while it is still open. The job is
+        # bound BEFORE the write, so its own view of the log is empty and the
+        # unreplayed-log guard does not fire -- which is exactly the state a
+        # state machine is in at the top of a turn.
+        job = await connection_bound_job(compactor, claimed, epoch)
+        compacting = asyncio.create_task(job.compact())
+        await wait_until_blocked_on_a_transaction(db_pool)
+        assert not compacting.done(), "compaction must WAIT for the writer's row lock"
+
+        await inflight.commit()
+        assert await asyncio.wait_for(compacting, timeout=20) is True
+    finally:
+        await compactor.close()
+        await writer.close()
+
+    assert (
+        await db_pool.fetchval(
+            "SELECT count(*) FROM jorb_step WHERE job_id = $1", job_id
+        )
+        == 0
+    ), (
+        "a checkpoint survived compaction; the next step() at that sequence "
+        "would replay it instead of running"
+    )

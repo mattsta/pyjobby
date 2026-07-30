@@ -69,7 +69,7 @@ leader.
 | Process        | Script         | What it owns                                                                                                                                                                                       | What it does **not** do                                                                                                                                                                                                                                                                                               |
 | -------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Worker**     | `pj`           | Claiming, executing job code, this attempt's state transitions, its own registry row and heartbeat, its own job-thread pool                                                                        | Decide whether a queue may run at all — `claim_jorb()` does. Recover its own crash — the monitor does. Enforce any other worker's deadline.                                                                                                                                                                           |
-| **Monitor**    | `pj-monitor`   | Every safety-net sweep in the platform: timeouts, dead-worker reclaim, stuck-claim reclaim, stranded-waiter recovery, and seven retention sweeps                                                   | Execute jobs, enqueue anything, elect a leader. Several instances are safe; every sweep is one atomic statement or a transaction holding its own row locks.                                                                                                                                                           |
+| **Monitor**    | `pj-monitor`   | Every safety-net sweep in the platform: timeouts, dead-worker reclaim, stuck-claim reclaim, stranded-waiter recovery, and eight retention sweeps                                                   | Execute jobs, enqueue anything, elect a leader. Several instances are safe; every sweep is one atomic statement or a transaction holding its own row locks.                                                                                                                                                           |
 | **Scheduler**  | `pj-scheduler` | Firing due `jorb_schedule` rows into `jorb`, the safety checks around that (concurrency, backpressure, jitter, circuit breaker), the **bounded** catch-up after an outage, and `jorb_schedule_log` | Run the jobs it creates — it only inserts them. Catch up without a ceiling: `backfill_limit` is both the opt-in and the bound, so an outage cannot become a flood. Several instances are safe: each schedule is row-locked `FOR UPDATE SKIP LOCKED` while it fires, and `deadline_key` makes a duplicate insert fail. |
 | **Admin CLI**  | `pj-admin`     | Nothing at runtime. It is a client: schema install/migrate, queue controls, DLQ, requeue, `doctor`                                                                                                 | Participate in execution.                                                                                                                                                                                                                                                                                             |
 | **Web admin**  | `pj-web`       | HTML operator UI, a JSON API, and `GET /metrics` for Prometheus                                                                                                                                    | Authenticate anybody. Keep it on localhost or behind a proxy.                                                                                                                                                                                                                                                         |
@@ -156,7 +156,13 @@ Concretely, one attempt:
 Every step from 3 onward is **fenced**: each statement carries `AND
 run_epoch = $n`, and the terminal ones also carry `AND state IN ('claimed',
 'running')`. A worker that lost the row while it was running writes
-nothing.
+nothing. The durable writes take that epoch by **locking** the job row
+(`FOR SHARE`) rather than reading it, which is what makes "the fence matched
+nothing" a fact about **commit** time rather than about the writing
+statement's snapshot — see
+[Liveness, fencing and recovery](#liveness-fencing-and-recovery) below and
+[DXE.md](DXE.md#fencing-why-a-zombie-cannot-corrupt-a-checkpoint) for the
+whole argument.
 
 Three shapes are worth noticing because they look like exceptions and are
 not. A **durable sleep** is not a parked worker: it checkpoints a wake time
@@ -243,10 +249,11 @@ statement rather than another clause.
 Nothing can refuse a pin at enqueue time, because the fleet it must match
 is whatever is running when the job is finally claimed. A job pinned to a
 build nobody runs is therefore unclaimable in exactly the way a job above
-every ceiling is, and it is caught the same three ways: `pj-admin doctor`'s
-unclaimable sweep counts it per queue, `pj-admin jobs why` names it, and
-an idle worker logs it once a minute. `jorb_app_version_idx` exists for
-those three readers and not for the claim — they ask the _inverse_
+every ceiling is, and it is caught the same four ways: `pj-admin doctor`'s
+unclaimable sweep counts it per queue, `pyjobby_jobs_unclaimable{queue,reason}`
+exposes that same sweep as a gauge on `GET /metrics`, `pj-admin jobs why`
+names it, and an idle worker logs it once a minute. `jorb_app_version_idx`
+exists for those readers and not for the claim — they ask the _inverse_
 question ("is any queued job here pinned to a version nobody advertises?"),
 which the claim's own index cannot answer at all. It is partial on
 `app_version IS NOT NULL`, so a deployment that never stamps a job has an
@@ -491,15 +498,34 @@ whenever a job _enters_ an attempt (a claim) or is _abandoned_ by one — a
 retry, a monitor requeue, an operator requeue. Every state-changing
 statement a worker issues carries `AND run_epoch = $n`.
 
+**The fence is a LOCK, not a snapshot read.** Every durable write reads the
+epoch through a CTE that takes the job row `FOR SHARE` and selects its write
+`FROM` that CTE. Testing the epoch with a plain `EXISTS` would have been
+enough only against a supersession that had already committed: an `EXISTS`
+is evaluated against the writing statement's own snapshot, so a requeue in
+flight but not yet committed is invisible to it, and the abandoned execution
+reads the old epoch, passes the test, and commits **after** the
+supersession. The lock closes that because the epoch bump is an `UPDATE` and
+holds the row exclusively — the stale write blocks, and when the requeue
+commits, READ COMMITTED re-evaluates the locking clause against the new row
+version, finds the bumped epoch, and matches nothing. "The fence matched
+nothing" is therefore a statement about commit time. (It is `FOR SHARE` so
+that one live execution's concurrent writes do not serialise against each
+other; `compact()` is the single exception and takes the row exclusively,
+because it writes the row too.)
+
 So a "dead" worker that was merely partitioned, and is still executing, can
-do no harm when it comes back: its completion matches zero rows, its
-checkpoint writes match zero rows and raise `StaleExecutionError`, and it
-abandons the attempt quietly. Requeueing bumps the epoch _itself_ rather
-than leaving that to the next claim, because otherwise the abandoned
-execution would keep the current epoch for the whole window between requeue
-and re-claim and could still write checkpoints for an attempt that has been
-replaced. This is what lets recovery be a plain `UPDATE` with no
-distributed agreement anywhere. The DXE half of the argument is in
+do no harm when it comes back — nor can one whose write was already in
+flight at the instant the takeover committed: its completion matches zero
+rows, its checkpoint writes match zero rows and raise
+`StaleExecutionError`, and it abandons the attempt quietly. Requeueing bumps
+the epoch _itself_ rather than leaving that to the next claim, because
+otherwise the abandoned execution would keep the current epoch for the whole
+window between requeue and re-claim and could still write checkpoints for an
+attempt that has been replaced. This is what lets recovery be a plain
+`UPDATE` with no distributed agreement anywhere. The DXE half of the
+argument — the lock order, the deadlock analysis, and the interleave each
+fence was written against — is in
 [DXE.md](DXE.md#fencing-why-a-zombie-cannot-corrupt-a-checkpoint).
 
 ---
@@ -511,8 +537,8 @@ ran. Retention is therefore **on by default** — a policy nobody remembers
 to switch on is not a policy — and `0` on either window means "keep
 forever".
 
-Seven sweeps on two windows. `--checkpoint-retention-days` governs the first;
-`--retention-days` governs the other six, because none of those tables has
+Eight sweeps on two windows. `--checkpoint-retention-days` governs the first
+two; `--retention-days` governs the other six, because none of those tables has
 a lifetime of its own to argue for — they all mean "as long as the work they
 describe".
 

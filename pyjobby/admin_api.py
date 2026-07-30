@@ -190,6 +190,123 @@ UNCLAIMABLE_REASONS: Final[tuple[str, ...]] = (
     "app_version_unmet",
 )
 
+#: The sweep :meth:`AdminAPI.unclaimable_jobs` runs. See that method for what
+#: the arms mean and why they are disjoint in this order.
+#:
+#: MODULE LEVEL, not a literal inside the method, because /metrics runs it on
+#: the scrape timer and tests/test_metrics_scrape_cost.py plans THIS OBJECT --
+#: imported, not copied -- so the plan the charter certifies is the plan the
+#: scrape gets. A copy pasted into the test is a copy that stays green after
+#: the statement it is meant to guard has changed.
+#:
+#: Params: $1 stale_after_seconds, $2 scan_limit, $3 sample_limit,
+#: $4 UNCLAIMABLE_REASONS (the report order).
+UNCLAIMABLE_JOBS_SQL: Final = """
+    WITH fleet AS (
+        -- One row per queue that HAS live workers, holding the whole of what
+        -- those workers will accept: the highest ceiling among them, the
+        -- union of their advertised capabilities and the union of the app
+        -- versions they advertise.
+        -- The LEFT JOIN keeps a worker that advertises nothing.
+        SELECT w.queue,
+               count(DISTINCT w.id)                    AS live_workers,
+               max(w.max_prio)                         AS max_ceiling,
+               coalesce(array_agg(DISTINCT caps.cap)
+                            FILTER (WHERE caps.cap IS NOT NULL),
+                        '{}'::text[])                  AS advertised,
+               coalesce(array_agg(DISTINCT w.app_version)
+                            FILTER (WHERE w.app_version IS NOT NULL),
+                        '{}'::text[])                  AS versions
+          FROM jorb_worker w
+          LEFT JOIN LATERAL unnest(w.capabilities) AS caps(cap)
+               ON TRUE
+         WHERE w.shutdown_at IS NULL
+           AND w.last_seen > now() - make_interval(secs => $1)
+         GROUP BY w.queue
+    ),
+    blocked AS (
+        SELECT f.queue, f.live_workers, f.max_ceiling, f.advertised,
+               f.versions,
+               'above_worker_ceiling'::text AS reason,
+               j.id, j.prio, j.capability, j.app_version
+          FROM fleet f
+         CROSS JOIN LATERAL (
+             SELECT id, prio, capability, app_version
+               FROM jorb
+              WHERE queue = f.queue
+                AND state = 'queued'
+                AND run_after <= now()
+                AND prio > f.max_ceiling
+              ORDER BY prio, run_after
+              LIMIT $2
+         ) j
+        UNION ALL
+        SELECT f.queue, f.live_workers, f.max_ceiling, f.advertised,
+               f.versions,
+               'capability_unmet'::text,
+               j.id, j.prio, j.capability, j.app_version
+          FROM fleet f
+         CROSS JOIN LATERAL (
+             SELECT id, prio, capability, app_version
+               FROM jorb
+              WHERE queue = f.queue
+                AND state = 'queued'
+                AND run_after <= now()
+                -- disjoint from the arm above, on purpose
+                AND prio <= f.max_ceiling
+                AND capability IS NOT NULL
+                AND NOT (capability = ANY (f.advertised))
+              ORDER BY prio, run_after
+              LIMIT $2
+         ) j
+        UNION ALL
+        SELECT f.queue, f.live_workers, f.max_ceiling, f.advertised,
+               f.versions,
+               'app_version_unmet'::text,
+               j.id, j.prio, j.capability, j.app_version
+          FROM fleet f
+         CROSS JOIN LATERAL (
+             SELECT id, prio, capability, app_version
+               FROM jorb
+              WHERE queue = f.queue
+                AND state = 'queued'
+                AND run_after <= now()
+                -- disjoint from BOTH arms above: a job that is also above
+                -- the ceiling or wants an unadvertised capability is
+                -- reported there, so the complement of each of those
+                -- predicates is restated here
+                AND prio <= f.max_ceiling
+                AND (capability IS NULL
+                     OR capability = ANY (f.advertised))
+                AND app_version IS NOT NULL
+                AND NOT (app_version = ANY (f.versions))
+              ORDER BY prio, run_after
+              LIMIT $2
+         ) j
+    )
+    SELECT queue, reason, live_workers, max_ceiling, advertised,
+           versions,
+           count(*)::int                              AS blocked_count,
+           (array_agg(id ORDER BY prio, id))[1:$3::int]
+                                                      AS sample_job_ids,
+           min(prio)                                  AS lowest_prio,
+           max(prio)                                  AS highest_prio,
+           coalesce(array_agg(DISTINCT capability)
+                        FILTER (WHERE capability IS NOT NULL),
+                    '{}'::text[])                     AS missing_caps,
+           coalesce(array_agg(DISTINCT app_version)
+                        FILTER (WHERE app_version IS NOT NULL),
+                    '{}'::text[])                     AS missing_versions
+      FROM blocked
+     GROUP BY queue, reason, live_workers, max_ceiling, advertised,
+              versions
+     -- Ordered by UNCLAIMABLE_REASONS itself, not alphabetically: that tuple
+     -- IS the precedence the arms above are disjoint by, and reporting in a
+     -- different order than the one the disjointness rule is written in is
+     -- how the two drift apart.
+     ORDER BY queue, array_position($4::text[], reason)
+"""
+
 
 #: Default page size for the per-job trails (get_job_history, get_job_steps).
 #: Matches web_admin.MAX_PAGE_LIMIT, which is the bound the HTTP surface
@@ -1320,18 +1437,21 @@ class AdminAPI:
 
         Cost: bounded, and it never scans the job table. Live workers come
         from ``jorb_worker_live_idx``; each cause is then one LATERAL per
-        queue-with-workers over ``jorb_claim_idx (queue, prio, run_after)
-        WHERE state = 'queued'``, stopping at `scan_limit` rows. The ceiling
-        arm is a pure index range scan (prio > ceiling is that index's second
-        column), so it reads only rows it returns. The capability arm has no
-        index for its predicate and walks the queue's claimable rows -- still
-        strictly less than the per-queue backlog aggregate `doctor` already
-        runs beside it, and no index exists or should exist for a column
-        almost no job sets. The app_version arm DOES have one
-        (``jorb_app_version_idx``, partial on the pinned queued rows), because
-        every idle worker asks the same question on a timer and only an
-        operator runs this; from there it reads the queue's pinned rows and
-        sorts them into claim order for the sample.
+        queue-with-workers, stopping at `scan_limit` rows, and EVERY ARM IS
+        ANSWERED FROM AN INDEX -- which this runs on the /metrics scrape timer
+        (``pyjobby_jobs_unclaimable``), not only on demand, so
+        tests/test_metrics_scrape_cost.py plans all three.
+        The ceiling arm rides ``jorb_claim_idx (queue, prio, run_after) WHERE
+        state = 'queued'`` as a pure range scan (prio > ceiling is that
+        index's second column), so it reads only rows it returns. The
+        capability arm rides ``jorb_capability_idx``, partial on the
+        capability-bearing queued rows, and the app_version arm rides
+        ``jorb_app_version_idx``, partial on the pinned ones: both start from
+        "the rows that carry the column at all", which on the overwhelmingly
+        common install is none, and both are physically empty in a deployment
+        that uses neither feature. The capability arm used to have no index
+        and walked the queue's whole claimable slice to return zero -- 300k
+        rows read per scrape, growing with the backlog.
 
         Args:
             stale_after_seconds: heartbeat age past which a worker is not
@@ -1351,117 +1471,12 @@ class AdminAPI:
             healthy answer.
         """
         rows = await self.conn.fetch(
-            """
-            WITH fleet AS (
-                -- One row per queue that HAS live workers, holding the whole
-                -- of what those workers will accept: the highest ceiling
-                -- among them, the union of their advertised capabilities and
-                -- the union of the app versions they advertise.
-                -- The LEFT JOIN keeps a worker that advertises nothing.
-                SELECT w.queue,
-                       count(DISTINCT w.id)                    AS live_workers,
-                       max(w.max_prio)                         AS max_ceiling,
-                       coalesce(array_agg(DISTINCT caps.cap)
-                                    FILTER (WHERE caps.cap IS NOT NULL),
-                                '{}'::text[])                  AS advertised,
-                       coalesce(array_agg(DISTINCT w.app_version)
-                                    FILTER (WHERE w.app_version IS NOT NULL),
-                                '{}'::text[])                  AS versions
-                  FROM jorb_worker w
-                  LEFT JOIN LATERAL unnest(w.capabilities) AS caps(cap)
-                       ON TRUE
-                 WHERE w.shutdown_at IS NULL
-                   AND w.last_seen > now() - make_interval(secs => $1)
-                 GROUP BY w.queue
-            ),
-            blocked AS (
-                SELECT f.queue, f.live_workers, f.max_ceiling, f.advertised,
-                       f.versions,
-                       'above_worker_ceiling'::text AS reason,
-                       j.id, j.prio, j.capability, j.app_version
-                  FROM fleet f
-                 CROSS JOIN LATERAL (
-                     SELECT id, prio, capability, app_version
-                       FROM jorb
-                      WHERE queue = f.queue
-                        AND state = 'queued'
-                        AND run_after <= now()
-                        AND prio > f.max_ceiling
-                      ORDER BY prio, run_after
-                      LIMIT $2
-                 ) j
-                UNION ALL
-                SELECT f.queue, f.live_workers, f.max_ceiling, f.advertised,
-                       f.versions,
-                       'capability_unmet'::text,
-                       j.id, j.prio, j.capability, j.app_version
-                  FROM fleet f
-                 CROSS JOIN LATERAL (
-                     SELECT id, prio, capability, app_version
-                       FROM jorb
-                      WHERE queue = f.queue
-                        AND state = 'queued'
-                        AND run_after <= now()
-                        -- disjoint from the arm above, on purpose
-                        AND prio <= f.max_ceiling
-                        AND capability IS NOT NULL
-                        AND NOT (capability = ANY (f.advertised))
-                      ORDER BY prio, run_after
-                      LIMIT $2
-                 ) j
-                UNION ALL
-                SELECT f.queue, f.live_workers, f.max_ceiling, f.advertised,
-                       f.versions,
-                       'app_version_unmet'::text,
-                       j.id, j.prio, j.capability, j.app_version
-                  FROM fleet f
-                 CROSS JOIN LATERAL (
-                     SELECT id, prio, capability, app_version
-                       FROM jorb
-                      WHERE queue = f.queue
-                        AND state = 'queued'
-                        AND run_after <= now()
-                        -- disjoint from BOTH arms above: a job that is also
-                        -- above the ceiling or wants an unadvertised
-                        -- capability is reported there, so the complement of
-                        -- each of those predicates is restated here
-                        AND prio <= f.max_ceiling
-                        AND (capability IS NULL
-                             OR capability = ANY (f.advertised))
-                        AND app_version IS NOT NULL
-                        AND NOT (app_version = ANY (f.versions))
-                      ORDER BY prio, run_after
-                      LIMIT $2
-                 ) j
-            )
-            SELECT queue, reason, live_workers, max_ceiling, advertised,
-                   versions,
-                   count(*)::int                              AS blocked_count,
-                   (array_agg(id ORDER BY prio, id))[1:$3::int]
-                                                              AS sample_job_ids,
-                   min(prio)                                  AS lowest_prio,
-                   max(prio)                                  AS highest_prio,
-                   coalesce(array_agg(DISTINCT capability)
-                                FILTER (WHERE capability IS NOT NULL),
-                            '{}'::text[])                     AS missing_caps,
-                   coalesce(array_agg(DISTINCT app_version)
-                                FILTER (WHERE app_version IS NOT NULL),
-                            '{}'::text[])                     AS missing_versions
-              FROM blocked
-             GROUP BY queue, reason, live_workers, max_ceiling, advertised,
-                      versions
-             -- Ordered by UNCLAIMABLE_REASONS itself, not alphabetically:
-             -- that tuple IS the precedence the arms above are disjoint by,
-             -- and reporting in a different order than the one the disjointness
-             -- rule is written in is how the two drift apart.
-             ORDER BY queue, array_position($4::text[], reason)
-            """,
+            UNCLAIMABLE_JOBS_SQL,
             stale_after_seconds,
             scan_limit,
             sample_limit,
             list(UNCLAIMABLE_REASONS),
         )
-
         report: list[dict[str, Any]] = []
         for row in rows:
             reason: str = row["reason"]

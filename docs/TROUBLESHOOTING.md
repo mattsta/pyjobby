@@ -19,12 +19,13 @@ gate, and a deploy smoke test. Run it before reading logs.
 $ pj-admin --dsn "$PYJOBBY_DSN" doctor
 PASS database: connected
 PASS schema: installed, migrations current (baseline)
-PASS triggers: all schema triggers present (7)
+PASS triggers: all schema triggers present (8)
 PASS notify-queue: 0.0% full
 WARN workers: no live workers seen in last 60s
 PASS job-threads: 0 live worker(s) claiming
 PASS queue q_reports: depth 1, oldest runnable 51m
 PASS partition-limits: every queue with partition_limits has a limit to scope
+PASS backfill: every enabled schedule's backfill_limit fits its max_concurrent_jobs
 PASS unclaimable: no queued job is invisible to its queue's live workers
 PASS blocked-waiters: no waiting jobs blocked on failed upstreams
 PASS mailbox: no unread mail older than a day
@@ -48,6 +49,7 @@ all" is a WARN, so one worker of ten refusing to claim cannot be graver.
 | `job-threads`     | live workers that claim nothing                                                                                                                                                          | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing)  |
 | `queue <name>`    | backlog past `--max-depth` (10000) or `--max-age-minutes` (60)                                                                                                                           | [The backlog is growing](#the-backlog-is-growing)                                         |
 | `partition-limits` | a queue sets `partition_limits` with neither `max_concurrency` nor `rate_limit`, so there is nothing to re-scope and every lane is unlimited — the flag reads as tenant isolation and delivers none                                                       | [One partition is backed up](#one-partition-is-backed-up-and-the-rest-of-the-queue-is-fine) |
+| `backfill`        | an enabled schedule's `backfill_limit` cannot land in full: a backfilled tick is refused by `max_concurrent_jobs` exactly like an on-time one, and the currently-due tick already holds a slot, so landing N of them needs `max_concurrent_jobs` ≥ N + 1 (at the default cap of 1, ANY `backfill_limit` catches up on nothing) | [A schedule is not firing](#a-schedule-is-not-firing)                                     |
 | `unclaimable`     | queued, runnable jobs that no live worker on their queue could ever claim — above every ceiling, wanting a capability nobody advertises, or pinned to an `app_version` nobody advertises | [Jobs sit queued forever](#jobs-sit-queued-forever-and-nothing-is-wrong-with-the-workers) |
 | `blocked-waiters` | jobs in `waiting` whose upstream crashed or was cancelled — the monitor leaves them alone, so this is the only place they show up                                                        | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq)                               |
 | `mailbox`         | unread durable mail older than a day — usually a sender using a topic nothing `recv()`s                                                                                                  | [STATECHARTS.md § Waiting](STATECHARTS.md#waiting)                                        |
@@ -65,9 +67,16 @@ draining is fine; an old queue is not. Tune the thresholds per install with
 | One named job is not running                                  | `pj-admin jobs why ID`, then [Nothing is being claimed](#nothing-is-being-claimed)          |
 | Jobs sit in `queued`, workers look idle                       | [Nothing is being claimed](#nothing-is-being-claimed)                                       |
 | Jobs sit queued forever and the workers are fine              | [Jobs sit queued forever](#jobs-sit-queued-forever-and-nothing-is-wrong-with-the-workers)   |
+| `jobs why` says `app_version_unmet`                           | [Jobs sit queued forever](#jobs-sit-queued-forever-and-nothing-is-wrong-with-the-workers)   |
 | A worker heartbeats but never claims                          | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing)    |
 | Queue depth or age climbing                                   | [The backlog is growing](#the-backlog-is-growing)                                           |
+| A debounced job looks stuck — `run_after` keeps moving        | [Nothing is being claimed § `run_after`](#nothing-is-being-claimed)                         |
 | One tenant's jobs pile up while the rest of the queue drains  | [One partition is backed up](#one-partition-is-backed-up-and-the-rest-of-the-queue-is-fine) |
+| `partition_limits` is on and nothing is being limited         | [One partition is backed up](#one-partition-is-backed-up-and-the-rest-of-the-queue-is-fine) |
+| A stream reader never ends                                    | [A stream reader hangs](#a-stream-reader-hangs-or-a-job-dies-on-a-closed-stream)            |
+| `StreamClosedError` in the DLQ                                | [A stream reader hangs](#a-stream-reader-hangs-or-a-job-dies-on-a-closed-stream)            |
+| A finished job's stream came back empty                       | [A stream reader hangs](#a-stream-reader-hangs-or-a-job-dies-on-a-closed-stream)            |
+| An enqueue returned an old, already-finished job              | [An enqueue returned an old job](#an-enqueue-returned-an-old-already-finished-job)          |
 | The table grows even though retention is on                   | [Retention is falling behind](#retention-is-falling-behind)                                 |
 | Enqueues start failing platform-wide                          | [NOTIFY queue saturation](#notify-queue-saturation)                                         |
 | A cron schedule stopped running                               | [A schedule is not firing](#a-schedule-is-not-firing)                                       |
@@ -413,6 +422,37 @@ silent about it deliberately: it is claimed the instant the lane lets go, so
 reporting it would drown the sweep that finds work no worker can _ever_
 claim.
 
+### The opposite shape: `partition_limits` on, and nothing limited
+
+```
+WARN partition-limits: 1 queue(s) set partition_limits with neither
+max_concurrency nor rate_limit, so there is nothing to re-scope and every
+lane is unlimited: ingest. ...
+```
+
+This is the failure the section above cannot show you, because nothing is
+backed up: **`partition_limits` caps nothing on its own.** It is not a
+limit, it is a **scope** — it makes `max_concurrency` and `rate_limit` count
+per distinct `partition_key` instead of per queue. Set with neither of them,
+there is nothing to re-scope: every lane is unlimited, one tenant can take
+the whole queue, and the deployment believes tenants are isolated.
+
+Nothing else reveals it. `queues show` prints `Partition Limits: yes` and is
+telling the truth about the column; `queues list` and `queues stats` print
+`-` for both limits, which reads as "no cap here" rather than "the isolation
+you configured is inert". Only `doctor` puts the two facts side by side.
+
+Two fixes, and which one is right depends on what was meant:
+
+```bash
+pj-admin queues limits ingest --max-concurrency 8   # give it a limit to scope
+pj-admin queues limits ingest --no-partition-limits # or drop the scope
+```
+
+`queues limits ... --partition-limits` on a queue with neither limit set
+says so at the time, too — the command reports that it changed the scope and
+added no cap, rather than leaving you to notice.
+
 ## A worker is alive, heartbeating, and doing nothing
 
 The worst shape of outage there is: on liveness alone this worker is
@@ -519,8 +559,8 @@ The queue drains only as fast as the **slowest connected listener**, so the
 cause is almost always a consumer that stopped reading — a wedged
 dashboard, a stuck `pj-ws`, an abandoned `LISTEN` session. Find it in
 `pg_stat_activity` and end it. There is no channel to turn off for relief:
-all five remaining channels are load-bearing, and four of them are already
-demand-gated (an unobserved job emits none). The fifth,
+all six remaining channels are load-bearing, and five of them are already
+demand-gated (an unobserved job emits none). The sixth,
 `schedule_executed`, is **ungated on purpose** — its consumer, the
 websocket dashboard, has no polling fallback, so a gate would drop events
 rather than delay them — and it costs nothing here, because it fires once
@@ -529,7 +569,7 @@ job hot path. Full argument:
 [SCALE.md § NOTIFY queue saturation](SCALE.md#3-notify-queue-saturation--the-cliff).
 
 A missing trigger is the opposite failure and `doctor` checks it
-separately, by name, over all seven the schema installs — the five NOTIFY
+separately, by name, over all eight the schema installs — the six NOTIFY
 triggers plus `jorb_history_record` and `jorb_dag_complete`. Nothing raises
 when one goes missing: waiters silently degrade to their polling fallback,
 or the audit trail silently stops being written. `FAIL triggers` names the
@@ -714,6 +754,110 @@ Note that a re-run you asked for is a separate verb precisely because it
 repeats side effects: `jobs retry` refuses a finished job, `jobs rerun`
 accepts one. See
 [OPERATIONS.md § Retry, re-run, fork](OPERATIONS.md#retry-re-run-fork).
+
+---
+
+## An enqueue returned an old, already-finished job
+
+The quietest failure on the enqueue side, and the mirror image of the one
+above: nothing raised, nothing warned, you were handed a job id — and it is
+the id of a job that ran last Tuesday. `enqueue(..., identity_key=K)`
+promises **at most one row per key, in any state**, so a key that some
+earlier call already used does not create a second job; it returns the first
+one. If your code then waits on that id it gets last Tuesday's result
+immediately, and if it checks the state it finds `finished` before the work
+it just asked for has happened at all.
+
+Confirm it in one call, before doing anything else:
+
+```python
+existing = await client.get_job_by_identity("nightly-rebuild")
+# JobInfo(id=91, state='finished', finished=<last Tuesday>, ...) or None
+```
+
+`None` means the key is free and the enqueue really did create the job. A
+`JobInfo` means the key is taken, and its `state` and `finished` say by
+what.
+
+The fix in the calling code is to stop guessing which of the two happened:
+
+```python
+job_id, created = await client.enqueue_identified(
+    "myapp.jobs.Rebuild", identity_key="nightly-rebuild"
+)
+if not created:
+    log.info("rebuild %s was already under way (or done) as job %s", ..., job_id)
+```
+
+`enqueue_identified` returns exactly the same job id as `enqueue` would; the
+only difference is that it also tells you whether **this** call is the one
+that created it. The plain `enqueue` returns a bare int because most callers
+do not care — but the id alone can never distinguish the two, because both
+outcomes return the same one.
+
+Then fix the key. An `identity_key` never re-arms while its row exists, so
+a key that names a recurring piece of work (`nightly-rebuild`) is claimed by
+the first run **forever**, or until retention reaps it — which is the other
+half of the surprise: the promise is at most once _for as long as the row
+survives_ (`--retention-days`), so the same key comes back to life on
+retention's schedule rather than never. Scope keys to a time or an object
+you can name — `nightly-rebuild:2026-07-29`, `order:4711:ship` — and the
+question stops arising. `pj-admin jobs inspect ID` prints `Identity:` for
+exactly this reason: it is the field that says re-submitting the work will
+not produce a new job. See
+[CLIENT_LIBRARY.md § At-most-once work](CLIENT_LIBRARY.md#4b-at-most-once-work-identity-keys).
+
+If what you wanted was "collapse duplicates that have not started yet, and
+re-arm once one is claimed", that is `deadline_key`; if it was "collapse a
+burst into one run with the latest arguments", that is `client.debounce()`.
+Both are in the list in the previous section.
+
+## A stream reader hangs, or a job dies on a closed stream
+
+Durable streams (`self.stream_write` / `client.read_stream`) have three
+failure shapes and they look nothing alike.
+
+**The reader never ends.** `async for row in client.read_stream(id, key)`
+stops on the first of two things: the closing marker that
+`stream_close(key)` writes, or the job reaching a terminal state. A job that
+never calls `stream_close` **and** never terminates satisfies neither, so
+the reader waits — correctly, and forever. That is not a hang in the reader,
+it is a job that has not finished; check the job first:
+
+```bash
+pj-admin jobs why ID       # running? deferred? waiting on something?
+pj-admin jobs steps ID     # what it has completed
+```
+
+A long-lived durable machine is the usual case, and the answer is to bound
+the read rather than the job: `asyncio.timeout()` around the loop. A stream
+has no deadline of its own because the job's is the real one. Note the
+second stop condition covers cancels and timeouts: a terminal job's stream
+is over whether or not it was closed, and one final read happens after the
+terminal state is observed, so a row committed just before the end is still
+delivered.
+
+**`StreamClosedError` in the DLQ.** The job appended to a stream it had
+already closed, or closed the same key twice. It is recorded as a step
+failure and consumes the job's retry budget exactly like any other raise,
+so the symptom is a job that retries a few times and then dead-letters with
+that error naming the job and the key. It is deliberately not idempotent: a
+second `stream_close` is not a retry — the marker's own checkpoint
+fast-forwards on replay — it is two call sites both believing they own the
+end of the stream, and an append after the marker lands where no reader will
+ever look. Fix the call site; there is no flag.
+
+**A finished job's stream came back empty.** Stream rows are reaped on the
+**checkpoint** window, not the job window: `jorb_stream` rows of `finished`
+jobs older than `--checkpoint-retention-days` (default **1 day**) are
+deleted while the job row itself stays for `--retention-days` (default 30).
+So a job that succeeded last week still has its row, its result and its
+history, and no stream at all — a stream exists to be read _while the job
+runs_, and every reader stops at the terminal state anyway. If a stream's
+contents are part of the answer rather than progress reporting, return them
+(or a pointer to them) as the job's `result`, which lives on the job window.
+`crashed` and `cancelled` jobs keep their streams until the whole row ages
+out, because a retry resumes from those rows.
 
 ---
 

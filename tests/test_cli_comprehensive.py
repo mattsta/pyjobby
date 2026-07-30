@@ -852,6 +852,55 @@ class TestQueuesCommands:
             assert result.exit_code == 0
             mock_admin_api.queue_stats.assert_called()
 
+    def test_queues_stats_marks_a_partitioned_queues_limits_per_lane(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        """The Limits cell is the one place the two numbers appear NEXT TO the
+        counts they govern, so it is the place the scope matters most.
+
+        `queues list` carried "/lane" and this row did not, which is worse
+        than neither carrying it: the row prints ``Running 40`` and
+        ``conc=4`` side by side, and an operator reading a limit that appears
+        to have been blown by a factor of ten goes debugging the claim path
+        instead of counting lanes.
+        """
+        mock_admin_api.queue_stats.return_value = [
+            {
+                **mock_admin_api.queue_stats.return_value[0],
+                "queue": "ingest",
+                "max_concurrency": 4,
+                "rate_limit": 10,
+                "rate_period_seconds": 60.0,
+                "partition_limits": True,
+            },
+        ]
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(cli, ["--config", "test.py", "queues", "stats"])
+
+            assert result.exit_code == 0, result.output
+            assert "conc=4 /lane" in result.output
+            assert "rate=10/60s /lane" in result.output
+
+    def test_queues_stats_leaves_a_queue_wide_limit_unmarked(
+        self, cli_runner, mock_admin_api, mock_db_params
+    ):
+        """Queue-wide is the default scope; marking it would make the marker
+        noise rather than news."""
+        mock_admin_api.queue_stats.return_value = [
+            {
+                **mock_admin_api.queue_stats.return_value[0],
+                "max_concurrency": 4,
+                "rate_limit": 10,
+                "partition_limits": False,
+            },
+        ]
+        with mock_cli_context(mock_admin_api, mock_db_params):
+            result = cli_runner.invoke(cli, ["--config", "test.py", "queues", "stats"])
+
+            assert result.exit_code == 0, result.output
+            assert "conc=4" in result.output
+            assert "/lane" not in result.output
+
     def test_queues_stats_json(self, cli_runner, mock_admin_api, mock_db_params):
         """--json is the per-queue stat records, verbatim: a dashboard reads
         the counts out of it."""
@@ -1511,6 +1560,65 @@ class TestHelperFunctions:
         data_row = capsys.readouterr().out.splitlines()[2]
         assert "xxx" in data_row
         assert "\x1b[92m" not in data_row
+
+    def test_print_table_truncates_nothing_when_the_row_fits(self, capsys):
+        """The bug this rule replaced, in its plainest form.
+
+        Twelve columns of two or three characters is nothing like 80 columns
+        wide, and the old flat ``max_width // len(headers)`` cap cut every one
+        of them to six anyway -- headers included. Width is only ever taken
+        back from a row that does not fit.
+        """
+        from pyjobby.cli import print_table
+
+        headers = ["Queue", "Paused", "Queued", "Running", "Limits"]
+        rows = [["orders", "no", "3", "1", "conc=5, rate=10/60s /lane"]]
+        print_table(headers, rows, max_width=80)
+
+        lines = capsys.readouterr().out.splitlines()
+        for header in headers:
+            assert header in lines[0]
+        for cell in rows[0]:
+            assert cell in lines[2]
+
+    def test_print_table_never_truncates_a_header(self, capsys):
+        """A cut header names no column.
+
+        ``Scheduled`` came out as ``Sched`` on `queues stats`, which is not a
+        shorter label -- it is a different word. A column floors at its own
+        header even when that means the table overflows, because a table an
+        operator can read wide beats one they cannot read at all.
+        """
+        from pyjobby.cli import print_table
+
+        headers = ["Queue", "Scheduled", "Cancelled", "Limits"]
+        rows = [["q", "0", "0", "x" * 400]]
+        print_table(headers, rows, max_width=40)
+
+        lines = capsys.readouterr().out.splitlines()
+        for header in headers:
+            assert header in lines[0], lines[0]
+
+    def test_print_table_shrinks_the_widest_column_first(self, capsys):
+        """Overflow is paid for by whoever caused it.
+
+        One long cell beside three short ones must not cost the short ones
+        anything: they are already at or near their headers, and the row is
+        only too wide because of the one column that is.
+        """
+        from pyjobby.cli import print_table
+
+        headers = ["Queue", "Paused", "Limits"]
+        rows = [["orders", "no", "x" * 200]]
+        print_table(headers, rows, max_width=40)
+
+        lines = capsys.readouterr().out.splitlines()
+        data = lines[2]
+        # the two narrow columns are intact...
+        assert data.startswith("orders  no      ")
+        # ...and the whole row was brought inside the budget by the third
+        assert len(data) == 40
+        assert len(lines[0]) == 40
 
 
 # ============================================================================

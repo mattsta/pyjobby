@@ -68,32 +68,59 @@ def _fit(cell: str, width: int) -> str:
     return cell + " " * (width - len(plain))
 
 
+#: What ``print_table`` puts between two columns, and therefore the width the
+#: budget below has to reserve for each gap.
+_COLUMN_GAP = "  "
+
+
 def print_table(headers: list[str], rows: list[list[str]], max_width: int = 80) -> None:
-    """Print data as formatted table"""
+    """Print data as a formatted table, shrinking only what overflows.
+
+    Columns are sized to their widest VISIBLE cell, and nothing is truncated
+    while the whole row fits ``max_width``. When it does not, width is taken
+    back one character at a time from whichever column is currently widest,
+    and never below its HEADER -- a column narrower than the word above it is
+    unreadable in a way that no amount of saved space pays for.
+
+    The rule this replaced was a flat ``max_width // len(headers)`` cap
+    applied to every column whether or not the row overflowed at all. It cost
+    nothing to be wrong about the total width and everything to be wrong about
+    the distribution: `queues stats` has eleven numeric columns and one
+    ``Limits`` column that holds a sentence, so the sentence was cut to the
+    same fourteen characters as ``Cancelled`` -- on an 80-column budget the
+    real row was under 70 and needed no cutting whatsoever. Worse, headers
+    were cut too: ``Scheduled`` came out as ``Sched``.
+    """
     if not rows:
         print_warning("No data to display")
         return
 
-    # Calculate column widths from VISIBLE lengths
-    col_widths = [len(h) for h in headers]
+    # The narrowest a column may become, and the width it wants.
+    floors = [len(h) for h in headers]
+    col_widths = list(floors)
     for row in rows:
         for i, cell in enumerate(row):
             col_widths[i] = max(col_widths[i], len(_ANSI_SGR.sub("", str(cell))))
 
-    # Limit column widths to fit terminal
-    for i in range(len(col_widths)):
-        col_widths[i] = min(col_widths[i], max_width // len(headers))
+    # Everything left for the columns themselves once the gaps are paid for.
+    budget = max_width - len(_COLUMN_GAP) * (len(headers) - 1)
 
-    # Print header
-    header_row = "  ".join(
-        h[: col_widths[i]].ljust(col_widths[i]) for i, h in enumerate(headers)
-    )
+    # Take from the widest column, repeatedly, until it fits -- so the column
+    # that caused the overflow is the one that pays for it. A table whose
+    # HEADERS alone exceed the budget overflows instead: there is nothing left
+    # to give back, and a truncated header names no column at all.
+    while sum(col_widths) > budget:
+        shrinkable = [i for i, w in enumerate(col_widths) if w > floors[i]]
+        if not shrinkable:
+            break
+        col_widths[max(shrinkable, key=lambda i: col_widths[i])] -= 1
+
+    header_row = _COLUMN_GAP.join(h.ljust(col_widths[i]) for i, h in enumerate(headers))
     click.echo(f"{Colors.BOLD}{header_row}{Colors.ENDC}")
     click.echo("-" * len(header_row))
 
-    # Print rows
     for row in rows:
-        row_str = "  ".join(
+        row_str = _COLUMN_GAP.join(
             _fit(str(cell), col_widths[i]) for i, cell in enumerate(row)
         )
         click.echo(row_str)

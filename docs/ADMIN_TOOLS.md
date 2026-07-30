@@ -178,7 +178,7 @@ A live platform, idle:
 $ pj-admin --dsn "$PYJOBBY_DSN" doctor
 PASS database: connected
 PASS schema: installed, migrations current (baseline)
-PASS triggers: all schema triggers present (7)
+PASS triggers: all schema triggers present (8)
 PASS notify-queue: 0.0% full
 WARN workers: no live workers seen in last 60s
 PASS job-threads: 0 live worker(s) claiming
@@ -239,7 +239,7 @@ tell this database from one that never applied the migration at all.
 
 Triggers get their own check for the same reason the shape does: nothing
 raises when one is missing, the platform just quietly stops waking waiters
-or recording history. All seven the schema installs are checked by name.
+or recording history. All eight the schema installs are checked by name.
 
 ### The `unclaimable` check — work the fleet cannot see
 
@@ -376,8 +376,17 @@ Result:
 Optional fields appear only when the job has them. `Identity:` is one of
 them, and it is the one that changes what you can do next: a job holding an
 `identity_key` cannot be replaced by re-submitting the same work, because
-that enqueue returns this very job. `Forked From:` / `Forked Into:`,
+that enqueue returns this very job. `Debounce:` (with the window's `fires:`
+and `cap:` while the row can still be bounced, or `window: closed` once it
+has been claimed), `App Version:`, `Lane:`, `Forked From:` / `Forked Into:`,
 `Capability:`, `User ID:` and `Tags:` behave the same way.
+
+Three of those answer a question no other per-job view can. `Debounce:`
+explains a queued job whose `Run After` keeps moving — producers are still
+collapsing onto it. `App Version:` is why a healthy-looking queued job may
+be claimable by nobody. `Lane:` is the `partition_key` this job counts
+against, so on a queue with `partition_limits` it is what decides **which**
+cap is holding it — `queues show` names the scope but never the lanes.
 
 ```console
 $ pj-admin jobs inspect 48210
@@ -511,6 +520,7 @@ $ pj-admin jobs why 48821 --json
   "prio": 5000,
   "capability": null,
   "app_version": null,
+  "identity_key": null,
   "run_after": "2026-07-28T23:25:02.825604+00:00",
   "created": "2026-07-28T23:25:02.825604+00:00",
   "updated": "2026-07-28T23:25:02.825604+00:00",
@@ -804,7 +814,8 @@ maintenance  no      8         100         60s
 
 $ pj-admin queues stats
 Queue        Paused  Queued  Scheduled  Claimed  Running  Waiting  Finished  Crashed  Cancelled  Total  Limits
------------------------------------------------------------------------------------------------------------------------
+----------------------------------------------------------------------------------------------------------------------------
+ingest       no      0       0          0        0        0        0         0        0          0      conc=4 /lane
 maintenance  no      0       0          0        0        0        0         0        0          0      conc=8, rate=100/60s
 ```
 
@@ -812,14 +823,17 @@ Every state the `Total` sums has a column, so the row adds up: `Queued` is
 work claimable **now** and `Scheduled` is queued-but-deferred, the same split
 `/metrics` and the websocket dashboard report.
 
-The **`/lane` suffix in `queues list` is the scope**, and it is load-bearing.
-A queue with `--partition-limits` counts both limits per `partition_key`, so
-a bare `4` against a queue running forty jobs reads as a limit that has
-stopped working — it is 4 per lane across ten lanes, doing exactly what it
-was set to do. It is printed on the number itself, the same way the web
-dashboard's queue table prints it and for the same reason `queues show`
-spells it out as `PER partition_key`: a limit must never be read out of
-scope.
+The **`/lane` suffix is the scope**, and it is load-bearing. A queue with
+`--partition-limits` counts both limits per `partition_key`, so a bare `4`
+against a queue running forty jobs reads as a limit that has stopped
+working — it is 4 per lane across ten lanes, doing exactly what it was set
+to do. It is printed on the number itself, the same way the web dashboard's
+queue table prints it and for the same reason `queues show` spells it out as
+`PER partition_key`: a limit must never be read out of scope.
+
+Both fleet-wide views carry it, and `queues stats` is where it matters most:
+its `Limits` cell sits on the same row as `Running`, so a per-lane cap
+printed bare is a cap that looks blown by the number right next to it.
 
 `queues clear QUEUE` deletes **queued and waiting** jobs — work that has not
 started — and prompts unless `-f/--force`, naming the states it is about to
@@ -1147,15 +1161,21 @@ pyjobby_job_duration_seconds       pyjobby_throughput_jobs_per_second
 pyjobby_arrival_jobs_per_second    pyjobby_retry_attempts_per_second
 pyjobby_dlq_jobs_per_second        pyjobby_notify_queue_usage_ratio
 pyjobby_workers_live               pyjobby_workers_not_claiming
-pyjobby_worker_job_threads_abandoned_max
+pyjobby_jobs_unclaimable           pyjobby_worker_job_threads_abandoned_max
 pyjobby_table_bytes                pyjobby_table_index_bytes
 pyjobby_table_total_bytes          pyjobby_table_live_tuples
 pyjobby_table_dead_tuples          pyjobby_table_dead_tuple_ratio
 ```
 
-The three worth alerting on first are `pyjobby_notify_queue_usage_ratio`,
-`pyjobby_queue_oldest_queued_seconds` (age, not depth) and
-`pyjobby_workers_not_claiming`.
+The four worth alerting on first are `pyjobby_notify_queue_usage_ratio`,
+`pyjobby_queue_oldest_queued_seconds` (age, not depth),
+`pyjobby_workers_not_claiming` and `pyjobby_jobs_unclaimable`. The last is
+labelled `(queue, reason)` and is the **only** series that goes non-zero for
+stranded work — a job above every live worker's ceiling, wanting a
+capability nobody advertises, or pinned to a build nobody runs never fails,
+never retries and never reaches the DLQ, so every other number here reads
+normal while it sits there. Alert on it above 0; it is the gauge form of
+[`doctor`'s `unclaimable` check](#the-unclaimable-check--work-the-fleet-cannot-see).
 
 For the realtime feed — `pj-ws`, its protocol and its dashboard — see
 [WEBSOCKET_DASHBOARD.md](WEBSOCKET_DASHBOARD.md). It is unauthenticated

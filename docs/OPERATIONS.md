@@ -65,11 +65,12 @@ pj-admin --dsn "$PYJOBBY_DSN" doctor [--max-depth 10000] [--max-age-minutes 60]
 ```
 
 Checks (FAIL exits nonzero; WARN does not): database reachable, the schema's
-**shape** against the manifest of objects this release addresses, all seven
+**shape** against the manifest of objects this release addresses, all eight
 schema triggers present by name, NOTIFY queue saturation, live workers seen
 in the last 60s, workers that are alive but claiming nothing, per-queue
 depth and oldest-runnable age, queues that set `partition_limits` with
-neither limit for it to re-scope, jobs no live worker on their queue could
+neither limit for it to re-scope, enabled schedules whose `backfill_limit`
+cannot land in full, jobs no live worker on their queue could
 ever claim, waiters blocked on a crashed or cancelled
 upstream, unread durable mail older than a day, DLQ size, overdue
 schedules. Run it from cron/CI
@@ -80,12 +81,13 @@ Prometheus.
 $ pj-admin --dsn "$PYJOBBY_DSN" doctor
 PASS database: connected
 PASS schema: installed, migrations current (baseline)
-PASS triggers: all schema triggers present (7)
+PASS triggers: all schema triggers present (8)
 PASS notify-queue: 0.0% full
 WARN workers: no live workers seen in last 60s
 PASS job-threads: 0 live worker(s) claiming
 PASS queues: no queued jobs
 PASS partition-limits: every queue with partition_limits has a limit to scope
+PASS backfill: every enabled schedule's backfill_limit fits its max_concurrent_jobs
 PASS unclaimable: no queued job is invisible to its queue's live workers
 PASS blocked-waiters: no waiting jobs blocked on failed upstreams
 PASS mailbox: no unread mail older than a day
@@ -272,7 +274,7 @@ jumps the queue, 900 is background work. Every worker also has a **ceiling**
 A priority above every live worker's ceiling is therefore not "very low
 priority", it is **unclaimable**: the job is never claimed, never runs, never
 fails, never retries, never reaches the DLQ, and no age-based check sees it,
-because none of them look at `queued`. It simply sits there. Three things
+because none of them look at `queued`. It simply sits there. Four things
 stop that happening quietly:
 
 - **`doctor` sweeps for it.** `WARN unclaimable` counts, per queue, the
@@ -356,10 +358,11 @@ not, unless asked: forking is how work is re-run under _new_ code. Schedule
 firings are never pinned.
 
 A job pinned to a build nobody runs is unclaimable in exactly the way a job
-above every ceiling is, and the same three things stop it happening quietly:
+above every ceiling is, and the same four things stop it happening quietly:
 `doctor`'s `WARN unclaimable` counts them per queue and names the versions the
-fleet _does_ advertise, `pj-admin jobs why ID` answers `app_version_unmet` with
-those numbers, and an idle worker logs it at most once a minute:
+fleet _does_ advertise, `pyjobby_jobs_unclaimable{queue,reason}` carries that
+same count on the scrape, `pj-admin jobs why ID` answers `app_version_unmet`
+with those numbers, and an idle worker logs it at most once a minute:
 
 ```
 [default:1000] 3 runnable job(s) on this queue are PINNED to an app version this

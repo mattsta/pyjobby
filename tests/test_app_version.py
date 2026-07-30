@@ -33,6 +33,7 @@ What this file pins, in the order the claim path meets it:
 from __future__ import annotations
 
 import pytest
+from loguru import logger
 
 from pyjobby.admin_api import AdminAPI
 from pyjobby.client import (
@@ -739,6 +740,30 @@ class TestConfigDeclaration:
         """
         assert resolve_app_version(unusable, None) is None
         assert resolve_app_version(None, unusable) is None
+
+    async def test_the_warning_names_the_reason_the_version_was_refused(self):
+        """The whole value of warning instead of exiting is the message.
+
+        A fleet that came up unpinned prints ONE line about it, and that line
+        has to say which of the three rules the version broke -- too long, not
+        a string, blank -- because the operator's next move is different for
+        each. It was written printf-style (``"... (%s)", refused``) and loguru
+        formats with ``str.format``, so the placeholder rendered literally and
+        the reason never reached the log at all: the line said a version was
+        refused and would not say why.
+        """
+        said: list[str] = []
+        sink = logger.add(said.append, level="WARNING", format="{message}")
+        try:
+            assert resolve_app_version("v" * (MAX_APP_VERSION_LENGTH + 1), None) is None
+        finally:
+            logger.remove(sink)
+
+        assert len(said) == 1, said
+        assert "%s" not in said[0], said[0]
+        # the reason, verbatim from the enqueue side's own refusal
+        assert str(MAX_APP_VERSION_LENGTH) in said[0], said[0]
+        assert "app_version" in said[0], said[0]
 
     async def test_a_usable_version_is_still_advertised_verbatim(self):
         """The positive control: the refusals above must not have turned into

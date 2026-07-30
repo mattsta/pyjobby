@@ -54,13 +54,50 @@ from pyjobby.monitor import (
 )
 from pyjobby.pj import STMTS
 
-#: `SET state = 'x'` — what a statement moves a job TO.
-_WRITES_STATE = re.compile(r"SET\s+state\s*=\s*'(\w+)'", re.IGNORECASE)
+#: An UPDATE's SET list: everything from `SET` to the clause that ends it.
+#:
+#: Extracted first, and the state assignment looked for INSIDE it, because
+#: `state` is not always the first thing an UPDATE sets. The pattern used to be
+#: `SET\s+state\s*=\s*'(\w+)'`, anchored to the word after SET -- so a
+#: statement written `SET updated = now(), state = 'queued'` was read as
+#: writing NO state at all, dropped silently out of the inventory below, and
+#: every transition-legality assertion in this file simply never saw it. An
+#: extractor whose failure mode is a smaller list is the worst kind of guard.
+_SET_LIST = re.compile(
+    r"\bSET\b(.*?)(?=\bWHERE\b|\bRETURNING\b|\bFROM\b|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+#: `state = 'x'` anywhere in a SET list — what a statement moves a job TO.
+_WRITES_STATE = re.compile(r"\bstate\s*=\s*'(\w+)'", re.IGNORECASE)
 
 #: `AND state = 'x'` or `AND state IN ('x', 'y')` — what it moves a job FROM.
 _GUARDS_STATE = re.compile(
     r"AND\s+state\s+(?:=\s*'(\w+)'|IN\s*\(([^)]*)\))", re.IGNORECASE
 )
+
+
+def transition_in(sql: str) -> tuple[frozenset[str], str] | None:
+    """The (sources, target) one statement implies, or None if it writes no
+    state. A function so the extractor itself can be fed a synthetic
+    statement and checked, rather than only ever being pointed at STMTS."""
+    target = None
+    for set_list in _SET_LIST.finditer(sql):
+        target = _WRITES_STATE.search(set_list.group(1))
+        if target is not None:
+            break
+    if target is None:
+        return None
+    guard = _GUARDS_STATE.search(sql)
+    if guard is None:
+        sources: frozenset[str] = frozenset()
+    elif guard.group(1):
+        sources = frozenset({guard.group(1)})
+    else:
+        sources = frozenset(
+            part.strip().strip("'") for part in guard.group(2).split(",")
+        )
+    return sources, target.group(1)
 
 
 def statement_transitions() -> dict[str, tuple[frozenset[str], str]]:
@@ -72,19 +109,9 @@ def statement_transitions() -> dict[str, tuple[frozenset[str], str]]:
     """
     found: dict[str, tuple[frozenset[str], str]] = {}
     for name, sql in STMTS.items():
-        target = _WRITES_STATE.search(sql)
-        if target is None:
-            continue
-        guard = _GUARDS_STATE.search(sql)
-        if guard is None:
-            sources: frozenset[str] = frozenset()
-        elif guard.group(1):
-            sources = frozenset({guard.group(1)})
-        else:
-            sources = frozenset(
-                part.strip().strip("'") for part in guard.group(2).split(",")
-            )
-        found[name] = (sources, target.group(1))
+        transition = transition_in(sql)
+        if transition is not None:
+            found[name] = transition
     return found
 
 
@@ -95,6 +122,29 @@ def test_the_extractor_finds_the_statements_that_change_state():
     assert {"run", "finished", "retry", "crashed", "cancelled"} <= set(found)
     assert found["run"] == (frozenset({"claimed", "running"}), "running")
     assert found["finished"] == (frozenset({"claimed", "running"}), "finished")
+
+
+def test_the_extractor_sees_a_state_written_anywhere_in_the_set_list():
+    """The failure that made the guard smaller than the thing it guards.
+
+    Every statement in STMTS today happens to write `state` first, so the
+    old anchored pattern found all of them and looked correct. The first one
+    written the other way round -- an ordinary, reviewable way to write an
+    UPDATE -- would have vanished from the inventory instead of failing, and
+    nothing would have said so. Fed synthetically because the point is
+    precisely that no real statement has this shape yet.
+    """
+    assert transition_in(
+        "UPDATE jorb SET updated = now(), state = 'queued' "
+        "WHERE id = $1 AND state IN ('crashed', 'cancelled') RETURNING id"
+    ) == (frozenset({"crashed", "cancelled"}), "queued")
+
+    # ...and the guard against the opposite failure: a WHERE-clause state test
+    # is not a state WRITE, so a pure read must still extract nothing.
+    assert transition_in("SELECT id FROM jorb WHERE state = 'queued'") is None
+    assert (
+        transition_in("UPDATE jorb SET awaited = FALSE WHERE state = 'running'") is None
+    )
 
 
 @pytest.mark.parametrize("statement", sorted(statement_transitions()))
