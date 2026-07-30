@@ -1115,8 +1115,8 @@ Declare it once for a deployment that pins everything, on the client or in the
 config file both halves already read:
 
 ```python
-client = JobClient(pool, app_version="2026.07.28+a1b2c3d")   # every enqueue
-client = await JobClient.from_config("./pyjobby.toml")       # app_version = "..."
+client = JobClient(pool, app_version="2026.07.28+a1b2c3d")  # every enqueue
+client = await JobClient.from_config("./pyjobby.toml")  # app_version = "..."
 ```
 
 A per-call `app_version=` overrides the client's, so a deployment that wants

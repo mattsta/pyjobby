@@ -24,18 +24,18 @@ class ChargeAndShip(Job):
         return {"charge": charge, "label": label, "note": note}
 ```
 
-| Primitive                                                      | Backing table           | What it guarantees                                                                                                                                                                                                                                           |
-| -------------------------------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `await self.step(name, fn, *a, **kw)`                          | `jorb_step`             | `fn` runs **at least once**; once its checkpoint commits it never runs again                                                                                                                                                                                 |
-| `await self.transaction(name, fn, *a, **kw)`                   | `jorb_step`             | **exactly once** for work `fn` does on the connection it is handed — that write and the checkpoint are one commit                                                                                                                                            |
-| `timeout=` on either of those (or `step_timeout` on the class) | `jorb_step`             | one step is bounded on its own; blowing the budget records a **timeout against that step** and retries the job                                                                                                                                               |
-| `await self.sleep(seconds)`                                    | `jorb_step`             | the job resumes after the delay **without occupying a worker**                                                                                                                                                                                               |
-| `await self.set_event(key, value)`                             | `jorb_event`            | a durable key/value another job or an operator can read                                                                                                                                                                                                      |
-| `await self.get_event(key)`                                    | `jorb_event`            | reads one back — this job's, or another's by id. **Not a step**: an event is durable state, so reading it is a query, and recording the answer would freeze the first value read into every later replay                                                     |
-| `await self.send(job_id, msg)` / `await self.recv(topic)`      | `jorb_mailbox`          | a durable mailbox, **exactly-once on both ends**: a send commits with its checkpoint (it runs through `transaction()`), and a recv consumes and checkpoints in one statement — no crash timing can deliver twice, consume twice, or eat a message unrecorded |
-| `await self.stream_write(key, value)` / `await self.stream_close(key)` | `jorb_stream`   | an ordered, durable output channel a client reads incrementally, **exactly-once per call site** — the row and its checkpoint are one commit, so a retry continues the stream instead of repeating it                                                       |
-| `await self.compact()`                                         | `jorb_step`             | discards this job's checkpoint log and restarts its step sequence, bounding replay for a job that lives indefinitely                                                                                                                                         |
-| `self.cancelled`                                               | `jorb.cancel_requested` | cooperative cancellation for long synchronous loops                                                                                                                                                                                                          |
+| Primitive                                                              | Backing table           | What it guarantees                                                                                                                                                                                                                                           |
+| ---------------------------------------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `await self.step(name, fn, *a, **kw)`                                  | `jorb_step`             | `fn` runs **at least once**; once its checkpoint commits it never runs again                                                                                                                                                                                 |
+| `await self.transaction(name, fn, *a, **kw)`                           | `jorb_step`             | **exactly once** for work `fn` does on the connection it is handed — that write and the checkpoint are one commit                                                                                                                                            |
+| `timeout=` on either of those (or `step_timeout` on the class)         | `jorb_step`             | one step is bounded on its own; blowing the budget records a **timeout against that step** and retries the job                                                                                                                                               |
+| `await self.sleep(seconds)`                                            | `jorb_step`             | the job resumes after the delay **without occupying a worker**                                                                                                                                                                                               |
+| `await self.set_event(key, value)`                                     | `jorb_event`            | a durable key/value another job or an operator can read                                                                                                                                                                                                      |
+| `await self.get_event(key)`                                            | `jorb_event`            | reads one back — this job's, or another's by id. **Not a step**: an event is durable state, so reading it is a query, and recording the answer would freeze the first value read into every later replay                                                     |
+| `await self.send(job_id, msg)` / `await self.recv(topic)`              | `jorb_mailbox`          | a durable mailbox, **exactly-once on both ends**: a send commits with its checkpoint (it runs through `transaction()`), and a recv consumes and checkpoints in one statement — no crash timing can deliver twice, consume twice, or eat a message unrecorded |
+| `await self.stream_write(key, value)` / `await self.stream_close(key)` | `jorb_stream`           | an ordered, durable output channel a client reads incrementally, **exactly-once per call site** — the row and its checkpoint are one commit, so a retry continues the stream instead of repeating it                                                         |
+| `await self.compact()`                                                 | `jorb_step`             | discards this job's checkpoint log and restarts its step sequence, bounding replay for a job that lives indefinitely                                                                                                                                         |
+| `self.cancelled`                                                       | `jorb.cancel_requested` | cooperative cancellation for long synchronous loops                                                                                                                                                                                                          |
 
 ---
 
@@ -672,13 +672,13 @@ copied and everything re-runs.
 
 ### What the new row inherits
 
-| Copied | Not copied |
-| --- | --- |
-| `job_class`, `kwargs` (or an override) | `deadline_key`, `identity_key`, `debounce_key` |
-| `queue`, `prio` (or overrides) | `schedule_id` |
-| `capability`, `tags` | `dag_id`, `run_group`, `waitfor_*` |
-| `uid`, `partition_key` | `app_version` (pass one to pin the fork) |
-| `admin_data` (retry/timeout policy) | `result`, error fields, `run_count`, `error_count` |
+| Copied                                 | Not copied                                         |
+| -------------------------------------- | -------------------------------------------------- |
+| `job_class`, `kwargs` (or an override) | `deadline_key`, `identity_key`, `debounce_key`     |
+| `queue`, `prio` (or overrides)         | `schedule_id`                                      |
+| `capability`, `tags`                   | `dag_id`, `run_group`, `waitfor_*`                 |
+| `uid`, `partition_key`                 | `app_version` (pass one to pin the fork)           |
+| `admin_data` (retry/timeout policy)    | `result`, error fields, `run_count`, `error_count` |
 
 The split is identity: everything that describes the **work**, or says
 **whose** it is, comes across — and nothing that names **this particular

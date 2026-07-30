@@ -319,9 +319,9 @@ Two things were measured, both gated in `pj-bench plans` against a seed of
 20,000 jobs spread over 8 lanes:
 
 - **The per-lane count** (`partition_lane_count`) — the `GROUP BY
-  partition_key` that runs inside the advisory lock. **2 buffers, 0 rows
+partition_key` that runs inside the advisory lock. **2 buffers, 0 rows
   discarded**: an index-only scan of `jorb_partition_inflight_idx (queue,
-  partition_key) WHERE state IN ('claimed','running')`, so it reads one
+partition_key) WHERE state IN ('claimed','running')`, so it reads one
   queue's in-flight rows and nothing else. That index is the cheapest one in
   the schema to keep — enqueue never touches it, because a `queued` row is
   not in it.

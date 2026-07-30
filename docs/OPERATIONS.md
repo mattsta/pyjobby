@@ -362,10 +362,10 @@ Retention is **on by default** (`--retention-days 30`) and runs in the
 monitor. Two windows, and the second one exists because checkpoints are the
 bulkiest rows in the system with the shortest useful life:
 
-| Window                            | Deletes                                                                                                                                                                                                                                                                                                                                        |
-| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Window                            | Deletes                                                                                                                                                                                                                                                                                                                                                 |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--retention-days` (30)           | terminal jobs — and with them, by cascade, their history, events, streams, mail and checkpoints — plus **the five tables no cascade reaches**: consumed mailbox rows of _live_ jobs, history rows of _live_ jobs (a durable machine that never terminates writes ~3 per wake, forever), emptied DAGs, schedule executions, retired worker registry rows |
-| `--checkpoint-retention-days` (1) | the `jorb_step` checkpoints **and `jorb_stream` rows** of terminal jobs, keeping the job row itself. Both are `finished`-only: a `crashed`/`cancelled` job is retryable, its retry fast-forwards completed checkpoints, and reaping either early would make the resumed job re-run steps or leave its stream missing what the first attempt wrote |
+| `--checkpoint-retention-days` (1) | the `jorb_step` checkpoints **and `jorb_stream` rows** of terminal jobs, keeping the job row itself. Both are `finished`-only: a `crashed`/`cancelled` job is retryable, its retry fast-forwards completed checkpoints, and reaping either early would make the resumed job re-run steps or leave its stream missing what the first attempt wrote       |
 
 `0` on either means keep forever; that sweep does not run at all.
 
@@ -558,11 +558,11 @@ What it costs is in [SCALE.md](SCALE.md#partitioned-claims-what-fairness-costs).
 Three verbs for "run this again", because they carry different risk. The
 first two reuse the job's row; the third does not.
 
-| Verb | Row | Starts from | For |
-| --- | --- | --- | --- |
-| `jobs retry ID` | **same** id | its checkpoints (resume) | a job that did _not_ succeed (`crashed`, `cancelled`) |
-| `jobs rerun ID` | **same** id | step 1 (or `--resume`) | any terminal job, **including a finished one** |
-| `jobs fork ID` | **NEW** id | `--from-step N` | any job in any state, when the re-run must not be the same job |
+| Verb            | Row         | Starts from              | For                                                            |
+| --------------- | ----------- | ------------------------ | -------------------------------------------------------------- |
+| `jobs retry ID` | **same** id | its checkpoints (resume) | a job that did _not_ succeed (`crashed`, `cancelled`)          |
+| `jobs rerun ID` | **same** id | step 1 (or `--resume`)   | any terminal job, **including a finished one**                 |
+| `jobs fork ID`  | **NEW** id  | `--from-step N`          | any job in any state, when the re-run must not be the same job |
 
 - **Retry** — `pj-admin jobs retry ID`, `pj-admin dlq retry ID`. Refuses a
   finished job: re-running successful work repeats its side effects, and

@@ -162,11 +162,11 @@ different things. Pick by what you want to be true, not by which name reads
 better — and the question that separates them is **what happens to the
 duplicate**.
 
-| Option         | Unique among            | A duplicate enqueue…                                                     |
-| -------------- | ----------------------- | ------------------------------------------------------------------------ |
-| `deadline_key` | `queued` rows, per queue | is **ignored** — it raises, and the pending job is untouched; the key re-arms once claimed |
-| `identity_key` | all rows, table-wide     | **returns the existing job** untouched: this exact work happens at most once, until retention reaps the row |
-| `debounce()`   | `queued` rows never claimed, table-wide | **moves the job** — later, and with the new arguments: the burst collapses into one run once it goes quiet |
+| Option         | Unique among                            | A duplicate enqueue…                                                                                        |
+| -------------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `deadline_key` | `queued` rows, per queue                | is **ignored** — it raises, and the pending job is untouched; the key re-arms once claimed                  |
+| `identity_key` | all rows, table-wide                    | **returns the existing job** untouched: this exact work happens at most once, until retention reaps the row |
+| `debounce()`   | `queued` rows never claimed, table-wide | **moves the job** — later, and with the new arguments: the burst collapses into one run once it goes quiet  |
 
 **`deadline_key` collapses, then re-arms.** The unique index covers queued
 rows only, so while a job sits in the queue a duplicate submission raises
@@ -217,7 +217,7 @@ retention window on purpose — because the work genuinely recurs — you wanted
 **`debounce()` collapses a burst, and runs the freshest arguments.** The
 other two leave the pending job alone; this one changes it. Each call parks
 one job `period` seconds out and every duplicate while it is still queued
-pushes `run_after` further out *and replaces the row's kwargs*, so what
+pushes `run_after` further out _and replaces the row's kwargs_, so what
 finally runs is a single job carrying the arguments of the last call. That
 is right for work whose input is a moving target: re-index this document,
 recompute this cart, reload the config that just changed nine times.
@@ -231,7 +231,7 @@ job_id, created = await client.debounce(
     period=5.0,
     cap=30.0,
     doc_id=doc_id,
-    revision=revision,   # the LAST revision is the one indexed
+    revision=revision,  # the LAST revision is the one indexed
 )
 ```
 
@@ -470,7 +470,7 @@ async for row in client.read_stream(job_id, "rows"):
 
 Each call site appends **exactly once** across every attempt — the row and
 its checkpoint are one commit — so a job that streams half its rows and then
-crashes streams the *rest* on the retry rather than repeating what it already
+crashes streams the _rest_ on the retry rather than repeating what it already
 sent. That is what makes the loop above safe to retry, and it is also why the
 loop's LENGTH must be deterministic: `rows` comes from a checkpointed
 `step()`, so the retry sees the same list and the same call sequence.

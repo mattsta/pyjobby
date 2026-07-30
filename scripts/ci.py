@@ -181,9 +181,9 @@ def fetch_run(run_id: int) -> tuple[Run, dict[str, list[str]]]:
         for name in archive.namelist():
             match = re.fullmatch(r"\d+_(.+)\.txt", name)
             if match:
-                job_logs[match.group(1)] = archive.read(name).decode(
-                    errors="replace"
-                ).splitlines()
+                job_logs[match.group(1)] = (
+                    archive.read(name).decode(errors="replace").splitlines()
+                )
 
         for job_name, step_name, started, ended in failed_steps:
             window = [
@@ -219,9 +219,12 @@ def parse_step(step_name: str, lines: list[str]) -> FailedStep:
             continue
         if in_summary and line.startswith("="):
             in_summary = False
-        if in_summary and line.strip():
-            parsed.signatures.append(line.rstrip())
-        elif SIGNATURE.search(line) and not NOISE.search(line):
+        if (
+            in_summary
+            and line.strip()
+            or SIGNATURE.search(line)
+            and not NOISE.search(line)
+        ):
             parsed.signatures.append(line.rstrip())
 
     clean = [ln.rstrip() for ln in lines if ln.strip() and not NOISE.search(ln)]

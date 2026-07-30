@@ -212,30 +212,30 @@ jorb_history; pj-monitor reaps timeouts and jobs of dead workers
 
 ## Database Schema Summary
 
-| Column            | Purpose                                                                                                                                                           |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`              | Primary key                                                                                                                                                       |
-| `queue`           | Route jobs to specific workers                                                                                                                                    |
-| `capability`      | A worker must advertise this to claim the job; NULL means anyone may                                                                                              |
-| `app_version`     | Pin the job's remaining work to one build — only a worker advertising the same version claims it; NULL (the default) means any worker may                          |
-| `state`           | Current status (queued → claimed → running → finished/crashed)                                                                                                    |
-| `prio`            | Priority as a finishing position: the **smallest** number is claimed first, and each worker claims only `prio <=` its own ceiling (`pj --max-prio`, default 1000) |
-| `run_after`       | Minimum start time                                                                                                                                                |
-| `job_class`       | Python class path                                                                                                                                                 |
-| `kwargs`          | Arguments (JSONB)                                                                                                                                                 |
-| `result`          | Return value (JSONB)                                                                                                                                              |
-| `error_backtrace` | Stack trace on failure                                                                                                                                            |
-| `waitfor_job`     | Dependency on specific job                                                                                                                                        |
-| `waitfor_group`   | Dependency on job group                                                                                                                                           |
-| `run_group`       | Group identifier for this job                                                                                                                                     |
-| `deadline_key`    | Unique key for singleton scheduling — among `queued` rows only, so it re-arms once the job is claimed                                                              |
-| `identity_key`    | Caller-chosen at-most-once identity — unique in every state, for as long as retention keeps the row                                                                |
-| `debounce_key`    | Caller-chosen name for a burst collapsed onto this row — unique among `queued` rows never claimed, so it is released for good when a worker claims the job          |
+| Column              | Purpose                                                                                                                                                           |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`                | Primary key                                                                                                                                                       |
+| `queue`             | Route jobs to specific workers                                                                                                                                    |
+| `capability`        | A worker must advertise this to claim the job; NULL means anyone may                                                                                              |
+| `app_version`       | Pin the job's remaining work to one build — only a worker advertising the same version claims it; NULL (the default) means any worker may                         |
+| `state`             | Current status (queued → claimed → running → finished/crashed)                                                                                                    |
+| `prio`              | Priority as a finishing position: the **smallest** number is claimed first, and each worker claims only `prio <=` its own ceiling (`pj --max-prio`, default 1000) |
+| `run_after`         | Minimum start time                                                                                                                                                |
+| `job_class`         | Python class path                                                                                                                                                 |
+| `kwargs`            | Arguments (JSONB)                                                                                                                                                 |
+| `result`            | Return value (JSONB)                                                                                                                                              |
+| `error_backtrace`   | Stack trace on failure                                                                                                                                            |
+| `waitfor_job`       | Dependency on specific job                                                                                                                                        |
+| `waitfor_group`     | Dependency on job group                                                                                                                                           |
+| `run_group`         | Group identifier for this job                                                                                                                                     |
+| `deadline_key`      | Unique key for singleton scheduling — among `queued` rows only, so it re-arms once the job is claimed                                                             |
+| `identity_key`      | Caller-chosen at-most-once identity — unique in every state, for as long as retention keeps the row                                                               |
+| `debounce_key`      | Caller-chosen name for a burst collapsed onto this row — unique among `queued` rows never claimed, so it is released for good when a worker claims the job        |
 | `debounce_deadline` | The ceiling a bounce may not defer that row past, set by the first call of the burst; NULL when the caller asked for no cap                                       |
-| `partition_key`   | The caller's fair-share lane (a tenant, a customer): inert until the queue sets `jorb_queue.partition_limits`, and then the queue's limits count per lane          |
-| `schedule_id`     | The `jorb_schedule` row that fired this job; NULL for every direct enqueue                                                                                         |
-| `forked_from`     | The job this one was forked from — lineage only, `ON DELETE SET NULL`, so a fork outlives the source retention reaps                                               |
-| `tags`            | The caller's own labels, indexed for `search_jobs()` and `pj-admin jobs list --tag`                                                                                |
+| `partition_key`     | The caller's fair-share lane (a tenant, a customer): inert until the queue sets `jorb_queue.partition_limits`, and then the queue's limits count per lane         |
+| `schedule_id`       | The `jorb_schedule` row that fired this job; NULL for every direct enqueue                                                                                        |
+| `forked_from`       | The job this one was forked from — lineage only, `ON DELETE SET NULL`, so a fork outlives the source retention reaps                                              |
+| `tags`              | The caller's own labels, indexed for `search_jobs()` and `pj-admin jobs list --tag`                                                                               |
 
 ## Example Workflows
 

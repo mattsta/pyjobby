@@ -245,10 +245,10 @@ The fleet-wide sweep for the condition
 that is `queued`, due, and that **no live worker on its queue could ever
 claim**. Three ways in, and the check names which one, per queue:
 
-| Cause                  | The line says                                                   | Fix                                                                                     |
-| ---------------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `above_worker_ceiling` | `N on 'queue' above every live worker's ceiling (prio …)`       | `pj --max-prio` higher, or `pj-admin jobs set-priority ID N` lower                      |
-| `capability_unmet`     | `N on 'queue' needing capability 'x', which none … advertises`  | start a worker with `pj --queue Q --cap x`                                              |
+| Cause                  | The line says                                                   | Fix                                                                                    |
+| ---------------------- | --------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `above_worker_ceiling` | `N on 'queue' above every live worker's ceiling (prio …)`       | `pj --max-prio` higher, or `pj-admin jobs set-priority ID N` lower                     |
+| `capability_unmet`     | `N on 'queue' needing capability 'x', which none … advertises`  | start a worker with `pj --queue Q --cap x`                                             |
 | `app_version_unmet`    | `N on 'queue' needing app version 'x', which none … advertises` | start a worker with `pj --queue Q --app-version x`, or `pj-admin jobs set-app-version` |
 
 The causes are **disjoint**, in that order: a job that trips more than one is
@@ -483,7 +483,7 @@ indented block below it are the same answer for a human. Every reason:
 | `no_live_workers`                    | Nothing is on that queue — read the queue, not the fleet total.                                                                               |
 | `above_worker_ceiling`               | The job's `prio` is above every live worker's `--max-prio`.                                                                                   |
 | `capability_unmet`                   | No live worker on the queue advertises the capability, and the answer names what they _do_ advertise.                                         |
-| `app_version_unmet`                  | The job is pinned to an `app_version` no live worker on the queue advertises; the answer names the versions they _do_ run.                     |
+| `app_version_unmet`                  | The job is pinned to an `app_version` no live worker on the queue advertises; the answer names the versions they _do_ run.                    |
 | `queue_at_max_concurrency`           | In-flight count against the cap.                                                                                                              |
 | `rate_limited`                       | Admissions in the window against the limit.                                                                                                   |
 | `claimable`                          | Nothing declines it: how many claimable jobs sort ahead of it in claim order (`prio`, then `run_after`).                                      |

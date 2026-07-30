@@ -346,7 +346,7 @@ $ pj-admin schedule history hourly-rollup --result skipped --json
 One row and not one per dropped tick: a per-second schedule down for a day
 misses 86,400 of them, and describing an outage must not become its own denial
 of service. The scheduler logs the same sentence at `WARNING`. It is there so
-that a bound set too low is *visible* — silence about the dropped work is how
+that a bound set too low is _visible_ — silence about the dropped work is how
 unbounded backfill hides in the implementations that offer it.
 
 The rest follows from backfilled fires going through the ordinary fire path:

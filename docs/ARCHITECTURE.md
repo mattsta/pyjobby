@@ -66,15 +66,15 @@ leader.
 
 ## The components
 
-| Process        | Script         | What it owns                                                                                                                                             | What it does **not** do                                                                                                                                                                            |
-| -------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Worker**     | `pj`           | Claiming, executing job code, this attempt's state transitions, its own registry row and heartbeat, its own job-thread pool                              | Decide whether a queue may run at all — `claim_jorb()` does. Recover its own crash — the monitor does. Enforce any other worker's deadline.                                                        |
-| **Monitor**    | `pj-monitor`   | Every safety-net sweep in the platform: timeouts, dead-worker reclaim, stuck-claim reclaim, stranded-waiter recovery, and seven retention sweeps         | Execute jobs, enqueue anything, elect a leader. Several instances are safe; every sweep is one atomic statement or a transaction holding its own row locks.                                        |
+| Process        | Script         | What it owns                                                                                                                                                                                       | What it does **not** do                                                                                                                                                                                                                                                                                               |
+| -------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Worker**     | `pj`           | Claiming, executing job code, this attempt's state transitions, its own registry row and heartbeat, its own job-thread pool                                                                        | Decide whether a queue may run at all — `claim_jorb()` does. Recover its own crash — the monitor does. Enforce any other worker's deadline.                                                                                                                                                                           |
+| **Monitor**    | `pj-monitor`   | Every safety-net sweep in the platform: timeouts, dead-worker reclaim, stuck-claim reclaim, stranded-waiter recovery, and seven retention sweeps                                                   | Execute jobs, enqueue anything, elect a leader. Several instances are safe; every sweep is one atomic statement or a transaction holding its own row locks.                                                                                                                                                           |
 | **Scheduler**  | `pj-scheduler` | Firing due `jorb_schedule` rows into `jorb`, the safety checks around that (concurrency, backpressure, jitter, circuit breaker), the **bounded** catch-up after an outage, and `jorb_schedule_log` | Run the jobs it creates — it only inserts them. Catch up without a ceiling: `backfill_limit` is both the opt-in and the bound, so an outage cannot become a flood. Several instances are safe: each schedule is row-locked `FOR UPDATE SKIP LOCKED` while it fires, and `deadline_key` makes a duplicate insert fail. |
-| **Admin CLI**  | `pj-admin`     | Nothing at runtime. It is a client: schema install/migrate, queue controls, DLQ, requeue, `doctor`                                                       | Participate in execution.                                                                                                                                                                          |
-| **Web admin**  | `pj-web`       | HTML operator UI, a JSON API, and `GET /metrics` for Prometheus                                                                                          | Authenticate anybody. Keep it on localhost or behind a proxy.                                                                                                                                      |
-| **Websocket**  | `pj-ws`        | The aggregate dashboard feed (one polled query per interval, shared by every client) and per-job watches                                                 | Tail individual transitions — see [the notification model](#the-notification-model). Also unauthenticated.                                                                                         |
-| **Benchmarks** | `pj-bench`     | Reproducing every number in SCALE.md, and the `pj-bench plans` CI gate that fails when a hot query stops using its index                                 | Anything outside its own uniquely-named queue, which it deletes in a `finally`.                                                                                                                    |
+| **Admin CLI**  | `pj-admin`     | Nothing at runtime. It is a client: schema install/migrate, queue controls, DLQ, requeue, `doctor`                                                                                                 | Participate in execution.                                                                                                                                                                                                                                                                                             |
+| **Web admin**  | `pj-web`       | HTML operator UI, a JSON API, and `GET /metrics` for Prometheus                                                                                                                                    | Authenticate anybody. Keep it on localhost or behind a proxy.                                                                                                                                                                                                                                                         |
+| **Websocket**  | `pj-ws`        | The aggregate dashboard feed (one polled query per interval, shared by every client) and per-job watches                                                                                           | Tail individual transitions — see [the notification model](#the-notification-model). Also unauthenticated.                                                                                                                                                                                                            |
+| **Benchmarks** | `pj-bench`     | Reproducing every number in SCALE.md, and the `pj-bench plans` CI gate that fails when a hot query stops using its index                                                                           | Anything outside its own uniquely-named queue, which it deletes in a `finally`.                                                                                                                                                                                                                                       |
 
 A `pj` invocation is a launcher: it forks `--workers N` processes **on each
 `--queue` named** (so two queues at `--workers 4` is eight processes), each
@@ -124,9 +124,9 @@ Concretely, one attempt:
 
 2. **Claim.** The worker calls `claim_jorb()`, which returns at most one
    row and does everything in one statement: state → `claimed`, `run_count
-   - 1`, **`run_epoch + 1`**, `claimed_at`, `claimed_by`, `worker_pid`,
+   - 1`, **`run*epoch + 1`**, `claimed_at`, `claimed_by`, `worker_pid`,
 `worker_host`. Zero rows back means "nothing claimable", which covers
-     an empty queue, a paused queue, a queue at its cap, a lane at _its_
+     an empty queue, a paused queue, a queue at its cap, a lane at \_its*
      cap, and a backlog pinned to a code version this worker does not
      advertise — identically.
 
@@ -516,16 +516,16 @@ Seven sweeps on two windows. `--checkpoint-retention-days` governs the first;
 a lifetime of its own to argue for — they all mean "as long as the work they
 describe".
 
-| Sweep           | Default | What goes                                                                                                | Why this window                                                                                                                                                                                                                                  |
-| --------------- | ------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Checkpoints     | 1 day   | `jorb_step` rows of terminal jobs; the job row stays                                                     | Checkpoints exist to make a job _resumable_. The instant it terminates, resume is impossible — so they are the bulkiest thing hanging off a job with the shortest useful life. They outlive the terminal transition only far enough to debug it. |
-| Streams         | 1 day   | `jorb_stream` rows of terminal jobs; the job row stays                                                   | Same window, same argument: a stream exists to be read _while_ the job runs, and every reader stops at the terminal state. A second sweep rather than a second table in the checkpoint one, so each stays a two-buffer answer when there is nothing to do. |
-| Jobs            | 30 days | The whole `jorb` row, and its history, events, streams, mailbox, checkpoints and DAG edges by `ON DELETE CASCADE` | The job's own audit lifetime — and, because an `identity_key` lives exactly as long as its row, the horizon on at-most-once.                                                                                                                     |
-| Consumed mail   | 30 days | `jorb_mailbox` rows with `consumed_at` set                                                               | The job-scoped cascade cannot reach these: a long-lived workflow reads mail for months and never terminates, so nothing else would ever free them.                                                                                               |
-| History         | 30 days | `jorb_history` rows past the window                                                                      | The audit trail lives as long as the work it describes. A durable machine that never terminates is never reached by the job cascade, so nothing else bounds its wake/sleep history.                                                              |
-| Orphaned DAGs   | 30 days | `jorb_dag` rows past the window with no jobs left                                                        | Jobs point **at** a DAG (`ON DELETE SET NULL`), so job retention never touches it. Left alone it does not merely linger, it keeps _answering_: `jorb_dag_status` LEFT JOINs `jorb`, so an emptied DAG reports `total_jobs = 0` forever.          |
-| Schedule log    | 30 days | `jorb_schedule_log` rows, except each schedule's newest                                                  | It cascades only from `jorb_schedule`, which operators disable rather than delete — so it had no upper bound of any kind, at cron rate, for the life of the install.                                                                             |
-| Retired workers | 30 days | `jorb_worker` rows both retired and silent for the window                                                | One row per worker _process start_, and nothing ever deleted one: a fleet that redeploys accumulates registry rows for as long as it exists.                                                                                                     |
+| Sweep           | Default | What goes                                                                                                         | Why this window                                                                                                                                                                                                                                            |
+| --------------- | ------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Checkpoints     | 1 day   | `jorb_step` rows of terminal jobs; the job row stays                                                              | Checkpoints exist to make a job _resumable_. The instant it terminates, resume is impossible — so they are the bulkiest thing hanging off a job with the shortest useful life. They outlive the terminal transition only far enough to debug it.           |
+| Streams         | 1 day   | `jorb_stream` rows of terminal jobs; the job row stays                                                            | Same window, same argument: a stream exists to be read _while_ the job runs, and every reader stops at the terminal state. A second sweep rather than a second table in the checkpoint one, so each stays a two-buffer answer when there is nothing to do. |
+| Jobs            | 30 days | The whole `jorb` row, and its history, events, streams, mailbox, checkpoints and DAG edges by `ON DELETE CASCADE` | The job's own audit lifetime — and, because an `identity_key` lives exactly as long as its row, the horizon on at-most-once.                                                                                                                               |
+| Consumed mail   | 30 days | `jorb_mailbox` rows with `consumed_at` set                                                                        | The job-scoped cascade cannot reach these: a long-lived workflow reads mail for months and never terminates, so nothing else would ever free them.                                                                                                         |
+| History         | 30 days | `jorb_history` rows past the window                                                                               | The audit trail lives as long as the work it describes. A durable machine that never terminates is never reached by the job cascade, so nothing else bounds its wake/sleep history.                                                                        |
+| Orphaned DAGs   | 30 days | `jorb_dag` rows past the window with no jobs left                                                                 | Jobs point **at** a DAG (`ON DELETE SET NULL`), so job retention never touches it. Left alone it does not merely linger, it keeps _answering_: `jorb_dag_status` LEFT JOINs `jorb`, so an emptied DAG reports `total_jobs = 0` forever.                    |
+| Schedule log    | 30 days | `jorb_schedule_log` rows, except each schedule's newest                                                           | It cascades only from `jorb_schedule`, which operators disable rather than delete — so it had no upper bound of any kind, at cron rate, for the life of the install.                                                                                       |
+| Retired workers | 30 days | `jorb_worker` rows both retired and silent for the window                                                         | One row per worker _process start_, and nothing ever deleted one: a fleet that redeploys accumulates registry rows for as long as it exists.                                                                                                               |
 
 The two lifetimes are deliberately independent — that is the whole point of
 splitting them. Every one of these sweeps also **refuses** to delete a row
@@ -612,14 +612,14 @@ The row is wide, but it is not a grab bag. Every column belongs to one of
 six families, and which family a column is in decides how the rest of the
 platform treats it:
 
-| Family                | Columns                                                                                                  | Answers                        |
-| --------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------ |
-| **the work**          | `job_class`, `kwargs`, `result`, `admin_data`                                                            | what to run, and what came out |
-| **routing**           | `queue`, `prio`, `capability`, `app_version`, `run_after`                                                | who may claim it, and when     |
-| **whose work it is**  | `uid`, `tags`, `partition_key`                                                                           | for the application's benefit  |
-| **which work it is**  | `deadline_key`, `identity_key`, `debounce_key` (+ `debounce_deadline`)                                   | is this a duplicate?           |
-| **structure/lineage** | `waitfor_job`, `waitfor_group`, `run_group`, `dag_id`, `schedule_id`, `forked_from`                      | how it relates to other rows   |
-| **execution**         | `state`, `run_count`, `error_count`, `run_epoch`, `claimed_by`, the timestamps                           | where this attempt is          |
+| Family                | Columns                                                                             | Answers                        |
+| --------------------- | ----------------------------------------------------------------------------------- | ------------------------------ |
+| **the work**          | `job_class`, `kwargs`, `result`, `admin_data`                                       | what to run, and what came out |
+| **routing**           | `queue`, `prio`, `capability`, `app_version`, `run_after`                           | who may claim it, and when     |
+| **whose work it is**  | `uid`, `tags`, `partition_key`                                                      | for the application's benefit  |
+| **which work it is**  | `deadline_key`, `identity_key`, `debounce_key` (+ `debounce_deadline`)              | is this a duplicate?           |
+| **structure/lineage** | `waitfor_job`, `waitfor_group`, `run_group`, `dag_id`, `schedule_id`, `forked_from` | how it relates to other rows   |
+| **execution**         | `state`, `run_count`, `error_count`, `run_epoch`, `claimed_by`, the timestamps      | where this attempt is          |
 
 The split between the third family and the fourth is the one that earns
 its keep, because it decides what a **fork** carries. A fork is a new row
@@ -641,11 +641,11 @@ _wants_ is a decision
 what is architectural is that the difference between them is entirely the
 _shape of the index_, and the shape is the promise:
 
-| Key            | Index predicate                                 | Held until                | A duplicate enqueue     |
-| -------------- | ------------------------------------------------- | ------------------------- | ----------------------- |
-| `deadline_key` | `state = 'queued'`, and scoped **per queue**     | the claim, then it re-arms | raises                  |
-| `identity_key` | none — every state, table-wide                   | the row is deleted        | returns the same job    |
-| `debounce_key` | `state = 'queued' AND run_count = 0`, table-wide | the first claim, for good | **moves** the job       |
+| Key            | Index predicate                                  | Held until                 | A duplicate enqueue  |
+| -------------- | ------------------------------------------------ | -------------------------- | -------------------- |
+| `deadline_key` | `state = 'queued'`, and scoped **per queue**     | the claim, then it re-arms | raises               |
+| `identity_key` | none — every state, table-wide                   | the row is deleted         | returns the same job |
+| `debounce_key` | `state = 'queued' AND run_count = 0`, table-wide | the first claim, for good  | **moves** the job    |
 
 `run_count = 0` on the third is not decoration: `claim_jorb` increments it,
 so the key is released at the first claim and can never be taken back — and
@@ -699,7 +699,7 @@ _Made conditional:_
   writes to it.
 - The per-lane count has an index of its own
   (`jorb_partition_inflight_idx`) whose predicate is `state IN ('claimed',
-  'running')`, so it is bounded by work in flight rather than by the table,
+'running')`, so it is bounded by work in flight rather than by the table,
   and a queued row — the hot write — is not in it at all.
 - `updated` is deliberately _not_ indexed: it is rewritten by every state
   change, so an index on it would add a write to each of the ~4 updates per
