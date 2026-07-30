@@ -28,7 +28,7 @@ import pytest_asyncio
 
 from pyjobby import dxe
 from pyjobby.client import JobClient, JobError
-from pyjobby.db import requeue_job
+from pyjobby.db import requeue_job, rerun_job
 from pyjobby.pj import Job
 
 from .conftest import wait_for_job_state
@@ -138,9 +138,15 @@ async def test_concurrent_appends_never_share_a_position(unique_queue, db_pool):
 
     async def append(i: int) -> int | None:
         try:
-            return await db_pool.fetchval(
+            # FOR SHARE on the job row, so the eight appends do NOT serialise
+            # on the fence -- a shared lock is what the fence needs (it must
+            # only conflict with the epoch bump's exclusive one) and this is
+            # the case that would notice if it were FOR UPDATE.
+            row = await db_pool.fetchrow(
                 dxe.STREAM_APPEND_SQL, job_id, "rows", {"i": i}, False, 1
             )
+            assert row["fenced"] and not row["already_closed"]
+            return int(row["seq"])
         except asyncpg.UniqueViolationError:
             return None
 
@@ -217,6 +223,83 @@ async def test_a_superseded_writer_appends_nothing(
         await job.stream_close("rows")
 
     assert [r["seq"] for r in await stream_rows(db_pool, job_id)] == [0]
+
+
+async def test_writing_after_close_raises_instead_of_landing_unreachably(
+    prepared_worker, unique_queue, db_pool
+):
+    """A closed stream refuses further rows, loudly.
+
+    Every reader stops at the closing marker, so a row appended after it is a
+    row nothing will ever read: the write "succeeded" and its data was gone.
+    Silence there turns a caller bug into missing output, which is why this is
+    an error and not a no-op.
+    """
+    job_id = await running_job(db_pool, unique_queue)
+    job = writer(prepared_worker, job_id)
+
+    await job.stream_write("rows", {"i": 0})
+    await job.stream_close("rows")
+
+    with pytest.raises(dxe.StreamClosedError) as raised:
+        await job.stream_write("rows", {"i": 1})
+
+    assert str(job_id) in str(raised.value) and "rows" in str(raised.value)
+    assert [(r["seq"], r["closed"]) for r in await stream_rows(db_pool, job_id)] == [
+        (0, False),
+        (1, True),
+    ]
+    # ...and the OTHER key is untouched: the refusal is per (job, key)
+    assert await job.stream_write("other", {"i": 0}) == 0
+
+
+async def test_closing_a_stream_twice_raises_rather_than_being_idempotent(
+    prepared_worker, unique_queue, db_pool
+):
+    """Deliberately not idempotent.
+
+    A close is already exactly-once per CALL SITE -- its checkpoint
+    fast-forwards on every replay -- so a second close is never a retry. It is
+    two call sites both believing they own the end of this stream, which is
+    exactly the state that produces writes past the marker. Hiding it would
+    hide the bug the test above catches.
+    """
+    job_id = await running_job(db_pool, unique_queue)
+    job = writer(prepared_worker, job_id)
+
+    await job.stream_close("rows")
+
+    with pytest.raises(dxe.StreamClosedError, match="already closed"):
+        await job.stream_close("rows")
+
+    assert len(await stream_rows(db_pool, job_id)) == 1
+
+
+async def test_the_refused_write_is_recorded_as_that_steps_failure(
+    prepared_worker, unique_queue, db_pool
+):
+    """Ordinary step semantics, which is why StreamClosedError is not a
+    DXEError: the attempt is checkpointed with its error (in a transaction of
+    its own, since the append's transaction rolled back), so
+    `pj-admin jobs steps` names the call that did it and the job's retry budget
+    applies to it like any other failure."""
+    job_id = await running_job(db_pool, unique_queue)
+    job = writer(prepared_worker, job_id)
+
+    await job.stream_close("rows")
+    with pytest.raises(dxe.StreamClosedError):
+        await job.stream_write("rows", {"i": 1})
+
+    steps = await db_pool.fetch(
+        "SELECT step_seq, name, error FROM jorb_step WHERE job_id = $1 "
+        "ORDER BY step_seq",
+        job_id,
+    )
+    assert [(r["name"], r["error"] is None) for r in steps] == [
+        ("dxe.stream-close:rows", True),
+        ("dxe.stream:rows", False),
+    ]
+    assert "StreamClosedError" in steps[1]["error"]
 
 
 async def test_a_replayed_write_returns_its_position_without_appending(
@@ -383,6 +466,72 @@ async def test_a_retried_job_continues_its_stream_instead_of_repeating_it(
     assert row["error_count"] == 1  # it really did fail once
     assert seen == [{"i": i} for i in range(3)]
     assert [r["seq"] for r in await stream_rows(db_pool, job_id)] == [0, 1, 2, 3]
+
+
+async def test_a_fresh_rerun_starts_the_stream_over_at_seq_zero(
+    live_worker, unique_queue, db_pool, reader
+):
+    """`rerun` (fresh, the default) wipes the streams with the checkpoints.
+
+    A position is assigned as "one past the highest this key holds". Left in
+    place, the second run's first `stream_write` took seq 3 instead of 0, so
+    `get_stream`/`read_stream` handed every reader the FIRST run's rows with
+    the second run's appended -- one stream claiming to be two runs, and no
+    way for a reader to see the boundary. Wiping them is the only answer that
+    keeps a stream a description of the run that is happening.
+    """
+    await live_worker()
+
+    job_id = await db_pool.fetchval(
+        "INSERT INTO jorb (job_class, kwargs, queue) VALUES ($1,$2,$3) RETURNING id",
+        "tests.dxe_jobs.StreamProducerJob",
+        {"key": "rows", "n": 3},
+        unique_queue,
+    )
+    await wait_for_job_state(db_pool, job_id, ("finished",))
+    first = await reader.get_stream(job_id, "rows")
+    assert first == {"values": [{"i": i} for i in range(3)], "closed": True}
+
+    assert await rerun_job(db_pool, job_id) == job_id
+    # nothing survives the requeue: the wipe and the requeue are one statement
+    assert await stream_rows(db_pool, job_id) == []
+
+    await wait_for_job_state(db_pool, job_id, ("finished",), timeout=30)
+
+    rows = await stream_rows(db_pool, job_id)
+    assert [r["seq"] for r in rows] == [0, 1, 2, 3], "the new run streams from 0"
+    assert await reader.get_stream(job_id, "rows") == first
+    assert [value async for value in reader.read_stream(job_id, "rows")] == [
+        {"i": i} for i in range(3)
+    ], "a reader sees the NEW run's output, not both runs concatenated"
+
+
+async def test_rerun_resume_keeps_the_stream_it_already_wrote(
+    live_worker, unique_queue, db_pool
+):
+    """The other half of the rule, and the reason the wipe is on `fresh` only.
+
+    `--resume` means "continue this run": the completed `stream_write`
+    checkpoints fast-forward and append nothing, so the rows the interrupted
+    attempt wrote are the only copy that run will ever have. Wiping them would
+    leave a resumed job's stream permanently missing its own prefix.
+    """
+    await live_worker()
+
+    job_id = await db_pool.fetchval(
+        "INSERT INTO jorb (job_class, kwargs, queue) VALUES ($1,$2,$3) RETURNING id",
+        "tests.dxe_jobs.StreamProducerJob",
+        {"key": "rows", "n": 3},
+        unique_queue,
+    )
+    await wait_for_job_state(db_pool, job_id, ("finished",))
+    before = await stream_rows(db_pool, job_id)
+
+    assert await rerun_job(db_pool, job_id, fresh=False) == job_id
+
+    assert await stream_rows(db_pool, job_id) == before
+    await wait_for_job_state(db_pool, job_id, ("finished",), timeout=30)
+    assert await stream_rows(db_pool, job_id) == before
 
 
 async def test_a_stream_of_a_job_that_does_not_exist_fails_fast(reader):

@@ -24,6 +24,7 @@ PASS notify-queue: 0.0% full
 WARN workers: no live workers seen in last 60s
 PASS job-threads: 0 live worker(s) claiming
 PASS queue q_reports: depth 1, oldest runnable 51m
+PASS partition-limits: every queue with partition_limits has a limit to scope
 PASS unclaimable: no queued job is invisible to its queue's live workers
 PASS blocked-waiters: no waiting jobs blocked on failed upstreams
 PASS mailbox: no unread mail older than a day
@@ -46,6 +47,7 @@ all" is a WARN, so one worker of ten refusing to claim cannot be graver.
 | `workers`         | no heartbeat in the last 60s                                                                                                                                                             | [Nothing is being claimed](#nothing-is-being-claimed)                                     |
 | `job-threads`     | live workers that claim nothing                                                                                                                                                          | [A worker is alive and doing nothing](#a-worker-is-alive-heartbeating-and-doing-nothing)  |
 | `queue <name>`    | backlog past `--max-depth` (10000) or `--max-age-minutes` (60)                                                                                                                           | [The backlog is growing](#the-backlog-is-growing)                                         |
+| `partition-limits` | a queue sets `partition_limits` with neither `max_concurrency` nor `rate_limit`, so there is nothing to re-scope and every lane is unlimited — the flag reads as tenant isolation and delivers none                                                       | [One partition is backed up](#one-partition-is-backed-up-and-the-rest-of-the-queue-is-fine) |
 | `unclaimable`     | queued, runnable jobs that no live worker on their queue could ever claim — above every ceiling, wanting a capability nobody advertises, or pinned to an `app_version` nobody advertises | [Jobs sit queued forever](#jobs-sit-queued-forever-and-nothing-is-wrong-with-the-workers) |
 | `blocked-waiters` | jobs in `waiting` whose upstream crashed or was cancelled — the monitor leaves them alone, so this is the only place they show up                                                        | [Jobs are landing in the DLQ](#jobs-are-landing-in-the-dlq)                               |
 | `mailbox`         | unread durable mail older than a day — usually a sender using a topic nothing `recv()`s                                                                                                  | [STATECHARTS.md § Waiting](STATECHARTS.md#waiting)                                        |

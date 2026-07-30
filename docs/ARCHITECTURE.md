@@ -518,8 +518,8 @@ describe".
 
 | Sweep           | Default | What goes                                                                                                         | Why this window                                                                                                                                                                                                                                            |
 | --------------- | ------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Checkpoints     | 1 day   | `jorb_step` rows of terminal jobs; the job row stays                                                              | Checkpoints exist to make a job _resumable_. The instant it terminates, resume is impossible — so they are the bulkiest thing hanging off a job with the shortest useful life. They outlive the terminal transition only far enough to debug it.           |
-| Streams         | 1 day   | `jorb_stream` rows of terminal jobs; the job row stays                                                            | Same window, same argument: a stream exists to be read _while_ the job runs, and every reader stops at the terminal state. A second sweep rather than a second table in the checkpoint one, so each stays a two-buffer answer when there is nothing to do. |
+| Checkpoints     | 1 day   | `jorb_step` rows of **`finished`** jobs only; the job row stays                                                   | Checkpoints exist to make a job _resumable_. Once it has succeeded there is nothing left to resume — so they are the bulkiest thing hanging off a job with the shortest useful life. `finished` and not all three terminal states: `crashed` and `cancelled` are retryable and a retry resumes from exactly these rows, so those wait for the job window. |
+| Streams         | 1 day   | `jorb_stream` rows of **`finished`** jobs only; the job row stays                                                 | Same window, same argument, and the same `finished`-only restriction for the same reason: a retry's completed `stream_write` checkpoints fast-forward without appending, so reaping early would leave the resumed job's stream permanently missing its own prefix. A second sweep rather than a second table in the checkpoint one, so each stays a two-buffer answer when there is nothing to do. |
 | Jobs            | 30 days | The whole `jorb` row, and its history, events, streams, mailbox, checkpoints and DAG edges by `ON DELETE CASCADE` | The job's own audit lifetime — and, because an `identity_key` lives exactly as long as its row, the horizon on at-most-once.                                                                                                                               |
 | Consumed mail   | 30 days | `jorb_mailbox` rows with `consumed_at` set                                                                        | The job-scoped cascade cannot reach these: a long-lived workflow reads mail for months and never terminates, so nothing else would ever free them.                                                                                                         |
 | History         | 30 days | `jorb_history` rows past the window                                                                               | The audit trail lives as long as the work it describes. A durable machine that never terminates is never reached by the job cascade, so nothing else bounds its wake/sleep history.                                                                        |
@@ -653,6 +653,21 @@ without that, a row that was claimed, failed and was **retried** would come
 back to `queued` still holding a key a new burst may already have taken,
 and the retry `UPDATE` would violate the index inside a worker's failure
 handler.
+
+The other half of that rule is in the statements rather than in the indexes:
+**every statement that puts a row back into `queued` clears `deadline_key`,
+`debounce_key` and `debounce_deadline`** (`db.REQUEUE_CLEARS_KEYS` — retry,
+rerun, DLQ retry, the monitor's timeout retry and its dead-worker and
+stuck-claim sweeps; a waiter's wake clears `deadline_key`, which is the only
+one a `waiting` row can hold). A key's collapse duty ends the first time its
+row leaves `queued`, so a requeue must not carry it back into an index the
+row was already released from. `run_count` alone does not cover the row that
+was **cancelled while still parked** — it was never claimed, so `run_count`
+is 0 — and it never covered `deadline_key` at all. Both indexes are unique,
+and the sweeps are **batch** statements, so one such row aborted the whole
+`UPDATE`: every other doomed job in that batch stayed stranded, every cycle.
+The consequence to carry is that a requeued job is dedupe-anonymous — it
+runs, and a duplicate submitted while it was gone is its own job.
 
 The consequence worth carrying is that **retention is the horizon on "at
 most once"**. `identity_key`'s index has no state predicate, so the key

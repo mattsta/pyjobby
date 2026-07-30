@@ -356,6 +356,22 @@ The rest follows from backfilled fires going through the ordinary fire path:
   `max_concurrent_jobs 1` could be defeated by stopping the scheduler and
   starting it again. A backfilled tick the limits refuse is recorded as the
   skip it is, with its own reason.
+
+  **They BIND, and at the defaults they bind completely — size them together.**
+  The rule is `max_concurrent_jobs >= backfill_limit + 1`; the `+1` is the
+  currently-due tick, which fires before the backfill runs and is still in
+  flight while it does. `max_concurrent_jobs` defaults to **1**, so a schedule
+  created with `--backfill-limit 3` and nothing else fires the due tick,
+  finds its one slot taken, and records all three backfilled ticks as
+  `max_concurrent` skips — the feature is switched on and inert. `pj-admin
+  schedule add` prints a warning to stderr naming both numbers when they are
+  set this way; it does not refuse, because "catch up on what fits" is a
+  legitimate request.
+
+  **Fires go newest-first**, which is what makes a partial recovery useful: the
+  cap is spent on the freshest ticks and the ticks it costs you are the oldest.
+  That is the same principle that collects only the newest `N` in the first
+  place — the value of a late fire decays.
 - **The circuit breaker counts a backfilled enqueue failure** like any other.
 - **Two schedulers recovering at once converge.** Each backfilled tick carries
   the same per-tick `deadline_key` an on-time fire carries, so the loser

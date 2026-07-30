@@ -164,6 +164,39 @@ async def new_backends(pool: asyncpg.Pool) -> AsyncIterator[list[int]]:
         found.extend(sorted(await backend_pids(pool) - before))
 
 
+async def wait_until_blocked_on_a_transaction(
+    pool: asyncpg.Pool, timeout: float = 20.0, expected: int = 1
+) -> None:
+    """Poll until ``expected`` backends here are waiting on a row lock.
+
+    This is what makes a two-transaction interleave DETERMINISTIC instead of a
+    sleep and a hope: the holder is released only once the other side is
+    PROVABLY stuck on it, so the test pins the ordering it means rather than
+    the ordering the box happened to produce. Used by the debounce races (a
+    bounce waiting out a concurrent updater, a speculative insert waiting out
+    a conflicting key) and by the stream-append fence (a zombie's append
+    waiting out the requeue that is bumping its epoch).
+
+    Each xdist worker owns its own database (conftest.db_params), so
+    ``current_database()`` scopes this to this test's own traffic.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        blocked = await pool.fetchval(
+            "SELECT count(*) FROM pg_stat_activity "
+            " WHERE datname = current_database() "
+            "   AND wait_event_type = 'Lock' "
+            "   AND wait_event IN ('transactionid', 'tuple')"
+        )
+        if blocked >= expected:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(
+        f"fewer than {expected} backend(s) blocked on the holder's transaction "
+        f"within {timeout}s: the race resolved without waiting, which it must not"
+    )
+
+
 async def kill_backends(
     pool: asyncpg.Pool, pids: list[int] | set[int], timeout: float = 10.0
 ) -> int:

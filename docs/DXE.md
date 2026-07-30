@@ -409,7 +409,31 @@ nothing has to loop looking for a free slot.
 
 Appends are fenced on `run_epoch` like every other durable write: a
 superseded execution appends nothing, because a reader has no way to tell two
-writers apart.
+writers apart. The fence **locks the job row** (`FOR SHARE`) rather than merely
+testing the epoch, because an unlocked test is evaluated against the statement's
+own snapshot: a zombie whose append began before the requeue committed would
+read the old epoch, pass, and leave a row in the stream that readers can never
+distinguish from the live attempt's output. With the lock the zombie waits for
+the requeue, re-reads the bumped epoch, and appends nothing. In the opposite
+order the requeue waits out one append transaction, and the append it waited
+for was the live attempt's.
+
+### Writing to a closed stream raises
+
+`stream_write` after `stream_close` raises **`StreamClosedError`**, naming the
+job and the key. A closing marker is where every reader stops, so a row
+appended after it is a row nothing will ever read — accepting it would turn a
+caller bug into output that silently disappears.
+
+Closing a key **twice** raises the same error. That is deliberate rather than
+unfriendly: a close is already exactly-once per _call site_ (its checkpoint
+fast-forwards on every replay), so a second close is never a retry — it is two
+call sites that both believe they own the end of the stream, which is precisely
+the state that produces writes past the marker.
+
+`StreamClosedError` is not a `DXEError`: like `StepTimeoutError` it is an
+ordinary step **failure**, recorded as that step's error and taking the job's
+normal retry path, so `pj-admin jobs steps <id>` names the call that did it.
 
 ### The closing marker is a column, never a value
 
@@ -601,14 +625,26 @@ running the same code shape, and asserts that the effect happened **twice** for
 pj-admin jobs steps <id>       # what completed, what failed, timings
 pj-admin jobs rerun <id> --resume
                                # resume: completed steps fast-forward
-pj-admin jobs rerun <id>       # restart: deletes checkpoints, runs from step 1
+pj-admin jobs rerun <id>       # restart: deletes checkpoints AND streams,
+                               # runs from step 1
 ```
 
 Fresh is the default — a plain `rerun` (no flag; there is no `--fresh`,
-`fresh=` is the `AdminAPI.rerun_job` keyword) discards the checkpoints. Use
-it when the recorded results are _wrong_ rather than merely incomplete —
+`fresh=` is the `AdminAPI.rerun_job` keyword) discards the checkpoints **and
+the job's `jorb_stream` rows**, in the same statement that requeues the row.
+Use it when the recorded results are _wrong_ rather than merely incomplete —
 after fixing a bug in a step, for instance. It is the operator's way to
 discard checkpoints for a job that is going to run again.
+
+The streams go because a position is assigned as one past the highest that key
+holds: left in place, the fresh run's first `stream_write` would take seq _N_
+rather than 0, and `get_stream`/`read_stream` would hand every reader the
+previous run's output with the new run appended to it — one stream claiming to
+be two runs. After a fresh rerun the stream starts empty and at seq 0, so what
+a reader sees is the run that is happening. `--resume` keeps both, which is
+the whole point of resume: the completed `stream_write` checkpoints
+fast-forward and append nothing, so the rows the interrupted attempt wrote are
+that run's only copy.
 
 ---
 

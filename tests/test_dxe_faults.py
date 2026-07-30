@@ -50,6 +50,7 @@ from .utils.faults import (
     record_effect,
     record_effect_out_of_band,
     sigkill_group,
+    wait_until_blocked_on_a_transaction,
     write_worker_config,
 )
 
@@ -612,8 +613,13 @@ async def apply_fenced_statement(pool, name: str, job_id: int, epoch: int) -> in
         )[0]
         return int(row["consumed"])
     if name == "stream-append":
-        rows = await pool.fetch(STMTS[name], job_id, "fence", {"v": 1}, False, epoch)
-        return len(rows)
+        # Always returns exactly one row (fenced / already_closed / seq), so
+        # "did it write?" is the fence column and not the row count -- the
+        # statement has to be able to say "superseded" and "you closed this
+        # stream" separately, and neither can be an empty result.
+        row = await pool.fetchrow(STMTS[name], job_id, "fence", {"v": 1}, False, epoch)
+        assert not row["already_closed"]
+        return int(row["fenced"])
     raise AssertionError(f"unhandled statement {name}")
 
 
@@ -1189,3 +1195,95 @@ async def test_dead_lettering_fences_the_execution_it_abandons(db_pool, unique_q
         )
         == []
     )
+
+
+# ============================================================================
+# 13. the append fence is a LOCK, not a snapshot read
+# ============================================================================
+
+
+async def test_a_zombies_append_cannot_commit_after_the_requeue_that_fenced_it(
+    db_pool, db_params, unique_queue
+):
+    """The window an unlocked epoch test leaves open, driven as two real
+    transactions.
+
+    ``STREAM_APPEND_SQL`` used to fence with a bare
+    ``EXISTS (SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $5)``. That is
+    evaluated against the appending statement's OWN snapshot, so a requeue
+    already in flight but not yet committed is invisible to it: the zombie
+    read the old epoch, passed the test, and appended. The row then sat in the
+    stream forever, and a reader has no way to tell it from the live attempt's
+    output -- which is the entire reason the fence exists.
+
+    ``FOR SHARE`` closes it because the epoch bump is an UPDATE and holds the
+    row's exclusive lock: the append BLOCKS, and when the requeue commits,
+    READ COMMITTED re-evaluates the clause against the new row version and
+    finds the bumped epoch. The interleave is made deterministic by waiting
+    until the appender is provably stuck on the holder's lock, so this pins
+    the ordering rather than observing whichever one the box produced.
+    """
+    job_id = await enqueue(db_pool, unique_queue, "tests.dxe_jobs.OkJob", {"x": 1})
+    claimed = await claim_once(db_pool, unique_queue)
+    epoch = claimed["run_epoch"]
+    assert [
+        r["id"] for r in await db_pool.fetch(STMTS["run"], job_id, epoch, None)
+    ] == [job_id]
+
+    holder = await db.connect(**db_params)
+    zombie = await db.connect(**db_params)
+    try:
+        # the requeue starts and takes the row lock, but does NOT commit
+        requeue = holder.transaction()
+        await requeue.start()
+        assert (
+            await holder.fetchval(
+                db.build_requeue_sql(("claimed", "running")),
+                job_id,
+                datetime.timedelta(0),
+                False,
+            )
+            == job_id
+        )
+
+        # ...and the abandoned execution tries to append at its old epoch
+        appending = asyncio.create_task(
+            zombie.fetchrow(
+                dxe.STREAM_APPEND_SQL, job_id, "rows", {"i": 0}, False, epoch
+            )
+        )
+        await wait_until_blocked_on_a_transaction(db_pool)
+        assert not appending.done(), "the append must WAIT for the requeue, not race it"
+
+        await requeue.commit()
+        appended = await asyncio.wait_for(appending, timeout=20)
+    finally:
+        await zombie.close()
+        await holder.close()
+
+    assert appended["fenced"] == 0, "the zombie must observe the BUMPED epoch"
+    assert appended["seq"] is None
+    assert (
+        await db_pool.fetchval(
+            "SELECT count(*) FROM jorb_stream WHERE job_id = $1", job_id
+        )
+        == 0
+    ), "a superseded execution left a row in a stream readers cannot filter"
+
+    # and the caller sees the refusal as StaleExecutionError, not as silence.
+    # On a real CONNECTION, not the pool: stream_write runs through
+    # transaction(), whose scope is the worker's own connection -- handed a
+    # pool it would raise AttributeError, and transaction()'s error path would
+    # convert that into a StaleExecutionError this assertion could not tell
+    # from the real one.
+    live = await db_pool.fetchval("SELECT run_epoch FROM jorb WHERE id = $1", job_id)
+    assert live > epoch
+    caller = await db.connect(**db_params)
+    try:
+        job = await connection_bound_job(
+            caller, {"id": job_id, "run_epoch": epoch}, epoch
+        )
+        with pytest.raises(dxe.StaleExecutionError):
+            await job.stream_write("rows", {"i": 0})
+    finally:
+        await caller.close()

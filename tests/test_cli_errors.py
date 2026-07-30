@@ -1258,6 +1258,79 @@ class TestScheduleAddValidation:
             == DEFAULT_PRIO_CEILING
         )
 
+    async def test_a_backfill_limit_the_concurrency_cap_swallows_is_warned_about(
+        self, dsn, db_pool, test_id
+    ):
+        """The two safety features interact and the interaction is invisible.
+
+        A backfilled tick goes through the SAME fire path an on-time one does,
+        so `max_concurrent_jobs` refuses it the same way -- and the
+        currently-due tick already occupies a slot before the backfill runs.
+        At the default of 1, `--backfill-limit 3` therefore fires NOTHING: the
+        feature is switched on, recorded in `schedule show`, and completely
+        inert, with no signal anywhere. WARN and not refuse, because "catch up
+        on what fits" is a legitimate request and the fires are ordered
+        newest-first so what survives is the freshest.
+        """
+        result = await run_cli(
+            "--dsn",
+            dsn,
+            "schedule",
+            "add",
+            test_id,
+            "tests.dxe_jobs.OkJob",
+            "0 * * * *",
+            "--backfill-limit",
+            "3",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "--backfill-limit 3 needs --max-concurrent 4" in result.stderr
+        assert "0 of 3 backfilled tick(s) can fire per recovery" in result.stderr
+        # on stderr, so a script parsing the command's result is unaffected
+        assert "--backfill-limit" not in result.stdout
+        assert await self._count(db_pool, test_id) == 1
+
+    async def test_sizing_the_two_together_warns_about_nothing(
+        self, dsn, db_pool, test_id
+    ):
+        """backfill_limit + 1 slots is the rule; meeting it is silent."""
+        result = await run_cli(
+            "--dsn",
+            dsn,
+            "schedule",
+            "add",
+            test_id,
+            "tests.dxe_jobs.OkJob",
+            "0 * * * *",
+            "--backfill-limit",
+            "3",
+            "--max-concurrent",
+            "4",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "--backfill-limit" not in result.stderr
+        assert await self._count(db_pool, test_id) == 1
+
+    async def test_the_default_backfill_limit_warns_about_nothing(
+        self, dsn, db_pool, test_id
+    ):
+        """A schedule that never opted in must not be nagged about a feature
+        it is not using -- that is how a real warning gets ignored."""
+        result = await run_cli(
+            "--dsn",
+            dsn,
+            "schedule",
+            "add",
+            test_id,
+            "tests.dxe_jobs.OkJob",
+            "0 * * * *",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "--backfill-limit" not in result.stderr
+
     async def test_a_fleet_that_declares_a_higher_ceiling_may_use_it(
         self, dsn, db_pool, test_id
     ):

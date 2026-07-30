@@ -40,6 +40,7 @@ from .utils.faults import (
     effect_counts_per_job,
     ensure_effects_table,
     record_effect,
+    wait_until_blocked_on_a_transaction,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -880,3 +881,87 @@ class TestConcurrentForks:
         assert len(ids) == 5
         for job_id in ids:
             assert len(await steps_of(db_pool, job_id)) == 2
+
+
+class TestTheSourceDeletedUnderneath:
+    """`forked_from REFERENCES jorb (id)`, so the source has to still exist
+    when the insert's FK check runs -- and nothing serialises a fork against a
+    retention sweep or an operator delete."""
+
+    async def test_a_concurrent_delete_is_a_refusal_and_not_a_driver_error(
+        self, db_pool, db_params, unique_queue
+    ):
+        """The fork's snapshot found the source, and by the time the INSERT's
+        foreign key was checked it was gone.
+
+        Before the fix this surfaced as a raw
+        ``asyncpg.ForeignKeyViolationError`` naming ``jorb_forked_from_fkey``
+        and a column no caller ever passed -- an operator running
+        ``jobs fork`` during an incident got a driver traceback about
+        referential integrity instead of "the job you named is not there any
+        more". It is the same condition ``_no_such_job`` reports, only observed
+        later, so it gets the same kind of answer.
+
+        Deterministic by construction: the DELETE is held in an open
+        transaction until the fork is provably blocked on its row lock.
+        """
+        source = await make_source(db_pool, unique_queue)
+        await record_steps(db_pool, source, 3)
+
+        deleter = await db.connect(**db_params)
+        forker = await db.connect(**db_params)
+        try:
+            deleting = deleter.transaction()
+            await deleting.start()
+            await deleter.execute("DELETE FROM jorb WHERE id = $1", source)
+
+            forking = asyncio.create_task(db.fork_job(forker, source, from_step=3))
+            await wait_until_blocked_on_a_transaction(db_pool)
+            assert not forking.done(), "the fork must wait out the open delete"
+
+            await deleting.commit()
+
+            with pytest.raises(db.ForkRefused, match="was deleted while forking"):
+                await asyncio.wait_for(forking, timeout=20)
+        finally:
+            await forker.close()
+            await deleter.close()
+
+        assert (
+            await db_pool.fetchval(
+                "SELECT count(*) FROM jorb WHERE forked_from = $1", source
+            )
+            == 0
+        ), "nothing may be written when the fork is refused"
+
+    async def test_a_delete_that_rolls_back_lets_the_fork_land(
+        self, db_pool, db_params, unique_queue
+    ):
+        """The positive control: the refusal must come from the source really
+        going away, not merely from having waited for a lock."""
+        source = await make_source(db_pool, unique_queue)
+        await record_steps(db_pool, source, 3)
+
+        deleter = await db.connect(**db_params)
+        forker = await db.connect(**db_params)
+        try:
+            deleting = deleter.transaction()
+            await deleting.start()
+            await deleter.execute("DELETE FROM jorb WHERE id = $1", source)
+
+            forking = asyncio.create_task(db.fork_job(forker, source, from_step=3))
+            await wait_until_blocked_on_a_transaction(db_pool)
+
+            await deleting.rollback()
+            fork = await asyncio.wait_for(forking, timeout=20)
+        finally:
+            await forker.close()
+            await deleter.close()
+
+        assert fork["steps_copied"] == 2
+        assert (
+            await db_pool.fetchval(
+                "SELECT forked_from FROM jorb WHERE id = $1", fork["job_id"]
+            )
+            == source
+        )

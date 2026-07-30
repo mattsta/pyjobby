@@ -216,8 +216,14 @@ Enqueue a single job.
 - `identity_key` (str): This exact work happens **at most once**. Unique
   across _every_ state, so if a job with this key already exists — queued,
   running, finished, crashed — the enqueue returns **that job's id** instead
-  of writing a second row, and never raises (default: None). Bounded by
-  retention; see [At-most-once work](#4b-at-most-once-work-identity-keys).
+  of writing a second row (default: None). It does not raise on the DUPLICATE,
+  which is the point; it does raise `ValueError` when the existing job is a
+  different `job_class` than the one you asked for, and `RuntimeError` in the
+  pathological case where a stream of other writers claims the key past the
+  speculative retry budget. Refused in combination with `deadline_key`,
+  `debounce_key`, `waitfor_job`/`waitfor_group` and DAG nodes — see
+  [At-most-once work](#4b-at-most-once-work-identity-keys) for why each.
+  Bounded by retention.
 - `partition_key` (str): The fair-share **lane** this job belongs to — a
   tenant, an account, an api key (default: None). Inert labelling unless the
   job's queue has `partition_limits` set
@@ -225,8 +231,7 @@ Enqueue a single job.
   that queue's `max_concurrency` and `rate_limit` are counted **per key**, so
   one tenant filling its own share cannot starve the rest. Jobs with no key
   form **one lane of their own** — never hidden, never refused for being
-  unlabelled. Inherited by a fork, like `uid` and `tags`. Max 256 characters;
-  longer raises `ValueError`. See
+  unlabelled. Inherited by a fork, like `uid` and `tags`. See
   [Queue controls](OPERATIONS.md#queue-controls-what-the-limits-actually-promise).
 - `app_version` (str): **Pin** this job to a code version — only a worker
   advertising the same `pj --app-version` will claim it (default: None, which
@@ -236,6 +241,17 @@ Enqueue a single job.
   row, same code); **not** inherited by a fork. Empty strings and versions
   longer than 128 characters raise `ValueError`. See
   [Pinning work to a code version](#7b-pinning-work-to-a-code-version).
+
+  > **Every caller-chosen key is validated the same way.** `deadline_key`,
+  > `identity_key`, `debounce_key` and `partition_key` must be **non-empty**
+  > and at most **256 characters**; anything else raises `ValueError` before
+  > any row is written. Empty is refused rather than stored because `''` is a
+  > real value, not the absence of one: it takes a slot in that column's index,
+  > so every other caller who passed an empty key collides with it — unrelated
+  > jobs deduplicating against each other, or sharing one fair-share lane. It
+  > is almost always an f-string over a value that was missing. `None` (the
+  > default) is how a job says it is not using the feature.
+
 - `admin_data` (dict): Metadata for tracking (default: None)
 - `tags` (dict): Your own labels — customer, region, batch — that you can
   filter jobs by later (default: None). See [Job Tags](#8-job-tags).
@@ -350,10 +366,13 @@ single enqueue means.
 Payload and options never collide: the `kwargs` dict is delivered to the
 job verbatim, even if it contains keys named like options.
 
-`identity_key` is the one `enqueue()` option a batch refuses, shared or
-per-job: a batch is one INSERT returning one id per row **in order**, and an
-identity that already exists has no row in it to return. Enqueue identified
-jobs one at a time with `enqueue_identified()`.
+A batch refuses two `enqueue()` options, shared or per-job, for two different
+reasons. `identity_key`: a batch is one INSERT returning one id per row **in
+order**, and an identity that already exists has no row in it to return —
+enqueue identified jobs one at a time with `enqueue_identified()`.
+`debounce_key`: a batch has no bounce statement in front of its INSERT, so a
+key already held would violate `jorb_debounce_idx` and take the whole batch
+down instead of collapsing — call `debounce()` per key.
 
 **Returns:** List of job IDs, in the order given
 
@@ -435,8 +454,9 @@ if (await client.retry_job(12345))["status"] == "requeued":
 Run a terminal job again, including one that already finished (repeating its
 side effects). Returns `{"job_id", "status", "fresh"}` with status
 `'requeued'` or `'not_rerunnable'`; `fresh` echoes the mode asked for —
-`True` wipes DXE checkpoints and restarts from step 1, `False` resumes from
-them.
+`True` wipes DXE checkpoints **and the job's durable streams** and restarts
+from step 1 (so the new run's stream starts at seq 0 instead of being appended
+to the last run's), `False` resumes from both.
 
 #### `fork_job(job_id, *, from_step=1, queue=None, priority=None, kwargs_override=None, app_version=None)`
 
@@ -637,7 +657,7 @@ marked "async only" below.
 - `enqueue_identified(job_class, *, identity_key, ...)` — the at-most-once enqueue, returning `(job_id, created)` so a caller can tell "I started this" from "this was already under way". Plain `enqueue(..., identity_key=...)` does the same write and returns the bare id.
 - `debounce(job_class, *, key, period, cap=None, ...)` — collapse a burst of equivalent enqueues onto one job that fires `period` seconds after the last of them, carrying that last call's arguments; returns `(job_id, created)`. See [Debouncing a burst](#4c-debouncing-a-burst-debounce).
 - `enqueue_handle(...)` — enqueue and get a `JobHandle` (`.wait()` — alias `.result()` —, `.status()`, `.cancel()`, `.event()`) (async only; a handle's own methods are coroutines bound to the async client, so `run()` / `wait_for_result()` are the sync shapes of this workflow).
-- `enqueue_in_transaction(conn, ...)` — enqueue on the CALLER's asyncpg connection, inside their transaction (async only; no sync twin).
+- `enqueue_in_transaction(conn, ...)` — enqueue on the CALLER's asyncpg connection, inside their transaction (async only; no sync twin). Accepts `identity_key` (the identified statement runs inside your transaction and returns the existing job's id when the key is held); **refuses** `debounce_key`, which needs a bounce-or-insert pair this path does not run.
 - `create_pipeline_with_results(stages, ...)` — a pipeline where each stage receives the previous stage's result.
 
 **Property**
@@ -898,12 +918,35 @@ Two rules come with it:
   `order:4711:ship` is safe because order ids are not reused;
   `nightly-rebuild` is not, and `nightly-rebuild:2026-07-29` is.
 
-`identity_key` and `deadline_key` may coexist on one row and keep their
-separate meanings, but you usually want one or the other — see
-[writing-jobs.md § Choosing your dedupe primitive](writing-jobs.md#choosing-your-dedupe-primitive).
-Identity is **not** a batch option: `enqueue_batch()` returns one id per row
-in order, and an identity that already exists has no row in that INSERT to
+**What an `identity_key` refuses, and why each one is not a limitation.** All
+four are `ValueError` at the door, before anything is written:
+
+- **`deadline_key`** — the two answer "what happens to a duplicate?" with
+  opposite answers (hand back the existing job for the life of the row, vs.
+  raise and then re-arm at the claim). Pick one; see
+  [writing-jobs.md § Choosing your dedupe primitive](writing-jobs.md#choosing-your-dedupe-primitive).
+- **`debounce_key`** — the third answer to the same question (move the job and
+  rewrite its arguments).
+- **`waitfor_job` / `waitfor_group`** — an identified enqueue may return a job
+  it did **not** create, and that job carries whatever dependency the enqueue
+  that really made it asked for. Your edge would silently not be applied and
+  the work would run unordered. Give the identity to the job that does the
+  work and let an unidentified waiter depend on it.
+- **A DAG node** (`DAGBuilder.add(..., identity_key=...)`) — a DAG stamps
+  `dag_id` and `run_group` onto the ids its enqueues return, so a pre-existing
+  identity would have the DAG rewire a live job out of the DAG it belongs to.
+  Enqueue the identified job separately and depend on it.
+
+Identity is also **not** a batch option: `enqueue_batch()` returns one id per
+row in order, and an identity that already exists has no row in that INSERT to
 return, so it is refused rather than silently dropped.
+`enqueue_in_transaction()` **does** accept it, and it behaves exactly as it
+does elsewhere: the identified statement runs inside your transaction, returns
+the existing job's id when the key is already held (discarding the row it would
+have created), and its retry loop — which exists because a conflicting writer
+committing after your snapshot leaves the statement with nothing to return —
+re-runs inside that transaction, so it converges at `READ COMMITTED` and cannot
+above it.
 
 ### 4c. Debouncing a burst (`debounce()`)
 

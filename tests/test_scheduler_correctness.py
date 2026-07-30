@@ -742,6 +742,95 @@ class TestBoundedBackfill:
                 ("max_concurrent", 2),  # the two the limit refused, each recorded
             ]
 
+    async def test_a_binding_concurrency_cap_sacrifices_the_OLDEST_ticks(
+        self, db_pool, monkeypatch
+    ):
+        """Which of the kept ticks survives a refusal, and it is not arbitrary.
+
+        The safety limits BIND -- ``max_concurrent_jobs`` defaults to 1 and the
+        due tick already holds a slot -- so a backfill burst is usually refused
+        partway through. Fired oldest-first (as it was), the budget was spent
+        on the STALEST ticks and the freshest were the ones dropped: the exact
+        inverse of the principle the feature is built on, and the reason it
+        collects only the newest ``keep`` in the first place. Newest-first
+        means a refusal costs the oldest tick, so whatever does fire is the
+        most useful thing available.
+
+        A cap of 2 leaves room for the due tick and exactly ONE backfill, which
+        is what makes the assertion a statement about ORDER rather than about
+        a count.
+        """
+        async with db_pool.acquire() as conn:
+            schedule_id, due = await self._overdue(
+                conn, monkeypatch, backfill_limit=3, max_concurrent_jobs=2
+            )
+            top_of_hour = due + timedelta(hours=10)
+
+            await _run_one_pass(SchedulerWorker(conn, poll_interval=0.05))
+
+            fired = [
+                r["run_after"]
+                for r in await conn.fetch(
+                    "SELECT run_after FROM jorb WHERE schedule_id = $1 "
+                    "ORDER BY run_after",
+                    schedule_id,
+                )
+            ]
+            assert fired == [due, top_of_hour], (
+                "the one backfilled tick that fitted must be the NEWEST missed "
+                "tick, not the oldest of the three the bound kept"
+            )
+            # the two the cap refused are recorded as the skips they are
+            refused = await conn.fetch(
+                "SELECT scheduled_time FROM jorb_schedule_log "
+                "WHERE schedule_id = $1 AND skip_reason = 'max_concurrent' "
+                "ORDER BY scheduled_time",
+                schedule_id,
+            )
+            assert [r["scheduled_time"] for r in refused] == [
+                top_of_hour - timedelta(hours=2),
+                top_of_hour - timedelta(hours=1),
+            ]
+
+    async def test_the_dropped_summary_is_written_after_the_fires_it_describes(
+        self, db_pool, monkeypatch
+    ):
+        """Ordering, because a crash mid-burst used to re-inflate skip_count.
+
+        The summary was written BEFORE the fires. A scheduler that died partway
+        through the burst therefore re-recorded it on the next recovery pass --
+        and again on the next -- so ``skip_count`` grew with the number of
+        crashes instead of with the number of dropped ticks, which is the one
+        thing it is read for. Written last, a crash mid-burst loses at most the
+        summary row, and the fires it describes are missing from the log too,
+        so the history stays consistent with itself.
+
+        ``jorb_schedule_log.id`` is an identity column, so comparing ids IS
+        comparing write order.
+        """
+        async with db_pool.acquire() as conn:
+            schedule_id, _due = await self._overdue(
+                conn, monkeypatch, backfill_limit=3, max_concurrent_jobs=10
+            )
+
+            await _run_one_pass(SchedulerWorker(conn, poll_interval=0.05))
+
+            log = await conn.fetch(
+                "SELECT id, result, skip_reason FROM jorb_schedule_log "
+                "WHERE schedule_id = $1 ORDER BY id",
+                schedule_id,
+            )
+            summaries = [r for r in log if r["skip_reason"] == "backfill_limit"]
+            assert len(summaries) == 1, "one summary row, written exactly once"
+            assert summaries[0]["id"] == log[-1]["id"], (
+                "the summary must be the LAST row of the recovery, after every "
+                "backfilled fire it stands beside"
+            )
+            after = await conn.fetchrow(
+                "SELECT skip_count FROM jorb_schedule WHERE id = $1", schedule_id
+            )
+            assert after["skip_count"] == 1
+
     async def test_a_second_recovery_over_the_same_window_mints_nothing(
         self, db_pool, monkeypatch
     ):

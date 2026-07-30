@@ -623,9 +623,15 @@ class ExportLedger(Job):
         for page in range(pages):
             rows = await self.step(f"page-{page}", self.fetch_page, account, page)
             await self.stream_write("pages", {"page": page, "rows": rows})
+            await asyncio.sleep(0.4)  # stands in for the work of a real page
         await self.stream_close("pages")
         return {"pages": pages}
 ```
+
+The `sleep` is what makes the claim below testable rather than merely true:
+without it the job finishes before a reader could observe anything mid-run, so
+a reader that only worked _after_ the job ended would pass. In a real export
+that line is the page itself.
 
 ```python
 job_id = await client.enqueue("myapp.exports.ExportLedger", queue="exports", account=42)
@@ -667,9 +673,12 @@ _somebody_.
 class TenantReport(Job):
     """One tenant's report: collect the rows, render them, stream the stages."""
 
-    async def task(self, tenant: str, month: str, revision: int = 1) -> dict[str, Any]:
+    async def task(
+        self, tenant: str, month: str, revision: int = 1, pause: float = 0.0
+    ) -> dict[str, Any]:
         rows = await self.step("collect", self.collect, tenant, month)
         await self.stream_write("progress", {"stage": "collected", "rows": rows})
+        await asyncio.sleep(pause)  # stands in for the work of a real report
         url = await self.step("render", self.render, tenant, month)
         await self.stream_write("progress", {"stage": "rendered", "url": url})
         await self.stream_close("progress")
@@ -684,7 +693,13 @@ class TenantReport(Job):
 
 Two steps, because `collect` is the expensive half and the incident at the end
 of this example must not pay for it twice. Two stream rows, because the caller
-watches a progress list rather than waiting for the result.
+watches a progress list rather than waiting for the result. `pause` stands in
+for the work a real report does — the tailing section below asserts the job is
+still `running` when the first stage reaches the reader, and without it there
+would be no run left to observe. (The test class carries one further argument
+the document leaves out, `render_ok`: it is the bug the incident story deploys
+a fix for, and the fork flips it through `kwargs_override` instead of waiting
+for a release.)
 
 ### One lane per tenant
 
@@ -728,15 +743,26 @@ job_id, created = await client.debounce(
 )
 ```
 
-Three presses, one row, and the revision that runs is the third one — which is
-the whole reason this is `debounce()` and not a `deadline_key`. `cap` is
-written to the row by the first call, so a fourth press asking for a much
-longer quiet window still cannot push the job past it; the test asserts
-`run_after` has landed exactly on that ceiling.
+Press after press, one row, and the revision that runs is **the last press's**
+— which is the whole reason this is `debounce()` and not a `deadline_key`.
+`cap` is written to the row by the first call, so a further press asking for a
+much longer quiet window still cannot push the job past it; the test presses
+four times (revisions 1, 2, 3, then a fourth with a 600-second period), asserts
+`run_after` has landed exactly on that ceiling, and asserts the job finishes
+with `revision == 4` after one `collect`.
 
 ### The client tails the run
 
 ```python
+job_id = await client.enqueue(
+    "myapp.reports.TenantReport",
+    queue="reports",
+    partition_key=tenant,
+    tenant=tenant,
+    month="2026-07",
+    pause=1.0,  # so the first row really does arrive mid-run
+)
+
 async for update in client.read_stream(job_id, "progress"):
     show(update["stage"])  # 'collected', then 'rendered'
 ```

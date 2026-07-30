@@ -167,26 +167,30 @@ class TestTheKeyIsHeldInEveryState:
         assert len(held) == 1
         assert held[0]["queue"] == unique_queue, "the second call re-routed the job"
 
-    async def test_the_two_keys_coexist_on_one_row(
+    async def test_the_two_keys_cannot_be_combined_on_one_row(
         self, job_client, db_pool, unique_queue
     ):
-        """Nothing stops a job carrying both, and they keep their separate
-        meanings: the identity answers the second enqueue while the job is
-        still queued, so the deadline_key's UniqueViolationError never fires."""
+        """Carrying both is refused, and nothing is written.
+
+        The two answer the SAME question -- what happens to a duplicate
+        enqueue? -- with opposite answers: an identity hands the existing job
+        back for the life of the row, a deadline_key raises and then re-arms at
+        the claim. A row carrying both makes which answer a caller gets depend
+        on which index its INSERT collided with first, and the second call gets
+        a job whose identity promise it never asked for. (This USED to be
+        allowed: the previous test here asserted the coexistence, which was the
+        absence of a check rather than a decision -- client._KEYS_CONTRADICT's
+        own comment has always described the three keys as mutually exclusive.)
+        """
         key = f"identity:{unique_queue}:both"
         deadline = f"deadline:{unique_queue}:both"
-        first = await job_client.enqueue(
-            OK, queue=unique_queue, identity_key=key, deadline_key=deadline
-        )
 
-        second = await job_client.enqueue(
-            OK, queue=unique_queue, identity_key=key, deadline_key=deadline
-        )
+        with pytest.raises(ValueError, match="cannot be combined with deadline_key"):
+            await job_client.enqueue(
+                OK, queue=unique_queue, identity_key=key, deadline_key=deadline
+            )
 
-        assert second == first
-        held = await rows_holding(db_pool, key)
-        assert len(held) == 1
-        assert held[0]["deadline_key"] == deadline
+        assert await rows_holding(db_pool, key) == []
 
 
 class TestTheCreatedFlag:

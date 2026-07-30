@@ -176,6 +176,14 @@ right for work that recurs: a nightly digest, a debounced re-index, a "the
 cart changed, schedule a reminder" job. Tomorrow's is a legitimately new
 job, and the key must not stop it.
 
+Once released, the key is not taken back: a **retry, re-run or DLQ retry
+clears `deadline_key` from the row it requeues** (as does the monitor when it
+reclaims a job from a dead worker, and a waiter's wake). So a job that failed
+and was retried no longer collapses anything — it just runs, and a duplicate
+submitted while it was out of the queue is a job of its own. That is the only
+answer that works: the duplicate may already hold the key, and a requeue that
+tried to take it back would raise instead of requeueing.
+
 ```python
 # one pending reminder per cart; tomorrow's is a different job
 try:

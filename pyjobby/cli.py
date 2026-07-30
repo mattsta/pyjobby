@@ -936,17 +936,20 @@ def jobs_steps(ctx: click.Context, job_id: int, output_json: bool) -> None:
 @click.option(
     "--resume",
     is_flag=True,
-    help="Keep DXE checkpoints: completed steps fast-forward instead of re-executing",
+    help=(
+        "Keep DXE checkpoints and durable streams: completed steps "
+        "fast-forward instead of re-executing"
+    ),
 )
 @click.pass_context
 def jobs_rerun(ctx: click.Context, job_id: int, resume: bool) -> None:
     """RE-RUN a terminal job — including a FINISHED one (repeats side effects)
 
-    By default the run is fresh: DXE checkpoints are wiped and the job
-    re-executes from step 1, which is what "run it again" means. Pass
-    --resume to keep the checkpoints instead — completed steps fast-forward
-    and execution continues where it left off, which is how an interrupted
-    durable job is resumed.
+    By default the run is fresh: DXE checkpoints and durable streams are wiped
+    and the job re-executes from step 1, streaming from seq 0, which is what
+    "run it again" means. Pass --resume to keep both instead — completed steps
+    fast-forward and execution continues where it left off, which is how an
+    interrupted durable job is resumed.
 
     `jobs retry` is the verb for jobs that did NOT succeed; it refuses
     finished jobs precisely because re-running them repeats their effects.
@@ -2147,6 +2150,31 @@ def schedule_add(
             f"--priority {priority} --max-prio {priority}` (or declare "
             f"prio_ceiling in the config file, once, for every command).",
             code=2,
+        )
+
+    # The two safety features interact, and the interaction is invisible: a
+    # backfill fires through the SAME path an on-time tick does, so
+    # max_concurrent_jobs refuses backfilled ticks exactly as it refuses
+    # duplicate on-time ones. The recovery needs backfill_limit + 1 slots (the
+    # +1 is the currently-due tick, which the caller fires before the backfill
+    # runs), so at the default max_concurrent 1 a backfill_limit of any size
+    # fires nothing at all -- the feature is inert and says so nowhere. WARN
+    # rather than refuse: "catch up on what you can, up to my concurrency" is a
+    # legitimate thing to ask for, and the fires are ordered newest-first so
+    # what survives the cap is the freshest. On stderr, so a scripted `schedule
+    # add` still parses its stdout.
+    if backfill_limit > 0 and backfill_limit + 1 > max_concurrent:
+        print_warning(
+            f"--backfill-limit {backfill_limit} needs --max-concurrent "
+            f"{backfill_limit + 1} to land in full, and this schedule has "
+            f"{max_concurrent}: a backfilled tick is refused by "
+            f"max_concurrent_jobs exactly like an on-time one, and the "
+            f"currently-due tick already occupies one slot. "
+            f"{max_concurrent - 1 if max_concurrent > 1 else 0} of "
+            f"{backfill_limit} backfilled tick(s) can fire per recovery; the "
+            f"rest are recorded as `max_concurrent` skips. Fires go "
+            f"newest-first, so the ticks lost are the oldest.",
+            err=True,
         )
 
     async def _add() -> None:
@@ -3408,8 +3436,9 @@ def doctor(
 
     Checks: database reachability, schema/migrations, NOTIFY triggers,
     NOTIFY queue saturation, live workers, workers that are alive but
-    claiming nothing, queue backlogs, jobs no live worker can claim, blocked
-    waiters, unread mail, the DLQ, and overdue schedules.
+    claiming nothing, queue backlogs, queues whose partition_limits scope
+    nothing, jobs no live worker can claim, blocked waiters, unread mail, the
+    DLQ, and overdue schedules.
 
     With --json the same checks come out as [{check, status, message}] and
     the exit code is unchanged, so a CI job can scrape them.
@@ -3591,6 +3620,36 @@ def doctor(
                     f"{summary} (thresholds: depth {max_depth}, "
                     f"age {max_age_minutes}m)",
                 )
+
+            # A queue that asked for per-lane limits and set no limits. This
+            # is the one queue-control setting that does NOTHING on its own:
+            # partition_limits does not cap anything, it RE-SCOPES the caps --
+            # max_concurrency and rate_limit are counted per distinct
+            # partition_key instead of per queue. With neither set there is
+            # nothing to re-scope, so the flag is on, the operator believes
+            # tenants are isolated, and every lane is unlimited. Invisible
+            # otherwise: `queues show` prints `Partition Limits: yes` and is
+            # telling the truth about the column.
+            unscoped = await conn.fetch("""
+                SELECT name FROM jorb_queue
+                WHERE COALESCE(partition_limits, FALSE)
+                  AND max_concurrency IS NULL
+                  AND rate_limit IS NULL
+                ORDER BY name
+            """)
+            doc.warn_if(
+                bool(unscoped),
+                "partition-limits",
+                "every queue with partition_limits has a limit to scope",
+                f"{len(unscoped)} queue(s) set partition_limits with neither "
+                f"max_concurrency nor rate_limit, so there is nothing to "
+                f"re-scope and every lane is unlimited: "
+                f"{', '.join(q['name'] for q in unscoped)}. "
+                f"partition_limits does not cap anything by itself -- it makes "
+                f"the two limits count per partition_key instead of per queue. "
+                f"Set one (pj-admin queues limits NAME --max-concurrency N), or "
+                f"clear the flag (--no-partition-limits)",
+            )
 
             # Work no live worker on its queue could ever claim. Checked
             # right after the backlog, because the backlog is what it hides

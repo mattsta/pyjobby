@@ -55,6 +55,45 @@ class StaleExecutionError(DXEError):
     attempt owns the row now."""
 
 
+class StreamClosedError(Exception):
+    """A job appended to a stream it had already closed.
+
+    Deliberately **not** a ``DXEError``: those are control-flow signals that
+    bypass checkpoint recording, and this is an ordinary step FAILURE that must
+    be recorded like any other -- naming the key and the job is the whole point,
+    and the job's retry budget applies to it exactly as to a step that raised.
+
+    Raised by BOTH ``stream_write`` after ``stream_close`` and a second
+    ``stream_close`` of the same key. A silently-idempotent close would be the
+    friendlier-looking choice and the wrong one: the closing marker is already
+    exactly-once per call site (its checkpoint fast-forwards on every replay),
+    so a *second* close is not a retry, it is two call sites both believing they
+    own the end of the stream. And an append after the marker is worse than a
+    caller bug the platform can hide: readers stop at ``closed``, so the row
+    lands where nothing will ever read it and the stream silently loses data.
+    """
+
+    def __init__(self, job_id: int, key: str, *, closing: bool) -> None:
+        did = "close" if closing else "append to"
+        super().__init__(
+            f"job {job_id} tried to {did} stream {key!r}, which it has already "
+            f"closed. A closing marker ends the stream: readers stop there, so "
+            f"anything written after it is unreachable. "
+            + (
+                "stream_close() is exactly-once per call site already (the "
+                "checkpoint fast-forwards on replay), so a second close means "
+                "two call sites both think they own the end of this stream -- "
+                "close it in one place."
+                if closing
+                else "Write every row before closing, or use a second key for "
+                "the output that comes later."
+            )
+        )
+        self.job_id = job_id
+        self.key = key
+        self.closing = closing
+
+
 class StepTimeoutError(Exception):
     """A durable step ran longer than its per-step budget.
 
@@ -186,15 +225,52 @@ GET_EVENT_SQL = """SELECT value FROM jorb_event WHERE job_id = $1 AND key = $2""
 # execution's appends must not land in a stream a live attempt is still
 # writing, because a reader cannot tell the two writers apart.
 #
+# THE FENCE TAKES THE JOB ROW'S LOCK, which is what makes it a fence rather
+# than a hint. An unlocked `EXISTS (SELECT ... run_epoch = $5)` is evaluated
+# against this statement's own snapshot, so a zombie whose statement started
+# before the requeue committed reads the OLD epoch, passes, and appends -- and
+# the row then sits in the stream forever, indistinguishable to a reader from
+# the live attempt's output. The window is real and was reproduced. `FOR SHARE`
+# closes it because the epoch bump is an UPDATE and therefore takes the row's
+# exclusive lock: the zombie's append blocks instead of proceeding, and when the
+# requeue commits, READ COMMITTED re-evaluates this clause against the NEW row
+# version (EvalPlanQual), finds the bumped epoch, matches nothing and appends
+# nothing. In the other order the requeue is the one that waits, for as long as
+# one append transaction takes, and the append it waited for was legitimate.
+#
+# The lock cannot live in an EXISTS subquery -- a locking clause needs rows it
+# can identify with individual table rows -- so the fence is a CTE the INSERT
+# selects FROM. MATERIALIZED so the lock is taken once, before the insert, and
+# not folded into it.
+#
+# A CLOSED STREAM REFUSES FURTHER ROWS, loudly. The closing marker is where
+# every reader stops, so a row appended after it is a row nothing will ever
+# read: silently accepting it turns a caller bug into missing output. `shut`
+# reports the marker separately from the fence because "superseded" and "you
+# already closed this" need opposite responses from the caller (abandon
+# quietly vs. record a step failure), and neither can be inferred from an
+# empty result.
+#
 # Params: $1 job_id, $2 key, $3 value, $4 closed, $5 writer run_epoch.
-STREAM_APPEND_SQL = """INSERT INTO jorb_stream
-            (job_id, key, seq, value, closed, run_epoch)
-        SELECT $1, $2,
-               COALESCE((SELECT max(s.seq) FROM jorb_stream s
-                          WHERE s.job_id = $1 AND s.key = $2), -1) + 1,
-               $3, $4, $5
-        WHERE EXISTS (SELECT 1 FROM jorb WHERE id = $1 AND run_epoch = $5)
-        RETURNING seq"""
+STREAM_APPEND_SQL = """WITH locked AS MATERIALIZED (
+            SELECT id FROM jorb WHERE id = $1 AND run_epoch = $5 FOR SHARE
+        ), shut AS (
+            SELECT 1 FROM jorb_stream
+             WHERE job_id = $1 AND key = $2 AND closed
+        ), appended AS (
+            INSERT INTO jorb_stream
+                (job_id, key, seq, value, closed, run_epoch)
+            SELECT $1, $2,
+                   COALESCE((SELECT max(s.seq) FROM jorb_stream s
+                              WHERE s.job_id = $1 AND s.key = $2), -1) + 1,
+                   $3, $4, $5
+              FROM locked
+             WHERE NOT EXISTS (SELECT 1 FROM shut)
+            RETURNING seq
+        )
+        SELECT (SELECT count(*) FROM locked)::int AS fenced,
+               (SELECT count(*) FROM shut)::int   AS already_closed,
+               (SELECT seq FROM appended)         AS seq"""
 
 # Discard a job's whole checkpoint log so its step sequence can restart at 1.
 #

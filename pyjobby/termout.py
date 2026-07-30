@@ -41,9 +41,14 @@ def print_error(msg: str) -> None:
     click.echo(f"{Colors.FAIL}Error: {msg}{Colors.ENDC}", err=True)
 
 
-def print_warning(msg: str) -> None:
-    """Print warning message in yellow"""
-    click.echo(f"{Colors.WARNING}{msg}{Colors.ENDC}")
+def print_warning(msg: str, *, err: bool = False) -> None:
+    """Print warning message in yellow.
+
+    ``err=True`` sends it to stderr, which is what a warning ABOUT a command
+    that is still going to succeed wants: the command's stdout is its result,
+    and a script parsing that result must not have advice mixed into it.
+    """
+    click.echo(f"{Colors.WARNING}{msg}{Colors.ENDC}", err=err)
 
 
 #: ANSI SGR sequences (the color codes Colors.* emit). Table layout must

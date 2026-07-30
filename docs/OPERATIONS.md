@@ -68,8 +68,9 @@ Checks (FAIL exits nonzero; WARN does not): database reachable, the schema's
 **shape** against the manifest of objects this release addresses, all seven
 schema triggers present by name, NOTIFY queue saturation, live workers seen
 in the last 60s, workers that are alive but claiming nothing, per-queue
-depth and oldest-runnable age, jobs no live worker on their queue could ever
-claim, waiters blocked on a crashed or cancelled
+depth and oldest-runnable age, queues that set `partition_limits` with
+neither limit for it to re-scope, jobs no live worker on their queue could
+ever claim, waiters blocked on a crashed or cancelled
 upstream, unread durable mail older than a day, DLQ size, overdue
 schedules. Run it from cron/CI
 as a platform health probe; scrape `GET /metrics` on the web admin for
@@ -84,6 +85,7 @@ PASS notify-queue: 0.0% full
 WARN workers: no live workers seen in last 60s
 PASS job-threads: 0 live worker(s) claiming
 PASS queues: no queued jobs
+PASS partition-limits: every queue with partition_limits has a limit to scope
 PASS unclaimable: no queued job is invisible to its queue's live workers
 PASS blocked-waiters: no waiting jobs blocked on failed upstreams
 PASS mailbox: no unread mail older than a day
@@ -120,8 +122,8 @@ waiting -> queued                                  (dependency satisfied)
   (errors reset) or `pj-admin jobs rerun ID`.
 - **DXE jobs** (using `self.step(...)`) resume from their last completed
   checkpoint on any retry — `pj-admin jobs steps ID` shows what completed.
-  `pj-admin jobs rerun ID` wipes checkpoints for a from-scratch rerun;
-  `--resume` keeps them.
+  `pj-admin jobs rerun ID` wipes checkpoints **and durable streams** for a
+  from-scratch rerun; `--resume` keeps both.
 - **Durable sleeps** hold no worker: a sleeping job is simply `queued` with
   a future `run_after`.
 
@@ -568,11 +570,15 @@ first two reuse the job's row; the third does not.
   finished job: re-running successful work repeats its side effects, and
   that has to be asked for by name.
 - **Re-run** — `pj-admin jobs rerun ID`. Accepts a finished job. FRESH by
-  default: the DXE step checkpoints are dropped and the job re-executes
-  from step 1 — that is what "run it again" means. Add `--resume` to keep
-  the checkpoints instead; completed steps fast-forward and the job
-  continues where it stopped, which is how an interrupted durable job is
-  resumed.
+  default: the DXE step checkpoints **and the job's durable streams** are
+  dropped and the job re-executes from step 1 — that is what "run it again"
+  means. The streams go with the checkpoints because a stream position is one
+  past the highest that key holds, so keeping them would have the new run's
+  output land _after_ the old run's and every reader be handed the two runs
+  concatenated as one. Add `--resume` to keep both instead; completed steps
+  fast-forward (appending nothing, so the first attempt's rows stay the only
+  copy) and the job continues where it stopped, which is how an interrupted
+  durable job is resumed.
 - **Fork** — `pj-admin jobs fork ID --from-step N` (or `--from-failure`).
   Creates a **second job** that re-executes this one's work from step N,
   with steps 1..N-1 copied in as checkpoints so they fast-forward. The

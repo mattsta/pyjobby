@@ -228,7 +228,13 @@ STMTS["finished"] = """UPDATE jorb
 # Bumps run_epoch so the attempt being abandoned is fenced out immediately --
 # a timed-out task may still be executing, and checkpoint writes are guarded
 # by the epoch alone.
-STMTS["retry"] = """UPDATE jorb
+# Clears the dedupe keys (db.REQUEUE_CLEARS_KEYS states the rule once): the
+# row is going back into 'queued', and a key whose collapse duty ended at the
+# first claim must not re-enter jorb_deadline_idx / jorb_debounce_idx on the
+# way. deadline_key is the one that can actually collide here -- a duplicate
+# enqueued while this attempt ran is sitting in the index -- and the debounce
+# columns are cleared beside it because this is ONE rule, not two.
+STMTS["retry"] = f"""UPDATE jorb
               SET state = 'queued',
                   run_epoch = run_epoch + 1,
                   run_after = now() + $2::interval,
@@ -236,6 +242,7 @@ STMTS["retry"] = """UPDATE jorb
                   error_backtrace = $4,
                   error_count = error_count + 1,
                   timeout_at = NULL,
+                  {db.REQUEUE_CLEARS_KEYS}
                   updated = now()
               WHERE id = $1
                 AND state IN ('claimed', 'running')
@@ -301,8 +308,15 @@ STMTS["reschedule"] = """UPDATE jorb
 # path of every grouped job — count made a fan-out of N cost O(N²) index
 # reads across its lifetime. NOT EXISTS stops at the first unfinished
 # member, which is O(1) for all N-1 completions that don't wake anyone.
-STMTS["enqueue-next-if-peer-group-is-finished"] = """ UPDATE jorb
+#
+# Clears deadline_key on the way in (db.WAKE_CLEARS_KEYS): 'waiting' is
+# outside jorb_deadline_idx, so several waiters of one group may legally hold
+# the same key, and this is ONE update over all of them -- carrying the key
+# into 'queued' would violate the index and roll back the wake of every OTHER
+# waiter in the group along with it.
+STMTS["enqueue-next-if-peer-group-is-finished"] = f""" UPDATE jorb
             SET state = 'queued',
+                {db.WAKE_CLEARS_KEYS}
                 updated = now()
             WHERE id IN (
                 SELECT id FROM jorb
@@ -317,9 +331,11 @@ STMTS["enqueue-next-if-peer-group-is-finished"] = """ UPDATE jorb
             )
             RETURNING id"""
 
-# Wake jobs waiting on a single upstream job we just finished.
-STMTS["enqueue-next-self-finished"] = """ UPDATE jorb
+# Wake jobs waiting on a single upstream job we just finished. Clears
+# deadline_key for the reason the group wake above does.
+STMTS["enqueue-next-self-finished"] = f""" UPDATE jorb
             SET state = 'queued',
+                {db.WAKE_CLEARS_KEYS}
                 updated = now()
             WHERE id IN (
                 SELECT id FROM jorb
@@ -864,9 +880,27 @@ class JobSystem:
         # so an elapsed-time test against it would be a guess about uptime
         if self._hidden_reported and now - self._hidden_reported < 60:
             return
+
+        ceiling_rows = await self.ex("above-ceiling", self.qname, self.prio)
+        # Asked whatever this worker's own version is. An UNVERSIONED worker
+        # is the one most likely to be looking at pinned work it cannot take
+        # (it is what a fleet runs before anybody sets --app-version), so
+        # skipping the question when self.app_version is None would hide the
+        # condition from exactly the fleet that has it.
+        version_rows = await self.ex(
+            "hidden-versions", self.qname, self.app_version, self.prio
+        )
+        # STAMPED HERE, after BOTH statements came back, and never before them.
+        # Stamped up front, a connection that dropped between the two suppressed
+        # the whole report for a minute -- and the reconnect that follows starts
+        # the timer again, so a worker with a flapping connection could report
+        # the invisible work it is sitting on approximately never. This is the
+        # only surface that names the condition from inside the fleet, and it
+        # costs nothing to re-run: the caller only reaches it when the worker
+        # found nothing claimable.
         self._hidden_reported = now
 
-        rows = await self.ex("above-ceiling", self.qname, self.prio)
+        rows = ceiling_rows
         above = rows[0]["above"] if rows else 0
         if above:
             logger.warning(
@@ -887,12 +921,7 @@ class JobSystem:
                 rows[0]["lowest"],
             )
 
-        # Asked whatever this worker's own version is. An UNVERSIONED worker
-        # is the one most likely to be looking at pinned work it cannot take
-        # (it is what a fleet runs before anybody sets --app-version), so
-        # skipping the question when self.app_version is None would hide the
-        # condition from exactly the fleet that has it.
-        rows = await self.ex("hidden-versions", self.qname, self.app_version, self.prio)
+        rows = version_rows
         mismatched = rows[0]["mismatched"] if rows else 0
         if not mismatched:
             return
@@ -2268,10 +2297,16 @@ class Job:
         differ only in the marker column and the checkpoint name they consume
         a sequence number under, so the exactly-once argument is written
         once. Returns the position the row took.
+
+        THREE OUTCOMES, and the statement reports them separately because they
+        need opposite responses: the fence failed (this execution has been
+        superseded -- abandon quietly, StaleExecutionError), the stream is
+        already closed (a caller bug that must be recorded as a step failure,
+        StreamClosedError), or the row landed and its position comes back.
         """
 
         async def _do_append(conn: asyncpg.Connection) -> int:
-            rows = await conn.fetch(
+            row = await conn.fetchrow(
                 dxe.STREAM_APPEND_SQL,
                 self.job["id"],
                 key,
@@ -2279,11 +2314,16 @@ class Job:
                 closed,
                 self._dxe_epoch,
             )
-            if not rows:
+            # Checked before the closed marker: a superseded execution has no
+            # standing to complain about anything, and "abandon quietly" is
+            # the only correct answer for it.
+            if not row["fenced"]:
                 raise dxe.StaleExecutionError(
                     f"job {self.job['id']} epoch {self._dxe_epoch} superseded"
                 )
-            return int(rows[0]["seq"])
+            if row["already_closed"]:
+                raise dxe.StreamClosedError(self.job["id"], key, closing=closed)
+            return int(row["seq"])
 
         return int(await self.transaction(name, _do_append))
 
@@ -2313,8 +2353,16 @@ class Job:
         sees in ``pj-admin jobs steps`` — one checkpoint per write, in call
         order, with the position as its output.
 
-        Fenced on this execution's epoch: a superseded attempt appends
-        nothing, because a reader cannot tell two writers apart.
+        Fenced on this execution's epoch, and the fence takes the job row's
+        lock: a superseded attempt appends nothing even if its statement began
+        before the requeue committed, because a reader cannot tell two writers
+        apart.
+
+        Raises ``StreamClosedError`` if this key has already been closed.
+        Readers stop at the closing marker, so a row written after it is a row
+        nothing will ever read -- the platform refuses rather than accepting
+        output into a hole. The refusal is recorded as this step's failure and
+        takes the job's ordinary retry path.
         """
         return await self._stream_append(f"dxe.stream:{key}", key, value, closed=False)
 
@@ -2333,6 +2381,13 @@ class Job:
 
         Checkpointed under ``dxe.stream-close:<key>``, exactly-once and
         epoch-fenced like ``stream_write``.
+
+        CLOSING TWICE RAISES ``StreamClosedError`` -- it is deliberately not
+        idempotent. Every close is already exactly-once per CALL SITE (the
+        checkpoint fast-forwards on every replay), so a second close is never a
+        retry: it is two call sites that both believe they own the end of this
+        stream, which is the bug that leaves a job writing rows past its own
+        marker. Refused where the author can still see it.
         """
         await self._stream_append(f"dxe.stream-close:{key}", key, None, closed=True)
 

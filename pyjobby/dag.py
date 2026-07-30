@@ -31,6 +31,29 @@ if TYPE_CHECKING:
     from .client import JobClient
 
 
+def _refuse_identity(node: DAGNode) -> None:
+    """Refuse a node carrying an ``identity_key``.
+
+    A DAG does not merely enqueue its nodes, it WIRES them: ``execute()``
+    stamps ``dag_id`` and ``run_group`` onto the ids the enqueues handed back.
+    An identified enqueue may hand back a job it did not create -- that is its
+    whole contract -- so a node whose identity already existed had the DAG
+    rewrite a PRE-EXISTING row: the job was taken out of the DAG it belonged to
+    and rewired into this one, mid-flight, leaving its old DAG reporting a
+    member it no longer had. Observed, not theorised.
+
+    Refused rather than resolved because there is nothing to resolve: a graph
+    is a set of jobs created together, and a node that might already exist is
+    not one of them. Checked in ``add()`` (where the caller supplied the
+    option) and again in ``validate()`` (for a hand-built node), so no path
+    reaches the wiring with one.
+    """
+    if node._job_options.get("identity_key") is not None:
+        from .client import _NO_DAG_IDENTITY
+
+        raise ValueError(f"{node.job_class}: {_NO_DAG_IDENTITY}")
+
+
 @dataclass
 class DAGNode:
     """A node in the DAG representing a job"""
@@ -120,6 +143,7 @@ class DAGBuilder:
 
         # Merge common and job-specific options
         node._job_options = {**self.common_options, **options}
+        _refuse_identity(node)
 
         self.nodes.append(node)
         return node
@@ -131,10 +155,18 @@ class DAGBuilder:
         Checks:
         1. No cycles (must be acyclic)
         2. All dependencies are in the DAG
+        3. No node carries an identity_key (see :func:`_refuse_identity`)
 
         Raises:
             ValueError: If DAG is invalid
         """
+        # Re-checked here, not only in add(): a node may be constructed
+        # directly and appended to self.nodes, and execute() calls this before
+        # it opens its transaction, so this is the last gate in front of the
+        # wiring that an identity would let loose on somebody else's job.
+        for node in self.nodes:
+            _refuse_identity(node)
+
         # Check all dependencies are in this DAG
         for node in self.nodes:
             for dep in node.depends_on:

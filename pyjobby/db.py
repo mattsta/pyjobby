@@ -108,6 +108,47 @@ def utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC)
 
 
+#: The SET-clause fragment every statement that puts a job BACK into 'queued'
+#: has to carry, spelled once so the rule is one rule and not six.
+#:
+#: A deadline_key and a debounce_key are held by a row that is QUEUED --
+#: jorb_deadline_idx is partial on ``state = 'queued'`` and jorb_debounce_idx
+#: on ``state = 'queued' AND run_count = 0`` -- so a key's collapse duty ends
+#: the first time its row leaves 'queued', and duplicates enqueued afterwards
+#: open a NEW window on a NEW row. Every statement that returns the row to
+#: 'queued' therefore has to drop the keys, or the row re-enters indexes it has
+#: no business being in and takes the new window's row's slot: with a later
+#: burst holding the key, the requeue raises a unique violation instead of
+#: requeueing. That is not a corner case, it is a batch-poisoner -- one such
+#: row aborted the whole statement, so the monitor's dead-worker sweep and a
+#: bulk `jobs retry` failed for every OTHER job in the batch too, every cycle,
+#: forever.
+#:
+#: Kept out of it: identity_key (jorb_identity_idx has no state predicate; the
+#: row holds that key for life, which is the promise) and partition_key (a lane
+#: label, not a dedupe key). Statements that requeue from an ATTEMPT rather
+#: than from a terminal state cannot violate jorb_debounce_idx -- they ran, so
+#: run_count >= 1 -- but they clear the same three columns anyway, because the
+#: rule an operator has to hold is "leaving 'queued' ends the key", not "leaving
+#: 'queued' ends the key except along these two edges".
+REQUEUE_CLEARS_KEYS: Final = """deadline_key = NULL,
+                debounce_key = NULL,
+                debounce_deadline = NULL,"""
+
+#: What a WAITER's wake has to carry, and it is a strictly smaller set.
+#:
+#: 'waiting' is outside jorb_deadline_idx, so two waiting rows may legally hold
+#: the same deadline_key -- and the wake is ONE UPDATE over every waiter of the
+#: upstream, so waking both would violate the index and roll the whole statement
+#: back, leaving every other waiter of that upstream parked as well. Level-
+#: triggered, so it fails again on the monitor's next pass, forever.
+#:
+#: No debounce columns: a debounced enqueue with waitfor_job/waitfor_group is
+#: refused at the door (client._NO_DEBOUNCE_WAITFOR), precisely because the
+#: collapse window is held by a QUEUED row, so a waiting row never carries one.
+WAKE_CLEARS_KEYS: Final = "deadline_key = NULL,"
+
+
 def build_requeue_sql(
     allowed_states: tuple[str, ...] = ("crashed",),
     *,
@@ -130,12 +171,31 @@ def build_requeue_sql(
     also guard on state IN ('claimed','running'). Checkpoints are loaded
     without an epoch filter, so bumping costs no resume capability.
 
-    ``wipe_checkpoints`` deletes the job's jorb_step rows in the same
-    statement: a resume replays checkpoints regardless of epoch, so a re-RUN
-    ("do it again anyway", repeating side effects) must discard them or the
-    durable job would fast-forward over the very work it was asked to redo.
-    Retry leaves them (that IS resume). One statement, so the wipe and the
-    requeue commit together and no re-claim can land between them.
+    ``wipe_checkpoints`` deletes the job's jorb_step rows AND its jorb_stream
+    rows in the same statement: a resume replays checkpoints regardless of
+    epoch, so a re-RUN ("do it again anyway", repeating side effects) must
+    discard them or the durable job would fast-forward over the very work it
+    was asked to redo. The streams go with them because a stream position is
+    assigned as "one past the highest this key holds": keeping the old rows
+    would have the fresh run's first ``stream_write`` land at seq N instead of
+    0, so every reader of the re-run would be handed the previous run's output
+    with the new run appended to it -- one stream claiming to be two runs.
+    Retry and ``rerun --resume`` leave both (that IS resume: the fast-forwarded
+    ``stream_write`` checkpoints append nothing, so the rows the first attempt
+    wrote are the only copy there will ever be). One statement, so the wipes and
+    the requeue commit together and no re-claim can land between them.
+
+    THE DEDUPE KEYS ARE CLEARED, always. A deadline_key and a debounce_key are
+    held by a QUEUED row and their collapse duty is over the first time the row
+    leaves 'queued' (jorb_deadline_idx and jorb_debounce_idx say so with their
+    predicates). A requeue puts the row BACK into 'queued', so a row that
+    carried its key across would re-enter those unique indexes -- and if a
+    later burst has since opened a new window on the same key, the requeue
+    itself raises a unique violation, inside a failure handler or in the middle
+    of a batch. Cleared here, a retry can never be refused for a key whose job
+    it already is, and the new window's row is left alone. (identity_key is NOT
+    cleared: its index has no state predicate, the row holds it for life, and
+    the promise is that no second row exists while this one does.)
 
     Parameters: $1 job_id, $2 delay (interval), $3 reset_errors (bool).
     """
@@ -152,6 +212,7 @@ def build_requeue_sql(
                 finished = NULL,
                 timeout_at = NULL,
                 cancel_requested = FALSE,
+                {REQUEUE_CLEARS_KEYS}
                 updated = now()
             WHERE {target}
               AND state IN ({states})
@@ -162,6 +223,8 @@ def build_requeue_sql(
             {requeue}
         ), wiped AS (
             DELETE FROM jorb_step WHERE job_id IN (SELECT id FROM bumped)
+        ), unstreamed AS (
+            DELETE FROM jorb_stream WHERE job_id IN (SELECT id FROM bumped)
         )
         SELECT id FROM bumped"""
 
@@ -237,12 +300,17 @@ async def rerun_job(
     Separate from :func:`retry_job` on purpose: re-running successful work
     repeats its side effects, so callers must ask for it by name.
 
-    ``fresh`` (the default) discards the job's DXE checkpoint log so the run
-    actually re-executes -- a durable job's checkpoints are replayed with no
-    epoch filter, so without the wipe a rerun would fast-forward over the
-    very steps it was asked to redo and repeat nothing. Pass ``fresh=False``
-    to keep the checkpoints, i.e. RESUME an interrupted durable job from
-    where it stopped rather than restart it.
+    ``fresh`` (the default) discards the job's DXE checkpoint log AND its
+    durable streams so the run actually re-executes -- a durable job's
+    checkpoints are replayed with no epoch filter, so without the wipe a rerun
+    would fast-forward over the very steps it was asked to redo and repeat
+    nothing. The streams go with the checkpoints because a stream position is
+    "one past the highest this key holds": left in place, the fresh run's first
+    ``stream_write`` would land after the previous run's rows and every reader
+    would be handed both runs concatenated as one. Pass ``fresh=False`` to keep
+    both, i.e. RESUME an interrupted durable job from where it stopped rather
+    than restart it -- the completed ``stream_write`` checkpoints fast-forward
+    and append nothing, so the first attempt's rows are the run's only copy.
     """
     return await requeue_job(
         conn,
@@ -267,8 +335,9 @@ async def requeue_job(
     and by the monitor (which requeues in-flight states). Prefer the named
     verbs; pass ``allowed_states`` only for a genuinely different guard.
 
-    ``wipe_checkpoints`` discards the job's DXE checkpoint log so the next
-    attempt re-executes from the start; retry leaves it to resume.
+    ``wipe_checkpoints`` discards the job's DXE checkpoint log and its durable
+    streams so the next attempt re-executes from the start and streams from
+    seq 0; retry leaves both to resume.
 
     Returns the job id, or None if it wasn't in an allowed state."""
     if delay is None:
@@ -427,8 +496,23 @@ async def fork_job(
 ) -> dict[str, Any]:
     """Fork ``job_id`` into a NEW job that starts at ``from_step``.
 
-    THE fork verb for every surface (client, admin API, `pj-admin jobs
-    fork`), so no surface can fork on terms another one would refuse.
+    THE fork verb for every surface (client, admin API, `pj-admin jobs fork`).
+    WHAT THAT DOES AND DOES NOT COVER, exactly, because "no surface can fork on
+    terms another would refuse" was an overstatement:
+
+    * ENFORCED HERE, for every surface: ``from_step >= 1``, the source existing,
+      ``from_step`` within the source's recorded steps + 1, the source not being
+      deleted underneath the fork, and ``app_version`` (empty and over-long,
+      via :func:`client.validate_app_version` -- one call, here, rather than one
+      per wrapper).
+    * LEFT TO THE WRAPPERS: ``priority``. The ceiling a priority is checked
+      against is a property of the CALLER's deployment (a client's declared
+      ``prio_ceiling``, an AdminAPI's, the CLI's ``--max-prio`` or config), and
+      this function is handed a connection and no deployment. Moving the check
+      here would mean either inventing a default ceiling that silently differs
+      from the caller's or plumbing one through every call -- so it stays where
+      the number lives. Every wrapper does check it, with the same
+      ``client.validate_priority``.
 
     ``from_step`` is 1-based and names the step the fork EXECUTES first:
     ``1`` (the default) copies no checkpoints and re-runs the whole job under
@@ -464,22 +548,42 @@ async def fork_job(
     "queue", "priority"}``.
 
     Raises ForkRefused when there is no such job, when ``from_step`` is below
-    1, or when it exceeds the source's recorded step count + 1 (there is no
-    prefix to copy that far, so the request is a typo rather than a fork).
+    1, when it exceeds the source's recorded step count + 1 (there is no
+    prefix to copy that far, so the request is a typo rather than a fork), or
+    when the source is DELETED while the fork is being written. Raises
+    ValueError for an empty or over-long ``app_version``.
     """
+    from .client import validate_app_version
+
     if from_step < 1:
         raise ForkRefused(
             f"from_step must be at least 1 (steps are numbered from 1); got {from_step}"
         )
-    row = await conn.fetchrow(
-        FORK_JOB_SQL,
-        job_id,
-        from_step,
-        queue,
-        priority,
-        kwargs_override,
-        app_version,
-    )
+    try:
+        row = await conn.fetchrow(
+            FORK_JOB_SQL,
+            job_id,
+            from_step,
+            queue,
+            priority,
+            kwargs_override,
+            validate_app_version(app_version),
+        )
+    except asyncpg.ForeignKeyViolationError as e:
+        # `forked_from REFERENCES jorb (id)`, and the only way the reference can
+        # fail is a concurrent DELETE of the very source this statement read: a
+        # retention sweep or `jobs delete` committing between this snapshot
+        # (which found the source, so `src` had a row) and the FK check at the
+        # end of the insert. Reported as the refusal it is -- the caller's
+        # argument turned out not to name a job any more, which is exactly what
+        # `_no_such_job` says, only later -- rather than as a raw
+        # ForeignKeyViolationError naming a column no caller passed.
+        raise ForkRefused(
+            f"source job {job_id} was deleted while forking, so the fork has "
+            f"nothing to descend from and nothing was written; the source was "
+            f"there when this statement began (retention or an operator delete "
+            f"committed underneath it)"
+        ) from e
     if not row["source_exists"]:
         raise _no_such_job(job_id)
     if row["job_id"] is None:

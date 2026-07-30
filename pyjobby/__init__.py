@@ -43,7 +43,13 @@ from .client import (
 )
 from .dag import DAGBuilder
 from .db import ForkRefused, JobState
-from .dxe import DXEError, NondeterminismError, StaleExecutionError, StepTimeoutError
+from .dxe import (
+    DXEError,
+    NondeterminismError,
+    StaleExecutionError,
+    StepTimeoutError,
+    StreamClosedError,
+)
 
 # MachineDefinitionError comes from .fsm, not .statemachine: the declaration
 # format has no imports of its own, so exporting the error a bad machine
@@ -97,6 +103,7 @@ __all__ = [
     "StaleExecutionError",
     "StateMachineJob",
     "StepTimeoutError",
+    "StreamClosedError",
     "SyncJobClient",
     "SyncMachine",
     "UnhandledEventError",

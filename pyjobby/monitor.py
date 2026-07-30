@@ -147,7 +147,14 @@ SWEEP_TIMED_OUT_SQL = """
 """
 
 #: In-flight jobs of workers whose heartbeat went stale. ($1 grace, $2 batch)
-SWEEP_DEAD_WORKER_JOBS_SQL = """
+#:
+#: Clears the dedupe keys (db.REQUEUE_CLEARS_KEYS holds the rule): this puts
+#: rows back into 'queued', and it does it for a WHOLE BATCH in one statement.
+#: A single row whose deadline_key a duplicate has since re-armed would raise a
+#: unique violation that aborts the entire UPDATE -- so every other doomed job
+#: of every dead worker stays stranded, and the sweep fails the same way on
+#: every cycle after this one. Recovery permanently disabled by one row.
+SWEEP_DEAD_WORKER_JOBS_SQL = f"""
     WITH doomed AS MATERIALIZED (
         SELECT j.id FROM jorb j
         JOIN jorb_worker w ON w.id = j.claimed_by
@@ -161,6 +168,7 @@ SWEEP_DEAD_WORKER_JOBS_SQL = """
         run_epoch = run_epoch + 1,
         run_after = now(),
         timeout_at = NULL,
+        {db.REQUEUE_CLEARS_KEYS}
         updated = now()
     FROM doomed
     WHERE jorb.id = doomed.id
@@ -195,8 +203,10 @@ RETIRE_DEAD_WORKERS_SQL = """
 #: case the worker is alive and heartbeating, so the dead-worker sweep never
 #: fires and the timeout sweep (state='running') never sees it; this sweep
 #: is the only thing that can. Requeue bumps run_epoch, so if the claimer
-#: somehow does come back for it, its writes are fenced out.
-SWEEP_STUCK_CLAIMS_SQL = """
+#: somehow does come back for it, its writes are fenced out. Clears the dedupe
+#: keys, and it is a batch statement, so for the reason the dead-worker sweep
+#: above spells out.
+SWEEP_STUCK_CLAIMS_SQL = f"""
     WITH doomed AS MATERIALIZED (
         SELECT id FROM jorb
         WHERE state = 'claimed'
@@ -209,6 +219,7 @@ SWEEP_STUCK_CLAIMS_SQL = """
         run_epoch = run_epoch + 1,
         run_after = now(),
         timeout_at = NULL,
+        {db.REQUEUE_CLEARS_KEYS}
         updated = now()
     FROM doomed
     WHERE jorb.id = doomed.id
@@ -603,9 +614,17 @@ SWEEP_SATISFIED_GROUP_WAITERS_SQL = """
 #: ...and the wake both flavors share. Guarded on 'waiting' so a row that
 #: moved (a concurrent cancel, the edge-triggered wake beating us) is left
 #: alone; the loser of that race loses quietly, as everywhere else.
-WAKE_WAITERS_SQL = """
+#:
+#: Clears deadline_key (db.WAKE_CLEARS_KEYS): 'waiting' is outside
+#: jorb_deadline_idx, so two waiters may legally hold the same key, and this
+#: statement wakes a whole BATCH of them at once. Carrying the key into
+#: 'queued' would make the pair violate the index, roll the statement back, and
+#: leave every other waiter in the batch parked -- and since the sweep is
+#: level-triggered it would do it again on every pass, forever.
+WAKE_WAITERS_SQL = f"""
     UPDATE jorb w
     SET state = 'queued',
+        {db.WAKE_CLEARS_KEYS}
         updated = now()
     WHERE w.id = ANY($1::bigint[])
       AND w.state = 'waiting'
@@ -675,8 +694,10 @@ CANCEL_UNSATISFIABLE_WAITERS_SQL = """
 #: Requeue one timed-out job for another attempt. Bumps run_epoch: the
 #: execution that blew the deadline may still be running, and its
 #: epoch-only-guarded writes must stop applying now, not at the next claim.
+#: Clears the dedupe keys, like every other statement that returns a row to
+#: 'queued' (db.REQUEUE_CLEARS_KEYS).
 #: ($1 job_id, $2 error message, $3 retry delay interval)
-RETRY_TIMED_OUT_SQL = """
+RETRY_TIMED_OUT_SQL = f"""
     UPDATE jorb
     SET state = 'queued',
         run_epoch = run_epoch + 1,
@@ -684,6 +705,7 @@ RETRY_TIMED_OUT_SQL = """
         error_count = error_count + 1,
         error_message = $2,
         run_after = now() + $3::interval,
+        {db.REQUEUE_CLEARS_KEYS}
         updated = now()
     WHERE id = $1
       AND state = 'running'

@@ -41,9 +41,10 @@ from click.testing import CliRunner
 
 from pyjobby import db as db_module
 from pyjobby.cli import cli
-from pyjobby.client import JobClient
+from pyjobby.client import ENQUEUE_SQL, JobClient
 
 from .conftest import wait_for_job_state
+from .utils.faults import wait_until_blocked_on_a_transaction
 
 pytestmark = pytest.mark.asyncio
 
@@ -80,35 +81,12 @@ async def row(pool: asyncpg.Pool, job_id: int) -> dict[str, Any]:
     return dict(await pool.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id))
 
 
-async def wait_until_blocked_on_a_transaction(
-    pool: asyncpg.Pool, timeout: float = 20.0
-) -> None:
-    """Poll until some backend here is waiting on another's transaction lock.
-
-    Both halves of debounce can block on one: the bounce UPDATE waits for a
-    concurrent updater of the same row, and the speculative insert waits for
-    the transaction holding the conflicting key. Observing the wait -- rather
-    than sleeping and hoping -- is what makes the race tests below
-    deterministic: the holder is released only once the other side is
-    provably stuck on it.
-
-    Each xdist worker owns its own database (conftest.db_params), so
-    `current_database()` scopes this to this test's own traffic.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        blocked = await pool.fetchval(
-            "SELECT count(*) FROM pg_stat_activity "
-            " WHERE datname = current_database() "
-            "   AND wait_event_type = 'Lock' AND wait_event = 'transactionid'"
-        )
-        if blocked:
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError(
-        f"no backend blocked on the holder's transaction within {timeout}s: "
-        f"the racing debounce resolved without waiting, which it must not"
-    )
+# The lock-wait observer both halves of debounce need -- the bounce UPDATE
+# waiting out a concurrent updater of the same row, and the speculative insert
+# waiting out the transaction holding the conflicting key -- lives in
+# tests/utils/faults.py, because the stream-append fence needs exactly the same
+# observation for exactly the same reason. Re-exported under this module's name
+# so the race tests below read as they always did.
 
 
 class TestTheFirstCallParks:
@@ -601,19 +579,30 @@ class TestRacingProducers:
         key = f"{unique_queue}:insertrace"
         client = JobClient(pool=db_pool)
 
-        # db_module.connect, not asyncpg's: the outbox INSERT writes jsonb
-        # kwargs and needs pyjobby's codecs on the connection.
+        # db_module.connect, not asyncpg's: the INSERT writes jsonb kwargs and
+        # needs pyjobby's codecs on the connection.
+        #
+        # The winning row is planted with the shared row builder and the plain
+        # ENQUEUE_SQL rather than through enqueue_in_transaction(), which now
+        # REFUSES debounce_key (client._NO_OUTBOX_DEBOUNCE -- that path has no
+        # bounce statement in front of it, so a held key would abort the
+        # caller's transaction instead of collapsing). What this test needs is
+        # only an uncommitted INSERT holding the key, which is what
+        # debounce()'s own speculative insert is; the refusal is about the
+        # public verb, not about the statement.
         holder = await db_module.connect(**db_params)
         try:
             transaction = holder.transaction()
             await transaction.start()
-            winner = await JobClient.enqueue_in_transaction(
-                holder,
-                OK,
-                queue=unique_queue,
-                debounce_key=key,
-                run_after=datetime.now(UTC) + timedelta(seconds=30),
-                x=1,
+            winner = await holder.fetchval(
+                ENQUEUE_SQL,
+                *JobClient.build_enqueue_row(
+                    OK,
+                    queue=unique_queue,
+                    debounce_key=key,
+                    run_after=datetime.now(UTC) + timedelta(seconds=30),
+                    x=1,
+                ),
             )
 
             joining = asyncio.create_task(

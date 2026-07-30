@@ -156,8 +156,9 @@ Usage: pj-admin doctor [OPTIONS]
 
   Checks: database reachability, schema/migrations, NOTIFY triggers, NOTIFY
   queue saturation, live workers, workers that are alive but claiming nothing,
-  queue backlogs, jobs no live worker can claim, blocked waiters, unread mail,
-  the DLQ, and overdue schedules.
+  queue backlogs, queues whose partition_limits scope nothing, jobs no live
+  worker can claim, blocked waiters, unread mail, the DLQ, and overdue
+  schedules.
 
   With --json the same checks come out as [{check, status, message}] and the
   exit code is unchanged, so a CI job can scrape them.
@@ -182,6 +183,7 @@ PASS notify-queue: 0.0% full
 WARN workers: no live workers seen in last 60s
 PASS job-threads: 0 live worker(s) claiming
 PASS queues: no queued jobs
+PASS partition-limits: every queue with partition_limits has a limit to scope
 PASS unclaimable: no queued job is invisible to its queue's live workers
 PASS blocked-waiters: no waiting jobs blocked on failed upstreams
 PASS mailbox: no unread mail older than a day
@@ -286,21 +288,28 @@ not.
 
 ```console
 $ pj-admin jobs --help
+Usage: pj-admin jobs [OPTIONS] COMMAND [ARGS]...
+
+  Manage jobs
+
+Options:
+  --help  Show this message and exit.
+
 Commands:
-  cancel         Cancel one or more jobs.
-  delete         Delete one or more jobs (permanent!)
-  fork           FORK a job into a NEW job that starts at a given step
-  history        Show a job's full transition trail (including per-attempt errors)
-  inspect        Show detailed information about a job
-  list           List jobs with optional filtering
-  rerun          RE-RUN a terminal job — including a FINISHED one (repeats side effects)
-  retry          Retry one or more crashed jobs
-  retry-stats    Show retry statistics from the jorb_history audit trail
+  cancel           Cancel one or more jobs.
+  delete           Delete one or more jobs (permanent!)
+  fork             FORK a job into a NEW job that starts at a given step
+  history          Show a job's full transition trail (including...
+  inspect          Show detailed information about a job
+  list             List jobs with optional filtering
+  rerun            RE-RUN a terminal job — including a FINISHED one...
+  retry            Retry one or more crashed jobs
+  retry-stats      Show retry statistics from the jorb_history audit trail
   set-app-version  Re-pin (or unpin) a queued or waiting job's app version.
-  set-priority   Change a queued or waiting job's priority.
-  steps          Show a job's DXE step checkpoints
-  timeout-stats  Show timeout statistics (from jorb.timeout_at/state)
-  why            Explain, in one command, why a job is not running
+  set-priority     Change a queued or waiting job's priority.
+  steps            Show a job's DXE step checkpoints
+  timeout-stats    Show timeout statistics (from jorb.timeout_at/state)
+  why              Explain, in one command, why a job is not running
 ```
 
 ### Finding jobs
@@ -547,18 +556,19 @@ Usage: pj-admin jobs rerun [OPTIONS] JOB_ID
 
   RE-RUN a terminal job — including a FINISHED one (repeats side effects)
 
-  By default the run is fresh: DXE checkpoints are wiped and the job re-
-  executes from step 1, which is what "run it again" means. Pass --resume to
-  keep the checkpoints instead — completed steps fast-forward and execution
-  continues where it left off, which is how an interrupted durable job is
-  resumed.
+  By default the run is fresh: DXE checkpoints and durable streams are wiped
+  and the job re-executes from step 1, streaming from seq 0, which is what
+  "run it again" means. Pass --resume to keep both instead — completed steps
+  fast-forward and execution continues where it left off, which is how an
+  interrupted durable job is resumed.
 
   `jobs retry` is the verb for jobs that did NOT succeed; it refuses finished
   jobs precisely because re-running them repeats their effects.
 
 Options:
-  --resume  Keep DXE checkpoints: completed steps fast-forward instead of
-            re-executing
+  --resume  Keep DXE checkpoints and durable streams: completed steps fast-
+            forward instead of re-executing
+  --help    Show this message and exit.
 ```
 
 - `jobs retry ID...` — for jobs that did **not** succeed (`crashed` or
@@ -834,7 +844,7 @@ important signal:
   a worker that advertises none. Mid-deploy a fleet has workers on two
   versions, and this column is the answer to "why is that pinned job still
   queued?" (see
-  [CLIENT_LIBRARY.md § Pinning work to a code version](CLIENT_LIBRARY.md#pinning-work-to-a-code-version)).
+  [CLIENT_LIBRARY.md § Pinning work to a code version](CLIENT_LIBRARY.md#7b-pinning-work-to-a-code-version)).
 
 Both are explained in
 [OPERATIONS.md § Abandoned job threads](OPERATIONS.md#abandoned-job-threads-when-a-worker-stops-claiming-on-purpose).

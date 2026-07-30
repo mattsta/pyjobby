@@ -1620,7 +1620,12 @@ class AdminAPI:
         Returns True if the row was updated, False if the job does not exist
         or has already left the queue.
         """
-        validate_app_version(app_version)
+        # The RETURN VALUE is what gets written, exactly as in the client twin
+        # (client.update_job_app_version): the validator is the one place that
+        # decides what a version pin may be, and discarding what it hands back
+        # would let this path drift from every other the day it normalises
+        # anything.
+        app_version = validate_app_version(app_version)
         result: str = await self.conn.execute(
             """
             UPDATE jorb SET app_version = $2
@@ -2686,16 +2691,19 @@ class AdminAPI:
         (db.rerun_job, the websocket rerun action, `pj-admin jobs rerun`);
         `retry` is the verb that refuses finished jobs.
 
-        By default the run is fresh: the job's DXE checkpoints are deleted
-        so it actually re-executes from step 1. Pass fresh=False to RESUME
-        instead — checkpoints are kept and completed steps fast-forward,
-        which is how an interrupted durable job is continued. Either way the
-        same row is requeued with its error budget reset.
+        By default the run is fresh: the job's DXE checkpoints AND its durable
+        streams are deleted so it actually re-executes from step 1 and streams
+        from seq 0 (a position is one past the highest that key holds, so
+        keeping the rows would concatenate the two runs into one stream). Pass
+        fresh=False to RESUME instead — both are kept, completed steps
+        fast-forward and their stream writes append nothing, which is how an
+        interrupted durable job is continued. Either way the same row is
+        requeued with its error budget reset.
 
         Args:
             job_id: Job ID
-            fresh: True (default) restarts from step 1; False resumes from
-                the recorded checkpoints
+            fresh: True (default) restarts from step 1 with an empty stream;
+                False resumes from the recorded checkpoints and streams
 
         Returns:
             {"job_id", "status", "fresh"} where status is 'requeued' or
@@ -2767,7 +2775,7 @@ class AdminAPI:
             queue=queue,
             priority=priority,
             kwargs_override=kwargs_override,
-            app_version=validate_app_version(app_version),
+            app_version=app_version,
         )
 
     async def fork_job_from_failure(
@@ -2796,7 +2804,7 @@ class AdminAPI:
             queue=queue,
             priority=priority,
             kwargs_override=kwargs_override,
-            app_version=validate_app_version(app_version),
+            app_version=app_version,
         )
 
     async def list_forks(

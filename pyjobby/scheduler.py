@@ -902,6 +902,20 @@ class SchedulerWorker:
         the circuit breaker counts an enqueue failure, and the per-tick
         deadline key makes two schedulers recovering at once converge on one
         job per tick. Jitter is not applied -- see :meth:`execute_schedule`.
+
+        THE KEPT TICKS FIRE NEWEST FIRST, and that is not cosmetic. Those
+        safety refusals BIND: ``max_concurrent_jobs`` defaults to 1, and the
+        current due tick the caller just fired already occupies that one slot,
+        so at the default a backfill burst is refused from its second fire
+        onward. Firing oldest-first spent the budget on the STALEST ticks and
+        skipped the freshest -- the exact inversion of the principle this
+        feature is built on ("the value of a late fire decays", which is why
+        only the newest ``keep`` are collected at all). Newest-first means a
+        refusal sacrifices the oldest tick, so whatever DOES get fired is the
+        most useful thing available. Sizing rule for an operator who wants the
+        whole burst to land: ``max_concurrent_jobs >= backfill_limit + 1``
+        (the +1 is the due tick), which `schedule add` warns about at creation
+        time and docs/RECURRING_SCHEDULER.md spells out.
         """
         limit = schedule["backfill_limit"]
         if limit <= 0:
@@ -923,6 +937,28 @@ class SchedulerWorker:
             keep=limit,
         )
 
+        # NEWEST FIRST -- see the docstring. missed.kept is ascending because
+        # the window is walked forward; the fires are the reverse of it, so a
+        # safety refusal costs the OLDEST tick rather than the freshest.
+        for tick in reversed(missed.kept):
+            result = await self.execute_schedule(schedule, tick, allow_jitter=False)
+            # Logged against the tick's SCHEDULED time, never against now:
+            # `actual_time` far ahead of `scheduled_time` is the honest and
+            # only marker that a fire was a backfill, and rewriting
+            # scheduled_time to hide the gap would erase the outage.
+            await self.log_execution(schedule, tick, result)
+            self.record_metrics(result)
+
+        # THE SUMMARY IS WRITTEN LAST, after the fires it describes. It used to
+        # come first, which made a crash mid-burst re-record it on the next
+        # recovery pass and inflate skip_count by the same dropped count again,
+        # every time -- a counter that grew with the number of crashes rather
+        # than with the number of dropped ticks, which is the one thing it is
+        # read for. After the move, a crash mid-burst loses at most this one
+        # summary row (the fires that DID happen are each logged as they
+        # happen), and losing the row is strictly better than double-counting
+        # it: the fires it describes are absent from the log too, so the
+        # history stays consistent with itself.
         if missed.dropped_window is not None:
             oldest, newest = missed.dropped_window
             detail = (
@@ -953,15 +989,6 @@ class SchedulerWorker:
             await self.manager.record_execution_skip(schedule["id"], "backfill_limit")
             await self.log_execution(schedule, oldest, summary)
             self.record_metrics(summary)
-
-        for tick in missed.kept:
-            result = await self.execute_schedule(schedule, tick, allow_jitter=False)
-            # Logged against the tick's SCHEDULED time, never against now:
-            # `actual_time` far ahead of `scheduled_time` is the honest and
-            # only marker that a fire was a backfill, and rewriting
-            # scheduled_time to hide the gap would erase the outage.
-            await self.log_execution(schedule, tick, result)
-            self.record_metrics(result)
 
     async def run(self) -> None:
         """Main scheduler loop"""

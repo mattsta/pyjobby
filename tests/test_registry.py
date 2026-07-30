@@ -157,3 +157,89 @@ class TestUnsatisfiableSignatures:
 
         with pytest.raises(TypeError, match="unknown parameters"):
             await defaulted.enqueue(client, queue=unique_queue, width=5)
+
+
+# ---------------------------------------------------------------------------
+# The option list, and what shadows what
+# ---------------------------------------------------------------------------
+
+
+class TestTheRoutingOptions:
+    """`partition_key` and `app_version` are the two row-level knobs the typed
+    enqueue could not reach.
+
+    They are options, not task kwargs, so without explicit parameters they
+    landed in `**task_kwargs` and were refused as unknown parameters -- a
+    decorated job simply could not be enqueued into a fair-share lane or
+    pinned to a build, and the workaround was to stop using the decorator's
+    enqueue at all. Declared here for the same reason `identity_key` and
+    `deadline_key` are: an option name SHADOWS a task parameter of the same
+    name, which the module docstring says and which is the price of the
+    explicit list.
+    """
+
+    async def test_a_decorated_job_enqueues_into_a_lane_with_a_pin(
+        self, client, db_pool, unique_queue
+    ):
+        @job
+        class LaneReport(Job):
+            async def task(self, day: str) -> dict[str, Any]:
+                return {"day": day}
+
+        job_id = await LaneReport.enqueue(
+            client,
+            queue=unique_queue,
+            partition_key="tenant-42",
+            app_version="2026.07.29",
+            day="mon",
+        )
+
+        row = await db_pool.fetchrow(
+            "SELECT partition_key, app_version, kwargs FROM jorb WHERE id = $1", job_id
+        )
+        assert row["partition_key"] == "tenant-42"
+        assert row["app_version"] == "2026.07.29"
+        assert row["kwargs"] == {"day": "mon"}, "options must not leak into kwargs"
+
+    async def test_omitting_app_version_still_inherits_the_clients_pin(
+        self, db_pool, unique_queue
+    ):
+        """None is not "unpinned" here, it is "whatever the client declared" --
+        the same precedence every untyped enqueue follows (JobClient._app_version).
+        A typed enqueue that hard-coded None would silently write unpinned work
+        from a client whose whole purpose is pinning."""
+
+        @job
+        class PinnedReport(Job):
+            async def task(self, day: str) -> dict[str, Any]:
+                return {"day": day}
+
+        pinned = JobClient(db_pool, app_version="2026.07.29")
+        job_id = await PinnedReport.enqueue(pinned, queue=unique_queue, day="tue")
+
+        assert (
+            await db_pool.fetchval("SELECT app_version FROM jorb WHERE id = $1", job_id)
+            == "2026.07.29"
+        )
+
+    async def test_the_refusals_reach_the_typed_enqueue_too(self, client, unique_queue):
+        """The options go through the same shared row builder, so the same
+        validation applies -- there is no second door."""
+
+        @job
+        class KeyedReport(Job):
+            async def task(self, day: str) -> dict[str, Any]:
+                return {"day": day}
+
+        with pytest.raises(ValueError, match="partition_key is empty"):
+            await KeyedReport.enqueue(
+                client, queue=unique_queue, partition_key="", day="wed"
+            )
+        with pytest.raises(ValueError, match="cannot be combined with deadline_key"):
+            await KeyedReport.enqueue(
+                client,
+                queue=unique_queue,
+                identity_key="i",
+                deadline_key="d",
+                day="wed",
+            )

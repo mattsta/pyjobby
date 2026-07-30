@@ -665,6 +665,82 @@ class TestDoctorQueueBacklog:
 
 
 # ============================================================================
+# Queue controls that promise something they cannot deliver
+# ============================================================================
+
+
+class TestDoctorPartitionLimits:
+    """`partition_limits` is the one queue-control setting that does nothing
+    on its own.
+
+    It does not CAP anything -- it re-scopes the caps, counting
+    `max_concurrency` and `rate_limit` per distinct `partition_key` instead of
+    per queue. With neither set there is nothing to re-scope, so the flag is
+    on, `queues show` prints `Partition Limits: yes` (truthfully, about the
+    column), the operator believes their tenants are isolated, and every lane
+    is unlimited. Nothing else in the platform says so.
+    """
+
+    async def _queue(self, pool, name: str, **control) -> None:
+        await pool.execute(
+            """INSERT INTO jorb_queue
+                   (name, partition_limits, max_concurrency, rate_limit)
+               VALUES ($1, TRUE, $2, $3)""",
+            name,
+            control.get("max_concurrency"),
+            control.get("rate_limit"),
+        )
+
+    async def test_a_queue_with_no_limit_to_scope_warns(
+        self, dsn, db_pool, unique_queue
+    ):
+        await self._queue(db_pool, unique_queue)
+
+        result = await run_doctor(dsn)
+
+        assert result.exit_code == 0, result.output  # a config problem, not a FAIL
+        status, message = parse_checks(result.output)["partition-limits"]
+        assert status == "WARN"
+        assert unique_queue in message
+        assert "nothing to re-scope" in message
+        assert "--max-concurrency" in message
+
+    @pytest.mark.parametrize(
+        "control",
+        [{"max_concurrency": 4}, {"rate_limit": 10}],
+        ids=["max-concurrency", "rate-limit"],
+    )
+    async def test_either_limit_is_enough_to_scope(
+        self, dsn, db_pool, unique_queue, control
+    ):
+        """Both limits are re-scoped by the flag, so either one on its own
+        gives it something to do."""
+        await self._queue(db_pool, unique_queue, **control)
+
+        result = await run_doctor(dsn)
+
+        assert parse_checks(result.output)["partition-limits"] == (
+            "PASS",
+            "every queue with partition_limits has a limit to scope",
+        )
+
+    async def test_a_limited_queue_without_the_flag_is_not_this_checks_business(
+        self, dsn, db_pool, unique_queue
+    ):
+        """The inverse is a perfectly ordinary queue-wide cap, which is the
+        default and the common case."""
+        await db_pool.execute(
+            """INSERT INTO jorb_queue (name, partition_limits, max_concurrency)
+               VALUES ($1, FALSE, 4)""",
+            unique_queue,
+        )
+
+        result = await run_doctor(dsn)
+
+        assert parse_checks(result.output)["partition-limits"][0] == "PASS"
+
+
+# ============================================================================
 # Work no live worker can claim
 # ============================================================================
 # The proactive half of `pj-admin jobs why ID`. Both ways into the condition

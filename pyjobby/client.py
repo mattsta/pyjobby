@@ -417,18 +417,79 @@ _KEYS_CONTRADICT: Final = (
     "primitive')."
 )
 
-#: Longest ``partition_key`` an enqueue accepts.
+#: The same contradiction between the OTHER two keys, which the comment above
+#: promised was mutually exclusive and which nothing enforced. A row carrying
+#: both would have the identified statement resolve the conflict by handing the
+#: existing job back while jorb_deadline_idx was meanwhile refusing duplicates
+#: of the same work outright -- so which promise a caller got depended on which
+#: index the row happened to collide with first.
+_IDENTITY_AND_DEADLINE: Final = (
+    "identity_key cannot be combined with deadline_key: they promise opposite "
+    "things about a duplicate enqueue -- identity_key hands back the existing "
+    "job (at most once, for the life of the row), deadline_key raises and then "
+    "RE-ARMS the moment the job is claimed, so tomorrow's submission is a new "
+    "job. Those cannot both be true of one row. Pick the one whose promise you "
+    "want (docs/writing-jobs.md, 'Choosing your dedupe primitive')."
+)
+
+#: Why an identified enqueue cannot also carry a dependency edge.
 #:
-#: A partition key is a GROUPING KEY read inside the serialised claim
-#: section, not a payload: on a queue with ``partition_limits`` every
-#: saturated lane's key is carried in an array that the claim's per-row test
-#: probes, so an unbounded key would put an unbounded string into the one
-#: critical section that sets a capped queue's whole ceiling. 256 characters
-#: is far past every real lane name (a tenant id, an account, an api key, a
-#: region) and short enough that a thousand saturated lanes is still a small
-#: array. Refused at the door, where the caller can still be told, rather
-#: than accepted and paid for on every claim forever.
-MAX_PARTITION_KEY_LENGTH: Final = 256
+#: An identified enqueue's whole contract is that it may return a job it did
+#: NOT create. That job has whatever dependency the enqueue which really made
+#: it asked for -- a different upstream, a different group, or none at all, and
+#: it may have finished months ago. So the caller's `waitfor_job=X` is silently
+#: not applied: nothing raises, nothing waits, and the ordering the caller
+#: asked for simply does not exist. Refused, because the failure is invisible
+#: at the call site and shows up as work that ran too early.
+_NO_IDENTITY_WAITFOR: Final = (
+    "identity_key cannot be combined with waitfor_job/waitfor_group: an "
+    "identified enqueue may return a job it did not create, and that job "
+    "already has whatever dependency (or none) the enqueue that really made it "
+    "asked for -- so this dependency would silently not be applied and the "
+    "work would run unordered. Give the identity to the job that does the "
+    "work and let an unidentified waiter depend on it, or key the identity to "
+    "include the upstream."
+)
+
+#: Why a DAG node cannot carry an identity_key.
+#:
+#: A DAG node is enqueued and then WIRED: `execute()` rewrites dag_id and
+#: run_group on the ids it just got back. An identity that already existed
+#: hands back somebody else's job, so the wiring rewrites a PRE-EXISTING row --
+#: taking it out of the DAG it belongs to and into this one, mid-flight, with
+#: its old DAG left reporting a member it no longer has. Observed, not
+#: theorised. There is nothing to resolve here: a graph is a set of jobs
+#: created together, and a node that might already exist is not one of them.
+_NO_DAG_IDENTITY: Final = (
+    "identity_key is not a DAG node option: a DAG enqueues its nodes and then "
+    "stamps dag_id and run_group onto the ids it got back, and an identity "
+    "that already exists hands back a job this DAG did not create -- so the "
+    "stamp would STEAL a live job out of its own DAG and rewire it into this "
+    "one. Enqueue the identified job on its own and have the DAG depend on it."
+)
+
+#: Why the plain enqueue paths refuse a debounce_key, and it is the batch's
+#: reason (see _NO_BATCH_DEBOUNCE) reached by a different door: enqueue() and
+#: enqueue_in_transaction() run the plain INSERT, with no bounce statement in
+#: front of it. A key already held therefore does not collapse -- it raises a
+#: unique violation, which in the outbox case aborts the CALLER's transaction
+#: and takes their application write with it -- and a key not yet held silently
+#: writes a row with no ``debounce_deadline``, an uncapped collapse window that
+#: nothing will ever clamp and that later bounces will defer forever.
+#:
+#: One constant for both because they are one statement: enqueue() IS
+#: enqueue_in_transaction() on a pooled connection. Every guarantee the option
+#: implies lives in JobClient.debounce()'s bounce-or-insert pair, which is what
+#: the schema's own COMMENT on jorb.debounce_key has always said ("Set only by
+#: JobClient.debounce()").
+_NO_OUTBOX_DEBOUNCE: Final = (
+    "debounce_key is not an enqueue() / enqueue_in_transaction() option: "
+    "collapsing a burst is a bounce-or-insert pair of statements and these "
+    "paths run the plain INSERT -- a key already held would raise instead of "
+    "collapsing (aborting the caller's transaction, in the outbox case), and a "
+    "key not yet held would open a collapse window with no cap to clamp it. "
+    "Call debounce(key=..., period=..., cap=...), which owns that pair."
+)
 
 #: Longest ``app_version`` an enqueue accepts.
 #:
@@ -480,6 +541,75 @@ def validate_app_version(app_version: str | None) -> str | None:
             f"say why a job is not running"
         )
     return app_version
+
+
+#: Longest any caller-chosen key an enqueue accepts may be, and the shortest.
+#:
+#: One bound for all four (deadline_key, identity_key, debounce_key,
+#: partition_key) because they are the same KIND of thing: a name the caller
+#: chose, stored in a column something INDEXES or GROUPS BY, never a payload.
+#: partition_key documented the reasoning first (MAX_PARTITION_KEY_LENGTH,
+#: which this unifies) and the argument transfers unchanged: an unbounded key
+#: is an unbounded string in a btree the enqueue path writes and the claim path
+#: reads. 256 characters is far past every real one -- an order id, a tenant, a
+#: date-stamped digest name, a ULID -- and short enough that a saturated queue's
+#: worth of them is still small.
+MAX_KEY_LENGTH: Final = 256
+
+#: Longest ``partition_key`` an enqueue accepts.
+#:
+#: A partition key is a GROUPING KEY read inside the serialised claim
+#: section, not a payload: on a queue with ``partition_limits`` every
+#: saturated lane's key is carried in an array that the claim's per-row test
+#: probes, so an unbounded key would put an unbounded string into the one
+#: critical section that sets a capped queue's whole ceiling. Refused at the
+#: door, where the caller can still be told, rather than accepted and paid for
+#: on every claim forever.
+#:
+#: The SAME bound as every other caller-chosen key, and named separately only
+#: because the name is public API; :data:`MAX_KEY_LENGTH` is where the number
+#: and the reasoning live.
+MAX_PARTITION_KEY_LENGTH: Final = MAX_KEY_LENGTH
+
+
+def validate_key(name: str, value: str | None) -> str | None:
+    """Check one caller-chosen key column and return it, or None if unset.
+
+    THE one validator for deadline_key, identity_key, debounce_key and
+    partition_key, so no key can be refused on one path and accepted on
+    another. None means "not using this feature" and is always fine; anything
+    else has to be a name, which means non-empty and bounded.
+
+    An EMPTY key is refused rather than stored because it is not the same thing
+    as no key at all and behaves nothing like it: `''` is a real value, so it
+    takes a slot in that column's unique index and every OTHER caller who
+    passed an empty key collides with it -- unrelated jobs deduplicating
+    against each other, or (for partition_key) sharing one fair-share lane
+    while the NULL lane sits beside them. It is almost always a variable that
+    came back blank: an f-string over a missing id, a config value the
+    deployment did not set. Refused here, where the caller is still around to
+    hear about it.
+    """
+    if value is None:
+        return None
+    if not value.strip():
+        raise ValueError(
+            f"{name} is empty: None is how a job says it is not using this "
+            f"feature (and is the default), while '' is a real key -- it takes "
+            f"a slot in that column's index, so every other caller who passed "
+            f"an empty {name} would collide with this job. This is usually an "
+            f"f-string over a value that was missing; omit the argument "
+            f"instead."
+        )
+    if len(value) > MAX_KEY_LENGTH:
+        raise ValueError(
+            f"{name} is {len(value)} characters, above the {MAX_KEY_LENGTH} the "
+            f"platform accepts: it is a NAME the caller chose, stored in a "
+            f"column the enqueue path indexes and the claim path reads, not a "
+            f"payload — key it to an id, a tenant or a date stamp rather than "
+            f"to the data itself"
+        )
+    return value
 
 
 #: Why a debounced job cannot also wait on something. `waitfor_job` /
@@ -585,6 +715,16 @@ class JobInfo:
     priority: int
     state: str
     created: datetime
+
+
+#: The projection that fills a :class:`JobInfo`, spelled once. Every column
+#: here is a field of the dataclass and every field is a column here --
+#: ``JobInfo(**dict(row))`` is the constructor, so the two lists have to match
+#: exactly or the call raises. Written twice (get_job, get_job_by_identity) it
+#: was two chances to add a field and update one of them.
+_JOB_INFO_SELECT: Final = (
+    "SELECT id, job_class, queue, prio as priority, state, created FROM jorb"
+)
 
 
 @dataclass
@@ -1333,13 +1473,18 @@ class JobClient:
         migrated is enqueue, and the driver's message is true and useless --
         it names no database and no fix. Say both; the caller chains the
         original so the traceback keeps the SQL detail.
+
+        Worded for any verb, not just enqueue: every client method that touches
+        a jorb table routes its UndefinedTableError through here (enqueue,
+        enqueue_identified, debounce, the pipeline, the fork pair), and the
+        answer is the same one for all of them.
         """
         from . import migrations
         from .configloader import describe_db_target
 
         return RuntimeError(
-            f"Cannot enqueue into {describe_db_target(self._db_params)}: "
-            f"{migrations.SCHEMA_REMEDY}"
+            f"The pyjobby schema is not installed in "
+            f"{describe_db_target(self._db_params)}: {migrations.SCHEMA_REMEDY}"
         )
 
     def _app_version(self, override: str | None) -> str | None:
@@ -1694,6 +1839,20 @@ class JobClient:
         method, so the client's version does NOT apply -- pass it, or use
         `enqueue()` when the transaction is not the caller's.
 
+        ``debounce_key`` is REFUSED here (see _NO_OUTBOX_DEBOUNCE): this path
+        runs the plain INSERT with no bounce statement in front of it, so a key
+        already held would abort the caller's whole transaction rather than
+        collapse, and one not yet held would open a window with no cap. The
+        refusal covers ``enqueue()`` as well, which is this method on a pooled
+        connection and has exactly the same two failures.
+        ``identity_key`` IS accepted and does what it does everywhere: the
+        identified statement runs inside the caller's transaction, returns the
+        existing job's id when the key is already held, and discards the row it
+        would have created. The retry loop it may enter therefore re-runs inside
+        that transaction -- which is fine at READ COMMITTED (each attempt is a
+        new statement snapshot) and cannot converge above it, exactly as the
+        loop's own docstring says.
+
         Example:
             async with conn.transaction():
                 await conn.execute("INSERT INTO orders ...")
@@ -1701,6 +1860,8 @@ class JobClient:
                     conn, 'myapp.jobs.FulfillOrder', order_id=42
                 )
         """
+        if options.get("debounce_key") is not None:
+            raise ValueError(_NO_OUTBOX_DEBOUNCE)
         job_id, _ = await JobClient._enqueue_row(conn, job_class, **options)
         return job_id
 
@@ -1870,18 +2031,25 @@ class JobClient:
                 "collapse window, and there is no window without a key"
             )
 
-        # Bounded here because here is the last place a caller exists to be
-        # told: past this point the key is a row, and the cost of an oversized
-        # one is paid by every claim on that queue rather than by the enqueue
-        # that wrote it.
-        if partition_key is not None and len(partition_key) > MAX_PARTITION_KEY_LENGTH:
-            raise ValueError(
-                f"partition_key is {len(partition_key)} characters, above the "
-                f"{MAX_PARTITION_KEY_LENGTH} the platform accepts: it names a "
-                f"fair-share LANE (a tenant, an account, an api key) and is "
-                f"read inside the serialised claim section, so it is a label "
-                f"and not a payload"
-            )
+        # ...and the same completeness for identity_key, whose exclusivity the
+        # comment on _KEYS_CONTRADICT has always claimed and which nothing
+        # checked. Beside the debounce arm above, not in enqueue_identified():
+        # the scheduler, the batch, the outbox path and the DAG all build rows
+        # through here and none of them goes through that method.
+        if identity_key is not None:
+            if deadline_key is not None:
+                raise ValueError(_IDENTITY_AND_DEADLINE)
+            if waitfor_job or waitfor_group:
+                raise ValueError(_NO_IDENTITY_WAITFOR)
+
+        # Every caller-chosen key, bounded and non-empty by ONE rule. Here
+        # because here is the last place a caller exists to be told: past this
+        # point the key is a row, and its cost is paid by whatever reads it --
+        # a claim, an index probe -- rather than by the enqueue that wrote it.
+        validate_key("deadline_key", deadline_key)
+        validate_key("identity_key", identity_key)
+        validate_key("debounce_key", debounce_key)
+        validate_key("partition_key", partition_key)
 
         # Here for the same reason, and it is the ONE place every writer's
         # version pin is checked: the pool enqueue, the caller's transaction,
@@ -2138,11 +2306,7 @@ class JobClient:
         """
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                """
-                SELECT id, job_class, queue, prio as priority, state, created
-                FROM jorb
-                WHERE id = $1
-            """,
+                f"{_JOB_INFO_SELECT} WHERE id = $1",
                 job_id,
             )
 
@@ -2170,11 +2334,7 @@ class JobClient:
         """
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                """
-                SELECT id, job_class, queue, prio as priority, state, created
-                FROM jorb
-                WHERE identity_key = $1
-            """,
+                f"{_JOB_INFO_SELECT} WHERE identity_key = $1",
                 identity_key,
             )
 
@@ -2260,9 +2420,10 @@ class JobClient:
         side effects it will repeat. Asked for by name, never implied:
         `retry_job` is the verb that refuses finished jobs.
 
-        By default the run is fresh (DXE checkpoints wiped, re-executes from
-        step 1). Pass fresh=False to RESUME an interrupted durable job from
-        its recorded checkpoints instead.
+        By default the run is fresh (DXE checkpoints AND durable streams
+        wiped, re-executes from step 1 and streams from seq 0). Pass
+        fresh=False to RESUME an interrupted durable job from its recorded
+        checkpoints instead, keeping the stream it had already written.
 
         Returns:
             {"job_id", "status", "fresh"} where status is 'requeued' or
@@ -2382,15 +2543,21 @@ class JobClient:
         if priority is not None:
             validate_priority(priority, self.prio_ceiling)
         async with self.pool.acquire() as conn:
-            return await db.fork_job(
-                conn,
-                job_id,
-                from_step=from_step,
-                queue=queue,
-                priority=priority,
-                kwargs_override=kwargs_override,
-                app_version=validate_app_version(app_version),
-            )
+            try:
+                return await db.fork_job(
+                    conn,
+                    job_id,
+                    from_step=from_step,
+                    queue=queue,
+                    priority=priority,
+                    kwargs_override=kwargs_override,
+                    app_version=app_version,
+                )
+            except asyncpg.UndefinedTableError as e:
+                # Same translation every other client verb makes: an
+                # unmigrated database answers `relation "jorb" does not exist`,
+                # which names neither the database nor the fix.
+                raise self._unmigrated_database_error() from e
 
     async def fork_job_from_failure(
         self,
@@ -2417,14 +2584,17 @@ class JobClient:
         if priority is not None:
             validate_priority(priority, self.prio_ceiling)
         async with self.pool.acquire() as conn:
-            return await db.fork_job_from_failure(
-                conn,
-                job_id,
-                queue=queue,
-                priority=priority,
-                kwargs_override=kwargs_override,
-                app_version=validate_app_version(app_version),
-            )
+            try:
+                return await db.fork_job_from_failure(
+                    conn,
+                    job_id,
+                    queue=queue,
+                    priority=priority,
+                    kwargs_override=kwargs_override,
+                    app_version=app_version,
+                )
+            except asyncpg.UndefinedTableError as e:
+                raise self._unmigrated_database_error() from e
 
     # =========================================================================
     # Waiting on jobs (LISTEN/NOTIFY with polling fallback)
