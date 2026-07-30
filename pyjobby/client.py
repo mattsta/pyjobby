@@ -113,10 +113,11 @@ ENQUEUE_SQL = """
         capability, uid, run_group,
         waitfor_job, waitfor_group,
         deadline_key, admin_data, tags, state, schedule_id,
-        identity_key, debounce_key, debounce_deadline, partition_key
+        identity_key, debounce_key, debounce_deadline, partition_key,
+        app_version
     )
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-            $16, $17, $18, $19)
+            $16, $17, $18, $19, $20)
     RETURNING id
 """
 
@@ -168,10 +169,11 @@ ENQUEUE_IDENTIFIED_SQL = """
             capability, uid, run_group,
             waitfor_job, waitfor_group,
             deadline_key, admin_data, tags, state, schedule_id,
-            identity_key, debounce_key, debounce_deadline, partition_key
+            identity_key, debounce_key, debounce_deadline, partition_key,
+            app_version
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                $15, $16, $17, $18, $19)
+                $15, $16, $17, $18, $19, $20)
         ON CONFLICT (identity_key) WHERE identity_key IS NOT NULL DO NOTHING
         RETURNING id, job_class
     )
@@ -266,10 +268,11 @@ ENQUEUE_DEBOUNCED_SQL = """
         capability, uid, run_group,
         waitfor_job, waitfor_group,
         deadline_key, admin_data, tags, state, schedule_id,
-        identity_key, debounce_key, debounce_deadline, partition_key
+        identity_key, debounce_key, debounce_deadline, partition_key,
+        app_version
     )
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-            $16, $17, $18, $19)
+            $16, $17, $18, $19, $20)
     ON CONFLICT (debounce_key)
         WHERE debounce_key IS NOT NULL AND state = 'queued' AND run_count = 0
         DO NOTHING
@@ -287,7 +290,8 @@ ENQUEUE_BATCH_SQL = """
         capability, uid, run_group,
         waitfor_job, waitfor_group,
         deadline_key, admin_data, tags, state, schedule_id,
-        identity_key, debounce_key, debounce_deadline, partition_key
+        identity_key, debounce_key, debounce_deadline, partition_key,
+        app_version
     )
     SELECT * FROM UNNEST(
         $1::text[], $2::jsonb[], $3::text[], $4::int[],
@@ -295,7 +299,8 @@ ENQUEUE_BATCH_SQL = """
         $8::bigint[], $9::bigint[], $10::bigint[],
         $11::text[], $12::jsonb[], $13::jsonb[],
         $14::jorbstate[], $15::bigint[], $16::text[],
-        $17::text[], $18::timestamptz[], $19::text[]
+        $17::text[], $18::timestamptz[], $19::text[],
+        $20::text[]
     )
     RETURNING id
 """
@@ -424,6 +429,58 @@ _KEYS_CONTRADICT: Final = (
 #: array. Refused at the door, where the caller can still be told, rather
 #: than accepted and paid for on every claim forever.
 MAX_PARTITION_KEY_LENGTH: Final = 256
+
+#: Longest ``app_version`` an enqueue accepts.
+#:
+#: A version string is a build identifier -- a tag, a git sha, a release date,
+#: at worst all three -- and it is compared for EQUALITY by every claim on the
+#: queue and carried in operator-facing messages that have to stay one line.
+#: 128 characters is past every real one and short enough that neither is a
+#: problem. Bounded at the door for the same reason ``partition_key`` is: past
+#: the enqueue there is no caller left to tell.
+MAX_APP_VERSION_LENGTH: Final = 128
+
+#: Why an empty ``app_version`` is refused rather than stored.
+#:
+#: NULL is how a job says "not pinned", and it is the default. An empty string
+#: is a DIFFERENT value that no worker can ever advertise (`pj --app-version
+#: ""` is the same as passing nothing), so a row carrying one is pinned to a
+#: version that cannot exist -- unclaimable forever, and reported as wanting
+#: version ''. It is almost always a variable that came back empty: an unset
+#: ``$GIT_SHA``, a build stamp the CI step did not write. Refused here, where
+#: the caller is still around to hear about it.
+_EMPTY_APP_VERSION: Final = (
+    "app_version is empty: NULL/None is how a job says it is not pinned to a "
+    "code version (and is the default), while '' would pin it to a version no "
+    "worker can advertise -- the job would sit 'queued' forever. This is "
+    "usually an unset build variable; omit the argument to enqueue unpinned "
+    "work."
+)
+
+
+def validate_app_version(app_version: str | None) -> str | None:
+    """Check an ``app_version`` and return it, or None for unpinned work.
+
+    One home for the two ways a version pin goes wrong before it is written --
+    empty (a build variable that came back blank, pinning the job to a version
+    nothing can advertise) and unbounded (a string in the claim's equality
+    test and in every message about the job) -- so the enqueue paths and
+    ``update_job_app_version`` refuse the same values with the same words.
+    """
+    if app_version is None:
+        return None
+    if not app_version.strip():
+        raise ValueError(_EMPTY_APP_VERSION)
+    if len(app_version) > MAX_APP_VERSION_LENGTH:
+        raise ValueError(
+            f"app_version is {len(app_version)} characters, above the "
+            f"{MAX_APP_VERSION_LENGTH} the platform accepts: it names a BUILD "
+            f"(a tag, a sha, a release stamp), is compared for equality by "
+            f"every claim on the queue, and is printed in the messages that "
+            f"say why a job is not running"
+        )
+    return app_version
+
 
 #: Why a debounced job cannot also wait on something. `waitfor_job` /
 #: `waitfor_group` insert the row as 'waiting', and jorb_debounce_idx covers
@@ -824,6 +881,7 @@ class JobClient:
         pool: asyncpg.Pool,
         db_params: dict[str, Any] | str | None = None,
         prio_ceiling: int = DEFAULT_PRIO_CEILING,
+        app_version: str | None = None,
     ):
         """
         Initialize client with connection pool.
@@ -843,11 +901,20 @@ class JobClient:
                 because a job above the fleet's ceiling is never claimed and
                 says so nowhere. Raise it only to match workers you actually
                 run at that ceiling.
+            app_version: the APPLICATION code version to stamp on every
+                enqueue through this client (default: None -- unpinned work,
+                claimable by any worker). A stamped job is claimed ONLY by a
+                worker advertising the same version (`pj --app-version`), so
+                declaring it here pins this deployment's work to matching
+                code. Per-call `app_version=` overrides it; a deployment that
+                wants MOST work unpinned leaves this unset and pins the
+                individual jobs instead.
 
         Note: Use JobClient.create() or JobClient.from_config() instead
         """
         self.pool = pool
         self.prio_ceiling = prio_ceiling
+        self.app_version = validate_app_version(app_version)
         self._closed = False
         # A pool handed to the constructor belongs to the CALLER — a web app
         # routinely shares one pool between its ORM and this client, and
@@ -876,6 +943,7 @@ class JobClient:
         min_size: int = 5,
         max_size: int = 20,
         prio_ceiling: int = DEFAULT_PRIO_CEILING,
+        app_version: str | None = None,
         **kwargs: Any,
     ) -> JobClient:
         """
@@ -892,6 +960,8 @@ class JobClient:
             prio_ceiling: this fleet's worker priority ceiling
                 (`pj --max-prio`, default 1000); enqueueing above it is
                 refused. See JobClient.__init__.
+            app_version: code version to stamp on every enqueue through this
+                client (default: None — unpinned). See JobClient.__init__.
             **kwargs: Additional asyncpg.create_pool parameters
 
         Returns:
@@ -922,7 +992,12 @@ class JobClient:
             "user": user,
             "password": password,
         }
-        client = cls(pool, db_params=db_params, prio_ceiling=prio_ceiling)
+        client = cls(
+            pool,
+            db_params=db_params,
+            prio_ceiling=prio_ceiling,
+            app_version=app_version,
+        )
         client._owns_pool = True
         return client
 
@@ -933,6 +1008,7 @@ class JobClient:
         min_size: int = 5,
         max_size: int = 20,
         prio_ceiling: int | None = None,
+        app_version: str | None = None,
     ) -> JobClient:
         """
         Create client from pyjobby config file.
@@ -947,6 +1023,13 @@ class JobClient:
                 file's own ``prio_ceiling`` is used, and 1000 if the file
                 does not declare one — the ceiling is a deployment fact,
                 declared once in the file every daemon already reads.
+            app_version: code version to stamp on every enqueue through this
+                client. Left unset (the default), the config file's own
+                ``app_version`` is used, and None if the file does not declare
+                one. Declared in that file for the same reason the ceiling is,
+                and it is the SAME key ``pj --app-version`` defaults to — the
+                two halves of a version pin have to agree, so they read one
+                string from one place.
 
         Raises:
             ConfigError: the file declares no db_params. Falling back to
@@ -962,7 +1045,9 @@ class JobClient:
         """
         from .configloader import ConfigError, load_config_from_file
 
-        config = load_config_from_file(config_path, keys=["db_params", "prio_ceiling"])
+        config = load_config_from_file(
+            config_path, keys=["db_params", "prio_ceiling", "app_version"]
+        )
         db_params = config.get("db_params")
         if not db_params:
             raise ConfigError(f"No db_params found in config file: {config_path}")
@@ -975,8 +1060,16 @@ class JobClient:
                 DEFAULT_PRIO_CEILING if configured is None else int(configured)
             )
 
+        if app_version is None:
+            app_version = config.get("app_version")
+
         pool = await db.create_pool(min_size=min_size, max_size=max_size, **db_params)
-        client = cls(pool, db_params=db_params, prio_ceiling=prio_ceiling)
+        client = cls(
+            pool,
+            db_params=db_params,
+            prio_ceiling=prio_ceiling,
+            app_version=app_version,
+        )
         client._owns_pool = True
         return client
 
@@ -1034,6 +1127,7 @@ class JobClient:
         deadline_key: str | None = None,
         identity_key: str | None = None,
         partition_key: str | None = None,
+        app_version: str | None = None,
         admin_data: dict[str, Any] | None = None,
         tags: dict[str, Any] | None = None,
         # result storage & passing
@@ -1092,6 +1186,17 @@ class JobClient:
                 of their own: never hidden, never refused for being
                 unlabelled. Inherited by a fork, like uid and tags. Max
                 MAX_PARTITION_KEY_LENGTH characters (default: None)
+            app_version: PIN this job to a code version: only a worker
+                advertising the same `pj --app-version` will claim it, and it
+                stays 'queued' while none is running. Default None means this
+                CLIENT's declared version (JobClient(pool, app_version=...) or
+                the config file's `app_version`), and unpinned when the client
+                declared none — an unpinned job is claimed by every worker,
+                versioned ones included. For a rolling deploy that must not
+                resume a job's checkpoints on new code. NOT inherited by a
+                fork unless the fork asks; kept across retry and rerun, which
+                re-execute the same row. Max MAX_APP_VERSION_LENGTH
+                characters; '' is refused (default: None)
             admin_data: Metadata dict (default: None)
             tags: The caller's OWN labels — customer, tenant, region, batch —
                 as a flat dict of string keys to scalar values, filterable
@@ -1202,6 +1307,7 @@ class JobClient:
                     deadline_key=deadline_key,
                     identity_key=identity_key,
                     partition_key=partition_key,
+                    app_version=self._app_version(app_version),
                     admin_data=admin_data,
                     tags=tags,
                     save_result=save_result,
@@ -1236,6 +1342,17 @@ class JobClient:
             f"{migrations.SCHEMA_REMEDY}"
         )
 
+    def _app_version(self, override: str | None) -> str | None:
+        """The version to stamp on one enqueue: the call's, else this client's.
+
+        The same precedence rule as `prio_ceiling`, and it exists as a method
+        because every enqueue path has to apply it identically -- a path that
+        forgot would silently write UNPINNED work from a client whose whole
+        purpose is pinning, and nothing downstream could tell that apart from
+        a deliberate choice.
+        """
+        return self.app_version if override is None else override
+
     async def enqueue_identified(
         self, job_class: str, *, identity_key: str, **options: Any
     ) -> tuple[int, bool]:
@@ -1265,10 +1382,12 @@ class JobClient:
                          order_id, job_id)
             result = await client.wait_for_result(job_id)
         """
-        # enqueue()'s ceiling rule, applied here too: this client's declared
-        # worker ceiling unless the call overrides it for itself.
+        # enqueue()'s ceiling and version rules, applied here too: this
+        # client's declared worker ceiling and code version unless the call
+        # overrides either for itself.
         ceiling = options.pop("prio_ceiling", None)
         options["prio_ceiling"] = self.prio_ceiling if ceiling is None else ceiling
+        options["app_version"] = self._app_version(options.pop("app_version", None))
         async with self.pool.acquire() as conn:
             try:
                 return await self._enqueue_row(
@@ -1355,9 +1474,14 @@ class JobClient:
                 f"pass None for a collapse window with no ceiling"
             )
 
-        # enqueue()'s ceiling rule, applied here too (see enqueue_identified).
+        # enqueue()'s ceiling and version rules, applied here too (see
+        # enqueue_identified). A collapsed burst is one job like any other, and
+        # it carries the pin the client declared; the bounce never rewrites it,
+        # because the version belongs to the row the window opened, not to
+        # whichever call bounced it last.
         ceiling = options.pop("prio_ceiling", None)
         options["prio_ceiling"] = self.prio_ceiling if ceiling is None else ceiling
+        options["app_version"] = self._app_version(options.pop("app_version", None))
 
         # ONE clock for both halves. The bounce compares its new run_after
         # against a debounce_deadline some earlier call computed, and the
@@ -1563,7 +1687,12 @@ class JobClient:
         Being static, there is no client here holding this deployment's
         declared worker priority ceiling, so `priority` is checked against
         the platform default (see validate_priority); a fleet running a
-        raised ceiling passes `prio_ceiling=` with the call.
+        raised ceiling passes `prio_ceiling=` with the call. For the same
+        reason there is no declared `app_version` to inherit: this path pins
+        nothing unless the call names `app_version=` itself. Called through a
+        client (`client.enqueue_in_transaction(...)`) it is still the static
+        method, so the client's version does NOT apply -- pass it, or use
+        `enqueue()` when the transaction is not the caller's.
 
         Example:
             async with conn.transaction():
@@ -1671,6 +1800,7 @@ class JobClient:
         debounce_key: str | None = None,
         debounce_deadline: datetime | None = None,
         partition_key: str | None = None,
+        app_version: str | None = None,
         admin_data: dict[str, Any] | None = None,
         tags: dict[str, Any] | None = None,
         save_result: bool = True,
@@ -1699,7 +1829,13 @@ class JobClient:
 
         ``prio_ceiling`` is the fleet's worker ceiling; enqueue() passes the
         client's, and the static/outbox path (which has no client) gets the
-        platform default. See validate_priority."""
+        platform default. See validate_priority.
+
+        ``app_version`` is taken as given: this is a static method, so the
+        client's declared version has already been resolved by whichever
+        enqueue path called it (see JobClient._app_version). A caller reaching
+        this directly -- the scheduler does -- therefore enqueues UNPINNED work
+        unless it names a version itself, which is what schedules want."""
         if job_kwargs is not None and kwargs:
             raise ValueError(
                 f"unknown enqueue options: {sorted(kwargs)} — with a "
@@ -1746,6 +1882,11 @@ class JobClient:
                 f"read inside the serialised claim section, so it is a label "
                 f"and not a payload"
             )
+
+        # Here for the same reason, and it is the ONE place every writer's
+        # version pin is checked: the pool enqueue, the caller's transaction,
+        # the batch and the scheduler all build their rows through this.
+        app_version = validate_app_version(app_version)
 
         validate_priority(priority, prio_ceiling)
 
@@ -1846,6 +1987,7 @@ class JobClient:
             debounce_key,
             debounce_deadline,
             partition_key,
+            app_version,
         ]
 
     async def enqueue_batch(
@@ -1948,12 +2090,19 @@ class JobClient:
                 raise ValueError(f"job {index}: {_NO_BATCH_IDENTITY}")
             if "debounce_key" in per_job:
                 raise ValueError(f"job {index}: {_NO_BATCH_DEBOUNCE}")
+            layered = {**options, **per_job}
+            # enqueue()'s version rule, per row: the per-job option, else the
+            # shared one, else this client's declared version. Resolved here
+            # rather than merged under the option dicts so that an explicit
+            # `app_version=None` means the same thing it means everywhere else
+            # (take the client's), not "pin nothing".
+            layered["app_version"] = self._app_version(layered.get("app_version"))
             rows.append(
                 self.build_enqueue_row(
                     job_class,
                     prio_ceiling=ceiling,
                     job_kwargs=kwargs,
-                    **{**options, **per_job},
+                    **layered,
                 )
             )
         return rows
@@ -2166,6 +2315,7 @@ class JobClient:
         queue: str | None = None,
         priority: int | None = None,
         kwargs_override: dict[str, Any] | None = None,
+        app_version: str | None = None,
     ) -> dict[str, Any]:
         """
         FORK a job into a NEW one that starts at `from_step`.
@@ -2204,6 +2354,13 @@ class JobClient:
             priority: run the fork at another priority (default: the source's)
             kwargs_override: replace the arguments wholesale (default: the
                 source's kwargs)
+            app_version: pin the FORK to a code version (default: None —
+                unpinned, whatever the source was). The source's pin is
+                deliberately not inherited and neither is this client's
+                declared one: a fork is usually how work is re-run under NEW
+                code, so inheriting either would strand the fork on a build
+                that is going away. Pass the version explicitly when the fork
+                really does belong to one.
 
         Returns:
             {"job_id", "source_job_id", "from_step", "steps_copied",
@@ -2230,6 +2387,7 @@ class JobClient:
                 queue=queue,
                 priority=priority,
                 kwargs_override=kwargs_override,
+                app_version=validate_app_version(app_version),
             )
 
     async def fork_job_from_failure(
@@ -2239,6 +2397,7 @@ class JobClient:
         queue: str | None = None,
         priority: int | None = None,
         kwargs_override: dict[str, Any] | None = None,
+        app_version: str | None = None,
     ) -> dict[str, Any]:
         """
         fork_job() from the first step whose checkpoint recorded an error.
@@ -2248,6 +2407,10 @@ class JobClient:
         twice. Raises db.ForkRefused when no step recorded a failure — a job
         that crashed outside its steps has no failing step to start from, and
         guessing one would fast-forward work that never ran.
+
+        ``app_version`` pins the fork, unpinned by default -- the incident
+        shape is "deploy the fix, then fork", so the fork belongs to the NEW
+        build if it belongs to any (see fork_job).
         """
         if priority is not None:
             validate_priority(priority, self.prio_ceiling)
@@ -2258,6 +2421,7 @@ class JobClient:
                 queue=queue,
                 priority=priority,
                 kwargs_override=kwargs_override,
+                app_version=validate_app_version(app_version),
             )
 
     # =========================================================================
@@ -3188,6 +3352,51 @@ class JobClient:
 
         return result != "UPDATE 0"
 
+    async def update_job_app_version(
+        self, job_id: int, app_version: str | None
+    ) -> bool:
+        """Re-pin (or unpin) a job that has not been claimed yet.
+
+        The twin of `update_job_priority`, and it exists for the same reason:
+        the version is a claim gate, so a job pinned to code nobody runs is
+        stranded, and the fix has to be reachable without raw SQL. `None`
+        CLEARS the pin, which makes the job claimable by every worker — the
+        remedy for a pin whose deploy has moved on.
+
+        Only queued/waiting jobs, exactly like the priority twin: a claimed or
+        running job has already been matched to a worker, so changing the gate
+        it passed through decides nothing, and a terminal job's pin is
+        history. A RETRY of that job will keep whatever this row says, which is
+        why repinning it now is the operator's move rather than the requeue's.
+
+        Returns True if the row was updated, False if the job does not exist
+        or has already left the queue.
+
+        Raises:
+            ValueError: an empty or over-long version (see
+                validate_app_version) — the same refusal an enqueue makes.
+
+        Example:
+            # the deploy this job was waiting for is never coming
+            if await client.update_job_app_version(12345, None):
+                print("unpinned; any worker may run it now")
+        """
+        app_version = validate_app_version(app_version)
+
+        async with self.pool.acquire() as conn:
+            result: str = await conn.execute(
+                """
+                UPDATE jorb
+                SET app_version = $2
+                WHERE id = $1
+                  AND state IN ('queued', 'waiting')
+            """,
+                job_id,
+                app_version,
+            )
+
+        return result != "UPDATE 0"
+
     async def get_jobs(
         self,
         queue: str | None = None,
@@ -3668,12 +3877,15 @@ class JobClient:
                         )
 
                     # enqueue_in_transaction is static and so has no client to
-                    # read the fleet's ceiling from; pass ours, and let an
-                    # explicit common_options ceiling still win.
+                    # read the fleet's ceiling or declared code version from;
+                    # pass ours, and let an explicit common_options value still
+                    # win. A pipeline is ordinary work and carries this
+                    # client's pin like any other enqueue would.
                     options: dict[str, Any] = {
                         "queue": queue,
                         "priority": priority,
                         "prio_ceiling": self.prio_ceiling,
+                        "app_version": self.app_version,
                         **result_options,
                         **common_options,
                     }
@@ -3954,6 +4166,7 @@ class SyncJobClient:
         min_size: int = 1,
         max_size: int = 4,
         prio_ceiling: int = DEFAULT_PRIO_CEILING,
+        app_version: str | None = None,
         **connect_kwargs: Any,
     ):
         """
@@ -3965,6 +4178,9 @@ class SyncJobClient:
                 (`pj --max-prio`, default 1000); enqueueing above it is
                 refused. Named explicitly rather than left to
                 **connect_kwargs, which would hand it to asyncpg.
+            app_version: code version stamped on every enqueue through this
+                client (default: None — unpinned). Named explicitly for the
+                same reason. See JobClient.__init__.
             **connect_kwargs: asyncpg.connect kwargs (host, port, database,
                 user, password, ...) used when no DSN is given
         """
@@ -3972,7 +4188,14 @@ class SyncJobClient:
         self._closed = False
         try:
             self._client: JobClient = self._loop.run_until_complete(
-                self._create(dsn, connect_kwargs, min_size, max_size, prio_ceiling)
+                self._create(
+                    dsn,
+                    connect_kwargs,
+                    min_size,
+                    max_size,
+                    prio_ceiling,
+                    app_version,
+                )
             )
         except BaseException:
             # a bad DSN / unreachable database / bad kwargs raises here, and
@@ -3990,16 +4213,25 @@ class SyncJobClient:
         min_size: int,
         max_size: int,
         prio_ceiling: int = DEFAULT_PRIO_CEILING,
+        app_version: str | None = None,
     ) -> JobClient:
         if dsn is not None:
             pool = await db.create_pool(dsn, min_size=min_size, max_size=max_size)
-            client = JobClient(pool, db_params=dsn, prio_ceiling=prio_ceiling)
+            client = JobClient(
+                pool,
+                db_params=dsn,
+                prio_ceiling=prio_ceiling,
+                app_version=app_version,
+            )
         else:
             pool = await db.create_pool(
                 min_size=min_size, max_size=max_size, **connect_kwargs
             )
             client = JobClient(
-                pool, db_params=dict(connect_kwargs), prio_ceiling=prio_ceiling
+                pool,
+                db_params=dict(connect_kwargs),
+                prio_ceiling=prio_ceiling,
+                app_version=app_version,
             )
         # the pool is this facade's own creation; nobody else can close it
         client._owns_pool = True
@@ -4013,18 +4245,22 @@ class SyncJobClient:
         min_size: int = 1,
         max_size: int = 4,
         prio_ceiling: int | None = None,
+        app_version: str | None = None,
     ) -> SyncJobClient:
         """Build from a pyjobby.toml, like JobClient.from_config() —
         scripts and cron jobs are exactly where a config file lives.
 
         ``prio_ceiling`` left unset takes the file's ``prio_ceiling`` (else
-        1000), and a file with no db_params is a ConfigError rather than a
-        silent fallback to asyncpg's environment defaults — both exactly as
-        in JobClient.from_config(), which documents why.
+        1000), ``app_version`` left unset takes the file's ``app_version``
+        (else None, unpinned), and a file with no db_params is a ConfigError
+        rather than a silent fallback to asyncpg's environment defaults — all
+        exactly as in JobClient.from_config(), which documents why.
         """
         from .configloader import ConfigError, load_config_from_file
 
-        config = load_config_from_file(config_path, keys=["db_params", "prio_ceiling"])
+        config = load_config_from_file(
+            config_path, keys=["db_params", "prio_ceiling", "app_version"]
+        )
         db_params = config.get("db_params")
         if not db_params:
             raise ConfigError(f"No db_params found in config file: {config_path}")
@@ -4035,10 +4271,14 @@ class SyncJobClient:
                 DEFAULT_PRIO_CEILING if configured is None else int(configured)
             )
 
+        if app_version is None:
+            app_version = config.get("app_version")
+
         return cls(
             min_size=min_size,
             max_size=max_size,
             prio_ceiling=prio_ceiling,
+            app_version=app_version,
             **db_params,
         )
 
@@ -4115,6 +4355,7 @@ class SyncJobClient:
         queue: str | None = None,
         priority: int | None = None,
         kwargs_override: dict[str, Any] | None = None,
+        app_version: str | None = None,
     ) -> dict[str, Any]:
         """Synchronous JobClient.fork_job()."""
         result: dict[str, Any] = self._run(
@@ -4124,6 +4365,7 @@ class SyncJobClient:
                 queue=queue,
                 priority=priority,
                 kwargs_override=kwargs_override,
+                app_version=app_version,
             )
         )
         return result
@@ -4135,11 +4377,16 @@ class SyncJobClient:
         queue: str | None = None,
         priority: int | None = None,
         kwargs_override: dict[str, Any] | None = None,
+        app_version: str | None = None,
     ) -> dict[str, Any]:
         """Synchronous JobClient.fork_job_from_failure()."""
         result: dict[str, Any] = self._run(
             self._client.fork_job_from_failure(
-                job_id, queue=queue, priority=priority, kwargs_override=kwargs_override
+                job_id,
+                queue=queue,
+                priority=priority,
+                kwargs_override=kwargs_override,
+                app_version=app_version,
             )
         )
         return result
@@ -4288,6 +4535,13 @@ class SyncJobClient:
         """Synchronous JobClient.update_job_priority()."""
         updated: bool = self._run(
             self._client.update_job_priority(job_id, new_priority)
+        )
+        return updated
+
+    def update_job_app_version(self, job_id: int, app_version: str | None) -> bool:
+        """Synchronous JobClient.update_job_app_version()."""
+        updated: bool = self._run(
+            self._client.update_job_app_version(job_id, app_version)
         )
         return updated
 

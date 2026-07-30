@@ -129,6 +129,7 @@ def run_worker_process(
             queue,
             list(worker.capabilities),
             worker.prio,
+            worker.app_version,
             __version__,
             worker.job_threads,
         )
@@ -149,6 +150,7 @@ def run_worker_process(
                 worker.capabilities,
                 worker.prio,
                 registry_id,
+                None,
             )
 
             if jobs:

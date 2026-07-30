@@ -89,12 +89,19 @@ class FailingJob:
 # =============================================================================
 
 
-async def claim_job(conn, queue="default", capabilities=None, max_priority=1000):
+async def claim_job(
+    conn,
+    queue="default",
+    capabilities=None,
+    max_priority=1000,
+    app_version: str | None = None,
+):
     """Claim a job using the actual worker STMTS.
 
-    The v1 claim statement takes 6 parameters: pid, host, queue,
-    capabilities, priority ceiling, and the jorb_worker registry id
-    (None for tests that hand-claim without registering a worker).
+    The v1 claim statement takes 7 parameters: pid, host, queue,
+    capabilities, priority ceiling, the jorb_worker registry id
+    (None for tests that hand-claim without registering a worker), and
+    the application code version the worker advertises.
     """
     if capabilities is None:
         capabilities = []
@@ -107,6 +114,7 @@ async def claim_job(conn, queue="default", capabilities=None, max_priority=1000)
         capabilities,
         max_priority,
         None,  # claimed_by (jorb_worker.id; no registry row in these tests)
+        app_version,  # app_version this worker advertises
     )
     return claimed
 
@@ -446,6 +454,7 @@ class TestProducerConsumerIntegration:
                     [],
                     1000,
                     None,
+                    None,  # app_version (this worker advertises none)
                 )
                 if claimed:
                     claimed_jobs.append(claimed["id"])
@@ -680,6 +689,7 @@ class TestAdvancedClientFeatures:
                 ["cpu"],  # Only has CPU capability
                 1000,
                 None,
+                None,  # app_version (this worker advertises none)
             )
             assert claimed_no_gpu is None
 
@@ -692,6 +702,7 @@ class TestAdvancedClientFeatures:
                 ["cpu", "gpu"],  # Has GPU capability
                 1000,
                 None,
+                None,  # app_version (this worker advertises none)
             )
             assert claimed_with_gpu is not None
             assert claimed_with_gpu["id"] == job_id

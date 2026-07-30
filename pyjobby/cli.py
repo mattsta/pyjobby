@@ -470,6 +470,11 @@ def jobs_inspect(ctx: click.Context, job_id: int, output_json: bool) -> None:
                         click.echo("  window:        closed (released at the claim)")
                 if job["capability"]:
                     click.echo(f"Capability:      {job['capability']}")
+                # Only when set, like every optional field here -- and worth
+                # its own line, because it is the whole reason a healthy-looking
+                # queued job may be claimable by nobody.
+                if job["app_version"]:
+                    click.echo(f"App Version:     {job['app_version']}")
                 if job["uid"]:
                     click.echo(f"User ID:         {job['uid']}")
                 if job["tags"]:
@@ -511,8 +516,9 @@ def jobs_why(ctx: click.Context, job_id: int, output_json: bool) -> None:
     every worker calls), so it covers every way a job can fail to be
     claimed — terminal, held by a worker, parked on a dependency, deferred,
     a paused queue, a concurrency cap or rate limit, no live workers on the
-    queue, a capability nobody advertises, or a priority above every live
-    worker's ceiling — and says which one, with the numbers behind it.
+    queue, a capability nobody advertises, an app version nobody runs, or a
+    priority above every live worker's ceiling — and says which one, with the
+    numbers behind it.
 
     Assembling this by hand took `jobs inspect`, `queues show`, `workers
     list` and a query, and the priority-ceiling case could not be answered
@@ -536,6 +542,11 @@ def jobs_why(ctx: click.Context, job_id: int, output_json: bool) -> None:
                 f"{answer['state']}  {answer['queue']}  "
                 f"{answer['job_class']}  prio {answer['prio']}"
                 + (f"  cap {answer['capability']}" if answer["capability"] else "")
+                + (
+                    f"  app version {answer['app_version']}"
+                    if answer["app_version"]
+                    else ""
+                )
                 + (
                     f"  identity {answer['identity_key']}"
                     if answer["identity_key"]
@@ -680,6 +691,70 @@ def jobs_set_priority(
             await conn.close()
 
     asyncio.run(_set_priority())
+
+
+@jobs.command("set-app-version")
+@click.argument("job_id", type=int)
+@click.argument("version", required=False)
+@click.option(
+    "--clear",
+    is_flag=True,
+    help="UNPIN the job: any live worker may then claim it. The remedy for "
+    "work stranded by a deploy that moved on",
+)
+@click.pass_context
+def jobs_set_app_version(
+    ctx: click.Context, job_id: int, version: str | None, clear: bool
+) -> None:
+    """Re-pin (or unpin) a queued or waiting job's app version.
+
+    A job with an app_version is claimed ONLY by a worker advertising the same
+    one (`pj --app-version`), so a job pinned to a build nobody runs sits
+    queued forever -- it never fails and never reaches the DLQ. This is one of
+    the two documented ways out; the other is starting a worker on the version
+    the job wants. `--clear` unpins the job, which makes every live worker on
+    its queue a candidate again.
+
+    Only jobs still in the queue can be repinned: once claimed, the job has
+    already been matched to a worker and the pin decides nothing. Mirrors
+    `jobs set-priority`, which refuses the same states for the same reason.
+    """
+    if clear and version is not None:
+        fail(
+            "pass either a VERSION or --clear, not both: one pins the job to a "
+            "build and the other removes the pin",
+            code=2,
+        )
+    if not clear and version is None:
+        fail(
+            "name the app version to pin this job to, or pass --clear to "
+            "unpin it (an empty pin is not the same as no pin: no worker can "
+            "advertise it)",
+            code=2,
+        )
+
+    async def _set_app_version() -> None:
+        conn, api = await get_api(ctx)
+        try:
+            try:
+                updated = await api.update_job_app_version(job_id, version)
+            except ValueError as e:
+                fail(str(e), code=2)
+            if updated:
+                print_success(
+                    f"Job {job_id} unpinned (any worker may claim it)"
+                    if clear
+                    else f"Job {job_id} pinned to app version {version}"
+                )
+            else:
+                fail(
+                    f"Job {job_id} not found or no longer queued/waiting "
+                    f"(only queued or waiting jobs can be repinned)"
+                )
+        finally:
+            await conn.close()
+
+    asyncio.run(_set_app_version())
 
 
 @jobs.command("delete")
@@ -910,6 +985,14 @@ def jobs_rerun(ctx: click.Context, job_id: int, resume: bool) -> None:
 @click.option(
     "--priority", "-p", type=int, default=None, help="Run the fork at another priority"
 )
+@click.option(
+    "--app-version",
+    default=None,
+    help="PIN the fork to a code version (only a worker advertising it will "
+    "claim the fork). The source's pin is never inherited: a fork is usually "
+    "how work is re-run under NEW code, so inheriting it would strand the "
+    "fork on the build you just replaced",
+)
 @max_prio_option
 @click.pass_context
 def jobs_fork(
@@ -919,6 +1002,7 @@ def jobs_fork(
     from_failure: bool,
     queue: str | None,
     priority: int | None,
+    app_version: str | None,
     max_prio: int | None,
 ) -> None:
     """FORK a job into a NEW job that starts at a given step
@@ -939,7 +1023,9 @@ def jobs_fork(
     no uid, no deadline_key, no identity_key, no debounce_key, no
     schedule, no DAG or
     dependency edges -- two live rows sharing an idempotency key would make
-    that key mean nothing, and an identity_key promises there is only one.
+    that key mean nothing, and an identity_key promises there is only one. It
+    does not inherit the source's app_version either: pass --app-version to
+    pin the fork, which is how "deploy the fix, then fork" works.
 
     --priority is refused above the deployment's worker ceiling, exactly as
     `jobs set-priority` refuses it: no worker would claim the fork. The
@@ -960,7 +1046,10 @@ def jobs_fork(
             try:
                 if from_failure:
                     result = await api.fork_job_from_failure(
-                        job_id, queue=queue, priority=priority
+                        job_id,
+                        queue=queue,
+                        priority=priority,
+                        app_version=app_version,
                     )
                 else:
                     result = await api.fork_job(
@@ -968,6 +1057,7 @@ def jobs_fork(
                         from_step=1 if from_step is None else from_step,
                         queue=queue,
                         priority=priority,
+                        app_version=app_version,
                     )
             except db.ForkRefused as refusal:
                 fail(str(refusal))
@@ -1501,6 +1591,10 @@ def workers_list(ctx: click.Context, output_json: bool) -> None:
                     "Host",
                     "PID",
                     "Queue",
+                    # What this worker will CLAIM, not just that it is alive:
+                    # a fleet mid-deploy has workers on two versions and the
+                    # answer to "why is that job still queued?" is this column.
+                    "App Version",
                     "Status",
                     "Threads",
                     "Last Seen",
@@ -1519,6 +1613,7 @@ def workers_list(ctx: click.Context, output_json: bool) -> None:
                             w["host"],
                             str(w["pid"]),
                             w["queue"],
+                            w["app_version"] or "-",
                             _worker_status(w),
                             _worker_threads(w),
                             _fmt_age(w["last_seen_age_seconds"]),
@@ -3148,8 +3243,9 @@ def stuck_worker_summary(rows: list[asyncpg.Record]) -> str:
 
 
 # Jobs that are queued, runnable, and that NO live worker on their queue could
-# ever claim -- above every live ceiling, or wanting a capability nobody
-# advertises. WARN and never FAIL: this is a workload problem, not a platform
+# ever claim -- above every live ceiling, wanting a capability nobody
+# advertises, or pinned to an app version nobody runs. WARN and never FAIL:
+# this is a workload problem, not a platform
 # fault. The database is healthy, the fleet is healthy, and what is wrong is
 # the relationship between what a job asks for and what the running workers
 # accept -- which no amount of platform repair fixes, and which is nobody's
@@ -3160,8 +3256,10 @@ DOCTOR_UNCLAIMABLE_REMEDY = (
     "they are runnable and INVISIBLE to every live worker on their queue, so "
     "nothing ever claims them: they stay queued forever, never fail, and "
     "never reach the DLQ. Raise the fleet's ceiling (pj --max-prio N), start "
-    "a worker advertising the capability (pj --queue Q --cap C), or lower the "
-    "job (pj-admin jobs set-priority ID N). Remember lower prio = more "
+    "a worker advertising the capability (pj --queue Q --cap C), start a "
+    "worker on the app version the job wants (pj --queue Q --app-version V), "
+    "or change the job (pj-admin jobs set-priority ID N, pj-admin jobs "
+    "set-app-version ID [V|--clear]). Remember lower prio = more "
     "urgent. `pj-admin jobs why ID` explains any one of them in full"
 )
 
@@ -3180,7 +3278,10 @@ def unclaimable_summary(records: list[dict[str, Any]]) -> str:
 
     One clause per record from `AdminAPI.unclaimable_jobs`, each carrying the
     queue, the cause, the numbers the remedy needs, and example ids to hand
-    to `pj-admin jobs why`.
+    to `pj-admin jobs why`. One branch per :data:`UNCLAIMABLE_REASONS` entry,
+    because each cause's numbers are different -- a prio span, the missing
+    capabilities, the missing app versions -- and a generic clause would print
+    the label without the fact the operator acts on.
     """
     clauses = []
     for r in records[:DOCTOR_UNCLAIMABLE_NAMED]:
@@ -3193,6 +3294,14 @@ def unclaimable_summary(records: list[dict[str, Any]]) -> str:
                 f"({_prio_span(d['lowest_blocked_prio'], d['highest_blocked_prio'])}; "
                 f"the highest --max-prio among {r['live_workers']} live "
                 f"worker(s) is {d['max_live_ceiling']}; e.g. jobs {ids})"
+            )
+        elif r["reason"] == "app_version_unmet":
+            missing = ", ".join(repr(v) for v in d["missing_app_versions"])
+            advertised = ", ".join(d["advertised_app_versions"]) or "nothing"
+            clauses.append(
+                f"{count} on {r['queue']!r} needing app version {missing}, "
+                f"which none of the {r['live_workers']} live worker(s) "
+                f"advertises (they advertise: {advertised}; e.g. jobs {ids})"
             )
         else:
             missing = ", ".join(repr(c) for c in d["missing_capabilities"])

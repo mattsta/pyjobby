@@ -92,10 +92,22 @@ async def lock_timeout_seconds(conn: asyncpg.Connection) -> float:
     return float(raw.removesuffix("ms")) / 1000.0
 
 
-async def claim_once(conn: asyncpg.Connection, queue: str, worker_id: int = 1):
+async def claim_once(
+    conn: asyncpg.Connection,
+    queue: str,
+    worker_id: int = 1,
+    app_version: str | None = None,
+):
     """Claim through the REAL claim statement the worker uses."""
     return await conn.fetchrow(
-        STMTS["claim"], worker_id, "claim-contention-test", queue, ["test"], 1000, None
+        STMTS["claim"],
+        worker_id,
+        "claim-contention-test",
+        queue,
+        ["test"],
+        1000,
+        None,
+        app_version,
     )
 
 

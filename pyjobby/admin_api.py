@@ -22,6 +22,7 @@ from . import db
 from .client import (
     DEFAULT_PRIO_CEILING,
     tags_filter_sql,
+    validate_app_version,
     validate_priority,
     validate_tags,
 )
@@ -121,6 +122,9 @@ EXPLAIN_REASONS: dict[str, str] = {
     "worker's ceiling (jorb_worker.max_prio)",
     "capability_unmet": "j.capability = ANY(p_capabilities) is false for every "
     "live worker on the queue (and j.capability IS NOT NULL)",
+    "app_version_unmet": "j.app_version = p_app_version is false for every "
+    "live worker on the queue (and j.app_version IS NOT NULL) -- the job is "
+    "pinned to a build nobody is running",
     "no_live_workers": "j.queue = p_queue never runs, because nothing on this "
     "queue is calling claim_jorb at all",
     # --- the jorb_queue control plane, checked before the SELECT ---
@@ -157,6 +161,8 @@ EXPLAIN_GROUP_LIMIT = 1000
 
 #: Most distinct capabilities `explain_job` lists as live on a queue. A fleet
 #: advertising more than this has an answer that no longer fits on a line.
+#: Shared with the app_version arm, which lists the same kind of thing (what
+#: the live fleet advertises) and stops fitting on a line at the same size.
 EXPLAIN_CAPABILITY_LIMIT = 50
 
 #: How many unclaimable jobs `unclaimable_jobs` counts per queue per cause.
@@ -171,13 +177,18 @@ UNCLAIMABLE_SCAN_LIMIT = 1000
 UNCLAIMABLE_SAMPLE_LIMIT = 5
 
 #: The reasons `unclaimable_jobs` can report, in the order it reports them.
-#: Both are :data:`EXPLAIN_REASONS` keys, and deliberately so: this is the
-#: fleet-wide sweep for the two conditions `explain_job` answers one job at a
+#: All three are :data:`EXPLAIN_REASONS` keys, and deliberately so: this is the
+#: fleet-wide sweep for the conditions `explain_job` answers one job at a
 #: time, and an operator who reads "above_worker_ceiling" in a doctor line and
 #: then in a `jobs why` answer is reading about the same thing.
+#:
+#: THE ORDER IS THE DISJOINTNESS RULE, and it is `explain_job`'s order: a job
+#: that trips more than one of these is counted under the first, so the two
+#: verbs never send an operator to different remedies for the same row.
 UNCLAIMABLE_REASONS: Final[tuple[str, ...]] = (
     "above_worker_ceiling",
     "capability_unmet",
+    "app_version_unmet",
 )
 
 
@@ -282,6 +293,9 @@ class JobInfo:
     run_count: int
     error_count: int
     capability: str | None = None
+    # the code version this job is PINNED to: only a worker advertising the
+    # same one claims it, NULL for unpinned work (see sql/schema/10_jobs.sql)
+    app_version: str | None = None
     uid: int | None = None
     # the caller's own labels (customer/tenant/region/batch); '{}' when unset
     tags: dict | None = None
@@ -599,7 +613,7 @@ class AdminAPI:
                 counted as live (default: 60), matching `list_workers`
 
         Returns:
-            ``{job_id, state, queue, job_class, prio, capability,
+            ``{job_id, state, queue, job_class, prio, capability, app_version,
             identity_key, run_after, created, updated, reason, summary,
             details}``, or None when no
             such job exists -- absence is the caller's to report, exactly as
@@ -611,7 +625,8 @@ class AdminAPI:
         row = await self.conn.fetchrow(
             """
             SELECT j.id, j.state::text AS state, j.queue, j.job_class, j.prio,
-                   j.capability, j.run_after, j.created, j.updated,
+                   j.capability, j.app_version, j.run_after, j.created,
+                   j.updated,
                    j.started, j.finished, j.claimed_at, j.timeout_at,
                    j.claimed_by, j.worker_host, j.worker_pid,
                    j.run_count, j.error_count, j.error_message,
@@ -653,6 +668,11 @@ class AdminAPI:
             "job_class": row["job_class"],
             "prio": row["prio"],
             "capability": row["capability"],
+            # Reported for every answer, not only the app_version_unmet one:
+            # a pin is invisible in every other view of a job, and "this job
+            # is pinned to a build" changes how an operator reads a `deferred`
+            # or `claimable` answer too -- the next deploy may strand it.
+            "app_version": row["app_version"],
             # Reported because it changes what the operator should DO about
             # the answer: a job holding an identity_key cannot be replaced by
             # enqueueing the same work again -- that call returns this very
@@ -959,7 +979,7 @@ class AdminAPI:
 
         # One pass over the registry, which holds one row per worker process:
         # how many are live on this queue, the highest ceiling among them, and
-        # how many of them would accept THIS job's prio and capability.
+        # how many of them would accept THIS job's prio, capability and pin.
         fleet = await self.conn.fetchrow(
             """
             SELECT count(*)                                   AS live,
@@ -967,7 +987,10 @@ class AdminAPI:
                    count(*) FILTER (WHERE max_prio >= $3)     AS at_prio,
                    count(*) FILTER (
                        WHERE $4::text IS NULL OR $4 = ANY(capabilities)
-                   )                                          AS capable
+                   )                                          AS capable,
+                   count(*) FILTER (
+                       WHERE $5::text IS NULL OR app_version = $5
+                   )                                          AS versioned
               FROM jorb_worker
              WHERE queue = $1
                AND shutdown_at IS NULL
@@ -977,6 +1000,7 @@ class AdminAPI:
             stale_after_seconds,
             row["prio"],
             row["capability"],
+            row["app_version"],
         )
         live = fleet["live"] or 0
 
@@ -1046,6 +1070,53 @@ class AdminAPI:
                     "live_workers": live,
                     "workers_with_capability": 0,
                     "advertised_capabilities": advertised,
+                },
+            )
+
+        if row["app_version"] is not None and fleet["versioned"] == 0:
+            # Third in the same order the sweep uses, so a job that is both
+            # above the ceiling and pinned to a dead build gets the ceiling
+            # answer from BOTH verbs (see UNCLAIMABLE_REASONS).
+            #
+            # The versions the fleet DOES advertise are the actionable half:
+            # 'v3, v4' says the deploy moved past this job, and 'nothing' says
+            # no worker here was started with --app-version at all -- which
+            # are different mistakes with different fixes.
+            advertised_versions = await self.conn.fetchval(
+                """
+                SELECT coalesce(array_agg(DISTINCT v ORDER BY v), '{}')
+                  FROM (
+                    SELECT app_version AS v
+                      FROM jorb_worker
+                     WHERE queue = $1
+                       AND shutdown_at IS NULL
+                       AND last_seen > now() - make_interval(secs => $2)
+                       AND app_version IS NOT NULL
+                     LIMIT $3
+                  ) s
+                """,
+                queue,
+                stale_after_seconds,
+                EXPLAIN_CAPABILITY_LIMIT,
+            )
+            advertised_versions = list(advertised_versions or [])
+            return (
+                "app_version_unmet",
+                f"This job is PINNED to app version {row['app_version']!r} and "
+                f"none of the {live} live worker(s) on {queue!r} advertises it "
+                f"(they advertise: "
+                f"{', '.join(advertised_versions) if advertised_versions else 'nothing'})"
+                f" — claim_jorb admits a pinned job only to a worker running "
+                f"the SAME version, so it stays queued, never fails and never "
+                f"reaches the DLQ. Start a worker with `pj --queue {queue} "
+                f"--app-version {row['app_version']}`, or repin the job: "
+                f"`pj-admin jobs set-app-version {row['id']} "
+                f"[VERSION|--clear]`.",
+                {
+                    "app_version": row["app_version"],
+                    "live_workers": live,
+                    "workers_with_app_version": 0,
+                    "advertised_app_versions": advertised_versions,
                 },
             )
 
@@ -1209,20 +1280,22 @@ class AdminAPI:
         """Every job no live worker on its queue could ever claim, per queue.
 
         `explain_job` answers this for ONE job an operator already suspects.
-        This is the sweep: the same two conditions, asked of the whole fleet
+        This is the sweep: the same conditions, asked of the whole fleet
         at once, so the condition can be FOUND rather than confirmed. It is
         the platform's quietest failure -- a job above every live worker's
-        ceiling, or wanting a capability none of them advertises, stays
-        'queued' forever. It never fails, never retries, never reaches the
-        DLQ, and every other health signal (queue depth, worker liveness,
-        throughput) reads normal while it sits there.
+        ceiling, wanting a capability none of them advertises, or pinned to an
+        app_version none of them runs, stays 'queued' forever. It never fails,
+        never retries, never reaches the DLQ, and every other health signal
+        (queue depth, worker liveness, throughput) reads normal while it sits
+        there.
 
-        THE TWO CAUSES ARE THE TWO :data:`UNCLAIMABLE_REASONS`, both
+        THE CAUSES ARE :data:`UNCLAIMABLE_REASONS`, all of them
         :data:`EXPLAIN_REASONS` keys, and they are made DISJOINT here in the
-        order `explain_job` headlines them: a job that is both above the
-        ceiling AND wants an unadvertised capability is counted only under
-        `above_worker_ceiling`. Two verbs that disagreed about which cause a
-        job has would send the operator to the wrong remedy.
+        order that tuple declares -- which is the order `explain_job`
+        headlines them: a job that is above the ceiling AND wants an
+        unadvertised capability AND is pinned to a dead build is counted only
+        under `above_worker_ceiling`. Two verbs that disagreed about which
+        cause a job has would send the operator to the wrong remedy.
 
         A QUEUE WITH NO LIVE WORKERS IS DELIBERATELY NOT REPORTED. It cannot
         be: "no live worker could claim it" is trivially true of every job on
@@ -1247,7 +1320,11 @@ class AdminAPI:
         index for its predicate and walks the queue's claimable rows -- still
         strictly less than the per-queue backlog aggregate `doctor` already
         runs beside it, and no index exists or should exist for a column
-        almost no job sets.
+        almost no job sets. The app_version arm DOES have one
+        (``jorb_app_version_idx``, partial on the pinned queued rows), because
+        every idle worker asks the same question on a timer and only an
+        operator runs this; from there it reads the queue's pinned rows and
+        sorts them into claim order for the sample.
 
         Args:
             stale_after_seconds: heartbeat age past which a worker is not
@@ -1271,14 +1348,18 @@ class AdminAPI:
             WITH fleet AS (
                 -- One row per queue that HAS live workers, holding the whole
                 -- of what those workers will accept: the highest ceiling
-                -- among them and the union of their advertised capabilities.
+                -- among them, the union of their advertised capabilities and
+                -- the union of the app versions they advertise.
                 -- The LEFT JOIN keeps a worker that advertises nothing.
                 SELECT w.queue,
                        count(DISTINCT w.id)                    AS live_workers,
                        max(w.max_prio)                         AS max_ceiling,
                        coalesce(array_agg(DISTINCT caps.cap)
                                     FILTER (WHERE caps.cap IS NOT NULL),
-                                '{}'::text[])                  AS advertised
+                                '{}'::text[])                  AS advertised,
+                       coalesce(array_agg(DISTINCT w.app_version)
+                                    FILTER (WHERE w.app_version IS NOT NULL),
+                                '{}'::text[])                  AS versions
                   FROM jorb_worker w
                   LEFT JOIN LATERAL unnest(w.capabilities) AS caps(cap)
                        ON TRUE
@@ -1288,11 +1369,12 @@ class AdminAPI:
             ),
             blocked AS (
                 SELECT f.queue, f.live_workers, f.max_ceiling, f.advertised,
+                       f.versions,
                        'above_worker_ceiling'::text AS reason,
-                       j.id, j.prio, j.capability
+                       j.id, j.prio, j.capability, j.app_version
                   FROM fleet f
                  CROSS JOIN LATERAL (
-                     SELECT id, prio, capability
+                     SELECT id, prio, capability, app_version
                        FROM jorb
                       WHERE queue = f.queue
                         AND state = 'queued'
@@ -1303,11 +1385,12 @@ class AdminAPI:
                  ) j
                 UNION ALL
                 SELECT f.queue, f.live_workers, f.max_ceiling, f.advertised,
+                       f.versions,
                        'capability_unmet'::text,
-                       j.id, j.prio, j.capability
+                       j.id, j.prio, j.capability, j.app_version
                   FROM fleet f
                  CROSS JOIN LATERAL (
-                     SELECT id, prio, capability
+                     SELECT id, prio, capability, app_version
                        FROM jorb
                       WHERE queue = f.queue
                         AND state = 'queued'
@@ -1319,8 +1402,33 @@ class AdminAPI:
                       ORDER BY prio, run_after
                       LIMIT $2
                  ) j
+                UNION ALL
+                SELECT f.queue, f.live_workers, f.max_ceiling, f.advertised,
+                       f.versions,
+                       'app_version_unmet'::text,
+                       j.id, j.prio, j.capability, j.app_version
+                  FROM fleet f
+                 CROSS JOIN LATERAL (
+                     SELECT id, prio, capability, app_version
+                       FROM jorb
+                      WHERE queue = f.queue
+                        AND state = 'queued'
+                        AND run_after <= now()
+                        -- disjoint from BOTH arms above: a job that is also
+                        -- above the ceiling or wants an unadvertised
+                        -- capability is reported there, so the complement of
+                        -- each of those predicates is restated here
+                        AND prio <= f.max_ceiling
+                        AND (capability IS NULL
+                             OR capability = ANY (f.advertised))
+                        AND app_version IS NOT NULL
+                        AND NOT (app_version = ANY (f.versions))
+                      ORDER BY prio, run_after
+                      LIMIT $2
+                 ) j
             )
             SELECT queue, reason, live_workers, max_ceiling, advertised,
+                   versions,
                    count(*)::int                              AS blocked_count,
                    (array_agg(id ORDER BY prio, id))[1:$3::int]
                                                               AS sample_job_ids,
@@ -1328,14 +1436,23 @@ class AdminAPI:
                    max(prio)                                  AS highest_prio,
                    coalesce(array_agg(DISTINCT capability)
                                 FILTER (WHERE capability IS NOT NULL),
-                            '{}'::text[])                     AS missing_caps
+                            '{}'::text[])                     AS missing_caps,
+                   coalesce(array_agg(DISTINCT app_version)
+                                FILTER (WHERE app_version IS NOT NULL),
+                            '{}'::text[])                     AS missing_versions
               FROM blocked
-             GROUP BY queue, reason, live_workers, max_ceiling, advertised
-             ORDER BY queue, reason
+             GROUP BY queue, reason, live_workers, max_ceiling, advertised,
+                      versions
+             -- Ordered by UNCLAIMABLE_REASONS itself, not alphabetically:
+             -- that tuple IS the precedence the arms above are disjoint by,
+             -- and reporting in a different order than the one the disjointness
+             -- rule is written in is how the two drift apart.
+             ORDER BY queue, array_position($4::text[], reason)
             """,
             stale_after_seconds,
             scan_limit,
             sample_limit,
+            list(UNCLAIMABLE_REASONS),
         )
 
         report: list[dict[str, Any]] = []
@@ -1346,6 +1463,13 @@ class AdminAPI:
                     "max_live_ceiling": row["max_ceiling"],
                     "lowest_blocked_prio": row["lowest_prio"],
                     "highest_blocked_prio": row["highest_prio"],
+                }
+            elif reason == "app_version_unmet":
+                # Same keys `explain_job` uses for the same facts, so a doctor
+                # line and a `jobs why --json` answer read alike.
+                details = {
+                    "missing_app_versions": list(row["missing_versions"] or []),
+                    "advertised_app_versions": list(row["versions"] or []),
                 }
             else:
                 details = {
@@ -1472,6 +1596,38 @@ class AdminAPI:
             """,
             job_id,
             new_priority,
+        )
+        return result != "UPDATE 0"
+
+    async def update_job_app_version(
+        self, job_id: int, app_version: str | None
+    ) -> bool:
+        """Re-pin (or unpin) a job that has not been claimed yet.
+
+        The twin of `update_job_priority`, refusing the same states for the
+        same reason: the version is a claim gate, and a job that has already
+        been claimed has already passed through it. `None` CLEARS the pin,
+        which is the remedy for a job stranded by a deploy that moved on --
+        cleared, it is claimable by every live worker again.
+
+        Unlike the priority twin there is no ceiling to check against: nothing
+        the platform can read says which builds a fleet is ABOUT to run, so a
+        version no worker advertises yet is a legitimate pin (that is what a
+        deploy in progress looks like). What makes it safe is that the
+        stranding is loud -- doctor's unclaimable sweep, `jobs why`, and every
+        idle worker's log all name it.
+
+        Returns True if the row was updated, False if the job does not exist
+        or has already left the queue.
+        """
+        validate_app_version(app_version)
+        result: str = await self.conn.execute(
+            """
+            UPDATE jorb SET app_version = $2
+             WHERE id = $1 AND state IN ('queued', 'waiting')
+            """,
+            job_id,
+            app_version,
         )
         return result != "UPDATE 0"
 
@@ -1824,7 +1980,8 @@ class AdminAPI:
         """
         records = await self.conn.fetch(
             """
-            SELECT w.id, w.host, w.pid, w.queue, w.capabilities, w.version,
+            SELECT w.id, w.host, w.pid, w.queue, w.capabilities,
+                   w.app_version, w.version,
                    w.started, w.last_seen, w.shutdown_at,
                    w.job_threads, w.job_threads_abandoned,
                    EXTRACT(EPOCH FROM (now() - w.last_seen))::float
@@ -2561,6 +2718,7 @@ class AdminAPI:
         queue: str | None = None,
         priority: int | None = None,
         kwargs_override: dict[str, Any] | None = None,
+        app_version: str | None = None,
     ) -> dict[str, Any]:
         """
         FORK a job: create a NEW job that re-executes this one's work from
@@ -2582,6 +2740,10 @@ class AdminAPI:
             priority: run the fork at another priority (default: the source's)
             kwargs_override: replace the job's arguments wholesale (default:
                 the source's kwargs)
+            app_version: pin the FORK to a code version (default: None —
+                unpinned, whatever the source was). Not inherited on purpose:
+                a fork is how work is re-run under NEW code, so the source's
+                pin would strand it (see db.fork_job)
 
         Returns:
             {"job_id", "source_job_id", "from_step", "steps_copied",
@@ -2590,7 +2752,8 @@ class AdminAPI:
         Raises:
             db.ForkRefused: no such job, from_step below 1, or from_step past
                 the source's recorded step count + 1
-            ValueError: a priority above this deployment's worker ceiling
+            ValueError: a priority above this deployment's worker ceiling, or
+                an empty/over-long app_version
         """
         if priority is not None:
             # Same guard as enqueue and set-priority, for the same reason: a
@@ -2604,6 +2767,7 @@ class AdminAPI:
             queue=queue,
             priority=priority,
             kwargs_override=kwargs_override,
+            app_version=validate_app_version(app_version),
         )
 
     async def fork_job_from_failure(
@@ -2613,6 +2777,7 @@ class AdminAPI:
         queue: str | None = None,
         priority: int | None = None,
         kwargs_override: dict[str, Any] | None = None,
+        app_version: str | None = None,
     ) -> dict[str, Any]:
         """
         fork_job() from the first step whose checkpoint recorded an error.
@@ -2631,6 +2796,7 @@ class AdminAPI:
             queue=queue,
             priority=priority,
             kwargs_override=kwargs_override,
+            app_version=validate_app_version(app_version),
         )
 
     async def list_forks(

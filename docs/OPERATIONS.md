@@ -314,6 +314,48 @@ To fix jobs already in that state: lower their priority
 900)`, both refused above the ceiling for the same reason), or start a
 worker whose `--max-prio` covers them.
 
+## Pinning in-flight work to a code version
+
+A rolling deploy replaces the code under jobs that are already queued. A job
+enqueued with an `app_version` is claimed **only** by a worker advertising the
+same one, so its remaining work runs on the build it was written for:
+
+```bash
+pj --config ./pyjobby.toml --queue default --app-version 2026.07.28+a1b2c3d
+```
+
+```python
+await client.enqueue("myapp.jobs.MigrateTenant", app_version="2026.07.28+a1b2c3d")
+# or declare it once: JobClient(pool, app_version=...), or `app_version` in
+# pyjobby.toml, which both `pj` and JobClient.from_config read
+```
+
+**Only the job opts in.** A job with no `app_version` — the default — is
+claimed by every worker, versioned ones included, so a deploy never stops the
+fleet draining its ordinary backlog. There is no worker-side "matching work
+only" flag.
+
+Retry, re-run and DLQ retry keep the pin (same row, same code). A fork does
+not, unless asked: forking is how work is re-run under _new_ code. Schedule
+firings are never pinned.
+
+A job pinned to a build nobody runs is unclaimable in exactly the way a job
+above every ceiling is, and the same three things stop it happening quietly:
+`doctor`'s `WARN unclaimable` counts them per queue and names the versions the
+fleet _does_ advertise, `pj-admin jobs why ID` answers `app_version_unmet` with
+those numbers, and an idle worker logs it at most once a minute:
+
+```
+[default:1000] 3 runnable job(s) on this queue are PINNED to an app version this
+worker does not advertise (e.g. '2026.07.01'; this worker advertises
+'2026.07.28') ... those jobs stay queued forever
+```
+
+Nothing can refuse the pin at enqueue time — the fleet it must match is
+whatever is running when the job is finally claimed — so the reporting is the
+whole safety net. Two remedies: run the version the job asked for, or change
+the job (`pj-admin jobs set-app-version ID VERSION`, or `--clear` to unpin it).
+
 ## Retention: what it deletes, and what it refuses to
 
 Retention is **on by default** (`--retention-days 30`) and runs in the
@@ -417,7 +459,10 @@ unclaimable` names work no live worker on that queue could ever claim);
 workers' own logs for `NOT CLAIMING` (abandoned job threads — see above) and
 for `ABOVE this worker's priority ceiling` (jobs whose `prio` exceeds
 `--max-prio` — see [Priority, and the ceiling a worker claims
-under](#priority-and-the-ceiling-a-worker-claims-under)); and remember that a
+under](#priority-and-the-ceiling-a-worker-claims-under)) and for `PINNED to an
+app version` (jobs pinned to a build this worker does not run — see [Pinning
+in-flight work to a code
+version](#pinning-in-flight-work-to-a-code-version)); and remember that a
 `capability` no worker advertises is invisible in the same way.
 
 **The scheduler missed fires** (was down at fire time). By default missed

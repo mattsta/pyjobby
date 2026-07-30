@@ -19,6 +19,14 @@ port = 5432
 # would ever claim. LOWER numbers are MORE urgent; default 1000.
 prio_ceiling = 1000
 
+# This deployment's APPLICATION code version, for pinning in-flight work to
+# matching code across a rolling deploy. Read by both halves of the pin: `pj`
+# advertises it (`pj --app-version`) and JobClient.from_config() stamps it on
+# every enqueue, so workers and producers cannot disagree about it. Commented
+# out = nothing is pinned, which is the default and what most deployments
+# want; a job with no app_version is claimed by every worker.
+# app_version = "2026.07.28+a1b2c3d"
+
 # Experimental per-worker HTTP endpoints (pj workers only). Off by default —
 # uncomment to enable; there is no authentication.
 # [web_listen]

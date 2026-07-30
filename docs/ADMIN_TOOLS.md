@@ -243,17 +243,22 @@ or recording history. All seven the schema installs are checked by name.
 The fleet-wide sweep for the condition
 [`jobs why`](#why-is-this-job-not-running) answers one job at a time: a job
 that is `queued`, due, and that **no live worker on its queue could ever
-claim**. Two ways in, and the check names which one, per queue:
+claim**. Three ways in, and the check names which one, per queue:
 
-| Cause                  | The line says                                                  | Fix                                                                |
-| ---------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `above_worker_ceiling` | `N on 'queue' above every live worker's ceiling (prio …)`      | `pj --max-prio` higher, or `pj-admin jobs set-priority ID N` lower |
-| `capability_unmet`     | `N on 'queue' needing capability 'x', which none … advertises` | start a worker with `pj --queue Q --cap x`                         |
+| Cause                  | The line says                                                   | Fix                                                                                     |
+| ---------------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `above_worker_ceiling` | `N on 'queue' above every live worker's ceiling (prio …)`       | `pj --max-prio` higher, or `pj-admin jobs set-priority ID N` lower                      |
+| `capability_unmet`     | `N on 'queue' needing capability 'x', which none … advertises`  | start a worker with `pj --queue Q --cap x`                                              |
+| `app_version_unmet`    | `N on 'queue' needing app version 'x', which none … advertises` | start a worker with `pj --queue Q --app-version x`, or `pj-admin jobs set-app-version` |
+
+The causes are **disjoint**, in that order: a job that trips more than one is
+counted under the first, so this check and `jobs why` never send you to
+different remedies for the same row.
 
 ```console
 $ pj-admin doctor
 ...
-WARN unclaimable: 4 claimable job(s) that no live worker can claim: 3 on 'reports' above every live worker's ceiling (prio 500; the highest --max-prio among 1 live worker(s) is 100; e.g. jobs 1, 2, 3); 1 on 'reports' needing capability 'gpu', which none of the 1 live worker(s) advertises (they advertise: cpu; e.g. jobs 4). they are runnable and INVISIBLE to every live worker on their queue, so nothing ever claims them: they stay queued forever, never fail, and never reach the DLQ. Raise the fleet's ceiling (pj --max-prio N), start a worker advertising the capability (pj --queue Q --cap C), or lower the job (pj-admin jobs set-priority ID N). Remember lower prio = more urgent. `pj-admin jobs why ID` explains any one of them in full
+WARN unclaimable: 5 claimable job(s) that no live worker can claim: 3 on 'reports' above every live worker's ceiling (prio 500; the highest --max-prio among 1 live worker(s) is 100; e.g. jobs 1, 2, 3); 1 on 'reports' needing capability 'gpu', which none of the 1 live worker(s) advertises (they advertise: cpu; e.g. jobs 4); 1 on 'reports' needing app version '2026.07.01', which none of the 1 live worker(s) advertises (they advertise: 2026.07.28; e.g. jobs 5). they are runnable and INVISIBLE to every live worker on their queue, so nothing ever claims them: they stay queued forever, never fail, and never reach the DLQ. Raise the fleet's ceiling (pj --max-prio N), start a worker advertising the capability (pj --queue Q --cap C), start a worker on the app version the job wants (pj --queue Q --app-version V), or change the job (pj-admin jobs set-priority ID N, pj-admin jobs set-app-version ID [V|--clear]). Remember lower prio = more urgent. `pj-admin jobs why ID` explains any one of them in full
 ```
 
 It is a **WARN**: the platform is healthy, the workload is not. Up to three
@@ -291,6 +296,7 @@ Commands:
   rerun          RE-RUN a terminal job — including a FINISHED one (repeats side effects)
   retry          Retry one or more crashed jobs
   retry-stats    Show retry statistics from the jorb_history audit trail
+  set-app-version  Re-pin (or unpin) a queued or waiting job's app version.
   set-priority   Change a queued or waiting job's priority.
   steps          Show a job's DXE step checkpoints
   timeout-stats  Show timeout statistics (from jorb.timeout_at/state)
@@ -477,6 +483,7 @@ indented block below it are the same answer for a human. Every reason:
 | `no_live_workers`                    | Nothing is on that queue — read the queue, not the fleet total.                                                                               |
 | `above_worker_ceiling`               | The job's `prio` is above every live worker's `--max-prio`.                                                                                   |
 | `capability_unmet`                   | No live worker on the queue advertises the capability, and the answer names what they _do_ advertise.                                         |
+| `app_version_unmet`                  | The job is pinned to an `app_version` no live worker on the queue advertises; the answer names the versions they _do_ run.                     |
 | `queue_at_max_concurrency`           | In-flight count against the cap.                                                                                                              |
 | `rate_limited`                       | Admissions in the window against the limit.                                                                                                   |
 | `claimable`                          | Nothing declines it: how many claimable jobs sort ahead of it in claim order (`prio`, then `run_after`).                                      |
@@ -493,6 +500,7 @@ $ pj-admin jobs why 48821 --json
   "job_class": "myapp.jobs.NightlyRollup",
   "prio": 5000,
   "capability": null,
+  "app_version": null,
   "run_after": "2026-07-28T23:25:02.825604+00:00",
   "created": "2026-07-28T23:25:02.825604+00:00",
   "updated": "2026-07-28T23:25:02.825604+00:00",
@@ -526,8 +534,8 @@ safe to run against a table with hundreds of millions of rows, and safe to
 run from a monitoring loop.
 
 This verb needs a job id, which means somebody already suspects that job.
-The same two fleet-shaped reasons — `above_worker_ceiling` and
-`capability_unmet` — are swept for across every queue by
+The same three fleet-shaped reasons — `above_worker_ceiling`,
+`capability_unmet` and `app_version_unmet` — are swept for across every queue by
 [`doctor`'s `unclaimable` check](#the-unclaimable-check--work-the-fleet-cannot-see),
 which is how those jobs get found in the first place.
 
@@ -569,6 +577,16 @@ Options:
   deployment's worker ceiling is refused too, since no worker would claim
   it. The ceiling comes from the config file's `prio_ceiling`, and
   `--max-prio N` overrides it for one command.
+- `jobs set-app-version ID [VERSION | --clear]` — re-pin (or unpin) a
+  **queued or waiting** job. A pinned job is claimed only by a worker
+  advertising the same `pj --app-version`, so a job pinned to a build nobody
+  runs sits queued forever; `--clear` unpins it and every live worker on its
+  queue becomes a candidate again. Refuses the same states `set-priority`
+  does, for the same reason — a claimed job has already been matched to a
+  worker. There is deliberately no ceiling-style refusal here: a version no
+  worker advertises **yet** is what a deploy in progress looks like, and the
+  stranding is reported loudly instead (see
+  [the `unclaimable` check](#the-unclaimable-check--work-the-fleet-cannot-see)).
 - `jobs delete ID...` — permanent, one line per id, prompts once for the
   whole list unless `-f/--force`.
 
@@ -786,27 +804,33 @@ routine cleanup is retention's job
 
 ```console
 $ pj-admin workers list
-ID  Host             PID    Queue            Status  Threads  Last Seen  Current Job
-------------------------------------------------------------------------------------
-1   optionality.loc  75674  pjbench_e2e_9c5  live    0/8      5s ago     -
-2   optionality.loc  75675  pjbench_e2e_9c5  live    0/8      5s ago     -
-3   optionality.loc  75673  pjbench_e2e_9c5  live    0/8      5s ago     -
-4   optionality.loc  75676  pjbench_e2e_9c5  live    0/8      5s ago     -
+ID  Host             PID    Queue            App Version  Status  Threads  Last Seen  Current Job
+-------------------------------------------------------------------------------------------------
+1   optionality.loc  75674  pjbench_e2e_9c5  -            live    0/8      5s ago     -
+2   optionality.loc  75675  pjbench_e2e_9c5  -            live    0/8      5s ago     -
+3   optionality.loc  75673  pjbench_e2e_9c5  -            live    0/8      5s ago     -
+4   optionality.loc  75676  pjbench_e2e_9c5  -            live    0/8      5s ago     -
 ```
 
 This reads the `jorb_worker` registry: live workers plus recently
-shut-down ones, each with the job it currently holds. Two columns carry the
+shut-down ones, each with the job it currently holds. Three columns carry the
 important signal:
 
 - **Status** — `live`, or **`not claiming`** for a worker that heartbeats
   perfectly and does no work, because abandoned job threads fill its pool:
 
   ```
-  2   host-b    9910   heavy  not claiming  8/8      3s ago     -
+  2   host-b    9910   heavy  -  not claiming  8/8      3s ago     -
   ```
 
 - **Threads** — `abandoned/pool`. `8/8` _is_ the refusing state; `7/8` is
   one timed-out job away from it and reads nothing like `0/8`.
+
+- **App Version** — what this worker advertises (`pj --app-version`), `-` for
+  a worker that advertises none. Mid-deploy a fleet has workers on two
+  versions, and this column is the answer to "why is that pinned job still
+  queued?" (see
+  [CLIENT_LIBRARY.md § Pinning work to a code version](CLIENT_LIBRARY.md#pinning-work-to-a-code-version)).
 
 Both are explained in
 [OPERATIONS.md § Abandoned job threads](OPERATIONS.md#abandoned-job-threads-when-a-worker-stops-claiming-on-purpose).

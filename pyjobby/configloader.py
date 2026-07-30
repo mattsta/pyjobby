@@ -17,6 +17,7 @@ would fail later, further from the cause.
 
     # pyjobby.toml
     prio_ceiling = 1000
+    app_version = "2026.07.28+a1b2c3d"
 
     [db_params]
     host = "postgres.internal"
@@ -32,7 +33,13 @@ would fail later, further from the cause.
 ``db_params`` is asyncpg.connect() keyword arguments and only those.
 Optional keys are simply omitted (TOML has no null): a missing
 ``web_listen`` table means no web listener, a missing ``prio_ceiling``
-means the platform default.
+means the platform default, and a missing ``app_version`` means this
+deployment does not pin work to a code version at all.
+
+``app_version`` is declared HERE, once, because both halves of the pin read
+it from the same file: ``pj --app-version`` defaults to it (what the workers
+advertise) and ``JobClient.from_config`` defaults to it (what an enqueue
+stamps). Two places to write the same string is one place to forget it.
 """
 
 from __future__ import annotations
@@ -70,7 +77,9 @@ _MAX_CONFIG_BYTES = 1024 * 1024
 #: process did not want -- and `prio_ceilng = 100` would then silently leave
 #: the setting at its default in every process, forever, with the file
 #: sitting there looking like it said otherwise.
-KNOWN_TOP_LEVEL_KEYS = frozenset({"db_params", "prio_ceiling", "web_listen"})
+KNOWN_TOP_LEVEL_KEYS = frozenset(
+    {"app_version", "db_params", "prio_ceiling", "web_listen"}
+)
 
 
 def describe_db_target(target: Mapping[str, Any] | str | None) -> str:

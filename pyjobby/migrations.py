@@ -119,7 +119,8 @@ def _names(listing: str) -> frozenset[str]:
 
 REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
     "jorb": _names("""
-        id queue capability prio state job_class kwargs admin_data result uid
+        id queue capability app_version prio state job_class kwargs admin_data
+        result uid
         tags run_group waitfor_group waitfor_job dag_id deadline_key
         identity_key debounce_key debounce_deadline partition_key
         schedule_id forked_from run_count
@@ -132,7 +133,8 @@ REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
         partition_limits created updated
     """),
     "jorb_worker": _names("""
-        id host pid queue capabilities max_prio version started last_seen
+        id host pid queue capabilities max_prio app_version version started
+        last_seen
         shutdown_at idle job_threads job_threads_abandoned
     """),
     "jorb_step": _names("""
@@ -180,7 +182,7 @@ REQUIRED_TRIGGERS: tuple[str, ...] = (
 
 REQUIRED_INDEXES: frozenset[str] = _names("""
     jorb_pkey jorb_claim_idx jorb_claimed_at_idx jorb_started_idx
-    jorb_inflight_idx jorb_partition_inflight_idx
+    jorb_inflight_idx jorb_partition_inflight_idx jorb_app_version_idx
     jorb_retention_idx jorb_created_idx jorb_timeout_idx
     jorb_waitfor_job_idx jorb_waitfor_group_idx jorb_run_group_idx
     jorb_group_unfinished_idx jorb_uid_idx jorb_forked_from_idx

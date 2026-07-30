@@ -228,6 +228,14 @@ Enqueue a single job.
   unlabelled. Inherited by a fork, like `uid` and `tags`. Max 256 characters;
   longer raises `ValueError`. See
   [Queue controls](OPERATIONS.md#queue-controls-what-the-limits-actually-promise).
+- `app_version` (str): **Pin** this job to a code version — only a worker
+  advertising the same `pj --app-version` will claim it (default: None, which
+  means this client's declared version, and unpinned when it declared none).
+  An unpinned job is claimed by every worker, versioned ones included, so the
+  job opts in and the worker never does. Kept across retry and rerun (same
+  row, same code); **not** inherited by a fork. Empty strings and versions
+  longer than 128 characters raise `ValueError`. See
+  [Pinning work to a code version](#7b-pinning-work-to-a-code-version).
 - `admin_data` (dict): Metadata for tracking (default: None)
 - `tags` (dict): Your own labels — customer, region, batch — that you can
   filter jobs by later (default: None). See [Job Tags](#8-job-tags).
@@ -430,7 +438,7 @@ side effects). Returns `{"job_id", "status", "fresh"}` with status
 `True` wipes DXE checkpoints and restarts from step 1, `False` resumes from
 them.
 
-#### `fork_job(job_id, *, from_step=1, queue=None, priority=None, kwargs_override=None)`
+#### `fork_job(job_id, *, from_step=1, queue=None, priority=None, kwargs_override=None, app_version=None)`
 
 Create a **NEW** job that re-executes this one's work from `from_step`, with
 steps `1..from_step-1` copied in as checkpoints so they fast-forward. The
@@ -457,7 +465,10 @@ structure: `uid`, `deadline_key`, `identity_key`, `debounce_key`,
 membership and dependency edges are left unset, because two live rows
 sharing an idempotency key would make that key mean nothing — and an
 `identity_key` most of all, since its whole promise is that the row holding
-it is the only one. Streams, events and
+it is the only one. It does not inherit the source's `app_version` either, nor
+this client's: a fork is usually how work is re-run under **new** code, so
+inheriting a pin would strand the fork on the build you just replaced — pass
+`app_version=` to pin it deliberately. Streams, events and
 mailbox messages are the source's output and are not copied either — see
 [DXE.md](DXE.md#forking-a-job-a-new-row-from-a-checkpoint-prefix).
 
@@ -467,7 +478,7 @@ is below 1, or when it is past the source's recorded step count + 1 — and
 `ValueError` for a `priority` above this client's worker ceiling, the same
 refusal `enqueue` makes.
 
-#### `fork_job_from_failure(job_id, *, queue=None, priority=None, kwargs_override=None)`
+#### `fork_job_from_failure(job_id, *, queue=None, priority=None, kwargs_override=None, app_version=None)`
 
 `fork_job` from the first step whose checkpoint recorded an error — the
 incident shape: deploy the fix, fork the crashed job from the step that
@@ -615,6 +626,11 @@ marked "async only" below.
 
 - `bulk_retry(job_ids)`, `bulk_cancel(job_ids)`, `bulk_delete(job_ids)`, `bulk_update_priority(job_ids, new_priority)`.
 - `delete_job(job_id)`, `purge_queue(queue, states=None)` — delete one job, or a queue's jobs by state.
+
+**Changing a queued job**
+
+- `update_job_priority(job_id, new_priority)` — re-prioritise a **queued or waiting** job; validated against this client's `prio_ceiling` for the same reason `enqueue` is.
+- `update_job_app_version(job_id, app_version)` — re-pin (or, with `None`, unpin) a **queued or waiting** job. The remedy for work stranded by a deploy that moved past its pin; see [Pinning work to a code version](#7b-pinning-work-to-a-code-version).
 
 **Advanced enqueue**
 
@@ -1066,6 +1082,69 @@ await client.enqueue(
 # Geolocation-specific
 await client.enqueue("myapp.jobs.SyncData", capability="us-west", region="us-west-1")
 ```
+
+### 7b. Pinning work to a code version
+
+A rolling deploy replaces the code under jobs that are already in flight. For
+most work that is fine, and for a durable (DXE) job whose checkpoints were
+written by the old build it is usually fine too — `NondeterminismError` catches
+a resumed job whose step sequence really did change. When a deployment cannot
+accept the risk, it says so on the job:
+
+```python
+# this job's remaining work belongs to THIS build
+await client.enqueue(
+    "myapp.jobs.MigrateTenant", app_version="2026.07.28+a1b2c3d", tenant="acme"
+)
+```
+
+and starts its workers advertising the same version:
+
+```console
+$ pj --queue default --app-version 2026.07.28+a1b2c3d
+```
+
+**One rule: the job opts in.** A job with an `app_version` is claimed only by
+a worker advertising that exact version. A job **without** one — the default —
+is claimed by every worker, versioned ones included, so turning this on never
+stops a fleet draining its ordinary backlog mid-deploy. There is no worker-side
+"only take matching work" flag, because that would make claimability a matrix
+of two settings instead of one rule.
+
+Declare it once for a deployment that pins everything, on the client or in the
+config file both halves already read:
+
+```python
+client = JobClient(pool, app_version="2026.07.28+a1b2c3d")   # every enqueue
+client = await JobClient.from_config("./pyjobby.toml")       # app_version = "..."
+```
+
+A per-call `app_version=` overrides the client's, so a deployment that wants
+_most_ work unpinned leaves the client unset and pins the individual jobs.
+
+**What keeps the pin:** `retry`, `rerun` and DLQ retry — they requeue the same
+row to re-execute the same code. **What does not:** a fork, unless you ask
+(`fork_job(..., app_version=...)`), because a fork is usually how work is
+re-run under _new_ code and inheriting the old pin would strand it. Jobs minted
+by a recurring schedule are never pinned: a schedule describes recurring work,
+not a deployment.
+
+**Stranding is loud, in three places.** Nothing can refuse a pin at enqueue
+time — the fleet it has to match is whatever is running when the job is finally
+claimed — so a job pinned to a build nobody runs is reported by `pj-admin
+doctor`'s `unclaimable` check, explained by `pj-admin jobs why ID` as
+`app_version_unmet` with the versions the fleet _does_ run, and logged once a
+minute by every idle worker on that queue. Two remedies, either of which frees
+it:
+
+```console
+$ pj --queue default --app-version 2026.07.01          # run what it asked for
+$ pj-admin jobs set-app-version 48821 2026.07.28       # or repin it
+$ pj-admin jobs set-app-version 48821 --clear          # or unpin it
+```
+
+From code, `client.update_job_app_version(job_id, version_or_None)` does the
+same for a **queued or waiting** job.
 
 ### 8. Job Tags
 

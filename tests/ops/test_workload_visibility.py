@@ -23,16 +23,20 @@ from tests.ops.conftest import registered_workers, wait_until
 pytestmark = [pytest.mark.ops, pytest.mark.slow, pytest.mark.e2e]
 
 
-async def raw_enqueue(db_pool, queue: str, prio: int = 100, capability=None) -> int:
+async def raw_enqueue(
+    db_pool, queue: str, prio: int = 100, capability=None, app_version=None
+) -> int:
     """The back door the docs blame: a row that arrived without JobClient,
     so nothing could refuse it at the caller."""
     return await db_pool.fetchval(
-        "INSERT INTO jorb (queue, job_class, kwargs, prio, capability, state) "
+        "INSERT INTO jorb (queue, job_class, kwargs, prio, capability, state, "
+        "app_version) "
         "VALUES ($1, 'tests.dxe_jobs.OkJob', '{\"x\": 1}'::jsonb, $2, $3, "
-        "'queued') RETURNING id",
+        "'queued', $4) RETURNING id",
         queue,
         prio,
         capability,
+        app_version,
     )
 
 
@@ -146,6 +150,108 @@ class TestUnclaimableCapability:
         fleet.worker(unique_queue, "--cap", "gpu")
         await wait_for_job_state(db_pool, job_id, ("finished",), timeout=30)
         assert admin("doctor").stdout.count("WARN unclaimable") == 0
+
+
+class TestUnclaimableAppVersion:
+    """A job pinned to a build the fleet has moved past, with real processes.
+
+    The reference design this parallels strands such jobs silently. Ours must
+    make that impossible to miss, so all three loud surfaces are induced here
+    against a live fleet -- doctor's sweep, `jobs why`, and the idle worker's
+    own log -- and then BOTH documented remedies are shown actually draining
+    the work (the second one in its own test, because a remedy that only works
+    after the other one has been tried is not a remedy).
+    """
+
+    async def test_doctor_names_it_why_explains_it_and_a_matching_worker_frees_it(
+        self, fleet, admin, db_pool, unique_queue
+    ):
+        fleet.worker(unique_queue, "--app-version", "v1")
+        await wait_until(
+            lambda: registered_workers(db_pool, unique_queue),
+            describe="worker registered",
+            timeout=30,
+        )
+        job_id = await raw_enqueue(db_pool, unique_queue, app_version="v2")
+
+        report = admin("doctor")
+        assert report.returncode == 0, "unclaimable is a WARN, never a FAIL"
+        assert "WARN unclaimable:" in report.stdout
+        assert "needing app version 'v2'" in report.stdout
+        assert "they advertise: v1" in report.stdout
+        assert "jobs why" in report.stdout
+
+        why = admin("jobs", "why", str(job_id), "--json")
+        answer = json.loads(why.stdout)
+        assert answer["reason"] == "app_version_unmet"
+        assert answer["details"]["advertised_app_versions"] == ["v1"]
+
+        # The worker with nothing to do says what is hiding behind the pin --
+        # the same once-a-minute report that names work above its ceiling.
+        await wait_until(
+            lambda: asyncio.sleep(
+                0, "PINNED to an app version" in fleet.procs[0].log_text()
+            ),
+            describe="idle worker logged the hidden work",
+            timeout=90,
+        )
+
+        # Remedy A: run the version the job asked for. Nothing about the job
+        # changes, and the v1 worker is still running beside it.
+        fleet.worker(unique_queue, "--app-version", "v2")
+        await wait_for_job_state(db_pool, job_id, ("finished",), timeout=30)
+        assert admin("doctor").stdout.count("WARN unclaimable") == 0
+
+    async def test_clearing_the_pin_frees_it_for_the_fleet_already_running(
+        self, fleet, admin, db_pool, unique_queue
+    ):
+        """Remedy B: the deploy the job was waiting for is never coming, so the
+        job stops waiting for it. No new process, and the worker that had been
+        refusing the job runs it."""
+        fleet.worker(unique_queue, "--app-version", "v1")
+        await wait_until(
+            lambda: registered_workers(db_pool, unique_queue),
+            describe="worker registered",
+            timeout=30,
+        )
+        job_id = await raw_enqueue(db_pool, unique_queue, app_version="v2")
+
+        # It really is stuck first: otherwise the remedy proves nothing.
+        await asyncio.sleep(2)
+        assert (
+            await db_pool.fetchval("SELECT state FROM jorb WHERE id = $1", job_id)
+            == "queued"
+        )
+
+        cleared = admin("jobs", "set-app-version", str(job_id), "--clear")
+        assert cleared.returncode == 0, cleared.stdout + cleared.stderr
+
+        await wait_for_job_state(db_pool, job_id, ("finished",), timeout=30)
+
+    async def test_a_versioned_fleet_still_drains_unpinned_work(
+        self, fleet, admin, db_pool, unique_queue
+    ):
+        """The rule that keeps a rolling deploy from stopping the queue: only
+        the JOB opts in, so a worker advertising a version is not a narrower
+        worker. If this ever fails, turning the feature on anywhere halts every
+        queue's ordinary backlog."""
+        fleet.worker(unique_queue, "--app-version", "v1")
+        client = JobClient(pool=db_pool)
+        job_ids = [
+            await client.enqueue("tests.dxe_jobs.OkJob", queue=unique_queue, x=n)
+            for n in range(3)
+        ]
+
+        await wait_until(
+            lambda: db_pool.fetchval(
+                "SELECT count(*) = 3 FROM jorb WHERE id = ANY($1) "
+                "AND state = 'finished'",
+                job_ids,
+            ),
+            describe="unpinned work drained by a versioned fleet",
+            timeout=30,
+        )
+        assert "WARN unclaimable" not in admin("doctor").stdout
 
 
 class TestExactConcurrencyLimit:

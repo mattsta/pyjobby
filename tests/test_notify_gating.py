@@ -142,7 +142,7 @@ class TestEnqueueGate:
         assert heard.on("jorb_enqueued") == []
 
         claimed = await db_pool.fetchrow(
-            STMTS["claim"], 1, "gate-test", unique_queue, ["test"], 1000, None
+            STMTS["claim"], 1, "gate-test", unique_queue, ["test"], 1000, None, None
         )
         assert claimed is not None, "gated enqueue must still be claimable"
         assert claimed["id"] == job_id
@@ -225,7 +225,14 @@ class TestEnqueueGateCannotBeRaced:
             # nothing — the producer has not committed)
             await db_pool.execute(STMTS["worker-idle"], worker_id, True)
             missed = await db_pool.fetchrow(
-                STMTS["claim"], 1, "gate-test", unique_queue, ["test"], 1000, worker_id
+                STMTS["claim"],
+                1,
+                "gate-test",
+                unique_queue,
+                ["test"],
+                1000,
+                worker_id,
+                None,
             )
             assert missed is None, "uncommitted insert must not be claimable"
 
@@ -254,7 +261,14 @@ class TestEnqueueGateCannotBeRaced:
         async with listening(db_params, "jorb_enqueued") as heard:
             await db_pool.execute(STMTS["worker-idle"], worker_id, True)
             found = await db_pool.fetchrow(
-                STMTS["claim"], 1, "gate-test", unique_queue, ["test"], 1000, worker_id
+                STMTS["claim"],
+                1,
+                "gate-test",
+                unique_queue,
+                ["test"],
+                1000,
+                worker_id,
+                None,
             )
             await heard.settle()
 

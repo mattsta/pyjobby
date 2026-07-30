@@ -473,30 +473,27 @@ class TestScheduleManager:
 
     @pytest.mark.asyncio
     async def test_set_next_run(self, db_pool, manager):
-        """Test updating schedule's next_run timestamp."""
-        # Create schedule
+        """Test updating schedule's next_run timestamp.
+
+        The claim is that set_next_run WRITES, so the target instant is a
+        fixed literal rather than another cron evaluation: the original
+        form compared "next midnight" against "next minute", which are THE
+        SAME instant during the 23:59 UTC minute -- a test that failed one
+        minute per day, only for whoever happened to run it then.
+        """
         schedule_id = await manager.create_schedule(
             name="update-test", job_class="test.Job", cron_expr="0 0 * * *"
         )
 
-        # Get initial next_run
-        async with db_pool.acquire() as conn:
-            initial_next_run = await conn.fetchval(
-                "SELECT next_run FROM jorb_schedule WHERE id = $1", schedule_id
-            )
+        target = datetime(2099, 1, 2, 3, 4, 5, tzinfo=UTC)
+        await manager.set_next_run(schedule_id, target)
 
-        # Update to run every minute
-        await manager.set_next_run(
-            schedule_id, manager.calculate_next_run("* * * * *", "UTC")
-        )
-
-        # Verify next_run was updated
         async with db_pool.acquire() as conn:
             new_next_run = await conn.fetchval(
                 "SELECT next_run FROM jorb_schedule WHERE id = $1", schedule_id
             )
 
-        assert new_next_run != initial_next_run
+        assert new_next_run == target
 
     @pytest.mark.asyncio
     async def test_record_execution_success(self, db_pool, manager):

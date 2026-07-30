@@ -436,25 +436,28 @@ async def insert_worker(
     shutdown: bool = False,
     max_prio: int = DEFAULT_PRIO_CEILING,
     capabilities: tuple[str, ...] = (),
+    app_version: str | None = None,
 ) -> int:
     """Register a worker row directly, as pj.py's WORKER_REGISTER_SQL does.
 
-    `max_prio` and `capabilities` are the whole of what a worker will accept,
-    so they are what the `unclaimable` check reads; starting a real worker to
-    publish two columns it writes once at registration buys nothing and costs
-    a process per case.
+    `max_prio`, `capabilities` and `app_version` are the whole of what a worker
+    will accept, so they are what the `unclaimable` check reads; starting a real
+    worker to publish three columns it writes once at registration buys nothing
+    and costs a process per case.
     """
     return await pool.fetchval(
         """INSERT INTO jorb_worker
-               (host, pid, queue, last_seen, shutdown_at, max_prio, capabilities)
+               (host, pid, queue, last_seen, shutdown_at, max_prio, capabilities,
+                app_version)
            VALUES ('doctor-test', 4242, $1, now() - $2::interval,
-                   CASE WHEN $3 THEN now() ELSE NULL END, $4, $5)
+                   CASE WHEN $3 THEN now() ELSE NULL END, $4, $5, $6)
            RETURNING id""",
         queue,
         last_seen_age,
         shutdown,
         max_prio,
         list(capabilities),
+        app_version,
     )
 
 
@@ -535,19 +538,21 @@ async def insert_queued(
     run_after_age: timedelta = timedelta(0),
     prio: int = 100,
     capability: str | None = None,
+    app_version: str | None = None,
 ) -> list[int]:
     """Insert `count` queued jobs; returns their ids in insertion order."""
     return [
         await pool.fetchval(
             """INSERT INTO jorb (job_class, queue, state, run_after, prio,
-                                 capability)
+                                 capability, app_version)
                VALUES ('tests.dxe_jobs.OkJob', $1, 'queued', now() - $2::interval,
-                       $3, $4)
+                       $3, $4, $5)
                RETURNING id""",
             queue,
             run_after_age,
             prio,
             capability,
+            app_version,
         )
         for _ in range(count)
     ]
@@ -714,6 +719,46 @@ class TestDoctorUnclaimable:
         )
         assert "pj --queue Q --cap C" in message
 
+    async def test_an_app_version_no_live_worker_runs_warns(
+        self, dsn, db_pool, unique_queue
+    ):
+        """The deploy-shaped silence, and the one the reference design leaves
+        unreported: the pin was correct when the job was enqueued and the fleet
+        rolled past it."""
+        await insert_worker(db_pool, unique_queue, app_version="v3")
+        (job,) = await insert_queued(db_pool, unique_queue, app_version="v2")
+
+        result = await run_doctor(dsn)
+
+        assert result.exit_code == 0, result.output
+        status, message = parse_checks(result.output)["unclaimable"]
+        assert status == "WARN"
+        assert message.startswith(
+            "1 claimable job(s) that no live worker can claim: 1 on "
+            f"{unique_queue!r} needing app version 'v2', which none of the 1 "
+            "live worker(s) advertises (they advertise: v3; "
+            f"e.g. jobs {job})."
+        )
+        # both remedies, named
+        assert "pj --queue Q --app-version V" in message
+        assert "pj-admin jobs set-app-version ID [V|--clear]" in message
+
+    async def test_unpinned_work_beside_a_versioned_fleet_does_not_warn(
+        self, dsn, db_pool, unique_queue
+    ):
+        """A versioned worker is not a narrower worker: it claims unpinned work
+        like any other, so a deploy must not make this check fire across the
+        whole install."""
+        await insert_worker(db_pool, unique_queue, app_version="v3")
+        await insert_queued(db_pool, unique_queue)
+
+        result = await run_doctor(dsn)
+
+        assert parse_checks(result.output)["unclaimable"] == (
+            "PASS",
+            "no queued job is invisible to its queue's live workers",
+        )
+
     async def test_claimable_work_does_not_warn(self, dsn, db_pool, unique_queue):
         await insert_worker(db_pool, unique_queue, max_prio=500, capabilities=("gpu",))
         await insert_queued(db_pool, unique_queue, prio=500, capability="gpu")
@@ -753,27 +798,39 @@ class TestDoctorUnclaimable:
         assert checks["unclaimable"][0] == "PASS"
         assert checks["workers"] == ("WARN", "no live workers seen in last 60s")
 
-    async def test_both_causes_and_both_queues_are_named(
+    async def test_every_cause_and_both_queues_are_named(
         self, dsn, db_pool, unique_queue
     ):
         other = f"{unique_queue}_b"
-        await insert_worker(db_pool, unique_queue, max_prio=10, capabilities=("cpu",))
+        await insert_worker(
+            db_pool,
+            unique_queue,
+            max_prio=10,
+            capabilities=("cpu",),
+            app_version="v3",
+        )
         await insert_worker(db_pool, other, max_prio=10)
         await insert_queued(db_pool, unique_queue, count=2, prio=900)
         # under the ceiling, so this one is blocked by its capability alone:
-        # the two causes are disjoint, and a job that is both is counted as
+        # the causes are disjoint, and a job that is both is counted as
         # above_worker_ceiling (the cause `jobs why` headlines)
         await insert_queued(db_pool, unique_queue, prio=5, capability="gpu")
+        # under the ceiling and wanting nothing special, so this one is blocked
+        # by its pin alone -- the third cause, disjoint from the first two
+        await insert_queued(db_pool, unique_queue, prio=5, app_version="v2")
         await insert_queued(db_pool, other, prio=900)
 
         result = await run_doctor(dsn)
 
         status, message = parse_checks(result.output)["unclaimable"]
         assert status == "WARN"
-        assert message.startswith("4 claimable job(s) that no live worker can claim:")
+        assert message.startswith("5 claimable job(s) that no live worker can claim:")
         assert f"2 on {unique_queue!r} above every live worker's ceiling" in message
         assert f"1 on {unique_queue!r} needing capability 'gpu'" in message
-        assert f"1 on {other!r} above every live worker's ceiling" in message
+        assert f"1 on {unique_queue!r} needing app version 'v2'" in message
+        # DOCTOR_UNCLAIMABLE_NAMED is 3, so the fourth group is summarised
+        # rather than spelled out -- the line has to stay one line
+        assert "and 1 more" in message
 
     async def test_the_warning_is_identical_in_json(self, dsn, db_pool, unique_queue):
         await insert_worker(db_pool, unique_queue, capabilities=("cpu",))

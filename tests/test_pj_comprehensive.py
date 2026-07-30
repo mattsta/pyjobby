@@ -129,6 +129,7 @@ class TestJobClaiming:
                 ("test",),
                 1000,
                 None,  # not registered in jorb_worker for this unit test
+                None,  # app_version (this worker advertises none)
             )
 
             assert len(claimed) == 1
@@ -167,7 +168,7 @@ class TestJobClaiming:
         async with prepared_system(db_params, worker_params) as system:
             # Claim should get most urgent job first (lower number)
             claimed = await system.ex(
-                "claim", system.pid, system.node, unique_queue, (), 1000, None
+                "claim", system.pid, system.node, unique_queue, (), 1000, None, None
             )
 
             assert len(claimed) == 1
@@ -205,7 +206,7 @@ class TestJobClaiming:
         basic_worker_params = {**worker_params, "capabilities": ()}
         async with prepared_system(db_params, basic_worker_params) as system:
             claimed = await system.ex(
-                "claim", system.pid, system.node, unique_queue, (), 1000, None
+                "claim", system.pid, system.node, unique_queue, (), 1000, None, None
             )
 
             # gets the capability-free job, never the special one
@@ -213,7 +214,7 @@ class TestJobClaiming:
 
             # nothing else claimable for this worker
             again = await system.ex(
-                "claim", system.pid, system.node, unique_queue, (), 1000, None
+                "claim", system.pid, system.node, unique_queue, (), 1000, None, None
             )
             assert again == []
 

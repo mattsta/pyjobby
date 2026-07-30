@@ -90,10 +90,20 @@ $$;
 
 COMMENT ON FUNCTION claim_queue_lock IS 'Serialise claims for one controlled queue, waiting at most lock_timeout (50ms). TRUE = held for the rest of the transaction; FALSE = timed out, treat the queue as busy.';
 
+-- The three things a worker publishes about what it will claim, and the one
+-- that is OPT-IN FROM THE JOB'S SIDE. p_capabilities and p_max_prio describe
+-- the worker: a job is refused when the worker lacks what it asks for.
+-- p_app_version is the other direction -- a job carrying no app_version is
+-- claimable by every worker, versioned or not, and only a job that pins
+-- itself asks the fleet to match it. One rule, no matrix: there is
+-- deliberately no worker-side "require a match" flag, because the cell it
+-- would add (a versioned worker refusing unversioned work) is a fleet that
+-- stops draining its own backlog halfway through a deploy.
 CREATE FUNCTION claim_jorb(
     p_queue        TEXT,
     p_capabilities TEXT[],
     p_max_prio     INTEGER,
+    p_app_version  TEXT,
     p_worker_pid   INTEGER,
     p_worker_host  TEXT,
     p_worker_id    BIGINT
@@ -220,6 +230,17 @@ BEGIN
         -- lane test that is trivially true for them would still be a
         -- different statement, and this is the hottest query in the platform.
         --
+        -- WHY THE VERSION GATE IS NOT A THIRD STATEMENT, by the same standard.
+        -- It is a per-row filter of exactly capability's shape over rows
+        -- jorb_claim_idx already returned -- one comparison against a scalar
+        -- this process passed in -- so it costs what capability costs, and a
+        -- fleet with no versioned job anywhere has a predicate that is TRUE
+        -- for every row and a probe that still stops on the first index
+        -- entry. Partitioning is different in kind: its test reads a set
+        -- computed under the queue lock, so a queue with no lanes would be
+        -- carrying a plan built for one. Forking the statement on the version
+        -- as well would give four claims to keep in step to buy nothing.
+        --
         -- ORDER IS UNCHANGED: prio then run_after, the queue's own claim
         -- order, served by jorb_claim_idx exactly as below. Partitioning
         -- decides WHICH rows are eligible, never which eligible row wins.
@@ -254,6 +275,8 @@ BEGIN
                SELECT j.id FROM jorb j
                 WHERE j.queue = p_queue
                   AND (j.capability = ANY(p_capabilities) OR j.capability IS NULL)
+                  AND (j.app_version IS NULL
+                       OR j.app_version = p_app_version)
                   AND j.prio <= p_max_prio
                   AND j.run_after <= now()
                   AND j.state = 'queued'
@@ -282,6 +305,7 @@ BEGIN
            SELECT j.id FROM jorb j
             WHERE j.queue = p_queue
               AND (j.capability = ANY(p_capabilities) OR j.capability IS NULL)
+              AND (j.app_version IS NULL OR j.app_version = p_app_version)
               AND j.prio <= p_max_prio
               AND j.run_after <= now()
               AND j.state = 'queued'
@@ -292,5 +316,5 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION claim_jorb IS 'Atomically admit at most one queued job for a worker, enforcing the queue pause/concurrency/rate controls. With jorb_queue.partition_limits those two limits are counted PER jorb.partition_key instead of per queue, and the claim skips the lanes that are at theirs -- so a saturated lane never blocks another, and the NULL lane is a lane like any other. Returns zero rows when nothing is claimable.';
+COMMENT ON FUNCTION claim_jorb IS 'Atomically admit at most one queued job for a worker, enforcing the queue pause/concurrency/rate controls. With jorb_queue.partition_limits those two limits are counted PER jorb.partition_key instead of per queue, and the claim skips the lanes that are at theirs -- so a saturated lane never blocks another, and the NULL lane is a lane like any other. p_app_version is what THIS worker advertises: a job with jorb.app_version set is admitted only to a worker advertising the same one, and a job without it (the default) is admitted to any worker, so the pin is opt-in per job and never per worker. Returns zero rows when nothing is claimable.';
 

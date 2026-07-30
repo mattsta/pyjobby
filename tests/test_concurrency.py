@@ -24,9 +24,20 @@ async def connect_with_codec(db_params):
     return await db.connect(**db_params)
 
 
-async def claim(conn, queue, *, pid=1, host="worker", caps=("test",), prio=1000):
-    """Claim the next job on `queue` (schema v1 six-argument claim)."""
-    return await conn.fetchrow(STMTS["claim"], pid, host, queue, list(caps), prio, None)
+async def claim(
+    conn,
+    queue,
+    *,
+    pid=1,
+    host="worker",
+    caps=("test",),
+    prio=1000,
+    app_version: str | None = None,
+):
+    """Claim the next job on `queue` (schema v1 seven-argument claim)."""
+    return await conn.fetchrow(
+        STMTS["claim"], pid, host, queue, list(caps), prio, None, app_version
+    )
 
 
 async def count_state(conn, queue: str, state: str) -> int:

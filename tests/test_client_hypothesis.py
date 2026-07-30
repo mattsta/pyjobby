@@ -71,8 +71,8 @@ def queue_name_strategy(draw):
 # =============================================================================
 
 
-async def claim_and_finish_job(conn, queue="default"):
-    """Claim a job and mark it as finished (v1: 6-arg claim, epoch fencing)."""
+async def claim_and_finish_job(conn, queue="default", app_version: str | None = None):
+    """Claim a job and mark it as finished (v1: 7-arg claim, epoch fencing)."""
     claimed = await conn.fetchrow(
         STMTS["claim"],
         12345,  # worker_pid
@@ -81,6 +81,7 @@ async def claim_and_finish_job(conn, queue="default"):
         [],  # capabilities
         1000,  # max_priority
         None,  # claimed_by (no jorb_worker registry row in these tests)
+        app_version,  # app_version this worker advertises
     )
     if claimed:
         epoch = claimed["run_epoch"]
@@ -127,7 +128,7 @@ class TestEnqueueProperties:
         # CONSUMER: Worker can claim the job
         async with db_pool.acquire() as conn:
             claimed = await conn.fetchrow(
-                STMTS["claim"], 12345, "test-worker", queue, [], 1000, None
+                STMTS["claim"], 12345, "test-worker", queue, [], 1000, None, None
             )
 
             assert claimed is not None
@@ -174,6 +175,7 @@ class TestEnqueueProperties:
                     [],
                     10000,  # High enough to claim all
                     None,
+                    None,  # app_version (this worker advertises none)
                 )
                 if claimed:
                     claimed_priorities.append(claimed["prio"])
@@ -203,7 +205,7 @@ class TestEnqueueProperties:
         # CONSUMER: Cannot claim immediately
         async with db_pool.acquire() as conn:
             claimed_early = await conn.fetchrow(
-                STMTS["claim"], 12345, "test-worker", "default", [], 1000, None
+                STMTS["claim"], 12345, "test-worker", "default", [], 1000, None, None
             )
             assert claimed_early is None  # Too early
 
@@ -255,6 +257,7 @@ class TestBatchEnqueueProperties:
                     [],
                     1000,
                     None,
+                    None,  # app_version (this worker advertises none)
                 )
                 if not claimed:
                     break
@@ -286,7 +289,14 @@ class TestBatchEnqueueProperties:
             claimed_priorities = []
             for _ in range(batch_size):
                 claimed = await conn.fetchrow(
-                    STMTS["claim"], 12345, "test-worker", "default", [], 10000, None
+                    STMTS["claim"],
+                    12345,
+                    "test-worker",
+                    "default",
+                    [],
+                    10000,
+                    None,
+                    None,
                 )
                 if claimed:
                     claimed_priorities.append(claimed["prio"])
@@ -335,7 +345,14 @@ class TestDependencyProperties:
             for expected_index in range(chain_length):
                 # Claim next available job
                 claimed = await conn.fetchrow(
-                    STMTS["claim"], 12345, "test-worker", "default", [], 1000, None
+                    STMTS["claim"],
+                    12345,
+                    "test-worker",
+                    "default",
+                    [],
+                    1000,
+                    None,
+                    None,
                 )
 
                 assert claimed is not None
@@ -407,6 +424,7 @@ class TestQueueIsolationProperties:
                     [],
                     1000,
                     None,
+                    None,  # app_version (this worker advertises none)
                 )
                 if claimed:
                     queue1_claimed.append(claimed["id"])
@@ -480,7 +498,14 @@ class TestConcurrentOperationProperties:
             claimed_count = 0
             for _ in range(total_jobs):
                 claimed = await conn.fetchrow(
-                    STMTS["claim"], 12345, "test-worker", "default", [], 1000, None
+                    STMTS["claim"],
+                    12345,
+                    "test-worker",
+                    "default",
+                    [],
+                    1000,
+                    None,
+                    None,
                 )
                 if claimed:
                     claimed_count += 1
@@ -528,6 +553,7 @@ class TestConcurrentOperationProperties:
                     [],
                     1000,
                     None,
+                    None,
                 )
                 if claimed:
                     async with claim_lock:
@@ -574,7 +600,7 @@ class TestStateTransitionProperties:
 
             # Claim job: queued -> claimed (run_epoch is the fencing token)
             await conn.execute(
-                STMTS["claim"], 12345, "test-worker", "default", [], 1000, None
+                STMTS["claim"], 12345, "test-worker", "default", [], 1000, None, None
             )
             job = await conn.fetchrow("SELECT * FROM jorb WHERE id = $1", job_id)
             assert job["state"] == "claimed"

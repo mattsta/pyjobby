@@ -154,6 +154,19 @@ pj-admin -c ./pyjobby.toml doctor
 not given — one declaration instead of the same number repeated on four
 command lines. An explicit flag always wins.
 
+`app_version` (a string, optional) is this deployment's application code
+version. It is read by BOTH halves of a version pin — `pj` advertises it when
+`--app-version` is not given, and `JobClient.from_config` stamps it on every
+enqueue — so the workers and the producers cannot disagree about it. Omit it
+and nothing is pinned, which is the default and what most deployments want;
+see
+[OPERATIONS.md § Pinning in-flight work to a code version](OPERATIONS.md#pinning-in-flight-work-to-a-code-version).
+A deployment that sets it usually templates it from the build:
+
+```toml
+app_version = "2026.07.28+a1b2c3d"
+```
+
 `db_params` is **`asyncpg.connect()` keyword arguments**, and only those.
 Do not put `min_size` or `max_size` in it: workers, the scheduler,
 `pj-admin` and `pj-bench` open a plain connection and will reject the
@@ -288,6 +301,7 @@ named.
 | `--cap`             | none          | capabilities this host advertises; repeatable                                                     |
 | `--workers`         | CPU count / 2 | worker processes **per queue** (`pj --help` prints the value computed for the machine it runs on) |
 | `--max-prio`        | 1000          | priority ceiling; jobs above it are not claimed                                                   |
+| `--app-version`     | config, else none | the app code version these workers advertise; a job pinned to another one is not claimed here |
 | `--max-retries`     | 10            | attempts before a job is dead-lettered (`crashed`)                                                |
 | `--default-timeout` | 3600          | fallback job timeout in seconds; `0` disables                                                     |
 | `--check-interval`  | 5.0           | idle poll interval; LISTEN/NOTIFY wakes workers sooner                                            |

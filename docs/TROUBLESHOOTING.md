@@ -194,9 +194,10 @@ this version of pyjobby; run `db migrate` and confirm with `doctor`.
 executable version of this whole section: it asks the claim path itself
 which of these conditions is refusing the job and answers with the numbers
 behind it — the paused queue, the cap and what is filling it, the missing
-capability and what _is_ advertised, the priority ceiling, the `run_after`,
-the blocking job and its state. The priority-ceiling case in particular
-cannot be reached any other way at runtime.
+capability and what _is_ advertised, the app version the job is pinned to and
+what the fleet runs, the priority ceiling, the `run_after`, the blocking job
+and its state. The priority-ceiling and app-version cases in particular cannot
+be reached any other way at runtime.
 
 ```console
 $ pj-admin jobs why 48822
@@ -236,7 +237,14 @@ The rest of this section is the same walk by hand — for when the symptom is
    [deployment-guide.md § Worker settings](deployment-guide.md#worker-settings).
 4. **Capability.** A job with a `capability` no worker advertises is
    invisible to those workers. Workers advertise with `--cap`.
-5. **Priority — and remember the direction.** A **lower** `prio` is
+5. **App version.** A job with an `app_version` is claimed only by a worker
+   advertising the same one (`pj --app-version`), so a job pinned to a build
+   the fleet has rolled past is invisible to all of them. `pj-admin workers
+   list` has an App Version column and `pj-admin jobs inspect ID` prints the
+   job's pin when it has one. An idle worker also logs the condition once a
+   minute: grep its log for `PINNED to an app version`. Jobs with no pin are
+   never affected — the job opts in, never the worker.
+6. **Priority — and remember the direction.** A **lower** `prio` is
    claimed **sooner**; the big numbers are the ones nothing runs. Each
    worker has a ceiling (`pj --max-prio`, default 1000) and claims only
    `prio <= ceiling`, so a job above every live worker's ceiling is
@@ -249,7 +257,7 @@ The rest of this section is the same walk by hand — for when the symptom is
    the job's `prio` or by running a worker with a `--max-prio` that covers
    it — see
    [OPERATIONS.md § Priority](OPERATIONS.md#priority-and-the-ceiling-a-worker-claims-under).
-6. **`run_after`.** A job with a future `run_after` is _supposed_ to be
+7. **`run_after`.** A job with a future `run_after` is _supposed_ to be
    invisible — that is how retry backoff and durable sleep are
    implemented. `pj-admin jobs inspect ID` shows it.
 
@@ -301,10 +309,10 @@ $ pj-admin doctor
 PASS workers: 1 live worker(s) seen in last 60s
 PASS job-threads: 1 live worker(s) claiming
 PASS queue reports: depth 4, oldest runnable 0m
-WARN unclaimable: 4 claimable job(s) that no live worker can claim: 3 on 'reports' above every live worker's ceiling (prio 500; the highest --max-prio among 1 live worker(s) is 100; e.g. jobs 1, 2, 3); 1 on 'reports' needing capability 'gpu', which none of the 1 live worker(s) advertises (they advertise: cpu; e.g. jobs 4). they are runnable and INVISIBLE to every live worker on their queue, so nothing ever claims them: they stay queued forever, never fail, and never reach the DLQ. Raise the fleet's ceiling (pj --max-prio N), start a worker advertising the capability (pj --queue Q --cap C), or lower the job (pj-admin jobs set-priority ID N). Remember lower prio = more urgent. `pj-admin jobs why ID` explains any one of them in full
+WARN unclaimable: 5 claimable job(s) that no live worker can claim: 3 on 'reports' above every live worker's ceiling (prio 500; the highest --max-prio among 1 live worker(s) is 100; e.g. jobs 1, 2, 3); 1 on 'reports' needing capability 'gpu', which none of the 1 live worker(s) advertises (they advertise: cpu; e.g. jobs 4); 1 on 'reports' needing app version '2026.07.01', which none of the 1 live worker(s) advertises (they advertise: 2026.07.28; e.g. jobs 5). they are runnable and INVISIBLE to every live worker on their queue, so nothing ever claims them: they stay queued forever, never fail, and never reach the DLQ. Raise the fleet's ceiling (pj --max-prio N), start a worker advertising the capability (pj --queue Q --cap C), start a worker on the app version the job wants (pj --queue Q --app-version V), or change the job (pj-admin jobs set-priority ID N, pj-admin jobs set-app-version ID [V|--clear]). Remember lower prio = more urgent. `pj-admin jobs why ID` explains any one of them in full
 ```
 
-Two causes, and the line says which, per queue:
+Three causes, and the line says which, per queue:
 
 - **Above every live worker's ceiling.** A worker claims only
   `prio <= --max-prio` (default 1000) and **lower prio is more urgent**, so
@@ -315,6 +323,16 @@ Two causes, and the line says which, per queue:
   or by lowering the jobs: `pj-admin jobs set-priority ID 900`.
 - **A capability nobody advertises.** The line names what the fleet _does_
   advertise. Fix by starting a worker with it: `pj --queue reports --cap gpu`.
+- **An app version nobody runs.** The job was pinned to a build
+  (`app_version`) so that its in-flight work would not resume on new code,
+  and the deploy moved past it. The line names the versions the fleet _does_
+  advertise. Two fixes, both documented: run the version the job asked for
+  (`pj --queue reports --app-version 2026.07.01`), or change the job —
+  `pj-admin jobs set-app-version ID 2026.07.28` to repin it to what is
+  running, or `pj-admin jobs set-app-version ID --clear` to unpin it so any
+  worker will take it. Nothing can refuse this pin at enqueue time, because
+  the fleet it has to match is whatever is running when the job is finally
+  claimed — which is why it is swept for here.
 
 Take an id from the line and `pj-admin jobs why ID` for the full per-job
 answer with the numbers behind it. Rows enqueued through `JobClient` cannot

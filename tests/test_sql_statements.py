@@ -31,10 +31,11 @@ async def claim(
     caps=("test",),
     prio=1000,
     worker_id=None,
+    app_version: str | None = None,
 ):
-    """Claim the next job on `queue` (schema v1 six-argument claim)."""
+    """Claim the next job on `queue` (schema v1 seven-argument claim)."""
     return await conn.fetchrow(
-        STMTS["claim"], pid, host, queue, list(caps), prio, worker_id
+        STMTS["claim"], pid, host, queue, list(caps), prio, worker_id, app_version
     )
 
 

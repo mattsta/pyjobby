@@ -70,18 +70,21 @@ async def make_worker(
     *,
     capabilities: tuple[str, ...] = ("test",),
     max_prio: int = DEFAULT_PRIO_CEILING,
+    app_version: str | None = None,
     host: str = "worker-host",
     pid: int = 4242,
 ) -> int:
     """Register a live worker on `queue`, as pj.py's WORKER_REGISTER_SQL does."""
     return await conn.fetchval(
-        """INSERT INTO jorb_worker (host, pid, queue, capabilities, max_prio)
-           VALUES ($1, $2, $3, $4, $5) RETURNING id""",
+        """INSERT INTO jorb_worker (host, pid, queue, capabilities, max_prio,
+                                    app_version)
+           VALUES ($1, $2, $3, $4, $5, $6) RETURNING id""",
         host,
         pid,
         queue,
         list(capabilities),
         max_prio,
+        app_version,
     )
 
 
@@ -363,6 +366,61 @@ class TestQueuedRowPredicate:
 
         assert answer["reason"] == "claimable"
 
+    async def test_an_app_version_nobody_runs_names_what_is_running(
+        self, admin_api, db_connection, unique_queue
+    ):
+        """The deploy-shaped silence: the pin was right when the job was
+        enqueued and the fleet moved past it."""
+        await make_worker(db_connection, unique_queue, app_version="v3")
+        await make_worker(db_connection, unique_queue, app_version="v4", pid=4243)
+        job = await make_job(db_connection, unique_queue, app_version="v2")
+        answer = await admin_api.explain_job(job)
+
+        assert answer["reason"] == "app_version_unmet"
+        assert answer["app_version"] == "v2"
+        assert answer["details"]["app_version"] == "v2"
+        assert answer["details"]["workers_with_app_version"] == 0
+        assert answer["details"]["advertised_app_versions"] == ["v3", "v4"]
+        assert answer["details"]["live_workers"] == 2
+        # Both documented remedies are in the answer, not only one of them
+        assert "--app-version v2" in answer["summary"]
+        assert "set-app-version" in answer["summary"]
+
+    async def test_an_unversioned_fleet_advertises_nothing_and_says_so(
+        self, admin_api, db_connection, unique_queue
+    ):
+        """A different mistake with a different fix: nobody was started with
+        --app-version at all, so there is no deploy to wait for."""
+        await make_worker(db_connection, unique_queue)
+        job = await make_job(db_connection, unique_queue, app_version="v2")
+        answer = await admin_api.explain_job(job)
+
+        assert answer["reason"] == "app_version_unmet"
+        assert answer["details"]["advertised_app_versions"] == []
+        assert "they advertise: nothing" in answer["summary"]
+
+    async def test_an_app_version_that_IS_advertised_does_not_block(
+        self, admin_api, db_connection, unique_queue
+    ):
+        await make_worker(db_connection, unique_queue, app_version="v2")
+        job = await make_job(db_connection, unique_queue, app_version="v2")
+        answer = await admin_api.explain_job(job)
+
+        assert answer["reason"] == "claimable"
+
+    async def test_unpinned_work_is_never_blocked_by_a_versioned_fleet(
+        self, admin_api, db_connection, unique_queue
+    ):
+        """The rule the whole feature rests on: the JOB opts in. A versioned
+        fleet claims unpinned work exactly as an unversioned one does, so
+        `jobs why` must not invent a reason for it."""
+        await make_worker(db_connection, unique_queue, app_version="v3")
+        job = await make_job(db_connection, unique_queue)
+        answer = await admin_api.explain_job(job)
+
+        assert answer["reason"] == "claimable"
+        assert answer["app_version"] is None
+
 
 class TestFleet:
     async def test_no_live_workers_on_the_queue(
@@ -572,6 +630,78 @@ class TestUnclaimableSweep:
         }
         assert (await admin_api.explain_job(job))["reason"] == entry["reason"]
 
+    async def test_an_app_version_nobody_runs_is_found(
+        self, admin_api, db_connection, unique_queue
+    ):
+        await make_worker(db_connection, unique_queue, app_version="v3")
+        job = await make_job(db_connection, unique_queue, app_version="v2")
+
+        report = await admin_api.unclaimable_jobs()
+
+        (entry,) = report
+        assert entry["queue"] == unique_queue
+        assert entry["reason"] == "app_version_unmet"
+        assert entry["count"] == 1
+        assert entry["sample_job_ids"] == [job]
+        assert entry["details"] == {
+            "missing_app_versions": ["v2"],
+            "advertised_app_versions": ["v3"],
+        }
+        assert (await admin_api.explain_job(job))["reason"] == entry["reason"]
+
+    async def test_unpinned_work_beside_a_versioned_fleet_is_not_reported(
+        self, admin_api, db_connection, unique_queue
+    ):
+        """A versioned fleet is not a narrower fleet: unpinned work is
+        claimable by it, so a sweep that reported it would WARN through every
+        deploy in the install."""
+        await make_worker(db_connection, unique_queue, app_version="v3")
+        await make_job(db_connection, unique_queue)
+        await make_job(db_connection, unique_queue, app_version="v3")
+
+        assert await admin_api.unclaimable_jobs() == []
+
+    async def test_the_three_causes_are_disjoint_and_ordered_like_jobs_why(
+        self, admin_api, db_connection, unique_queue
+    ):
+        """A job that trips all three is counted ONCE, under the cause
+        `explain_job` headlines -- otherwise the two verbs disagree and the
+        operator is pointed at the wrong fix."""
+        await make_worker(
+            db_connection,
+            unique_queue,
+            max_prio=100,
+            capabilities=("cpu",),
+            app_version="v3",
+        )
+        every = await make_job(
+            db_connection,
+            unique_queue,
+            prio=900,
+            capability="gpu",
+            app_version="v2",
+        )
+        # ... and one that trips only the last two, to prove the second arm
+        # does not swallow the third either
+        capped = await make_job(
+            db_connection, unique_queue, capability="gpu", app_version="v2"
+        )
+        pinned = await make_job(db_connection, unique_queue, app_version="v2")
+
+        report = await admin_api.unclaimable_jobs()
+
+        assert [(e["reason"], e["count"]) for e in report] == [
+            ("above_worker_ceiling", 1),
+            ("capability_unmet", 1),
+            ("app_version_unmet", 1),
+        ]
+        assert report[0]["sample_job_ids"] == [every]
+        assert report[1]["sample_job_ids"] == [capped]
+        assert report[2]["sample_job_ids"] == [pinned]
+        assert (await admin_api.explain_job(every))["reason"] == "above_worker_ceiling"
+        assert (await admin_api.explain_job(capped))["reason"] == "capability_unmet"
+        assert (await admin_api.explain_job(pinned))["reason"] == "app_version_unmet"
+
     async def test_claimable_work_is_not_reported(
         self, admin_api, db_connection, unique_queue
     ):
@@ -722,12 +852,21 @@ class TestUnclaimableSweep:
     async def test_every_reason_it_emits_is_in_the_reason_table(
         self, admin_api, db_connection, unique_queue
     ):
-        """The vocabulary is shared with `jobs why`, not parallel to it."""
+        """The vocabulary is shared with `jobs why`, not parallel to it -- and
+        the REPORT ORDER is UNCLAIMABLE_REASONS' own order, which is also the
+        order the arms are made disjoint in. One cause per entry, all of them
+        induced, so a cause added to the tuple without a report arm (or
+        reported in a different order) fails here."""
         await make_worker(
-            db_connection, unique_queue, max_prio=100, capabilities=("cpu",)
+            db_connection,
+            unique_queue,
+            max_prio=100,
+            capabilities=("cpu",),
+            app_version="v3",
         )
         await make_job(db_connection, unique_queue, prio=900)
         await make_job(db_connection, unique_queue, capability="gpu")
+        await make_job(db_connection, unique_queue, app_version="v2")
 
         report = await admin_api.unclaimable_jobs()
 

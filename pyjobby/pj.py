@@ -101,11 +101,11 @@ STMTS: dict[str, str] = {}
 # run_epoch increments on every claim: it is the fencing token that keeps a
 # superseded execution from writing results/checkpoints later.
 # Argument order is the worker's, not the function's.
-STMTS["claim"] = """SELECT * FROM claim_jorb($3, $4::text[], $5, $1, $2, $6)"""
+STMTS["claim"] = """SELECT * FROM claim_jorb($3, $4::text[], $5, $7, $1, $2, $6)"""
 
 # Runnable work in this queue that this worker's ceiling hides from it.
 # Only ever run by an IDLE worker, at most once a minute (see
-# _report_unclaimable_priorities): a job above every live worker's ceiling
+# _report_hidden_work): a job above every live worker's ceiling
 # is otherwise completely silent -- queued forever, never failing, absent
 # from the DLQ -- so this is the one place the platform can notice it.
 # Served by jorb_claim_idx (queue, prio, run_after) WHERE state = 'queued'.
@@ -115,6 +115,36 @@ STMTS["above-ceiling"] = """SELECT count(*) AS above, min(prio) AS lowest
                                AND state = 'queued'
                                AND prio > $2
                                AND run_after <= now()"""
+
+# The same question about the OTHER claim gate a job can pin itself behind:
+# runnable work on this queue stamped with an app_version this worker does not
+# advertise. Asked from the same place and at the same cadence as the ceiling
+# count above -- a second statement rather than FILTERs on that one, because
+# the two want different index ranges: the ceiling arm is a range over
+# jorb_claim_idx's `prio`, and folding this into it with an OR would turn the
+# healthy answer (an empty range, zero rows read) into a walk of the whole
+# runnable slice on every idle poll -- which is the shape of a capped queue
+# sitting on a large backlog, a perfectly ordinary configuration.
+#
+# Served instead by jorb_app_version_idx (queue, app_version) WHERE
+# state = 'queued' AND app_version IS NOT NULL, so this reads the queue's
+# VERSIONED queued rows and nothing else -- none at all in a deployment that
+# never stamps a job, which is why the gate costs the platform nothing until
+# somebody uses it.
+#
+# `IS DISTINCT FROM` and not `<>`: this worker's own version is NULL when it
+# advertises none, and `app_version <> NULL` is NULL for every row, which
+# would report a fleet running no versions at all as having nothing hidden --
+# the exact case the log exists for.
+STMTS["hidden-versions"] = """SELECT count(*) AS mismatched,
+                                     min(app_version) AS wanted
+                                FROM jorb
+                               WHERE queue = $1
+                                 AND state = 'queued'
+                                 AND app_version IS NOT NULL
+                                 AND app_version IS DISTINCT FROM $2
+                                 AND prio <= $3
+                                 AND run_after <= now()"""
 
 # Fetch an upstream job's stored result for run-time result passing
 # (admin_data.use_result_from).
@@ -325,17 +355,23 @@ STMTS["worker-idle"] = """UPDATE jorb_worker
 
 # Worker registry (executed on the heartbeat connection, not prepared).
 #
-# `capabilities` and `max_prio` are published together because together they
-# are the whole of what this worker will claim -- claim_jorb() filters on
-# `capability = ANY($2)` and `prio <= $3`, and both values live in this
-# process and nowhere else. Publishing only the first left "this job's prio
-# is above every live worker's ceiling" unanswerable at runtime, which is the
-# platform's quietest failure: the job stays queued forever without ever
-# failing. The ceiling is a STARTUP constant, so it is written here and never
-# again -- the heartbeat below rewrites only what changes.
+# `capabilities`, `max_prio` and `app_version` are published together because
+# together they are the whole of what this worker will claim -- claim_jorb()
+# filters on `capability = ANY($2)`, `prio <= $3` and a job's app_version
+# matching this one, and all three values live in this process and nowhere
+# else. Publishing only the first left "this job's prio is above every live
+# worker's ceiling" unanswerable at runtime, which is the platform's quietest
+# failure: the job stays queued forever without ever failing, and a job pinned
+# to a version nobody runs is the same silence by a different door. All three
+# are STARTUP constants, so they are written here and never again -- the
+# heartbeat below rewrites only what changes.
+#
+# `version` is a different column and a different fact: the pyjobby LIBRARY
+# release this process imported, not the application code it runs.
 WORKER_REGISTER_SQL = """INSERT INTO jorb_worker
-        (host, pid, queue, capabilities, max_prio, version, job_threads)
-        VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id"""
+        (host, pid, queue, capabilities, max_prio, app_version, version,
+         job_threads)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id"""
 # The heartbeat carries the job-thread saturation with it. A worker whose pool
 # is full of abandoned threads refuses to claim (see _too_many_abandoned_
 # threads) but goes on beating, so every liveness signal the platform has says
@@ -385,6 +421,13 @@ class JobSystem:
     # `pj --max-prio`; the default is shared with the client, which refuses
     # to enqueue above it (see client.DEFAULT_PRIO_CEILING).
     prio: int = DEFAULT_PRIO_CEILING
+    # The APPLICATION code version this worker advertises (`pj
+    # --app-version`, else the config file's `app_version`). None -- the
+    # default -- means it advertises none, and claim_jorb() then admits it
+    # only jobs that are not pinned to a version. A pinned job is admitted
+    # only to a worker whose value equals the job's, so the pin is the JOB's
+    # to declare and this is how the fleet answers it.
+    app_version: str | None = None
     stop: bool = False
     pid: int = field(default_factory=lambda: os.getpid())
     node: str = field(default_factory=lambda: platform.node())
@@ -443,9 +486,11 @@ class JobSystem:
     # last said so (see _too_many_abandoned_threads)
     _refusing_since: float | None = None
     _refusal_logged: float = 0.0
-    # when this worker last reported queued work above its priority ceiling
-    # (see _report_unclaimable_priorities)
-    _ceiling_reported: float = 0.0
+    # when this worker last reported queued work it cannot see -- above its
+    # priority ceiling, or pinned to an app_version it does not advertise.
+    # ONE instant for both causes, because they share the once-a-minute gate
+    # (see _report_hidden_work).
+    _hidden_reported: float = 0.0
 
     async def ex(self, op: str, *args: Any) -> list[asyncpg.Record]:
         """Execute prepared statement ``op`` with *args, reconnecting (and
@@ -583,6 +628,7 @@ class JobSystem:
             self.qname,
             list(self.capabilities),
             self.prio,
+            self.app_version,
             __version__,
             self.job_threads,
         )
@@ -781,57 +827,92 @@ class JobSystem:
         return True
 
     # ------------------------------------------------------------------
-    # the priority ceiling: saying so when work is hiding above it
+    # the claim gates: saying so when work is hiding behind one of them
     # ------------------------------------------------------------------
 
-    async def _report_unclaimable_priorities(self) -> None:
-        """Say when this queue holds runnable work above this worker's
-        ceiling.
+    async def _report_hidden_work(self) -> None:
+        """Say when this queue holds runnable work this worker cannot see.
 
-        A job with ``prio`` above every live worker's ceiling is the quietest
-        failure this platform has: ``claim_jorb`` filters it out, so it never
-        runs, never errors, never retries, never reaches the DLQ and never
-        ages into any check that looks at *terminal* states. It is simply
-        ``queued``, forever, and the ordering being inverted (LOWER is MORE
-        urgent) is what walks people into it — ``priority=5000`` reads as
-        "whenever you get to it" and means "never".
+        TWO CAUSES, ONE CADENCE. A job with ``prio`` above every live worker's
+        ceiling is the quietest failure this platform has: ``claim_jorb``
+        filters it out, so it never runs, never errors, never retries, never
+        reaches the DLQ and never ages into any check that looks at *terminal*
+        states. It is simply ``queued``, forever, and the ordering being
+        inverted (LOWER is MORE urgent) is what walks people into it —
+        ``priority=5000`` reads as "whenever you get to it" and means "never".
+        A job pinned to an ``app_version`` no live worker advertises is the
+        same silence reached by a different door, and it is reached by
+        ACCIDENT rather than by misreading a number: the pin was correct when
+        the job was enqueued and the deploy it was waiting for moved on
+        without it.
 
         The client refuses to enqueue above its declared ceiling
         (``client.validate_priority``), which is where the caller can still
         be told. This is the other half, for the jobs that got in anyway —
         raw SQL, another tool, a schedule, a client that declared a higher
-        ceiling than the workers actually run with.
+        ceiling than the workers actually run with. Nothing can refuse a
+        version pin at enqueue, because the fleet it has to match is whatever
+        is running whenever the job is finally claimed.
 
         Run only by an IDLE worker (nothing was claimable, so this costs no
-        throughput) and at most once a minute. It reports what is true of
-        THIS worker; a fleet may legitimately run a higher-ceiling worker
-        elsewhere, which the message says rather than assumes."""
+        throughput) and at most once a minute, both causes under the same
+        gate. It reports what is true of THIS worker; a fleet may legitimately
+        run a higher-ceiling or differently-versioned worker elsewhere, which
+        both messages say rather than assume."""
         now = time.monotonic()
         # 0.0 means "never reported": a monotonic clock has no fixed epoch,
         # so an elapsed-time test against it would be a guess about uptime
-        if self._ceiling_reported and now - self._ceiling_reported < 60:
+        if self._hidden_reported and now - self._hidden_reported < 60:
             return
-        self._ceiling_reported = now
+        self._hidden_reported = now
 
         rows = await self.ex("above-ceiling", self.qname, self.prio)
         above = rows[0]["above"] if rows else 0
-        if not above:
+        if above:
+            logger.warning(
+                "[{}:{}] {} runnable job(s) on this queue are ABOVE this "
+                "worker's priority ceiling of {} (least-urgent claimable "
+                "prio; the lowest blocked one is {}) and will never be "
+                "claimed here. Lower prio is MORE urgent, so a big number is "
+                "not 'later', it is 'never': unless another worker on this "
+                "queue runs with a higher --max-prio, those jobs stay queued "
+                "forever. Fix by lowering their prio "
+                "(client.update_job_priority) or by running a worker with "
+                "--max-prio at or above {}.",
+                self.qname,
+                self.prio,
+                above,
+                self.prio,
+                rows[0]["lowest"],
+                rows[0]["lowest"],
+            )
+
+        # Asked whatever this worker's own version is. An UNVERSIONED worker
+        # is the one most likely to be looking at pinned work it cannot take
+        # (it is what a fleet runs before anybody sets --app-version), so
+        # skipping the question when self.app_version is None would hide the
+        # condition from exactly the fleet that has it.
+        rows = await self.ex("hidden-versions", self.qname, self.app_version, self.prio)
+        mismatched = rows[0]["mismatched"] if rows else 0
+        if not mismatched:
             return
         logger.warning(
-            "[{}:{}] {} runnable job(s) on this queue are ABOVE this worker's "
-            "priority ceiling of {} (least-urgent claimable prio; the lowest "
-            "blocked one is {}) and will never be claimed here. Lower prio is "
-            "MORE urgent, so a big number is not 'later', it is 'never': "
-            "unless another worker on this queue runs with a higher "
-            "--max-prio, those jobs stay queued forever. Fix by lowering "
-            "their prio (client.update_job_priority) or by running a worker "
-            "with --max-prio at or above {}.",
+            "[{}:{}] {} runnable job(s) on this queue are PINNED to an app "
+            "version this worker does not advertise (e.g. {!r}; this worker "
+            "advertises {}) and will never be claimed here. A job with an "
+            "app_version is claimed only by a worker advertising the SAME "
+            "one, so unless another worker on this queue runs with "
+            "--app-version {!r}, those jobs stay queued forever — they never "
+            "fail and never reach the DLQ. Fix by starting a worker with "
+            "--app-version {!r}, or by repinning the jobs "
+            "(pj-admin jobs set-app-version ID [VERSION|--clear]).",
             self.qname,
             self.prio,
-            above,
-            self.prio,
-            rows[0]["lowest"],
-            rows[0]["lowest"],
+            mismatched,
+            rows[0]["wanted"],
+            repr(self.app_version) if self.app_version else "no version",
+            rows[0]["wanted"],
+            rows[0]["wanted"],
         )
 
     async def _deregister_worker(self) -> None:
@@ -1041,6 +1122,7 @@ class JobSystem:
                     self.capabilities,
                     self.prio,
                     self.worker_id,
+                    self.app_version,
                 )
                 jobs = await self.ex("claim", *claim_args)
 
@@ -1055,8 +1137,9 @@ class JobSystem:
 
                 if not jobs:
                     # nothing claimable: the one moment worth asking whether
-                    # something is sitting just above our ceiling, unseen
-                    await self._report_unclaimable_priorities()
+                    # something is sitting behind one of our claim gates,
+                    # unseen -- above our ceiling, or pinned to another version
+                    await self._report_hidden_work()
                     sleepytime = True
                     continue
 
@@ -2343,6 +2426,42 @@ async def _preflight_problem(db_params: dict[str, Any]) -> str | None:
     return None
 
 
+def resolve_app_version(flag: str | None, configured: Any) -> str | None:
+    """The app version this fleet advertises: the flag, else the config file.
+
+    Same precedence as the priority ceiling above it -- explicit flag > config
+    file > nothing -- and the config key is shared with the client for the
+    reason the ceiling's is: a version pin has two halves (what the workers
+    advertise, what an enqueue stamps) and they have to agree, so a deployment
+    declares it once in the file every process already reads.
+
+    AN EMPTY VERSION MEANS "advertise none", not "advertise ''", and that
+    distinction is not pedantry: ``--app-version "$GIT_SHA"`` with the variable
+    unset is exactly how one arrives, and a worker advertising ``''`` would
+    claim only jobs pinned to ``''`` -- which nothing can enqueue, because the
+    client refuses to write one (client.validate_app_version). The fleet would
+    come up healthy and claim nothing at all. The enqueue side RAISES on the
+    same input because a caller is there to be told; a launcher flag has no
+    caller, and refusing to boot would take a whole fleet down over a blank
+    template variable, so this warns and carries on unpinned.
+
+    A function rather than four lines inside ``workit`` so the rule can be
+    tested without spawning a fleet to observe it.
+    """
+    version = flag if flag is not None else configured
+    if version is None:
+        return None
+    version = str(version)
+    if not version.strip():
+        logger.warning(
+            "The app version this fleet was given is empty (an unset build "
+            "variable?); it will advertise NO app version and claim only "
+            "unpinned jobs"
+        )
+        return None
+    return version
+
+
 def runAndDone(
     qname: str,
     caps: tuple[str],
@@ -2355,6 +2474,7 @@ def runAndDone(
     reload_jobs: bool = False,
     job_threads: int = 8,
     max_prio: int = DEFAULT_PRIO_CEILING,
+    app_version: str | None = None,
     heartbeat_interval: float = db.DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
 ) -> None:
     """Run the JobSystem for this worker process.
@@ -2362,7 +2482,10 @@ def runAndDone(
     ``max_prio`` is this worker's priority ceiling. It is passed explicitly
     because it used to be dropped here: whatever `pj` was told, every worker
     it launched ran at the dataclass default, so no operator could run a
-    worker for low-urgency work at all."""
+    worker for low-urgency work at all. ``app_version`` is passed for the same
+    reason and would fail the same way -- a fleet launched with
+    ``--app-version`` whose children all advertised None would claim no pinned
+    job at all, while `pj-admin workers list` said they did."""
     configure_worker_logging()
     # our parent right now IS the launcher; if it dies we should too
     launcher_pid = os.getppid()
@@ -2374,6 +2497,7 @@ def runAndDone(
         checkInterval=check_interval,
         webPort=web_listen,
         prio=max_prio,
+        app_version=app_version,
         max_retries=max_retries,
         default_timeout=default_timeout,
         reload_jobs=reload_jobs,
@@ -2432,6 +2556,16 @@ def runAndDone(
     "urgent, so raising this makes a worker take LESS urgent work as well; "
     "a job above every worker's ceiling is never claimed at all. Defaults "
     "to the config file's prio_ceiling, else 1000",
+)
+@click.option(
+    "--app-version",
+    default=None,
+    help="APPLICATION code version these workers advertise. A job enqueued "
+    "with an app_version is claimed ONLY by a worker advertising the same "
+    "one; a job without one is claimed by any worker, so this pins in-flight "
+    "work to matching code during a rolling deploy without holding back "
+    "ordinary work. Defaults to the config file's app_version, else none "
+    "(claims unpinned jobs only)",
 )
 @click.option(
     "--path",
@@ -2501,6 +2635,7 @@ def workit(
     cap: tuple[str],
     workers: int,
     max_prio: int | None,
+    app_version: str | None,
     path: str,
     max_retries: int,
     default_timeout: int,
@@ -2531,7 +2666,7 @@ def workit(
 
     try:
         loadedConfig = load_config_from_file(
-            config, {"db_params", "web_listen", "prio_ceiling"}
+            config, {"db_params", "web_listen", "prio_ceiling", "app_version"}
         )
     except RuntimeError as e:
         logger.error("Failed to load config {}: {}", config, e)
@@ -2545,6 +2680,8 @@ def workit(
         # that admits only prio-0 work) is a real value, not "unset".
         configured = loadedConfig.get("prio_ceiling")
         max_prio = DEFAULT_PRIO_CEILING if configured is None else configured
+
+    app_version = resolve_app_version(app_version, loadedConfig.get("app_version"))
 
     if not loadedConfig.get("db_params"):
         logger.error("No db_params found in config: {}", config)
@@ -2574,12 +2711,17 @@ def workit(
 
     logger.info(
         "[{}] Launching {} worker(s) on each of {} queue(s) [{}] at priority "
-        "ceiling {}: {} processes",
+        "ceiling {}{}: {} processes",
         localver,
         workers,
         len(queues),
         ", ".join(queues),
         max_prio,
+        # Named at launch because it decides what the whole fleet will claim
+        # and is otherwise visible only in the registry: an operator who typed
+        # the wrong version, or whose config declared one they did not expect,
+        # finds out here rather than from jobs that never run.
+        f" advertising app version {app_version!r}" if app_version else "",
         workers * len(queues),
     )
     launched: set[Process] = set()
@@ -2649,6 +2791,7 @@ def workit(
                 "job_threads": job_threads,
                 "heartbeat_interval": heartbeat_interval,
                 "max_prio": max_prio,
+                "app_version": app_version,
             },
         )
         p.start()

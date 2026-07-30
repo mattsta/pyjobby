@@ -159,10 +159,12 @@ async def enqueue(pool, queue: str, job_class: str, kwargs: dict | None = None) 
     return job_id
 
 
-async def claim_once(conn, queue: str, worker_id: int | None = None):
+async def claim_once(
+    conn, queue: str, worker_id: int | None = None, app_version: str | None = None
+):
     """Claim through the REAL claim statement (bumping run_epoch)."""
     return await conn.fetchrow(
-        STMTS["claim"], 4242, CLAIM_HOST, queue, ["test"], 1000, worker_id
+        STMTS["claim"], 4242, CLAIM_HOST, queue, ["test"], 1000, worker_id, app_version
     )
 
 

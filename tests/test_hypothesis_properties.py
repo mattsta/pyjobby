@@ -161,6 +161,7 @@ class TestProducerConsumerInvariants:
                 [None],  # capabilities - accept jobs with no capability
                 prio + job_count,  # max priority
                 None,  # claimed_by (unregistered worker)
+                None,  # app_version (this worker advertises none)
             )
             if result:
                 claimed.append(result[0]["id"])
@@ -203,6 +204,7 @@ class TestProducerConsumerInvariants:
                 [None],
                 10000,
                 None,  # claimed_by (unregistered worker)
+                None,  # app_version (this worker advertises none)
             )
             if result:
                 claimed_jobs.append(result[0]["id"])
@@ -505,6 +507,7 @@ class TestPriorityOrdering:
                 [None],
                 max(priorities),  # Accept up to max priority
                 None,  # claimed_by (unregistered worker)
+                None,  # app_version (this worker advertises none)
             )
             if result:
                 claimed_priorities.append(result[0]["prio"])
@@ -594,6 +597,7 @@ class TestCapabilityMatching:
                 [required_capability],  # worker capabilities
                 10000,
                 None,  # claimed_by (unregistered worker)
+                None,  # app_version (this worker advertises none)
             )
             if result:
                 claimed.append(result[0]["id"])

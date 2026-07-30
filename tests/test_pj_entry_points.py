@@ -540,9 +540,16 @@ class TestExStatementRunner:
                 name: await system.cxn.prepare(stmt) for name, stmt in STMTS.items()
             }
 
-            # schema v1 claim: 6 parameters, last is the registry worker id
+            # schema v1 claim: 7 parameters, last is the advertised app version
             result = await system.ex(
-                "claim", os.getpid(), "testhost", unique_queue, ("test",), 1000, None
+                "claim",
+                os.getpid(),
+                "testhost",
+                unique_queue,
+                ("test",),
+                1000,
+                None,
+                None,
             )
             assert isinstance(result, list)
             assert result == []

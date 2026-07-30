@@ -999,7 +999,11 @@ def _notify_commit_lock_cost(modes: dict[str, Any]) -> dict[str, Any]:
 # 2. claim — throughput through the real claim_jorb(), and contention
 # =========================================================================
 
-CLAIM_SQL = "SELECT id, run_epoch FROM claim_jorb($1, $2::text[], $3, $4, $5, $6)"
+#: $4 is the claiming worker's app_version, NULL here: the benchmark measures
+#: the unpinned path, which is what every job takes unless a deployment opts
+#: in, and a pinned probe would measure the same statement with one more
+#: equality test.
+CLAIM_SQL = "SELECT id, run_epoch FROM claim_jorb($1, $2::text[], $3, $4, $5, $6, $7)"
 
 #: What a real worker writes the instant its job returns -- the worker's own
 #: epoch-fenced terminal statement, not an approximation of it, so a churn arm
@@ -1157,7 +1161,14 @@ async def _claim_loop(
     async with pool.acquire() as conn:
         while time.monotonic() < deadline and remaining["left"] > 0:
             row = await conn.fetchrow(
-                CLAIM_SQL, queue, ["bench"], 1000, worker_index, "pj-bench", None
+                CLAIM_SQL,
+                queue,
+                ["bench"],
+                1000,
+                None,
+                worker_index,
+                "pj-bench",
+                None,
             )
             if row is None:
                 queued = await conn.fetchval(
@@ -1919,10 +1930,16 @@ async def _drain_notifications(
 # 5. plans — EXPLAIN every hot query; the CI regression gate
 # =========================================================================
 
+#: $4 is the claiming worker's app_version, and NULL is the case that has to
+#: stay free: with no job in the seed pinned, the predicate is TRUE for every
+#: row and the probe must still stop on the first index entry (max_rows_removed
+#: 0 below). A pinned fleet pays one equality test per row examined, which is
+#: what capability already costs beside it.
 CLAIM_PROBE_SQL = """
     SELECT j.id FROM jorb j
      WHERE j.queue = $1
        AND (j.capability = ANY($2::text[]) OR j.capability IS NULL)
+       AND (j.app_version IS NULL OR j.app_version = $4::text)
        AND j.prio <= $3
        AND j.run_after <= now()
        AND j.state = 'queued'
@@ -1969,6 +1986,7 @@ PARTITIONED_CLAIM_SQL = """
     SELECT j.id FROM jorb j
      WHERE j.queue = $1
        AND (j.capability = ANY($2::text[]) OR j.capability IS NULL)
+       AND (j.app_version IS NULL OR j.app_version = $6::text)
        AND j.prio <= $3
        AND j.run_after <= now()
        AND j.state = 'queued'
@@ -2289,7 +2307,7 @@ def hot_queries() -> tuple[HotQuery, ...]:
     """
 
     def claim_args(queue: str, _seed: dict[str, Any]) -> list[Any]:
-        return [queue, ["bench"], 1000]
+        return [queue, ["bench"], 1000, None]
 
     def window_args(_queue: str, _seed: dict[str, Any]) -> list[Any]:
         return [db.utcnow() - datetime.timedelta(hours=1)]
@@ -2346,7 +2364,7 @@ def hot_queries() -> tuple[HotQuery, ...]:
             "claim_jorb's claimable-row probe on a partitioned queue, caught "
             "up (no lane at its limit)",
             PARTITIONED_CLAIM_SQL,
-            lambda queue, _seed: [queue, ["bench"], 1000, [], False],
+            lambda queue, _seed: [queue, ["bench"], 1000, [], False, None],
             # The case that has to stay free. With nothing saturated the
             # blocked set is empty, the per-row test is false for every row,
             # and the probe stops on the first index entry exactly as the
@@ -2365,6 +2383,7 @@ def hot_queries() -> tuple[HotQuery, ...]:
                 1000,
                 [PLAN_BLOCKED_LANE],
                 False,
+                None,
             ],
             # The cost of fairness, stated as a number: the probe walks past
             # the held-back tenant's queued rows to reach the free lane's.

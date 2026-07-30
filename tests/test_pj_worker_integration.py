@@ -55,9 +55,20 @@ class TimeoutJob(Job):
         return "should_not_reach"
 
 
-async def claim(conn, queue, *, pid=12345, host="test-node", caps=(), prio=1000):
+async def claim(
+    conn,
+    queue,
+    *,
+    pid=12345,
+    host="test-node",
+    caps=(),
+    prio=1000,
+    app_version: str | None = None,
+):
     """Claim the next job on `queue` via the REAL claim statement."""
-    return await conn.fetchrow(STMTS["claim"], pid, host, queue, list(caps), prio, None)
+    return await conn.fetchrow(
+        STMTS["claim"], pid, host, queue, list(caps), prio, None, app_version
+    )
 
 
 # ============================================================================

@@ -322,7 +322,8 @@ async def requeue_job(
 # for a fast-forwarded stream write).
 #
 # Params: $1 source job id, $2 from_step (1-based), $3 queue override or
-# NULL, $4 priority override or NULL, $5 kwargs override or NULL.
+# NULL, $4 priority override or NULL, $5 kwargs override or NULL, $6 the
+# fork's own app_version or NULL.
 FORK_JOB_SQL = """
     WITH src AS (
         SELECT * FROM jorb WHERE id = $1
@@ -333,7 +334,7 @@ FORK_JOB_SQL = """
     ), forked AS (
         INSERT INTO jorb (
             job_class, kwargs, queue, prio, capability, uid, tags, admin_data,
-            state, forked_from, partition_key
+            state, forked_from, partition_key, app_version
         )
         SELECT src.job_class,
                COALESCE($5::jsonb, src.kwargs),
@@ -352,7 +353,17 @@ FORK_JOB_SQL = """
                -- WHICH piece of work it is, so a tenant's fork is still that
                -- tenant's job and still counts against that tenant's lane.
                -- Same reasoning that carries uid and tags across.
-               src.partition_key
+               src.partition_key,
+               -- NOT INHERITED, and the contrast with the line above is the
+               -- point: a partition_key says whose work this is, an
+               -- app_version says which BUILD may run it -- and the main
+               -- reason to fork is to re-run the work under new code. A fork
+               -- that inherited the source's pin would be stranded by the
+               -- deploy the operator just made, which is the failure this
+               -- whole feature exists to make impossible to miss. So the fork
+               -- is unpinned unless the caller pins it, and the caller who
+               -- wants the source's pin passes the source's version.
+               $6::text
           FROM src, recorded
          WHERE $2::int <= recorded.steps + 1
         RETURNING id, queue, prio
@@ -412,6 +423,7 @@ async def fork_job(
     queue: str | None = None,
     priority: int | None = None,
     kwargs_override: dict[str, Any] | None = None,
+    app_version: str | None = None,
 ) -> dict[str, Any]:
     """Fork ``job_id`` into a NEW job that starts at ``from_step``.
 
@@ -441,6 +453,12 @@ async def fork_job(
     every execution counter — it starts queued at run_epoch 0 with no errors
     and no result.
 
+    ``app_version`` is the fork's OWN pin and defaults to None, unpinned —
+    the source's is deliberately not inherited, because a fork usually exists
+    to re-run the work under NEW code and inheriting the pin would strand it
+    on the build that just went away. A caller who really wants the source's
+    pin reads it and passes it.
+
     Returns ``{"job_id", "source_job_id", "from_step", "steps_copied",
     "queue", "priority"}``.
 
@@ -453,7 +471,13 @@ async def fork_job(
             f"from_step must be at least 1 (steps are numbered from 1); got {from_step}"
         )
     row = await conn.fetchrow(
-        FORK_JOB_SQL, job_id, from_step, queue, priority, kwargs_override
+        FORK_JOB_SQL,
+        job_id,
+        from_step,
+        queue,
+        priority,
+        kwargs_override,
+        app_version,
     )
     if not row["source_exists"]:
         raise _no_such_job(job_id)
@@ -480,6 +504,7 @@ async def fork_job_from_failure(
     queue: str | None = None,
     priority: int | None = None,
     kwargs_override: dict[str, Any] | None = None,
+    app_version: str | None = None,
 ) -> dict[str, Any]:
     """:func:`fork_job` from the first step that FAILED.
 
@@ -508,6 +533,7 @@ async def fork_job_from_failure(
         queue=queue,
         priority=priority,
         kwargs_override=kwargs_override,
+        app_version=app_version,
     )
 
 
